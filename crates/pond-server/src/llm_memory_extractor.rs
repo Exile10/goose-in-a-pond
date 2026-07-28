@@ -1,15 +1,22 @@
 //! LLM-based memory extractor — uses the live LLM provider to extract
 //! durable facts from conversation turns.
 //!
-//! The extraction prompt is intentionally compact (~150 tokens of instruction)
-//! to work well with 3B parameter models.
+//! The extraction prompt is the whole per-turn prefill of a background job that
+//! runs after *every* turn, on the same single-slot local model that is serving
+//! chat — so its size is a latency cost, not just a context cost. It is kept
+//! near ~400 tokens (1589 chars) and spends that budget on the two rules a
+//! small model gets wrong unprompted: write in the third person, and write a
+//! sentence that still means something with the conversation removed.
+//! `pond-core`'s extraction service enforces both regardless — see
+//! `fact_defect`.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use pond_core::models::domain::message::ChatMessage;
 use pond_core::models::ports::provider::LlmProvider;
-use pond_core::user_data::domain::memory::{MemorySegment, MemoryTier};
+use pond_core::user_data::domain::memory::{fact_defect, normalise_fact_content, MemorySegment};
 use pond_core::user_data::ports::memory_extractor::{ExtractedFact, MemoryExtractor};
+use pond_core::user_data::services::memory_relevance::is_duplicate_content;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -17,24 +24,29 @@ const EXTRACTION_PROMPT: &str = "\
 Extract durable facts about the USER from this conversation turn.
 Return JSON: {\"facts\":[{\"content\":\"one sentence fact\",\"segment\":\"identity|preference|correction|relationship|project|knowledge|context\",\"importance\":0.0-1.0}]}
 
-Segment guide:
-- identity: core user facts (name, role, location). importance 0.80-0.85
-- correction: user explicitly corrects something. importance 0.85-0.90. Add \"corrects\":\"the wrong claim being fixed\" field.
-- preference: style, defaults, likes/dislikes. importance 0.65-0.75
-- relationship: people, pets, connections. importance 0.65-0.75
-- project: ongoing work, deadlines, goals. importance 0.55-0.65
-- knowledge: facts the user taught (not common knowledge). importance 0.45-0.55
-- context: current situation, transient. importance 0.30-0.40
+Each content is stored forever and shown with no conversation around it:
+- Third person. Never \"I\", \"me\", \"my\", \"we\".
+- Self-contained: name every person and place. Never \"there\", \"that place\",
+  \"the latter\", \"the former\", or an opening \"He/She/It/They\".
+- One plain sentence, no label prefix.
+\"my mom florence lives in kisumu, i moved there in 2019\" ->
+{\"facts\":[{\"content\":\"The user's mother Florence lives in Kisumu.\",\"segment\":\"relationship\",\"importance\":0.7},{\"content\":\"The user moved to Kisumu in 2019.\",\"segment\":\"identity\",\"importance\":0.8}]}
 
-Max 3 facts per turn. Prefer fewer, higher-quality facts.
-NEVER save:
-- General knowledge or facts the assistant provided (weather, Wikipedia, etc.)
-- Info already in the system prompt (assistant name, timezone, personality)
-- Speculative or unverified claims (\"I think\", \"maybe\", \"probably\")
-- Transient conversational filler (\"OK\", \"thanks\", greetings)
-- Empty or vague content without concrete information
-ONLY save facts about the user that would be lost if forgotten.
-If nothing is worth remembering, return {\"facts\":[]}.";
+Segments (importance):
+- identity 0.80 name, role, home city
+- correction 0.90 the user fixes something; add \"corrects\":\"the wrong claim\".
+  Save it even when it restates a fact already stored.
+- preference 0.70 style, defaults, likes and dislikes
+- relationship 0.70 named people and pets
+- project 0.60 ongoing work the user returns to across days. A task the user
+  asked for this turn is NOT a project.
+- knowledge 0.50 facts the user taught, not common knowledge
+- context 0.35 transient, useful for a few days
+
+Max 3 facts, fewer is better. Never save a request already carried out
+(\"write a prime function\", \"set a reminder\"), anything the assistant supplied
+or the system prompt already states, guesses (\"I think\", \"maybe\"), filler, or
+vague content. If nothing is worth keeping, return {\"facts\":[]}.";
 
 pub struct LlmMemoryExtractor {
     live_provider: Arc<RwLock<Option<Arc<dyn LlmProvider>>>>,
@@ -102,18 +114,12 @@ fn parse_extraction_response(
 
     // Try new format: {"facts": [...]}
     if let Some(arr) = extract_facts_from_object(&cleaned) {
-        let facts = parse_fact_array(&arr, existing_content, max_facts);
-        return Ok(facts);
+        return Ok(parse_fact_array(&arr, existing_content, max_facts));
     }
 
     // Try legacy format: bare JSON array [...]
     if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&cleaned) {
-        let facts: Vec<ExtractedFact> = arr
-            .iter()
-            .filter_map(|v| parse_fact_json(v, existing_content))
-            .take(max_facts)
-            .collect();
-        return Ok(facts);
+        return Ok(parse_fact_array(&arr, existing_content, max_facts));
     }
 
     // Try extracting JSON from within the text (model may add preamble)
@@ -122,8 +128,7 @@ fn parse_extraction_response(
         if let Some(end) = cleaned.rfind('}') {
             let slice = &cleaned[start..=end];
             if let Some(arr) = extract_facts_from_object(slice) {
-                let facts = parse_fact_array(&arr, existing_content, max_facts);
-                return Ok(facts);
+                return Ok(parse_fact_array(&arr, existing_content, max_facts));
             }
         }
     }
@@ -132,12 +137,7 @@ fn parse_extraction_response(
         if let Some(end) = cleaned.rfind(']') {
             let slice = &cleaned[start..=end];
             if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(slice) {
-                let facts: Vec<ExtractedFact> = arr
-                    .iter()
-                    .filter_map(|v| parse_fact_json(v, existing_content))
-                    .take(max_facts)
-                    .collect();
-                return Ok(facts);
+                return Ok(parse_fact_array(&arr, existing_content, max_facts));
             }
         }
     }
@@ -162,35 +162,42 @@ fn extract_facts_from_object(text: &str) -> Option<Vec<serde_json::Value>> {
 }
 
 /// Parse a JSON array of fact objects into `ExtractedFact` values.
+///
+/// Rejected facts do not consume the `max_facts` budget, and each accepted fact
+/// joins the dedup set so one response cannot emit the same fact twice in two
+/// wordings. The extraction service re-applies both checks before writing —
+/// this pass only stops junk from crowding out good facts here.
 fn parse_fact_array(
     arr: &[serde_json::Value],
     existing_content: &[String],
     max_facts: usize,
 ) -> Vec<ExtractedFact> {
-    arr.iter()
-        .filter_map(|v| parse_fact_json(v, existing_content))
-        .take(max_facts)
-        .collect()
+    let mut seen: Vec<String> = existing_content.to_vec();
+    let mut facts: Vec<ExtractedFact> = Vec::new();
+    for value in arr {
+        if facts.len() >= max_facts {
+            break;
+        }
+        if let Some(fact) = parse_fact_json(value, &seen) {
+            seen.push(fact.content.to_lowercase());
+            facts.push(fact);
+        }
+    }
+    facts
 }
 
 fn parse_fact_json(v: &serde_json::Value, existing: &[String]) -> Option<ExtractedFact> {
     // Accept both new format key ("content") and legacy key ("fact")
-    let content = v
+    let raw = v
         .get("content")
         .or_else(|| v.get("fact"))
-        .and_then(|f| f.as_str())?
-        .trim()
-        .to_string();
-    if content.len() < 5 {
-        return None;
-    }
+        .and_then(|f| f.as_str())?;
+    let content = normalise_fact_content(raw);
 
-    // Skip if already exists
-    let lower = content.to_lowercase();
-    if existing
-        .iter()
-        .any(|e| e.contains(&lower) || lower.contains(e.as_str()))
-    {
+    // Unusable content: first person, a reference nothing can resolve, or
+    // nothing at all. Dropped here so it never reaches the store.
+    if let Some(defect) = fact_defect(&content) {
+        tracing::debug!(defect = %defect, "[memory-extraction] rejected fact: {content:?}");
         return None;
     }
 
@@ -214,6 +221,16 @@ fn parse_fact_json(v: &serde_json::Value, existing: &[String]) -> Option<Extract
         .and_then(|c| c.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+
+    // Skip if an existing memory already says this — unless it is a
+    // correction, which restates the claim it overturns almost word for word
+    // and would be dropped in favour of the stale row. Read after the segment
+    // so the exemption can see it; `pond-core` applies the same rule at the
+    // write gate.
+    let is_correction = segment == MemorySegment::Correction || corrects.is_some();
+    if !is_correction && existing.iter().any(|e| is_duplicate_content(e, &content)) {
+        return None;
+    }
 
     Some(ExtractedFact {
         content,
@@ -412,6 +429,133 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].segment, MemorySegment::Correction);
         assert_eq!(facts[0].corrects, Some("User's name is John".to_string()));
+    }
+
+    // ── quality gate ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn defective_facts_are_dropped_at_parse_time() {
+        let json = r#"{"facts": [
+            {"content": "The user's mother lives in the latter city.", "segment": "relationship", "importance": 0.7},
+            {"content": "My mom's name is Florence", "segment": "relationship", "importance": 0.7},
+            {"content": "The user's mother is named Florence and lives in Kisumu.", "segment": "relationship", "importance": 0.7}
+        ]}"#;
+        let facts = parse_extraction_response(json, &[], 3).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(
+            facts[0].content,
+            "The user's mother is named Florence and lives in Kisumu."
+        );
+    }
+
+    #[test]
+    fn a_rejected_fact_does_not_consume_the_budget() {
+        // Two junk facts ahead of two good ones, max 2: both good ones survive.
+        let json = r#"{"facts": [
+            {"content": "She lives in Kisumu.", "segment": "relationship", "importance": 0.7},
+            {"content": "My birthday is in March.", "segment": "identity", "importance": 0.8},
+            {"content": "The user's mother is named Florence.", "segment": "relationship", "importance": 0.7},
+            {"content": "The user works at Jarida.", "segment": "identity", "importance": 0.8}
+        ]}"#;
+        let facts = parse_extraction_response(json, &[], 2).unwrap();
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].content, "The user's mother is named Florence.");
+        assert_eq!(facts[1].content, "The user works at Jarida.");
+    }
+
+    #[test]
+    fn a_label_prefix_is_stripped_from_content() {
+        let json = r#"{"facts": [
+            {"content": "Active Project: The user is porting the dashboard to the Jetson.", "segment": "project", "importance": 0.6}
+        ]}"#;
+        let facts = parse_extraction_response(json, &[], 3).unwrap();
+        assert_eq!(
+            facts[0].content,
+            "The user is porting the dashboard to the Jetson."
+        );
+    }
+
+    #[test]
+    fn one_response_cannot_emit_the_same_fact_twice() {
+        let json = r#"{"facts": [
+            {"content": "The user's mother's name is Florence.", "segment": "relationship", "importance": 0.7},
+            {"content": "Florence is the name of the user's mother.", "segment": "relationship", "importance": 0.7}
+        ]}"#;
+        let facts = parse_extraction_response(json, &[], 3).unwrap();
+        assert_eq!(facts.len(), 1);
+    }
+
+    #[test]
+    fn the_prompt_states_the_rules_the_gate_enforces() {
+        // The gate is silent when it fires, so the prompt has to carry the same
+        // rules or every turn pays for facts that are thrown away.
+        for clue in [
+            "Third person",
+            "Self-contained",
+            "the latter",
+            "NOT a project",
+            "restates a fact already stored",
+        ] {
+            assert!(
+                EXTRACTION_PROMPT.contains(clue),
+                "extraction prompt lost: {clue:?}"
+            );
+        }
+    }
+
+    /// This prompt is prefilled after *every* turn, on the same single-slot
+    /// local model that is serving chat, so growth here is felt as latency on
+    /// the next user message. It reached 2466 chars once by accretion; this
+    /// ceiling makes the next accretion a failing test rather than a silent
+    /// regression.
+    const EXTRACTION_PROMPT_CEILING: usize = 1800;
+
+    #[test]
+    fn the_prompt_stays_within_its_prefill_budget() {
+        assert!(
+            EXTRACTION_PROMPT.len() <= EXTRACTION_PROMPT_CEILING,
+            "extraction prompt is {} chars, ceiling is {EXTRACTION_PROMPT_CEILING}",
+            EXTRACTION_PROMPT.len()
+        );
+    }
+
+    #[test]
+    fn a_correction_is_not_deduplicated_away_at_parse_time() {
+        // The stale row is already in the store; the correction changes one
+        // word of it, in the same order. Deliberately *not* an argument
+        // reversal: the order guard exempts those anyway, so a reversal pair
+        // would pass this test even with the correction exemption deleted. Here
+        // the lexical measure genuinely reads a duplicate (Jaccard 0.75,
+        // containment 0.86), so only the exemption keeps the fix.
+        let stale = "The user's daughter Aisha started school in Nakuru last year";
+        let fixed = "The user's daughter Aisha started school in Nairobi last year";
+        assert!(
+            is_duplicate_content(stale, fixed),
+            "test is vacuous unless the lexical measure flags this pair"
+        );
+
+        // Both the segment and the bare `corrects` field must exempt it, since
+        // a small model sets one without the other often enough.
+        let existing = vec![stale.to_lowercase()];
+        for segment in ["correction", "preference"] {
+            let json = format!(
+                r#"{{"facts": [{{"content": "{fixed}", "segment": "{segment}", "importance": 0.9, "corrects": "{stale}"}}]}}"#
+            );
+            let facts = parse_extraction_response(&json, &existing, 3).unwrap();
+            assert_eq!(
+                facts.len(),
+                1,
+                "correction dropped with segment {segment:?}"
+            );
+        }
+
+        // …while an ordinary restatement of the same row is still dropped.
+        let json = format!(
+            r#"{{"facts": [{{"content": "{fixed}", "segment": "preference", "importance": 0.7}}]}}"#
+        );
+        assert!(parse_extraction_response(&json, &existing, 3)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

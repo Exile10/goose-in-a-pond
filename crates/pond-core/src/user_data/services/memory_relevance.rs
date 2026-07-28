@@ -131,6 +131,261 @@ pub const SEMANTIC_DEDUP_THRESHOLD: f32 = 0.92;
 /// How many nearest neighbours to inspect when checking for a paraphrase.
 pub const SEMANTIC_DEDUP_NEIGHBOURS: usize = 5;
 
+// ── Lexical dedup (the no-embeddings path) ──────────────────────────────────
+//
+// With `embedding_provider = "none"` the semantic pass above is inert: nothing
+// is embedded, so nothing is ever compared. Everything below has to hold the
+// line on its own, which is why it is a token measure rather than the substring
+// containment it replaces — "The user's mother's name is Florence." and "My
+// mom's name is Florence …" share no substring at all.
+
+/// How many recent memories a new fact is compared against.
+///
+/// These strings never reach an LLM prompt (the extractor uses them only for
+/// its own parse-time dedup), so the window is sized for recall, not tokens.
+pub const DEDUP_RECENT_WINDOW: usize = 50;
+
+/// Jaccard floor (shared content words over all content words).
+pub const LEXICAL_DEDUP_JACCARD: f32 = 0.45;
+
+/// Containment floor (shared content words over the *shorter* side).
+///
+/// Both floors must be cleared. Jaccard alone misses a short restatement of a
+/// long fact; containment alone fires on "prefers dark mode" vs "prefers dark
+/// roast coffee". Together they caught every duplicate pair seen in a real
+/// store without merging a genuinely distinct one.
+pub const LEXICAL_DEDUP_CONTAINMENT: f32 = 0.8;
+
+/// Fewest content words either side must have before the token measure is
+/// trusted. Below this a single shared word swings the ratios wildly, and
+/// negation ("is happy" / "is not happy") reduces to the same token set.
+const MIN_DEDUP_TOKENS: usize = 3;
+
+/// Words carrying no *discriminative* signal between two memories. Distinct
+/// from [`STOPWORDS`]: "user" is dropped here because every third-person fact
+/// contains it, and negations are deliberately kept because dropping them would
+/// make a fact and its contradiction look identical.
+const DEDUP_STOPWORDS: &[&str] = &[
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "am", "in", "on", "at",
+    "of", "to", "for", "and", "or", "but", "with", "that", "this", "these", "those", "it", "its",
+    "as", "by", "from", "has", "have", "had", "do", "does", "did", "user", "he", "she", "they",
+    "them", "their", "his", "her", "him", "my", "me", "mine", "our", "ours", "we", "you", "your",
+    "there", "here", "then", "than", "which", "who", "what", "when", "will", "would", "can",
+    "could", "should", "also", "very", "some", "into", "about", "one", "so", "if", "up", "out",
+];
+
+/// Kinship synonyms folded to one form. Without this the single most common
+/// duplicate in a personal store — "mother" written once as "mom" — reads as
+/// two unrelated facts.
+const TOKEN_ALIASES: &[(&str, &str)] = &[
+    ("mom", "mother"),
+    ("mum", "mother"),
+    ("mommy", "mother"),
+    ("mummy", "mother"),
+    ("mama", "mother"),
+    ("momma", "mother"),
+    ("dad", "father"),
+    ("daddy", "father"),
+    ("papa", "father"),
+    ("grandma", "grandmother"),
+    ("granny", "grandmother"),
+    ("nana", "grandmother"),
+    ("grandpa", "grandfather"),
+    ("grandad", "grandfather"),
+    ("granddad", "grandfather"),
+    ("kid", "child"),
+    ("children", "child"),
+];
+
+/// Shortest token kept. Two characters, not [`MIN_KEYWORD_LEN`]: dedup wants
+/// every scrap of signal ("pm", "ai"), and it never runs a SQL `LIKE`.
+const MIN_DEDUP_TOKEN_LEN: usize = 2;
+
+/// Normalise one raw word the way [`content_tokens`] does, but without the
+/// stopword and length filters — [`ORDER_SENSITIVE_MARKERS`] are themselves
+/// stopwords, so the order check needs the unfiltered sequence.
+fn normalise_word(raw: &str) -> String {
+    let word = raw
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    let word = singularise(strip_possessive(&word));
+    TOKEN_ALIASES
+        .iter()
+        .find(|(from, _)| *from == word)
+        .map(|(_, to)| (*to).to_string())
+        .unwrap_or(word)
+}
+
+/// Content words of a memory: lowercased, de-punctuated, possessive-stripped,
+/// crudely singularised, alias-folded, stopword-filtered, order-independent.
+pub fn content_tokens(text: &str) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for raw in text.split_whitespace() {
+        let word = normalise_word(raw);
+        if word.len() < MIN_DEDUP_TOKEN_LEN || DEDUP_STOPWORDS.contains(&word.as_str()) {
+            continue;
+        }
+        if !seen.iter().any(|w| w == &word) {
+            seen.push(word);
+        }
+    }
+    seen
+}
+
+fn strip_possessive(word: &str) -> &str {
+    word.strip_suffix("'s")
+        .or_else(|| word.strip_suffix("\u{2019}s"))
+        .unwrap_or(word)
+}
+
+/// Drop a plural "s". Skips endings where the "s" is part of the stem
+/// ("status", "class", "analysis") rather than a suffix.
+fn singularise(word: &str) -> String {
+    let keep = word.len() <= 3
+        || !word.ends_with('s')
+        || word.ends_with("ss")
+        || word.ends_with("us")
+        || word.ends_with("is")
+        || word.ends_with("as");
+    if keep {
+        word.to_string()
+    } else {
+        word[..word.len() - 1].to_string()
+    }
+}
+
+/// Words that flip a fact's polarity. A token measure is order- and
+/// polarity-blind, so "is happy" and "is not happy" reduce to nearly the same
+/// set — these are checked separately and never dropped as stopwords.
+const NEGATIONS: &[&str] = &[
+    "not",
+    "no",
+    "never",
+    "nor",
+    "without",
+    "cannot",
+    "can't",
+    "don't",
+    "doesn't",
+    "didn't",
+    "isn't",
+    "aren't",
+    "wasn't",
+    "won't",
+    "shouldn't",
+    "wouldn't",
+];
+
+/// Connectives whose two arguments are not interchangeable. "X over Y" and
+/// "Y over X" are opposite claims that reduce to one token set, so a set
+/// measure scores the reversal a perfect duplicate — the failure that silently
+/// dropped a correction and kept the stale row it was fixing.
+///
+/// Read as *normalised words*, not content tokens: most of these are dedup
+/// stopwords ("to", "than") and would otherwise be filtered away before the
+/// comparison. Copulas are deliberately absent — "Florence is the user's
+/// mother" and "The user's mother is Florence" are the same fact.
+const ORDER_SENSITIVE_MARKERS: &[&str] = &[
+    "over", "than", "instead", "rather", "versus", "vs", "before", "after", "above", "below", "to",
+    "from",
+];
+
+/// Jaccard and containment of two memories' content words, in that order.
+///
+/// A raw measure: it does not consider polarity, and returns `(0.0, 0.0)` when
+/// either side has fewer than three content words. Use [`is_duplicate_content`]
+/// to decide anything.
+pub fn lexical_overlap(a: &str, b: &str) -> (f32, f32) {
+    token_overlap(&content_tokens(a), &content_tokens(b))
+}
+
+fn token_overlap(ta: &[String], tb: &[String]) -> (f32, f32) {
+    if ta.len() < MIN_DEDUP_TOKENS || tb.len() < MIN_DEDUP_TOKENS {
+        return (0.0, 0.0);
+    }
+    let shared = ta.iter().filter(|t| tb.contains(t)).count() as f32;
+    let union = (ta.len() + tb.len()) as f32 - shared;
+    let shorter = ta.len().min(tb.len()) as f32;
+    (shared / union, shared / shorter)
+}
+
+fn is_negated(tokens: &[String]) -> bool {
+    tokens.iter().any(|t| NEGATIONS.contains(&t.as_str()))
+}
+
+/// Words of `text` normalised but not stopword-filtered, so a marker survives.
+fn normalised_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(normalise_word)
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Keep only the discriminative words of one side of a marker.
+fn content_of(words: &[String]) -> Vec<&str> {
+    words
+        .iter()
+        .map(String::as_str)
+        .filter(|w| w.len() >= MIN_DEDUP_TOKEN_LEN && !DEDUP_STOPWORDS.contains(w))
+        .collect()
+}
+
+/// True when the two texts share an [`ORDER_SENSITIVE_MARKERS`] connective and
+/// have exchanged its arguments — "prefers dark mode over light mode" against
+/// "prefers light mode over dark mode".
+///
+/// Both directions of the crossing are required, and a word present on both
+/// sides in the other text ("mode") is ignored, so this only fires on a genuine
+/// reversal. Firing wrongly costs one redundant row; not firing costs a fact.
+fn is_argument_swap(a: &str, b: &str) -> bool {
+    let (wa, wb) = (normalised_words(a), normalised_words(b));
+    for marker in ORDER_SENSITIVE_MARKERS {
+        let (Some(ia), Some(ib)) = (
+            wa.iter().position(|w| w == marker),
+            wb.iter().position(|w| w == marker),
+        ) else {
+            continue;
+        };
+        let (a_before, a_after) = (content_of(&wa[..ia]), content_of(&wa[ia + 1..]));
+        let (b_before, b_after) = (content_of(&wb[..ib]), content_of(&wb[ib + 1..]));
+        let crossed_back = a_before
+            .iter()
+            .any(|t| b_after.contains(t) && !b_before.contains(t));
+        let crossed_forward = a_after
+            .iter()
+            .any(|t| b_before.contains(t) && !b_after.contains(t));
+        if crossed_back && crossed_forward {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when two memories say the same thing, judged without embeddings.
+///
+/// Opposite polarity is never a duplicate, nor is an argument reversal — both
+/// checked first because the token measure is blind to polarity *and* to order.
+/// Then case-insensitive substring containment (the cheap exact-restatement
+/// case), then the token measure for reworded duplicates.
+pub fn is_duplicate_content(a: &str, b: &str) -> bool {
+    let (la, lb) = (a.trim().to_lowercase(), b.trim().to_lowercase());
+    if la.is_empty() || lb.is_empty() {
+        return false;
+    }
+    let (ta, tb) = (content_tokens(&la), content_tokens(&lb));
+    if is_negated(&ta) != is_negated(&tb) {
+        return false;
+    }
+    if is_argument_swap(&la, &lb) {
+        return false;
+    }
+    if la.contains(&lb) || lb.contains(&la) {
+        return true;
+    }
+    let (jaccard, containment) = token_overlap(&ta, &tb);
+    jaccard >= LEXICAL_DEDUP_JACCARD && containment >= LEXICAL_DEDUP_CONTAINMENT
+}
+
 // ── Embedding backfill ───────────────────────────────────────────────────────
 
 /// Rows embedded per backfill batch.
@@ -313,6 +568,152 @@ mod tests {
         let without = relevance_score(&f, None, now);
         let with_zero = relevance_score(&f, Some(0.0), now);
         assert!((without - with_zero).abs() < f32::EPSILON);
+    }
+
+    // ── lexical dedup ───────────────────────────────────────────────────
+
+    #[test]
+    fn content_tokens_normalises_possessives_plurals_and_kinship() {
+        assert_eq!(
+            content_tokens("The user's mother's name is Florence."),
+            vec!["mother", "name", "florence"]
+        );
+        // "mom" folds onto "mother", "lives" onto "live".
+        assert_eq!(
+            content_tokens("My mom's name is Florence and she lives in the latter city"),
+            vec!["mother", "name", "florence", "live", "latter", "city"]
+        );
+    }
+
+    #[test]
+    fn content_tokens_keeps_stems_that_merely_end_in_s() {
+        for word in ["status", "class", "analysis", "gas", "canvas"] {
+            assert_eq!(content_tokens(word), vec![word.to_string()], "{word}");
+        }
+    }
+
+    #[test]
+    fn the_three_florence_memories_collapse_without_embeddings() {
+        // Two rows that shipped side by side in a real store: reworded copies
+        // of one fact, sharing no substring, so only the token measure sees it.
+        let stored = "The user's mother's name is Florence.";
+        let reworded = "My mom's name is Florence and she lives in the latter city";
+        assert!(is_duplicate_content(reworded, stored));
+        assert!(is_duplicate_content(stored, reworded), "must be symmetric");
+    }
+
+    #[test]
+    fn a_restatement_of_a_captured_task_is_a_duplicate() {
+        assert!(is_duplicate_content(
+            "The user waters the plants every evening at 6 PM",
+            "Set a reminder to water the plants every evening at 6 PM",
+        ));
+    }
+
+    #[test]
+    fn distinct_facts_are_not_deduplicated() {
+        // Each pair shares wording but states something different. Losing the
+        // second one is the failure mode this threshold pair guards against.
+        let distinct: &[(&str, &str)] = &[
+            (
+                "The user prefers dark mode",
+                "The user prefers dark roast coffee",
+            ),
+            (
+                "The user's mother's name is Florence.",
+                "The user's father's name is Peter.",
+            ),
+            (
+                "The user's mother lives in Kisumu",
+                "The user's mother lives in Nairobi",
+            ),
+            ("The user's dog is named Rex", "The user's cat is named Rex"),
+            (
+                "The user has expressed a preference for brevity in interactions",
+                "The user set an interaction preference to use only one word for a goodbye",
+            ),
+            (
+                "The user is building a smart-home dashboard",
+                "The user is reading a book about beekeeping",
+            ),
+        ];
+        for (a, b) in distinct {
+            assert!(!is_duplicate_content(a, b), "wrongly merged {a:?} / {b:?}");
+        }
+    }
+
+    #[test]
+    fn a_negation_is_not_a_duplicate_of_what_it_negates() {
+        // The token measure does run here and scores these a duplicate
+        // (Jaccard 0.75, containment 1.00) — "not" is the only token that
+        // differs. The polarity gate is the only thing keeping them apart.
+        let (jaccard, containment) = lexical_overlap(
+            "The user is not happy with the new voice",
+            "The user is happy with the new voice",
+        );
+        assert!(jaccard >= LEXICAL_DEDUP_JACCARD && containment >= LEXICAL_DEDUP_CONTAINMENT);
+        assert!(!is_duplicate_content(
+            "The user is not happy with the new voice",
+            "The user is happy with the new voice"
+        ));
+    }
+
+    #[test]
+    fn an_argument_reversal_is_not_a_duplicate() {
+        // The regression this guard exists for: the reversal reduces to the
+        // *identical* token set, so Jaccard and containment both read 1.00 and
+        // the correction was dropped in favour of the stale row it fixed.
+        let stale = "The user prefers dark mode over light mode";
+        let fixed = "The user prefers light mode over dark mode";
+        assert_eq!(lexical_overlap(stale, fixed), (1.0, 1.0));
+        assert!(!is_duplicate_content(stale, fixed));
+        assert!(!is_duplicate_content(fixed, stale), "must be symmetric");
+
+        // The same shape with an elided marker ("prefers X to Y").
+        assert!(!is_duplicate_content(
+            "The user prefers tea to coffee",
+            "The user prefers coffee to tea"
+        ));
+
+        // A reversed journey. "to" alone cannot see it — both sentences put the
+        // same city after "to" — so "from" has to be a marker as well.
+        let there = "The user moved to Nairobi from Kisumu";
+        let back = "The user moved to Kisumu from Nairobi";
+        assert_eq!(lexical_overlap(there, back), (1.0, 1.0));
+        assert!(!is_duplicate_content(there, back));
+        assert!(!is_duplicate_content(back, there), "must be symmetric");
+    }
+
+    #[test]
+    fn a_same_order_restatement_is_still_caught() {
+        // The order guard must not blunt the measure: same claim, same order,
+        // marker present in both.
+        assert!(is_duplicate_content(
+            "The user prefers dark mode over light mode",
+            "The user prefers dark mode over light mode in every app",
+        ));
+        assert!(is_duplicate_content(
+            "The user moved from Nairobi to Kisumu",
+            "The user moved to Kisumu from Nairobi",
+        ));
+    }
+
+    #[test]
+    fn exact_and_contained_restatements_still_dedup() {
+        assert!(is_duplicate_content(
+            "The user works at Jarida",
+            "the user works at jarida"
+        ));
+        assert!(is_duplicate_content(
+            "The user works at Jarida as an engineer",
+            "The user works at Jarida"
+        ));
+    }
+
+    #[test]
+    fn empty_content_is_never_a_duplicate() {
+        assert!(!is_duplicate_content("", "The user works at Jarida"));
+        assert!(!is_duplicate_content("   ", ""));
     }
 
     // ── backfill ────────────────────────────────────────────────────────

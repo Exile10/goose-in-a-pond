@@ -7,6 +7,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 // ── Memory classification ────────────────────────────────────────────────────
 
@@ -218,6 +219,388 @@ impl MemoryFragment {
             corrects,
         }
     }
+}
+
+// ── Fact quality gate ───────────────────────────────────────────────────────
+
+/// Shortest trimmed content, in characters, that can carry a fact.
+pub const MIN_FACT_CONTENT_LEN: usize = 8;
+
+/// Why a candidate memory was refused at write time.
+///
+/// A stored memory is injected into the assistant's context on later turns,
+/// long after the conversation that produced it is gone. Anything that only
+/// made sense inside that conversation is not merely useless — it actively
+/// misleads — so it is cheaper to lose the fact than to keep it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactDefect {
+    /// Nothing left after normalisation, or too short to carry a fact.
+    TooShort,
+    /// Contains a deictic with no antecedent inside the sentence — "the latter
+    /// city", a trailing "there", a leading bare pronoun.
+    UnresolvedReference,
+    /// Written from the user's point of view ("my mother"). Injected into the
+    /// assistant's context, "my" reads as the *assistant's* mother.
+    FirstPerson,
+}
+
+impl FactDefect {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TooShort => "too short",
+            Self::UnresolvedReference => "unresolved reference",
+            Self::FirstPerson => "first person",
+        }
+    }
+}
+
+impl std::fmt::Display for FactDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Label prefixes a small model likes to bolt onto fact content
+/// ("Active Project: …"). Matched case-insensitively against the text before
+/// an early colon.
+const LABEL_PREFIXES: &[&str] = &[
+    "active project",
+    "current project",
+    "ongoing project",
+    "project",
+    "preference",
+    "relationship",
+    "correction",
+    "knowledge",
+    "identity",
+    "context",
+    "memory",
+    "fact",
+    "note",
+];
+
+/// How far into the string a colon may sit and still be a label separator.
+const LABEL_SCAN_CHARS: usize = 24;
+
+/// Verbs that can open a *captured request* — a copy of what the user asked
+/// for this turn rather than a statement about the user. A bare imperative
+/// opener is necessary but nowhere near sufficient: "Build a treehouse for the
+/// children this summer" and "Run the Nairobi marathon in October" open the
+/// same way and are durable undertakings. See [`is_captured_request`].
+const TASK_VERBS: &[&str] = &[
+    "add",
+    "build",
+    "calculate",
+    "check",
+    "compile",
+    "convert",
+    "create",
+    "debug",
+    "delete",
+    "design",
+    "draft",
+    "explain",
+    "find",
+    "fix",
+    "generate",
+    "give",
+    "help",
+    "implement",
+    "install",
+    "list",
+    "make",
+    "open",
+    "play",
+    "refactor",
+    "remind",
+    "remove",
+    "rename",
+    "run",
+    "schedule",
+    "send",
+    "set",
+    "show",
+    "summarise",
+    "summarize",
+    "tell",
+    "translate",
+    "turn",
+    "update",
+    "write",
+];
+
+/// Objects that mark an imperative as work the assistant does and finishes.
+/// Deliberately concrete: a "reminder" or a "function" is produced and done
+/// with, a "treehouse", "novel", "marathon" or "logo" is not.
+const ASSISTANT_ARTIFACT_NOUNS: &[&str] = &[
+    "alarm",
+    "appointment",
+    "calendar",
+    "chart",
+    "code",
+    "command",
+    "draft",
+    "email",
+    "file",
+    "folder",
+    "function",
+    "list",
+    "meeting",
+    "message",
+    "note",
+    "password",
+    "playlist",
+    "program",
+    "query",
+    "regex",
+    "reminder",
+    "screenshot",
+    "script",
+    "snippet",
+    "spreadsheet",
+    "summary",
+    "timer",
+    "translation",
+];
+
+/// First-person markers that are unambiguous wherever they appear.
+///
+/// "i" and "us" are handled separately — each collides with a real word.
+/// "mine" is deliberately absent: it is a common noun ("a coal mine") far more
+/// often than a predicate pronoun ("that laptop is mine"), and every rule that
+/// tried to tell the two apart produced new false positives in one direction or
+/// the other. Storing "That laptop is mine now." is the cheaper error.
+const FIRST_PERSON: &[&str] = &["my", "myself", "our", "ours", "ourselves", "we", "me"];
+
+/// Contracted first-person forms. [`split_tokens`] keeps internal apostrophes
+/// so "I'm" stays one token and never reaches the bare-pronoun arms below —
+/// "I'm allergic to peanuts." was being stored verbatim.
+const FIRST_PERSON_CONTRACTIONS: &[&str] = &[
+    "i'm", "i've", "i'll", "i'd", "we're", "we've", "we'll", "we'd", "let's",
+];
+
+/// Tokens that make a preceding "I" a pronoun subject rather than a numeral or
+/// an initial ("Type I diabetes" must survive).
+const I_PREDICATES: &[&str] = &[
+    "am", "was", "have", "had", "will", "would", "can", "could", "should", "do", "did", "like",
+    "prefer", "want", "need", "think", "live", "work", "use", "enjoy", "hate", "love", "also",
+    "just", "usually", "always", "never", "often",
+];
+
+/// How many in-sentence antecedents "the latter" / "the former" need. They
+/// *select between two* candidates, so one proper noun is not enough — "The
+/// user's mother Florence lives in the latter city" still names no city.
+const CONTRASTIVE_ANTECEDENTS: usize = 2;
+
+/// Pronouns that cannot resolve when they open a sentence.
+const LEADING_PRONOUNS: &[&str] = &[
+    "he", "she", "they", "him", "her", "them", "his", "hers", "its", "it", "their", "theirs",
+];
+
+/// Bigram deictics that point outside the sentence.
+const DEICTIC_BIGRAMS: &[(&str, &str)] = &[
+    ("that", "place"),
+    ("this", "place"),
+    ("same", "place"),
+    ("that", "city"),
+    ("that", "town"),
+    ("that", "country"),
+    ("that", "person"),
+    ("that", "one"),
+];
+
+/// Verbs that make a leading "there" the expletive subject ("there is a leak")
+/// rather than a place the reader cannot find.
+const EXPLETIVE_FOLLOWERS: &[&str] = &[
+    "is", "are", "was", "were", "will", "would", "has", "have", "had", "seems", "appears",
+];
+
+/// Split into (raw, lowercased) tokens with edge punctuation removed.
+///
+/// Edge-only trimming keeps internal apostrophes and hyphens, so "user's" stays
+/// one token and "U.S." never collapses onto the pronoun "us".
+fn split_tokens(content: &str) -> Vec<(&str, String)> {
+    content
+        .split_whitespace()
+        .map(|raw| raw.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|t| !t.is_empty())
+        .map(|t| (t, t.to_lowercase()))
+        .collect()
+}
+
+/// Clean up fact content before it is validated or stored: collapse whitespace
+/// and drop a leading segment label the model invented.
+pub fn normalise_fact_content(raw: &str) -> String {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some(colon) = collapsed
+        .char_indices()
+        .take(LABEL_SCAN_CHARS)
+        .find(|(_, c)| *c == ':')
+        .map(|(i, _)| i)
+    else {
+        return collapsed;
+    };
+    let label = collapsed[..colon].trim().to_lowercase();
+    if LABEL_PREFIXES.contains(&label.as_str()) {
+        collapsed[colon + 1..].trim().to_string()
+    } else {
+        collapsed
+    }
+}
+
+/// Inspect fact content and return the first defect that makes it unstorable.
+///
+/// Deliberately conservative: every rule here permanently discards a fact, so
+/// each one is anchored to a token pattern that a well-formed third-person
+/// sentence cannot produce.
+pub fn fact_defect(content: &str) -> Option<FactDefect> {
+    let trimmed = content.trim();
+    if trimmed.chars().count() < MIN_FACT_CONTENT_LEN {
+        return Some(FactDefect::TooShort);
+    }
+    let tokens = split_tokens(trimmed);
+    if tokens.is_empty() {
+        return Some(FactDefect::TooShort);
+    }
+    if has_first_person(&tokens) {
+        return Some(FactDefect::FirstPerson);
+    }
+    if has_unresolved_reference(&tokens) {
+        return Some(FactDefect::UnresolvedReference);
+    }
+    None
+}
+
+/// Drop a trailing plural "s" so a singular-only word list matches either form.
+fn singular(word: &str) -> &str {
+    match word.strip_suffix('s') {
+        Some(stem) if stem.len() >= 3 => stem,
+        _ => word,
+    }
+}
+
+/// True when the content is a copy of a one-off request the assistant already
+/// carried out ("Set a reminder to water the plants") rather than a durable
+/// undertaking of the user's.
+///
+/// A bare imperative opener is *grammar*, not transience: "Build a treehouse
+/// for the children this summer" and "Design the new logo for Jarida" open the
+/// same way and are exactly the long-lived projects this must not demote. So
+/// two signals are required — an imperative opener **and** a named assistant
+/// artifact in the object.
+///
+/// The verb alone is never enough, however assistant-ish it sounds: "Convert
+/// the garage into a workshop this year" and "Install the solar panels on the
+/// roof before the rains" are year-long undertakings that open on "convert" and
+/// "install". The object is what separates work that gets produced and finished
+/// from work the user lives with.
+///
+/// The rule is calibrated to under-demote. Missing a captured request leaves a
+/// stale `Project` row that consolidation can retire; demoting a real project
+/// drops it to `Short` tier and it decays away in about a week.
+pub fn is_captured_request(content: &str) -> bool {
+    let tokens = split_tokens(content);
+    if tokens.len() < 3 || !TASK_VERBS.contains(&tokens[0].1.as_str()) {
+        return false;
+    }
+    tokens
+        .iter()
+        .skip(1)
+        .any(|(_, lower)| ASSISTANT_ARTIFACT_NOUNS.contains(&singular(lower)))
+}
+
+/// Fold the typographic apostrophe onto ASCII so "I’m" and "I'm" are one token.
+fn ascii_apostrophe(word: &str) -> Cow<'_, str> {
+    if word.contains('\u{2019}') {
+        Cow::Owned(word.replace('\u{2019}', "'"))
+    } else {
+        Cow::Borrowed(word)
+    }
+}
+
+fn has_first_person(tokens: &[(&str, String)]) -> bool {
+    tokens.iter().enumerate().any(|(idx, (raw, lower))| {
+        let token = ascii_apostrophe(lower);
+        if FIRST_PERSON_CONTRACTIONS.contains(&token.as_ref()) {
+            return true;
+        }
+        let prev = idx.checked_sub(1).map(|i| tokens[i].1.as_str());
+        let next = tokens.get(idx + 1).map(|(_, l)| l.as_str());
+        match token.as_ref() {
+            "i" => idx == 0 || next.is_some_and(|n| I_PREDICATES.contains(&n)),
+            // The country, spelled "US" or written as "the US", is not a pronoun.
+            "us" => *raw != "US" && prev != Some("the"),
+            other => FIRST_PERSON.contains(&other),
+        }
+    })
+}
+
+/// How many proper nouns sit *before* `idx` and could be the antecedent.
+///
+/// A capitalised word is the only antecedent signal available without a parser.
+/// Position 0 does not count (every sentence starts capitalised) and "I" names
+/// nothing. Counting only what precedes matters: an anaphor cannot be resolved
+/// by a name that comes after it, and the old "any capital anywhere" test
+/// forgave the dangling phrase whenever the sentence happened to mention a
+/// person, city, month or weekday — which is most real facts.
+///
+/// Position is the *only* thing counted. Asking additionally what kind of
+/// antecedent it is — a proper noun in a locative phrase, for "there" and place
+/// deictics — destroyed facts whose place is introduced by a copula rather than
+/// a preposition ("The user's home town is Kisumu and his parents still live
+/// there."). Resolving a deictic to the wrong earlier name costs one vague row;
+/// the kind test cost whole correct facts.
+fn antecedents_before(tokens: &[(&str, String)], idx: usize) -> usize {
+    (1..idx).filter(|i| is_proper_noun(tokens, *i)).count()
+}
+
+fn is_proper_noun(tokens: &[(&str, String)], idx: usize) -> bool {
+    let (raw, lower) = &tokens[idx];
+    lower != "i" && raw.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
+fn has_unresolved_reference(tokens: &[(&str, String)]) -> bool {
+    if LEADING_PRONOUNS.contains(&tokens[0].1.as_str()) {
+        return true;
+    }
+
+    for (idx, (_, lower)) in tokens.iter().enumerate() {
+        let prev = idx.checked_sub(1).map(|i| tokens[i].1.as_str());
+        let next = tokens.get(idx + 1);
+        match lower.as_str() {
+            "latter" | "former" if prev == Some("the") => {
+                // "the former Yugoslavia" names its referent. Otherwise the
+                // word selects between two earlier candidates, so it needs two:
+                // "moved from Nairobi to Kisumu and prefers the latter" reads
+                // on its own, "mother Florence lives in the latter city" does
+                // not, however many other capitals the sentence carries.
+                let names_referent = next
+                    .and_then(|(raw, _)| raw.chars().next())
+                    .is_some_and(|c| c.is_uppercase());
+                if !names_referent && antecedents_before(tokens, idx) < CONTRASTIVE_ANTECEDENTS {
+                    return true;
+                }
+            }
+            "there" => {
+                let expletive =
+                    next.is_some_and(|(_, l)| EXPLETIVE_FOLLOWERS.contains(&l.as_str()));
+                if !expletive && antecedents_before(tokens, idx) == 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        if let Some((_, following)) = next {
+            // Any earlier proper noun resolves it. See [`antecedents_before`]
+            // for why the kind of noun is deliberately not inspected.
+            if DEICTIC_BIGRAMS.contains(&(lower.as_str(), following.as_str()))
+                && antecedents_before(tokens, idx) == 0
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Cosine similarity between two embedding vectors.
@@ -525,5 +908,264 @@ mod tests {
             None,
         );
         assert!(!frag.is_correction());
+    }
+
+    // ── fact quality gate ───────────────────────────────────────────────
+
+    /// Content a real conversation produces that must survive the gate. The
+    /// expensive failure mode here is over-eagerness: a rejected fact is gone.
+    const KEEPERS: &[&str] = &[
+        "The user's mother lives in Kisumu.",
+        "The user's mother's name is Florence.",
+        // "therapist" contains "there"; token matching must not see it.
+        "The user's therapist is Dr. Amina.",
+        "The user thereafter switched to decaf coffee.",
+        // "mine" as a noun, "us" as a country, "I" as a numeral. "mine" is not
+        // a first-person marker at all any more, so every reading survives.
+        "The user works in a mine near Kakamega.",
+        "The user works in a coal mine near Kakamega.",
+        "The user explored an abandoned mine last year.",
+        "The user's uncle owns a gold mine.",
+        "The user lives in the US and visits Kenya each August.",
+        "The user has Type I diabetes.",
+        // Expletive "there", not a place.
+        "There is a spare key under the doormat.",
+        "The user says there are two dogs in the compound.",
+        // "the former" naming its referent, and a resolvable "the latter" —
+        // two candidates in the sentence, of any kind.
+        "The user grew up in the former Yugoslavia.",
+        "The user moved from Nairobi to Kisumu and prefers the latter.",
+        "The user compared Rust and Go and prefers the latter.",
+        // A "there" whose place is named in the same sentence — introduced by a
+        // preposition in the first, by a copula in the second and third.
+        "The user moved to Kisumu in 2019 and still works there.",
+        "The user's home town is Kisumu and his parents still live there.",
+        "The user's employer is Jarida and the user works there full time.",
+        // Words that merely contain a flagged token.
+        "The user prefers the shorter route to work.",
+        "The user is a formerly published poet.",
+        "The user's houseplants are watered every evening at 6 PM.",
+    ];
+
+    /// Content pulled from (or modelled on) the junk rows the extractor wrote
+    /// into a real memory store.
+    const REJECTS: &[(&str, FactDefect)] = &[
+        (
+            "The user's mother lives in the latter city.",
+            FactDefect::UnresolvedReference,
+        ),
+        // One capitalised token elsewhere in the sentence used to forgive the
+        // dangling phrase; it names a person, not the city.
+        (
+            "The user's mother Florence lives in the latter city.",
+            FactDefect::UnresolvedReference,
+        ),
+        // First-person contractions: one token each, so the bare-pronoun
+        // matcher never saw them.
+        ("I'm allergic to peanuts.", FactDefect::FirstPerson),
+        (
+            "I've been learning Swahili for two years.",
+            FactDefect::FirstPerson,
+        ),
+        ("We're planning a trip to Mombasa.", FactDefect::FirstPerson),
+        ("I\u{2019}m allergic to peanuts.", FactDefect::FirstPerson),
+        (
+            "My mom's name is Florence and she lives in the latter city",
+            FactDefect::FirstPerson,
+        ),
+        (
+            "The user's brother lives there.",
+            FactDefect::UnresolvedReference,
+        ),
+        (
+            "She lives in Kisumu and works as a nurse.",
+            FactDefect::UnresolvedReference,
+        ),
+        ("Her name is Florence.", FactDefect::UnresolvedReference),
+        ("It is broken again today.", FactDefect::UnresolvedReference),
+        (
+            "The user enjoyed that place a great deal.",
+            FactDefect::UnresolvedReference,
+        ),
+        ("I prefer tea over coffee.", FactDefect::FirstPerson),
+        (
+            "The user asked me to water the plants.",
+            FactDefect::FirstPerson,
+        ),
+        (
+            "We are planning a trip to Mombasa.",
+            FactDefect::FirstPerson,
+        ),
+        ("Our dog is called Rex.", FactDefect::FirstPerson),
+        ("Tea.", FactDefect::TooShort),
+        ("   ", FactDefect::TooShort),
+    ];
+
+    #[test]
+    fn well_formed_facts_pass_the_gate() {
+        for content in KEEPERS {
+            assert_eq!(
+                fact_defect(content),
+                None,
+                "should have been kept: {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn defective_facts_are_rejected_with_the_right_reason() {
+        for (content, expected) in REJECTS {
+            assert_eq!(
+                fact_defect(content),
+                Some(*expected),
+                "wrong verdict for {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolvable_and_dangling_latter_are_told_apart() {
+        // Same trailing clause; only the presence of an antecedent differs.
+        assert!(fact_defect("The user's mother lives in the latter city.").is_some());
+        assert!(fact_defect(
+            "The user's mother moved from Nairobi to Kisumu and lives in the latter city."
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn normalise_strips_an_invented_label_prefix() {
+        assert_eq!(
+            normalise_fact_content(
+                "Active Project: Create a short Python function to check if a number is prime."
+            ),
+            "Create a short Python function to check if a number is prime."
+        );
+        assert_eq!(
+            normalise_fact_content("Note:  the pump runs at dawn"),
+            "the pump runs at dawn"
+        );
+    }
+
+    #[test]
+    fn normalise_leaves_a_sentence_that_merely_contains_a_colon() {
+        assert_eq!(
+            normalise_fact_content("The user's rule: keep replies short"),
+            "The user's rule: keep replies short"
+        );
+        assert_eq!(
+            normalise_fact_content("The   user  likes\ttea "),
+            "The user likes tea"
+        );
+    }
+
+    #[test]
+    fn captured_requests_are_told_apart_from_real_projects() {
+        assert!(is_captured_request(
+            "Create a short Python function to check if a number is prime."
+        ));
+        assert!(is_captured_request(
+            "Set a reminder to water the plants every evening at 6 PM"
+        ));
+        assert!(!is_captured_request(
+            "The user is building a smart-home dashboard for the Jetson."
+        ));
+        assert!(!is_captured_request(
+            "The user wants to write a book about beekeeping."
+        ));
+        assert!(!is_captured_request("Setup"));
+    }
+
+    #[test]
+    fn an_imperative_opener_alone_does_not_demote_a_project() {
+        // All four are durable undertakings that happen to be phrased as
+        // imperatives. Demoting them files them as Context, Short tier, and
+        // they decay out of the store inside a week.
+        for durable in [
+            "Build a treehouse for the children this summer",
+            "Write a novel about beekeeping",
+            "Run the Nairobi marathon in October",
+            "Design the new logo for Jarida",
+            "Learn Swahili before the trip to Mombasa",
+            // Verbs that sound like assistant work and are not: keying on the
+            // verb alone demoted both of these to Context, Short tier.
+            "Convert the garage into a workshop this year",
+            "Install the solar panels on the roof before the rains",
+        ] {
+            assert!(!is_captured_request(durable), "demoted: {durable:?}");
+        }
+    }
+
+    #[test]
+    fn assistant_work_is_still_demoted() {
+        // An imperative opener plus a named artifact in the object. The artifact
+        // is the only signal now: the verb on its own could not tell "Install
+        // the solar panels" from "Install the dependencies".
+        for request in [
+            "Create a short Python function to check if a number is prime.",
+            "Set a reminder to water the plants every evening at 6 PM",
+            "Write an email to the landlord about the leak",
+            "Make a list of the groceries",
+            "Schedule a meeting with the landlord for Monday",
+            "Translate the summary into Swahili.",
+        ] {
+            assert!(is_captured_request(request), "not demoted: {request:?}");
+        }
+    }
+
+    #[test]
+    fn an_assistant_verb_without_an_artifact_is_left_alone() {
+        // The cost of requiring the artifact noun: these three are captured
+        // requests and are no longer demoted, so they sit in Project until
+        // consolidation retires them. A stale Project row is the cheaper error —
+        // the alternative demoted real year-long undertakings.
+        for missed in [
+            "Translate the poem into Swahili.",
+            "Explain how the decay formula works.",
+            "Refactor the retrieval loop.",
+        ] {
+            assert!(!is_captured_request(missed), "demoted: {missed:?}");
+        }
+    }
+
+    #[test]
+    fn mine_is_no_longer_a_first_person_marker() {
+        // Deliberate, and the whole point of dropping the disambiguation: every
+        // rule that tried to separate the noun from the pronoun leaked in one
+        // direction or the other (a premodifier stack hid "a coal mine"; a
+        // backward walk past "of" let "a friend of mine" through). Keeping the
+        // noun reading is worth storing the handful of pronoun sentences,
+        // because the pronoun case costs one imprecise row and the noun case
+        // destroyed a correct fact outright.
+        for kept in [
+            "The user works in a coal mine near Kakamega.",
+            "The user explored a very old abandoned mine.",
+            // Genuinely first person, and now stored anyway.
+            "That laptop is mine now.",
+            "A friend of mine works at Jarida.",
+        ] {
+            assert_eq!(fact_defect(kept), None, "rejected: {kept:?}");
+        }
+        // The unambiguous first-person markers still fire.
+        assert_eq!(
+            fact_defect("My laptop is broken again."),
+            Some(FactDefect::FirstPerson)
+        );
+    }
+
+    #[test]
+    fn a_deictic_resolves_to_any_earlier_proper_noun() {
+        // Positional counting only. "Peter" is a person, not a place, so this
+        // row is vaguer than we would like — but demanding a *place* antecedent
+        // (a proper noun after a locative preposition) threw away every fact
+        // whose place arrives through a copula, which is most of them.
+        assert!(fact_defect("The user's brother Peter enjoyed that place in March.").is_none());
+        assert!(
+            fact_defect("The user's home town is Kisumu and his parents still live there.")
+                .is_none()
+        );
+        // With nothing named before it, the deictic is still dangling.
+        assert!(fact_defect("The user's brother enjoyed that place in March.").is_some());
+        assert!(fact_defect("The user's brother lives there.").is_some());
     }
 }

@@ -14,8 +14,8 @@ Segment-based memory with importance scoring, exponential decay, automatic extra
   └─────────────┘                                           │
         │ Vec<ExtractedFact>                                │
         ▼                                                   │
-  ┌─────────────┐    dedup against recent 20 memories       │
-  │  Extraction │                                           │
+  ┌─────────────┐    quality gate, then dedup against the   │
+  │  Extraction │    50 most recent memories                │
   │  Service    │    rate limited (configurable interval)    │
   └──────┬──────┘                                           │
          │ MemoryFragment::from_extraction()                │
@@ -86,16 +86,157 @@ After each chat response is persisted, a background task extracts durable facts:
 
 1. **Rate limit**: skips if last extraction was < `memory_extraction_interval_secs` (default 10s) ago
 2. **Minimum length**: skips if both user message and response are < 15 chars
-3. **LLM call**: compact prompt (~150 tokens) asks for JSON array of facts
-4. **Dedup**: substring match against 20 most recent memories
-5. **Storage**: each fact becomes a `MemoryFragment::from_extraction()` with segment/importance/tier
+3. **LLM call**: compact prompt asks for `{"facts":[…]}` (see `crates/pond-server/src/llm_memory_extractor.rs`)
+4. **Normalise**: collapse whitespace, drop an invented label prefix ("Active Project: …")
+5. **Quality gate**: reject content that cannot survive outside its conversation (below)
+6. **Dedup**: substring *and* token overlap against the 50 most recent memories, plus
+   the facts already stored by this same run — corrections exempt (below)
+7. **Reclassify**: a `Project` fact that is really a captured request is filed as `Context`
+8. **Storage**: each fact becomes a `MemoryFragment::from_extraction()` with segment/importance/tier
 
-The extraction prompt is designed for 3B models:
-```
-Extract durable facts from this conversation. Output JSON array only.
-Each: {"fact":"...","segment":"identity|preference|...","importance":0.0-1.0}
-Skip: greetings, small talk. Max 3 facts.
-```
+The extraction prompt is the entire per-turn prefill of a job that runs after *every* turn,
+on the same single-slot local model that is serving chat, so its length is felt as latency
+on the next user message, not just as context. It is held to ~400 tokens (1589 chars) and a
+unit test fails the build above `EXTRACTION_PROMPT_CEILING` (1800 chars) — it had reached
+2466 by accretion, roughly doubling that background prefill.
+
+`MemoryExtractionService` is the **write gate**: steps 4–7 run there, in `pond-core`, for
+every extractor adapter. `LlmMemoryExtractor` applies the same normalise/gate/dedup checks
+while parsing, but only so junk cannot consume the `memory_extraction_max_facts` budget
+ahead of good facts — the core service does not trust it.
+
+### Fact quality gate
+
+A stored memory is injected into the **assistant's** context many turns later, with none
+of the conversation that produced it. Content that only made sense inside that
+conversation does not merely waste tokens, it misleads. `fact_defect()` in
+`pond-core/src/user_data/domain/memory.rs` rejects three classes outright:
+
+| Defect | Example (real rows from a production store) | Rule |
+|--------|---------------------------------------------|------|
+| `UnresolvedReference` | "The user's mother lives in the latter city." | "the latter"/"the former" with no named referent, a non-expletive "there", a deictic like "that place", or a sentence opening on a bare pronoun |
+| `FirstPerson` | "My mom's name is Florence…" | any of "I / me / my / we / our", including contractions ("I'm", "I've", "We're") — in the assistant's context "my mother" reads as the *assistant's* mother |
+| `TooShort` | "Tea." | fewer than `MIN_FACT_CONTENT_LEN` (8) characters |
+
+The gate is deliberately hard to trip. A rejected fact is *lost*, so every rule is anchored
+to a token pattern a well-formed third-person sentence cannot produce, and each has
+explicit escapes: "The user's therapist…" is not "there", "lives in the US" is not "us",
+"Type I diabetes" is not "I", "There is a spare key…" is the expletive, "grew up in the
+former Yugoslavia" names its referent, and "moved from Nairobi to Kisumu and prefers the
+latter" resolves inside its own sentence. Defective facts are **not repaired**: conjugating
+"I like" into "The user likes" or inventing the referent of "the latter" is the judgement
+we do not have at write time, and a wrong repair outlives the conversation that could have
+corrected it. The extraction prompt carries the same rules with a worked example, so
+compliance is the common case and the gate is the backstop.
+
+Two rules here were tightened and then deliberately loosened again, because each
+refinement destroyed more real facts than the imprecision it removed:
+
+- **"mine" is not a first-person marker at all.** It is a common noun ("a coal mine") far
+  more often than a predicate pronoun ("that laptop is mine"), and no rule separated the two
+  cleanly: checking the previous token alone let one adjective discard "The user works in a
+  **coal** mine near Kakamega."; walking back past premodifiers to find a determiner then
+  admitted "a friend **of** mine works at Jarida" as third person. Both directions were
+  wrong, so the disambiguation is gone and "mine" is simply not checked. The cost is that
+  "That laptop is mine now." is stored — one imprecise row, against a rule that was
+  destroying correct ones.
+- **An antecedent only has to precede its anaphor.** The old test asked whether *any* token
+  after the first was capitalised, which a name, city, month or weekday satisfies — i.e.
+  most real facts — so the rule almost never fired. Antecedents are now counted
+  **positionally**, before the deictic, and nothing else about them is inspected. Requiring
+  a *place* antecedent for "there" and "that city" (a proper noun after a locative
+  preposition) looked more precise and destroyed every fact whose place arrives through a
+  copula: "The user's home town is Kisumu and his parents still live there." "the
+  latter"/"the former" still need `CONTRASTIVE_ANTECEDENTS` (2) because they *select between
+  two* candidates, which is what catches the original production row ("The user's mother
+  Florence lives in the latter city" names a person, not a city). The residual imprecision
+  is that a single earlier name of any kind resolves "that place" — "The user's brother
+  Peter enjoyed that place in March." is stored, vaguely.
+
+### Captured requests are not projects
+
+"Set a reminder to water the plants every evening at 6 PM" is a task the assistant already
+carried out, not an ongoing commitment — but it was landing in the `Project` segment
+(`Long` tier, decay 0.01) and staying there forever. A `Project` fact that
+`is_captured_request()` recognises is reclassified to `Context`: importance 0.3, `Short`
+tier, so it still informs the next few turns and then archives itself in about a week. It
+is reclassified rather than dropped because the short-horizon information is genuinely
+useful; only its permanence was wrong. The rule fires **only** for `Project` — an
+imperative in a `Preference` ("Use one word for goodbyes") is a real standing instruction
+and must keep its tier.
+
+A bare imperative opener is **grammar, not transience**, and keying on it alone demoted
+exactly the long-lived commitments the `Project` segment exists for: "Build a treehouse for
+the children this summer", "Write a novel about beekeeping", "Run the Nairobi marathon in
+October", "Design the new logo for Jarida". Two signals are therefore required — an
+imperative opener from `TASK_VERBS` **and** a named assistant artifact in the object
+(`ASSISTANT_ARTIFACT_NOUNS`: reminder, function, script, email, summary …, things that get
+produced and finished).
+
+The **object is the whole signal**; the verb never is. An "assistant-only verb" list was
+tried as a second single-signal arm and it demoted "Convert the garage into a workshop this
+year" and "Install the solar panels on the roof before the rains" — year-long undertakings
+that happen to open on a verb an assistant also answers to. There is no verb that means
+"this is assistant work" independent of what it acts on, so the list is gone. The cost is
+under-firing: "Translate the poem into Swahili." and "Explain how the decay formula works."
+are captured requests and are no longer demoted. That is the intended direction — the rule
+is calibrated to **under-demote**, because missing a captured request leaves a stale
+`Project` row that consolidation can retire, while demoting a real project drops it to
+`Short` tier and it decays out of the store inside a week.
+
+### Dedup without embeddings
+
+Semantic dedup (cosine ≥ `SEMANTIC_DEDUP_THRESHOLD`) is inert when
+`embedding_provider = "none"`: nothing is embedded, so nothing is compared. The
+non-semantic path in `memory_relevance.rs` therefore has to stand alone, and substring
+containment is not enough — "The user's mother's name is Florence." and "My mom's name is
+Florence…" share no substring at all. `is_duplicate_content()` layers:
+
+1. **Polarity** — opposite polarity is never a duplicate ("is happy" / "is not happy"),
+   checked first because a token measure is negation-blind.
+2. **Argument order** — a token measure is *also* order-blind, and "prefers dark mode over
+   light mode" against "prefers light mode over dark mode" reduces to the **identical**
+   token set: Jaccard 1.00, containment 1.00. `is_argument_swap()` catches the reversal by
+   splitting both texts at a shared `ORDER_SENSITIVE_MARKERS` connective (over, than, to,
+   from, instead, rather, before, after, versus …) and checking whether its arguments
+   crossed in both directions. "from" is there for the reversed journey — "moved **to**
+   Nairobi from Kisumu" against "moved **to** Kisumu from Nairobi", which splitting at "to"
+   cannot see because the crossing is entirely on one side of it. Copulas are deliberately
+   absent from that list — "Florence is the user's mother" and "The user's mother is
+   Florence" are one fact, so a general order-sensitivity test (Kendall tau, bigram
+   equality) would break them; only these connectives make word order meaning-bearing.
+3. **Substring containment**, case-insensitive — the cheap exact-restatement case.
+4. **Token overlap** — content words after possessive stripping, crude singularisation,
+   kinship aliasing (mom → mother), and a dedup-specific stopword list that also drops
+   "user" (every third-person fact has it, so it carries no signal). Duplicate requires
+   Jaccard ≥ 0.45 **and** containment ≥ 0.8 over the shorter side.
+
+Both floors are required. Jaccard alone misses a short restatement of a long fact;
+containment alone merges "prefers dark mode" with "prefers dark roast coffee". The pair is
+tuned against real duplicate and non-duplicate rows (`memory_relevance.rs` tests) —
+notably, "mother lives in Kisumu" vs "mother lives in Nairobi" clears Jaccard but fails
+containment, which is the right answer: contradictions must both be stored and left to
+consolidation. The measure is only trusted when both sides have ≥ 3 content words.
+
+Comparison window is `DEDUP_RECENT_WINDOW` (50, up from 20). These strings never reach an
+LLM prompt, so the window is sized for recall, not tokens.
+
+### Corrections are exempt from dedup
+
+A correction restates the claim it overturns, in almost the same words — which is exactly
+what both the lexical measure and the ≥ 0.92 cosine pass score as a duplicate. Dropping it
+leaves the **stale** row standing, so the store ends up asserting the thing the user just
+took the trouble to deny. That is the worst outcome the memory system can produce, and it
+is silent.
+
+So a fact whose segment is `Correction` **or** that carries a `corrects` field (the same
+disjunction as `MemoryFragment::is_correction()`, since a small model routinely sets one
+without the other) skips both dedup passes and is written. Both halves of the pair then
+sit in the store and consolidation supersedes the old row — that path is the only one that
+knows which of the two won, and it already refuses to prune a `Correction`. The exemption
+is enforced in `MemoryExtractionService` (the write gate) and mirrored in
+`LlmMemoryExtractor`'s parse-time prefilter, where the segment and `corrects` field are now
+read *before* the dedup check so the exemption can see them.
 
 ## Auto-Classification
 
