@@ -14,7 +14,7 @@
  */
 import * as readline from "readline";
 import { SpotifyProvider } from "./providers/spotify.js";
-import type { TrackInfo, TimeRange } from "./providers/types.js";
+import type { TimeRange } from "./providers/types.js";
 
 const provider = new SpotifyProvider();
 
@@ -94,20 +94,15 @@ const TOOLS = [
   {
     name: "library",
     description:
-      "The user's own Spotify library and listening history: their liked songs, what they listen to most, and what they played recently. Also saves or removes a song from their liked songs. Use for 'save this', 'do I like this song', 'what do I listen to most', 'what was I playing yesterday'.",
+      "The user's own Spotify library and listening history: their liked songs, what they listen to most, and what they played recently. Read-only — Spotify does not let this app change what is liked. Use for 'what are my liked songs', 'what do I listen to most', 'what was I playing yesterday'.",
     inputSchema: {
       type: "object",
       properties: {
         action: {
           type: "string",
-          enum: ["saved", "save", "unsave", "top_tracks", "top_artists", "recent"],
+          enum: ["saved", "top_tracks", "top_artists", "recent"],
           description:
-            "saved = list liked songs; save / unsave = add or remove a song from liked songs (defaults to whatever is playing); top_tracks / top_artists = what they listen to most; recent = recently played.",
-        },
-        query: {
-          type: "string",
-          description:
-            "Song to save or unsave, if not the one currently playing (e.g. 'Sura Yako by Sauti Sol').",
+            "saved = list liked songs; top_tracks / top_artists = what they listen to most; recent = recently played.",
         },
         time_range: {
           type: "string",
@@ -450,18 +445,6 @@ async function handlePlayPlaylist(args: Record<string, unknown>): Promise<string
   return `Now playing playlist: ${actual}`;
 }
 
-/**
- * Finds the track a save/unsave should apply to: the one named, or whatever is
- * playing. "Save this" is the overwhelmingly common phrasing, so a missing
- * query means the current track rather than an error.
- */
-async function trackToActOn(query: string | undefined): Promise<TrackInfo | null> {
-  if (query) {
-    const hits = await provider.searchTracks(query, 1);
-    return hits[0] ?? null;
-  }
-  return provider.getNowPlaying();
-}
 
 async function handleLibrary(args: Record<string, unknown>): Promise<string> {
   const action = args.action as string;
@@ -479,22 +462,6 @@ async function handleLibrary(args: Record<string, unknown>): Promise<string> {
       );
     }
 
-    case "save":
-    case "unsave": {
-      const track = await trackToActOn(query);
-      if (!track) {
-        return query
-          ? `No results found for "${query}".`
-          : "Nothing is playing, so there is no song to save. Name one instead.";
-      }
-      const label = `${track.name} by ${track.artist}`;
-      if (action === "save") {
-        await provider.saveTrack(track.id);
-        return `Saved ${label} to liked songs.`;
-      }
-      await provider.removeSavedTrack(track.id);
-      return `Removed ${label} from liked songs.`;
-    }
 
     case "top_tracks": {
       const tracks = await provider.getTopTracks(range, limit);

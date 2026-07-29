@@ -26,8 +26,10 @@ pub fn builtin_oauth_providers() -> Vec<OAuthProviderConfig> {
             // "Insufficient client scope" until the user signs in again, which
             // the music extension detects and says so rather than reporting a
             // bare 403.
+            // Read only: PUT/DELETE /me/tracks answer 403 Forbidden for this app
+            // even when user-library-modify is granted, so asking for it would
+            // widen the consent screen for a capability GIAP cannot use.
             "user-library-read".to_string(),
-            "user-library-modify".to_string(),
             "user-top-read".to_string(),
             "user-read-recently-played".to_string(),
         ],
