@@ -10,6 +10,16 @@ export interface TrackInfo {
   volume_percent?: number;
 }
 
+/** An artist, as returned by the taste endpoints. */
+export interface ArtistInfo {
+  id: string;
+  name: string;
+  genres: string[];
+}
+
+/** How far back the taste endpoints look. */
+export type TimeRange = "short_term" | "medium_term" | "long_term";
+
 /** Spotify's repeat modes: off, repeat one track, repeat the whole context. */
 export type RepeatState = "off" | "track" | "context";
 
@@ -47,6 +57,13 @@ export interface MusicProvider {
   setRepeat(state: RepeatState): Promise<string>;
   getDevices(): Promise<DeviceInfo[]>;
   transferPlayback(deviceId: string, deviceName: string): Promise<string>;
+  getSavedTracks(limit?: number): Promise<TrackInfo[]>;
+  saveTrack(trackId: string): Promise<string>;
+  removeSavedTrack(trackId: string): Promise<string>;
+  isSaved(trackId: string): Promise<boolean>;
+  getTopTracks(range: TimeRange, limit?: number): Promise<TrackInfo[]>;
+  getTopArtists(range: TimeRange, limit?: number): Promise<ArtistInfo[]>;
+  getRecentlyPlayed(limit?: number): Promise<TrackInfo[]>;
   getNowPlaying(): Promise<TrackInfo | null>;
   getQueue(): Promise<TrackInfo[]>;
   /** Appends to the queue without disturbing what is currently playing. */
