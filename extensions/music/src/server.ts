@@ -63,6 +63,22 @@ const TOOLS = [
     },
   },
   {
+    name: "play_playlist",
+    description:
+      "Play one of the playlists in the user's Spotify library, by name. Use this for ANY request to play a playlist — 'play my Randoms playlist', 'play the EDM playlist', 'play randoms' when Randoms is one of their playlists. Do NOT use the 'play' tool for a playlist: it searches the words as a song title and starts an unrelated track instead. Matches loosely, so a rough or misspelled name is fine, and prefers a playlist the user created over one they follow.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description:
+            "The playlist name as the user said it (e.g. 'Randoms', 'sauti sol kenyan gold', 'EDM').",
+        },
+      },
+      required: ["name"],
+    },
+  },
+  {
     name: "playlists",
     description:
       "List every playlist in the user's Spotify library, separated into ones they created and ones they follow from other people. Use this to answer 'what playlists do I have' or 'which of these are mine', and to find the exact name before playing one with the 'play' tool.",
@@ -121,7 +137,14 @@ async function handlePlay(args: Record<string, unknown>): Promise<string> {
   // Playlist: match one of the user's own by name and play it. provider.play
   // sends a non-track URI as context_uri, so playback runs through the whole
   // playlist rather than stopping after one song.
-  if (query && (args.type as string | undefined) === "playlist") {
+  //
+  // The word "playlist" in the query counts even when `type` was left unset.
+  // Telling the model to set it did not work: asked to "play randoms playlist
+  // in my library" it still searched those words as a song title, played an
+  // unrelated track, and reported that it had started the playlist. A request
+  // that says "playlist" is not ambiguous enough to justify guessing wrong.
+  const saysPlaylist = !!query && /\bplaylists?\b/i.test(query);
+  if (query && ((args.type as string | undefined) === "playlist" || saysPlaylist)) {
     const { uri: playlistUri, name } = await resolvePlaylist(query);
     await provider.play(playlistUri);
     return `Now playing playlist: ${name}`;
@@ -157,7 +180,10 @@ async function handlePlay(args: Record<string, unknown>): Promise<string> {
     await provider.play(top.uri);
 
     const others = tracks.slice(1, 4);
-    let text = `Now playing: ${top.name} by ${top.artist} (${top.album})`;
+    // Say "track" outright. When the user asked for a playlist and this branch
+    // ran anyway, a bare "Now playing: X" was reported back as "I started your
+    // playlist"; naming what actually started makes the mismatch visible.
+    let text = `Now playing track: ${top.name} by ${top.artist} (${top.album})`;
     if (others.length > 0) {
       text +=
         "\n\nOther matches:\n" +
@@ -281,6 +307,15 @@ async function resolvePlaylist(name: string): Promise<{ uri: string; name: strin
     .map(r => r.p.name)
     .join(", ");
   throw new Error(`No playlist matching "${name}". Closest: ${suggestions || "(none)"}`);
+}
+
+async function handlePlayPlaylist(args: Record<string, unknown>): Promise<string> {
+  const name = (args.name ?? args.query) as string | undefined;
+  if (!name) return "Which playlist? Give me its name.";
+
+  const { uri, name: actual } = await resolvePlaylist(name);
+  await provider.play(uri);
+  return `Now playing playlist: ${actual}`;
 }
 
 async function handlePlaylists(): Promise<string> {
@@ -428,6 +463,10 @@ async function handleRequest(
           case "queue":
             debug("queue →", args.query || args.uri || "(nothing)");
             text = await handleQueue(args);
+            break;
+          case "play_playlist":
+            debug("play_playlist →", args.name ?? args.query ?? "");
+            text = await handlePlayPlaylist(args);
             break;
           case "playlists":
             debug("playlists → listing");
