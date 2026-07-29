@@ -214,6 +214,24 @@ function normalizeName(s: string): string {
 }
 
 /**
+ * Words people wrap around a playlist's actual name — "play the EDM playlist
+ * from my library". Scored as content they drag the match around: they dilute
+ * the real words, and "playlist" alone matched half of "Scratch Adventure - S*x
+ * Playlist". Stripped from the query only; a playlist really called "... Playlist"
+ * still matches on its remaining words.
+ */
+const QUERY_FILLER = new Set([
+  "the", "a", "an", "my", "our", "from", "in", "on", "of", "please", "playlist",
+  "playlists", "list", "library", "spotify", "called", "named", "one",
+]);
+
+/** Drops filler, keeping the original if that would leave nothing to match on. */
+function contentWords(normalized: string): string {
+  const kept = normalized.split(" ").filter(w => w && !QUERY_FILLER.has(w));
+  return kept.length > 0 ? kept.join(" ") : normalized;
+}
+
+/**
  * Scores how well a spoken name matches a playlist's real one, 0 (no) to 1.
  *
  * Real playlist names are messy — "Sauti sol/Kenyan gold" with an emoji on the
@@ -223,7 +241,7 @@ function normalizeName(s: string): string {
  * of them.
  */
 function playlistMatchScore(query: string, playlistName: string): number {
-  const q = normalizeName(query);
+  const q = contentWords(normalizeName(query));
   const n = normalizeName(playlistName);
   if (!q || !n) return 0;
   if (q === n) return 1;
@@ -248,7 +266,10 @@ async function resolvePlaylist(name: string): Promise<{ uri: string; name: strin
 
   const ranked = playlists
     .map(p => ({ p, score: playlistMatchScore(name, p.name) }))
-    .sort((a, b) => b.score - a.score);
+    // On a tie, prefer a playlist the user made. Libraries contain both a
+    // followed "EDM" and their own "EDM", which score identically, and picking
+    // the stranger's copy is the wrong guess every time.
+    .sort((a, b) => b.score - a.score || Number(b.p.is_own) - Number(a.p.is_own));
 
   // Half the words matching is enough to be confident; below that the request
   // is better refused than answered with an arbitrary playlist.
