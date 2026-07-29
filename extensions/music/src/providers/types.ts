@@ -58,9 +58,6 @@ export interface MusicProvider {
   getDevices(): Promise<DeviceInfo[]>;
   transferPlayback(deviceId: string, deviceName: string): Promise<string>;
   getSavedTracks(limit?: number): Promise<TrackInfo[]>;
-  saveTrack(trackId: string): Promise<string>;
-  removeSavedTrack(trackId: string): Promise<string>;
-  isSaved(trackId: string): Promise<boolean>;
   getTopTracks(range: TimeRange, limit?: number): Promise<TrackInfo[]>;
   getTopArtists(range: TimeRange, limit?: number): Promise<ArtistInfo[]>;
   getRecentlyPlayed(limit?: number): Promise<TrackInfo[]>;

@@ -42,6 +42,9 @@ interface SpotifyPlaylist {
  *   GET /artists/{id}/top-tracks             403
  *   GET /browse/featured-playlists           403
  *   GET /browse/new-releases                 403
+ *   GET /me/tracks/contains                  403
+ *   PUT / DELETE /me/tracks                  403  (library writes, even
+ *                                                 with user-library-modify)
  *   track.preview_url                        always null
  *
  * So there is no "play me something like this", no mood or tempo matching, and
@@ -315,23 +318,8 @@ export class SpotifyProvider implements MusicProvider {
       .map(t => this.parseTrack(t));
   }
 
-  async saveTrack(trackId: string): Promise<string> {
-    await this.command('PUT', `/me/tracks?ids=${encodeURIComponent(trackId)}`);
-    return 'Saved to your library';
-  }
 
-  async removeSavedTrack(trackId: string): Promise<string> {
-    await this.command('DELETE', `/me/tracks?ids=${encodeURIComponent(trackId)}`);
-    return 'Removed from your library';
-  }
 
-  async isSaved(trackId: string): Promise<boolean> {
-    const data = await this.api<boolean[]>(
-      'GET',
-      `/me/tracks/contains?ids=${encodeURIComponent(trackId)}`
-    );
-    return Array.isArray(data) && data[0] === true;
-  }
 
   async getTopTracks(range: TimeRange, limit: number = 20): Promise<TrackInfo[]> {
     const clamped = Math.max(1, Math.min(50, limit));
