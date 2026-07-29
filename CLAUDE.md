@@ -90,8 +90,23 @@ npm run dev            # Vite + auto-starts pond-server (concurrently)
 npm run build          # Vite build -> pond-desktop/dist (embedded into the server binary)
 npm test               # Vitest unit tests
 npx playwright test    # E2E — self-mocked (page.route()); spins up its own Vite, no server needed
+
+bash ../scripts/stage-server-sidecar.sh   # REQUIRED before the line below
 npm run tauri build    # native desktop app bundle
 ```
+- **`tauri build` needs the server sidecar staged first.** `tauri.conf.json`
+  declares `externalBin: ["binaries/pond-server"]`, which the bundler resolves to
+  `src-tauri/binaries/pond-server-<target-triple>`; without it the build fails
+  late with ``resource path `binaries/pond-server-…` doesn't exist``.
+  `scripts/stage-server-sidecar.sh` builds the UI, builds pond-server in release
+  with `RUSTFLAGS` **emptied** (`.cargo/config.toml` sets `-C target-cpu=native`,
+  which would SIGILL on another CPU), and copies it to the triple-suffixed path.
+- **Both sides of Tauri must share a major/minor.** `tauri` (Rust) and
+  `@tauri-apps/api`/`cli` (npm) are each declared `^2`, so the two lockfiles can
+  drift apart and `tauri build` then refuses to start with "Found version
+  mismatched Tauri packages". Fix by moving the npm side within its existing
+  range — `npm update @tauri-apps/api @tauri-apps/cli` — and confirm with
+  `npx tauri info`.
 - E2E mocks use origin-agnostic `**/api/**` globs and pin the API base via `window.__GIAP_SERVER_URL__` in `tests/e2e/helpers/api-mocks.ts` (`mockAllApiRoutes`). `page.route` is **last-registered-wins** — register catch-alls before specific routes.
 - In a plain browser the app defaults its API base to `window.location.origin` (so the single-executable dashboard works same-origin over the LAN); the Tauri shell injects `window.__GIAP_SERVER_URL__` for a local server. See `defaultServerUrl()` in `PondApiClient.ts`.
 
