@@ -173,6 +173,15 @@ impl SettingsRepository for SqliteSettingsRepository {
             settings.vision_motion_threshold.to_string()
         );
         upsert!("vision_classifier_model", &settings.vision_classifier_model);
+        // Private mesh (#132)
+        upsert!(
+            "mesh_enabled",
+            if settings.mesh_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
         // Privacy / sensor access
         upsert!(
             "mic_enabled",
@@ -698,6 +707,8 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
             }
         }
         "vision_classifier_model" => s.vision_classifier_model = value.to_string(),
+        // Private mesh (#132)
+        "mesh_enabled" => s.mesh_enabled = value == "true",
         // Privacy / sensor access
         "mic_enabled" => s.mic_enabled = value == "true",
         "cameras_enabled" => s.cameras_enabled = value == "true",
@@ -933,5 +944,20 @@ mod tests {
         assert_eq!(got.retention_sensitive_days, 3);
         assert_eq!(got.retention_events_by_category.get("network"), Some(&14));
         assert_eq!(got.retention_events_by_category.get("sensor"), Some(&5));
+    }
+
+    #[tokio::test]
+    async fn mesh_enabled_roundtrips() {
+        let repo = fresh_repo().await;
+
+        let s0 = repo.get().await.unwrap();
+        assert!(!s0.mesh_enabled, "off by default");
+
+        let mut s = s0;
+        s.mesh_enabled = true;
+        repo.update(&s).await.unwrap();
+
+        let got = repo.get().await.unwrap();
+        assert!(got.mesh_enabled);
     }
 }
