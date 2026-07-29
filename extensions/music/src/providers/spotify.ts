@@ -1,4 +1,4 @@
-import type { MusicProvider, TrackInfo, PlaylistInfo, AlbumInfo } from './types.js';
+import type { MusicProvider, TrackInfo, PlaylistInfo, AlbumInfo, DeviceInfo, RepeatState } from './types.js';
 
 interface SpotifyTrack {
   id: string;
@@ -232,6 +232,57 @@ export class SpotifyProvider implements MusicProvider {
   async setShuffle(enabled: boolean): Promise<string> {
     await this.command('PUT', `/me/player/shuffle?state=${enabled}`);
     return `Shuffle ${enabled ? 'enabled' : 'disabled'}`;
+  }
+
+  async seek(positionMs: number): Promise<string> {
+    const clamped = Math.max(0, Math.round(positionMs));
+    await this.command('PUT', `/me/player/seek?position_ms=${clamped}`);
+    const mins = Math.floor(clamped / 60000);
+    const secs = String(Math.floor((clamped % 60000) / 1000)).padStart(2, '0');
+    return `Jumped to ${mins}:${secs}`;
+  }
+
+  async setRepeat(state: RepeatState): Promise<string> {
+    await this.command('PUT', `/me/player/repeat?state=${state}`);
+    const label =
+      state === 'off'
+        ? 'Repeat off'
+        : state === 'track'
+          ? 'Repeating this track'
+          : 'Repeating the album or playlist';
+    return label;
+  }
+
+  async getDevices(): Promise<DeviceInfo[]> {
+    interface DevicesResponse {
+      devices: Array<{
+        id: string | null;
+        name: string;
+        type: string;
+        is_active: boolean;
+        volume_percent?: number;
+      }>;
+    }
+
+    const data = await this.api<DevicesResponse>('GET', '/me/player/devices');
+    return (data.devices || [])
+      // A device with no id cannot be targeted for transfer, so it is not worth
+      // offering as somewhere to send playback.
+      .filter(d => d.id)
+      .map(d => ({
+        id: d.id as string,
+        name: d.name,
+        type: d.type,
+        is_active: d.is_active,
+        volume_percent: d.volume_percent,
+      }));
+  }
+
+  async transferPlayback(deviceId: string, deviceName: string): Promise<string> {
+    // `play: true` keeps it playing across the move; without it Spotify can
+    // hand the device the track in a paused state, which reads as a failure.
+    await this.command('PUT', '/me/player', { device_ids: [deviceId], play: true });
+    return `Playback moved to ${deviceName}`;
   }
 
   async getNowPlaying(): Promise<TrackInfo | null> {
