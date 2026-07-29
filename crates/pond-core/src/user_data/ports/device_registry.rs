@@ -30,6 +30,16 @@ pub struct Device {
     pub room: Option<String>,
 }
 
+/// Editable fields from the Devices "Configure" UI (name, hostname, room).
+/// Unlike `rename` (name-only, used by Matter commissioning), this covers
+/// everything the manual-registration form itself collects.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateDeviceRequest {
+    pub name: String,
+    pub hostname: Option<String>,
+    pub room: Option<String>,
+}
+
 /// Request to register a new device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterDeviceRequest {
@@ -71,5 +81,21 @@ pub trait DeviceRegistry: Send + Sync {
     /// no body; real registries override it.
     async fn rename(&self, device_id: &str, _name: &str) -> Result<()> {
         anyhow::bail!("this registry does not support renaming device '{device_id}'")
+    }
+
+    /// Force a device to read as offline until its next heartbeat/turn-on.
+    /// Devices without a real liveness signal (host, sensor, manually
+    /// registered types, …) have no other way to go offline — `is_online` is
+    /// otherwise derived purely from `last_seen` recency. Default errors so
+    /// the many test doubles need no body; real registries override it.
+    async fn set_offline(&self, device_id: &str) -> Result<()> {
+        anyhow::bail!("this registry does not support setting device '{device_id}' offline")
+    }
+
+    /// Update editable fields (name, hostname, room) and return the updated
+    /// device. Default errors so the many test doubles need no body; real
+    /// registries override it.
+    async fn update(&self, device_id: &str, _request: UpdateDeviceRequest) -> Result<Device> {
+        anyhow::bail!("this registry does not support updating device '{device_id}'")
     }
 }
