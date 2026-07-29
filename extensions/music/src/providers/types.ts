@@ -10,6 +10,19 @@ export interface TrackInfo {
   volume_percent?: number;
 }
 
+/** Spotify's repeat modes: off, repeat one track, repeat the whole context. */
+export type RepeatState = "off" | "track" | "context";
+
+/** A device Spotify can play on — phone, computer, speaker. */
+export interface DeviceInfo {
+  id: string;
+  name: string;
+  /** Spotify's own label: "Computer", "Smartphone", "Speaker", "TV"... */
+  type: string;
+  is_active: boolean;
+  volume_percent?: number;
+}
+
 export interface PlaylistInfo {
   id: string;
   name: string;
@@ -30,6 +43,10 @@ export interface MusicProvider {
   previous(): Promise<string>;
   setVolume(percent: number): Promise<string>;
   setShuffle(enabled: boolean): Promise<string>;
+  seek(positionMs: number): Promise<string>;
+  setRepeat(state: RepeatState): Promise<string>;
+  getDevices(): Promise<DeviceInfo[]>;
+  transferPlayback(deviceId: string, deviceName: string): Promise<string>;
   getNowPlaying(): Promise<TrackInfo | null>;
   getQueue(): Promise<TrackInfo[]>;
   /** Appends to the queue without disturbing what is currently playing. */
