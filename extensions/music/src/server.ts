@@ -14,6 +14,7 @@
  */
 import * as readline from "readline";
 import { SpotifyProvider } from "./providers/spotify.js";
+import type { TrackInfo, TimeRange } from "./providers/types.js";
 
 const provider = new SpotifyProvider();
 
@@ -89,6 +90,38 @@ const TOOLS = [
     description:
       "List every playlist in the user's Spotify library, separated into ones they created and ones they follow from other people. Use this to answer 'what playlists do I have' or 'which of these are mine', and to find the exact name before playing one with the 'play' tool.",
     inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "library",
+    description:
+      "The user's own Spotify library and listening history: their liked songs, what they listen to most, and what they played recently. Also saves or removes a song from their liked songs. Use for 'save this', 'do I like this song', 'what do I listen to most', 'what was I playing yesterday'.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["saved", "save", "unsave", "top_tracks", "top_artists", "recent"],
+          description:
+            "saved = list liked songs; save / unsave = add or remove a song from liked songs (defaults to whatever is playing); top_tracks / top_artists = what they listen to most; recent = recently played.",
+        },
+        query: {
+          type: "string",
+          description:
+            "Song to save or unsave, if not the one currently playing (e.g. 'Sura Yako by Sauti Sol').",
+        },
+        time_range: {
+          type: "string",
+          enum: ["short_term", "medium_term", "long_term"],
+          description:
+            "How far back top_tracks / top_artists look: short_term is about 4 weeks, medium_term about 6 months, long_term is several years. Defaults to medium_term.",
+        },
+        limit: {
+          type: "number",
+          description: "How many to return, 1-50. Defaults to 20.",
+        },
+      },
+      required: ["action"],
+    },
   },
   {
     name: "devices",
@@ -417,6 +450,94 @@ async function handlePlayPlaylist(args: Record<string, unknown>): Promise<string
   return `Now playing playlist: ${actual}`;
 }
 
+/**
+ * Finds the track a save/unsave should apply to: the one named, or whatever is
+ * playing. "Save this" is the overwhelmingly common phrasing, so a missing
+ * query means the current track rather than an error.
+ */
+async function trackToActOn(query: string | undefined): Promise<TrackInfo | null> {
+  if (query) {
+    const hits = await provider.searchTracks(query, 1);
+    return hits[0] ?? null;
+  }
+  return provider.getNowPlaying();
+}
+
+async function handleLibrary(args: Record<string, unknown>): Promise<string> {
+  const action = args.action as string;
+  const range = (args.time_range as TimeRange) || "medium_term";
+  const limit = typeof args.limit === "number" ? args.limit : 20;
+  const query = args.query as string | undefined;
+
+  switch (action) {
+    case "saved": {
+      const tracks = await provider.getSavedTracks(limit);
+      if (tracks.length === 0) return "No liked songs in this Spotify account.";
+      return (
+        `${tracks.length} liked song(s):\n` +
+        tracks.map((t, i) => `${i + 1}. ${t.name} by ${t.artist}`).join("\n")
+      );
+    }
+
+    case "save":
+    case "unsave": {
+      const track = await trackToActOn(query);
+      if (!track) {
+        return query
+          ? `No results found for "${query}".`
+          : "Nothing is playing, so there is no song to save. Name one instead.";
+      }
+      const label = `${track.name} by ${track.artist}`;
+      if (action === "save") {
+        await provider.saveTrack(track.id);
+        return `Saved ${label} to liked songs.`;
+      }
+      await provider.removeSavedTrack(track.id);
+      return `Removed ${label} from liked songs.`;
+    }
+
+    case "top_tracks": {
+      const tracks = await provider.getTopTracks(range, limit);
+      if (tracks.length === 0) return "Spotify has no top tracks for this period yet.";
+      return (
+        `Top ${tracks.length} track(s) (${describeRange(range)}):\n` +
+        tracks.map((t, i) => `${i + 1}. ${t.name} by ${t.artist}`).join("\n")
+      );
+    }
+
+    case "top_artists": {
+      const artists = await provider.getTopArtists(range, limit);
+      if (artists.length === 0) return "Spotify has no top artists for this period yet.";
+      return (
+        `Top ${artists.length} artist(s) (${describeRange(range)}):\n` +
+        artists
+          .map((a, i) => `${i + 1}. ${a.name}${a.genres.length ? ` - ${a.genres.slice(0, 3).join(", ")}` : ""}`)
+          .join("\n")
+      );
+    }
+
+    case "recent": {
+      const tracks = await provider.getRecentlyPlayed(limit);
+      if (tracks.length === 0) return "No recent listening history.";
+      return (
+        `${tracks.length} recently played:\n` +
+        tracks.map((t, i) => `${i + 1}. ${t.name} by ${t.artist}`).join("\n")
+      );
+    }
+
+    default:
+      return `Unknown action: ${action}`;
+  }
+}
+
+function describeRange(range: TimeRange): string {
+  return range === "short_term"
+    ? "last 4 weeks"
+    : range === "long_term"
+      ? "several years"
+      : "last 6 months";
+}
+
 async function handleDevices(args: Record<string, unknown>): Promise<string> {
   const devices = await provider.getDevices();
   if (devices.length === 0) {
@@ -626,6 +747,10 @@ async function handleRequest(
           case "play_playlist":
             debug("play_playlist →", args.name ?? args.query ?? "");
             text = await handlePlayPlaylist(args);
+            break;
+          case "library":
+            debug("library →", args.action, args.query ?? "");
+            text = await handleLibrary(args);
             break;
           case "devices":
             debug("devices →", args.transfer_to ?? "(list)");

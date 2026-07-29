@@ -21,6 +21,15 @@ pub fn builtin_oauth_providers() -> Vec<OAuthProviderConfig> {
             "playlist-read-private".to_string(),
             "playlist-modify-public".to_string(),
             "playlist-modify-private".to_string(),
+            // Library and listening history. Adding a scope does not upgrade
+            // tokens already issued: existing installs keep getting
+            // "Insufficient client scope" until the user signs in again, which
+            // the music extension detects and says so rather than reporting a
+            // bare 403.
+            "user-library-read".to_string(),
+            "user-library-modify".to_string(),
+            "user-top-read".to_string(),
+            "user-read-recently-played".to_string(),
         ],
         bundled_client_id: "9aa8d81a57624c87b392bf242c872224".to_string(),
         token_key: "SPOTIFY_ACCESS_TOKEN".to_string(),
