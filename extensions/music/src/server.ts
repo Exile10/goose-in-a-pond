@@ -72,10 +72,14 @@ const TOOLS = [
         name: {
           type: "string",
           description:
-            "The playlist name as the user said it (e.g. 'Randoms', 'sauti sol kenyan gold', 'EDM').",
+            "The playlist name as the user said it (e.g. 'Randoms', 'sauti sol kenyan gold', 'EDM'). Include 'by <person>' if they named an owner.",
+        },
+        uri: {
+          type: "string",
+          description:
+            "A Spotify playlist link or URI. Use this when the user pastes one — it plays even if the playlist is not in their library, which is the only way to reach someone else's playlist.",
         },
       },
-      required: ["name"],
     },
   },
   {
@@ -272,33 +276,80 @@ function playlistMatchScore(query: string, playlistName: string): number {
   if (!q || !n) return 0;
   if (q === n) return 1;
 
-  const qSquashed = q.replace(/ /g, "");
-  const nSquashed = n.replace(/ /g, "");
-  if (qSquashed === nSquashed) return 0.95;
-  if (nSquashed.includes(qSquashed) || qSquashed.includes(nSquashed)) return 0.9;
+  const qs = q.replace(/ /g, "");
+  const ns = n.replace(/ /g, "");
+  if (qs === ns) return 0.95;
+
+  // Naming a playlist by its opening words is the common case: people say
+  // "R&B Classics" for "R&B Classics 90s & 2000s - Best Old School...". A flat
+  // score for any containment let a short unrelated name ("Classics") tie with
+  // that, and the tie-break then handed it to the wrong playlist — so weight by
+  // how much of the longer string the match actually covers.
+  if (ns.startsWith(qs)) return 0.92;
+  if (ns.includes(qs)) return 0.75 + 0.15 * (qs.length / ns.length);
+  if (qs.includes(ns)) return 0.7 + 0.15 * (ns.length / qs.length);
 
   const qWords = q.split(" ");
   const nSet = new Set(n.split(" "));
   const overlap = qWords.filter(w => nSet.has(w)).length;
-  return overlap / qWords.length;
+  // Kept below the containment band so a partial word match never outranks one.
+  return Math.min(0.65, overlap / qWords.length);
+}
+
+/**
+ * Splits "RnB playlist by Arlene" into the name and the owner asked for.
+ *
+ * Only treats a trailing "by X" as an owner when X actually owns something in
+ * the library — playlist names contain "by" too, and misreading one as an owner
+ * would lose the real name.
+ */
+function splitOwnerHint(
+  query: string,
+  playlists: { owner: string }[]
+): { name: string; owner: string | null } {
+  const m = query.match(/^(.*?)\s+by\s+([^,]+)$/i);
+  if (!m) return { name: query, owner: null };
+
+  const candidate = normalizeName(m[2]);
+  const known = playlists.some(p => {
+    const o = normalizeName(p.owner);
+    return o === candidate || o.includes(candidate) || candidate.includes(o);
+  });
+
+  return known && m[1].trim()
+    ? { name: m[1].trim(), owner: m[2].trim() }
+    : { name: query, owner: null };
 }
 
 /**
  * Finds a playlist in the user's library by name. The model will have a name,
  * not an id, so requiring an id would make this unusable in practice.
  */
-async function resolvePlaylist(name: string): Promise<{ uri: string; name: string }> {
+async function resolvePlaylist(query: string): Promise<{ uri: string; name: string }> {
   const playlists = await provider.getPlaylists();
+  const { name, owner } = splitOwnerHint(query, playlists);
 
-  const ranked = playlists
+  // "by <person>" narrows to that person's playlists. Ignoring it silently
+  // played the user's own lookalike instead of the one they named.
+  let pool = playlists;
+  if (owner) {
+    const wanted = normalizeName(owner);
+    pool = playlists.filter(p => {
+      const o = normalizeName(p.owner);
+      return o === wanted || o.includes(wanted) || wanted.includes(o);
+    });
+    if (pool.length === 0) {
+      throw new Error(`Nobody called "${owner}" owns a playlist in this library.`);
+    }
+  }
+
+  const ranked = pool
     .map(p => ({ p, score: playlistMatchScore(name, p.name) }))
-    // On a tie, prefer a playlist the user made. Libraries contain both a
-    // followed "EDM" and their own "EDM", which score identically, and picking
-    // the stranger's copy is the wrong guess every time.
+    // On a genuine tie, prefer a playlist the user made — libraries hold both a
+    // followed "EDM" and their own, and the stranger's copy is the wrong guess.
+    // Only a tie: a better-matching playlist wins regardless of who owns it.
     .sort((a, b) => b.score - a.score || Number(b.p.is_own) - Number(a.p.is_own));
 
-  // Half the words matching is enough to be confident; below that the request
-  // is better refused than answered with an arbitrary playlist.
   const best = ranked[0];
   if (best && best.score >= 0.5) return { uri: best.p.uri, name: best.p.name };
 
@@ -306,12 +357,33 @@ async function resolvePlaylist(name: string): Promise<{ uri: string; name: strin
     .slice(0, 8)
     .map(r => r.p.name)
     .join(", ");
-  throw new Error(`No playlist matching "${name}". Closest: ${suggestions || "(none)"}`);
+  const scope = owner ? ` from ${owner}` : "";
+  // Spotify only lets us see playlists the user owns or follows: browsing
+  // someone else's is 403 for this app. So a playlist they have merely opened
+  // in Spotify is invisible here, and the way out is worth stating rather than
+  // leaving them to conclude the name matching is broken.
+  throw new Error(
+    `No playlist matching "${name}"${scope} in this library. ` +
+      `Closest${scope}: ${suggestions || "(none)"}. ` +
+      `Only playlists the user created or follows are visible — if it belongs to someone else, ` +
+      `they can follow it in Spotify, or paste its link to play it directly.`
+  );
 }
 
 async function handlePlayPlaylist(args: Record<string, unknown>): Promise<string> {
+  // A link or URI plays even when the playlist is not in the library, which is
+  // the only way to reach someone else's playlist — Spotify refuses to list
+  // another user's playlists for this app.
+  const given = (args.uri ?? args.url) as string | undefined;
+  if (given) {
+    const id = given.match(/playlist[/:]([A-Za-z0-9]+)/)?.[1];
+    if (!id) return `That does not look like a Spotify playlist link: ${given}`;
+    await provider.play(`spotify:playlist:${id}`);
+    return `Now playing playlist from the link provided.`;
+  }
+
   const name = (args.name ?? args.query) as string | undefined;
-  if (!name) return "Which playlist? Give me its name.";
+  if (!name) return "Which playlist? Give me its name, or a Spotify playlist link.";
 
   const { uri, name: actual } = await resolvePlaylist(name);
   await provider.play(uri);
