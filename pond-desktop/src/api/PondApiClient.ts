@@ -312,7 +312,7 @@ export class PondApiClient {
 
   listMeshPeers(): Promise<MeshPeer[]> {
     return this.get<{ peers: MeshPeer[] }>("/api/v1/mesh/peers").then(
-      (r) => r.peers ?? [],
+      (r) => r?.peers ?? [],
     );
   }
 
