@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Play, RefreshCw, Loader2, RotateCcw } from "lucide-react";
 import { DetailShell } from "./DetailShell";
-import { Card, Row, Toggle, Slider } from "./controls";
+import { Card, Row, Toggle } from "./controls";
 import { api } from "../../../api/PondApiClient";
 import type { Settings } from "../../../api/types";
 
@@ -43,12 +43,6 @@ const MOCK_VOICE_SETTINGS: Partial<Settings> = {
   voice_tts_voice: "en_US-lessac-medium.onnx",
 };
 
-// Speaking rate is a Hub-layer UI concern (not yet in Settings type).
-// The field `tts_speed` will be wired when the backend exposes it.
-// TODO Phase 8 wave 4: add tts_speed to Settings type + api.updateSettings({ tts_speed })
-type TtsSpeed = number;
-const DEFAULT_TTS_SPEED: TtsSpeed = 100;
-
 interface VoiceDetailProps {
   go: (route: string) => void;
 }
@@ -60,14 +54,9 @@ export function VoiceDetail({ go }: VoiceDetailProps) {
   const [error, setError]             = useState<string | null>(null);
   const [flash, setFlash]             = useState<{ text: string; ok: boolean } | null>(null);
 
-  // Local-only speaking rate (not yet in Settings type)
-  const [ttsSpeed, setTtsSpeed]       = useState<TtsSpeed>(DEFAULT_TTS_SPEED);
-
   // Reset calibration state
   const [resetting, setResetting]     = useState(false);
 
-  // Debounce timer for slider
-  const sliderTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flashTimer  = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Flash helper ───────────────────────────────────────────
@@ -84,7 +73,6 @@ export function VoiceDetail({ go }: VoiceDetailProps) {
     try {
       const s = await api.getSettings();
       setSettings(s);
-      // TODO Phase 8 wave 4: read s.tts_speed here once backend exposes it
     } catch (e) {
       console.warn("[VoiceDetail] API offline — using mock fallback:", e);
       setError("Could not reach the server. Showing offline view.");
@@ -96,26 +84,25 @@ export function VoiceDetail({ go }: VoiceDetailProps) {
   useEffect(() => {
     loadSettings();
     return () => {
-      if (sliderTimer.current) clearTimeout(sliderTimer.current);
       if (flashTimer.current) clearTimeout(flashTimer.current);
     };
   }, [loadSettings]);
 
   // ── Hands-free toggle ──────────────────────────────────────
-  // voice_hands_free is not yet in Settings type — wired as a local state with
-  // TODO comment; backend field will be `voice_hands_free` when added.
-  // TODO Phase 8 wave 4: add voice_hands_free to Settings type + wire updateSettings
   const [handsFreePending, setHandsFreePending] = useState(false);
-  const handsFree = false; // placeholder — replace with settings.voice_hands_free ?? false
+  const handsFree = settings.voice_hands_free ?? false;
 
   async function handleHandsFreeChange(on: boolean) {
     if (handsFreePending) return;
     setHandsFreePending(true);
+    const previous = settings.voice_hands_free;
+    setSettings((prev) => ({ ...prev, voice_hands_free: on }));
     try {
-      // TODO Phase 8 wave 4: await api.updateSettings({ voice_hands_free: on });
-      // For now we log and show a flash so the UX is not completely silent.
-      console.info("[VoiceDetail] hands-free toggled:", on, "(not persisted — field pending in backend)");
-      showFlash(on ? "Hands-free enabled (coming in wave 4)" : "Hands-free disabled (coming in wave 4)", true);
+      await api.updateSettings({ voice_hands_free: on });
+      showFlash(on ? "Hands-free enabled." : "Hands-free disabled.");
+    } catch (e) {
+      setSettings((prev) => ({ ...prev, voice_hands_free: previous }));
+      showFlash(`Failed to update hands-free: ${String(e)}`, false);
     } finally {
       setHandsFreePending(false);
     }
@@ -146,20 +133,6 @@ export function VoiceDetail({ go }: VoiceDetailProps) {
     }
   }
 
-  // ── Speaking rate slider (debounced) ───────────────────────
-  function handleSpeedChange(v: number) {
-    setTtsSpeed(v);
-    if (sliderTimer.current) clearTimeout(sliderTimer.current);
-    sliderTimer.current = setTimeout(async () => {
-      try {
-        // TODO Phase 8 wave 4: await api.updateSettings({ tts_speed: v });
-        console.info("[VoiceDetail] tts_speed:", v, "(not persisted — field pending in backend)");
-      } catch (e) {
-        showFlash(`Failed to update speaking rate: ${String(e)}`, false);
-      }
-    }, 400);
-  }
-
   // ── Reset wake-word calibration ────────────────────────────
   async function handleResetCalibration() {
     setResetting(true);
@@ -175,8 +148,34 @@ export function VoiceDetail({ go }: VoiceDetailProps) {
   }
 
   // ── Preview TTS ────────────────────────────────────────────
-  // TODO Phase 8 wave 4: call api.previewTts(voice, sample) when method is added
-  const [previewTitle] = useState("Preview coming in wave 4");
+  // Synthesises server-side with the active voice and plays the WAV back, so
+  // the user can hear a voice before committing to it.
+  const [previewing, setPreviewing] = useState(false);
+  const previewTitle = previewing ? "Playing…" : "Hear this voice";
+
+  async function handlePreview() {
+    if (previewing) return;
+    setPreviewing(true);
+    let url: string | null = null;
+    try {
+      const wav = await api.synthesizeSpeech(
+        "Hello, I'm Goose. This is how I sound.",
+      );
+      url = URL.createObjectURL(new Blob([wav], { type: "audio/wav" }));
+      const audio = new Audio(url);
+      // Resolve on end *or* error so a failed decode can't wedge the button.
+      await new Promise<void>((resolve) => {
+        audio.onended = () => resolve();
+        audio.onerror = () => resolve();
+        void audio.play().catch(() => resolve());
+      });
+    } catch (e) {
+      showFlash(`Could not play a preview: ${String(e)}`, false);
+    } finally {
+      if (url) URL.revokeObjectURL(url);
+      setPreviewing(false);
+    }
+  }
 
   // ── Derived helpers ────────────────────────────────────────
   const currentStt    = settings.active_whisper_model ?? "ggml-base.bin";
@@ -244,11 +243,12 @@ export function VoiceDetail({ go }: VoiceDetailProps) {
       <Card title="Listening">
         <Row
           label="Hands-free mode"
-          sub="Always listening for the wake word"
+          sub="Keep listening after a reply, so you can follow up without the wake word"
           control={
             <Toggle
               on={handsFree}
               onChange={handleHandsFreeChange}
+              disabled={handsFreePending}
             />
           }
         />
@@ -396,11 +396,19 @@ export function VoiceDetail({ go }: VoiceDetailProps) {
           <button
             className="mrow__btn"
             type="button"
-            disabled
+            onClick={handlePreview}
+            disabled={previewing}
             title={previewTitle}
-            style={{ display: "flex", alignItems: "center", gap: 4, opacity: 0.45, cursor: "not-allowed" }}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 4,
+              opacity: previewing ? 0.6 : 1,
+              cursor: previewing ? "progress" : "pointer",
+            }}
           >
-            <Play size={12} color="#7C3AED" strokeWidth={2} /> Preview
+            <Play size={12} color="#7C3AED" strokeWidth={2} />
+            {previewing ? "Playing…" : "Preview"}
           </button>
         }
       >
@@ -445,21 +453,10 @@ export function VoiceDetail({ go }: VoiceDetailProps) {
           </span>
         </div>
 
-        <div className="srow" style={{ cursor: "default" }}>
-          <span className="srow__text">
-            <span className="srow__label">Speaking rate</span>
-            {/* TODO Phase 8 wave 4: persist via api.updateSettings({ tts_speed }) */}
-          </span>
-          <span className="srow__control" style={{ flex: 1, maxWidth: 240 }}>
-            <Slider
-              min={50}
-              max={150}
-              value={ttsSpeed}
-              suffix="%"
-              onChange={handleSpeedChange}
-            />
-          </span>
-        </div>
+        {/* No speaking-rate control: the TTS stack has no rate parameter —
+            neither the VoiceOutput port nor the Piper adapter accepts one, and
+            POST /api/v1/tts takes only `text`. A slider here could not affect
+            playback, so it is left out until synthesis can honour it. */}
       </Card>
 
       {/* ── HubIco usage (invisible — keeps import alive for linter) ── */}

@@ -42,6 +42,11 @@ const MIC_CONSTRAINTS: MediaStreamConstraints = {
   } as MediaTrackConstraints,
 };
 
+/// How long hands-free waits for a follow-up before ending the conversation.
+/// Long enough to think before answering, short enough that the mic does not
+/// sit open once the user is finished.
+const HANDS_FREE_FOLLOW_UP_MS = 7000;
+
 const WAKE_SPEECH_RMS = 0.008;
 const WAKE_SILENCE_RMS = 0.004;
 const WAKE_ONSET_FRAMES = 2;       // 2 * 30ms = 60ms hysteresis
@@ -102,7 +107,19 @@ export class WebVoiceBackend implements VoiceBackend {
   // Public -- VoiceBackend interface
   // ════════════════════════════════════════════════════════════════
 
-  async recordWithVad(authToken?: string, sessionId?: string): Promise<Blob | null> {
+  /**
+   * Record until the speaker stops (VAD), or give up if they never start.
+   *
+   * `noSpeechTimeoutMs` bounds the "waiting for speech" phase. Without it the
+   * mic stays open for the full `maxDurationMs` (30s), which is far too long
+   * for a hands-free follow-up — silence is how the user ends a conversation,
+   * so it has to be detected quickly. Returns `null` when nothing was said.
+   */
+  async recordWithVad(
+    authToken?: string,
+    sessionId?: string,
+    vadOpts?: { noSpeechTimeoutMs?: number },
+  ): Promise<Blob | null> {
     // Only one mic listener may own the microphone at a time. The wake
     // listener may have just been restarted by a prior runPipeline() call's
     // finally block — stop it before opening the conversational-follow-up
@@ -164,6 +181,18 @@ export class WebVoiceBackend implements VoiceBackend {
           if (this.speculativeLlm) { this.speculativeLlm.abort.abort(); this.speculativeLlm = null; }
         }
 
+        // Nothing said within the follow-up window — treat it as "the user is
+        // done" and hand back null rather than holding the mic for 30s.
+        if (
+          vadOpts?.noSpeechTimeoutMs !== undefined &&
+          vad.phase === "waiting" &&
+          Date.now() - t0 >= vadOpts.noSpeechTimeoutMs
+        ) {
+          this.endPump(ctx);
+          resolve(null);
+          return;
+        }
+
         if (Date.now() - t0 >= DEFAULT_VAD_CONFIG.maxDurationMs || stop) {
           this.endPump(ctx);
           const blob = this.blobFromCtx(ctx);
@@ -199,6 +228,39 @@ export class WebVoiceBackend implements VoiceBackend {
     this.abortController = ac;
 
     try {
+      await this.runTurn(wav, opts, ac);
+    } catch (err) {
+      if (this.cancelled || (err as Error).name === "AbortError") return;
+      console.error("Web voice pipeline error:", err);
+      this.onError?.(String(err));
+      this.onStateChange?.("error");
+    } finally {
+      this.pipelineActive = false;
+      this.wakeDetecting = false;
+      this.abortController = null;
+      if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
+      // Restart the wake listener (it was killed when detection fired).
+      if (this._wakeWord && !this.cancelled) {
+        this.startWakeListener(this._wakeWord, this._wakeNorm.slice(1));
+      }
+    }
+  }
+
+  /**
+   * One conversational turn: transcribe → reply → optionally listen again.
+   *
+   * Kept separate from `runPipeline` because a turn can continue into another
+   * turn: a bare wake word waits for the command, and hands-free reopens the
+   * mic once the reply finishes. Those continuations must re-enter *here*, not
+   * `runPipeline` — its `pipelineActive` guard rejects re-entry, so recursing
+   * through the public method silently dropped the follow-up.
+   */
+  private async runTurn(
+    wav: Blob,
+    opts: PipelineOpts,
+    ac: AbortController,
+  ): Promise<void> {
+    {
       // Step 1: Transcribe (Q2-26: reuse the speculative result if this is
       // the same recording it was computed for — skips a redundant call).
       const reusable = this.speculative?.wav === wav ? this.speculative.transcript : null;
@@ -221,8 +283,8 @@ export class WebVoiceBackend implements VoiceBackend {
         if (idx !== -1) text = text.slice(idx + opts.stripWakeWord.length).trim();
         if (!text) {
           this.onStateChange?.("recording");
-          const cmd = await this.recordWithVad();
-          if (cmd) { this.onStateChange?.("thinking"); return this.runPipeline(cmd, { ...opts, stripWakeWord: undefined }); }
+          const cmd = await this.recordWithVad(opts.authToken, opts.sessionId);
+          if (cmd) { this.onStateChange?.("thinking"); return this.runTurn(cmd, { ...opts, stripWakeWord: undefined }, ac); }
           this.onStateChange?.("idle"); return;
         }
       }
@@ -258,21 +320,24 @@ export class WebVoiceBackend implements VoiceBackend {
       }, preStartedLlm);
 
       if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
-      if (!this.cancelled) this.onStateChange?.("idle");
-    } catch (err) {
-      if (this.cancelled || (err as Error).name === "AbortError") return;
-      console.error("Web voice pipeline error:", err);
-      this.onError?.(String(err));
-      this.onStateChange?.("error");
-    } finally {
-      this.pipelineActive = false;
-      this.wakeDetecting = false;
-      this.abortController = null;
-      if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
-      // Restart the wake listener (it was killed when detection fired).
-      if (this._wakeWord && !this.cancelled) {
-        this.startWakeListener(this._wakeWord, this._wakeNorm.slice(1));
+      if (this.cancelled) return;
+
+      // Hands-free: reopen the mic for a follow-up rather than making the user
+      // repeat the wake word. Staying silent ends the conversation, so no turn
+      // cap is needed — the window is short enough that the mic never lingers.
+      // Dismissal ("goodbye") already returned above.
+      if (opts.handsFree) {
+        this.onStateChange?.("recording");
+        const followUp = await this.recordWithVad(opts.authToken, opts.sessionId, {
+          noSpeechTimeoutMs: HANDS_FREE_FOLLOW_UP_MS,
+        });
+        if (followUp && !this.cancelled) {
+          this.onStateChange?.("thinking");
+          return this.runTurn(followUp, { ...opts, stripWakeWord: undefined }, ac);
+        }
       }
+
+      this.onStateChange?.("idle");
     }
   }
 

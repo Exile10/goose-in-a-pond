@@ -237,6 +237,12 @@ pub struct Settings {
     #[serde(default = "Settings::default_whisper_url")]
     pub voice_whisper_url: String,
 
+    /// Hands-free: after the assistant finishes speaking, reopen the mic for a
+    /// follow-up instead of requiring the wake word again. The turn ends by
+    /// itself when the user stays silent, so the conversation closes naturally.
+    #[serde(default)]
+    pub voice_hands_free: bool,
+
     // ── Active model selection ──────────────────────────────────────────────
     /// Active LLM model name from the registry (e.g. "gemma-2b", "llama-1b")
     #[serde(default = "Settings::default_active_llm_model")]
@@ -749,6 +755,7 @@ impl Default for Settings {
             voice_tts_voice: Self::default_tts_voice(),
             voice_recording_duration_secs: Self::default_recording_duration(),
             voice_whisper_url: Self::default_whisper_url(),
+            voice_hands_free: false,
             active_llm_model: Self::default_active_llm_model(),
             active_whisper_model: Self::default_active_whisper_model(),
             active_tts_model: Self::default_active_tts_model(),
@@ -1753,6 +1760,7 @@ mod tests {
             "voice_wake_word",
             "voice_wake_word_transcriptions",
             "voice_whisper_url",
+            "voice_hands_free",
             "weather_enabled",
             "weather_latitude",
             "weather_location_name",

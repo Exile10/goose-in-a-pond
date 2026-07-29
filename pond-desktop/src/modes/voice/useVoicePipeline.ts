@@ -45,6 +45,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
   const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wakeVariantsRef = useRef<string[]>([]);
+  const handsFreeRef = useRef(false);
 
   // Keep latest state accessible without stale closures
   const stateRef = useRef(state);
@@ -144,6 +145,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
           sessionId: s.sessionId ?? undefined,
           authToken: s.sessionToken ?? undefined,
           serverUrl,
+          handsFree: handsFreeRef.current,
         });
       };
 
@@ -176,11 +178,13 @@ export function useVoicePipeline(): VoicePipelineAPI {
 
   useEffect(() => {
     api.getSettings().then((s) => {
-      const dur = (s as Record<string, unknown>).voice_recording_duration_secs;
+      const dur = s.voice_recording_duration_secs;
       if (typeof dur === "number" && dur > 0) { setMaxSecs(dur); setSecsLeft(dur); }
 
-      const ww = (s as Record<string, unknown>).voice_wake_word;
+      const ww = s.voice_wake_word;
       if (typeof ww === "string" && ww.trim()) setWakeWord(ww.trim());
+
+      handsFreeRef.current = s.voice_hands_free ?? false;
     }).catch(() => {});
   }, []);
 
@@ -192,7 +196,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
 
     // Load calibrated variants
     api.getSettings().then((s) => {
-      const variants: string[] = (s as Record<string, unknown>).voice_wake_word_transcriptions as string[] ?? [];
+      const variants: string[] = s.voice_wake_word_transcriptions ?? [];
       wakeVariantsRef.current = variants;
       backend.startWakeListener(wakeWord, variants);
       dispatch({ type: "SET_VOICE_STATE", payload: "wait" });
@@ -239,6 +243,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
             sessionId: s.sessionId ?? undefined,
             authToken: s.sessionToken ?? undefined,
             serverUrl: s.serverUrl || "http://127.0.0.1:4000",
+            handsFree: handsFreeRef.current,
           });
         } else {
           // No speech detected — return to wake listening or idle
@@ -321,6 +326,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
           sessionId: s.sessionId ?? undefined,
           authToken: s.sessionToken ?? undefined,
           serverUrl: s.serverUrl || "http://127.0.0.1:4000",
+          handsFree: handsFreeRef.current,
         });
       } else {
         dispatch({ type: "SET_VOICE_STATE", payload: wakeWord ? "wait" : "idle" });

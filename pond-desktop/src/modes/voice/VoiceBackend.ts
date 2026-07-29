@@ -13,6 +13,9 @@ export interface PipelineOpts {
   sessionId?: string;
   authToken?: string;
   serverUrl: string;
+  /** Reopen the mic for a follow-up after the reply, instead of requiring the
+   *  wake word again. Sourced from the `voice_hands_free` setting. */
+  handsFree?: boolean;
 }
 
 export interface ResponseMeta {

@@ -61,6 +61,9 @@ export interface Settings {
   active_whisper_model?: string;
   active_tts_model?: string;
   voice_tts_voice?: string;
+  /** Reopen the mic for a follow-up after a reply, instead of requiring the
+   *  wake word again. */
+  voice_hands_free?: boolean;
 
   // Model roles
   chat_provider?: string;

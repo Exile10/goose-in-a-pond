@@ -125,6 +125,14 @@ impl SettingsRepository for SqliteSettingsRepository {
             settings.voice_recording_duration_secs.to_string()
         );
         upsert!("voice_whisper_url", &settings.voice_whisper_url);
+        upsert!(
+            "voice_hands_free",
+            if settings.voice_hands_free {
+                "true"
+            } else {
+                "false"
+            }
+        );
         upsert!("active_llm_model", &settings.active_llm_model);
         upsert!("active_whisper_model", &settings.active_whisper_model);
         upsert!("active_tts_model", &settings.active_tts_model);
@@ -707,6 +715,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
             }
         }
         "voice_whisper_url" => s.voice_whisper_url = value.to_string(),
+        "voice_hands_free" => s.voice_hands_free = value == "true",
         "active_llm_model" => s.active_llm_model = value.to_string(),
         "active_whisper_model" => s.active_whisper_model = value.to_string(),
         "active_tts_model" => s.active_tts_model = value.to_string(),
@@ -992,6 +1001,28 @@ mod tests {
         let repo = SqliteSettingsRepository::new(db.system.clone());
         std::mem::forget(tmp); // keep the sqlite file alive for the test
         repo
+    }
+
+    /// Hands-free must survive a restart: the toggle drives whether the voice
+    /// pipeline reopens the mic after a reply, so a value that silently reset
+    /// to the default would be a control that lies about what it saved.
+    #[tokio::test]
+    async fn voice_hands_free_roundtrips() {
+        let repo = fresh_repo().await;
+
+        // Off by default — hands-free keeps the mic open, so it is opt-in.
+        let s0 = repo.get().await.unwrap();
+        assert!(!s0.voice_hands_free);
+
+        let mut s = s0;
+        s.voice_hands_free = true;
+        repo.update(&s).await.unwrap();
+        assert!(repo.get().await.unwrap().voice_hands_free);
+
+        // And it can be turned back off (guards a write that only ever sets true).
+        s.voice_hands_free = false;
+        repo.update(&s).await.unwrap();
+        assert!(!repo.get().await.unwrap().voice_hands_free);
     }
 
     #[tokio::test]

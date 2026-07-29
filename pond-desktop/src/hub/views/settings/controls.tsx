@@ -1,16 +1,24 @@
 import { useState } from "react";
 
 // ─── Toggle (pill switch) ─────────────────────────────────────
+/**
+ * Controlled switch: `on` is the source of truth, never mirrored into local
+ * state. It used to seed local state once and ignore the prop afterwards, which
+ * made it lie in two ordinary situations — settings load asynchronously, so it
+ * mounted before its stored value arrived and never caught up; and when a save
+ * failed, the caller's revert left the switch showing a setting that was never
+ * stored. Every caller already drives it from state and reverts on error, so
+ * holding no state of its own is both simpler and honest.
+ */
 interface ToggleProps {
   on?: boolean;
   onChange?: (on: boolean) => void;
+  disabled?: boolean;
 }
-export function Toggle({ on: initial = false, onChange }: ToggleProps) {
-  const [on, setOn] = useState(initial);
+export function Toggle({ on = false, onChange, disabled = false }: ToggleProps) {
   function handleClick() {
-    const next = !on;
-    setOn(next);
-    onChange?.(next);
+    if (disabled) return;
+    onChange?.(!on);
   }
   return (
     <button
@@ -19,6 +27,7 @@ export function Toggle({ on: initial = false, onChange }: ToggleProps) {
       onClick={handleClick}
       aria-pressed={on}
       type="button"
+      disabled={disabled}
     >
       <span className="htoggle__knob" />
     </button>
