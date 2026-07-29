@@ -16,6 +16,10 @@ export interface PlaylistInfo {
   description: string;
   track_count: number;
   uri: string;
+  /** Display name of whoever created it. */
+  owner: string;
+  /** True when the signed-in user created it, false when they only follow it. */
+  is_own: boolean;
 }
 
 export interface MusicProvider {

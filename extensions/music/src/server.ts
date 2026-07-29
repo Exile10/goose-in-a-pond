@@ -37,7 +37,7 @@ const TOOLS = [
           type: "string",
           enum: ["track", "album", "playlist"],
           description:
-            "What the query names. 'album' plays the whole record in order; 'playlist' plays one of the user's own playlists, matched by name. Defaults to 'track'.",
+            "What the query names, defaulting to 'track'. If the user says the word 'playlist' you MUST pass 'playlist', and if they say 'album' you MUST pass 'album' — leaving this unset searches the words as a SONG TITLE, so 'play the sautisol playlist' would start a single Sauti Sol track instead of their playlist. 'playlist' matches against the user's library by name; 'album' plays the whole record in order.",
         },
       },
     },
@@ -65,7 +65,7 @@ const TOOLS = [
   {
     name: "playlists",
     description:
-      "List the user's own Spotify playlists by name. Use this to answer 'what playlists do I have', or to find the right name before playing one with the 'play' tool.",
+      "List every playlist in the user's Spotify library, separated into ones they created and ones they follow from other people. Use this to answer 'what playlists do I have' or 'which of these are mine', and to find the exact name before playing one with the 'play' tool.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -204,30 +204,83 @@ async function handleQueue(args: Record<string, unknown>): Promise<string> {
   return text;
 }
 
+/** Lowercase, drop emoji and punctuation, collapse runs of whitespace. */
+function normalizeName(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^\p{Letter}\p{Number}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
 /**
- * Finds one of the user's own playlists by name. The model will have a name,
+ * Scores how well a spoken name matches a playlist's real one, 0 (no) to 1.
+ *
+ * Real playlist names are messy — "Sauti sol/Kenyan gold" with an emoji on the
+ * end — and people say "sautisol". Plain substring matching fails on the missing
+ * space alone, so compare with spaces removed as well, and fall back to how many
+ * of the query's words the name actually contains, which survives a typo in one
+ * of them.
+ */
+function playlistMatchScore(query: string, playlistName: string): number {
+  const q = normalizeName(query);
+  const n = normalizeName(playlistName);
+  if (!q || !n) return 0;
+  if (q === n) return 1;
+
+  const qSquashed = q.replace(/ /g, "");
+  const nSquashed = n.replace(/ /g, "");
+  if (qSquashed === nSquashed) return 0.95;
+  if (nSquashed.includes(qSquashed) || qSquashed.includes(nSquashed)) return 0.9;
+
+  const qWords = q.split(" ");
+  const nSet = new Set(n.split(" "));
+  const overlap = qWords.filter(w => nSet.has(w)).length;
+  return overlap / qWords.length;
+}
+
+/**
+ * Finds a playlist in the user's library by name. The model will have a name,
  * not an id, so requiring an id would make this unusable in practice.
  */
 async function resolvePlaylist(name: string): Promise<{ uri: string; name: string }> {
-  const playlists = await provider.getPlaylists(50);
-  const wanted = name.trim().toLowerCase();
+  const playlists = await provider.getPlaylists();
 
-  const hit =
-    playlists.find(p => p.name.toLowerCase() === wanted) ??
-    playlists.find(p => p.name.toLowerCase().includes(wanted));
-  if (hit) return { uri: hit.uri, name: hit.name };
+  const ranked = playlists
+    .map(p => ({ p, score: playlistMatchScore(name, p.name) }))
+    .sort((a, b) => b.score - a.score);
 
-  throw new Error(
-    `No playlist matching "${name}". Available: ${playlists.map(p => p.name).join(", ") || "(none)"}`
-  );
+  // Half the words matching is enough to be confident; below that the request
+  // is better refused than answered with an arbitrary playlist.
+  const best = ranked[0];
+  if (best && best.score >= 0.5) return { uri: best.p.uri, name: best.p.name };
+
+  const suggestions = ranked
+    .slice(0, 8)
+    .map(r => r.p.name)
+    .join(", ");
+  throw new Error(`No playlist matching "${name}". Closest: ${suggestions || "(none)"}`);
 }
 
 async function handlePlaylists(): Promise<string> {
-  const playlists = await provider.getPlaylists(50);
+  const playlists = await provider.getPlaylists();
   if (playlists.length === 0) return "No playlists found on this Spotify account.";
-  return (
-    `${playlists.length} playlist(s):\n` + playlists.map(p => `- ${p.name}`).join("\n")
-  );
+
+  // Split them: "which of these did I make" is a question the raw list cannot
+  // answer, and Spotify hands us the owner on every entry anyway.
+  const mine = playlists.filter(p => p.is_own);
+  const followed = playlists.filter(p => !p.is_own);
+
+  let text = `${playlists.length} playlist(s) in the library: ${mine.length} created by the user, ${followed.length} followed from others.`;
+  if (mine.length > 0) {
+    text += `\n\nCreated by the user (${mine.length}):\n` + mine.map(p => `- ${p.name}`).join("\n");
+  }
+  if (followed.length > 0) {
+    text +=
+      `\n\nFollowed from other people (${followed.length}):\n` +
+      followed.map(p => `- ${p.name} (by ${p.owner})`).join("\n");
+  }
+  return text;
 }
 
 async function handleStatus(): Promise<string> {

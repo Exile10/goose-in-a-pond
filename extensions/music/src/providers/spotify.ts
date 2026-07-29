@@ -26,6 +26,7 @@ interface SpotifyPlaylist {
   tracks?: { total: number };
   items?: unknown[];
   uri: string;
+  owner?: { id: string; display_name?: string };
 }
 
 /**
@@ -175,7 +176,8 @@ export class SpotifyProvider implements MusicProvider {
     };
   }
 
-  private parsePlaylist(playlist: SpotifyPlaylist): PlaylistInfo {
+  private parsePlaylist(playlist: SpotifyPlaylist, currentUserId?: string): PlaylistInfo {
+    const owner = playlist.owner;
     return {
       id: playlist.id,
       name: playlist.name,
@@ -185,6 +187,8 @@ export class SpotifyProvider implements MusicProvider {
       // `playlist.tracks.total` outright throws on a perfectly ordinary account.
       track_count: playlist.tracks?.total ?? playlist.items?.length ?? 0,
       uri: playlist.uri,
+      owner: owner?.display_name || owner?.id || 'unknown',
+      is_own: currentUserId !== undefined && owner?.id === currentUserId,
     };
   }
 
@@ -368,19 +372,40 @@ export class SpotifyProvider implements MusicProvider {
     return (data.albums?.items || []).map(a => this.parseAlbum(a));
   }
 
-  async getPlaylists(limit: number = 20): Promise<PlaylistInfo[]> {
-    const clamped = Math.max(1, Math.min(50, limit));
-
+  /**
+   * Every playlist in the user's library, followed ones included.
+   *
+   * Spotify caps a page at 50, so a library larger than that has to be paged
+   * through: asking for one page silently hid 19 of this account's 69, which
+   * meant "which playlists do I have" was wrong and a playlist past the first
+   * page could never be found by name.
+   */
+  async getPlaylists(limit: number = 200): Promise<PlaylistInfo[]> {
     interface PlaylistsResponse {
       items: SpotifyPlaylist[];
+      total: number;
     }
 
-    const data = await this.api<PlaylistsResponse>(
-      'GET',
-      `/me/playlists?limit=${clamped}`
-    );
+    const wanted = Math.max(1, limit);
+    const out: PlaylistInfo[] = [];
+    let offset = 0;
 
-    return (data.items || []).map(p => this.parsePlaylist(p));
+    // Resolve the owner once so each playlist can be marked as theirs or not.
+    const me = await this.api<{ id: string }>('GET', '/me');
+
+    while (out.length < wanted) {
+      const page = await this.api<PlaylistsResponse>(
+        'GET',
+        `/me/playlists?limit=50&offset=${offset}`
+      );
+      const items = (page.items || []).filter(Boolean);
+      out.push(...items.map(p => this.parsePlaylist(p, me.id)));
+
+      offset += 50;
+      if (items.length === 0 || offset >= (page.total ?? 0)) break;
+    }
+
+    return out.slice(0, wanted);
   }
 
 
