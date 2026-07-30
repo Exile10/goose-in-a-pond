@@ -194,6 +194,7 @@ async fn make_app() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempD
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(NoDevices),
         matter: pond_core::user_data::ports::device_commissioning::MatterAvailability::off(),
+        matter_admin: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),

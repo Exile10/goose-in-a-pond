@@ -112,6 +112,7 @@ async fn make_app_with_real_memory(
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(NoDevices),
         matter: pond_core::user_data::ports::device_commissioning::MatterAvailability::off(),
+        matter_admin: None,
         memory_repo: memory_repo.clone(),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),

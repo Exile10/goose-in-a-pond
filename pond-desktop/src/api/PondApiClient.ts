@@ -35,6 +35,7 @@ import {
   type SessionMessageToolCall,
   type SessionSummary,
   type MusicControlAction,
+  type MatterControllerStatus,
   type NowPlayingApiResponse,
   type Settings,
   type UsageSummary,
@@ -373,6 +374,25 @@ export class PondApiClient {
     name?: string,
   ): Promise<{ id: string; name: string; node_id: number }> {
     return this.post("/api/v1/devices/commission", name ? { code, name } : { code });
+  }
+
+  /**
+   * The Matter controller process: where it came from and how long it has been
+   * up. A controller adopted from an earlier Pond run can serve its port for
+   * days while its mDNS state is dead, so its age is the only clue available
+   * before a commissioning attempt fails.
+   */
+  getMatterController(): Promise<MatterControllerStatus> {
+    return this.get("/api/v1/matter/controller");
+  }
+
+  /**
+   * Restart the controller, clearing a stale network stack. Returns its new
+   * status. Refused for a controller GIAP did not start. The commissioned fabric
+   * is unaffected — it lives in the controller's storage directory.
+   */
+  restartMatterController(): Promise<MatterControllerStatus> {
+    return this.post("/api/v1/matter/controller/restart", {});
   }
 
   unregisterDevice(id: string): Promise<void> {

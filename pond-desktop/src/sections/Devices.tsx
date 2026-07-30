@@ -2,10 +2,10 @@ import { useState, useEffect } from "react";
 import { Button, Separator, Switch } from "@heroui/react";
 import {
   Monitor, Cpu, Activity, Power, Settings, Plus, X, Radio, Smartphone,
-  Lightbulb, Lock, Thermometer, Fan, Blinds,
+  Lightbulb, Lock, Thermometer, Fan, Blinds, RotateCcw,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import type { Device, Settings as SettingsType } from "../api/types";
+import type { Device, MatterControllerStatus, Settings as SettingsType } from "../api/types";
 import { Section, Row } from "../components/shared";
 import { refreshHomeData } from "../hub/state/hubDataStore";
 
@@ -51,6 +51,21 @@ function timeSince(iso: string | null | undefined): string {
 }
 
 /**
+ * A process age, as a duration rather than a timestamp. Rounded up to a minute
+ * so a controller that has just been restarted reads as "1 min", not "0s".
+ */
+export function formatUptime(secs: number): string {
+  if (secs < 60) return "1 min";
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins} min`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  const rest = hours % 24;
+  return rest === 0 ? `${days}d` : `${days}d ${rest}h`;
+}
+
+/**
  * The Matter controller connection.
  *
  * It lives on this screen rather than under Settings because this is the screen
@@ -69,16 +84,45 @@ function MatterPanel() {
   const [loaded, setLoaded]     = useState(false);
   const [error, setError]       = useState<string | null>(null);
 
+  // The controller process, which is a separate question from the two settings:
+  // a controller can be connected and still unable to commission.
+  const [controller, setController] = useState<MatterControllerStatus | null>(null);
+  const [restarting, setRestarting] = useState(false);
+
+  // Only meaningful once Matter is on; when off there is no controller to report.
+  function loadController(matterOn: boolean) {
+    if (!matterOn) { setController(null); return; }
+    api.getMatterController()
+      .then(setController)
+      // Not surfaced as an error: the status is a diagnostic extra, and the
+      // controls above must stay usable when it is unavailable.
+      .catch(() => setController(null));
+  }
+
   useEffect(() => {
     api.getSettings()
       .then((s) => {
-        setEnabled(s.matter_enabled ?? false);
+        const on = s.matter_enabled ?? false;
+        setEnabled(on);
         setUrl(s.matter_ws_url ?? "");
         setBaseline(s.matter_ws_url ?? "");
+        loadController(on);
       })
       .catch((e) => setError(String(e)))
       .finally(() => setLoaded(true));
   }, []);
+
+  async function restartController() {
+    setRestarting(true);
+    setError(null);
+    try {
+      setController(await api.restartMatterController());
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRestarting(false);
+    }
+  }
 
   async function save(patch: Partial<SettingsType>) {
     setError(null);
@@ -92,6 +136,7 @@ function MatterPanel() {
   async function toggle(v: boolean) {
     setEnabled(v);
     await save({ matter_enabled: v });
+    loadController(v);
   }
 
   // Committed on blur rather than per keystroke, so one edit is one save.
@@ -128,6 +173,31 @@ function MatterPanel() {
           placeholder="ws://127.0.0.1:5580/ws"
         />
       </Row>
+      {controller && (
+        <Row
+          label="Controller process"
+          hint={
+            controller.restartable
+              ? "A controller left running from an earlier Pond keeps its network state, which can go stale — restarting the Pond re-adopts the same process, so restart the controller itself"
+              : "This controller was not started by the Pond, so it is yours to restart wherever you started it"
+          }
+        >
+          <div className="matter-controller-status">
+            <span className="muted-12">
+              {controller.description}
+              {controller.uptime_secs != null && `, up ${formatUptime(controller.uptime_secs)}`}
+            </span>
+            <Button
+              size="sm"
+              variant="outline"
+              isDisabled={!controller.restartable || restarting}
+              onPress={restartController}
+            >
+              <RotateCcw size={14} /> {restarting ? "Restarting…" : "Restart"}
+            </Button>
+          </div>
+        </Row>
+      )}
       {error && <p className="muted-12 text-error">{error}</p>}
     </Section>
   );

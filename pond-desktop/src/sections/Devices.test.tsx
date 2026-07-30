@@ -14,6 +14,8 @@ vi.mock("../api/PondApiClient", () => ({
     invokeTool: vi.fn(),
     // The Matter panel reads these two settings when the screen mounts.
     getSettings: vi.fn().mockResolvedValue({}),
+    getMatterController: vi.fn(),
+    restartMatterController: vi.fn(),
     updateSettings: vi.fn().mockResolvedValue({}),
   },
 }));

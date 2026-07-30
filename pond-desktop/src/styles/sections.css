@@ -2474,6 +2474,16 @@
   gap: 6px;
 }
 
+/* Matter controller provenance + its Restart button: the caption and the action
+   read as one line, wrapping rather than overflowing on a narrow window. */
+.matter-controller-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* Native input / select / textarea — polished field styling */
 .row__control input,
 .row__control select,

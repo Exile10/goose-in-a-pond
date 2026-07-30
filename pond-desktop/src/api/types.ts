@@ -208,6 +208,29 @@ export interface Settings {
   show_turn_stats?: boolean;
 }
 
+// ── Matter controller ────────────────────────────────────────
+//
+// The controller process behind `matter_ws_url`, as opposed to the devices on
+// its fabric. GIAP adopts any controller already listening on the port, so one
+// left over from an earlier run can be serving requests while its mDNS state is
+// dead — and restarting the Pond re-adopts the same process. Provenance and age
+// are what make that visible; `restartable` is what makes it fixable.
+
+/** Where the controller came from. Only a controller GIAP owns is restartable. */
+export type MatterControllerOrigin =
+  | "started_by_pond"
+  | "adopted_from_earlier_run"
+  | "external";
+
+export interface MatterControllerStatus {
+  origin: MatterControllerOrigin;
+  /** One clause naming the origin, rendered by the server. */
+  description: string;
+  pid: number | null;
+  uptime_secs: number | null;
+  restartable: boolean;
+}
+
 // ── Consolidation ────────────────────────────────────────────
 export type ConsolidationEventType =
   | "started"

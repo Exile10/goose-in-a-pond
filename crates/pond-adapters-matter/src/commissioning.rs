@@ -27,6 +27,7 @@ use pond_core::user_data::ports::device_commissioning::{
 use serde_json::json;
 
 use crate::client::MatterClient;
+use crate::control::SharedMatterClient;
 use crate::protocol::{node_to_device, MatterNode, ATTR_NODE_LABEL, CLUSTER_BASIC_INFORMATION};
 
 /// Commissioning is slow: discovery, attestation, and fabric join, often over
@@ -41,12 +42,23 @@ const COMMISSION_TIMEOUT: Duration = Duration::from_secs(180);
 const DECOMMISSION_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct MatterCommissioner {
-    client: Arc<MatterClient>,
+    /// The swappable handle, not a fixed connection. Commissioning outlives any
+    /// single socket: the supervisor replaces the client after a drop, and a
+    /// controller restart is now something a user can ask for — a commissioner
+    /// pinned to the original connection would go quietly dead at the first
+    /// reconnect and fail every pairing afterwards.
+    client: SharedMatterClient,
 }
 
 impl MatterCommissioner {
-    pub fn new(client: Arc<MatterClient>) -> Self {
+    pub fn new(client: SharedMatterClient) -> Self {
         Self { client }
+    }
+
+    /// The connection currently in use, cloned so the lock is released before
+    /// any await on the network.
+    async fn client(&self) -> Arc<MatterClient> {
+        self.client.read().await.clone()
     }
 
     /// Write the user-chosen name to the device's NodeLabel. Best-effort: if the
@@ -58,7 +70,12 @@ impl MatterCommissioner {
             "attribute_path": format!("0/{CLUSTER_BASIC_INFORMATION}/{ATTR_NODE_LABEL}"),
             "value": name,
         });
-        if let Err(e) = self.client.send_command("write_attribute", args).await {
+        if let Err(e) = self
+            .client()
+            .await
+            .send_command("write_attribute", args)
+            .await
+        {
             tracing::warn!(node_id, error = %e, "matter: could not write NodeLabel");
         }
     }
@@ -77,7 +94,8 @@ impl DeviceCommissioningPort for MatterCommissioner {
         };
 
         let result = self
-            .client
+            .client()
+            .await
             .send_command_with_timeout(command, args, COMMISSION_TIMEOUT)
             .await
             .context("commissioning failed")?;
@@ -107,7 +125,8 @@ impl DeviceCommissioningPort for MatterCommissioner {
 
     async fn decommission(&self, node_id: u64) -> Result<()> {
         match self
-            .client
+            .client()
+            .await
             .send_command_with_timeout(
                 "remove_node",
                 json!({ "node_id": node_id }),

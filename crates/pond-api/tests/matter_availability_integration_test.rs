@@ -99,9 +99,31 @@ impl DeviceRegistry for NoDevices {
     }
 }
 
+/// An app wired with a specific Matter availability and no controller admin —
+/// the common case for the commissioning tests.
+async fn make_app(matter: MatterAvailability) -> (axum::Router, tempfile::TempDir) {
+    build_app(matter, None).await
+}
+
+/// An app whose Matter is configured and whose controller reports `status`.
+async fn app_with_controller(
+    status: pond_core::user_data::ports::matter_controller::ControllerStatus,
+) -> (axum::Router, tempfile::TempDir) {
+    build_app(
+        MatterAvailability::off(),
+        Some(Arc::new(StubAdmin { status })),
+    )
+    .await
+}
+
 /// An app wired with a specific Matter availability, so each startup outcome can
 /// be exercised without standing up a controller.
-async fn make_app(matter: MatterAvailability) -> (axum::Router, tempfile::TempDir) {
+async fn build_app(
+    matter: MatterAvailability,
+    matter_admin: Option<
+        Arc<dyn pond_core::user_data::ports::matter_controller::MatterControllerAdmin>,
+    >,
+) -> (axum::Router, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
     let session_storage = Arc::new(SqliteSessionStorage::new(db.system.clone()));
@@ -125,6 +147,7 @@ async fn make_app(matter: MatterAvailability) -> (axum::Router, tempfile::TempDi
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(NoDevices),
         matter,
+        matter_admin,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
@@ -394,4 +417,126 @@ async fn a_failed_removal_also_keeps_the_reason() {
         error.contains("No route to host"),
         "reason dropped: {error}"
     );
+}
+
+// ── The controller process: provenance, and refusing to touch what is not ours ─
+
+/// A controller admin with a fixed answer, so the routes can be tested without a
+/// controller process to find.
+struct StubAdmin {
+    status: pond_core::user_data::ports::matter_controller::ControllerStatus,
+}
+
+#[async_trait::async_trait]
+impl pond_core::user_data::ports::matter_controller::MatterControllerAdmin for StubAdmin {
+    async fn status(&self) -> pond_core::user_data::ports::matter_controller::ControllerStatus {
+        self.status.clone()
+    }
+    async fn restart(&self) -> anyhow::Result<()> {
+        if !self.status.restartable {
+            anyhow::bail!(
+                "this Matter controller is {} , so GIAP will not restart it.",
+                self.status.origin.describe()
+            );
+        }
+        Ok(())
+    }
+}
+
+async fn get_json(app: axum::Router, method: &str, uri: &str) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("Authorization", "Bearer test-token")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[tokio::test]
+async fn the_status_route_reports_provenance_and_age() {
+    use pond_core::user_data::ports::matter_controller::{ControllerOrigin, ControllerStatus};
+    let (app, _tmp) = app_with_controller(ControllerStatus::owned(
+        ControllerOrigin::AdoptedFromEarlierRun,
+        4242,
+        97_200,
+    ))
+    .await;
+
+    let (status, json) = get_json(app, "GET", "/api/v1/matter/controller").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["origin"], "adopted_from_earlier_run");
+    assert_eq!(json["pid"], 4242);
+    // The age is the whole point: this is the controller worth suspecting.
+    assert_eq!(json["uptime_secs"], 97_200);
+    assert_eq!(json["restartable"], true);
+    // A caption the UI can show without re-deriving the wording.
+    assert!(json["description"].as_str().unwrap().contains("adopted"));
+}
+
+#[tokio::test]
+async fn an_external_controller_is_reported_but_not_restartable() {
+    use pond_core::user_data::ports::matter_controller::ControllerStatus;
+    let (app, _tmp) = app_with_controller(ControllerStatus::external()).await;
+
+    let (status, json) = get_json(app.clone(), "GET", "/api/v1/matter/controller").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["origin"], "external");
+    assert_eq!(json["restartable"], false);
+    // Nothing is claimed about a process GIAP did not start.
+    assert!(json["pid"].is_null());
+
+    // And the restart is refused with the reason, not silently ignored.
+    let (status, json) = get_json(app, "POST", "/api/v1/matter/controller/restart").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("not managed by this Pond"),
+        "{json}"
+    );
+}
+
+#[tokio::test]
+async fn restarting_an_owned_controller_answers_with_its_new_status() {
+    use pond_core::user_data::ports::matter_controller::{ControllerOrigin, ControllerStatus};
+    let (app, _tmp) = app_with_controller(ControllerStatus::owned(
+        ControllerOrigin::StartedByPond,
+        7,
+        30,
+    ))
+    .await;
+
+    let (status, json) = get_json(app, "POST", "/api/v1/matter/controller/restart").await;
+    assert_eq!(status, StatusCode::OK);
+    // Answered with the status so the caller need not poll for it.
+    assert_eq!(json["origin"], "started_by_pond");
+    assert_eq!(json["restartable"], true);
+}
+
+#[tokio::test]
+async fn with_matter_off_the_controller_routes_say_so_in_the_same_words() {
+    // No admin exists, and the reason comes from the availability enum rather
+    // than a fifth hand-written message.
+    let (app, _tmp) = make_app(MatterAvailability::off()).await;
+
+    let (status, json) = get_json(app, "GET", "/api/v1/matter/controller").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let error = json["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("Cannot manage the Matter controller."),
+        "{error}"
+    );
+    assert!(error.contains("Devices > Matter"), "{error}");
 }

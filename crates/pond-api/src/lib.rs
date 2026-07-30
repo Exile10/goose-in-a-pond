@@ -157,6 +157,10 @@ pub struct AppState {
     /// Matter commissioning, or why it is unavailable — decided at startup so
     /// the API can name the actual cause instead of one catch-all sentence.
     pub matter: pond_core::user_data::ports::device_commissioning::MatterAvailability,
+    /// The Matter controller *process*: where it came from, how long it has been
+    /// up, and whether GIAP may restart it. `None` when Matter is not configured.
+    pub matter_admin:
+        Option<Arc<dyn pond_core::user_data::ports::matter_controller::MatterControllerAdmin>>,
     /// Memory fragment repository for semantic/recency-based retrieval.
     pub memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
     /// Embedding provider — `None` until a real embedding model is configured.

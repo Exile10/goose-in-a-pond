@@ -2239,8 +2239,20 @@ async fn run_server(
     // is killed explicitly: kill_on_drop alone is not enough because a signal
     // (Ctrl-C / SIGTERM) terminates the process without unwinding, so the
     // destructor never runs and the controller would orphan.
+    //
+    // Shared rather than owned outright, because a restart replaces the child and
+    // shutdown must kill whichever one is live by then, not the first one.
     #[cfg(feature = "goose-agent")]
-    let mut matter_server_child: Option<tokio::process::Child>;
+    let matter_server_child: pond_adapters_matter::SharedControllerChild =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    // Inspect / restart the controller process. `None` when Matter is not
+    // configured, so there is no controller to speak of.
+    use pond_core::user_data::ports::matter_controller::MatterControllerAdmin;
+    #[cfg(feature = "goose-agent")]
+    let mut matter_admin: Option<Arc<dyn MatterControllerAdmin>> = None;
+    #[cfg(not(feature = "goose-agent"))]
+    let matter_admin: Option<Arc<dyn MatterControllerAdmin>> = None;
 
     // Matter commissioning, available only once a controller is connected — and
     // when it is not, the reason why. The API turns the reason into a 503 that
@@ -2271,35 +2283,39 @@ async fn run_server(
         // Auto-setup: install + start a controller when the URL is loopback and
         // nothing is serving it yet. A remote URL is someone else's server, and
         // an already-live port is reused as-is.
-        matter_server_child =
-            match pond_adapters_matter::local_port_from_ws_url(settings.matter_ws_url.trim()) {
-                Some(port) => {
-                    match pond_adapters_matter::ensure_matter_server(
-                        &data_dir,
-                        port,
-                        std::time::Duration::from_secs(120),
-                    )
-                    .await
-                    {
-                        Ok(child) => child,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Matter controller auto-setup failed");
-                            None
-                        }
-                    }
+        let local_port =
+            pond_adapters_matter::local_port_from_ws_url(settings.matter_ws_url.trim());
+        if let Some(port) = local_port {
+            match pond_adapters_matter::ensure_matter_server(
+                &data_dir,
+                port,
+                std::time::Duration::from_secs(120),
+            )
+            .await
+            {
+                Ok(child) => *matter_server_child.lock().await = child,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Matter controller auto-setup failed");
                 }
-                None => None,
-            };
+            }
+        }
+
+        // Built whenever Matter is configured, including when the connection
+        // below fails — a controller that answers its port but cannot commission
+        // is exactly when someone needs to see its age and restart it.
+        let admin = Arc::new(pond_adapters_matter::MatterController::new(
+            data_dir.clone(),
+            local_port,
+            matter_server_child.clone(),
+        ));
+        log_controller_provenance(admin.status().await);
+        matter_admin = Some(admin);
 
         match pond_adapters_matter::MatterClient::connect(settings.matter_ws_url.trim()).await {
             Ok((client, events)) => {
                 let cache: pond_adapters_matter::NodeCache =
                     Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
                 tracing::info!(url = %settings.matter_ws_url, "Matter controller connected");
-                // Same connection commissions new devices onto the fabric.
-                matter = MatterAvailability::Ready(Arc::new(
-                    pond_adapters_matter::MatterCommissioner::new(client.clone()),
-                ));
                 let control = Arc::new(pond_adapters_matter::MatterDeviceControl::new(
                     client.clone(),
                     cache.clone(),
@@ -2307,6 +2323,13 @@ async fn run_server(
                 // The supervisor swaps this handle on reconnect so the control
                 // keeps working across a matter-server restart (#195).
                 let client_handle = control.client_handle();
+                // Commissioning reads through the same swappable handle, so it
+                // survives a reconnect too. Pinned to the original connection it
+                // would go quietly dead the first time the controller restarted —
+                // including a restart the user just asked for.
+                matter = MatterAvailability::Ready(Arc::new(
+                    pond_adapters_matter::MatterCommissioner::new(client_handle.clone()),
+                ));
                 (control, Some((client, events, cache, client_handle)))
             }
             Err(e) => {
@@ -2324,10 +2347,10 @@ async fn run_server(
             }
         }
     } else {
-        // Matter disabled: nothing to install, nothing to start. Which of the
-        // two "off" states this is matters to the user: never switched on, or
-        // switched on with no controller address to connect to.
-        matter_server_child = None;
+        // Matter disabled: nothing to install, nothing to start, and no
+        // controller to administer. Which of the two "off" states this is matters
+        // to the user: never switched on, or switched on with no controller
+        // address to connect to.
         matter = if settings.matter_enabled {
             MatterAvailability::Unavailable(MatterUnavailable::NoUrl)
         } else {
@@ -2926,6 +2949,7 @@ async fn run_server(
         settings_repo,
         profile_repo,
         matter,
+        matter_admin,
         device_registry,
         memory_repo,
         embedding_provider,
@@ -3167,13 +3191,60 @@ async fn run_server(
     // the signal path (the process exits without unwinding), so kill it here —
     // otherwise the controller orphans and survives the Pond, including under
     // `systemctl stop`.
+    // Takes from the shared cell, so a controller started by a mid-session
+    // restart is killed rather than the one GIAP spawned at boot.
     #[cfg(feature = "goose-agent")]
-    if let Some(mut child) = matter_server_child.take() {
+    if let Some(mut child) = matter_server_child.lock().await.take() {
         tracing::info!("stopping matter-server controller");
         let _ = child.start_kill();
     }
 
     Ok(())
+}
+
+/// Beyond this age an adopted controller is worth naming as a suspect. Nothing
+/// breaks at a particular uptime — a stale mDNS stack is caused by network
+/// changes, not by the clock — but a controller that has been up across a day of
+/// them is the one that has had the chance to go stale, and it is the only clue
+/// available before a commissioning attempt fails.
+#[cfg(feature = "goose-agent")]
+const CONTROLLER_LONG_RUNNING_SECS: u64 = 12 * 60 * 60;
+
+/// Record where the controller came from and how long it has been up.
+///
+/// A reused controller was previously indistinguishable from one GIAP had just
+/// started: both logged one line saying the port was in use. That mattered,
+/// because restarting the Pond re-adopts the same controller, so a stale one is
+/// invisible and survives every restart the user tries.
+#[cfg(feature = "goose-agent")]
+fn log_controller_provenance(
+    status: pond_core::user_data::ports::matter_controller::ControllerStatus,
+) {
+    use pond_core::user_data::ports::matter_controller::ControllerOrigin;
+
+    let origin = status.origin.describe();
+    match (status.origin, status.uptime_secs) {
+        (ControllerOrigin::AdoptedFromEarlierRun, Some(secs))
+            if secs >= CONTROLLER_LONG_RUNNING_SECS =>
+        {
+            tracing::warn!(
+                pid = ?status.pid,
+                uptime_hours = secs / 3600,
+                "matter: controller {origin} and has been up for {}h. If commissioning fails with \
+                 a discovery timeout, restart the controller (Devices > Matter) — restarting the \
+                 Pond alone re-adopts this same process.",
+                secs / 3600,
+            );
+        }
+        (_, uptime) => {
+            tracing::info!(
+                pid = ?status.pid,
+                uptime_secs = ?uptime,
+                restartable = status.restartable,
+                "matter: controller {origin}",
+            );
+        }
+    }
 }
 
 /// Resolves when the process is asked to stop: Ctrl-C on any platform, plus

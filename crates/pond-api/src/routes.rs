@@ -131,6 +131,13 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/usage/summary", get(usage_summary))
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/commission", post(commission_device))
+        // The Matter controller as a process, not a device: its provenance, and
+        // the restart that clears a stale one without resorting to `pkill`.
+        .route("/matter/controller", get(matter_controller_status))
+        .route(
+            "/matter/controller/restart",
+            post(restart_matter_controller),
+        )
         .route("/devices/{id}", axum::routing::delete(unregister_device))
         .route("/devices/{id}/heartbeat", post(device_heartbeat))
         // Push-notification token register/unregister for a paired device (#95).
@@ -2276,6 +2283,76 @@ fn matter_unavailable(
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({ "error": format!("{action}. {}", why.reason()) })),
     )
+}
+
+/// The controller admin, or the 503 explaining why there isn't one.
+///
+/// No admin means Matter is not configured, and [`MatterAvailability`] already
+/// knows precisely which of the causes that is — so this reuses the same wording
+/// as the commissioning routes rather than inventing a fifth message.
+fn matter_admin(
+    state: &AppState,
+) -> Result<
+    Arc<dyn pond_core::user_data::ports::matter_controller::MatterControllerAdmin>,
+    (StatusCode, Json<Value>),
+> {
+    if let Some(admin) = state.matter_admin.clone() {
+        return Ok(admin);
+    }
+    let why = match state.matter.ready() {
+        Err(w) => w.clone(),
+        // Ready implies a configured controller, so this branch is unreachable;
+        // treating it as "off" is the conservative answer rather than a panic.
+        Ok(_) => pond_core::user_data::ports::device_commissioning::MatterUnavailable::Disabled,
+    };
+    Err(matter_unavailable(
+        "Cannot manage the Matter controller",
+        &why,
+    ))
+}
+
+/// `GET /api/v1/matter/controller` — where the controller came from, how long it
+/// has been up, and whether GIAP may restart it.
+async fn matter_controller_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let admin = matter_admin(&state)?;
+    let status = admin.status().await;
+    Ok(Json(json!({
+        "origin": status.origin,
+        "description": status.origin.describe(),
+        "pid": status.pid,
+        "uptime_secs": status.uptime_secs,
+        "restartable": status.restartable,
+    })))
+}
+
+/// `POST /api/v1/matter/controller/restart` — stop the controller and start a
+/// fresh one, clearing a stale network stack.
+///
+/// Answers with the new status so the caller does not have to poll for it. The
+/// fabric is untouched: commissioned nodes live in the controller's storage
+/// directory, not in the process.
+async fn restart_matter_controller(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let admin = matter_admin(&state)?;
+    admin.restart().await.map_err(|e| {
+        // `{e:#}` so a refusal ("not managed by this Pond") and a real failure
+        // ("still holding the port") are told apart by the reader.
+        let reason = format!("{e:#}");
+        tracing::error!(error = %reason, "matter: controller restart failed");
+        (StatusCode::BAD_GATEWAY, Json(json!({"error": reason})))
+    })?;
+
+    let status = admin.status().await;
+    Ok(Json(json!({
+        "origin": status.origin,
+        "description": status.origin.describe(),
+        "pid": status.pid,
+        "uptime_secs": status.uptime_secs,
+        "restartable": status.restartable,
+    })))
 }
 
 /// `POST /api/v1/devices/commission` — bring a Matter device onto the fabric.

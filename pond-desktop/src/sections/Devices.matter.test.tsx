@@ -11,6 +11,8 @@ vi.mock("../api/PondApiClient", () => ({
     commissionDevice: vi.fn(),
     invokeTool: vi.fn(),
     getSettings: vi.fn(),
+    getMatterController: vi.fn(),
+    restartMatterController: vi.fn(),
     updateSettings: vi.fn(),
   },
 }));
@@ -22,6 +24,7 @@ beforeEach(() => {
   mocked(api.listDevices).mockResolvedValue([]);
   mocked(api.getSettings).mockResolvedValue({});
   mocked(api.updateSettings).mockResolvedValue({});
+  mocked(api.getMatterController).mockRejectedValue(new Error("not configured"));
 });
 afterEach(() => cleanup());
 

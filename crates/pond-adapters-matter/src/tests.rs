@@ -478,7 +478,7 @@ async fn mock_commissioning_server(node: Value) -> (String, ReceivedCommands) {
 async fn commission_with_name_writes_nodelabel() {
     let (url, received) = mock_commissioning_server(light_node_json()).await;
     let (client, _events) = MatterClient::connect(&url).await.unwrap();
-    let commissioner = MatterCommissioner::new(client);
+    let commissioner = MatterCommissioner::new(Arc::new(tokio::sync::RwLock::new(client)));
 
     let dev = commissioner
         .commission(SetupCode::Passcode(20202021), Some("Living Room".into()))
@@ -508,7 +508,7 @@ async fn commission_with_name_writes_nodelabel() {
 async fn commission_without_name_leaves_nodelabel_alone() {
     let (url, received) = mock_commissioning_server(light_node_json()).await;
     let (client, _events) = MatterClient::connect(&url).await.unwrap();
-    let commissioner = MatterCommissioner::new(client);
+    let commissioner = MatterCommissioner::new(Arc::new(tokio::sync::RwLock::new(client)));
 
     let dev = commissioner
         .commission(SetupCode::Passcode(20202021), None)
@@ -559,7 +559,7 @@ async fn decommission_treats_already_gone_as_success() {
     });
 
     let (client, _events) = MatterClient::connect(&url).await.unwrap();
-    let commissioner = MatterCommissioner::new(client);
+    let commissioner = MatterCommissioner::new(Arc::new(tokio::sync::RwLock::new(client)));
     // Not an error: the node is already off the fabric.
     commissioner.decommission(2).await.unwrap();
 }
@@ -570,7 +570,7 @@ async fn decommission_treats_already_gone_as_success() {
 async fn decommission_sends_remove_node() {
     let (url, received) = mock_commissioning_server(light_node_json()).await;
     let (client, _events) = MatterClient::connect(&url).await.unwrap();
-    let commissioner = MatterCommissioner::new(client);
+    let commissioner = MatterCommissioner::new(Arc::new(tokio::sync::RwLock::new(client)));
 
     commissioner.decommission(2).await.unwrap();
 

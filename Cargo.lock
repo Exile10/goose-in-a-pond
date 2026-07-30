@@ -8612,6 +8612,7 @@ dependencies = [
  "rand 0.10.1",
  "serde",
  "serde_json",
+ "sysinfo 0.33.1",
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tracing",
