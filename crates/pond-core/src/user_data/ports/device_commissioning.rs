@@ -124,11 +124,11 @@ impl MatterUnavailable {
     /// setting alone changes nothing until the Pond is restarted.
     pub fn reason(&self) -> String {
         match self {
-            Self::Disabled => "Matter is turned off. Turn it on under Settings > Extensions \
-                 > Matter, then restart the Pond so it connects to the controller."
+            Self::Disabled => "Matter is turned off. Turn it on under Devices > Matter, then \
+                 restart the Pond so it connects to the controller."
                 .to_string(),
             Self::NoUrl => "Matter is on but no controller address is set. Set one under \
-                 Settings > Extensions > Matter, then restart the Pond."
+                 Devices > Matter, then restart the Pond."
                 .to_string(),
             Self::Unreachable { url } => format!(
                 "Matter is on, but the controller at {url} did not answer when the Pond \

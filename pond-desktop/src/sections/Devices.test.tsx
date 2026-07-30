@@ -12,6 +12,9 @@ vi.mock("../api/PondApiClient", () => ({
     registerDevice: vi.fn(),
     unregisterDevice: vi.fn(),
     invokeTool: vi.fn(),
+    // The Matter panel reads these two settings when the screen mounts.
+    getSettings: vi.fn().mockResolvedValue({}),
+    updateSettings: vi.fn().mockResolvedValue({}),
   },
 }));
 

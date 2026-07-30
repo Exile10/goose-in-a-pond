@@ -655,16 +655,6 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
           <input type="number" step={0.01} min={0} max={1} className="native-input native-input--w80" style={{ opacity: (s.vision_enabled ?? false) ? 1 : 0.45 }} disabled={!(s.vision_enabled ?? false)} value={s.vision_motion_threshold ?? 0.1} onChange={(e) => patch("vision_motion_threshold", Number(e.target.value))} />
         </Row>
       </Section>
-      <Section title="Matter">
-        <Row label="Enable Matter" hint="Commission and control Matter devices via a local controller on your LAN. The Pond connects at startup, so restart it after changing this">
-          <Switch isSelected={s.matter_enabled ?? false} onChange={(v) => patch("matter_enabled", v)}>
-            <Switch.Control><Switch.Thumb /></Switch.Control>
-          </Switch>
-        </Row>
-        <Row label="Controller address" hint="WebSocket URL of the Matter controller. A loopback address is installed and started for you if nothing is serving it">
-          <input className="native-input" style={{ opacity: (s.matter_enabled ?? false) ? 1 : 0.45 }} disabled={!(s.matter_enabled ?? false)} value={s.matter_ws_url ?? ""} onChange={(e) => patch("matter_ws_url", e.target.value)} placeholder="ws://127.0.0.1:5580/ws" />
-        </Row>
-      </Section>
       <Section title="API Keys / Integrations">
         {API_KEYS.map(([label, key, hint]) => (
           <Row key={key} label={label} hint={hint}>

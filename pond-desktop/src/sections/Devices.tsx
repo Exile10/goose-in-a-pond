@@ -1,11 +1,12 @@
 import { useState, useEffect } from "react";
-import { Button, Separator } from "@heroui/react";
+import { Button, Separator, Switch } from "@heroui/react";
 import {
   Monitor, Cpu, Activity, Power, Settings, Plus, X, Radio, Smartphone,
   Lightbulb, Lock, Thermometer, Fan, Blinds,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import type { Device } from "../api/types";
+import type { Device, Settings as SettingsType } from "../api/types";
+import { Section, Row } from "../components/shared";
 import { refreshHomeData } from "../hub/state/hubDataStore";
 
 const DEVICE_TYPES = [
@@ -47,6 +48,89 @@ function timeSince(iso: string | null | undefined): string {
   const hours = Math.floor(mins / 60);
   if (hours < 24) return `${hours}h ago`;
   return `${Math.floor(hours / 24)}d ago`;
+}
+
+/**
+ * The Matter controller connection.
+ *
+ * It lives on this screen rather than under Settings because this is the screen
+ * that fails without it: "Register device" refuses a setup code when no
+ * controller is connected, and the two knobs that decide that should be within
+ * reach of the button that needs them.
+ *
+ * Each change is saved on its own. `PUT /api/v1/settings` records the keys a
+ * request carries as deliberately chosen, so sending only what actually changed
+ * keeps that record honest (docs/developer/settings-defaults-and-user-intent.md).
+ */
+function MatterPanel() {
+  const [enabled, setEnabled]   = useState(false);
+  const [url, setUrl]           = useState("");
+  const [baseline, setBaseline] = useState("");
+  const [loaded, setLoaded]     = useState(false);
+  const [error, setError]       = useState<string | null>(null);
+
+  useEffect(() => {
+    api.getSettings()
+      .then((s) => {
+        setEnabled(s.matter_enabled ?? false);
+        setUrl(s.matter_ws_url ?? "");
+        setBaseline(s.matter_ws_url ?? "");
+      })
+      .catch((e) => setError(String(e)))
+      .finally(() => setLoaded(true));
+  }, []);
+
+  async function save(patch: Partial<SettingsType>) {
+    setError(null);
+    try {
+      await api.updateSettings(patch);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function toggle(v: boolean) {
+    setEnabled(v);
+    await save({ matter_enabled: v });
+  }
+
+  // Committed on blur rather than per keystroke, so one edit is one save.
+  async function commitUrl() {
+    const next = url.trim();
+    if (next === baseline) return;
+    setBaseline(next);
+    await save({ matter_ws_url: next });
+  }
+
+  if (!loaded) return null;
+
+  return (
+    <Section title="Matter">
+      <Row
+        label="Enable Matter"
+        hint="Commission and control Matter devices through a local controller. The Pond connects to it at startup, so restart the Pond after changing this"
+      >
+        <Switch isSelected={enabled} onChange={toggle}>
+          <Switch.Control><Switch.Thumb /></Switch.Control>
+        </Switch>
+      </Row>
+      <Row
+        label="Controller address"
+        hint="WebSocket URL of the Matter controller. A loopback address is installed and started for you if nothing is serving it yet"
+      >
+        <input
+          className="native-input"
+          style={{ opacity: enabled ? 1 : 0.45 }}
+          disabled={!enabled}
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          onBlur={commitUrl}
+          placeholder="ws://127.0.0.1:5580/ws"
+        />
+      </Row>
+      {error && <p className="muted-12 text-error">{error}</p>}
+    </Section>
+  );
 }
 
 export function Devices() {
@@ -174,6 +258,8 @@ export function Devices() {
           </Button>
         </div>
       </div>
+
+      <MatterPanel />
 
       {loading && <p className="muted-12">Loading devices…</p>}
       {error   && <p className="muted-12 text-error">{error}</p>}

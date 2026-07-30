@@ -1647,7 +1647,9 @@ mod tests {
             "vision_classifier_model",
         ];
         // Everything else is surfaced in the desktop UI (Settings tabs / hub
-        // views / onboarding) and mirrored in the TS Settings type.
+        // views / onboarding, or the screen the setting belongs to — the Matter
+        // keys sit on Devices, next to the button that needs them) and mirrored
+        // in the TS Settings type.
         const UI_WIRED: &[&str] = &[
             "active_embedding_model",
             "active_llm_model",

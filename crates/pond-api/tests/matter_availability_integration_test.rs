@@ -233,8 +233,8 @@ async fn each_cause_gets_its_own_message_and_none_is_the_old_catch_all() {
 #[tokio::test]
 async fn the_switched_off_case_names_the_control_that_now_exists() {
     let (_, error) = commission_error(MatterUnavailable::Disabled).await;
-    // The Settings > Extensions > Matter section this change adds.
-    assert!(error.contains("Settings > Extensions > Matter"), "{error}");
+    // The Devices > Matter section this change adds.
+    assert!(error.contains("Devices > Matter"), "{error}");
     assert!(error.contains("restart"), "{error}");
 }
 
@@ -279,7 +279,7 @@ async fn deleting_a_matter_device_reports_the_same_cause_from_its_own_action() {
         error.starts_with("Cannot remove this device from the Matter fabric."),
         "{error}"
     );
-    assert!(error.contains("Settings > Extensions > Matter"), "{error}");
+    assert!(error.contains("Devices > Matter"), "{error}");
 }
 
 #[tokio::test]

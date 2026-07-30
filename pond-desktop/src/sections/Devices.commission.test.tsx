@@ -10,6 +10,9 @@ vi.mock("../api/PondApiClient", () => ({
     unregisterDevice: vi.fn(),
     commissionDevice: vi.fn(),
     invokeTool: vi.fn(),
+    // The Matter panel reads these two settings when the screen mounts.
+    getSettings: vi.fn().mockResolvedValue({}),
+    updateSettings: vi.fn().mockResolvedValue({}),
   },
 }));
 
@@ -117,10 +120,13 @@ describe("Add device — Matter vs other", () => {
     });
     fireEvent.click(screen.getByText("Commission"));
 
+    // Asserted against the error element itself, not the screen: the Matter
+    // panel on this same screen legitimately mentions the default address and
+    // the restart too, so a screen-wide query would match either one.
+    const shown = await screen.findByText(/did not answer when the Pond started/);
     // The specific cause, the address that failed, and the restart step.
-    expect(await screen.findByText(/did not answer when the Pond started/)).toBeTruthy();
-    expect(screen.getByText(/ws:\/\/127\.0\.0\.1:5580\/ws/)).toBeTruthy();
-    expect(screen.getByText(/restart the Pond/)).toBeTruthy();
+    expect(shown.textContent).toContain("ws://127.0.0.1:5580/ws");
+    expect(shown.textContent).toContain("restart the Pond");
   });
 
   it("switching to 'Other device' restores the manual fields and registers", async () => {
