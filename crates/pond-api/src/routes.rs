@@ -2329,10 +2329,16 @@ async fn commission_device(
         .commission(code, name.clone())
         .await
         .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": e.to_string()})),
-            )
+            // `{e:#}`, not `{e}`: the controller's actual reason is the source of
+            // this error, and plain Display prints only the outermost context —
+            // turning "mDNS discovery timed out" into a bare "commissioning
+            // failed" that tells the user nothing they can act on.
+            let reason = format!("{e:#}");
+            // Logged as well as returned: a failed pairing left no trace on the
+            // server at all, so the only record was a toast the user had already
+            // dismissed.
+            tracing::error!(error = %reason, "commission: pairing failed");
+            (StatusCode::BAD_GATEWAY, Json(json!({"error": reason})))
         })?;
 
     // Ensure the registry row exists with the intended name, regardless of
@@ -2392,10 +2398,14 @@ async fn unregister_device(
             })?
             .clone();
         commissioner.decommission(node_id).await.map_err(|e| {
+            // Same reasoning as commissioning: `{e:#}` keeps the controller's
+            // reason instead of collapsing it to the wrapper.
+            let reason = format!("{e:#}");
+            tracing::error!(node_id, error = %reason, "decommission: removal failed");
             (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
-                    "error": format!("could not remove the device from the fabric: {e}")
+                    "error": format!("could not remove the device from the fabric: {reason}")
                 })),
             )
         })?;

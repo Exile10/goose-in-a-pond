@@ -44,6 +44,29 @@ impl OnboardingRepository for CompletedOnboarding {
     }
 }
 
+/// A commissioner whose controller refuses, the way a real one does: a wrapper
+/// context over the underlying reason.
+struct FailingCommissioner;
+
+#[async_trait::async_trait]
+impl pond_core::user_data::ports::device_commissioning::DeviceCommissioningPort
+    for FailingCommissioner
+{
+    async fn commission(
+        &self,
+        _code: pond_core::user_data::ports::device_commissioning::SetupCode,
+        _name: Option<String>,
+    ) -> anyhow::Result<pond_core::user_data::ports::device_commissioning::CommissionedDevice> {
+        use anyhow::Context;
+        Err(anyhow::anyhow!("Mdns discovery timed out")).context("commissioning failed")
+    }
+
+    async fn decommission(&self, _node_id: u64) -> anyhow::Result<()> {
+        use anyhow::Context;
+        Err(anyhow::anyhow!("No route to host")).context("removing the node from the fabric failed")
+    }
+}
+
 struct NoDevices;
 
 #[async_trait::async_trait]
@@ -301,4 +324,74 @@ async fn a_non_matter_device_is_still_deletable_with_matter_off() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+// ── The controller's reason must survive the trip to the user ─────────────────
+//
+// The adapter wraps controller failures in a `.context("commissioning failed")`,
+// and the handler used to render them with plain Display, which prints only that
+// outermost layer. So a real, actionable cause — "Mdns discovery timed out" —
+// reached the user as a bare "commissioning failed", which is exactly the dead
+// end this whole change exists to remove.
+
+#[tokio::test]
+async fn a_failed_pairing_reports_the_controllers_reason_not_just_the_wrapper() {
+    let (app, _tmp) = make_app(MatterAvailability::Ready(Arc::new(FailingCommissioner))).await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/devices/commission")
+                .header("content-type", "application/json")
+                .header("Authorization", "Bearer test-token")
+                .body(Body::from(r#"{"code":"20202021"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let error = json["error"].as_str().unwrap();
+
+    // The cause is what the user can act on.
+    assert!(
+        error.contains("Mdns discovery timed out"),
+        "the controller's reason was dropped: {error}"
+    );
+    // The wrapper is kept as context, not as the whole message.
+    assert!(error.contains("commissioning failed"), "{error}");
+}
+
+#[tokio::test]
+async fn a_failed_removal_also_keeps_the_reason() {
+    let (app, _tmp) = make_app(MatterAvailability::Ready(Arc::new(FailingCommissioner))).await;
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/devices/matter-1")
+                .header("Authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let error = json["error"].as_str().unwrap();
+
+    assert!(
+        error.contains("No route to host"),
+        "reason dropped: {error}"
+    );
 }
