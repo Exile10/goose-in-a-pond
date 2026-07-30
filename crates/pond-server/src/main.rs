@@ -42,7 +42,6 @@ mod whisper_process;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use futures::StreamExt as _;
 use pond_adapters_llamafile::LlamafileProvider;
 use pond_adapters_ollama::OllamaProvider;
 #[cfg(feature = "legacy-subprocess")]
@@ -1524,6 +1523,10 @@ async fn run_server(
     // the selected local provider so a failed local inference spills over to a
     // cloud model (failure-only, never on success). OFF by default (privacy-first)
     // — the toggle is persisted but no spill path is wired yet.
+    // `data_dir` is read only by the in-process GGUF arm, so it is genuinely
+    // unused without `local-inference` — not a mistake worth renaming the
+    // parameter for.
+    #[cfg_attr(not(feature = "local-inference"), allow(unused_variables))]
     async fn build_provider(
         provider: &str,
         model: &str,
@@ -2323,7 +2326,25 @@ async fn run_server(
         )
     };
 
-    let (agent, extension_manager, _tool_caller, tool_registry) = if pond_agent_active {
+    // The Matter wiring above rides the `goose-agent` build. Without it there is
+    // no controller to drive, so device commands are logged and dropped — the
+    // same stub the Matter path itself falls back to when the controller is
+    // unreachable. Everything downstream (the MCP dispatcher, the schedule
+    // executor) takes a `DeviceControlPort` and does not care which it got.
+    #[cfg(not(feature = "goose-agent"))]
+    let device_control: Arc<
+        dyn pond_core::user_data::ports::device_control::DeviceControlPort,
+    > = Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new());
+
+    // Typed explicitly so both arms stand on their own: without the `goose-agent`
+    // feature there is no `build_goose_backend` signature to infer the `None`s
+    // from.
+    let (agent, extension_manager, _tool_caller, tool_registry): (
+        Arc<dyn Agent>,
+        Option<Arc<dyn pond_core::mcp::ports::extension_manager::ExtensionManagerPort>>,
+        Option<Arc<dyn pond_core::mcp::ports::tools::tool_caller::ToolCaller>>,
+        Arc<dyn pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort>,
+    ) = if pond_agent_active {
         // Build PondAgent directly — no Goose, no llama backend conflict.
         let default_registry: Arc<
             dyn pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort,
@@ -2387,46 +2408,48 @@ async fn run_server(
 
         (agent, None, None, default_registry)
     } else {
-        build_goose_backend(
-            agent_backend,
-            &llamafile_url,
-            &data_dir,
-            weather.clone(),
-            device_registry.clone(),
-            scheduler.clone(),
-            settings_repo.clone(),
-            memory_repo.clone(),
-            embedding_provider.clone(),
-            skill_repo.clone(),
-            recipe_repo.clone(),
-            prompt_template_repo.clone(),
-            prompt_extra_repo.clone(),
-            draft_repo.clone(),
-            device_control.clone(),
-            Some(session_storage.clone()),
-            false, // voice_mode — server mode, not voice
-        )
-        .await
-    };
-
-    #[cfg(not(feature = "goose-agent"))]
-    let tool_caller: Option<Arc<dyn pond_core::mcp::ports::tools::tool_caller::ToolCaller>> = None;
-    #[cfg(not(feature = "goose-agent"))]
-    let tool_registry: Arc<dyn pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort> =
-        Arc::new(pond_core::mcp::services::tool_registry::InMemoryToolRegistry::new());
-    #[cfg(not(feature = "goose-agent"))]
-    let (agent, extension_manager): (
-        Arc<dyn Agent>,
-        Option<Arc<dyn pond_core::mcp::ports::extension_manager::ExtensionManagerPort>>,
-    ) = {
-        if agent_backend == "goose" {
-            tracing::warn!(
-                "Goose agent backend requested but this binary was compiled without the `goose-agent` feature. \
-                 Rebuild with: cargo run -p pond-server -- serve  (goose-agent is a default feature). \
-                 Falling back to mock agent."
-            );
+        #[cfg(feature = "goose-agent")]
+        {
+            build_goose_backend(
+                agent_backend,
+                &llamafile_url,
+                &data_dir,
+                weather.clone(),
+                device_registry.clone(),
+                scheduler.clone(),
+                settings_repo.clone(),
+                memory_repo.clone(),
+                embedding_provider.clone(),
+                skill_repo.clone(),
+                recipe_repo.clone(),
+                prompt_template_repo.clone(),
+                prompt_extra_repo.clone(),
+                draft_repo.clone(),
+                device_control.clone(),
+                Some(session_storage.clone()),
+                false, // voice_mode — server mode, not voice
+            )
+            .await
         }
-        (Arc::new(MockAgent::new()), None)
+        // No Goose compiled in, so there is no backend to build and the mock
+        // agent answers instead. This is not something the user can fix at
+        // runtime — only a rebuild adds the feature — so say so plainly.
+        #[cfg(not(feature = "goose-agent"))]
+        {
+            if agent_backend == "goose" {
+                tracing::warn!(
+                    "Goose agent backend requested but this binary was compiled without the `goose-agent` feature. \
+                     Rebuild with: cargo run -p pond-server -- serve  (goose-agent is a default feature). \
+                     Falling back to mock agent."
+                );
+            }
+            (
+                Arc::new(MockAgent::new()),
+                None,
+                None,
+                Arc::new(pond_core::mcp::services::tool_registry::InMemoryToolRegistry::new()),
+            )
+        }
     };
 
     // ── Fill the deferred schedule executor now that the agent exists ─────────
@@ -3483,26 +3506,39 @@ async fn run_chat(
     let session_id = session_id_arg.unwrap_or("default-session").to_string();
 
     // ── Build repos for GooseAdapter (before db.system is consumed) ───────────────
+    //
+    // All but `template_repo` exist solely to be handed to the GooseAdapter
+    // below, so they are compiled only when there is an adapter to hand them to.
+    // `template_repo` is also used by the built-in reseed that follows, so it is
+    // built either way.
+    #[cfg(feature = "goose-agent")]
     let settings_repo_arc: Arc<
         dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
     > = Arc::new(SqliteSettingsRepository::new(db.system.clone()));
+    #[cfg(feature = "goose-agent")]
     let memory_repo: Arc<
         dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync,
     > = Arc::new(SqliteMemoryRepository::new(db.system.clone()));
-    let skill_repo: Arc<dyn pond_core::user_data::ports::skill::UserSkillRepository + Send + Sync> =
-        Arc::new(SqliteSkillRepository::new(db.system.clone()));
+    #[cfg(feature = "goose-agent")]
+    let skill_repo: Arc<
+        dyn pond_core::user_data::ports::skill::UserSkillRepository + Send + Sync,
+    > = Arc::new(SqliteSkillRepository::new(db.system.clone()));
+    #[cfg(feature = "goose-agent")]
     let recipe_repo: Arc<
         dyn pond_core::user_data::ports::recipe::AgentRecipeRepository + Send + Sync,
     > = Arc::new(SqliteRecipeRepository::new(db.system.clone()));
     let template_repo: Arc<
         dyn pond_core::user_data::ports::prompt_template::PromptTemplateRepository + Send + Sync,
     > = Arc::new(SqlitePromptTemplateRepository::new(db.system.clone()));
+    #[cfg(feature = "goose-agent")]
     let extras_repo: Arc<
         dyn pond_core::user_data::ports::prompt_extra::PromptExtraRepository + Send + Sync,
     > = Arc::new(SqlitePromptExtraRepository::new(db.system.clone()));
+    #[cfg(feature = "goose-agent")]
     let device_registry_arc: Arc<
         dyn pond_core::user_data::ports::device_registry::DeviceRegistry + Send + Sync,
     > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+    #[cfg(feature = "goose-agent")]
     let draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync> =
         Arc::new(SqliteDraftRepository::new(db.system.clone()));
 
@@ -3555,6 +3591,9 @@ async fn run_chat(
     // Wire weather so giap__get_current_weather MCP tool is available in voice mode.
     // Same gate as the primary wiring above: coordinates OR a location name (the
     // adapter geocodes the name), so an onboarded name-only config still works.
+    // Only the GooseAdapter receives the provider; the non-Goose path below reads
+    // the raw settings instead.
+    #[cfg(feature = "goose-agent")]
     let weather: Option<Arc<dyn WeatherProvider>> = if settings.weather_enabled
         && (settings.weather_latitude != 0.0
             || settings.weather_longitude != 0.0
@@ -6141,9 +6180,13 @@ async fn run_models(action: ModelAction) -> Result<()> {
 }
 
 // ── Agent CLI ─────────────────────────────────────────────────────────────────
+//
+// These two serve `run_agent_cmd` and nothing else, so they follow it in being
+// compiled only when there is a Goose backend for it to drive.
 
 /// Resolve the model role string from a `--role` flag value.
 /// All requests default to "chat" — the LLM handles tool routing natively via MCP.
+#[cfg(feature = "goose-agent")]
 fn resolve_role(role_arg: &str, _message: &str) -> String {
     match role_arg {
         "auto" | "chat" => "chat".to_string(),
@@ -6155,10 +6198,12 @@ fn resolve_role(role_arg: &str, _message: &str) -> String {
 ///
 /// Text tokens are printed as they arrive. Tool calls and results are shown
 /// on stderr so they don't pollute piped output. Returns when the stream ends.
+#[cfg(feature = "goose-agent")]
 async fn stream_agent_response(
     agent: &Arc<dyn Agent>,
     request: pond_core::shared::domain::agent::AgentRequest,
 ) -> Result<()> {
+    use futures::StreamExt as _;
     use pond_core::shared::domain::agent::AgentStreamEvent;
 
     let mut stream = agent.chat_stream(request).await?;
@@ -6238,10 +6283,23 @@ async fn stream_agent_response(
     Ok(())
 }
 
+/// The `agent` subcommand exists only to drive Goose directly — every arm asks
+/// for the `"goose"` backend by name — so without the feature there is nothing
+/// to fall back to. Failing here is better than a mock agent answering as though
+/// it were the real one.
+#[cfg(not(feature = "goose-agent"))]
+async fn run_agent_cmd(_action: AgentAction) -> Result<()> {
+    anyhow::bail!(
+        "the `agent` subcommand needs the `goose-agent` feature, and this binary was built \
+         without it. Rebuild with default features: cargo build -p pond-server"
+    )
+}
+
 /// One-shot or interactive Goose agent chat from the CLI.
 ///
 /// Builds the full GooseAdapter + GIAP MCP backend (same as `run_server`),
 /// streams the response to stdout, then exits (or loops in REPL mode).
+#[cfg(feature = "goose-agent")]
 async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
