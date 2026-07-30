@@ -2242,15 +2242,21 @@ async fn run_server(
     #[cfg(feature = "goose-agent")]
     let mut matter_server_child: Option<tokio::process::Child>;
 
-    // Matter commissioning, available only once a controller is connected.
-    // `None` means "Matter is off", which the API turns into a clear 503 rather
-    // than a confusing failure when someone submits a setup code.
-    type Commissioner =
-        Option<Arc<dyn pond_core::user_data::ports::device_commissioning::DeviceCommissioningPort>>;
+    // Matter commissioning, available only once a controller is connected — and
+    // when it is not, the reason why. The API turns the reason into a 503 that
+    // names the actual cause, so "turn it on in Settings" is never shown to
+    // someone whose setting is already on and whose controller is simply down.
+    use pond_core::user_data::ports::device_commissioning::{
+        MatterAvailability, MatterUnavailable,
+    };
+    // Left uninitialised on purpose: every branch of the wiring below assigns a
+    // definite outcome, so a placeholder here would only mask a missed one.
     #[cfg(feature = "goose-agent")]
-    let mut matter_commissioner: Commissioner = None;
+    let matter;
+    // Without the goose-agent feature there is no Matter adapter compiled in at
+    // all, so no setting can make commissioning work.
     #[cfg(not(feature = "goose-agent"))]
-    let matter_commissioner: Commissioner = None;
+    let matter = MatterAvailability::Unavailable(MatterUnavailable::Unsupported);
 
     #[cfg(feature = "goose-agent")]
     let (device_control, matter_bridge_parts): (
@@ -2291,7 +2297,7 @@ async fn run_server(
                     Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
                 tracing::info!(url = %settings.matter_ws_url, "Matter controller connected");
                 // Same connection commissions new devices onto the fabric.
-                matter_commissioner = Some(Arc::new(
+                matter = MatterAvailability::Ready(Arc::new(
                     pond_adapters_matter::MatterCommissioner::new(client.clone()),
                 ));
                 let control = Arc::new(pond_adapters_matter::MatterDeviceControl::new(
@@ -2308,6 +2314,9 @@ async fn run_server(
                     error = %e,
                     "Matter controller unreachable; device control falls back to the logging stub"
                 );
+                matter = MatterAvailability::Unavailable(MatterUnavailable::Unreachable {
+                    url: settings.matter_ws_url.trim().to_string(),
+                });
                 (
                     Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                     None,
@@ -2315,8 +2324,15 @@ async fn run_server(
             }
         }
     } else {
-        // Matter disabled: nothing to install, nothing to start.
+        // Matter disabled: nothing to install, nothing to start. Which of the
+        // two "off" states this is matters to the user: never switched on, or
+        // switched on with no controller address to connect to.
         matter_server_child = None;
+        matter = if settings.matter_enabled {
+            MatterAvailability::Unavailable(MatterUnavailable::NoUrl)
+        } else {
+            MatterAvailability::off()
+        };
         (
             Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
             None,
@@ -2909,7 +2925,7 @@ async fn run_server(
         tts,
         settings_repo,
         profile_repo,
-        commissioner: matter_commissioner,
+        matter,
         device_registry,
         memory_repo,
         embedding_provider,

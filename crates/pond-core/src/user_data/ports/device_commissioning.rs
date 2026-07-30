@@ -10,6 +10,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// What a device printed on its label (or an app shows) resolves to.
 ///
@@ -97,6 +98,78 @@ pub fn matter_node_id(device_id: &str) -> Option<u64> {
     device_id.strip_prefix("matter-")?.parse().ok()
 }
 
+/// Why this Pond cannot talk to a Matter controller.
+///
+/// Four very different problems used to surface as one sentence telling the user
+/// to "turn it on in Settings", which is unactionable when the setting is
+/// already on and the controller is simply down — or when the build has no
+/// Matter support at all. Each variant carries its own next step instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatterUnavailable {
+    /// `matter_enabled` is off.
+    Disabled,
+    /// Enabled, but `matter_ws_url` is blank.
+    NoUrl,
+    /// Enabled and addressed, but the controller did not answer at startup.
+    Unreachable { url: String },
+    /// Built without the `goose-agent` feature, so there is no Matter adapter.
+    Unsupported,
+}
+
+impl MatterUnavailable {
+    /// The cause and its remedy, as one sentence for the user.
+    ///
+    /// The three recoverable variants name the restart explicitly: the
+    /// controller connection is established once at startup, so flipping the
+    /// setting alone changes nothing until the Pond is restarted.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Disabled => "Matter is turned off. Turn it on under Settings > Extensions \
+                 > Matter, then restart the Pond so it connects to the controller."
+                .to_string(),
+            Self::NoUrl => "Matter is on but no controller address is set. Set one under \
+                 Settings > Extensions > Matter, then restart the Pond."
+                .to_string(),
+            Self::Unreachable { url } => format!(
+                "Matter is on, but the controller at {url} did not answer when the Pond \
+                 started. Check that it is running and reachable, then restart the Pond."
+            ),
+            Self::Unsupported => "This build has no Matter support: it was compiled without \
+                 the `goose-agent` feature."
+                .to_string(),
+        }
+    }
+}
+
+/// Whether this Pond can commission Matter devices, and if not, why.
+///
+/// Decided once at startup, when the controller connection is attempted. The
+/// commissioner and the reason live in the same enum so the two cannot drift out
+/// of sync — there is no way to hold a commissioner and still report a cause, or
+/// to lose the commissioner without recording one.
+#[derive(Clone)]
+pub enum MatterAvailability {
+    Ready(Arc<dyn DeviceCommissioningPort>),
+    Unavailable(MatterUnavailable),
+}
+
+impl MatterAvailability {
+    /// Matter off — the state of any Pond that has not enabled it.
+    pub fn off() -> Self {
+        Self::Unavailable(MatterUnavailable::Disabled)
+    }
+
+    /// The commissioner, or the reason there isn't one.
+    pub fn ready(
+        &self,
+    ) -> std::result::Result<&Arc<dyn DeviceCommissioningPort>, &MatterUnavailable> {
+        match self {
+            Self::Ready(c) => Ok(c),
+            Self::Unavailable(why) => Err(why),
+        }
+    }
+}
+
 /// Driven Port: bring a device onto — and off — the local fabric.
 #[async_trait]
 pub trait DeviceCommissioningPort: Send + Sync {
@@ -160,6 +233,48 @@ mod tests {
         assert_eq!(matter_node_id("fe78fa4d-0f85-4d48-bfc9-cc0cfd9f7d45"), None);
         assert_eq!(matter_node_id("matter-"), None);
         assert_eq!(matter_node_id("matter-abc"), None);
+    }
+
+    #[test]
+    fn every_unavailable_cause_reads_differently() {
+        let causes = [
+            MatterUnavailable::Disabled,
+            MatterUnavailable::NoUrl,
+            MatterUnavailable::Unreachable {
+                url: "ws://127.0.0.1:5580/ws".into(),
+            },
+            MatterUnavailable::Unsupported,
+        ];
+        let reasons: Vec<String> = causes.iter().map(MatterUnavailable::reason).collect();
+
+        // The whole point of the enum: four causes, four distinct messages. A
+        // user who cannot commission must be able to tell which one they hit.
+        for reason in &reasons {
+            assert!(!reason.is_empty());
+        }
+        for (i, a) in reasons.iter().enumerate() {
+            for b in &reasons[i + 1..] {
+                assert_ne!(a, b, "two causes share one message");
+            }
+        }
+
+        // The unreachable case names the address that failed, so the user knows
+        // which controller to go and look at.
+        assert!(reasons[2].contains("ws://127.0.0.1:5580/ws"));
+
+        // The three fixable causes say a restart is needed; the connection is
+        // made once at startup, so flipping the setting alone is not enough.
+        for reason in &reasons[..3] {
+            assert!(reason.contains("restart"), "missing the restart step");
+        }
+    }
+
+    #[test]
+    fn off_reports_disabled_rather_than_a_commissioner() {
+        match MatterAvailability::off().ready() {
+            Err(why) => assert_eq!(why, &MatterUnavailable::Disabled),
+            Ok(_) => panic!("Matter is off; there should be no commissioner"),
+        }
     }
 
     #[test]

@@ -2261,6 +2261,23 @@ async fn register_device(
     ))
 }
 
+/// The 503 for "this Pond cannot reach a Matter controller", with the cause.
+///
+/// Shared by every Matter route so the wording cannot drift between them, and so
+/// none of them can regress to a single message that hides which of the four
+/// causes (off / no address / controller down / unsupported build) actually
+/// applies. `action` names what failed, in the imperative, so the sentence reads
+/// as one thought: "Cannot commission a device. Matter is turned off…".
+fn matter_unavailable(
+    action: &str,
+    why: &pond_core::user_data::ports::device_commissioning::MatterUnavailable,
+) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": format!("{action}. {}", why.reason()) })),
+    )
+}
+
 /// `POST /api/v1/devices/commission` — bring a Matter device onto the fabric.
 ///
 /// Distinct from `register_device` on purpose: a Matter device is not GIAP's to
@@ -2284,14 +2301,11 @@ async fn commission_device(
         )
     })?;
 
-    let Some(commissioner) = state.commissioner.clone() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": "Matter is not enabled on this Pond — turn it on in Settings first."
-            })),
-        ));
-    };
+    let commissioner = state
+        .matter
+        .ready()
+        .map_err(|why| matter_unavailable("Cannot commission a device", why))?
+        .clone();
 
     let raw = req.get("code").and_then(Value::as_str).unwrap_or_default();
     // Validated before it reaches the controller.
@@ -2370,15 +2384,13 @@ async fn unregister_device(
     // If we cannot reach the controller to do so, the delete is refused rather
     // than half-applied.
     if let Some(node_id) = pond_core::user_data::ports::device_commissioning::matter_node_id(&id) {
-        let Some(commissioner) = state.commissioner.clone() else {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "error": "Matter is off, so this device cannot be removed from the fabric. \
-                              Enable Matter and try again."
-                })),
-            ));
-        };
+        let commissioner = state
+            .matter
+            .ready()
+            .map_err(|why| {
+                matter_unavailable("Cannot remove this device from the Matter fabric", why)
+            })?
+            .clone();
         commissioner.decommission(node_id).await.map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,

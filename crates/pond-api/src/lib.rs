@@ -154,9 +154,9 @@ pub struct AppState {
     pub profile_repo: Arc<dyn ProfileRepository + Send + Sync>,
     /// Device registry for GOTG devices and other connected hardware.
     pub device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
-    /// Matter commissioning, when a controller is wired (None = Matter off).
-    pub commissioner:
-        Option<Arc<dyn pond_core::user_data::ports::device_commissioning::DeviceCommissioningPort>>,
+    /// Matter commissioning, or why it is unavailable — decided at startup so
+    /// the API can name the actual cause instead of one catch-all sentence.
+    pub matter: pond_core::user_data::ports::device_commissioning::MatterAvailability,
     /// Memory fragment repository for semantic/recency-based retrieval.
     pub memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
     /// Embedding provider — `None` until a real embedding model is configured.

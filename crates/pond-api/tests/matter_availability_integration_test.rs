@@ -1,11 +1,13 @@
-//! Integration tests for GET/PUT /api/v1/settings
+//! Integration tests for the Matter-unavailable responses.
 //!
-//! Verifies:
-//! 1. PUT returns the FULL Settings object (not {"status":"ok"}).
-//! 2. Partial patch preserves unmodified fields.
-//! 3. GET returns the current settings after a PUT.
+//! Commissioning used to answer every failure with one sentence — "Matter is not
+//! enabled on this Pond — turn it on in Settings first." — which was wrong twice
+//! over: there was no such control in Settings, and the message was also what a
+//! user saw when the setting was already on and the controller was simply down,
+//! or when the binary had no Matter support at all. These tests pin the four
+//! causes to four distinct, actionable messages on both Matter routes.
 //!
-//! Run: cargo test -p pond-api --test settings_integration_test
+//! Run: cargo test -p pond-api --test matter_availability_integration_test
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -16,6 +18,7 @@ use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
 use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
 use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
 use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
+use pond_core::user_data::ports::device_commissioning::{MatterAvailability, MatterUnavailable};
 use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 use pond_core::user_data::ports::onboarding::OnboardingRepository;
 use pond_infra::mock_handshake::MockHandshake;
@@ -24,7 +27,7 @@ use reqwest::Client as ReqwestClient;
 use std::sync::Arc;
 use tower::ServiceExt;
 
-// ── Stubs ──────────────────────────────────────────────────────────────���───────
+// ── Stubs ─────────────────────────────────────────────────────────────────────
 
 struct CompletedOnboarding;
 
@@ -73,7 +76,9 @@ impl DeviceRegistry for NoDevices {
     }
 }
 
-async fn make_app() -> (axum::Router, tempfile::TempDir) {
+/// An app wired with a specific Matter availability, so each startup outcome can
+/// be exercised without standing up a controller.
+async fn make_app(matter: MatterAvailability) -> (axum::Router, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
     let session_storage = Arc::new(SqliteSessionStorage::new(db.system.clone()));
@@ -96,7 +101,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(NoDevices),
-        matter: pond_core::user_data::ports::device_commissioning::MatterAvailability::off(),
+        matter,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
@@ -159,143 +164,102 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
     )
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────────
+/// The `error` string from a commission attempt, and the status it came with.
+async fn commission_error(why: MatterUnavailable) -> (StatusCode, String) {
+    let (app, _tmp) = make_app(MatterAvailability::Unavailable(why)).await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/devices/commission")
+                .header("content-type", "application/json")
+                .header("Authorization", "Bearer test-token")
+                // A valid code, so nothing else can be the reason for the refusal.
+                .body(Body::from(r#"{"code":"20202021"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-/// PUT /api/v1/settings must return the full Settings object, not {"status":"ok"}.
-/// The frontend calls updateSettings() and expects a Settings type back.
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    (
+        status,
+        json["error"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
 #[tokio::test]
-async fn put_settings_returns_full_settings_object() {
-    let (app, _tmp) = make_app().await;
+async fn each_cause_gets_its_own_message_and_none_is_the_old_catch_all() {
+    let causes = [
+        MatterUnavailable::Disabled,
+        MatterUnavailable::NoUrl,
+        MatterUnavailable::Unreachable {
+            url: "ws://127.0.0.1:5580/ws".to_string(),
+        },
+        MatterUnavailable::Unsupported,
+    ];
 
-    let patch = serde_json::json!({
-        "assistant_name": "Jarvis"
-    });
+    let mut messages = Vec::new();
+    for cause in causes {
+        let (status, error) = commission_error(cause).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // Every message says what failed before it says why.
+        assert!(
+            error.starts_with("Cannot commission a device."),
+            "missing the action that failed: {error}"
+        );
+        // The message this whole change exists to remove: it pointed at a
+        // Settings control that did not exist, for a cause it had not checked.
+        assert!(
+            !error.contains("turn it on in Settings first"),
+            "the old catch-all is back: {error}"
+        );
+        messages.push(error);
+    }
+
+    for (i, a) in messages.iter().enumerate() {
+        for b in &messages[i + 1..] {
+            assert_ne!(a, b, "two causes are indistinguishable to the user");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_switched_off_case_names_the_control_that_now_exists() {
+    let (_, error) = commission_error(MatterUnavailable::Disabled).await;
+    // The Settings > Extensions > Matter section this change adds.
+    assert!(error.contains("Settings > Extensions > Matter"), "{error}");
+    assert!(error.contains("restart"), "{error}");
+}
+
+#[tokio::test]
+async fn a_controller_that_is_down_is_not_reported_as_a_setting_problem() {
+    let (_, error) = commission_error(MatterUnavailable::Unreachable {
+        url: "ws://10.0.0.7:5580/ws".to_string(),
+    })
+    .await;
+
+    // Naming the address is the difference between a dead end and a next step.
+    assert!(error.contains("ws://10.0.0.7:5580/ws"), "{error}");
+    // Telling this user to switch a setting on would be actively misleading.
+    assert!(!error.contains("Turn it on"), "{error}");
+}
+
+#[tokio::test]
+async fn deleting_a_matter_device_reports_the_same_cause_from_its_own_action() {
+    let (app, _tmp) = make_app(MatterAvailability::Unavailable(MatterUnavailable::Disabled)).await;
 
     let resp = app
         .oneshot(
             Request::builder()
-                .method("PUT")
-                .uri("/api/v1/settings")
-                .header("content-type", "application/json")
-                .header("Authorization", "Bearer test-token")
-                .body(Body::from(serde_json::to_vec(&patch).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-
-    // Must be a Settings object — NOT {"status":"ok"}
-    assert!(
-        json.get("status").and_then(|s| s.as_str()) != Some("ok"),
-        "PUT /settings returned {{\"status\":\"ok\"}} — should return full Settings"
-    );
-
-    // Should have known Settings fields
-    assert!(
-        json.get("assistant_name").is_some() || json.get("user_name").is_some(),
-        "Response doesn't look like a Settings object: {json}"
-    );
-
-    // The patched field should be reflected
-    assert_eq!(
-        json.get("assistant_name").and_then(|v| v.as_str()),
-        Some("Jarvis"),
-        "assistant_name not updated in response: {json}"
-    );
-}
-
-/// Partial patch preserves other fields.
-#[tokio::test]
-async fn put_settings_partial_patch_preserves_other_fields() {
-    let (app, _tmp) = make_app().await;
-
-    // First: set both fields
-    let patch1 = serde_json::json!({
-        "assistant_name": "Pond",
-        "user_name": "Jerry"
-    });
-    let resp1 = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/api/v1/settings")
-                .header("content-type", "application/json")
-                .header("Authorization", "Bearer test-token")
-                .body(Body::from(serde_json::to_vec(&patch1).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp1.status(), StatusCode::OK);
-
-    // Second: patch only assistant_name
-    let patch2 = serde_json::json!({ "assistant_name": "Goose" });
-    let resp2 = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/api/v1/settings")
-                .header("content-type", "application/json")
-                .header("Authorization", "Bearer test-token")
-                .body(Body::from(serde_json::to_vec(&patch2).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp2.status(), StatusCode::OK);
-
-    let bytes = axum::body::to_bytes(resp2.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-
-    assert_eq!(
-        json.get("assistant_name").and_then(|v| v.as_str()),
-        Some("Goose"),
-    );
-    // user_name from patch1 should be preserved
-    assert_eq!(
-        json.get("user_name").and_then(|v| v.as_str()),
-        Some("Jerry"),
-        "user_name was lost after partial patch"
-    );
-}
-
-/// GET /api/v1/settings returns current settings (including previously PUT values).
-#[tokio::test]
-async fn get_settings_returns_current_settings() {
-    let (app, _tmp) = make_app().await;
-
-    // Put a value
-    let patch = serde_json::json!({ "assistant_name": "Ducky" });
-    app.clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/api/v1/settings")
-                .header("content-type", "application/json")
-                .header("Authorization", "Bearer test-token")
-                .body(Body::from(serde_json::to_vec(&patch).unwrap()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    // Get settings
-    let get_resp = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/api/v1/settings")
+                .method("DELETE")
+                .uri("/api/v1/devices/matter-1")
                 .header("Authorization", "Bearer test-token")
                 .body(Body::empty())
                 .unwrap(),
@@ -303,31 +267,32 @@ async fn get_settings_returns_current_settings() {
         .await
         .unwrap();
 
-    assert_eq!(get_resp.status(), StatusCode::OK);
-
-    let bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let error = json["error"].as_str().unwrap();
 
-    assert_eq!(
-        json.get("assistant_name").and_then(|v| v.as_str()),
-        Some("Ducky"),
+    // Its own lead-in, the shared cause — the two routes cannot drift apart.
+    assert!(
+        error.starts_with("Cannot remove this device from the Matter fabric."),
+        "{error}"
     );
+    assert!(error.contains("Settings > Extensions > Matter"), "{error}");
 }
 
-/// GET /api/v1/weather must report {"enabled": false} rather than error
-/// when no weather provider is configured (the default in tests / for
-/// users who haven't set a location).
 #[tokio::test]
-async fn get_weather_reports_disabled_without_provider() {
-    let (app, _tmp) = make_app().await;
+async fn a_non_matter_device_is_still_deletable_with_matter_off() {
+    // The Matter gate is keyed on the `matter-<node_id>` id shape. A plain
+    // catalogue entry must not be caught by it.
+    let (app, _tmp) = make_app(MatterAvailability::off()).await;
 
     let resp = app
         .oneshot(
             Request::builder()
-                .method("GET")
-                .uri("/api/v1/weather")
+                .method("DELETE")
+                .uri("/api/v1/devices/living-room-pi")
                 .header("Authorization", "Bearer test-token")
                 .body(Body::empty())
                 .unwrap(),
@@ -335,12 +300,5 @@ async fn get_weather_reports_disabled_without_provider() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-
-    assert_eq!(json.get("enabled").and_then(|v| v.as_bool()), Some(false));
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 }

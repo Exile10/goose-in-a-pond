@@ -41,6 +41,8 @@ vi.mock("../api/PondApiClient", () => ({
     updateSettings: vi.fn(),
     resetWakeWordCalibration: vi.fn().mockResolvedValue(undefined),
     listModels: vi.fn().mockResolvedValue([]),
+    // The Extensions panel lists MCP servers on mount.
+    listExtensions: vi.fn().mockResolvedValue({ extensions: [] }),
     getActiveRoles: vi.fn().mockResolvedValue({ chat: null, think: null, task: null, asr: null, tts: null }),
   },
 }));
@@ -174,6 +176,30 @@ describe("Settings", () => {
     expect(memLimit).toBeTruthy();
   });
 
+  // Matter used to be reachable only by hand-writing the DB or calling the
+  // settings API, while the commissioning error told the user to "turn it on in
+  // Settings" — a control that did not exist. These guard the control existing.
+  it("Extensions panel offers a Matter toggle with the controller address", async () => {
+    await renderSettings();
+    await navigateTo("Extensions (MCP)");
+    await waitFor(() => {
+      if (!screen.queryByText("Matter")) throw new Error("not rendered");
+    });
+    expect(screen.getByText("Enable Matter")).toBeTruthy();
+    expect(screen.getByPlaceholderText("ws://127.0.0.1:5580/ws")).toBeTruthy();
+  });
+
+  it("the controller address is disabled until Matter is switched on", async () => {
+    await renderSettings();
+    await navigateTo("Extensions (MCP)");
+    await waitFor(() => {
+      if (!screen.queryByText("Matter")) throw new Error("not rendered");
+    });
+    // matter_enabled defaults off, so the address cannot be edited yet.
+    const url = screen.getByPlaceholderText("ws://127.0.0.1:5580/ws") as HTMLInputElement;
+    expect(url.disabled).toBe(true);
+  });
+
   it("Privacy panel shows data retention fields", async () => {
     await renderSettings();
     enableDevMode();
@@ -243,6 +269,23 @@ describe("Settings save payload", () => {
     await clickSave();
 
     expect(sentPatch()).toEqual({ user_name: "Ochieng" });
+  });
+
+  it("switching Matter on persists it, so the setting is reachable without the DB", async () => {
+    await renderSettings();
+    await navigateTo("Extensions (MCP)");
+    await waitFor(() => {
+      if (!screen.queryByText("Matter")) throw new Error("not rendered");
+    });
+
+    // Row does not associate its label with the control, so reach the switch
+    // through the row that owns it.
+    const row = screen.getByText("Enable Matter").closest(".row") as HTMLElement;
+    const toggle = row.querySelector("input") as HTMLInputElement;
+    fireEvent.click(toggle);
+    await clickSave();
+
+    expect(sentPatch()).toEqual({ matter_enabled: true });
   });
 
   it("never re-sends the server-owned wake-word transcriptions", async () => {

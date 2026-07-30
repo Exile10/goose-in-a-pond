@@ -98,6 +98,31 @@ describe("Add device — Matter vs other", () => {
     expect(screen.getByText("Setup code")).toBeTruthy();
   });
 
+  it("shows the server's reason and remedy when Matter is unavailable", async () => {
+    // The server distinguishes four causes (off / no address / controller down /
+    // unsupported build). Whichever it sends must reach the user intact — the
+    // old single message told people to flip a setting that had no control, and
+    // said nothing about the restart the connection actually needs.
+    mocked(api.commissionDevice).mockRejectedValue(
+      new Error(
+        "Cannot commission a device. Matter is on, but the controller at " +
+          "ws://127.0.0.1:5580/ws did not answer when the Pond started. Check that it is " +
+          "running and reachable, then restart the Pond.",
+      ),
+    );
+    await openModal();
+
+    fireEvent.change(await screen.findByPlaceholderText(/20202021/), {
+      target: { value: "20202021" },
+    });
+    fireEvent.click(screen.getByText("Commission"));
+
+    // The specific cause, the address that failed, and the restart step.
+    expect(await screen.findByText(/did not answer when the Pond started/)).toBeTruthy();
+    expect(screen.getByText(/ws:\/\/127\.0\.0\.1:5580\/ws/)).toBeTruthy();
+    expect(screen.getByText(/restart the Pond/)).toBeTruthy();
+  });
+
   it("switching to 'Other device' restores the manual fields and registers", async () => {
     mocked(api.registerDevice).mockResolvedValue({ id: "d1", name: "Pi" });
     await openModal();

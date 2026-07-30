@@ -112,7 +112,7 @@ async fn make_memory_app() -> (axum::Router, Arc<MockMemoryRepository>, tempfile
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(NoDevices),
-        commissioner: None,
+        matter: pond_core::user_data::ports::device_commissioning::MatterAvailability::off(),
         memory_repo: memory_repo.clone(),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),

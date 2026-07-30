@@ -200,6 +200,10 @@ export interface Settings {
   vision_fps?: number;
   vision_motion_threshold?: number;
 
+  // Matter (local controller connection; connects at server startup)
+  matter_enabled?: boolean;
+  matter_ws_url?: string;
+
   // Inference stats display
   show_turn_stats?: boolean;
 }
