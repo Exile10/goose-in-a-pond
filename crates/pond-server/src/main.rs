@@ -17,6 +17,7 @@
 //!   7. Initializes databases at a configurable data directory
 //!   8. Prompts for initial onboarding if not yet done
 
+mod asset_root;
 mod composite_model_catalog_provider;
 mod filesystem_model_storage;
 mod http_model_downloader;
@@ -2468,8 +2469,14 @@ async fn run_server(
 
     // Marketplace — curated registry of installable extensions.
     // Initialized before MCP auto-connect so startup can look up required_secrets.
+    // The asset root anchors entries that launch a bundled script, so they no
+    // longer depend on which directory pond-server happened to be started from.
+    let asset_root = asset_root::resolve();
+    tracing::info!(asset_root = %asset_root.display(), "resolved extension asset root");
     let marketplace: Arc<dyn pond_core::mcp::ports::extension_marketplace::ExtensionMarketplace> =
-        Arc::new(pond_core::mcp::services::marketplace::BundledMarketplace::new());
+        Arc::new(
+            pond_core::mcp::services::marketplace::BundledMarketplace::with_asset_root(&asset_root),
+        );
 
     // MCP client — load persisted server configs and auto-connect enabled ones.
     let mcp_server_repo: Option<Arc<dyn pond_core::mcp::ports::mcp_server::McpServerRepository>> = {
@@ -2484,20 +2491,63 @@ async fn run_server(
                     {
                         use pond_core::mcp::ports::extension_manager::AddExtensionRequest;
 
-                        // Start with persisted env, then resolve any secrets
-                        // from the secret repo that aren't already present.
-                        // This ensures OAuth tokens (stored in secrets.json,
-                        // not in mcp_servers.env) are injected at startup.
+                        // Start with the persisted env, then overwrite every
+                        // secret from the secret repository.
+                        //
+                        // The repository is authoritative for credentials; the
+                        // env stored on the row is a snapshot taken when the
+                        // extension was installed. Preferring the snapshot
+                        // handed the child an access token that had since been
+                        // rotated, on every restart, for as long as the row
+                        // survived — so overwrite rather than fill the gaps.
                         let mut env = srv.env.clone();
                         if let Some(sr) = &secret_repo {
                             if let Ok(Some(ext)) = marketplace.get_by_id(&srv.name).await {
                                 for secret_req in &ext.required_secrets {
-                                    if !env.contains_key(&secret_req.key) {
-                                        if let Ok(Some(val)) = sr.get(&secret_req.key).await {
-                                            env.insert(secret_req.key.clone(), val);
-                                        }
+                                    if let Ok(Some(val)) = sr.get(&secret_req.key).await {
+                                        env.insert(secret_req.key.clone(), val);
                                     }
                                 }
+                            }
+                        }
+
+                        // The internal token is a fresh UUID per process run, so
+                        // the persisted copy is always from a dead process. Left
+                        // alone, the child authenticates to /oauth/refresh with
+                        // it, gets a 401, and can never recover from an expired
+                        // access token — the extension simply stops working an
+                        // hour after every restart.
+                        //
+                        // GIAP_SERVER_URL is deliberately left as persisted:
+                        // auto-connect runs before the listener binds, so the
+                        // port is not known here. Install and the OAuth callback
+                        // both run after binding and write the correct value.
+                        env.insert(
+                            pond_api::oauth_callback::INTERNAL_TOKEN_ENV_KEY.to_string(),
+                            pond_api::oauth_callback::internal_extension_token().to_string(),
+                        );
+
+                        // A config persisted before extension paths were anchored
+                        // still carries a cwd-relative arg, which only resolves
+                        // when the server is launched from the repo root. Re-anchor
+                        // it here so an existing install heals on restart instead
+                        // of needing a manual remove-and-reinstall.
+                        let mut args = srv.args.clone();
+                        if pond_core::mcp::services::marketplace::anchor_asset_args(
+                            &mut args,
+                            &asset_root,
+                        ) {
+                            tracing::info!(
+                                extension = %srv.name,
+                                "re-anchored persisted extension args to the asset root"
+                            );
+                            let mut migrated = srv.clone();
+                            migrated.args = args.clone();
+                            if let Err(e) = repo.save(&migrated).await {
+                                tracing::warn!(
+                                    "failed to persist re-anchored args for '{}': {e}",
+                                    srv.name
+                                );
                             }
                         }
 
@@ -2506,7 +2556,7 @@ async fn run_server(
                             kind: srv.kind.clone(),
                             description: srv.description.clone(),
                             command: srv.command.clone(),
-                            args: srv.args.clone(),
+                            args,
                             env,
                             uri: srv.uri.clone(),
                         };
@@ -2977,6 +3027,7 @@ async fn run_server(
             .map(|(uri, html)| (uri.to_string(), html))
             .collect(),
         oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        oauth_outcomes: pond_api::oauth_callback::new_oauth_outcomes(),
         security_policy,
         api_port,
         weather_provider: weather.clone(),

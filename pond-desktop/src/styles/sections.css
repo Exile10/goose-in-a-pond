@@ -3636,6 +3636,15 @@
   margin: 0;
 }
 
+/* Shown when a token is already stored: signing in again is a deliberate
+   choice, not something the modal should do (or skip) on the user's behalf. */
+.secret-modal__oauth-note {
+  font-size: var(--text-sm);
+  color: var(--grey-500);
+  line-height: 1.5;
+  margin: 0;
+}
+
 .secret-modal__oauth-btn {
   display: inline-flex;
   align-items: center;

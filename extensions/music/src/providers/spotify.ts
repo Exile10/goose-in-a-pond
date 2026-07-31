@@ -68,8 +68,16 @@ export class SpotifyProvider implements MusicProvider {
     return false;
   }
 
-  private async api<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
-    const resp = await fetch(`${this.baseUrl}${path}`, {
+  /**
+   * Issues a request, refreshing the token and retrying once on a 401.
+   *
+   * Returns the raw `Response` and reads nothing from it — whether there is a
+   * body, and what it means, is the caller's business.
+   */
+  private async request(method: string, path: string, body?: unknown): Promise<Response> {
+    // Re-read the `token` getter on each attempt: a refresh replaces the token
+    // in place, and the retry has to send the new one.
+    const send = () => fetch(`${this.baseUrl}${path}`, {
       method,
       headers: {
         'Authorization': `Bearer ${this.token}`,
@@ -78,38 +86,51 @@ export class SpotifyProvider implements MusicProvider {
       body: body ? JSON.stringify(body) : undefined,
     });
 
-    if (resp.status === 401) {
-      // Token expired — refresh and retry once
-      const refreshed = await this.refreshToken();
-      if (refreshed) {
-        const retry = await fetch(`${this.baseUrl}${path}`, {
-          method,
-          headers: {
-            'Authorization': `Bearer ${this.token}`,
-            'Content-Type': 'application/json',
-          },
-          body: body ? JSON.stringify(body) : undefined,
-        });
-        if (retry.status === 204) return {} as T;
-        if (retry.ok) return retry.json() as Promise<T>;
-        const err = await retry.text();
-        throw new Error(`Spotify API ${retry.status} (after refresh): ${err}`);
-      }
-      throw new Error(
-        'Spotify token expired and refresh failed. Re-authenticate via GIAP Extensions.'
-      );
-    }
+    let resp = await send();
+    let afterRefresh = '';
 
-    if (resp.status === 204) {
-      return {} as T;
+    if (resp.status === 401) {
+      if (!await this.refreshToken()) {
+        throw new Error(
+          'Spotify token expired and refresh failed. Re-authenticate via GIAP Extensions.'
+        );
+      }
+      resp = await send();
+      afterRefresh = ' (after refresh)';
     }
 
     if (!resp.ok) {
-      const err = await resp.text();
-      throw new Error(`Spotify API ${resp.status}: ${err}`);
+      throw new Error(`Spotify API ${resp.status}${afterRefresh}: ${await resp.text()}`);
     }
 
-    return resp.json() as Promise<T>;
+    return resp;
+  }
+
+  /**
+   * Issues a request whose response body is of no interest.
+   *
+   * The player-control endpoints are documented to answer 204, but Spotify
+   * actually answers `POST /me/player/next` with a 200 that carries no
+   * content-type and a 27-byte opaque token. Parsing that as JSON is what made
+   * every skip fail with `Unexpected token ... is not valid JSON` — on a body
+   * no caller has ever read.
+   */
+  private async command(method: string, path: string, body?: unknown): Promise<void> {
+    await this.request(method, path, body);
+  }
+
+  /**
+   * Issues a request and parses a JSON body, tolerating a bodyless success.
+   *
+   * Reads the body as text first: `Response.json()` throws on an empty body,
+   * and an empty 200 or a 204 is a legitimate answer to several of these calls.
+   * A non-empty body that is not JSON is still an error worth surfacing.
+   */
+  private async api<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
+    const resp = await this.request(method, path, body);
+    const text = await resp.text();
+    if (!text.trim()) return {} as T;
+    return JSON.parse(text) as T;
   }
 
   private parseTrack(track: SpotifyTrack): TrackInfo {
@@ -156,33 +177,33 @@ export class SpotifyProvider implements MusicProvider {
       }
     }
 
-    await this.api('PUT', '/me/player/play', Object.keys(body).length > 0 ? body : undefined);
+    await this.command('PUT', '/me/player/play', Object.keys(body).length > 0 ? body : undefined);
     return uri ? `Playing ${uri}` : 'Resumed playback';
   }
 
   async pause(): Promise<string> {
-    await this.api('PUT', '/me/player/pause');
+    await this.command('PUT', '/me/player/pause');
     return 'Playback paused';
   }
 
   async next(): Promise<string> {
-    await this.api('POST', '/me/player/next');
+    await this.command('POST', '/me/player/next');
     return 'Skipped to next track';
   }
 
   async previous(): Promise<string> {
-    await this.api('POST', '/me/player/previous');
+    await this.command('POST', '/me/player/previous');
     return 'Went to previous track';
   }
 
   async setVolume(percent: number): Promise<string> {
     const clamped = Math.max(0, Math.min(100, Math.round(percent)));
-    await this.api('PUT', `/me/player/volume?volume_percent=${clamped}`);
+    await this.command('PUT', `/me/player/volume?volume_percent=${clamped}`);
     return `Volume set to ${clamped}%`;
   }
 
   async setShuffle(enabled: boolean): Promise<string> {
-    await this.api('PUT', `/me/player/shuffle?state=${enabled}`);
+    await this.command('PUT', `/me/player/shuffle?state=${enabled}`);
     return `Shuffle ${enabled ? 'enabled' : 'disabled'}`;
   }
 
@@ -194,18 +215,20 @@ export class SpotifyProvider implements MusicProvider {
       device?: { volume_percent: number };
     }
 
-    try {
-      const data = await this.api<PlayerState>('GET', '/me/player');
-      if (!data || !data.item) return null;
+    // Errors deliberately propagate. `null` here means one thing only —
+    // Spotify answered, and nothing is playing — because that is exactly how
+    // the caller reports it ("Nothing is currently playing on Spotify"). A
+    // `catch` returning null made an expired token, a failed refresh and an
+    // unreachable Spotify all indistinguishable from an idle player, which is
+    // the most misleading answer available.
+    const data = await this.api<PlayerState>('GET', '/me/player');
+    if (!data || !data.item) return null;
 
-      const track = this.parseTrack(data.item);
-      track.is_playing = data.is_playing;
-      track.progress_ms = data.progress_ms;
-      track.volume_percent = data.device?.volume_percent;
-      return track;
-    } catch {
-      return null;
-    }
+    const track = this.parseTrack(data.item);
+    track.is_playing = data.is_playing;
+    track.progress_ms = data.progress_ms;
+    track.volume_percent = data.device?.volume_percent;
+    return track;
   }
 
   async getQueue(): Promise<TrackInfo[]> {
@@ -230,20 +253,58 @@ export class SpotifyProvider implements MusicProvider {
     return tracks;
   }
 
+  /**
+   * Turns "Nairobi by Bensoul" into `track:"Nairobi" artist:"Bensoul"`.
+   *
+   * Spotify's search has no notion of natural language: every word in `q` is
+   * matched as a term, so "by" and a featured artist are scored as if the user
+   * had asked for them. "nairobi by bensoul" returns Extravaganza by Sauti Sol;
+   * "Intro by quality control ft gucci mane" returns Easy by Nicki Minaj. The
+   * field-filtered form returns the right track first in both cases.
+   *
+   * Returns `null` when the query has no "by", leaving it to be sent as-is.
+   */
+  private fieldFilteredQuery(query: string): string | null {
+    const split = query.match(/^(.*?)\s+by\s+(.*)$/i);
+    if (!split) return null;
+
+    const title = split[1].trim();
+    // Drop a featured-artist tail: the primary artist is what Spotify indexes
+    // under artist:, and the guest usually appears in the track title anyway.
+    const artist = split[2]
+      .replace(/\s+(feat\.?|ft\.?|featuring|with)\s+.*$/i, '')
+      .trim();
+
+    if (!title || !artist) return null;
+    // Quote both so multi-word values stay one term.
+    return `track:"${title}" artist:"${artist}"`;
+  }
+
   async searchTracks(query: string, limit: number = 10): Promise<TrackInfo[]> {
     const clamped = Math.max(1, Math.min(50, limit));
-    const encoded = encodeURIComponent(query);
 
     interface SearchResponse {
       tracks: { items: SpotifyTrack[] };
     }
 
-    const data = await this.api<SearchResponse>(
-      'GET',
-      `/search?type=track&q=${encoded}&limit=${clamped}`
-    );
+    const run = async (q: string) => {
+      const data = await this.api<SearchResponse>(
+        'GET',
+        `/search?type=track&q=${encodeURIComponent(q)}&limit=${clamped}`
+      );
+      return (data.tracks?.items || []).map(t => this.parseTrack(t));
+    };
 
-    return (data.tracks?.items || []).map(t => this.parseTrack(t));
+    // Try the precise form first, but never let it lose results: a strict
+    // filter finds nothing when the user misremembers a title, and the loose
+    // query still would.
+    const filtered = this.fieldFilteredQuery(query);
+    if (filtered) {
+      const hits = await run(filtered);
+      if (hits.length > 0) return hits;
+    }
+
+    return run(query);
   }
 
   async searchAlbums(query: string, limit: number = 10): Promise<AlbumInfo[]> {
@@ -313,7 +374,7 @@ export class SpotifyProvider implements MusicProvider {
   }
 
   async addToPlaylist(playlistId: string, trackUris: string[]): Promise<string> {
-    await this.api('POST', `/playlists/${playlistId}/tracks`, {
+    await this.command('POST', `/playlists/${playlistId}/tracks`, {
       uris: trackUris,
     });
 

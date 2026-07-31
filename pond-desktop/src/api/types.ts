@@ -40,9 +40,30 @@ export interface NowPlayingApiResponse {
   album_art?: string | null;
   progress_ms?: number;
   duration_ms?: number;
+  /**
+   * Set when Spotify answered but refused the request — `"unauthorized"`,
+   * `"forbidden"`, `"rate_limited"` or `"unavailable"`. Absent on a healthy
+   * response, including the genuine "connected but nothing playing" case.
+   */
+  error?: string;
+  /** Human-readable explanation for `error`, safe to show as-is. */
+  message?: string;
 }
 
 export type MusicControlAction = "play" | "pause" | "next" | "previous";
+
+// ── OAuth ────────────────────────────────────────────────────
+/**
+ * Outcome of a single OAuth flow, keyed server-side by its `state` nonce.
+ *
+ * `unknown` is not a failure on its own — a flow whose nonce the server never
+ * issued (it restarted mid-flow) reports it too, so callers should keep waiting
+ * until their own timeout rather than treating it as terminal.
+ */
+export interface OAuthFlowStatus {
+  status: "pending" | "completed" | "failed" | "unknown";
+  error?: string;
+}
 
 // ── Settings ─────────────────────────────────────────────────
 export interface Settings {
