@@ -123,15 +123,26 @@ function SecretField({
   );
 }
 
+/**
+ * How long to wait for a browser hand-off before giving up. Generous: the user
+ * may have to log in to the provider and pick an account first.
+ */
+const OAUTH_POLL_TIMEOUT_MS = 5 * 60 * 1000;
+
 /** OAuth sign-in block for a single oauth_flow requirement. */
 function OAuthBlock({
   req,
   extensionId,
+  alreadyAuthorized = false,
   onAuthorized,
   disabled,
 }: {
   req: SecretRequirement;
   extensionId: string;
+  /** A token is already stored. Shown as context — it never stands in for
+   *  completing a flow, since a stored token may belong to a different OAuth
+   *  app or have stopped working. */
+  alreadyAuthorized?: boolean;
   onAuthorized: () => void;
   disabled: boolean;
 }) {
@@ -158,14 +169,21 @@ function OAuthBlock({
     setError(null);
     setOauthState("polling");
     try {
-      const { auth_url } = await api.initiateOAuth(req.key, extensionId);
+      const { auth_url, state } = await api.initiateOAuth(req.key, extensionId);
       openExternal(auth_url);
 
-      // Poll checkSecret every 2s until the token appears
+      // Poll the outcome of THIS flow, identified by its state nonce.
+      //
+      // Watching the secret store instead is wrong on re-authorisation: the
+      // token key is already there from the previous sign-in, so the first
+      // poll reports success ~2s in and the modal completes whether or not the
+      // user ever finished — or even opened — the browser flow.
+      const startedAt = Date.now();
       pollRef.current = setInterval(async () => {
         try {
-          const exists = await api.checkSecret(req.key);
-          if (exists) {
+          const { status, error: flowError } = await api.getOAuthStatus(state);
+
+          if (status === "completed") {
             stopPoll();
             setOauthState("done");
             onAuthorized();
@@ -173,6 +191,23 @@ function OAuthBlock({
             reconnectTimerRef.current = setTimeout(() => {
               setOauthState("reconnecting");
             }, 800);
+            return;
+          }
+
+          if (status === "failed") {
+            stopPoll();
+            setOauthState("idle");
+            setError(flowError || "Sign-in failed. Please try again.");
+            return;
+          }
+
+          // "pending" and "unknown" both mean keep waiting — a server that
+          // restarted mid-flow reports "unknown" for a nonce it never issued,
+          // which is indistinguishable from a hand-off still in progress.
+          if (Date.now() - startedAt > OAUTH_POLL_TIMEOUT_MS) {
+            stopPoll();
+            setOauthState("idle");
+            setError("Timed out waiting for sign-in to complete. Please try again.");
           }
         } catch {
           // ignore transient check failures, keep polling
@@ -193,16 +228,23 @@ function OAuthBlock({
       <p className="secret-modal__oauth-desc">{req.description}</p>
 
       {oauthState === "idle" && (
-        <button
-          type="button"
-          className="secret-modal__oauth-btn"
-          onClick={handleSignIn}
-          disabled={disabled}
-        >
-          <BtnIcon size={13} strokeWidth={1.8} />
-          Sign in with {req.display_name}
-          <ExternalLink size={11} strokeWidth={2} />
-        </button>
+        <>
+          {alreadyAuthorized && (
+            <p className="secret-modal__oauth-note">
+              Already connected. Sign in again to switch account, or if playback stopped working.
+            </p>
+          )}
+          <button
+            type="button"
+            className="secret-modal__oauth-btn"
+            onClick={handleSignIn}
+            disabled={disabled}
+          >
+            <BtnIcon size={13} strokeWidth={1.8} />
+            {alreadyAuthorized ? "Sign in again" : `Sign in with ${req.display_name}`}
+            <ExternalLink size={11} strokeWidth={2} />
+          </button>
+        </>
       )}
 
       {oauthState === "polling" && (
@@ -261,9 +303,13 @@ function SecretConfigModal({
   const [saving, setSaving] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
 
-  // Track which oauth secrets are now authorised (checked by poll)
+  // Authorisations completed *in this modal session*, not tokens that merely
+  // exist in the store. Seeding this from fulfilledMap made the edit-mode modal
+  // auto-complete on mount for an OAuth-only extension, so re-authorising —
+  // after switching OAuth apps, or when the stored token stopped working — was
+  // impossible without deleting the secret by hand first.
   const [oauthDone, setOauthDone] = useState<Record<string, boolean>>(() =>
-    Object.fromEntries(oauthReqs.map((r) => [r.key, fulfilledMap[r.key] ?? false])),
+    Object.fromEntries(oauthReqs.map((r) => [r.key, false])),
   );
 
   // When all oauth-only requirements are fulfilled and there are no api key fields,
@@ -414,6 +460,7 @@ function SecretConfigModal({
                   <OAuthBlock
                     req={req}
                     extensionId={ext.id}
+                    alreadyAuthorized={fulfilledMap[req.key] ?? false}
                     onAuthorized={() =>
                       setOauthDone((prev) => ({ ...prev, [req.key]: true }))
                     }

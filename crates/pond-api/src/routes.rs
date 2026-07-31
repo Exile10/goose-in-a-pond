@@ -213,6 +213,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/oauth/callback", get(oauth_callback_handler))
         .route("/oauth/refresh", post(oauth_refresh_handler))
         .route("/oauth/providers", get(oauth_providers_handler))
+        .route("/oauth/status/{state}", get(oauth_status_handler))
         // ── Music (Spotify) ────────────────────────────────────────────────────
         .route("/music/now-playing", get(music_now_playing_handler))
         .route("/music/control", post(music_control_handler))
@@ -7620,6 +7621,10 @@ async fn install_marketplace_handler(
         crate::oauth_callback::INTERNAL_TOKEN_ENV_KEY.to_string(),
         crate::oauth_callback::internal_extension_token().to_string(),
     );
+    env.insert(
+        crate::oauth_callback::GIAP_SERVER_URL_ENV_KEY.to_string(),
+        crate::oauth_callback::local_server_url(state.api_port),
+    );
 
     let req = pond_core::mcp::ports::extension_manager::AddExtensionRequest {
         name: ext.id.clone(),
@@ -7993,6 +7998,26 @@ async fn oauth_authorize_handler(
 /// `GET /api/v1/oauth/callback` — Handle the OAuth provider's redirect.
 ///
 /// Query: `?code=...&state=...`
+/// Escapes text that is interpolated into the OAuth result pages.
+///
+/// Those pages embed strings GIAP does not control — a subprocess's stderr, or
+/// an error body returned by the OAuth provider — so they must not be able to
+/// close a tag and inject markup into a page rendered on 127.0.0.1.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 ///
 /// Exchanges the authorization code for tokens using the stored PKCE
 /// verifier, persists access/refresh tokens in the secret store, and
@@ -8012,15 +8037,33 @@ async fn oauth_callback_handler(
         sessions.remove(&state_nonce)
     };
 
+    // Every terminal branch below records how the flow ended, so the UI that
+    // started it can poll for the real answer instead of guessing from whether
+    // a token key happens to exist.
+    let fail = |reason: &str| {
+        let outcomes = state.oauth_outcomes.clone();
+        let nonce = state_nonce.clone();
+        let reason = reason.to_string();
+        async move {
+            crate::oauth_callback::record_outcome(
+                &outcomes,
+                &nonce,
+                crate::oauth_callback::FlowOutcome::Failed(reason),
+            )
+            .await;
+        }
+    };
+
     let session = match session {
         Some(s) => s,
         None => {
+            fail("Invalid or expired authorization state. Start the sign-in again.").await;
             return Html(
                 "<h1>Authorization failed</h1>\
                  <p>Invalid or expired state. Please try again.</p>"
                     .to_string(),
             )
-            .into_response()
+            .into_response();
         }
     };
 
@@ -8029,8 +8072,9 @@ async fn oauth_callback_handler(
     let provider = match providers.iter().find(|p| p.id == session.provider_id) {
         Some(p) => p,
         None => {
+            fail("Unknown OAuth provider.").await;
             return Html("<h1>Authorization failed</h1><p>Unknown provider.</p>".to_string())
-                .into_response()
+                .into_response();
         }
     };
 
@@ -8080,6 +8124,7 @@ async fn oauth_callback_handler(
 
             // If this OAuth flow was triggered by an extension install, restart
             // the extension so the child process picks up the new tokens.
+            let mut restart_error: Option<String> = None;
             if let Some(ext_id) = &session.extension_id {
                 if let (Some(mgr), Some(mp), Some(secret_repo)) = (
                     &state.extension_manager,
@@ -8097,6 +8142,10 @@ async fn oauth_callback_handler(
                         env.insert(
                             crate::oauth_callback::INTERNAL_TOKEN_ENV_KEY.to_string(),
                             crate::oauth_callback::internal_extension_token().to_string(),
+                        );
+                        env.insert(
+                            crate::oauth_callback::GIAP_SERVER_URL_ENV_KEY.to_string(),
+                            crate::oauth_callback::local_server_url(state.api_port),
                         );
 
                         // Remove the running extension and re-add with new env
@@ -8117,15 +8166,52 @@ async fn oauth_callback_handler(
                                 extension = %ext_id,
                                 "restarted extension with OAuth tokens"
                             ),
-                            Err(e) => tracing::warn!(
-                                extension = %ext_id,
-                                error = %e,
-                                "failed to restart extension after OAuth"
-                            ),
+                            Err(e) => {
+                                tracing::warn!(
+                                    extension = %ext_id,
+                                    error = %e,
+                                    "failed to restart extension after OAuth"
+                                );
+                                restart_error = Some(e.to_string());
+                            }
                         }
                     }
                 }
             }
+
+            // The tokens are stored either way, but if the extension could not be
+            // started there is nothing working on the other side — say so rather
+            // than showing a green "Connected" card over a dead extension.
+            if let Some(err) = restart_error {
+                fail(&format!(
+                    "Signed in, but the {} extension did not start: {}",
+                    session.extension_id.as_deref().unwrap_or("linked"),
+                    err
+                ))
+                .await;
+                return Html(format!(
+                    r#"<!DOCTYPE html>
+<html><head><title>Authorization Incomplete</title>
+<style>body{{font-family:system-ui;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f8f9fa}}
+.card{{max-width:40rem;padding:2rem;border-radius:12px;background:white;box-shadow:0 2px 8px rgba(0,0,0,0.1)}}
+h1{{color:#f59e0b;margin:0 0 .5rem}}p{{color:#6b7280}}
+pre{{white-space:pre-wrap;word-break:break-word;background:#f3f4f6;padding:1rem;border-radius:8px;color:#374151;font-size:.8rem}}</style></head>
+<body><div class="card"><h1>Signed in to {}, but the extension did not start</h1>
+<p>Your credentials were saved. The <code>{}</code> extension failed to launch, so it will not work yet.</p>
+<pre>{}</pre></div></body></html>"#,
+                    html_escape(&provider.display_name),
+                    html_escape(session.extension_id.as_deref().unwrap_or("unknown")),
+                    html_escape(&err),
+                ))
+                .into_response();
+            }
+
+            crate::oauth_callback::record_outcome(
+                &state.oauth_outcomes,
+                &state_nonce,
+                crate::oauth_callback::FlowOutcome::Completed,
+            )
+            .await;
 
             Html(format!(
                 r#"<!DOCTYPE html>
@@ -8141,22 +8227,55 @@ h1{{color:#22c55e;margin:0 0 .5rem}}p{{color:#6b7280}}</style></head>
         Ok(resp) => {
             let error_body = resp.text().await.unwrap_or_default();
             tracing::warn!(provider = %provider.id, error = %error_body, "OAuth token exchange failed");
+            fail(&format!("Token exchange failed: {error_body}")).await;
             Html(format!(
                 "<h1>Authorization failed</h1>\
                  <p>Token exchange error. Please try again.</p>\
                  <pre>{}</pre>",
-                error_body
+                html_escape(&error_body)
             ))
             .into_response()
         }
         Err(e) => {
             tracing::error!(provider = %provider.id, error = %e, "OAuth token exchange network error");
+            fail(&format!("Could not reach the provider: {e}")).await;
             Html(format!(
                 "<h1>Authorization failed</h1><p>Network error: {}</p>",
-                e
+                html_escape(&e.to_string())
             ))
             .into_response()
         }
+    }
+}
+
+/// `GET /api/v1/oauth/status/{state}` — How the flow with this `state` nonce ended.
+///
+/// Returns `pending` while the browser hand-off is still in flight, then
+/// `completed` or `failed` once the callback has run. `unknown` means the
+/// nonce was never issued by this process, or its outcome has aged out.
+///
+/// This exists so the sign-in UI can wait for the flow it actually started.
+/// Watching the secret store instead reports success the moment a token key is
+/// present — which, when re-authorising, is true before the user has done
+/// anything at all.
+async fn oauth_status_handler(
+    State(state): State<Arc<AppState>>,
+    Path(state_nonce): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if state.oauth_state.read().await.contains_key(&state_nonce) {
+        return Json(json!({"status": "pending"})).into_response();
+    }
+
+    match crate::oauth_callback::peek_outcome(&state.oauth_outcomes, &state_nonce).await {
+        Some(crate::oauth_callback::FlowOutcome::Completed) => {
+            Json(json!({"status": "completed"})).into_response()
+        }
+        Some(crate::oauth_callback::FlowOutcome::Failed(error)) => {
+            Json(json!({"status": "failed", "error": error})).into_response()
+        }
+        None => Json(json!({"status": "unknown"})).into_response(),
     }
 }
 
@@ -8427,6 +8546,37 @@ async fn spotify_api_call(
         .ok()
 }
 
+/// Maps a failing Spotify Web API status onto a stable machine-readable code
+/// and text the dashboard can show the user verbatim.
+///
+/// The 403 wording is the one that matters: Spotify apps in development mode
+/// only serve accounts explicitly allowlisted in the developer dashboard, and
+/// a non-allowlisted account still completes the whole OAuth flow — consent,
+/// code exchange, refresh token — before every single API call fails. Without
+/// naming that, the failure is indistinguishable from a paused player.
+fn spotify_error_hint(status: StatusCode) -> (&'static str, &'static str) {
+    match status {
+        StatusCode::UNAUTHORIZED => (
+            "unauthorized",
+            "Spotify rejected the saved credentials. Sign in to Spotify again.",
+        ),
+        StatusCode::FORBIDDEN => (
+            "forbidden",
+            "This Spotify account is not authorised for the app GIAP signs in with. \
+             Add it to that app's users in the Spotify developer dashboard, or set \
+             your own SPOTIFY_CLIENT_ID and sign in again.",
+        ),
+        StatusCode::TOO_MANY_REQUESTS => (
+            "rate_limited",
+            "Spotify is rate-limiting requests. Playback should reappear shortly.",
+        ),
+        _ => (
+            "unavailable",
+            "Spotify did not return playback information.",
+        ),
+    }
+}
+
 /// `GET /api/v1/music/now-playing` — Spotify playback snapshot for the dashboard widget.
 async fn music_now_playing_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -8437,10 +8587,26 @@ async fn music_now_playing_handler(State(state): State<Arc<AppState>>) -> axum::
         return Json(json!({"connected": false})).into_response();
     };
 
-    if !resp.status().is_success() {
-        // 204 = nothing currently playing; other failures degrade the same way
-        // so the widget can just show an idle state either way.
+    let status = resp.status();
+
+    // 204 is the only status that genuinely means "connected, nothing playing".
+    if status == StatusCode::NO_CONTENT {
         return Json(json!({"connected": true, "playing": false})).into_response();
+    }
+
+    if !status.is_success() {
+        // Everything else is a real failure. Reporting these as an idle player
+        // made a connection Spotify was actively refusing look like a paused
+        // one, leaving the widget with nothing to tell the user.
+        let (error, message) = spotify_error_hint(status);
+        tracing::warn!(status = %status, error, "Spotify now-playing request failed");
+        return Json(json!({
+            "connected": true,
+            "playing": false,
+            "error": error,
+            "message": message,
+        }))
+        .into_response();
     }
 
     let body: serde_json::Value = resp.json().await.unwrap_or_default();
@@ -8494,11 +8660,17 @@ async fn music_control_handler(
             Json(json!({"error": "No active Spotify device. Open Spotify on a device first."})),
         )
             .into_response(),
-        _ => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "Spotify request failed"})),
-        )
-            .into_response(),
+        // Same reasoning as the now-playing handler: say which failure it is
+        // rather than reporting an authorisation problem as a generic outage.
+        status => {
+            let (error, message) = spotify_error_hint(status);
+            tracing::warn!(status = %status, error, "Spotify control request failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": message, "code": error})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -11086,6 +11258,46 @@ mod tests {
         assert_eq!(urlencoding_lite("abc-123_x.y~"), "abc-123_x.y~");
         assert_eq!(urlencoding_lite("../evil"), "..%2Fevil");
         assert_eq!(urlencoding_lite("a?b=c"), "a%3Fb%3Dc");
+    }
+
+    // ── Spotify failure classification ───────────────────────────
+
+    #[test]
+    fn spotify_403_is_reported_as_an_authorisation_problem() {
+        let (code, message) = spotify_error_hint(StatusCode::FORBIDDEN);
+        assert_eq!(code, "forbidden");
+        // A development-mode app serves only allowlisted accounts, and the
+        // whole OAuth flow succeeds for everyone else — so the message has to
+        // point at the developer dashboard, not at the connection.
+        assert!(
+            message.contains("developer dashboard") && message.contains("SPOTIFY_CLIENT_ID"),
+            "403 message must name both remedies, got: {message}"
+        );
+    }
+
+    #[test]
+    fn spotify_401_asks_the_user_to_sign_in_again() {
+        let (code, message) = spotify_error_hint(StatusCode::UNAUTHORIZED);
+        assert_eq!(code, "unauthorized");
+        assert!(message.to_lowercase().contains("sign in"));
+    }
+
+    #[test]
+    fn spotify_failures_are_distinguishable_from_each_other() {
+        let codes = [
+            spotify_error_hint(StatusCode::UNAUTHORIZED).0,
+            spotify_error_hint(StatusCode::FORBIDDEN).0,
+            spotify_error_hint(StatusCode::TOO_MANY_REQUESTS).0,
+            spotify_error_hint(StatusCode::BAD_GATEWAY).0,
+        ];
+        let unique: std::collections::HashSet<_> = codes.iter().collect();
+        assert_eq!(
+            unique.len(),
+            codes.len(),
+            "each failure needs its own code — collapsing them is the bug this guards"
+        );
+        // 204 must never reach here: it is the one genuine "nothing playing".
+        assert!(!codes.contains(&"idle"));
     }
 
     // ── geocode-on-save decision ─────────────────────────────────

@@ -358,8 +358,13 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
     }),
   );
 
-  // OAuth
+  // OAuth — catch-all first, then the specific route (last registered wins).
   await page.route("**/api/v1/oauth/**", (route) =>
     route.fulfill({ json: { auth_url: "https://accounts.spotify.com/authorize?test=1", state: "test-state" } }),
+  );
+  // The sign-in modal polls this for the outcome of the flow it started; it no
+  // longer infers success from the token key existing.
+  await page.route("**/api/v1/oauth/status/**", (route) =>
+    route.fulfill({ json: { status: "completed" } }),
   );
 }
