@@ -4,11 +4,13 @@
  *
  * A small set of intent-shaped tools rather than one per endpoint (this was
  * once 14 tools, which was worse):
- *   play      — play a track, album, or one of the user's playlists, by name or URI
- *   queue     — append to the queue without interrupting the current track
- *   playlists — list the user's playlists by name
- *   status    — what's currently playing + queue
- *   control   — pause, resume, next, previous, volume, shuffle
+ *   play          — play a track or album, by name or URI
+ *   play_playlist — play a playlist from the library, by name or link
+ *   queue         — append to the queue without interrupting the current track
+ *   playlists     — list the user's playlists, split by who created them
+ *   devices       — list playback devices, or move playback to one
+ *   status        — what's currently playing + queue
+ *   control       — pause, resume, next, previous, volume, shuffle, seek, repeat
  */
 import * as readline from "readline";
 import { SpotifyProvider } from "./providers/spotify.js";
@@ -89,6 +91,21 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} },
   },
   {
+    name: "devices",
+    description:
+      "List the devices Spotify can play on (phone, computer, speaker, TV), or move playback to one of them. Call with no arguments to see what is available; pass transfer_to with a device name to move the music there without interrupting it. Use this for 'play this on the speaker', 'move it to my phone', 'where can I play this'.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        transfer_to: {
+          type: "string",
+          description:
+            "Name of the device to move playback to, as the user said it (e.g. 'my phone', 'kitchen speaker'). Matched loosely against the device list. Omit to just list devices.",
+        },
+      },
+    },
+  },
+  {
     name: "status",
     description:
       "Get what is currently playing on Spotify — track name, artist, album, progress, and upcoming queue.",
@@ -97,7 +114,7 @@ const TOOLS = [
   {
     name: "control",
     description:
-      "Control Spotify playback: pause, resume, next, previous, set volume, or toggle shuffle.",
+      "Control Spotify playback: pause, resume, next, previous, set volume, toggle shuffle, jump within the track, or set repeat.",
     inputSchema: {
       type: "object",
       properties: {
@@ -113,12 +130,22 @@ const TOOLS = [
             "set_volume",
             "shuffle_on",
             "shuffle_off",
+            "seek",
+            "repeat_off",
+            "repeat_track",
+            "repeat_all",
           ],
-          description: "The playback action to perform.",
+          description:
+            "The playback action to perform. 'seek' jumps within the current track (give position); 'repeat_track' loops the song, 'repeat_all' loops the album or playlist, 'repeat_off' stops looping.",
         },
         volume: {
           type: "number",
           description: "Exact volume level (0-100). Required when action is 'set_volume'.",
+        },
+        position: {
+          type: "string",
+          description:
+            "Where to jump to, for action 'seek'. Accepts 'm:ss' like '1:30', or a plain number of seconds like '90'.",
         },
       },
       required: ["action"],
@@ -390,6 +417,40 @@ async function handlePlayPlaylist(args: Record<string, unknown>): Promise<string
   return `Now playing playlist: ${actual}`;
 }
 
+async function handleDevices(args: Record<string, unknown>): Promise<string> {
+  const devices = await provider.getDevices();
+  if (devices.length === 0) {
+    return "No Spotify devices are available. Open Spotify on a phone, computer or speaker first.";
+  }
+
+  const target = args.transfer_to as string | undefined;
+  if (!target) {
+    return (
+      `${devices.length} device(s) available:\n` +
+      devices
+        .map(d => `- ${d.name} (${d.type})${d.is_active ? " - currently playing here" : ""}`)
+        .join("\n")
+    );
+  }
+
+  // Reuse the playlist name matcher: "my phone" against "SM-A576B" is the same
+  // loose-name problem, and the device type is worth matching on too, since
+  // people say "the speaker" far more often than a device's actual name.
+  const ranked = devices
+    .map(d => ({ d, score: Math.max(playlistMatchScore(target, d.name), playlistMatchScore(target, d.type)) }))
+    .sort((a, b) => b.score - a.score);
+
+  const best = ranked[0];
+  if (!best || best.score < 0.5) {
+    return `No device matching "${target}". Available: ${devices.map(d => `${d.name} (${d.type})`).join(", ")}`;
+  }
+  if (best.d.is_active) {
+    return `${best.d.name} is already the one playing.`;
+  }
+
+  return provider.transferPlayback(best.d.id, best.d.name);
+}
+
 async function handlePlaylists(): Promise<string> {
   const playlists = await provider.getPlaylists();
   if (playlists.length === 0) return "No playlists found on this Spotify account.";
@@ -468,9 +529,35 @@ async function handleControl(args: Record<string, unknown>): Promise<string> {
       return provider.setShuffle(true);
     case "shuffle_off":
       return provider.setShuffle(false);
+    case "seek": {
+      const ms = parsePosition(args.position);
+      if (ms === null) {
+        return "Where should I jump to? Give a time like '1:30' or a number of seconds.";
+      }
+      return provider.seek(ms);
+    }
+    case "repeat_off":
+      return provider.setRepeat("off");
+    case "repeat_track":
+      return provider.setRepeat("track");
+    case "repeat_all":
+      return provider.setRepeat("context");
     default:
       return `Unknown action: ${action}`;
   }
+}
+
+/** Reads "1:30", "90" or 90 as milliseconds. Returns null if it is neither. */
+function parsePosition(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, value * 1000);
+  if (typeof value !== "string") return null;
+
+  const text = value.trim();
+  const clock = text.match(/^(\d+):([0-5]?\d)$/);
+  if (clock) return (Number(clock[1]) * 60 + Number(clock[2])) * 1000;
+
+  const seconds = Number(text);
+  return Number.isFinite(seconds) ? Math.max(0, seconds * 1000) : null;
 }
 
 // ── Debug logging (goes to stderr, not stdout) ───────────────
@@ -539,6 +626,10 @@ async function handleRequest(
           case "play_playlist":
             debug("play_playlist →", args.name ?? args.query ?? "");
             text = await handlePlayPlaylist(args);
+            break;
+          case "devices":
+            debug("devices →", args.transfer_to ?? "(list)");
+            text = await handleDevices(args);
             break;
           case "playlists":
             debug("playlists → listing");
