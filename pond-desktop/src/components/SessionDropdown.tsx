@@ -173,7 +173,7 @@ export function SessionDropdown({
     if (isConfirming) {
       return (
         <div key={s.id} className="session-dropdown__item is-confirming">
-          <Trash2 size={13} style={{ flexShrink: 0, color: "var(--color-danger, #d92d20)" }} />
+          <Trash2 size={13} style={{ flexShrink: 0, color: "var(--color-destructive)" }} />
           <span className="session-dropdown__title">Delete this conversation?</span>
           <button
             className="session-dropdown__action session-dropdown__action--danger"
