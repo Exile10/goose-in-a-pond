@@ -14,6 +14,7 @@
  */
 import * as readline from "readline";
 import { SpotifyProvider } from "./providers/spotify.js";
+import type { TimeRange } from "./providers/types.js";
 
 const provider = new SpotifyProvider();
 
@@ -89,6 +90,33 @@ const TOOLS = [
     description:
       "List every playlist in the user's Spotify library, separated into ones they created and ones they follow from other people. Use this to answer 'what playlists do I have' or 'which of these are mine', and to find the exact name before playing one with the 'play' tool.",
     inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "library",
+    description:
+      "The user's own Spotify library and listening history: their liked songs, what they listen to most, and what they played recently. Read-only — Spotify does not let this app change what is liked. Use for 'what are my liked songs', 'what do I listen to most', 'what was I playing yesterday'.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["saved", "top_tracks", "top_artists", "recent"],
+          description:
+            "saved = list liked songs; top_tracks / top_artists = what they listen to most; recent = recently played.",
+        },
+        time_range: {
+          type: "string",
+          enum: ["short_term", "medium_term", "long_term"],
+          description:
+            "How far back top_tracks / top_artists look: short_term is about 4 weeks, medium_term about 6 months, long_term is several years. Defaults to medium_term.",
+        },
+        limit: {
+          type: "number",
+          description: "How many to return, 1-50. Defaults to 20.",
+        },
+      },
+      required: ["action"],
+    },
   },
   {
     name: "devices",
@@ -417,6 +445,66 @@ async function handlePlayPlaylist(args: Record<string, unknown>): Promise<string
   return `Now playing playlist: ${actual}`;
 }
 
+
+async function handleLibrary(args: Record<string, unknown>): Promise<string> {
+  const action = args.action as string;
+  const range = (args.time_range as TimeRange) || "medium_term";
+  const limit = typeof args.limit === "number" ? args.limit : 20;
+  const query = args.query as string | undefined;
+
+  switch (action) {
+    case "saved": {
+      const tracks = await provider.getSavedTracks(limit);
+      if (tracks.length === 0) return "No liked songs in this Spotify account.";
+      return (
+        `${tracks.length} liked song(s):\n` +
+        tracks.map((t, i) => `${i + 1}. ${t.name} by ${t.artist}`).join("\n")
+      );
+    }
+
+
+    case "top_tracks": {
+      const tracks = await provider.getTopTracks(range, limit);
+      if (tracks.length === 0) return "Spotify has no top tracks for this period yet.";
+      return (
+        `Top ${tracks.length} track(s) (${describeRange(range)}):\n` +
+        tracks.map((t, i) => `${i + 1}. ${t.name} by ${t.artist}`).join("\n")
+      );
+    }
+
+    case "top_artists": {
+      const artists = await provider.getTopArtists(range, limit);
+      if (artists.length === 0) return "Spotify has no top artists for this period yet.";
+      return (
+        `Top ${artists.length} artist(s) (${describeRange(range)}):\n` +
+        artists
+          .map((a, i) => `${i + 1}. ${a.name}${a.genres.length ? ` - ${a.genres.slice(0, 3).join(", ")}` : ""}`)
+          .join("\n")
+      );
+    }
+
+    case "recent": {
+      const tracks = await provider.getRecentlyPlayed(limit);
+      if (tracks.length === 0) return "No recent listening history.";
+      return (
+        `${tracks.length} recently played:\n` +
+        tracks.map((t, i) => `${i + 1}. ${t.name} by ${t.artist}`).join("\n")
+      );
+    }
+
+    default:
+      return `Unknown action: ${action}`;
+  }
+}
+
+function describeRange(range: TimeRange): string {
+  return range === "short_term"
+    ? "last 4 weeks"
+    : range === "long_term"
+      ? "several years"
+      : "last 6 months";
+}
+
 async function handleDevices(args: Record<string, unknown>): Promise<string> {
   const devices = await provider.getDevices();
   if (devices.length === 0) {
@@ -626,6 +714,10 @@ async function handleRequest(
           case "play_playlist":
             debug("play_playlist →", args.name ?? args.query ?? "");
             text = await handlePlayPlaylist(args);
+            break;
+          case "library":
+            debug("library →", args.action, args.query ?? "");
+            text = await handleLibrary(args);
             break;
           case "devices":
             debug("devices →", args.transfer_to ?? "(list)");

@@ -1,4 +1,4 @@
-import type { MusicProvider, TrackInfo, PlaylistInfo, AlbumInfo, DeviceInfo, RepeatState } from './types.js';
+import type { MusicProvider, TrackInfo, PlaylistInfo, AlbumInfo, DeviceInfo, RepeatState, ArtistInfo, TimeRange } from './types.js';
 
 interface SpotifyTrack {
   id: string;
@@ -42,6 +42,9 @@ interface SpotifyPlaylist {
  *   GET /artists/{id}/top-tracks             403
  *   GET /browse/featured-playlists           403
  *   GET /browse/new-releases                 403
+ *   GET /me/tracks/contains                  403
+ *   PUT / DELETE /me/tracks                  403  (library writes, even
+ *                                                 with user-library-modify)
  *   track.preview_url                        always null
  *
  * So there is no "play me something like this", no mood or tempo matching, and
@@ -121,7 +124,20 @@ export class SpotifyProvider implements MusicProvider {
     }
 
     if (!resp.ok) {
-      throw new Error(`Spotify API ${resp.status}${afterRefresh}: ${await resp.text()}`);
+      const body = await resp.text();
+
+      // A scope the token was never granted. Distinct from the withdrawn
+      // endpoints above, which answer 403 with a bare "Forbidden" and stay
+      // broken however many times the user signs in — this one is fixed by
+      // re-authorising, so say that instead of surfacing a raw 403.
+      if (resp.status === 403 && body.includes('Insufficient client scope')) {
+        throw new Error(
+          'Spotify has not granted GIAP this permission yet. Sign in to Spotify again ' +
+            'from the Extensions tab to authorise it.'
+        );
+      }
+
+      throw new Error(`Spotify API ${resp.status}${afterRefresh}: ${body}`);
     }
 
     return resp;
@@ -283,6 +299,69 @@ export class SpotifyProvider implements MusicProvider {
     // hand the device the track in a paused state, which reads as a failure.
     await this.command('PUT', '/me/player', { device_ids: [deviceId], play: true });
     return `Playback moved to ${deviceName}`;
+  }
+
+  // ── Library and listening history ──────────────────────────
+  // All of these need scopes added after the extension first shipped, so on an
+  // install that has not re-authorised they fail with the re-sign-in message
+  // from `request`, not a bare 403.
+
+  async getSavedTracks(limit: number = 20): Promise<TrackInfo[]> {
+    const clamped = Math.max(1, Math.min(50, limit));
+    interface SavedResponse {
+      items: Array<{ track: SpotifyTrack | null }>;
+    }
+    const data = await this.api<SavedResponse>('GET', `/me/tracks?limit=${clamped}`);
+    return (data.items || [])
+      .map(i => i.track)
+      .filter((t): t is SpotifyTrack => !!t)
+      .map(t => this.parseTrack(t));
+  }
+
+
+
+
+  async getTopTracks(range: TimeRange, limit: number = 20): Promise<TrackInfo[]> {
+    const clamped = Math.max(1, Math.min(50, limit));
+    interface TopTracks {
+      items: SpotifyTrack[];
+    }
+    const data = await this.api<TopTracks>(
+      'GET',
+      `/me/top/tracks?time_range=${range}&limit=${clamped}`
+    );
+    return (data.items || []).map(t => this.parseTrack(t));
+  }
+
+  async getTopArtists(range: TimeRange, limit: number = 20): Promise<ArtistInfo[]> {
+    const clamped = Math.max(1, Math.min(50, limit));
+    interface TopArtists {
+      items: Array<{ id: string; name: string; genres?: string[] }>;
+    }
+    const data = await this.api<TopArtists>(
+      'GET',
+      `/me/top/artists?time_range=${range}&limit=${clamped}`
+    );
+    return (data.items || []).map(a => ({
+      id: a.id,
+      name: a.name,
+      genres: a.genres || [],
+    }));
+  }
+
+  async getRecentlyPlayed(limit: number = 20): Promise<TrackInfo[]> {
+    const clamped = Math.max(1, Math.min(50, limit));
+    interface RecentResponse {
+      items: Array<{ track: SpotifyTrack | null }>;
+    }
+    const data = await this.api<RecentResponse>(
+      'GET',
+      `/me/player/recently-played?limit=${clamped}`
+    );
+    return (data.items || [])
+      .map(i => i.track)
+      .filter((t): t is SpotifyTrack => !!t)
+      .map(t => this.parseTrack(t));
   }
 
   async getNowPlaying(): Promise<TrackInfo | null> {
