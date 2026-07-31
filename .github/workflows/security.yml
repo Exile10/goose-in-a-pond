@@ -33,7 +33,7 @@ jobs:
     name: Rust — cargo audit (RustSec)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: false
           fetch-depth: 1
@@ -76,7 +76,7 @@ jobs:
       run:
         working-directory: ${{ matrix.project }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v7
         with:
@@ -109,7 +109,7 @@ jobs:
     # adds that file.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: false
           fetch-depth: 1
@@ -152,7 +152,7 @@ jobs:
     name: Secrets — gitleaks (full history)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history so a secret committed and later "deleted" still fails.
           fetch-depth: 0
