@@ -16,6 +16,10 @@ export interface PlaylistInfo {
   description: string;
   track_count: number;
   uri: string;
+  /** Display name of whoever created it. */
+  owner: string;
+  /** True when the signed-in user created it, false when they only follow it. */
+  is_own: boolean;
 }
 
 export interface MusicProvider {
@@ -28,12 +32,11 @@ export interface MusicProvider {
   setShuffle(enabled: boolean): Promise<string>;
   getNowPlaying(): Promise<TrackInfo | null>;
   getQueue(): Promise<TrackInfo[]>;
+  /** Appends to the queue without disturbing what is currently playing. */
+  addToQueue(uri: string): Promise<string>;
   searchTracks(query: string, limit?: number): Promise<TrackInfo[]>;
   searchAlbums(query: string, limit?: number): Promise<AlbumInfo[]>;
   getPlaylists(limit?: number): Promise<PlaylistInfo[]>;
-  getPlaylistTracks(playlistId: string): Promise<TrackInfo[]>;
-  createPlaylist(name: string, description?: string): Promise<PlaylistInfo>;
-  addToPlaylist(playlistId: string, trackUris: string[]): Promise<string>;
 }
 
 export interface AlbumInfo {
