@@ -231,7 +231,7 @@ a:hover {
 /* Firefox / Linux */
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgba(23, 22, 22, 0.18) transparent;
+  scrollbar-color: color-mix(in srgb, var(--color-text) 18%, transparent) transparent;
 }
 
 /* WebKit (macOS Safari, Chrome) */
@@ -245,12 +245,12 @@ a:hover {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(23, 22, 22, 0.18);
+  background: color-mix(in srgb, var(--color-text) 18%, transparent);
   border-radius: var(--radius-pill);
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(23, 22, 22, 0.30);
+  background: color-mix(in srgb, var(--color-text) 30%, transparent);
 }
 
 /* ── Utility Classes ────────────────────────────────────────── */
