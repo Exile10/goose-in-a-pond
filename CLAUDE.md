@@ -8,6 +8,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **No emojis in UI or code.** Use `lucide-react` icons for functional icons and the official logo for brand — never emojis (a lint guard, `no-emoji.test.ts`, scans source *including comments*).
 - **Trust the model for tool use / thinking** — no keyword pre-classification, no separate ToolCaller model in the main loop. The main LLM calls MCP tools natively.
 
+### Personal Agentic Intelligence (P.A.I.) — mandatory recursive check
+
+**Any work touching PAI-1 through PAI-8 starts by reading [`docs/architecture/pai/00-checklist.md`](docs/architecture/pai/00-checklist.md) and ends by updating it.** No exceptions, every session, however small the change.
+
+The eight capabilities — proactivity, thinking, multi-agent orchestration, hard profile boundaries, large context, smart compaction, personal context streaming, privacy guardrails — are **equally weighted and mutually interdependent**. A change that satisfies one in isolation is not done. The checklist's section 2.2 is the interdependency test; run it against all eight, not just the one being worked on.
+
+Two rules that cause the most damage when skipped:
+
+- **Re-verify before you trust.** Every current-state claim in the PAI documents is stamped with the date it was verified. Line numbers rot. Grep for the symbol, not the `file:line` — and fix the document in the same change when a claim has gone stale.
+- **Prerequisites must be LANDED, not merely DESIGNED.** [`docs/architecture/personal-agentic-intelligence.md`](docs/architecture/personal-agentic-intelligence.md) holds the dependency graph, the status ledger and the seven cross-cutting invariants. It decides what is eligible to be worked on.
+
 ---
 
 ## What GIAP is
