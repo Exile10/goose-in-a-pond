@@ -155,10 +155,12 @@ impl DiscoveryMcpServer {
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             eprintln!("[discovery] country '{}' not found", country);
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "Country '{}' not found. Check spelling or try a different name/code.",
-                country,
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                crate::format::format_no_results(
+                    &format!("country data for '{}'", country),
+                    &["giap-discovery__search_web"],
+                ),
+            )]));
         }
 
         if !resp.status().is_success() {
@@ -188,7 +190,10 @@ impl DiscoveryMcpServer {
 
         let text = match entry {
             Some(c) => format_country(c),
-            None => format!("No data found for '{}'.", country),
+            None => crate::format::format_no_results(
+                &format!("country data for '{}'", country),
+                &["giap-discovery__search_web"],
+            ),
         };
 
         let truncated = crate::format::truncate_to_budget(&text, COUNTRY_INFO_BUDGET);
@@ -259,10 +264,12 @@ Look up a food product by barcode or name: nutrition, ingredients, allergens, Nu
 
             let status = body["status"].as_u64().unwrap_or(0);
             if status == 0 {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Product with barcode '{}' not found in Open Food Facts database.",
-                    code,
-                ))]));
+                return Ok(CallToolResult::success(vec![Content::text(
+                    crate::format::format_no_results(
+                        &format!("barcode '{}' in the Open Food Facts database", code),
+                        &["giap-discovery__search_web"],
+                    ),
+                )]));
             }
 
             let product_data = &body["product"];
@@ -328,10 +335,15 @@ Look up a food product by barcode or name: nutrition, ingredients, allergens, Nu
             .unwrap_or_default();
 
         if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No products found for '{}'. Try a different name or use a barcode.",
-                query,
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                crate::format::format_no_results(
+                    &format!("products matching '{}'", query),
+                    &[
+                        "giap-discovery__lookup_product",
+                        "giap-discovery__search_web",
+                    ],
+                ),
+            )]));
         }
 
         // Build UI hint from first product in search results
@@ -449,7 +461,10 @@ Recent crowdsourced prices for a product barcode (find it via lookup_product). C
 
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
-                "No crowdsourced prices found for this product. Coverage varies by region.",
+                crate::format::format_no_results(
+                    "crowdsourced prices for this product",
+                    &["giap-discovery__search_web"],
+                ),
             )]));
         }
 
@@ -584,10 +599,15 @@ impl DiscoveryMcpServer {
             .unwrap_or_default();
 
         if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No web results found for '{}'. Try different keywords.",
-                query,
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                crate::format::format_no_results(
+                    &format!("web results for '{}'", query),
+                    &[
+                        "giap-knowledge__search_wikipedia",
+                        "giap-knowledge__instant_answer",
+                    ],
+                ),
+            )]));
         }
 
         // Build UI hint from SearXNG results
@@ -702,10 +722,20 @@ impl DiscoveryMcpServer {
         }
 
         if items.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No instant results for '{}'. For full web search, configure a SearXNG instance in Settings.",
-                query,
-            ))]));
+            // Terminal on purpose. search_web is the last resort, so a miss here
+            // ends the chain — and the model needs to be told that, or it
+            // repeats its previous sentence instead of reporting the outcome.
+            // (Measured on gemma-4-E2B: the old settings-tip wording produced a
+            // verbatim repeat of the preamble it had already streamed.)
+            return Ok(CallToolResult::success(vec![Content::text(
+                crate::format::format_dead_end(
+                    &format!("web results for '{}'", query),
+                    "search_web is the last resort, so there is nothing further to \
+                     try. Tell the user plainly that you could not find it, and that \
+                     configuring a SearXNG instance in Settings would enable full \
+                     web search.",
+                ),
+            )]));
         }
 
         // Build UI hint from DDG results

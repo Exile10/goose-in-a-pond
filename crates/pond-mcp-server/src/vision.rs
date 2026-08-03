@@ -245,7 +245,10 @@ camera saw.")]
 
         match self.camera_storage.list_events(&camera_id, limit).await {
             Ok(events) if events.is_empty() => Ok(CallToolResult::success(vec![Content::text(
-                format!("No recent events from camera '{camera_id}'."),
+                crate::format::format_no_results(
+                    &format!("recent events from camera '{camera_id}'"),
+                    &["giap-vision__look_at_camera_snapshot"],
+                ),
             )])),
             Ok(events) => {
                 let lines: Vec<String> = events
@@ -397,9 +400,15 @@ events, to show what changed or which way someone moved.")]
             .collect();
         with_frames.reverse();
         if with_frames.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No frames available from camera '{camera_id}'."
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                crate::format::format_no_results(
+                    &format!("stored frames from camera '{camera_id}'"),
+                    &[
+                        "giap-vision__look_at_camera_snapshot",
+                        "giap-vision__get_recent_camera_events",
+                    ],
+                ),
+            )]));
         }
 
         let picked = pick_evenly_spaced(with_frames.len(), frames);
