@@ -17,8 +17,11 @@ pub struct ModelCapabilities {
     pub audio_input: bool,           // Accepts raw audio (Gemma 4 E2B/E4B)
     pub context_window_tokens: u32,  // Max context window (default: 4096)
     pub structured_output: bool,     // GBNF grammar / JSON mode (GGUF models)
+    pub tool_calling: bool,          // Native tool calling (e.g. Gemma 4 `<|tool_call>`)
 }
 ```
+
+When `tool_calling` is true, tool definitions are passed through the chat template; when false, tools are described in the system prompt text instead.
 
 All fields default to the most conservative values (`false` / `4096`) so unknown models work safely.
 

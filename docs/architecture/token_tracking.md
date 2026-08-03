@@ -25,16 +25,25 @@ Per-session token accumulation with estimated usage from the agent stream, aggre
 
 ## Estimation
 
-Real token counts are not available from Goose's `AgentEvent` stream. The GooseAdapter estimates using a characters-per-token heuristic:
+Real token counts **are** available and are the primary path. The GooseAdapter aggregates the provider's per-inference `Usage` events into `TurnStats` (`crates/pond-core/src/shared/domain/turn_stats.rs`) across every inference in a turn, and reports those counts directly:
+
+```rust
+let usage = if saw_usage {
+    UsageStats { prompt_tokens: turn_stats.prompt_tokens,
+                 completion_tokens: turn_stats.completion_tokens }
+} else { /* heuristic fallback, below */ };
+```
+
+`prompt_tokens` is the size of the **final** inference — the turn's real context load — while `completion_tokens` is summed across the turn. Per-message counts persist via migration `0029_message_token_counts.sql`.
+
+The characters-per-token heuristic survives only as a fallback for providers that emit no `Usage` events at all (some HTTP providers):
 
 ```
 prompt_tokens  ≈ user_message.len() / 4
 completion_tokens ≈ accumulated_output_chars / 4
 ```
 
-This is approximate (~80% accurate for English text). The UI labels estimates with "~" prefix.
-
-Future improvement: hook into Goose's internal `ProviderUsage` tracking or read from Ollama's `eval_count` / `prompt_eval_count` fields.
+That fallback is approximate (~80% accurate for English text), and the UI labels estimates with a "~" prefix. Counts sourced from real provider usage carry no "~".
 
 ## Per-Session Storage
 
