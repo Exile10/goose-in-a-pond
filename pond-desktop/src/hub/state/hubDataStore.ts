@@ -299,12 +299,6 @@ function nowPlayingFromApi(np: NowPlayingApiResponse | null): NowPlayingData {
   };
 }
 
-function todayDateStr(): string {
-  // "Monday, June 1"
-  const d = new Date();
-  return d.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
-}
-
 // ─── Loader ───────────────────────────────────────────────────
 
 async function load() {
@@ -352,7 +346,6 @@ async function load() {
     state.data = {
       ...MOCK_HOME,
       user: userName,
-      date: todayDateStr(),
       devices: finalDevices,
       cameras: finalCameras,
       rooms,
@@ -371,6 +364,10 @@ async function load() {
   }
 }
 
+/** How often the weather slice is re-fetched. The server caches upstream
+ *  responses for 15 minutes, so most of these polls are answered locally. */
+const WEATHER_POLL_MS = 10 * 60_000;
+
 // Kick off load once on first import in a browser; safe to call again.
 if (typeof window !== "undefined") {
   // Fire-and-forget; UI renders mock until load resolves.
@@ -381,6 +378,19 @@ if (typeof window !== "undefined") {
   setInterval(() => {
     void refreshNowPlaying();
   }, 10_000);
+  // Weather changes on its own too, and a GIAP dashboard is typically left
+  // open for days — without this the card keeps showing whatever the sky was
+  // doing when the app started.
+  setInterval(() => {
+    void refreshWeather();
+  }, WEATHER_POLL_MS);
+  // Timers do not fire while the machine sleeps or the window is hidden, so
+  // catch up as soon as the dashboard is looked at again.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    void refreshWeather();
+    void refreshNowPlaying();
+  });
 }
 
 // ─── Public API ───────────────────────────────────────────────
@@ -403,6 +413,17 @@ export function useRoutines(): RoutineDetail[] {
 
 export function refreshHomeData(): Promise<void> {
   return load();
+}
+
+/** Re-fetches just the weather slice, without the full dashboard reload. */
+export async function refreshWeather(): Promise<void> {
+  try {
+    const w = await api.getWeather();
+    state.data = { ...state.data, weather: weatherFromApi(w) };
+    emit();
+  } catch {
+    // keep the last known reading rather than blanking the card
+  }
 }
 
 /** Re-fetches just the now-playing snapshot, without the full dashboard reload. */

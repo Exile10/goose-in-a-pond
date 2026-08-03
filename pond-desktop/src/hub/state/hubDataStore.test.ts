@@ -12,7 +12,7 @@ vi.mock("../../api/PondApiClient", () => ({
 }));
 
 import { api } from "../../api/PondApiClient";
-import { getHomeData, refreshHomeData, __resetHubDataForTests } from "./hubDataStore";
+import { getHomeData, refreshHomeData, refreshWeather, __resetHubDataForTests } from "./hubDataStore";
 import { ROUTINES as MOCK_ROUTINES } from "../data/routines";
 
 const apiMock = api as unknown as {
@@ -115,6 +115,39 @@ describe("hubDataStore", () => {
     const home = getHomeData();
     expect(home.weather.temp).toBe(64);
     expect(home.weather.cond).toBe("Partly cloudy");
+  });
+
+  it("refreshWeather updates the weather slice without a full reload", async () => {
+    apiMock.getSettings.mockResolvedValue({ user_name: "Ada", assistant_name: "Goose", prompt_style: "balanced" });
+    apiMock.listDevices.mockResolvedValue([]);
+    apiMock.listSchedules.mockResolvedValue([]);
+    apiMock.getWeather.mockResolvedValue({ enabled: true, temp: 16, cond: "Overcast", icon: "cloud" });
+
+    await refreshHomeData();
+    expect(getHomeData().weather.temp).toBe(16);
+
+    // The sky changed while the dashboard sat open; only the poll re-runs.
+    apiMock.getWeather.mockResolvedValue({ enabled: true, temp: 21, cond: "Clear sky", icon: "sun" });
+    apiMock.listDevices.mockClear();
+
+    await refreshWeather();
+    const home = getHomeData();
+    expect(home.weather.temp).toBe(21);
+    expect(home.weather.cond).toBe("Clear sky");
+    expect(apiMock.listDevices).not.toHaveBeenCalled();
+  });
+
+  it("refreshWeather keeps the last reading when the fetch fails", async () => {
+    apiMock.getSettings.mockResolvedValue({ user_name: "Ada", assistant_name: "Goose", prompt_style: "balanced" });
+    apiMock.listDevices.mockResolvedValue([]);
+    apiMock.listSchedules.mockResolvedValue([]);
+    apiMock.getWeather.mockResolvedValue({ enabled: true, temp: 16, cond: "Overcast", icon: "cloud" });
+
+    await refreshHomeData();
+    apiMock.getWeather.mockRejectedValue(new Error("server offline"));
+
+    await refreshWeather();
+    expect(getHomeData().weather.temp).toBe(16);
   });
 
   it("falls back to mock routines when no recipes returned", async () => {

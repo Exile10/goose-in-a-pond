@@ -3,6 +3,7 @@ import { MessageCircle, RefreshCw, Cpu, Wrench, Mic, Headphones } from "lucide-r
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { api } from "../api/PondApiClient";
 import { useHomeData } from "../hub/state/hubDataStore";
+import { formatHubDate, greetingForHour, useNow } from "../hub/state/useNow";
 import { AskGoose } from "../hub/primitives/AskGoose";
 import { RoomPills } from "../hub/primitives/RoomPills";
 import { DeviceTile } from "../hub/primitives/DeviceTile";
@@ -24,17 +25,11 @@ const HX = {
   chat: "M21 12a8 8 0 0 1-11.5 7.2L4 21l1.8-5.4A8 8 0 1 1 21 12z",
 };
 
-function greetingForHour(h: number): string {
-  if (h < 5)  return "Good night";
-  if (h < 12) return "Good morning";
-  if (h < 18) return "Good afternoon";
-  return "Good evening";
-}
-
 export function Dashboard() {
   const state = useAppState();
   const dispatch = useAppDispatch();
   const home = useHomeData();
+  const now = useNow();
 
   const [room, setRoom] = useState("home");
   const [activeRoles, setActiveRoles] = useState<ModelActiveRoles | null>(null);
@@ -71,7 +66,7 @@ export function Dashboard() {
       ? home.devices.slice(0, 6)
       : home.devices.filter((d) => d.room === roomName);
 
-  const greeting = greetingForHour(new Date().getHours());
+  const greeting = greetingForHour(now.getHours());
 
   const roleItems = activeRoles
     ? [
@@ -91,7 +86,7 @@ export function Dashboard() {
             {greeting}, <span>{home.user}</span>
           </div>
           <div className="home2__sub">
-            {home.date} · {home.weather.cond}, {home.weather.temp}°
+            {formatHubDate(now)} · {home.weather.cond}, {home.weather.temp}°
           </div>
         </div>
         <div className="home2__head-actions">
