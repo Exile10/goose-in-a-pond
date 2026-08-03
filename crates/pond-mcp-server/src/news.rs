@@ -251,7 +251,8 @@ specific topic.")]
 
         // Fallback: Wikimedia Featured Content Feed (no API key required)
         eprintln!("[news] No Guardian key — using Wikimedia feed fallback");
-        self.search_news_wikimedia().await
+        let query = params.0.query.as_deref().unwrap_or("").trim().to_string();
+        self.search_news_wikimedia(&query).await
     }
 
     #[tool(description = "\
@@ -445,7 +446,10 @@ impl NewsMcpServer {
     }
 
     /// Wikimedia Featured Content fallback for search_news (no API key needed).
-    async fn search_news_wikimedia(&self) -> Result<CallToolResult, rmcp::model::ErrorData> {
+    async fn search_news_wikimedia(
+        &self,
+        query: &str,
+    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
         let body = match self.fetch_wikimedia_feed().await {
             Ok(b) => b,
             Err(text) => return Ok(CallToolResult::success(vec![Content::text(text)])),
@@ -458,8 +462,10 @@ impl NewsMcpServer {
 
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
-                "No current events found from Wikipedia today. Try again later, \
-                 or add a Guardian API key in Settings for keyword search.",
+                crate::format::format_no_results(
+                    "current events from Wikipedia today",
+                    &["giap-discovery__search_web"],
+                ),
             )]));
         }
 
@@ -478,10 +484,19 @@ impl NewsMcpServer {
 
         let header = "Today's World News (via Wikipedia)";
         let mut text = crate::format::format_list_result(&items, header, SEARCH_NEWS_BUDGET);
-        text.push_str(
-            "\n\n(Source: Wikipedia current events — for keyword search, \
-             add a Guardian API key in Settings.)",
-        );
+        if query.is_empty() {
+            text.push_str(
+                "\n\n(Source: Wikipedia current events — for keyword search, \
+                 add a Guardian API key in Settings.)",
+            );
+        } else {
+            text.push_str(&format!(
+                "\n\nNOTE: no keyword news source is configured, so this is today's \
+                 GENERAL world news — it is NOT a search for '{query}'. If nothing \
+                 above is about '{query}', this is NOT the answer: call \
+                 giap-discovery__search_web now."
+            ));
+        }
         eprintln!(
             "[news] search_news (Wikimedia) done, {} items, {} chars",
             items.len(),

@@ -128,6 +128,33 @@ describe("reducer — voice state", () => {
     expect(next.voiceError).toBeNull();
   });
 
+  // Regression: every producer dispatches SET_VOICE_ERROR then
+  // SET_VOICE_STATE("error"), so an unconditional reset here erased the reason
+  // and the UI could only ever render the generic "Error" label.
+  it("SET_VOICE_STATE('error') preserves the reason set just before it", () => {
+    let s = reducer(BASE, {
+      type: "SET_VOICE_ERROR",
+      payload: "piper voice not found",
+    });
+    s = reducer(s, { type: "SET_VOICE_STATE", payload: "error" });
+    expect(s.voiceState).toBe("error");
+    expect(s.voiceError).toBe("piper voice not found");
+  });
+
+  it("leaving the error state clears the reason", () => {
+    const errored = reducer(
+      reducer(BASE, { type: "SET_VOICE_ERROR", payload: "boom" }),
+      { type: "SET_VOICE_STATE", payload: "error" },
+    );
+    expect(errored.voiceError).toBe("boom");
+
+    const recovered = reducer(errored, {
+      type: "SET_VOICE_STATE",
+      payload: "wait",
+    });
+    expect(recovered.voiceError).toBeNull();
+  });
+
   it("SET_VOICE_STATE transitions to 'wait' (passive wake-word listening)", () => {
     const next = reducer(BASE, { type: "SET_VOICE_STATE", payload: "wait" });
     expect(next.voiceState).toBe("wait");

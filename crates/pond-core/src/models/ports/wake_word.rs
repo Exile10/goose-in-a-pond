@@ -128,7 +128,9 @@ mod tests {
         let det = InstantActivation;
         let activation = det.wait_for_activation_with_audio().await.unwrap();
         assert!(activation.captured_audio.is_none());
-        assert!(!StreamingWakeWordDetector::activation_prompt(&det).is_empty());
+        // Empty by contract: it never waits, so it has nothing to prompt for.
+        // See `instant_activation_announces_nothing_because_it_never_waits`.
+        assert_eq!(StreamingWakeWordDetector::activation_prompt(&det), "");
     }
 
     #[tokio::test]
@@ -137,6 +139,8 @@ mod tests {
         let det: &dyn WakeWordDetector = &InstantActivation;
         assert!(det.wait_for_activation().await.is_ok());
         // activation_prompt on the WakeWordDetector trait object is unambiguous here.
-        assert!(!<dyn WakeWordDetector>::activation_prompt(det).is_empty());
+        // The blanket impl must forward the streaming trait's value verbatim,
+        // empty included — not substitute a default of its own.
+        assert_eq!(<dyn WakeWordDetector>::activation_prompt(det), "");
     }
 }

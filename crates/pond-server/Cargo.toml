@@ -38,16 +38,15 @@ face-onnx = ["dep:pond-adapters-face-onnx"]
 # face-onnx (ORT_DYLIB_PATH). Off = events stay plain "motion".
 # cargo run -p pond-server --features vision-onnx -- serve
 vision-onnx = ["dep:pond-adapters-vision-onnx"]
-# Keep the legacy whisper-server / piper subprocess paths compilable. This is
-# a one-release escape valve while the in-process backends bed in. Default
-# builds omit it — the subprocess modules (whisper_process, piper_process,
-# piper_http) are fully cfg'd out.
-legacy-subprocess = [
-    "pond-adapters-whisper/legacy-subprocess",
-    "pond-adapters-piper/legacy-subprocess",
-]
+# `legacy-subprocess` is gone (2026-08). It kept the whisper-server and piper
+# subprocess paths compilable as "a one-release escape valve while the
+# in-process backends bed in" — several releases ago. It was default-off, never
+# built by CI, and its modules (whisper_process, piper_process, piper_http) are
+# deleted. The in-process backends are the only path now.
 
 [dependencies]
+# Advisory file locking for the single-voice-session guard (voice_lock.rs).
+fs2 = { workspace = true }
 # Optional: only compiled when --features goose-agent is passed.
 pond-adapters-goose           = { path = "../pond-adapters-goose", optional = true }
 # Optional: only compiled when --features pond-agent is passed.
@@ -119,3 +118,7 @@ assert_cmd = { workspace = true }
 predicates = { workspace = true }
 indoc      = { workspace = true }
 futures    = { workspace = true }
+
+# getuid(), so the voice lock is per-user rather than per-machine.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

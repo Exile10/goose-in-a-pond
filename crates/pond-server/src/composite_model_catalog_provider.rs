@@ -44,7 +44,11 @@ impl ModelCatalogProvider for CompositeModelCatalogProvider {
                     all_models.extend(models);
                     all_binaries.extend(binaries);
                 }
-                Err(e) => tracing::warn!("catalog sub-provider failed: {e}"),
+                // Debug, not warn: the usual cause is Ollama simply not
+                // running, which is the normal state for a local-GGUF
+                // install. It was putting a warning on the voice console
+                // on every start.
+                Err(e) => tracing::debug!("catalog sub-provider failed: {e}"),
             }
         }
         Ok((all_models, all_binaries))

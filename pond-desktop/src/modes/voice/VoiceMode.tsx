@@ -196,7 +196,9 @@ function VoiceModeChildProcess() {
         )}
 
         <p className="vm-hint">
-          <kbd className="vm-kbd">&lceil;&Sigma;V</kbd>
+          {/* &#8984; and &#8679;, not &lceil;/&Sigma; — the previous entities
+              rendered as the literal maths symbols "⌈ΣV". */}
+          <kbd className="vm-kbd">&#8984;&#8679;V</kbd>
           {" / "}
           <kbd className="vm-kbd">Ctrl+Shift+V</kbd>
           {" to activate"}
@@ -351,7 +353,9 @@ function VoiceModePipeline() {
         )}
 
         <p className="vm-hint">
-          <kbd className="vm-kbd">&lceil;&Sigma;V</kbd>
+          {/* &#8984; and &#8679;, not &lceil;/&Sigma; — the previous entities
+              rendered as the literal maths symbols "⌈ΣV". */}
+          <kbd className="vm-kbd">&#8984;&#8679;V</kbd>
           {" / "}
           <kbd className="vm-kbd">Ctrl+Shift+V</kbd>
           {" to activate"}

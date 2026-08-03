@@ -2686,6 +2686,10 @@ async fn update_settings(
         tracing::warn!(error = %e, "failed to record user intent for settings patch");
     }
 
+    // Revoking microphone permission has to take effect now, not at the next
+    // restart — a privacy control the user has to reboot to apply is not one.
+    pond_core::models::domain::mic_gate::set_mic_enabled(merged.mic_enabled);
+
     // Hot-reload the ModelRouter whenever any provider/model field changes.
     let provider_keys = [
         "chat_provider",
@@ -5136,51 +5140,77 @@ async fn calibrate_wake_word(
         )
     })?;
 
-    // ── Transcribe via whisper.cpp ───────────────────────────────────────────
-    let whisper_url = format!("{}/inference", state.whisper_url);
-    let part = reqwest::multipart::Part::bytes(bytes)
-        .file_name(filename)
-        .mime_str(&content_type)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("MIME error: {e}")})),
-            )
-        })?;
-    let form = reqwest::multipart::Form::new()
-        .part("file", part)
-        .text("response_format", "json");
+    // ── Transcribe ───────────────────────────────────────────────────────────
+    // In-process first, exactly as POST /transcribe does. Without this branch
+    // the handler went straight to the HTTP whisper server, which a default
+    // build never spawns — that spawn is `#[cfg(feature = "legacy-subprocess")]`
+    // — so onboarding's wake-word calibration step returned 502 on every
+    // install. The CLI `pond-server calibrate` path did work in-process, so the
+    // two calibration routes disagreed and only one of them functioned.
+    let raw_transcript = if let Some(transcribe_fn) = &state.transcribe_audio {
+        let fn_clone = transcribe_fn.clone();
+        tokio::task::spawn_blocking(move || fn_clone(bytes))
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("transcription task panicked: {e}")})),
+                )
+            })?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("transcription failed: {e}")})),
+                )
+            })?
+            .trim()
+            .to_string()
+    } else {
+        let whisper_url = format!("{}/inference", state.whisper_url);
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename)
+            .mime_str(&content_type)
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("MIME error: {e}")})),
+                )
+            })?;
+        let form = reqwest::multipart::Form::new()
+            .part("file", part)
+            .text("response_format", "json");
 
-    let resp = state
-        .http_client
-        .post(&whisper_url)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| {
+        let resp = state
+            .http_client
+            .post(&whisper_url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": format!("whisper server unreachable: {e}")})),
+                )
+            })?;
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err((StatusCode::BAD_GATEWAY, Json(json!({"error": body}))));
+        }
+
+        let whisper_json: Value = resp.json().await.map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("whisper server unreachable: {e}")})),
+                Json(json!({"error": format!("whisper parse error: {e}")})),
             )
         })?;
 
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err((StatusCode::BAD_GATEWAY, Json(json!({"error": body}))));
-    }
-
-    let whisper_json: Value = resp.json().await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": format!("whisper parse error: {e}")})),
-        )
-    })?;
-
-    let raw_transcript = whisper_json["text"]
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .to_string();
+        whisper_json["text"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
     if raw_transcript.is_empty() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,

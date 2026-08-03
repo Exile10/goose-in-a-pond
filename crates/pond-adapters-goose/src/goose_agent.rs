@@ -78,6 +78,38 @@ const MEMORY_CANDIDATE_FLOOR: usize = 40;
 
 const GOOSE_MAX_TURNS_MESSAGE: &str = "I've reached the maximum number of actions I can do without user input. Would you like me to continue?";
 
+/// Goose's own text when a turn produced nothing at all. Matched verbatim, like
+/// [`GOOSE_MAX_TURNS_MESSAGE`], so GIAP can re-engage instead of handing the
+/// user a message that only tells them to try again.
+const GOOSE_EMPTY_TURN_MESSAGE: &str =
+    "The model returned an empty response. Please resend your message to continue.";
+
+/// How many times GIAP re-engages the model after a turn that produced no text
+/// and no tool call.
+///
+/// Deliberately small: each attempt is a full turn, and on-device that is a real
+/// wait. Two buys the recovery without turning a bad turn into a minute of
+/// silence.
+const MAX_EMPTY_TURN_REENGAGEMENTS: usize = 2;
+
+/// Appended to the user message when re-engaging after an empty turn.
+///
+/// The prompt MUST change between attempts. A local model sampling
+/// deterministically answers an unchanged conversation identically, so a retry
+/// that alters nothing is a wasted prefill — which is exactly what Goose's own
+/// retry did before `GOOSE_MAX_EMPTY_TURN_RETRIES=0` handed this over.
+const EMPTY_TURN_STEER: &str = "(Your previous attempt produced only internal reasoning and no reply. \
+Do not reason further — either call the tool you already decided on, or write the answer directly.)";
+
+/// Shown once the re-engagement budget is spent, in place of silence.
+///
+/// Says what the user can actually do about it. The failure is usually specific
+/// to how this turn's prompt lands, so rewording or a fresh session both clear
+/// it, while resending the same words often will not.
+const EMPTY_TURN_EXHAUSTED_MESSAGE: &str =
+    "I could not produce a response to that, even after retrying. \
+This usually clears if you reword the question — or start a new chat if it keeps happening.";
+
 /// Goose environment knobs GIAP owns, as `(key, Some(value) | None)` where
 /// `None` means "unset this key".
 ///
@@ -89,7 +121,7 @@ fn goose_env_knobs(
     provider: &str,
     effective_ctx: usize,
     hybrid_compaction: bool,
-) -> [(&'static str, Option<String>); 3] {
+) -> [(&'static str, Option<String>); 4] {
     let local = matches!(provider, "local" | "gguf");
     [
         // Without this Goose's ModelConfig defaults context_limit to 128K and
@@ -117,6 +149,13 @@ fn goose_env_knobs(
             "GOOSE_TOOL_PAIR_SUMMARIZATION",
             (local && hybrid_compaction).then(|| "false".to_string()),
         ),
+        // Empty-turn recovery has exactly one owner, and it is GIAP. Goose's own
+        // retry re-sends an unchanged conversation, which a deterministic local
+        // model answers identically — three full prefills before the user sees
+        // anything. GIAP varies the prompt between attempts instead
+        // (EMPTY_TURN_STEER), so Goose should detect the empty turn and hand
+        // straight back.
+        ("GOOSE_MAX_EMPTY_TURN_RETRIES", Some("0".to_string())),
     ]
 }
 
@@ -1719,7 +1758,10 @@ impl GooseAdapter {
         }
 
         let available: Vec<String> = registered_extensions().to_vec();
-        let signal = sel::selection_signal(first_message, memories);
+        // Two signals, scored independently and merged with max. Concatenating
+        // them let a kilobyte of memories drown a short question — see
+        // `selection_signals`.
+        let signals = sel::selection_signals(first_message, memories);
 
         // Score, or fall back to every group. Both the "no group embeddings" and
         // the "embedding this signal failed" paths widen — the asymmetry is
@@ -1728,21 +1770,35 @@ impl GooseAdapter {
             self.group_description_embeddings().await,
             self.embedding_provider.as_ref(),
         ) {
-            (Some(group_vectors), Some(provider)) => match provider.embed(&signal).await {
-                Ok(query) => Some(
-                    group_vectors
-                        .iter()
-                        .map(|(extension, v)| sel::GroupScore {
-                            extension: extension.clone(),
-                            score: cosine_similarity(&query, v),
-                        })
-                        .collect(),
-                ),
-                Err(e) => {
-                    tracing::warn!("tool selection: embedding the opening message failed: {e}");
-                    None
+            (Some(group_vectors), Some(provider)) => {
+                let mut per_signal: Vec<Vec<sel::GroupScore>> = Vec::with_capacity(signals.len());
+                let mut failed = None;
+                for signal in &signals {
+                    match provider.embed(signal).await {
+                        Ok(query) => per_signal.push(
+                            group_vectors
+                                .iter()
+                                .map(|(extension, v)| sel::GroupScore {
+                                    extension: extension.clone(),
+                                    score: cosine_similarity(&query, v),
+                                })
+                                .collect(),
+                        ),
+                        Err(e) => failed = Some(e),
+                    }
                 }
-            },
+                match (per_signal.is_empty(), failed) {
+                    // Every signal failed to embed — widen, as before.
+                    (true, Some(e)) => {
+                        tracing::warn!("tool selection: embedding the opening message failed: {e}");
+                        None
+                    }
+                    (true, None) => None,
+                    // At least one embedded: score on what we have rather than
+                    // discarding a good signal because its partner failed.
+                    _ => Some(sel::merge_scores(&per_signal)),
+                }
+            }
             _ => None,
         };
 
@@ -2661,16 +2717,12 @@ impl GooseAdapter {
             msg.push_str("\n</user-message>");
             msg
         };
-        let user_msg = attach_images(Message::user().with_text(&user_text), &request.images);
-        let session_cfg = goose::agents::types::SessionConfig {
-            id: goose_sid.clone(),
-            schedule_id: None,
-            // Voice requests get the tighter #105 cap so a runaway loop can't
-            // keep the speaker silent for the full text-chat turn budget.
-            // `agent_max_turns = 0` resolves to the uncapped sentinel here.
-            max_turns: Some(max_turns),
-            retry_config: None,
-        };
+        // Held as pieces rather than one built message: empty-turn recovery
+        // re-engages with a steered variant, and the prompt must actually differ
+        // between attempts or a deterministic model repeats itself.
+        let turn_text = user_text.clone();
+        let turn_images = request.images.clone();
+        let turn_goose_sid = goose_sid.clone();
 
         let agent_clone = self.agent.clone();
         let last_prompt_tokens_map = self.last_prompt_tokens_handle();
@@ -2713,68 +2765,107 @@ impl GooseAdapter {
                 message_len = user_msg_len,
             );
 
-            let mut goose_stream = match agent_clone.reply(user_msg, session_cfg, Some(cancel_token)).await {
-                Ok(s) => s,
-                Err(e) => {
-                    yield Ok(AgentStreamEvent::Error { content: e.to_string() });
-                    return;
-                }
-            };
+                let mut turn_stats = pond_core::shared::domain::turn_stats::TurnStats::default();
+                let mut saw_usage = false;
+                // ── Empty-turn recovery (GIAP-owned) ─────────────────────────
+                // A turn that yields no text and no tool call is a failure of the
+                // harness, not an answer, so it never reaches the user as silence.
+                // Goose detects the empty turn and hands straight back
+                // (GOOSE_MAX_EMPTY_TURN_RETRIES=0); GIAP re-engages with a changed
+                // prompt, and says something actionable once the budget is spent.
+                let mut attempt: usize = 0;
+                'attempts: loop {
+                    let attempt_text = if attempt == 0 {
+                        turn_text.clone()
+                    } else {
+                        format!("{turn_text}\n\n{EMPTY_TURN_STEER}")
+                    };
+                    let attempt_msg =
+                        attach_images(Message::user().with_text(&attempt_text), &turn_images);
+                    let attempt_cfg = goose::agents::types::SessionConfig {
+                        id: turn_goose_sid.clone(),
+                        schedule_id: None,
+                        // Voice requests get the tighter #105 cap so a runaway loop
+                        // can't keep the speaker silent for the full text-chat turn
+                        // budget. `agent_max_turns = 0` resolves to the uncapped
+                        // sentinel here.
+                        max_turns: Some(max_turns),
+                        retry_config: None,
+                    };
+                    // Text or a tool call — anything the user actually receives.
+                    let mut produced_visible = false;
+                let mut goose_stream = match agent_clone.reply(attempt_msg, attempt_cfg, Some(cancel_token.clone())).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        yield Ok(AgentStreamEvent::Error { content: e.to_string() });
+                        return;
+                    }
+                };
 
-            let mut turn_stats = pond_core::shared::domain::turn_stats::TurnStats::default();
-            let mut saw_usage = false;
-            while let Some(event_result) = goose_stream.next().await {
-                match event_result {
-                    Ok(event) => match event {
-                        goose::agents::AgentEvent::Message(msg) => {
-                            // Emit tool call and result events
-                            for content in &msg.content {
-                                match content {
-                                    goose::conversation::message::MessageContent::ToolRequest(tr) => {
-                                        if let Ok(tool_call) = &tr.tool_call {
-                                            let tool_name = tool_call.name.to_string();
-                                            // Guard: suppress tool calls not in the validated schema.
-                                            // An empty allowed set means no extensions loaded —
-                                            // every call is a hallucination and must be blocked.
-                                            //
-                                            // Read LIVE from the session's shim controls rather than
-                                            // a snapshot: `enable_tool_group` widens the set mid-turn
-                                            // and the very next call must be admitted, or the escape
-                                            // hatch would enable a group and then block its use.
-                                            if !guard_controls.is_tool_allowed(&tool_name) {
-                                                tracing::warn!(
+                while let Some(event_result) = goose_stream.next().await {
+                    match event_result {
+                        Ok(event) => match event {
+                            goose::agents::AgentEvent::Message(msg) => {
+                                // Emit tool call and result events
+                                for content in &msg.content {
+                                    match content {
+                                        goose::conversation::message::MessageContent::ToolRequest(tr) => {
+                                            if let Ok(tool_call) = &tr.tool_call {
+                                                let tool_name = tool_call.name.to_string();
+                                                // Guard: suppress tool calls not in the validated schema.
+                                                // An empty allowed set means no extensions loaded —
+                                                // every call is a hallucination and must be blocked.
+                                                //
+                                                // Read LIVE from the session's shim controls rather than
+                                                // a snapshot: `enable_tool_group` widens the set mid-turn
+                                                // and the very next call must be admitted, or the escape
+                                                // hatch would enable a group and then block its use.
+                                                if !guard_controls.is_tool_allowed(&tool_name) {
+                                                    tracing::warn!(
+                                                        tool = %tool_name,
+                                                        "Blocked unauthorized tool call (not in schema or no tools loaded)",
+                                                    );
+                                                    continue;
+                                                }
+                                                tool_id_to_name.insert(tr.id.clone(), tool_name.clone());
+                                                tool_call_starts.insert(tr.id.clone(), std::time::Instant::now());
+                                                tracing::info!(
+                                                    target: "giap::trace",
+                                                    kind = "tool_call",
+                                                    session_id = %session_id,
                                                     tool = %tool_name,
-                                                    "Blocked unauthorized tool call (not in schema or no tools loaded)",
+                                                    tool_id = %tr.id,
                                                 );
-                                                continue;
+                                                produced_visible = true;
+                                                yield Ok(AgentStreamEvent::ToolCall {
+                                                    id: tr.id.clone(),
+                                                    tool: tool_name,
+                                                    input: tool_call.arguments.clone().map(serde_json::Value::Object),
+                                                });
                                             }
-                                            tool_id_to_name.insert(tr.id.clone(), tool_name.clone());
-                                            tool_call_starts.insert(tr.id.clone(), std::time::Instant::now());
-                                            tracing::info!(
-                                                target: "giap::trace",
-                                                kind = "tool_call",
-                                                session_id = %session_id,
-                                                tool = %tool_name,
-                                                tool_id = %tr.id,
-                                            );
-                                            yield Ok(AgentStreamEvent::ToolCall {
-                                                id: tr.id.clone(),
-                                                tool: tool_name,
-                                                input: tool_call.arguments.clone().map(serde_json::Value::Object),
-                                            });
                                         }
-                                    }
-                                    goose::conversation::message::MessageContent::ToolResponse(tr) => {
-                                        if let Ok(tool_result) = &tr.tool_result {
-                                            let content_text = tool_result
-                                                .content
-                                                .iter()
-                                                .filter_map(|c| match c.deref() {
-                                                    rmcp::model::RawContent::Text(t) => Some(t.text.clone()),
-                                                    _ => None,
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join("\n");
+                                        goose::conversation::message::MessageContent::ToolResponse(tr) => {
+                                            // Surface BOTH arms. A failed dispatch still
+                                            // reaches the model — goose puts the error into
+                                            // its own conversation — so dropping the Err here
+                                            // only blinded the UI and pond_system.db. The turns
+                                            // that most needed explaining were the ones that
+                                            // left a tool_call with no matching tool_result.
+                                            let (content_text, failed) = match &tr.tool_result {
+                                                Ok(tool_result) => (
+                                                    tool_result
+                                                        .content
+                                                        .iter()
+                                                        .filter_map(|c| match c.deref() {
+                                                            rmcp::model::RawContent::Text(t) => Some(t.text.clone()),
+                                                            _ => None,
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                        .join("\n"),
+                                                    false,
+                                                ),
+                                                Err(e) => (format!("Error: {e}"), true),
+                                            };
 
                                             let tool_name = tool_id_to_name
                                                 .get(&tr.id)
@@ -2792,93 +2883,139 @@ impl GooseAdapter {
                                                 tool_id = %tr.id,
                                                 latency_ms = tool_latency_ms,
                                                 result_len = content_text.len(),
+                                                failed = failed,
                                             );
+                                            if failed {
+                                                tracing::warn!(
+                                                    tool = %tool_name,
+                                                    tool_id = %tr.id,
+                                                    error = %content_text,
+                                                    "tool call failed",
+                                                );
+                                            }
                                             yield Ok(AgentStreamEvent::ToolResult {
                                                 id: tr.id.clone(),
                                                 tool: tool_name,
                                                 content: content_text,
                                             });
                                         }
+                                        _ => {}
                                     }
-                                    _ => {}
                                 }
-                            }
-                            // Emit raw text — the SSE layer's stateful ThoughtFilter
-                            // handles stripping of <think>, <thought>, and
-                            // <|channel>thought...<channel|> tags across chunk
-                            // boundaries.  A per-chunk strip here interferes with
-                            // the stateful filter (it eats close tags the filter
-                            // is waiting for, causing answer text to be swallowed).
-                            let raw_text = msg.as_concat_text();
-                            if !raw_text.is_empty() {
-                                // Goose signals "budget exhausted" by streaming a
-                                // fixed sentence as ordinary assistant text (see
-                                // GOOSE_MAX_TURNS_MESSAGE). Re-emit it as a
-                                // structured event so a client can offer a real
-                                // continue action; the text still goes through so
-                                // history, persistence, and voice stay consistent.
-                                let hit_turn_limit = raw_text.trim() == GOOSE_MAX_TURNS_MESSAGE;
-                                total_output_chars += raw_text.len();
-                                yield Ok(AgentStreamEvent::Text { content: raw_text });
-                                if hit_turn_limit {
-                                    tracing::info!(
-                                        target: "giap::trace",
-                                        kind = "turn_limit_reached",
+                                // Emit raw text — the SSE layer's stateful ThoughtFilter
+                                // handles stripping of <think>, <thought>, and
+                                // <|channel>thought...<channel|> tags across chunk
+                                // boundaries.  A per-chunk strip here interferes with
+                                // the stateful filter (it eats close tags the filter
+                                // is waiting for, causing answer text to be swallowed).
+                                let raw_text = msg.as_concat_text();
+                                if !raw_text.is_empty() && raw_text.trim() == GOOSE_EMPTY_TURN_MESSAGE {
+                                    // Goose reporting the turn produced nothing. That is
+                                    // a signal to the harness, not an answer to the user
+                                    // — swallow it so the recovery loop below re-engages.
+                                    tracing::warn!(
                                         session_id = %session_id,
-                                        max_turns,
+                                        "goose reported an empty turn",
                                     );
-                                    yield Ok(AgentStreamEvent::TurnLimitReached { max_turns });
+                                } else if !raw_text.is_empty() {
+                                    // Goose signals "budget exhausted" by streaming a
+                                    // fixed sentence as ordinary assistant text (see
+                                    // GOOSE_MAX_TURNS_MESSAGE). Re-emit it as a
+                                    // structured event so a client can offer a real
+                                    // continue action; the text still goes through so
+                                    // history, persistence, and voice stay consistent.
+                                    let hit_turn_limit = raw_text.trim() == GOOSE_MAX_TURNS_MESSAGE;
+                                    produced_visible = true;
+                                    total_output_chars += raw_text.len();
+                                    yield Ok(AgentStreamEvent::Text { content: raw_text });
+                                    if hit_turn_limit {
+                                        tracing::info!(
+                                            target: "giap::trace",
+                                            kind = "turn_limit_reached",
+                                            session_id = %session_id,
+                                            max_turns,
+                                        );
+                                        yield Ok(AgentStreamEvent::TurnLimitReached { max_turns });
+                                    }
                                 }
                             }
+                            goose::agents::AgentEvent::HistoryReplaced(_) => {
+                                yield Ok(AgentStreamEvent::Status { content: "Compacting context...".to_string() });
+                            }
+                            // Per-inference usage from the provider. A turn can hold
+                            // several inferences (tool round-trips): the FINAL one's
+                            // input is the turn's real context load; outputs sum.
+                            goose::agents::AgentEvent::Usage(pu) => {
+                                saw_usage = true;
+                                turn_stats.inference_count += 1;
+                                if let Some(input) = pu.usage.input_tokens {
+                                    turn_stats.prompt_tokens = input.max(0) as u32;
+                                }
+                                if let Some(output) = pu.usage.output_tokens {
+                                    turn_stats.completion_tokens += output.max(0) as u32;
+                                }
+                                if let Some(stats) = &pu.stats {
+                                    if turn_stats.ttft_ms.is_none() {
+                                        turn_stats.ttft_ms = stats.time_to_first_token_ms;
+                                    }
+                                    if let Some(load) = stats.model_load_ms {
+                                        turn_stats.model_load_ms =
+                                            Some(turn_stats.model_load_ms.unwrap_or(0) + load);
+                                    }
+                                    if let Some(prefill) = stats.prefill_ms {
+                                        turn_stats.prefill_ms =
+                                            Some(turn_stats.prefill_ms.unwrap_or(0) + prefill);
+                                    }
+                                    if let Some(elapsed) = stats.elapsed_ms {
+                                        let decode =
+                                            elapsed.saturating_sub(stats.prefill_ms.unwrap_or(0));
+                                        turn_stats.decode_ms =
+                                            Some(turn_stats.decode_ms.unwrap_or(0) + decode);
+                                    }
+                                    if let Some(n_ctx) = stats.effective_context_tokens {
+                                        turn_stats.context_limit_tokens = Some(n_ctx as u32);
+                                    }
+                                    if let Some(draft) = &stats.draft {
+                                        turn_stats.draft_accept_rate = Some(draft.accept_rate as f32);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                        Err(e) => {
+                            yield Ok(AgentStreamEvent::Error { content: e.to_string() });
                         }
-                        goose::agents::AgentEvent::HistoryReplaced(_) => {
-                            yield Ok(AgentStreamEvent::Status { content: "Compacting context...".to_string() });
-                        }
-                        // Per-inference usage from the provider. A turn can hold
-                        // several inferences (tool round-trips): the FINAL one's
-                        // input is the turn's real context load; outputs sum.
-                        goose::agents::AgentEvent::Usage(pu) => {
-                            saw_usage = true;
-                            turn_stats.inference_count += 1;
-                            if let Some(input) = pu.usage.input_tokens {
-                                turn_stats.prompt_tokens = input.max(0) as u32;
-                            }
-                            if let Some(output) = pu.usage.output_tokens {
-                                turn_stats.completion_tokens += output.max(0) as u32;
-                            }
-                            if let Some(stats) = &pu.stats {
-                                if turn_stats.ttft_ms.is_none() {
-                                    turn_stats.ttft_ms = stats.time_to_first_token_ms;
-                                }
-                                if let Some(load) = stats.model_load_ms {
-                                    turn_stats.model_load_ms =
-                                        Some(turn_stats.model_load_ms.unwrap_or(0) + load);
-                                }
-                                if let Some(prefill) = stats.prefill_ms {
-                                    turn_stats.prefill_ms =
-                                        Some(turn_stats.prefill_ms.unwrap_or(0) + prefill);
-                                }
-                                if let Some(elapsed) = stats.elapsed_ms {
-                                    let decode =
-                                        elapsed.saturating_sub(stats.prefill_ms.unwrap_or(0));
-                                    turn_stats.decode_ms =
-                                        Some(turn_stats.decode_ms.unwrap_or(0) + decode);
-                                }
-                                if let Some(n_ctx) = stats.effective_context_tokens {
-                                    turn_stats.context_limit_tokens = Some(n_ctx as u32);
-                                }
-                                if let Some(draft) = &stats.draft {
-                                    turn_stats.draft_accept_rate = Some(draft.accept_rate as f32);
-                                }
-                            }
-                        }
-                        _ => {}
-                    },
-                    Err(e) => {
-                        yield Ok(AgentStreamEvent::Error { content: e.to_string() });
                     }
                 }
-            }
+
+                    if produced_visible {
+                        break 'attempts;
+                    }
+                    if attempt >= MAX_EMPTY_TURN_REENGAGEMENTS {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            attempts = attempt + 1,
+                            "empty turn: re-engagement budget spent",
+                        );
+                        total_output_chars += EMPTY_TURN_EXHAUSTED_MESSAGE.len();
+                        yield Ok(AgentStreamEvent::Text {
+                            content: EMPTY_TURN_EXHAUSTED_MESSAGE.to_string(),
+                        });
+                        break 'attempts;
+                    }
+                    attempt += 1;
+                    tracing::warn!(
+                        session_id = %session_id,
+                        attempt,
+                        max = MAX_EMPTY_TURN_REENGAGEMENTS,
+                        "empty turn: re-engaging with a steered prompt",
+                    );
+                    yield Ok(AgentStreamEvent::Status {
+                        content: format!(
+                            "No response — re-engaging ({attempt}/{MAX_EMPTY_TURN_REENGAGEMENTS})"
+                        ),
+                    });
+                }
             // Per-turn usage from the provider's per-inference Usage events.
             // Fall back to the chars/4 heuristic only when the provider emitted
             // no Usage events at all (some HTTP providers).
@@ -4121,6 +4258,52 @@ mod tests {
                 "{provider}"
             );
         }
+    }
+
+    /// Empty-turn recovery has one owner. Goose's own retry re-sends an
+    /// unchanged conversation, which a deterministic local model answers
+    /// identically — so it must be off on every provider and in both compaction
+    /// modes, leaving GIAP's steered re-engagement as the only recovery path.
+    #[test]
+    fn goose_never_retries_empty_turns_itself() {
+        for provider in ["local", "gguf", "ollama", "llamafile"] {
+            for hybrid in [true, false] {
+                assert_eq!(
+                    knob(
+                        &goose_env_knobs(provider, 4096, hybrid),
+                        "GOOSE_MAX_EMPTY_TURN_RETRIES"
+                    )
+                    .as_deref(),
+                    Some("0"),
+                    "{provider} hybrid={hybrid}"
+                );
+            }
+        }
+    }
+
+    /// The steer must actually change the prompt — a retry that alters nothing
+    /// reproduces the same empty turn and just costs another prefill.
+    #[test]
+    fn empty_turn_steer_is_non_empty_and_distinct_from_the_user_text() {
+        let user_text = "any news on the expressway toll?";
+        let steered = format!("{user_text}\n\n{EMPTY_TURN_STEER}");
+        assert_ne!(steered, user_text);
+        assert!(
+            steered.starts_with(user_text),
+            "the original ask must survive"
+        );
+        assert!(!EMPTY_TURN_STEER.trim().is_empty());
+    }
+
+    /// Goose's empty-turn sentence is matched verbatim, so a wording drift on an
+    /// upstream sync silently disables recovery. Pin it.
+    #[test]
+    fn goose_empty_turn_sentinel_is_pinned() {
+        assert_eq!(
+            GOOSE_EMPTY_TURN_MESSAGE,
+            "The model returned an empty response. Please resend your message to continue."
+        );
+        assert_ne!(GOOSE_EMPTY_TURN_MESSAGE, EMPTY_TURN_EXHAUSTED_MESSAGE);
     }
 
     /// The knob set doubles as the change signature that gates `set_var`, so a
