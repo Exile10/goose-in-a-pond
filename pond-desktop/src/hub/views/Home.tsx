@@ -14,6 +14,7 @@ import { HubClock } from "../primitives/HubClock";
 import { PanelHead } from "../primitives/PanelHead";
 import { AskGoose } from "../primitives/AskGoose";
 import { useHomeData } from "../state/hubDataStore";
+import { formatHubDate, greetingForHour, useNow } from "../state/useNow";
 
 // Extra icons used only in the Home view header
 const HX = {
@@ -25,16 +26,10 @@ interface HomeViewProps {
   go?: (route: string) => void;
 }
 
-function greetingForHour(h: number): string {
-  if (h < 5)  return "Good night";
-  if (h < 12) return "Good morning";
-  if (h < 18) return "Good afternoon";
-  return "Good evening";
-}
-
 export function HomeView({ go }: HomeViewProps) {
   const [room, setRoom] = useState("home");
   const home = useHomeData();
+  const now = useNow();
 
   const roomName = home.rooms.find((r) => r.id === room)?.name ?? "Home";
   const favorites =
@@ -42,7 +37,7 @@ export function HomeView({ go }: HomeViewProps) {
       ? home.devices.slice(0, 6)
       : home.devices.filter((d) => d.room === roomName);
 
-  const greeting = greetingForHour(new Date().getHours());
+  const greeting = greetingForHour(now.getHours());
 
   return (
     <div className="home2">
@@ -53,7 +48,7 @@ export function HomeView({ go }: HomeViewProps) {
             {greeting}, <span>{home.user}</span>
           </div>
           <div className="home2__sub">
-            {home.date} · {home.weather.cond}, {home.weather.temp}°
+            {formatHubDate(now)} · {home.weather.cond}, {home.weather.temp}°
           </div>
         </div>
         <div className="home2__head-actions">
