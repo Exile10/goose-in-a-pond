@@ -20,7 +20,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 2 | Requires the ability of the model to **think** | [PAI-5](./05-reasoning-and-thinking.md) | DESIGNED |
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
 | 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | DESIGNED |
-| 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | DESIGNED |
+| 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1 IN PROGRESS** |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
 | 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | DESIGNED |
@@ -139,3 +139,54 @@ which is exactly why check 2.1.3 exists. Re-verify; do not trust a prior pass, i
 **The build baseline is unblocked.** `goose/` can be populated from a clone of `jarida-io/Goose:main`
 when the submodule is uninitialized, which is what CI does. With it in place `cargo fmt --check`
 passes and `cargo test -p pond-core --lib` runs. Do this before assuming a cargo failure is yours.
+
+**2026-08-03 (evening) — PAI-3 P1 started. STOPPED MID-PHASE; read this before resuming.**
+
+### Done and committed
+
+`ContextGovernor` in `models/services/context/context_governor.rs`, exported through
+`context/mod.rs` and the compatibility re-export in `models/services/mod.rs`. Types:
+`WindowResolution { tokens, source }`, `WindowSource` (five rungs, with `label()` and `is_exact()`),
+`EngineWindow { tokens, model }`, `ContextInputs`. Plus `prompt_window()`, which is the existing
+local 8192 prompt-side clamp moved in unchanged.
+
+**Domain only — no call site repointed, so behaviour is unchanged.** 13 unit tests;
+`cargo test -p pond-core --lib` 704 passed / 0 failed; `cargo fmt --check` clean.
+
+### The exact remaining work for P1
+
+Four call sites, all in `crates/pond-adapters-goose/src/goose_agent.rs`. Verified 2026-08-03:
+
+| Line | What it does now | What it should become |
+|---|---|---|
+| ~636 | `env GOOSE_CONTEXT_LIMIT` else 8192, in the session-hydration replay path | `ContextGovernor::resolve` with session scope; `engine_reported` available here |
+| ~1478 | `env GOOSE_CONTEXT_LIMIT` else 8192, in `trim_goose_history` | same — **this is the bug the whole phase exists to fix** |
+| ~907 | `effective_context_window` → `resolve_context_window` (pinned > override > heuristic) | delegate to the governor, passing `registry_pinned` |
+| ~2182, ~2366 | `prompt_budget_ctx(provider, effective_context_window(...))` | `ContextGovernor::prompt_window(provider, resolve(...).tokens)` |
+
+Also: `pond-agent/src/agent.rs:375` (`min(override, caps)`) and `pond-api/src/routes.rs:1674-1685`
+(`TurnStats > override > caps`) are the other two of the four disagreeing paths named in the design.
+
+### Three things to be careful about
+
+1. **`GOOSE_CONTEXT_LIMIT` is still written and must stay written.** `goose_env_knobs`
+   (`goose_agent.rs:131`) sets it to the raw resolved window, and it flows into Ollama's
+   `options.num_ctx` — so the reported limit, the request's `num_ctx` and the KV cache agree.
+   Deleting the *reads* is the goal; deleting the *write* would desynchronise them. Two adapter
+   tests assert the written value (`goose_agent.rs:4224,4239`).
+2. **The env var carries the raw window, not the prompt budget.** Sites ~636 and ~1478 feed
+   `CompactionProfile::from_context_window` directly with it, while ~2182 and ~2366 clamp through
+   `prompt_budget_ctx` first. That asymmetry is deliberate and already correct; preserve it when
+   repointing, or the preamble silently grows on local providers.
+3. **Wire `engine_reported` only where the value is session-scoped and model-matched.** For the
+   settings path (`apply_goose_env_knobs`) pass `None` — it is process-wide, and a session's last
+   turn is not evidence about it. This keeps that path behaviour-identical.
+
+### Verification P1 still owes
+
+The regression test from the design doc section 7: assert no file under `models/services/context/`
+and no adapter budget path calls `std::env::var`. The module-level half of that already exists
+inside `context_governor.rs`; the adapter half cannot be written until the two reads are gone.
+
+`cargo check -p pond-adapters-goose` is the gate for all of the above and is slow from cold —
+start it early.
