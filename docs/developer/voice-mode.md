@@ -34,6 +34,37 @@ Every line printed above is load-bearing. If a model failed to resolve, its line
 says so instead of being absent, because a silent voice assistant and a broken
 one look identical from the outside.
 
+## One session per device
+
+A voice session owns the microphone and the speaker, and there is one of each.
+A second session does not degrade gracefully — it fights, and the symptoms
+never name the cause: two assistants answering in different voices, or a
+"stream configuration is not supported by the device" error from whichever one
+lost the race to open the input.
+
+So the second one refuses to start and says who has the lock:
+
+```
+another voice session (pid 25718) is already running on this device.
+
+Voice needs sole use of the microphone and speaker. Two sessions answer in
+different voices and take the audio device from each other.
+
+Stop the other session first — `kill 25718`.
+```
+
+`crates/pond-server/src/voice_lock.rs`. Two properties worth knowing:
+
+- **The lock is not in the data directory.** It is per-user, in the temp
+  directory. A session started with `POND_DATA_DIR` pointed at a scratch
+  profile takes the *same microphone* as the real one, so it must take the
+  same lock — scoping it to the data directory would permit exactly the pair
+  it exists to prevent.
+- **It is `flock`, not a pidfile.** The kernel releases it when the holder
+  dies, however it dies, so `kill -9` frees it and there is no such thing as a
+  stale lock to reconcile. The PID inside the file is only there to name the
+  holder in the message.
+
 ## The turn
 
 | | What the user gets |

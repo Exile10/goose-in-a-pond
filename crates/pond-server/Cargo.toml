@@ -45,6 +45,8 @@ vision-onnx = ["dep:pond-adapters-vision-onnx"]
 # deleted. The in-process backends are the only path now.
 
 [dependencies]
+# Advisory file locking for the single-voice-session guard (voice_lock.rs).
+fs2 = { workspace = true }
 # Optional: only compiled when --features goose-agent is passed.
 pond-adapters-goose           = { path = "../pond-adapters-goose", optional = true }
 # Optional: only compiled when --features pond-agent is passed.
@@ -116,3 +118,7 @@ assert_cmd = { workspace = true }
 predicates = { workspace = true }
 indoc      = { workspace = true }
 futures    = { workspace = true }
+
+# getuid(), so the voice lock is per-user rather than per-machine.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

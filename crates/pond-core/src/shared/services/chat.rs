@@ -4,7 +4,7 @@ use crate::models::ports::provider::LlmProvider;
 use crate::models::ports::speech_energy::SpeechEnergy;
 use crate::models::ports::voice_input::{SpeculativeSignal, VoiceInput};
 use crate::models::ports::voice_output::VoiceOutput;
-use crate::models::ports::wake_word::StreamingWakeWordDetector;
+use crate::models::ports::wake_word::{StreamingWakeWordDetector, WakeWordActivation};
 use crate::models::services::context_compactor::ContextCompactor;
 use crate::models::services::instant_activation::InstantActivation;
 use crate::prompts::{SYSTEM_PROMPT, TITLE_GENERATION_PROMPT};
@@ -92,6 +92,14 @@ fn is_dismissal_or_exit_phrase(text: &str) -> bool {
 /// Unicode scalar values (chars), not bytes, and cut on a char boundary so the
 /// serialized JSON is always valid. Sub-cap payloads are returned unchanged.
 const TOOL_RESULT_MAX_CHARS: usize = 2000;
+
+/// Consecutive microphone failures tolerated before voice mode gives up.
+///
+/// With [`MIC_RETRY_BACKOFF_MS`] rising linearly, this is roughly a minute of
+/// a genuinely absent device.
+const MIC_RETRY_BUDGET: u32 = 10;
+/// Base backoff between microphone retries; multiplied by the attempt number.
+const MIC_RETRY_BACKOFF_MS: u64 = 1_000;
 
 fn truncate_tool_result(mut content: String) -> String {
     // Find the byte offset of the (MAX+1)-th char. `char_indices().nth(N)`
@@ -1428,6 +1436,50 @@ impl ChatService {
     ///   Wait → Listen → Thinking → Speak → (back to Wait)
     ///
     /// Input is obtained via the `VoiceInput` port (stdin by default).
+    /// Wait for the wake word, surviving a microphone that comes and goes.
+    ///
+    /// Retries with a backoff rather than failing the session. Gives up only
+    /// after [`MIC_RETRY_BUDGET`] consecutive failures, which at this backoff
+    /// is roughly a minute of a genuinely absent device — long enough to
+    /// outlast anything transient, short enough that a permanently missing
+    /// microphone still reports itself instead of retrying in silence forever.
+    ///
+    /// Each failure is reported once on the console, because a voice assistant
+    /// that has quietly stopped listening is indistinguishable from one that
+    /// is listening and hearing nothing.
+    async fn wait_for_activation_resiliently(&self) -> Result<WakeWordActivation> {
+        let mut last_error = None;
+
+        for attempt in 1..=MIC_RETRY_BUDGET {
+            match self
+                .wake_word_detector
+                .wait_for_activation_with_audio()
+                .await
+            {
+                Ok(activation) => return Ok(activation),
+                Err(e) => {
+                    tracing::warn!(
+                        attempt,
+                        budget = MIC_RETRY_BUDGET,
+                        "microphone unavailable: {e}"
+                    );
+                    if self.stdout_diagnostics {
+                        println!("  microphone unavailable ({e}) — retrying");
+                    }
+                    last_error = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        MIC_RETRY_BACKOFF_MS * attempt as u64,
+                    ))
+                    .await;
+                }
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| anyhow::anyhow!("microphone unavailable"))
+            .context("the microphone did not become available; voice mode cannot continue"))
+    }
+
     pub async fn run_loop(&self) -> Result<()> {
         // First interaction always requires the wake word.
         // After that, conversational turn-taking: Goose listens for the user's
@@ -1483,10 +1535,24 @@ impl ChatService {
                     diag!("\n  {prompt}");
                 }
 
-                let activation = self
-                    .wake_word_detector
-                    .wait_for_activation_with_audio()
-                    .await?;
+                // A microphone that fails to open must not end the session.
+                //
+                // This `?` used to be fatal, so a transient device error —
+                // another process taking the input device, a Bluetooth
+                // headset switching profile, a USB mic re-enumerating — killed
+                // voice mode outright with "The requested stream configuration
+                // is not supported by the device" and no way back short of
+                // restarting. Devices come and go; an assistant that waits for
+                // one to come back is worth more than one that exits correctly.
+                let activation = match self.wait_for_activation_resiliently().await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        self.emit_event(WorkflowEvent::Exit {
+                            reason: "microphone_unavailable".to_string(),
+                        });
+                        return Err(e);
+                    }
+                };
 
                 // ── Listen (one-breath or fresh recording) ──
                 self.emit_event(WorkflowEvent::StateChanged {
@@ -2707,6 +2773,102 @@ mod tests {
         > {
             self.inner.first_user_message(session_id).await
         }
+    }
+
+    /// A microphone that fails and then recovers must not end the session.
+    ///
+    /// This killed a live session: another process took the input device, the
+    /// detector could not open a stream, and the `?` propagated straight out
+    /// of `run_loop` — "The requested stream configuration is not supported by
+    /// the device", process gone. Devices come and go; the loop waits.
+    #[tokio::test]
+    async fn a_microphone_that_fails_then_recovers_does_not_end_the_session() {
+        use async_trait::async_trait;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        /// Fails `fail_times` times, then activates.
+        struct FlakyMic {
+            attempts: AtomicU32,
+            fail_times: u32,
+        }
+
+        #[async_trait]
+        impl StreamingWakeWordDetector for FlakyMic {
+            async fn wait_for_activation_with_audio(&self) -> Result<WakeWordActivation> {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) < self.fail_times {
+                    return Err(anyhow::anyhow!(
+                        "The requested stream configuration is not supported by the device."
+                    ));
+                }
+                Ok(WakeWordActivation {
+                    captured_audio: None,
+                })
+            }
+            fn supports_interruption(&self) -> bool {
+                false
+            }
+        }
+
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "flaky-mic".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let output = Arc::new(CapturingSpeak::default());
+        let svc = ChatService::new(agent, session_id, storage)
+            .with_voice_input(Arc::new(ScriptedListenInput::new(["what time is it"])))
+            .with_voice_output(output.clone())
+            .with_wake_word_detector(Arc::new(FlakyMic {
+                attempts: AtomicU32::new(0),
+                fail_times: 2,
+            }));
+
+        svc.run_loop()
+            .await
+            .expect("a recoverable device error must not end the loop");
+
+        let spoken = output.spoken.lock().unwrap().clone();
+        assert!(
+            spoken.iter().any(|s| s.contains("what time is it")),
+            "the turn must run once the microphone came back; got: {spoken:?}"
+        );
+    }
+
+    /// A microphone that never comes back must still report itself, rather
+    /// than retrying in silence for the life of the process.
+    #[tokio::test(start_paused = true)]
+    async fn a_microphone_that_never_recovers_reports_instead_of_hanging() {
+        use async_trait::async_trait;
+
+        struct DeadMic;
+
+        #[async_trait]
+        impl StreamingWakeWordDetector for DeadMic {
+            async fn wait_for_activation_with_audio(&self) -> Result<WakeWordActivation> {
+                Err(anyhow::anyhow!("no audio input device found"))
+            }
+            fn supports_interruption(&self) -> bool {
+                false
+            }
+        }
+
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "dead-mic".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let svc =
+            ChatService::new(agent, session_id, storage).with_wake_word_detector(Arc::new(DeadMic));
+
+        let err = svc
+            .run_loop()
+            .await
+            .expect_err("a permanently absent microphone must surface");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("microphone"),
+            "the error must name the microphone: {msg}"
+        );
     }
 
     #[tokio::test]
