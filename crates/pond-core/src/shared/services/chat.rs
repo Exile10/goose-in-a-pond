@@ -46,45 +46,12 @@ fn bare_tool_name(tool: &str) -> String {
     }
 }
 
-/// Voice-loop control classification for a raw transcript.
-///
-/// This is voice-CLI UI control (turn-taking / loop lifecycle), NOT a
-/// tool/thinking classifier — these phrases are intercepted by `run_loop`
-/// before the LLM ever sees them, so the no-keyword-classification rule
-/// does not apply here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VoiceCommand {
-    /// Dismissal / sleep — return to wake-word mode, keep the loop alive.
-    Dismissal,
-    /// Hard exit — terminate the voice loop entirely.
-    Exit,
-    /// Ordinary utterance — hand it to the LLM.
-    Normal,
-}
+/// Voice-loop control phrases live in `pond-voice` so the desktop shell — a
+/// separate cargo workspace that cannot see `pond-core` — matches the same
+/// list. It was duplicated there, and a phrase added here did not work there.
+use pond_voice::control::{classify as classify_voice_command, VoiceCommand};
 
-/// Single source of truth for voice-loop control phrases. Used by BOTH
-/// `run_loop`'s dismissal/exit gates AND the Q2-26 speculative gate, so the
-/// keyword list never drifts between the two paths.
-fn classify_voice_command(text: &str) -> VoiceCommand {
-    let lower = text.trim().to_lowercase();
-    let lower = lower.trim_end_matches(|c: char| c == '.' || c == '!');
-    match lower {
-        "bye" | "goodbye" | "good bye" | "dismissed" | "go to sleep" | "that's all"
-        | "thats all" | "never mind" | "nevermind" | "stop" | "stop listening" => {
-            VoiceCommand::Dismissal
-        }
-        "exit" | "quit" => VoiceCommand::Exit,
-        _ => VoiceCommand::Normal,
-    }
-}
-
-/// True if `text` is any voice-loop control phrase (dismissal OR hard exit)
-/// that `run_loop` intercepts before the LLM sees it. Used by the Q2-26
-/// speculative-chat path to avoid speculatively calling `chat_stream_once`
-/// on a phrase that should never reach the LLM at all.
-fn is_dismissal_or_exit_phrase(text: &str) -> bool {
-    !matches!(classify_voice_command(text), VoiceCommand::Normal)
-}
+use pond_voice::control::is_control_phrase as is_dismissal_or_exit_phrase;
 
 /// Truncate a tool-result payload to the NDJSON contract's 2000-char cap.
 ///

@@ -444,7 +444,6 @@ pub async fn run_voice_pipeline(
     voice: State<'_, crate::chat_process::VoiceChatProcess>,
     audio_output: State<'_, SharedAudioOutput>,
 ) -> Result<(), String> {
-    use crate::tts_text;
     let audio_handle = audio_output.handle();
 
     // A terminal-voice child owns the mic and speaker exclusively while active —
@@ -527,7 +526,7 @@ pub async fn run_voice_pipeline(
     };
 
     // ── Strip Whisper artifacts (matching CLI's false-positive curbing) ──
-    let transcript = tts_text::strip_whisper_artifacts(&raw_transcript);
+    let transcript = pond_voice::text::strip_whisper_artifacts(&raw_transcript);
     if transcript.is_empty() {
         tracing::debug!(
             "Pipeline: artifact-only transcript stripped: {:?}",
@@ -545,7 +544,7 @@ pub async fn run_voice_pipeline(
     );
 
     // ── Dismissal / farewell handling (matching CLI's "bye" / "exit") ────
-    if let Some((farewell, is_exit)) = tts_text::check_dismissal(&transcript) {
+    if let Some((farewell, is_exit)) = pond_voice::control::farewell_for(&transcript) {
         let _ = app.emit(
             "transcript",
             TranscriptResult {
@@ -787,16 +786,19 @@ pub async fn run_voice_pipeline(
                 let flushed = sentence_buf.trim().to_string();
                 sentence_buf.clear();
                 if !flushed.is_empty() {
-                    let spoken = tts_text::strip_markdown_for_speech(&flushed);
+                    let spoken = pond_voice::text::strip_markdown_for_speech(&flushed);
                     if !spoken.is_empty() {
                         let _ = tts_tx.send(spoken).await;
                     }
                 }
-                let tool = val
-                    .get("tool")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("unknown");
-                let _ = tts_tx.send(tts_text::tool_announcement(tool)).await;
+                // Deliberately silent. Tool use is part of working on the
+                // request, and the working tone already says that —
+                // narrating each step ("Let me check the weather.")
+                // interrupted the tone to repeat it, and on a multi-tool
+                // turn the user heard a run of announcements before a single
+                // word of the actual answer. The server-side loop dropped
+                // these for the same reason; keeping them here would have
+                // left the desktop the only surface that still chatters.
                 continue;
             }
 
@@ -818,10 +820,10 @@ pub async fn run_voice_pipeline(
                 }
 
                 sentence_buf.push_str(&visible);
-                let (sentences, remainder) = tts_text::split_sentences(&sentence_buf);
+                let (sentences, remainder) = pond_voice::text::split_sentences(&sentence_buf);
                 sentence_buf = remainder;
                 for sentence in sentences {
-                    let spoken = tts_text::strip_markdown_for_speech(&sentence);
+                    let spoken = pond_voice::text::strip_markdown_for_speech(&sentence);
                     if !spoken.is_empty() {
                         let _ = tts_tx.send(spoken).await;
                     }
@@ -864,7 +866,7 @@ pub async fn run_voice_pipeline(
     // ── Flush any remaining sentence buffer ──────────────────────────────────
     let remainder = sentence_buf.trim().to_string();
     if !remainder.is_empty() {
-        let spoken = tts_text::strip_markdown_for_speech(&remainder);
+        let spoken = pond_voice::text::strip_markdown_for_speech(&remainder);
         if !spoken.is_empty() {
             let _ = tts_tx.send(spoken).await;
         }
