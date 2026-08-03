@@ -34,6 +34,7 @@ mod startup;
 mod system_deps;
 mod three_stage_consolidator;
 mod tracing_setup;
+mod voice_lock;
 mod voice_models;
 
 use anyhow::{Context, Result};
@@ -3251,6 +3252,34 @@ async fn run_chat(
         "\n  Goose in a Pond {} — voice\n",
         env!("CARGO_PKG_VERSION")
     );
+
+    // Before anything opens an audio device or loads a model: one voice
+    // session per device. Two sessions fight over the microphone and the
+    // speaker, and the symptoms never name that as the cause — they look like
+    // two assistants answering in different voices, or like a stream
+    // configuration the device has suddenly stopped supporting.
+    //
+    // Held for the rest of this function; released when the process exits,
+    // however it exits.
+    let _voice_lock = match voice_lock::VoiceLock::acquire() {
+        Ok(lock) => lock,
+        Err(e) => {
+            // Returned, not printed: `main` already renders the error to
+            // stderr, and printing it here as well showed the user the same
+            // paragraph twice. The NDJSON events are additive — the desktop
+            // shell reads those, never stderr.
+            if json_events {
+                use pond_core::shared::domain::agent::WorkflowEvent;
+                write_ndjson_line(&WorkflowEvent::Error {
+                    message: e.to_string(),
+                });
+                write_ndjson_line(&WorkflowEvent::Exit {
+                    reason: "already_running".to_string(),
+                });
+            }
+            return Err(e);
+        }
+    };
 
     let data_dir = default_data_dir();
     // Must run before any ONNX-dependent init (Piper TTS). `serve` and `setup`
