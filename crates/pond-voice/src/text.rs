@@ -1366,20 +1366,26 @@ pub fn contains_trigger(haystack: &str, trigger: &str) -> bool {
 /// Only a **leading** occurrence is removed, and only one: "goose, remind me
 /// to buy a goose" must keep the second. Anything before the trigger is a
 /// mis-transcribed run-up to it ("uh, goose, ...") and goes too.
-/// Only a run-up this long can precede the wake word and still be treated as
-/// leading. Absorbs "um", "hey", or a mis-transcribed article; past it, the
-/// trigger is a noun in a sentence rather than a greeting.
-const MAX_RUN_UP_WORDS: usize = 3;
+/// Words allowed to precede the wake word and still leave it "leading".
+///
+/// An explicit list, not a positional window. A window of "the first few
+/// words" looks equivalent and is not: it also matches the wake word used as
+/// an ordinary noun near the start of a sentence, so a follow-up turn of
+/// "feed the goose" was stripped down to nothing and the user's request
+/// vanished. Every word here is filler — none of them can be the point of a
+/// sentence — so consuming them alongside the greeting is always safe.
+const RUN_UP_WORDS: &[&str] = &["um", "uh", "er", "hey", "hi", "hello", "ok", "okay", "so"];
 
 pub fn strip_leading_wake_word(transcript: &str, triggers: &[String]) -> String {
     let normalized = normalize_transcript(transcript);
+    let words: Vec<&str> = normalized.split_whitespace().collect();
 
     // Prefer the longest matching trigger ("hey goose" over "goose") so the
     // greeting is consumed whole, and the earliest match among equals.
     let best = triggers
         .iter()
         .filter_map(|t| find_trigger_words(&normalized, t))
-        .filter(|&(start, _)| start <= MAX_RUN_UP_WORDS)
+        .filter(|&(start, _)| words[..start].iter().all(|w| RUN_UP_WORDS.contains(w)))
         .max_by_key(|&(start, end)| (end - start, std::cmp::Reverse(start)));
 
     let Some((_, end)) = best else {
@@ -1517,6 +1523,42 @@ mod wake_word_tests {
         let t = triggers(&["goose"]);
         let out = strip_leading_wake_word("tell me all about the goose please", &t);
         assert_eq!(out, "tell me all about the goose please");
+    }
+
+    /// The bug a positional run-up window hid: a short follow-up turn whose
+    /// SUBJECT is the wake word was gutted to an empty command, and the user's
+    /// request silently became nothing. Only filler may precede the greeting.
+    #[test]
+    fn a_short_command_about_the_wake_word_survives_intact() {
+        let t = triggers(&["goose"]);
+        for command in [
+            "feed the goose",
+            "the goose is loose",
+            "my goose needs water",
+        ] {
+            assert_eq!(
+                strip_leading_wake_word(command, &t),
+                command,
+                "{command:?} is a request, not a greeting"
+            );
+        }
+    }
+
+    /// Filler is filler wherever it appears in the run-up, and content is not
+    /// filler however short it is.
+    #[test]
+    fn only_filler_may_precede_the_greeting() {
+        let t = triggers(&["goose"]);
+        assert_eq!(
+            strip_leading_wake_word("um okay goose what time is it", &t),
+            "what time is it",
+            "a run of filler is still a run-up"
+        );
+        assert_eq!(
+            strip_leading_wake_word("cook goose tonight", &t),
+            "cook goose tonight",
+            "a content word before it means it is not a greeting"
+        );
     }
 
     /// "hey goose" and "goose" both match; consuming only "goose" would leave
