@@ -134,6 +134,17 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
     route.fulfill({ json: { devices: [] } }),
   );
 
+  // Music. `now-playing` is POLLED by the hub, so leaving it unmocked does not
+  // fail the music tests — it fails whichever unrelated test happens to assert
+  // a clean console. The request leaves the browser for 127.0.0.1:4000 and hits
+  // whatever is really listening: on a developer machine usually a live
+  // pond-server (CORS errors), in CI nothing at all (connection refused).
+  // That is what took out the hub state test.
+  await page.route("**/api/v1/music/now-playing", (route) =>
+    route.fulfill({ json: { playing: false, track: null } }),
+  );
+  await page.route("**/api/v1/music/**", (route) => route.fulfill({ json: { status: "ok" } }));
+
   // Weather — no location configured in tests, dashboard falls back to mock data.
   await page.route("**/api/v1/weather", (route) =>
     route.fulfill({ json: { enabled: false } }),
