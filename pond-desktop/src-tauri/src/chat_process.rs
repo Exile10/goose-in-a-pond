@@ -1071,6 +1071,14 @@ mod tests {
     fn a_dead_pid_is_not_treated_as_a_voice_child() {
         // Pid 0 is never a live pond-server chat process, so identity validation
         // must refuse it — a reused/dead pid is never a kill target.
-        assert!(!pid_is_voice_child(0));
+        //
+        // `None` (ps could not be run at all) is as good as `Some(false)` here:
+        // both mean "do not kill it". The distinction matters at the call site
+        // in `:701`, not to this assertion.
+        assert_ne!(
+            pid_is_voice_child(0),
+            Some(true),
+            "pid 0 must never be confirmed as a voice child"
+        );
     }
 }
