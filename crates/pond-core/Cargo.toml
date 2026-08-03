@@ -12,6 +12,8 @@ license.workspace = true
 test-mocks = []
 
 [dependencies]
+# Leaf crate — voice text/DSP primitives. See crates/pond-voice.
+pond-voice = { path = "../pond-voice" }
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }

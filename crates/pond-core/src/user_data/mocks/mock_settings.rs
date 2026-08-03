@@ -60,6 +60,14 @@ fn build_settings(store: &HashMap<String, String>) -> Settings {
     if let Some(v) = store.get("llm_provider") {
         s.llm_provider = v.clone();
     }
+    // Privacy toggle. Must round-trip: a mock that silently returns the
+    // default here makes any test of "does turning the mic off stick" pass
+    // for the wrong reason, or fail for one.
+    if let Some(v) = store.get("mic_enabled") {
+        if let Ok(b) = v.parse() {
+            s.mic_enabled = b;
+        }
+    }
     if let Some(v) = store.get("voice_wake_word") {
         s.voice_wake_word = v.clone();
     }
@@ -123,6 +131,7 @@ impl SettingsRepository for MockSettingsRepository {
             settings.llm_temperature.to_string(),
         );
         store.insert("llm_provider".into(), settings.llm_provider.clone());
+        store.insert("mic_enabled".into(), settings.mic_enabled.to_string());
         store.insert("voice_wake_word".into(), settings.voice_wake_word.clone());
         store.insert("voice_tts_voice".into(), settings.voice_tts_voice.clone());
         store.insert(

@@ -181,8 +181,17 @@ export function reducer(state: AppState, action: AppAction): AppState {
     case "SET_SESSION_ID":
       return { ...state, sessionId: action.payload };
 
+    // Clearing the error on a state change is right for every state EXCEPT
+    // "error" itself. Every producer dispatches SET_VOICE_ERROR and then
+    // SET_VOICE_STATE("error"), so the unconditional reset wiped the message
+    // the previous action had just set and the UI only ever showed the generic
+    // "Error" label. Entering the error state must preserve the reason.
     case "SET_VOICE_STATE":
-      return { ...state, voiceState: action.payload, voiceError: null };
+      return {
+        ...state,
+        voiceState: action.payload,
+        voiceError: action.payload === "error" ? state.voiceError : null,
+      };
 
     case "SET_VOICE_ERROR":
       return { ...state, voiceError: action.payload };

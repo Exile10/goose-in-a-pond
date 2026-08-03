@@ -13,9 +13,6 @@
 /// GIAP REST API + web dashboard (all interfaces, 0.0.0.0).
 pub const API_SERVER: u16 = 4000;
 
-/// whisper.cpp ASR subprocess (loopback only).
-pub const WHISPER: u16 = 9000;
-
 /// llamafile LLM subprocess (loopback only).
 pub const LLAMAFILE: u16 = 8080;
 
@@ -34,9 +31,6 @@ pub fn llamafile_port() -> u16 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(LLAMAFILE)
 }
-
-/// Piper TTS in-process HTTP bridge (loopback only).
-pub const PIPER_TTS: u16 = 8282;
 
 /// How many sequential port numbers to try before giving up.
 pub const MAX_TRIES: u16 = 10;

@@ -206,29 +206,59 @@ pub fn init_tracing_with_console(
     // so goose's narration is pure per-turn formatting and I/O cost — carve
     // it down to ERROR. Real goose failures still surface, and `RUST_LOG`
     // restores full goose verbosity for a debug session.
+    //
+    // These targets are silenced by NAME because they warn about things the
+    // user cannot act on and did not ask about: a Metal capability notice,
+    // llama.cpp's opinion of a model's token types, ggml's tensor tables.
+    // Anything genuinely wrong with GIAP is logged by GIAP.
+    const NOISY: &str = "llama-cpp-2=error,llama_cpp_2=error,ggml=error,\
+                         whisper=error,whisper_rs=error,ort=warn,\
+                         goose=error,goose_providers=error,\
+                         goose_local_inference=error,rmcp=error";
+
+    // What the FILE keeps above `info`. A voice session that misbehaves is
+    // diagnosed from these: which windows the wake word matched, what the
+    // transcript was before and after the wake word came off, which voice
+    // synthesized. They are `debug` because they are per-window and would
+    // bury the console — but the file is exactly where they belong, and
+    // needing to reproduce a fault with `RUST_LOG=debug` set means the
+    // interesting run is always the one that was not recorded.
+    const GIAP_VERBOSE: &str = "pond_adapters_whisper=debug,pond_adapters_piper=debug,\
+                                pond_core::shared::services::chat=debug,\
+                                pond_server=debug";
+
     let filter_str = if debug {
-        "debug,sqlx=warn,hyper=warn,tower=warn,reqwest=warn,hyper_util=warn,rustls=warn,\
-         llama-cpp-2=warn,ggml=warn,whisper=warn,\
-         goose=error,goose_providers=error,goose_local_inference=error,rmcp=error"
+        format!(
+            "debug,sqlx=warn,hyper=warn,tower=warn,reqwest=warn,hyper_util=warn,rustls=warn,\
+             llama-cpp-2=warn,llama_cpp_2=warn,ggml=warn,whisper=warn,whisper_rs=warn,ort=warn,\
+             goose=error,goose_providers=error,goose_local_inference=error,rmcp=error"
+        )
     } else {
-        "info,llama-cpp-2=error,ggml=error,whisper=error,\
-         goose=error,goose_providers=error,goose_local_inference=error,rmcp=error"
+        format!("info,{GIAP_VERBOSE},{NOISY}")
     };
     let rust_log_set = std::env::var("RUST_LOG").is_ok();
 
-    // Per-layer filters so the console can be quieter than the file (a single
-    // shared filter would couple them). The FILE always gets the full detail;
-    // the CONSOLE, on the interactive voice-chat path (`console_quiet`), is
-    // dropped to WARN so only real warnings/errors reach it — the curated,
-    // human-facing turn lines are printed directly (via `diag!`/`out!`, not
-    // tracing) and are unaffected. `RUST_LOG`, when set, wins for BOTH so a
-    // debug session sees everything on the console too.
-    let file_filter =
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter_str.into());
+    // Per-layer filters so the console can be quieter than the file. The FILE
+    // always gets the full detail; the CONSOLE, on the interactive voice path
+    // (`console_quiet`), takes warnings only — the human-facing turn lines are
+    // printed directly via `diag!`/`out!`, not through tracing, so they are
+    // unaffected.
+    //
+    // The carve-outs have to be repeated here. A bare `warn` directive is not
+    // "warn, keeping the rules above"; it REPLACES them, so every noisy target
+    // silenced above came back at WARN on precisely the surface the setting
+    // exists to keep quiet. That is where the wall of `llama-cpp-2:
+    // control-looking token` and `ggml_metal_device_init` over the voice UI
+    // came from.
+    //
+    // `RUST_LOG`, when set, wins for BOTH so a debug session sees everything.
+    let file_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| filter_str.as_str().into());
     let console_filter = if console_quiet && !rust_log_set {
-        tracing_subscriber::EnvFilter::new("warn")
+        tracing_subscriber::EnvFilter::new(format!("warn,{NOISY}"))
     } else {
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter_str.into())
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| filter_str.as_str().into())
     };
 
     // ── Rolling file appender ────────────────────────────────────────────

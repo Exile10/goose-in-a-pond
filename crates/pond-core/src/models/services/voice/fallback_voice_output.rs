@@ -64,18 +64,6 @@ impl VoiceOutput for FallbackVoiceOutput {
     fn stop_thinking_tone(&self) {
         self.primary.stop_thinking_tone();
     }
-
-    fn start_barge_in_listener(&self) {
-        self.primary.start_barge_in_listener();
-    }
-
-    fn stop_barge_in_listener(&self) {
-        self.primary.stop_barge_in_listener();
-    }
-
-    async fn speak_quip(&self) -> Option<&'static str> {
-        self.primary.speak_quip().await
-    }
 }
 
 #[cfg(test)]
