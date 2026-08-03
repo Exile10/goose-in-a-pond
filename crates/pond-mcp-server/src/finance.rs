@@ -185,7 +185,10 @@ impl FinanceMcpServer {
             .unwrap_or_default();
 
         let text = if rate_parts.is_empty() {
-            format!("No exchange rate data found for {} (as of {}).", base, date)
+            crate::format::format_no_results(
+                &format!("exchange rate data for {} (as of {})", base, date),
+                &["giap-discovery__search_web"],
+            )
         } else {
             format!(
                 "1 {} = {} (ECB data, {})",
@@ -429,10 +432,12 @@ impl FinanceMcpServer {
                                 let coin_symbol = first["symbol"].as_str().unwrap_or("???");
 
                                 if coin_id.is_empty() {
-                                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                                        "No cryptocurrency found for '{}'. Try a different name or symbol.",
-                                        asset,
-                                    ))]));
+                                    return Ok(CallToolResult::success(vec![Content::text(
+                                        crate::format::format_no_results(
+                                            &format!("a cryptocurrency matching '{}'", asset),
+                                            &["giap-discovery__search_web"],
+                                        ),
+                                    )]));
                                 }
 
                                 // Fetch price for the found coin
@@ -476,10 +481,12 @@ impl FinanceMcpServer {
                             }
                         }
 
-                        return Ok(CallToolResult::success(vec![Content::text(format!(
-                            "No cryptocurrency found for '{}'. Try a different name or symbol.",
-                            asset,
-                        ))]));
+                        return Ok(CallToolResult::success(vec![Content::text(
+                            crate::format::format_no_results(
+                                &format!("a cryptocurrency matching '{}'", asset),
+                                &["giap-discovery__search_web"],
+                            ),
+                        )]));
                     }
                     Err(e) => {
                         return Ok(CallToolResult::success(vec![Content::text(
@@ -597,11 +604,16 @@ impl FinanceMcpServer {
 
         if current == 0.0 && open == 0.0 && high == 0.0 && low == 0.0 {
             eprintln!("[finance] Finnhub returned all zeros for '{}'", symbol);
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No quote found for '{}'. Check the ticker symbol — \
-                 use standard US exchange symbols (e.g. AAPL, MSFT, GOOGL).",
-                symbol,
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                crate::format::format_no_results(
+                    &format!(
+                        "a stock quote for '{}' (standard US exchange symbols only, \
+                         e.g. AAPL, MSFT, GOOGL)",
+                        symbol
+                    ),
+                    &["giap-discovery__search_web"],
+                ),
+            )]));
         }
 
         let sign = if change >= 0.0 { "+" } else { "" };
@@ -682,11 +694,16 @@ impl FinanceMcpServer {
 
         if price == 0.0 && prev_close == 0.0 {
             eprintln!("[finance] Yahoo Finance returned no data for '{}'", symbol);
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No quote found for '{}'. Check the ticker symbol — \
-                 use standard US exchange symbols (e.g. AAPL, MSFT, GOOGL).",
-                symbol,
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                crate::format::format_no_results(
+                    &format!(
+                        "a stock quote for '{}' (standard US exchange symbols only, \
+                         e.g. AAPL, MSFT, GOOGL)",
+                        symbol
+                    ),
+                    &["giap-discovery__search_web"],
+                ),
+            )]));
         }
 
         let change = price - prev_close;

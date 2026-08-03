@@ -197,10 +197,13 @@ impl DeviceMcpServer {
                 )
             })?;
         match recipe {
-            None => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Recipe '{}' not found.",
-                params.0.name
-            ))])),
+            None => Ok(CallToolResult::success(vec![Content::text(
+                crate::format::format_dead_end(
+                    &format!("a recipe named '{}'", params.0.name),
+                    "No tool lists recipes, so there is nothing further to try — ask \
+                     the user for the exact recipe name.",
+                ),
+            )])),
             Some(r) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Recipe: {}\n{}\n\n{}",
                 r.name, r.description, r.yaml

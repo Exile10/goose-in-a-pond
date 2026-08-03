@@ -1,0 +1,29 @@
+[package]
+name = "pond-voice"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "pond_voice"
+path = "src/lib.rs"
+
+# LEAF CRATE — deliberately almost dependency-free.
+#
+# Everything depends inward on this: pond-core, both voice adapters, pond-api,
+# and — the reason it exists — `pond-desktop/src-tauri`, which declares its own
+# `[workspace]` and therefore cannot use pond-core. That path dependency is what
+# finally deletes `src-tauri/src/tts_text.rs`, a 981-line verbatim Rust port of
+# the normalisation in this crate, and lets both `webAudioUtils.ts` copies
+# shrink to a thin wrapper over the server.
+#
+# Dependencies are declared EXPLICITLY rather than with `workspace = true`.
+# `workspace = true` resolves against the outermost workspace, which is the
+# landmine already documented for the goose submodule
+# (docs/goose-patch-management.md); a crate reaching into a second build tree
+# should not carry that coupling. Adding tokio, cpal, anyhow or pond-core here
+# would defeat the whole point — keep this list at std plus, at most, thiserror.
+[dependencies]
+
+[dev-dependencies]

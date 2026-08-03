@@ -184,7 +184,10 @@ pub fn all_app_resources() -> Vec<(&'static str, &'static str)> {
 }
 
 // Re-export shared utilities for downstream Knowledge-family servers
-pub use format::{format_api_error, format_list_result, format_not_configured, truncate_to_budget};
+pub use format::{
+    format_api_error, format_dead_end, format_list_result, format_no_results,
+    format_not_configured, truncate_to_budget,
+};
 pub use http::{build_http_client, traced_get, traced_get_with};
 
 // Re-export the direct tool dispatcher

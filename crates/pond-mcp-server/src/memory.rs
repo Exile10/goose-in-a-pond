@@ -151,7 +151,11 @@ impl MemoryMcpServer {
         }
 
         let text = if filtered.is_empty() {
-            "No memories found.".to_string()
+            crate::format::format_dead_end(
+                "stored memories matching this",
+                "Nothing is stored about it. Answer from this conversation or ask \
+                 the user — do not search the web for a fact about them.",
+            )
         } else {
             filtered
                 .iter()
@@ -390,7 +394,11 @@ impl MemoryMcpServer {
             }
 
             return Ok(CallToolResult::success(vec![Content::text(
-                "No memory found with that exact content.".to_string(),
+                crate::format::format_dead_end(
+                    "a memory with that exact content",
+                    "Nothing was deleted. Call recall_memories to find the exact \
+                     wording before trying to forget it again.",
+                ),
             )]));
         }
 

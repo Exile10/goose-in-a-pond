@@ -31,13 +31,13 @@ use piper_rs::Piper;
 use pond_core::models::ports::voice_output::VoiceOutput;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
 use crate::{
-    f32_samples_to_pcm_le_bytes, pcm_to_wav, pick_quip, play_wav_on_handle, start_barge_in_thread,
-    start_thinking_tone_thread, AudioKeeper,
+    f32_samples_to_pcm_le_bytes, pcm_to_wav, play_wav_on_handle, start_thinking_tone_thread,
+    AudioKeeper,
 };
 
 /// Env var that espeak-rs consults to find the bundled `espeak-ng-data` dir.
@@ -61,15 +61,15 @@ pub struct PiperRsOutput {
     /// recent value so callers and tests can read it cheaply.
     last_sample_rate: Mutex<Option<u32>>,
     /// Thinking-tone stop flag — shared with the background tone thread.
-    thinking_active: Arc<AtomicBool>,
+    /// Which turn the working tone belongs to, or [`TONE_OFF`].
+    thinking_for: Arc<AtomicU64>,
+    /// Monotonic turn counter. Advanced by `begin_utterance`, and the only
+    /// thing that lets audio already in flight recognise that it belongs to a
+    /// turn the user has moved on from.
+    utterance: Arc<AtomicU64>,
     /// Speech interrupt flag — set true to immediately stop TTS playback.
     /// Checked by `play_wav_on_handle()` every 50 ms during playback.
     speech_interrupted: Arc<AtomicBool>,
-    /// Barge-in listener active flag — shared with the mic monitoring thread.
-    barge_in_active: Arc<AtomicBool>,
-    /// True while audio is actively playing. Shared with the barge-in thread so
-    /// it applies an elevated RMS threshold during playback (AEC gating).
-    is_speaking: Arc<AtomicBool>,
     /// Persistent audio output. One CoreAudio AudioUnit opened at construction
     /// time and kept alive for the lifetime of this adapter. All TTS playback
     /// calls reuse `audio_handle` to create sinks — no repeated open/close churn.
@@ -107,10 +107,10 @@ impl PiperRsOutput {
             model_path: RwLock::new(model_path),
             config_path: RwLock::new(config_path),
             last_sample_rate: Mutex::new(None),
-            thinking_active: Arc::new(AtomicBool::new(false)),
+            thinking_for: Arc::new(AtomicU64::new(crate::TONE_OFF)),
+            // Generations start at 1 so TONE_OFF (0) is never a real turn.
+            utterance: Arc::new(AtomicU64::new(1)),
             speech_interrupted: Arc::new(AtomicBool::new(false)),
-            barge_in_active: Arc::new(AtomicBool::new(false)),
-            is_speaking: Arc::new(AtomicBool::new(false)),
             _audio_keeper: audio_keeper,
             audio_handle,
         })
@@ -230,40 +230,41 @@ impl PiperRsOutput {
 #[async_trait]
 impl VoiceOutput for PiperRsOutput {
     fn start_thinking_tone(&self) {
-        start_thinking_tone_thread(self.thinking_active.clone());
+        let mine = self.utterance.load(Ordering::SeqCst);
+        // Already sounding for this turn: the turn asked twice, which is
+        // allowed and must not stack a second thread.
+        if self.thinking_for.swap(mine, Ordering::SeqCst) == mine {
+            return;
+        }
+        start_thinking_tone_thread(self.thinking_for.clone(), mine);
     }
 
     fn stop_thinking_tone(&self) {
-        self.thinking_active.store(false, Ordering::SeqCst);
+        self.thinking_for.store(crate::TONE_OFF, Ordering::SeqCst);
+    }
+
+    fn begin_utterance(&self) {
+        // The one place a turn's interrupt state is cleared. See the port doc:
+        // clearing it inside speak()/play_audio() made a barge-in last exactly
+        // one sentence.
+        //
+        // Advancing the generation FIRST is what makes that clear safe. Two
+        // turns can be alive at once (a speculative job fired on a provisional
+        // transcript, plus the confirmed one), and cancelling the first is done
+        // by setting the interrupt flag — which this call then wipes. Without
+        // the generation, starting a turn un-cancelled its predecessor and both
+        // spoke. Audio already in flight compares against the generation it
+        // started under, so it stays cancelled.
+        self.utterance.fetch_add(1, Ordering::SeqCst);
+        self.speech_interrupted.store(false, Ordering::SeqCst);
     }
 
     fn stop_speaking(&self) {
         self.speech_interrupted.store(true, Ordering::SeqCst);
     }
 
-    fn start_barge_in_listener(&self) {
-        start_barge_in_thread(
-            self.barge_in_active.clone(),
-            self.speech_interrupted.clone(),
-            self.is_speaking.clone(),
-        );
-    }
-
-    fn stop_barge_in_listener(&self) {
-        self.barge_in_active.store(false, Ordering::SeqCst);
-    }
-
-    async fn speak_quip(&self) -> Option<&'static str> {
-        let quip = pick_quip();
-        if let Err(e) = self.speak(quip).await {
-            tracing::debug!("Quip TTS failed: {e}");
-            return None;
-        }
-        Some(quip)
-    }
-
     async fn speak(&self, text: &str) -> Result<()> {
-        self.speech_interrupted.store(false, Ordering::SeqCst);
+        // No interrupt reset here — see begin_utterance().
         if text.trim().is_empty() {
             return Ok(());
         }
@@ -296,33 +297,29 @@ impl VoiceOutput for PiperRsOutput {
             let part2 = pcm_to_wav(&pcm[offset..], sample_rate);
 
             let flag = self.speech_interrupted.clone();
-            let is_speaking = self.is_speaking.clone();
+            let gen = self.utterance.clone();
             let handle = self.audio_handle.clone();
-            tokio::task::spawn_blocking(move || {
-                play_wav_on_handle(part1, &handle, &flag, &is_speaking)
-            })
-            .await
-            .context("playback task panicked")??;
+            tokio::task::spawn_blocking(move || play_wav_on_handle(part1, &handle, &flag, &gen))
+                .await
+                .context("playback task panicked")??;
 
             if !self.speech_interrupted.load(Ordering::Relaxed) {
                 let flag = self.speech_interrupted.clone();
-                let is_speaking = self.is_speaking.clone();
+                let gen = self.utterance.clone();
                 let handle = self.audio_handle.clone();
                 tokio::task::spawn_blocking(move || {
-                    play_wav_on_handle(part2, &handle, &flag, &is_speaking)
+                    play_wav_on_handle(part2, &handle, &flag, &gen)
                 })
                 .await
                 .context("playback task panicked")??;
             }
         } else {
             let flag = self.speech_interrupted.clone();
-            let is_speaking = self.is_speaking.clone();
+            let gen = self.utterance.clone();
             let handle = self.audio_handle.clone();
-            tokio::task::spawn_blocking(move || {
-                play_wav_on_handle(wav, &handle, &flag, &is_speaking)
-            })
-            .await
-            .context("playback task panicked")??;
+            tokio::task::spawn_blocking(move || play_wav_on_handle(wav, &handle, &flag, &gen))
+                .await
+                .context("playback task panicked")??;
         }
 
         Ok(())
@@ -338,11 +335,11 @@ impl VoiceOutput for PiperRsOutput {
     }
 
     async fn play_audio(&self, audio: Vec<u8>) -> Result<()> {
-        self.speech_interrupted.store(false, Ordering::SeqCst);
+        // No interrupt reset here — see begin_utterance().
         let flag = self.speech_interrupted.clone();
-        let is_speaking = self.is_speaking.clone();
+        let gen = self.utterance.clone();
         let handle = self.audio_handle.clone();
-        tokio::task::spawn_blocking(move || play_wav_on_handle(audio, &handle, &flag, &is_speaking))
+        tokio::task::spawn_blocking(move || play_wav_on_handle(audio, &handle, &flag, &gen))
             .await
             .context("playback task panicked")?
     }
@@ -532,5 +529,85 @@ mod tests {
         // Build a dummy function so we exercise the trait bound at compile time
         // without needing to construct a valid PiperRsOutput.
         fn _assert_object_safe(_: Arc<dyn VoiceOutput>) {}
+    }
+
+    // ── barge-in state ownership ─────────────────────────────────────────
+    //
+    // `speak()` and `play_audio()` used to clear `speech_interrupted` on entry.
+    // A barge-in during sentence one was therefore forgotten by sentence two,
+    // and the rest of the reply played out regardless. Interrupt state belongs
+    // to the TURN; `begin_utterance()` is the only place it resets.
+    //
+    // Driven through the flags rather than a live voice so it runs in CI —
+    // constructing PiperRsOutput needs a real ONNX model on disk.
+
+    /// Mirrors how the turn drives the flags across a multi-sentence reply.
+    struct InterruptState {
+        speech_interrupted: Arc<AtomicBool>,
+    }
+
+    impl InterruptState {
+        fn new() -> Self {
+            Self {
+                speech_interrupted: Arc::new(AtomicBool::new(false)),
+            }
+        }
+        /// What begin_utterance() does.
+        fn begin_utterance(&self) {
+            self.speech_interrupted.store(false, Ordering::SeqCst);
+        }
+        /// What the barge-in callback does on detecting speech.
+        fn barge_in(&self) {
+            self.speech_interrupted.store(true, Ordering::SeqCst);
+        }
+        /// What speak()/play_audio() check before emitting audio.
+        fn would_play(&self) -> bool {
+            !self.speech_interrupted.load(Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn a_barge_in_suppresses_every_later_sentence_in_the_turn() {
+        let st = InterruptState::new();
+        st.begin_utterance();
+        assert!(st.would_play(), "sentence 1 plays");
+
+        st.barge_in(); // user speaks over the assistant
+
+        assert!(!st.would_play(), "sentence 2 must be suppressed");
+        assert!(!st.would_play(), "sentence 3 must stay suppressed");
+    }
+
+    #[test]
+    fn the_next_turn_starts_speaking_again() {
+        let st = InterruptState::new();
+        st.begin_utterance();
+        st.barge_in();
+        assert!(!st.would_play());
+
+        st.begin_utterance(); // next turn
+        assert!(st.would_play(), "a new turn must clear the interrupt");
+    }
+
+    #[test]
+    fn begin_utterance_is_idempotent() {
+        let st = InterruptState::new();
+        st.begin_utterance();
+        st.begin_utterance();
+        assert!(st.would_play());
+    }
+
+    /// The port default must not silently swallow the contract for backends
+    /// that do not implement it (PrintOutput, tests).
+    #[test]
+    fn the_port_default_begin_utterance_is_a_no_op() {
+        struct Bare;
+        #[async_trait::async_trait]
+        impl VoiceOutput for Bare {
+            async fn speak(&self, _text: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        Bare.begin_utterance(); // must compile and not panic
     }
 }
