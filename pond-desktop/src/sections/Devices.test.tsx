@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, waitFor, cleanup } from "@testing-library/react";
+import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
 import { Devices } from "./Devices";
 import { api } from "../api/PondApiClient";
 import type { Device } from "../api/types";
@@ -12,6 +12,9 @@ vi.mock("../api/PondApiClient", () => ({
     registerDevice: vi.fn(),
     unregisterDevice: vi.fn(),
     invokeTool: vi.fn(),
+    markDeviceOnline: vi.fn(),
+    markDeviceOffline: vi.fn(),
+    updateDevice: vi.fn(),
   },
 }));
 
@@ -73,5 +76,80 @@ describe("Devices section — Matter devices", () => {
 
     expect(container.querySelector(".lucide-smartphone")).toBeTruthy();
     expect(container.querySelector(".lucide-monitor")).toBeNull();
+  });
+});
+
+describe("Devices section — power toggle", () => {
+  it("turning off an online device calls markDeviceOffline, not the MCP tool", async () => {
+    (api.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([matterLight]);
+    (api.markDeviceOffline as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+    render(<Devices />);
+    await screen.findByText("Living Room Light");
+
+    fireEvent.click(screen.getByText("Turn off"));
+
+    await waitFor(() => expect(api.markDeviceOffline).toHaveBeenCalledWith("matter-2"));
+    expect(api.invokeTool).not.toHaveBeenCalled();
+  });
+
+  it("turning on an offline device calls markDeviceOnline, not the MCP tool", async () => {
+    const offlineLight: Device = { ...matterLight, is_online: false };
+    (api.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([offlineLight]);
+    (api.markDeviceOnline as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+    render(<Devices />);
+    await screen.findByText("Living Room Light");
+
+    fireEvent.click(screen.getByText("Turn on"));
+
+    await waitFor(() => expect(api.markDeviceOnline).toHaveBeenCalledWith("matter-2"));
+    expect(api.invokeTool).not.toHaveBeenCalled();
+  });
+});
+
+describe("Devices section — Configure modal", () => {
+  it("opens editable, pre-filled with the device's current name/hostname/room", async () => {
+    const withHostname: Device = { ...matterLight, hostname: "light.local", room: "Living Room" };
+    (api.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([withHostname]);
+
+    render(<Devices />);
+    await screen.findByText("Living Room Light");
+
+    fireEvent.click(screen.getByText("Configure"));
+
+    const nameInput = await screen.findByDisplayValue("Living Room Light");
+    expect(nameInput.tagName).toBe("INPUT");
+    expect(screen.getByDisplayValue("light.local")).toBeTruthy();
+    expect(screen.getByDisplayValue("Living Room")).toBeTruthy();
+  });
+
+  it("saving edited fields calls updateDevice with the new values", async () => {
+    (api.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([matterLight]);
+    (api.updateDevice as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...matterLight,
+      name: "Renamed Light",
+      room: "Kitchen",
+    });
+
+    render(<Devices />);
+    await screen.findByText("Living Room Light");
+    fireEvent.click(screen.getByText("Configure"));
+
+    const nameInput = await screen.findByDisplayValue("Living Room Light");
+    fireEvent.change(nameInput, { target: { value: "Renamed Light" } });
+
+    const roomInput = screen.getByPlaceholderText("Living Room");
+    fireEvent.change(roomInput, { target: { value: "Kitchen" } });
+
+    fireEvent.click(screen.getByText("Save"));
+
+    await waitFor(() =>
+      expect(api.updateDevice).toHaveBeenCalledWith("matter-2", {
+        name: "Renamed Light",
+        hostname: undefined,
+        room: "Kitchen",
+      }),
+    );
   });
 });
