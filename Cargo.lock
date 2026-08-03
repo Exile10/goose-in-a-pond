@@ -8652,9 +8652,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "cpal",
  "piper-rs",
  "pond-core",
+ "pond-voice",
  "rodio",
  "tempfile",
  "tokio",
@@ -8717,10 +8717,9 @@ dependencies = [
  "async-trait",
  "cpal",
  "pond-core",
- "reqwest 0.13.3",
+ "pond-voice",
  "rodio",
  "serde",
- "serde_json",
  "tokio",
  "tracing",
  "whisper-rs",
@@ -8786,6 +8785,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond-audio"
+version = "0.1.0"
+dependencies = [
+ "cpal",
+ "pond-voice",
+ "tracing",
+]
+
+[[package]]
 name = "pond-core"
 version = "0.1.0"
 dependencies = [
@@ -8794,6 +8802,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "pond-voice",
  "serde",
  "serde_json",
  "tempfile",
@@ -8969,6 +8978,10 @@ dependencies = [
  "wiremock",
  "zip 2.4.2",
 ]
+
+[[package]]
+name = "pond-voice"
+version = "0.1.0"
 
 [[package]]
 name = "portable-atomic"

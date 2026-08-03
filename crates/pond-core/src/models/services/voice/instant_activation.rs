@@ -25,8 +25,13 @@ impl StreamingWakeWordDetector for InstantActivation {
         })
     }
 
+    /// Nothing to prompt for: this detector never waits, so there is no
+    /// moment to describe. It said "Type your message" for both callers, but
+    /// `--no-wake-word` pairs it with a *microphone* — so a voice session
+    /// announced a keyboard, twice per turn, next to the real "listening"
+    /// prompt. `run_loop` skips an empty prompt.
     fn activation_prompt(&self) -> &str {
-        "Type your message"
+        ""
     }
 
     /// `InstantActivation` resolves immediately, so it must NOT participate in
@@ -60,12 +65,20 @@ mod tests {
         assert!(!detector.supports_interruption());
     }
 
+    /// An empty prompt is the contract, not an oversight: this detector does
+    /// not wait, so there is no waiting to describe. The previous text claimed
+    /// the user should type, which is wrong whenever `--no-wake-word` is
+    /// paired with a microphone. `run_loop` skips an empty prompt entirely.
     #[tokio::test]
-    async fn instant_activation_prompt_is_non_empty() {
+    async fn instant_activation_announces_nothing_because_it_never_waits() {
         let detector = InstantActivation;
         // Explicitly call through StreamingWakeWordDetector to avoid ambiguity
         // with the deprecated WakeWordDetector blanket impl.
-        assert!(!StreamingWakeWordDetector::activation_prompt(&detector).is_empty());
+        assert_eq!(
+            StreamingWakeWordDetector::activation_prompt(&detector),
+            "",
+            "a detector that returns instantly must not prompt for anything"
+        );
     }
 
     #[tokio::test]

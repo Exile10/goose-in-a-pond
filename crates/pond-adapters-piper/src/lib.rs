@@ -2,7 +2,6 @@
 //!
 //! Exports:
 //! - `PiperRsOutput` — in-process `VoiceOutput` port (piper-rs / ort, default)
-//! - `PiperOutput`   — legacy subprocess `VoiceOutput` port (gated by `legacy-subprocess`)
 //!
 //! ## Default — in-process (`PiperRsOutput`)
 //!
@@ -10,87 +9,70 @@
 //! piper-rs bindings (ONNX Runtime + espeak-rs phonemizer). No subprocess,
 //! no per-utterance fork+exec cost.
 //!
-//! ## Legacy — subprocess (`PiperOutput`)
-//!
-//! Behind `#[cfg(feature = "legacy-subprocess")]`. Spawns `piper --output-raw`
-//! per utterance, pipes text to stdin, reads PCM from stdout. Kept as a
-//! one-release escape valve.
-//!
 //! ## Shared infrastructure
 //!
 //! Both backends reuse the same backend-agnostic helpers from this module:
 //! - `pcm_to_wav` — wraps int16 PCM into a minimal RIFF/WAV header
 //! - `play_wav_interruptible` — rodio playback with 50 ms interrupt polling
-//! - `start_thinking_tone_thread` — 440 Hz background pulse
-//! - `start_barge_in_thread` — cpal mic monitor with RMS energy gate
+//! - `start_thinking_tone_thread` — the soft working tone
 
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-#[cfg(feature = "legacy-subprocess")]
-use anyhow::anyhow;
-#[cfg(feature = "legacy-subprocess")]
-use async_trait::async_trait;
-#[cfg(feature = "legacy-subprocess")]
-use pond_core::models::ports::voice_output::VoiceOutput;
-#[cfg(feature = "legacy-subprocess")]
-use std::io::Write as _;
-#[cfg(feature = "legacy-subprocess")]
-use std::path::PathBuf;
-
 mod in_process;
 pub use in_process::PiperRsOutput;
 
-// ── Quips ─────────────────────────────────────────────────────────────────────
-
-/// Short reassurance phrases spoken while the LLM starts inference.
-/// Aim for 1-2 seconds of synthesised audio each.
-const QUIPS: &[&str] = &[
-    "On it.",
-    "Let me think.",
-    "Ruffling through possibilities.",
-    "Consulting the pond elders.",
-    "Wading into the knowledge pool.",
-    "Hatching a response.",
-    "Paddling upstream.",
-    "Assembling ideas, feather by feather.",
-    "Skimming the surface.",
-    "One moment.",
-    "Let me check.",
-    "Thinking that through.",
-];
-
-/// Pick a quip using sub-millisecond time as a cheap source of variety.
-pub(crate) fn pick_quip() -> &'static str {
-    let idx = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as usize)
-        .unwrap_or(0)
-        % QUIPS.len();
-    QUIPS[idx]
-}
-
-// ── Barge-in constants ────────────────────────────────────────────────────────
-
-/// RMS energy threshold for barge-in when the mic is idle (no TTS playing).
-const BARGE_IN_RMS_THRESHOLD: f32 = 0.02;
-
-/// Elevated RMS threshold used while TTS is actively playing.
-/// Speaker echo typically reads 0.01–0.05 RMS; intentional speech from
-/// a human nearby reads 0.10–0.40 RMS, so 0.15 separates the two reliably.
-const BARGE_IN_RMS_THRESHOLD_SPEAKING: f32 = 0.15;
-
-/// Duration in milliseconds of each audio analysis chunk for barge-in.
-const BARGE_IN_CHUNK_MS: u64 = 100;
-
 // ── Shared helpers (backend-agnostic) ─────────────────────────────────────────
 
-/// Spawn the 440 Hz thinking-tone background thread.
+/// Sample rate of the generated working tone.
+const TONE_RATE: u32 = 22_050;
+/// One breath of the tone: a soft chime, then silence, then repeat.
+const TONE_CYCLE_MS: u64 = 2_600;
+/// How long the chime itself rings before the silence.
+const TONE_CHIME_MS: u64 = 1_100;
+
+/// Build one cycle of the working tone: a chime followed by silence.
 ///
-/// Called by both `PiperRsOutput::start_thinking_tone` and the legacy
-/// `PiperOutput::start_thinking_tone`. The `active` flag is shared with the
-/// thread and cleared by `stop_thinking_tone` to break the loop.
+/// The old tone was a bare 440 Hz sine, one second on and one second off,
+/// forever. A pure tone at concert A with a hard cycle is about the most
+/// fatiguing thing a speaker can produce, and it played through every wait.
+///
+/// This is a major sixth (E5 over G4) — a consonant interval, so the two
+/// partials beat slowly rather than clashing — with the upper voice softer
+/// than the lower, a gentle attack so it fades in instead of clicking, and an
+/// exponential decay that lets it ring out. Then it rests. The silence is most
+/// of the cycle, which is what makes it something you can sit through: it
+/// reads as breathing rather than as an alarm.
+fn working_tone_cycle() -> Vec<f32> {
+    let chime_samples = (TONE_RATE as u64 * TONE_CHIME_MS / 1000) as usize;
+    let cycle_samples = (TONE_RATE as u64 * TONE_CYCLE_MS / 1000) as usize;
+    let mut out = Vec::with_capacity(cycle_samples);
+
+    for i in 0..chime_samples {
+        let t = i as f32 / TONE_RATE as f32;
+        let progress = i as f32 / chime_samples as f32;
+
+        // Fade in over the first 8% so the chime never clicks, then decay.
+        let attack = (progress / 0.08).min(1.0);
+        let decay = (-3.2 * progress).exp();
+        let envelope = attack * decay;
+
+        let root = (2.0 * std::f32::consts::PI * 392.00 * t).sin(); // G4
+        let sixth = (2.0 * std::f32::consts::PI * 659.25 * t).sin(); // E5
+        out.push((root * 0.6 + sixth * 0.4) * envelope * 0.5);
+    }
+
+    out.resize(cycle_samples, 0.0);
+    out
+}
+
+/// Spawn the background working-tone thread.
+///
+/// The `active` flag is shared with the thread and cleared by
+/// `stop_thinking_tone` to break the loop. Polled every 50 ms so the tone
+/// stops promptly when the first sentence of the answer is ready — a tone
+/// that outlives the wait is worse than no tone.
 pub(crate) fn start_thinking_tone_thread(active: Arc<AtomicBool>) {
     // If already playing, don't spawn a second thread.
     if active.swap(true, Ordering::SeqCst) {
@@ -108,23 +90,19 @@ pub(crate) fn start_thinking_tone_thread(active: Arc<AtomicBool>) {
             flag.store(false, Ordering::SeqCst);
             return;
         };
-        sink.set_volume(0.08);
+        sink.set_volume(0.10);
 
-        let rate = 22050u32;
-        let pulse_samples = rate as usize; // 1-second pulse
-        let pulse: Vec<f32> = (0..pulse_samples)
-            .map(|i| {
-                let t = i as f32 / rate as f32;
-                let envelope = (std::f32::consts::PI * t).sin();
-                (2.0 * std::f32::consts::PI * 440.0 * t).sin() * envelope * 0.5
-            })
-            .collect();
+        let cycle = working_tone_cycle();
+        let polls_per_cycle = TONE_CYCLE_MS / 50;
 
         while flag.load(Ordering::Relaxed) {
-            let buf = rodio::buffer::SamplesBuffer::new(1, rate, pulse.clone());
-            sink.append(buf);
-            for _ in 0..10 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+            sink.append(rodio::buffer::SamplesBuffer::new(
+                1,
+                TONE_RATE,
+                cycle.clone(),
+            ));
+            for _ in 0..polls_per_cycle {
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 if !flag.load(Ordering::Relaxed) {
                     sink.stop();
                     return;
@@ -135,354 +113,6 @@ pub(crate) fn start_thinking_tone_thread(active: Arc<AtomicBool>) {
     });
 }
 
-/// Spawn the cpal-based barge-in mic monitor thread.
-///
-/// Uses `BARGE_IN_RMS_THRESHOLD` when idle and `BARGE_IN_RMS_THRESHOLD_SPEAKING`
-/// while `is_speaking` is true, suppressing speaker echo without blocking
-/// intentional barge-in (human voice is much louder than echo).
-pub(crate) fn start_barge_in_thread(
-    active: Arc<AtomicBool>,
-    interrupt: Arc<AtomicBool>,
-    is_speaking: Arc<AtomicBool>,
-) {
-    // Don't spawn a second listener if one is already active.
-    if active.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
-    let active_flag = active;
-    let interrupt_flag = interrupt;
-
-    std::thread::spawn(move || {
-        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-
-        let host = cpal::default_host();
-        let device = match host.default_input_device() {
-            Some(d) => d,
-            None => {
-                tracing::debug!("Barge-in: no input device found");
-                active_flag.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-
-        // Use the device's default input config.
-        let config = match device.default_input_config() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!("Barge-in: no input config: {e}");
-                active_flag.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-
-        let sample_rate = config.sample_rate().0;
-        let channels = config.channels() as usize;
-        // Number of samples per analysis window.
-        let chunk_samples = (sample_rate as u64 * BARGE_IN_CHUNK_MS / 1000) as usize * channels;
-
-        let rms_buf = Arc::new(std::sync::Mutex::new(Vec::<f32>::with_capacity(
-            chunk_samples,
-        )));
-        let rms_buf_write = rms_buf.clone();
-        let active_for_callback = active_flag.clone();
-        let interrupt_for_callback = interrupt_flag.clone();
-        let is_speaking_for_callback = is_speaking.clone();
-
-        let stream_config: cpal::StreamConfig = config.into();
-
-        let stream = device.build_input_stream(
-            &stream_config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                if !active_for_callback.load(Ordering::Relaxed) {
-                    return;
-                }
-                let mut buf = rms_buf_write.lock().unwrap();
-                buf.extend_from_slice(data);
-
-                if buf.len() >= chunk_samples {
-                    let sum_sq: f32 = buf.iter().map(|s| s * s).sum();
-                    let rms = (sum_sq / buf.len() as f32).sqrt();
-                    buf.clear();
-
-                    let threshold = if is_speaking_for_callback.load(Ordering::Relaxed) {
-                        BARGE_IN_RMS_THRESHOLD_SPEAKING
-                    } else {
-                        BARGE_IN_RMS_THRESHOLD
-                    };
-                    if rms > threshold {
-                        tracing::debug!(
-                            "Barge-in: speech detected (RMS={rms:.4}, threshold={threshold:.2})"
-                        );
-                        interrupt_for_callback.store(true, Ordering::SeqCst);
-                        active_for_callback.store(false, Ordering::SeqCst);
-                    }
-                }
-            },
-            move |err| {
-                tracing::debug!("Barge-in stream error: {err}");
-            },
-            None,
-        );
-
-        let stream = match stream {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!("Barge-in: failed to build input stream: {e}");
-                active_flag.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-
-        if let Err(e) = stream.play() {
-            tracing::debug!("Barge-in: failed to start stream: {e}");
-            active_flag.store(false, Ordering::SeqCst);
-            return;
-        }
-
-        // Keep the stream alive while the listener is active.
-        while active_flag.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        // Stream is dropped here, releasing the mic.
-    });
-}
-
-// ── PiperOutput (legacy subprocess) ───────────────────────────────────────────
-
-/// VoiceOutput adapter that synthesises speech via the Piper TTS subprocess.
-///
-/// Kept behind `#[cfg(feature = "legacy-subprocess")]` as a one-release escape
-/// valve. Default builds use `PiperRsOutput` instead.
-#[cfg(feature = "legacy-subprocess")]
-pub struct PiperOutput {
-    piper_bin: PathBuf,
-    model: PathBuf,
-    /// Sample rate of the model's raw PCM output.
-    /// `en_US-lessac-medium` = 22 050 Hz.  Override with `with_sample_rate()`.
-    sample_rate: u32,
-    /// Optional path to the espeak-ng-data directory.
-    /// When set, `--espeak_data <path>` is passed to piper.
-    espeak_data: Option<PathBuf>,
-    /// Thinking tone stop flag — shared with the background tone thread.
-    thinking_active: Arc<AtomicBool>,
-    /// Speech interrupt flag — set to true to immediately stop TTS playback.
-    /// Checked by `play_wav_interruptible()` every 50ms during playback.
-    speech_interrupted: Arc<AtomicBool>,
-    /// Barge-in listener active flag — shared with the mic monitoring thread.
-    barge_in_active: Arc<AtomicBool>,
-    /// True while TTS audio is actively playing. Shared with the barge-in thread
-    /// so it uses an elevated RMS threshold to suppress speaker echo (AEC gating).
-    is_speaking: Arc<AtomicBool>,
-}
-
-#[cfg(feature = "legacy-subprocess")]
-impl PiperOutput {
-    /// Create a new `PiperOutput`.
-    ///
-    /// `piper_bin` — path to the piper executable.
-    /// `model`     — path to the `.onnx` voice model file.
-    pub fn new(piper_bin: PathBuf, model: PathBuf) -> Self {
-        Self {
-            piper_bin,
-            model,
-            sample_rate: 22_050,
-            espeak_data: None,
-            thinking_active: Arc::new(AtomicBool::new(false)),
-            speech_interrupted: Arc::new(AtomicBool::new(false)),
-            barge_in_active: Arc::new(AtomicBool::new(false)),
-            is_speaking: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    /// Set the espeak-ng-data directory (passed as `--espeak_data` to piper).
-    /// Required when piper was compiled against a different system path.
-    pub fn with_espeak_data(mut self, path: PathBuf) -> Self {
-        self.espeak_data = Some(path);
-        self
-    }
-
-    /// Override the expected sample rate (default: 22 050 for lessac-medium).
-    pub fn with_sample_rate(mut self, sample_rate: u32) -> Self {
-        self.sample_rate = sample_rate;
-        self
-    }
-
-    /// Assemble the piper command arguments.
-    ///
-    /// Exposed for integration tests that verify builder configuration without
-    /// running a real piper binary. Not part of the stable public API.
-    #[doc(hidden)]
-    pub fn build_args(&self) -> Vec<String> {
-        let mut args = vec![
-            "--model".to_string(),
-            self.model.to_string_lossy().to_string(),
-            "--output-raw".to_string(),
-            "--quiet".to_string(),
-        ];
-        if let Some(ref d) = self.espeak_data {
-            args.push("--espeak_data".to_string());
-            args.push(d.to_string_lossy().to_string());
-        }
-        args
-    }
-}
-
-#[cfg(feature = "legacy-subprocess")]
-#[async_trait]
-impl VoiceOutput for PiperOutput {
-    fn start_thinking_tone(&self) {
-        start_thinking_tone_thread(self.thinking_active.clone());
-    }
-
-    fn stop_thinking_tone(&self) {
-        self.thinking_active.store(false, Ordering::SeqCst);
-    }
-
-    fn stop_speaking(&self) {
-        self.speech_interrupted.store(true, Ordering::SeqCst);
-    }
-
-    fn start_barge_in_listener(&self) {
-        start_barge_in_thread(
-            self.barge_in_active.clone(),
-            self.speech_interrupted.clone(),
-            self.is_speaking.clone(),
-        );
-    }
-
-    fn stop_barge_in_listener(&self) {
-        self.barge_in_active.store(false, Ordering::SeqCst);
-    }
-
-    async fn speak_quip(&self) -> Option<&'static str> {
-        let quip = pick_quip();
-        if let Err(e) = self.speak(quip).await {
-            tracing::debug!("Quip TTS failed: {e}");
-            return None;
-        }
-        Some(quip)
-    }
-
-    async fn speak(&self, text: &str) -> Result<()> {
-        // Clear interrupt flag before this utterance.
-        self.speech_interrupted.store(false, Ordering::SeqCst);
-        let bin = self.piper_bin.clone();
-        let model = self.model.clone();
-        let sample_rate = self.sample_rate;
-        let text = text.to_string();
-        let espeak_data = self.espeak_data.clone();
-        let flag = self.speech_interrupted.clone();
-
-        // Synthesize then play with interrupt support.
-        let is_speaking = self.is_speaking.clone();
-        tokio::task::spawn_blocking(move || {
-            let wav =
-                synthesize_blocking(&bin, &model, espeak_data.as_deref(), sample_rate, &text)?;
-            if wav.is_empty() {
-                return Ok(());
-            }
-            play_wav_interruptible(wav, &flag, &is_speaking)
-        })
-        .await
-        .context("piper speak task panicked")??;
-
-        Ok(())
-    }
-
-    async fn synthesize(&self, text: &str) -> Result<Option<Vec<u8>>> {
-        let bin = self.piper_bin.clone();
-        let model = self.model.clone();
-        let sample_rate = self.sample_rate;
-        let text = text.to_string();
-        let espeak_data = self.espeak_data.clone();
-
-        let wav = tokio::task::spawn_blocking(move || {
-            synthesize_blocking(&bin, &model, espeak_data.as_deref(), sample_rate, &text)
-        })
-        .await
-        .context("piper synthesize task panicked")??;
-
-        if wav.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(wav))
-        }
-    }
-
-    async fn play_audio(&self, audio: Vec<u8>) -> Result<()> {
-        // Clear the interrupt flag before playback starts.
-        self.speech_interrupted.store(false, Ordering::SeqCst);
-        let flag = self.speech_interrupted.clone();
-        let is_speaking = self.is_speaking.clone();
-        tokio::task::spawn_blocking(move || play_wav_interruptible(audio, &flag, &is_speaking))
-            .await
-            .context("playback task panicked")?
-    }
-}
-
-// ── Blocking implementation (legacy subprocess) ───────────────────────────────
-
-/// Synthesize text to WAV bytes without playing. Returns the WAV buffer.
-#[cfg(feature = "legacy-subprocess")]
-fn synthesize_blocking(
-    piper_bin: &std::path::Path,
-    model: &std::path::Path,
-    espeak_data: Option<&std::path::Path>,
-    sample_rate: u32,
-    text: &str,
-) -> Result<Vec<u8>> {
-    use std::process::{Command, Stdio};
-
-    let mut cmd = Command::new(piper_bin);
-    cmd.args(["--model", &model.to_string_lossy()])
-        .args(["--output-raw", "--quiet"]);
-    if let Some(d) = espeak_data {
-        cmd.args(["--espeak_data", &d.to_string_lossy()]);
-    }
-    let mut child = cmd
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("Failed to spawn piper at {}", piper_bin.display()))?;
-
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("piper stdin unavailable"))?;
-        stdin
-            .write_all(text.as_bytes())
-            .context("Failed to write text to piper stdin")?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .context("Failed to wait for piper")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr = stderr.trim();
-        if stderr.is_empty() {
-            return Err(anyhow!("piper exited with status {}", output.status));
-        }
-        return Err(anyhow!(
-            "piper exited with status {}: {}",
-            output.status,
-            stderr
-        ));
-    }
-
-    let pcm = output.stdout;
-    if pcm.is_empty() {
-        tracing::warn!("piper produced no PCM output for text: {:?}", text);
-        return Ok(Vec::new());
-    }
-
-    Ok(pcm_to_wav(&pcm, sample_rate))
-}
-
 // ── WAV encoder (shared) ──────────────────────────────────────────────────────
 
 /// Wrap raw 16-bit mono PCM in a minimal RIFF/WAV container.
@@ -490,49 +120,14 @@ fn synthesize_blocking(
 /// Used by both backends — the legacy subprocess emits raw int16 PCM bytes
 /// directly; the in-process backend converts piper-rs's f32 samples to int16
 /// first via `f32_samples_to_pcm_le_bytes`.
-pub(crate) fn pcm_to_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
-    let channels: u16 = 1;
-    let bits_per_sample: u16 = 16;
-    let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
-    let block_align = channels * bits_per_sample / 8;
-    let data_len = pcm.len() as u32;
-    let riff_len = 36 + data_len;
-
-    let mut wav = Vec::with_capacity(44 + pcm.len());
-    // RIFF chunk
-    wav.extend_from_slice(b"RIFF");
-    wav.extend_from_slice(&riff_len.to_le_bytes());
-    wav.extend_from_slice(b"WAVE");
-    // fmt  sub-chunk
-    wav.extend_from_slice(b"fmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes()); // chunk size
-    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM format
-    wav.extend_from_slice(&channels.to_le_bytes());
-    wav.extend_from_slice(&sample_rate.to_le_bytes());
-    wav.extend_from_slice(&byte_rate.to_le_bytes());
-    wav.extend_from_slice(&block_align.to_le_bytes());
-    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
-    // data sub-chunk
-    wav.extend_from_slice(b"data");
-    wav.extend_from_slice(&data_len.to_le_bytes());
-    wav.extend_from_slice(pcm);
-    wav
-}
+pub(crate) use pond_voice::dsp::encode_wav_pcm16 as pcm_to_wav;
 
 /// Convert piper-rs's f32 mono samples (normalised to roughly [-1, 1]) to
 /// signed 16-bit little-endian PCM bytes ready for `pcm_to_wav`.
 ///
 /// Clamps to avoid wraparound when the model emits the rare out-of-range
 /// sample. Mirrors the conversion used in `piper-rs/examples/wav.rs`.
-pub(crate) fn f32_samples_to_pcm_le_bytes(samples: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(samples.len() * 2);
-    for &s in samples {
-        let clamped = s.clamp(-1.0, 1.0);
-        let v = (clamped * i16::MAX as f32) as i16;
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out
-}
+pub(crate) use pond_voice::dsp::f32_to_pcm16 as f32_samples_to_pcm_le_bytes;
 
 // ── Persistent audio output ───────────────────────────────────────────────────
 
@@ -588,50 +183,11 @@ impl Drop for AudioKeeper {
 
 // ── Audio playback (shared) ───────────────────────────────────────────────────
 
-/// Play WAV audio without interrupt support.
-#[cfg(feature = "legacy-subprocess")]
-#[allow(dead_code)]
-fn play_wav(wav: Vec<u8>) -> Result<()> {
-    play_wav_interruptible(wav, &AtomicBool::new(false), &AtomicBool::new(false))
-}
-
 /// Play WAV audio with interrupt support and AEC gating.
 ///
 /// Opens a fresh `OutputStream` on each call. Used only by the legacy
 /// subprocess backend (`PiperOutput`) — the in-process backend's TTS playback
 /// uses `play_wav_on_handle` with a persistent `OutputStreamHandle` instead.
-#[cfg(feature = "legacy-subprocess")]
-pub(crate) fn play_wav_interruptible(
-    wav: Vec<u8>,
-    interrupted: &AtomicBool,
-    is_speaking: &AtomicBool,
-) -> Result<()> {
-    use rodio::{Decoder, OutputStream, Sink};
-    use std::io::Cursor;
-
-    let cursor = Cursor::new(wav);
-    let decoder = Decoder::new(cursor).context("Failed to decode WAV for playback")?;
-
-    let (_stream, stream_handle) =
-        OutputStream::try_default().context("No audio output device found")?;
-    let sink = Sink::try_new(&stream_handle).context("Failed to create audio sink")?;
-
-    sink.append(decoder);
-    is_speaking.store(true, Ordering::SeqCst);
-
-    while !sink.empty() {
-        if interrupted.load(Ordering::Relaxed) {
-            sink.stop();
-            is_speaking.store(false, Ordering::SeqCst);
-            tracing::debug!("TTS playback interrupted by barge-in");
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-
-    is_speaking.store(false, Ordering::SeqCst);
-    Ok(())
-}
 
 /// Play WAV audio on an already-open `OutputStreamHandle` with interrupt support.
 ///
@@ -642,7 +198,6 @@ pub(crate) fn play_wav_on_handle(
     wav: Vec<u8>,
     handle: &rodio::OutputStreamHandle,
     interrupted: &AtomicBool,
-    is_speaking: &AtomicBool,
 ) -> Result<()> {
     use rodio::{Decoder, Sink};
     use std::io::Cursor;
@@ -651,19 +206,16 @@ pub(crate) fn play_wav_on_handle(
     let decoder = Decoder::new(cursor).context("Failed to decode WAV for playback")?;
     let sink = Sink::try_new(handle).context("Failed to create audio sink")?;
     sink.append(decoder);
-    is_speaking.store(true, Ordering::SeqCst);
 
     while !sink.empty() {
         if interrupted.load(Ordering::Relaxed) {
             sink.stop();
-            is_speaking.store(false, Ordering::SeqCst);
             tracing::debug!("TTS playback interrupted by barge-in");
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    is_speaking.store(false, Ordering::SeqCst);
     Ok(())
 }
 
@@ -672,28 +224,6 @@ pub(crate) fn play_wav_on_handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(feature = "legacy-subprocess")]
-    #[test]
-    fn piper_args_include_model_and_flags() {
-        let tts = PiperOutput::new(
-            PathBuf::from("/data/bin/piper"),
-            PathBuf::from("/data/models/tts/en_US-lessac-medium.onnx"),
-        );
-        let args = tts.build_args();
-        assert_eq!(args[0], "--model");
-        assert!(args[1].contains("en_US-lessac-medium.onnx"));
-        assert!(args.contains(&"--output-raw".to_string()));
-        assert!(args.contains(&"--quiet".to_string()));
-    }
-
-    #[cfg(feature = "legacy-subprocess")]
-    #[test]
-    fn with_sample_rate_overrides_default() {
-        let tts = PiperOutput::new(PathBuf::from("piper"), PathBuf::from("model.onnx"))
-            .with_sample_rate(16_000);
-        assert_eq!(tts.sample_rate, 16_000);
-    }
 
     #[test]
     fn pcm_to_wav_header_is_correct() {
@@ -727,15 +257,100 @@ mod tests {
         assert_eq!(i16::from_le_bytes([bytes[2], bytes[3]]), i16::MAX);
         assert_eq!(i16::from_le_bytes([bytes[4], bytes[5]]), -i16::MAX);
     }
+}
 
-    #[cfg(feature = "legacy-subprocess")]
+#[cfg(test)]
+mod working_tone_tests {
+    use super::*;
+
+    /// Most of the cycle is silence. That ratio is what makes the tone
+    /// something a person can sit through for a thirty-second answer instead
+    /// of a sound they want to escape — the tone it replaced was a bare 440 Hz
+    /// sine that ran half the time, forever.
     #[test]
-    fn piper_output_compiles_as_voice_output() {
-        use pond_core::models::ports::voice_output::VoiceOutput;
-        use std::sync::Arc;
-        let _out: Arc<dyn VoiceOutput> = Arc::new(PiperOutput::new(
-            PathBuf::from("piper"),
-            PathBuf::from("model.onnx"),
-        ));
+    fn the_tone_rests_for_most_of_its_cycle() {
+        let cycle = working_tone_cycle();
+        let silent = cycle.iter().filter(|s| **s == 0.0).count();
+        let ratio = silent as f32 / cycle.len() as f32;
+        assert!(
+            ratio > 0.5,
+            "only {:.0}% silence — a tone that never rests is an alarm",
+            ratio * 100.0
+        );
+    }
+
+    /// A waveform that starts at full amplitude clicks, and a click every few
+    /// seconds is more noticeable than the tone itself.
+    #[test]
+    fn the_chime_fades_in_rather_than_clicking() {
+        let cycle = working_tone_cycle();
+        assert_eq!(cycle[0], 0.0, "must start from silence");
+
+        let attack = (TONE_RATE as usize) / 100; // first 10 ms
+        let early = cycle[..attack].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let peak = cycle.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            early < peak * 0.8,
+            "amplitude jumps to {early} within 10ms of a {peak} peak"
+        );
+    }
+
+    /// It rings out instead of stopping dead, and it is over well before the
+    /// cycle ends, leaving real silence rather than a fade that never lands.
+    #[test]
+    fn the_chime_decays_and_finishes_inside_its_cycle() {
+        let cycle = working_tone_cycle();
+        let chime = (TONE_RATE as u64 * TONE_CHIME_MS / 1000) as usize;
+
+        let loudest = |r: &[f32]| r.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let first_third = loudest(&cycle[..chime / 3]);
+        let last_third = loudest(&cycle[chime * 2 / 3..chime]);
+        assert!(
+            last_third < first_third * 0.5,
+            "no decay: {first_third} then {last_third}"
+        );
+
+        assert!(
+            cycle[chime..].iter().all(|s| *s == 0.0),
+            "the rest of the cycle must be true silence"
+        );
+    }
+
+    /// Clipping would turn the chime into a buzz. The playback sink applies
+    /// its own gain on top, so headroom here is not optional.
+    #[test]
+    fn the_tone_never_clips() {
+        let peak = working_tone_cycle()
+            .iter()
+            .fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak <= 1.0, "clipped at {peak}");
+        assert!(peak < 0.85, "no headroom for the sink's gain: {peak}");
+        assert!(peak > 0.05, "inaudible at {peak}");
+    }
+
+    /// The stop poll has to divide the cycle, or stopping the tone waits for
+    /// a whole extra cycle and the chime plays over the first sentence.
+    #[test]
+    fn the_tone_can_be_stopped_promptly() {
+        assert_eq!(
+            TONE_CYCLE_MS % 50,
+            0,
+            "the 50ms stop poll must divide the cycle"
+        );
+        assert!(
+            TONE_CYCLE_MS / 50 >= 4,
+            "too few polls per cycle to stop responsively"
+        );
+    }
+
+    /// Silence has to outlast the chime, not merely exist.
+    #[test]
+    fn the_chime_is_shorter_than_the_rest_that_follows_it() {
+        assert!(
+            TONE_CHIME_MS < TONE_CYCLE_MS - TONE_CHIME_MS,
+            "{}ms of chime against {}ms of silence",
+            TONE_CHIME_MS,
+            TONE_CYCLE_MS - TONE_CHIME_MS
+        );
     }
 }

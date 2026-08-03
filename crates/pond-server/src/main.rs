@@ -27,10 +27,6 @@ mod llm_memory_consolidator;
 mod llm_memory_extractor;
 mod mdns_advertiser;
 mod model_download;
-#[cfg(feature = "legacy-subprocess")]
-mod piper_http;
-#[cfg(feature = "legacy-subprocess")]
-mod piper_process;
 mod ports;
 mod reqwest_model_downloader;
 mod schedule_executors;
@@ -38,20 +34,15 @@ mod startup;
 mod system_deps;
 mod three_stage_consolidator;
 mod tracing_setup;
-#[cfg(feature = "legacy-subprocess")]
-mod whisper_process;
+mod voice_models;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use pond_adapters_llamafile::LlamafileProvider;
 use pond_adapters_ollama::OllamaProvider;
-#[cfg(feature = "legacy-subprocess")]
-use pond_adapters_piper::PiperOutput;
 use pond_adapters_piper::PiperRsOutput;
 use pond_adapters_weather::{OpenMeteoWeatherAdapter, WeatherProvider};
-#[cfg(feature = "legacy-subprocess")]
-use pond_adapters_whisper::WhisperInput;
 use pond_adapters_whisper::{WhisperKeywordDetector, WhisperRsInput};
 use pond_api::{AppState, LlamafileManager};
 use pond_core::mcp::ports::mcp_server::McpServerRepository as _;
@@ -669,34 +660,12 @@ async fn run_setup(model: &str) -> Result<()> {
         );
     }
 
-    // Step 4: whisper-server binary — only with the legacy-subprocess escape valve.
-    // Default build runs Whisper in-process via whisper-rs; no second binary needed.
-    #[cfg(feature = "legacy-subprocess")]
-    {
-        println!("\n  [4/8] Downloading whisper-server binary (legacy-subprocess)...");
-        let _ = model_download::download_whisper_binary(&data_dir).await;
-    }
-    #[cfg(not(feature = "legacy-subprocess"))]
+    // Step 4: Whisper runs in-process via whisper-rs — no binary to fetch.
     {
         println!("\n  [4/8] Whisper runs in-process — no binary download needed.");
     }
 
-    // Step 5: Piper TTS binary — only with the legacy-subprocess escape valve.
-    // Default build runs Piper in-process via piper-rs.
-    #[cfg(feature = "legacy-subprocess")]
-    {
-        println!("\n  [5/8] Setting up Piper TTS subprocess (legacy-subprocess)...");
-        let piper_bin_ok = model_download::download_piper_binary(&data_dir)
-            .await
-            .is_ok();
-        if !piper_bin_ok {
-            println!("  ⚠  Piper binary unavailable — voice output will be text-only.");
-            println!("     Install piper manually or retry setup.");
-        } else {
-            println!("  ✅ Piper binary ready — select a voice model in the web Settings page.");
-        }
-    }
-    #[cfg(not(feature = "legacy-subprocess"))]
+    // Step 5: Piper runs in-process via piper-rs — only the voice model is fetched.
     {
         println!("\n  [5/8] Checking Piper TTS voice model...");
         let tts_dir = model_download::tts_models_dir(&data_dir);
@@ -1037,87 +1006,57 @@ async fn run_server(
 
     // STT — whisper ggml model download (the in-process backend reads the
     // same `.bin` files the legacy subprocess used).
-    let whisper_model_path: Option<std::path::PathBuf> = if settings.active_whisper_model.is_empty()
-    {
-        println!("  ⏭  STT: whisper skipped (no whisper model configured in Settings)");
-        None
-    } else {
-        let (whisper_filename, whisper_url, whisper_mb) =
-            SqliteModelRepository::new(db.system.clone())
-                .get_by_id(&format!("whisper/{}", settings.active_whisper_model))
-                .await
-                .ok()
-                .flatten()
-                .map(|r| {
-                    (
-                        r.filename.unwrap_or_else(|| {
-                            format!("ggml-{}.en.bin", &settings.active_whisper_model)
-                        }),
-                        r.url.unwrap_or_default(),
-                        r.size_mb,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    (
-                        format!("ggml-{}.en.bin", &settings.active_whisper_model),
-                        String::new(),
-                        0u64,
-                    )
-                });
-        let whisper_model = data_dir.join("models").join(&whisper_filename);
-        if !whisper_model.exists() {
-            println!(
-                "  📥 STT model not found — downloading ({})...",
-                settings.active_whisper_model
-            );
-            if !whisper_url.is_empty() {
-                if let Some(parent) = whisper_model.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-                match model_download::download_file(&whisper_url, &whisper_model, whisper_mb).await
-                {
-                    Ok(_) => {}
-                    Err(e) => println!("  ⚠  STT model download failed: {}", e),
-                }
+    // Apply the microphone privacy setting before anything can open a device.
+    pond_core::models::domain::mic_gate::set_mic_enabled(settings.mic_enabled);
+
+    // One resolution for both voice models, shared with the `chat` path.
+    let voice_models = voice_models::resolve_voice_models(
+        &settings,
+        &SqliteModelRepository::new(db.system.clone()),
+        &data_dir,
+    )
+    .await;
+
+    let whisper_model_path: Option<std::path::PathBuf> = match voice_models.whisper.as_ref() {
+        None => {
+            if settings.active_whisper_model.is_empty() {
+                println!("  ⏭  STT: whisper skipped (no whisper model configured in Settings)");
             } else {
                 println!(
-                    "  ⚠  STT model '{}' not in catalog — cannot download",
+                    "  ⚠  STT: '{}' matches no catalog entry or file on disk — transcription disabled",
                     settings.active_whisper_model
                 );
             }
+            None
         }
-        Some(whisper_model)
-    };
-
-    // Optional legacy subprocess — only compiled in with the escape-valve feature.
-    #[allow(unused_mut, unused_assignments)]
-    let mut whisper_port = ports::WHISPER;
-    #[cfg(feature = "legacy-subprocess")]
-    let _whisper_guard = if let Some(ref whisper_model) = whisper_model_path {
-        if !model_download::whisper_binary_path(&data_dir).exists() {
-            println!("  📥 STT binary not found — downloading...");
-            if let Err(e) = model_download::download_whisper_binary(&data_dir).await {
-                println!("  ⚠  STT binary download failed: {}", e);
+        Some(w) => {
+            if !w.path.exists() {
+                println!("  📥 STT model not found — downloading...");
+                match w.download.as_ref() {
+                    Some(dl) => {
+                        if let Some(parent) = w.path.parent() {
+                            let _ = tokio::fs::create_dir_all(parent).await;
+                        }
+                        if let Err(e) =
+                            model_download::download_file(&dl.url, &w.path, dl.size_mb).await
+                        {
+                            println!("  ⚠  STT model download failed: {}", e);
+                        }
+                    }
+                    None => println!("  ⚠  STT model has no catalog download URL"),
+                }
             }
+            Some(w.path.clone())
         }
-        let (guard, port) = whisper_process::try_start(&data_dir, whisper_model).await;
-        whisper_port = port;
-        guard
-    } else {
-        None
     };
-    #[cfg(not(feature = "legacy-subprocess"))]
-    let _whisper_guard: Option<()> = None;
 
-    // Honour an explicit settings override; otherwise compose the loopback URL.
-    // Used by the (legacy) audio-transcribe / calibrate HTTP routes in pond-api.
+    // Transcription is in-process; this URL only reaches an external
+    // whisper.cpp if the user has pointed a setting at one deliberately.
     const DEFAULT_WHISPER_URL: &str = "http://127.0.0.1:9000";
-    let whisper_url = if !settings.voice_whisper_url.is_empty()
-        && settings.voice_whisper_url != DEFAULT_WHISPER_URL
-    {
-        settings.voice_whisper_url.clone()
+    let whisper_url = if settings.voice_whisper_url.is_empty() {
+        DEFAULT_WHISPER_URL.to_string()
     } else {
-        format!("http://127.0.0.1:{}", whisper_port)
+        settings.voice_whisper_url.clone()
     };
 
     // In-process whisper for the HTTP transcribe route — avoids the external
@@ -1142,11 +1081,8 @@ async fn run_server(
     // Piper voice path — None when no voice is configured (skips all piper startup).
     // When voice_tts_voice is empty the user has not yet picked a piper voice in Settings;
     // do not fall back to a hardcoded default.
-    let piper_model: Option<std::path::PathBuf> = if settings.voice_tts_voice.is_empty() {
-        None
-    } else {
-        Some(model_download::tts_models_dir(&data_dir).join(&settings.voice_tts_voice))
-    };
+    let piper_model: Option<std::path::PathBuf> =
+        voice_models.piper.as_ref().map(|v| v.onnx.clone());
 
     // Only download/install piper components when piper is the configured active TTS
     // AND a specific voice model has been chosen by the user.
@@ -1154,45 +1090,34 @@ async fn run_server(
     // In-process build (default): download the .onnx + .onnx.json voice model
     // and the espeak-ng-data directory. No `piper` binary needed any more —
     // piper-rs loads the ONNX model directly via ort.
-    //
-    // Legacy build (--features legacy-subprocess): additionally download the
-    // `piper` executable.
-    let piper_is_primary = settings.active_tts_model.starts_with("piper");
+    // Gate on whether a voice resolved. `active_tts_model.starts_with("piper")`
+    // is never true for a catalog name like `en-lessac-medium`, so this block —
+    // including `ensure_espeak_ng_data`, without which piper cannot phonemize —
+    // was skipped on every boot.
+    let piper_is_primary = voice_models.tts_is_piper();
     if piper_is_primary {
         if let Some(ref piper_model_path) = piper_model {
-            #[cfg(feature = "legacy-subprocess")]
-            {
-                if !model_download::piper_binary_path(&data_dir).exists() {
-                    println!("  📥 Piper binary not found — downloading...");
-                    let _ = model_download::download_piper_binary(&data_dir).await;
-                }
-            }
             if !piper_model_path.exists() {
-                // Look up the exact voice in the DB to get the correct download URL.
-                let voice_filename = &settings.voice_tts_voice;
-                let registry_entry = SqliteModelRepository::new(db.system.clone())
-                    .list_by_category(&ModelCategory::TtsPiper)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|m| m.filename.as_deref() == Some(voice_filename.as_str()))
-                    .and_then(|m| {
-                        let mf = m.filename?;
-                        let cf = m.config_filename?;
-                        let mu = m.url?;
-                        let cu = m.config_url?;
-                        Some((mf, cf, mu, cu, m.size_mb))
-                    });
-                if let Some((mf, cf, mu, cu, sz)) = registry_entry {
-                    let _ = model_download::download_piper_model_entry(
-                        &data_dir, &mf, &cf, &mu, &cu, sz,
-                    )
-                    .await;
-                } else {
-                    println!(
-                        "  ⚠  Piper voice '{}' not in model catalog — cannot download",
-                        voice_filename
-                    );
+                match voice_models
+                    .piper
+                    .as_ref()
+                    .and_then(|v| v.download.as_ref())
+                {
+                    Some(dl) => {
+                        let _ = model_download::download_piper_model_entry(
+                            &data_dir,
+                            &dl.onnx_filename,
+                            &dl.config_filename,
+                            &dl.onnx_url,
+                            &dl.config_url,
+                            dl.size_mb,
+                        )
+                        .await;
+                    }
+                    None => println!(
+                        "  ⚠  Piper voice '{}' has no catalog download — cannot fetch",
+                        settings.voice_tts_voice
+                    ),
                 }
             }
             model_download::ensure_espeak_ng_data(&data_dir).await;
@@ -1225,7 +1150,6 @@ async fn run_server(
     #[allow(unused_mut)]
     let mut piper_http_port: Option<u16> = None;
 
-    #[cfg(not(feature = "legacy-subprocess"))]
     let piper_tts: Option<Arc<dyn pond_core::models::ports::voice_output::VoiceOutput>> =
         match &piper_model {
             Some(model_path) if model_path.exists() => {
@@ -1280,33 +1204,6 @@ async fn run_server(
             _ => None,
         };
 
-    #[cfg(feature = "legacy-subprocess")]
-    let piper_tts: Option<Arc<dyn pond_core::models::ports::voice_output::VoiceOutput>> =
-        match (piper_process::find_binary(&data_dir), &piper_model) {
-            (Some(bin), Some(model_path)) if model_path.exists() => {
-                let ed = espeak_data.clone();
-                match piper_http::start(bin.clone(), model_path.clone(), ed).await {
-                    Ok(port) => {
-                        println!("  ✅ Piper TTS running on port {}", port);
-                        piper_http_port = Some(port);
-                        let mut out = PiperOutput::new(bin, model_path.clone());
-                        if let Some(d) = espeak_data.clone() {
-                            out = out.with_espeak_data(d);
-                        }
-                        Some(Arc::new(out))
-                    }
-                    Err(e) => {
-                        tracing::warn!("piper-http failed to start: {e}");
-                        let mut out = PiperOutput::new(bin, model_path.clone());
-                        if let Some(d) = espeak_data.clone() {
-                            out = out.with_espeak_data(d);
-                        }
-                        Some(Arc::new(out))
-                    }
-                }
-            }
-            _ => None,
-        };
     let tts: Option<Arc<dyn pond_core::models::ports::voice_output::VoiceOutput>> = match piper_tts
     {
         Some(piper) => {
@@ -2772,7 +2669,6 @@ async fn run_server(
         let mut events = event_bus.subscribe();
         tokio::spawn(async move {
             use futures::StreamExt;
-            use pond_core::security::ports::event_log::EventLog as _;
             while let Some(bus_event) = events.next().await {
                 if let Err(e) = event_log.append(bus_event.to_event()).await {
                     tracing::warn!(error = %e, "failed to persist bus event to event log");
@@ -3351,13 +3247,10 @@ async fn run_chat(
         };
     }
 
-    out!("  ╔═══════════════════════════════════════╗");
     out!(
-        "  ║   🦆  Goose-in-a-Pond  v{}       ║",
+        "\n  Goose in a Pond {} — voice\n",
         env!("CARGO_PKG_VERSION")
     );
-    out!("  ║   Wait → Listen → Think → Speak      ║");
-    out!("  ╚═══════════════════════════════════════╝");
 
     let data_dir = default_data_dir();
     // Must run before any ONNX-dependent init (Piper TTS). `serve` and `setup`
@@ -3376,6 +3269,13 @@ async fn run_chat(
     // Same for the vision MCP server's camera-event store handle (#130).
     pond_mcp_server::init_vision_deps(Arc::new(SqliteCameraStorage::new(db.logs.clone())));
 
+    // And the sensor store. `run_server` installs all three; this path
+    // installed only two, so every voice session logged
+    // "spawn_sensor_server called before init_sensor_deps" and then failed to
+    // load giap-sensors — the extension was simply missing from voice, with
+    // an error on the console saying so.
+    pond_mcp_server::init_sensor_deps(Arc::new(SqliteSensorStorage::new(db.logs.clone())));
+
     // Load settings and model registry early — drives provider, model, TTS, and wake word.
     // Falls back to Settings::default() when the DB has no rows yet (first run).
     let settings_repo_chat = SqliteSettingsRepository::new(db.system.clone());
@@ -3387,12 +3287,35 @@ async fn run_chat(
 
     let settings_model = settings.chat_model.clone();
     let effective_model: &str = model.unwrap_or(&settings_model);
-    // Resolve TTS engine from CLI flag or settings. Normalise piper-* variants to "piper".
+
+    // Apply the microphone privacy setting before anything can open a device.
+    pond_core::models::domain::mic_gate::set_mic_enabled(settings.mic_enabled);
+
+    // One resolution for both voice models, accepting every on-disk shape the
+    // settings fields have carried. See `voice_models` for why there are three.
+    let voice_models = voice_models::resolve_voice_models(
+        &settings,
+        &SqliteModelRepository::new(db.system.clone()),
+        &data_dir,
+    )
+    .await;
+
+    // Setup problems worth telling the UI about, held until after `ready`.
+    // The NDJSON contract guarantees `ready` is the FIRST line and the desktop
+    // keys session setup on it, so a diagnostic emitted during wiring would
+    // both break the contract and arrive before there is a session to attach
+    // it to. Flushed immediately after `ready` below.
+    let deferred_diagnostics: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+
+    // Resolve the TTS engine from the CLI flag, else from what actually
+    // resolved. The old test was `active_tts_model.starts_with("piper")`, which
+    // is never true for a catalog name like `en-lessac-medium` — so every
+    // install fell through to text-only and said nothing about it.
     let effective_tts_owned: String;
     let effective_tts: &str = match tts {
         Some(t) => t,
         None => {
-            effective_tts_owned = if settings.active_tts_model.starts_with("piper") {
+            effective_tts_owned = if voice_models.tts_is_piper() {
                 "piper".to_string()
             } else {
                 settings.active_tts_model.clone()
@@ -3400,84 +3323,50 @@ async fn run_chat(
             &effective_tts_owned
         }
     };
-    out!(
-        "  Provider: {} (model: {})",
-        effective_provider,
-        effective_model
-    );
 
     // Resolve the whisper ggml model path (used by both the in-process backend
     // and the legacy HTTP subprocess). When voice input is not requested we
     // still resolve the path to surface a clear download-needed message.
     let whisper_model_path: Option<std::path::PathBuf> = if input == "whisper" {
-        let whisper_model_name = settings.active_whisper_model.as_str();
-        let (whisper_filename, whisper_url, whisper_mb) =
-            SqliteModelRepository::new(db.system.clone())
-                .get_by_id(&format!("whisper/{}", whisper_model_name))
-                .await
-                .ok()
-                .flatten()
-                .map(|r| {
-                    (
-                        r.filename
-                            .unwrap_or_else(|| format!("ggml-{}.en.bin", whisper_model_name)),
-                        r.url.unwrap_or_default(),
-                        r.size_mb,
-                    )
-                })
-                .unwrap_or_else(|| {
-                    (
-                        format!("ggml-{}.en.bin", whisper_model_name),
-                        String::new(),
-                        0u64,
-                    )
-                });
-        let whisper_model = data_dir.join("models").join(&whisper_filename);
-        if !whisper_model.exists() {
-            out!(
-                "  📥 STT model not found — downloading ({})...",
-                whisper_model_name
-            );
-            if !whisper_url.is_empty() {
-                if let Some(parent) = whisper_model.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
+        match voice_models.whisper.as_ref() {
+            None => {
+                let name = settings.active_whisper_model.as_str();
+                let reason = if name.is_empty() {
+                    "no STT model configured in Settings".to_string()
+                } else {
+                    format!("STT model '{name}' does not match any catalog entry or file on disk")
+                };
+                out!("  Listen   unavailable — {reason}");
+                if json_events {
+                    deferred_diagnostics
+                        .borrow_mut()
+                        .push(format!("voice input unavailable: {reason}"));
                 }
-                match model_download::download_file(&whisper_url, &whisper_model, whisper_mb).await
-                {
-                    Ok(_) => {}
-                    Err(e) => out!("  ⚠  STT model download failed: {}", e),
+                None
+            }
+            Some(w) => {
+                if !w.path.exists() {
+                    out!("  Listen   speech model missing — downloading...");
+                    match w.download.as_ref() {
+                        Some(dl) => {
+                            if let Some(parent) = w.path.parent() {
+                                let _ = tokio::fs::create_dir_all(parent).await;
+                            }
+                            if let Err(e) =
+                                model_download::download_file(&dl.url, &w.path, dl.size_mb).await
+                            {
+                                out!("  Listen   speech model download failed: {}", e);
+                            }
+                        }
+                        None => out!("  Listen   speech model has no download URL"),
+                    }
                 }
-            } else {
-                out!(
-                    "  ⚠  STT model '{}' not in catalog — cannot download",
-                    whisper_model_name
-                );
+                Some(w.path.clone())
             }
         }
-        Some(whisper_model)
     } else {
         None
     };
-
-    // Optionally start the legacy whisper.cpp subprocess. Default build skips
-    // this entirely — `WhisperRsInput` handles inference in-process.
-    #[allow(unused_mut, unused_assignments)]
-    let mut whisper_port = ports::WHISPER;
-    #[cfg(feature = "legacy-subprocess")]
-    let _whisper_guard = if let Some(ref whisper_model) = whisper_model_path {
-        let (guard, port) = whisper_process::try_start(&data_dir, whisper_model).await;
-        whisper_port = port;
-        guard
-    } else {
-        None
-    };
-    #[cfg(not(feature = "legacy-subprocess"))]
-    let _whisper_guard: Option<()> = None;
-
-    // The URL is only meaningful when the legacy subprocess is running; the
-    // in-process backend ignores it. Kept here to populate AppState.whisper_url
-    // for the (legacy) audio-transcribe / calibrate HTTP routes.
-    let whisper_url = format!("http://127.0.0.1:{}", whisper_port);
 
     // ── Model catalog & ModelService (for autonomous downloading) ──────────────
     let chat_model_repo: Arc<dyn ModelRepository + Send + Sync> =
@@ -3722,19 +3611,10 @@ async fn run_chat(
                     ],
                 )
             }
-            None => {
-                out!(
-                    "  Assistant: {} / style: {} / user: {}",
-                    settings.assistant_name,
-                    settings.prompt_style,
-                    settings.user_name
-                );
-                build_system_prompt(&settings)
-            }
+            None => build_system_prompt(&settings),
         }
     };
 
-    let db_system = db.system.clone();
     let storage: Arc<dyn SessionStorage> = Arc::new(SqliteSessionStorage::new(db.system.clone()));
     // Create session if it doesn't exist; ignore duplicate-key errors from prior runs
     if let Err(e) = storage.create_session(session_id.clone()).await {
@@ -3805,7 +3685,7 @@ async fn run_chat(
                     .flatten()
                     .and_then(|r| r.hf_id)
                     .unwrap_or_else(|| effective_model.to_string());
-                out!("  Model:    {} (local GGUF in-process)", hf_model_id);
+                out!("  Model    {} (local)", hf_model_id);
                 let llm = Arc::new(
                     LocalInferenceLlmAdapter::new_with_data_dir(&hf_model_id, &data_dir).await?,
                 );
@@ -3866,10 +3746,10 @@ async fn run_chat(
                     // Surface it on stderr (eout!) AND as an NDJSON error event so
                     // the UI can tell voice input is unavailable before we degrade
                     // to stdin (which the shell holds open and never writes to).
-                    eout!("  WARN: In-process whisper load failed: {}", e);
-                    eout!("     Falling back to stdin input.");
-                    out!("  ⚠  In-process whisper load failed: {}", e);
-                    out!("     Falling back to stdin input.");
+                    eout!("  Listen   FAILED to load speech model: {}", e);
+                    eout!("           Falling back to typed input.");
+                    out!("  Listen   FAILED to load speech model: {}", e);
+                    out!("           Falling back to typed input.");
                     if json_events {
                         write_ndjson_line(
                             &pond_core::shared::domain::agent::WorkflowEvent::Error {
@@ -3886,7 +3766,7 @@ async fn run_chat(
                 // whisper requested but no usable model path (download failed or
                 // model not in catalog — already warned above via out!). Same
                 // deaf-session hazard under --json-events: surface it.
-                eout!("  WARN: whisper model unavailable — falling back to stdin input.");
+                eout!("  Listen   speech model unavailable — falling back to typed input.");
                 if json_events {
                     write_ndjson_line(&pond_core::shared::domain::agent::WorkflowEvent::Error {
                         message:
@@ -3903,11 +3783,19 @@ async fn run_chat(
 
     let voice: Arc<dyn VoiceInput> = match (input, &whisper_backend) {
         ("whisper", Some(backend)) => {
-            out!("  Input:    whisper (in-process via whisper.cpp)");
+            out!(
+                "  Listen   {}",
+                voice_models
+                    .whisper
+                    .as_ref()
+                    .and_then(|w| w.path.file_stem())
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "whisper".to_string())
+            );
             backend.clone() as Arc<dyn VoiceInput>
         }
         _ => {
-            out!("  Input:    stdin");
+            out!("  Listen   typed input (no speech model)");
             Arc::new(StdinInput::new())
         }
     };
@@ -3922,24 +3810,14 @@ async fn run_chat(
         let transcriptions = settings.voice_wake_word_transcriptions.clone();
 
         if transcriptions.is_empty() {
-            out!(
-                "  Wake word: \"{}\" (no calibration — using raw phrase)",
-                trigger
-            );
+            out!("  Wake     \"{}\"", trigger);
         } else {
             out!(
-                "  Wake word: \"{}\" ({} calibrated variants)",
+                "  Wake     \"{}\" ({} calibrated variants)",
                 trigger,
                 transcriptions.len()
             );
         }
-        out!(
-            "  Energy gate:   {:.3} RMS  |  cooldown: {}ms  |  VAD silence: {}ms",
-            settings.voice_kws_energy_threshold,
-            settings.voice_kws_cooldown_ms,
-            settings.voice_kws_post_trigger_silence_ms
-        );
-
         use pond_adapters_whisper::{KeywordDetectorConfig, WhisperBackend};
         let kws_config = KeywordDetectorConfig {
             energy_threshold: settings.voice_kws_energy_threshold,
@@ -3949,10 +3827,14 @@ async fn run_chat(
         };
 
         let detector = Arc::new(
-            WhisperKeywordDetector::new(backend as Arc<dyn WhisperBackend>, trigger)
+            WhisperKeywordDetector::new(backend.clone() as Arc<dyn WhisperBackend>, trigger)
                 .with_transcriptions(transcriptions)
                 .with_config(kws_config),
         );
+        // The detector captures audio from before it fired, so the wake word
+        // is inside the command clip. Hand the transcriber the detector's own
+        // resolved trigger list so it strips exactly what matched.
+        backend.set_wake_words(detector.triggers());
         chat_service = chat_service.with_wake_word_detector(detector);
     };
 
@@ -3975,63 +3857,64 @@ async fn run_chat(
     // still see the answer, so only the event differs.
     let tts_unavailable = |reason: &str| -> Arc<dyn VoiceOutput> {
         if json_events {
-            write_ndjson_line(&pond_core::shared::domain::agent::WorkflowEvent::Error {
-                message: format!("voice output unavailable: {reason}; response is text-only"),
-            });
+            deferred_diagnostics.borrow_mut().push(format!(
+                "voice output unavailable: {reason}; response is text-only"
+            ));
         }
         text_fallback()
     };
     let voice_out: Arc<dyn VoiceOutput> = match effective_tts {
         "piper" => {
-            // Resolve model path: CLI arg → settings → warn and fall back to text
-            let model_path_opt: Option<std::path::PathBuf> = if let Some(p) = tts_model {
-                Some(p)
-            } else if !settings.voice_tts_voice.is_empty() {
-                Some(model_download::tts_models_dir(&data_dir).join(&settings.voice_tts_voice))
-            } else {
-                out!("  ⚠  TTS: piper requested but no voice model configured in Settings.");
-                out!("     Set a piper voice in the web UI, then restart. Using text output.");
-                None
+            // CLI arg wins; otherwise take whatever actually resolved.
+            let resolved_voice = voice_models.piper.clone();
+            let model_path_opt: Option<std::path::PathBuf> = match (&tts_model, &resolved_voice) {
+                (Some(p), _) => Some(p.clone()),
+                (None, Some(v)) => Some(v.onnx.clone()),
+                (None, None) => {
+                    out!("  Speak    no voice installed — pick one in Settings, then restart.");
+                    None
+                }
             };
             match model_path_opt {
-                None => tts_unavailable("piper requested but no voice model configured"),
+                None => tts_unavailable("piper requested but no voice model resolved"),
                 Some(model_path) => {
                     // Piper requires both the .onnx weights AND the .onnx.json config.
                     // Check both — the JSON is often missing even when the onnx was
                     // downloaded in an earlier version that didn't fetch the config.
-                    let config_path =
-                        std::path::PathBuf::from(format!("{}.json", model_path.display()));
-                    if !model_path.exists() || !config_path.exists() {
+                    // Prefer the resolved pair's config path: the catalog names it,
+                    // and it is not always the `<onnx>.json` sibling.
+                    let config_path = resolved_voice
+                        .as_ref()
+                        .map(|v| v.config.clone())
+                        .unwrap_or_else(|| {
+                            std::path::PathBuf::from(format!("{}.json", model_path.display()))
+                        });
+                    let installed = resolved_voice
+                        .as_ref()
+                        .map(|v| v.is_installed())
+                        .unwrap_or_else(|| model_path.exists() && config_path.exists());
+                    if !installed {
                         if model_path.exists() {
-                            out!("  📥 TTS model config (.json) missing — downloading...");
+                            out!("  Speak    voice config missing — downloading...");
                         } else {
-                            out!("  📥 TTS model not found — downloading configured voice...");
+                            out!("  Speak    voice missing — downloading...");
                         }
-                        // Look up in DB by filename to get the correct download URL.
-                        let voice_filename = settings.voice_tts_voice.as_str();
-                        let registry_entry = SqliteModelRepository::new(db_system.clone())
-                            .list_by_category(&ModelCategory::TtsPiper)
-                            .await
-                            .unwrap_or_default()
-                            .into_iter()
-                            .find(|m| m.filename.as_deref() == Some(voice_filename))
-                            .and_then(|m| {
-                                let mf = m.filename?;
-                                let cf = m.config_filename?;
-                                let mu = m.url?;
-                                let cu = m.config_url?;
-                                Some((mf, cf, mu, cu, m.size_mb))
-                            });
-                        if let Some((mf, cf, mu, cu, sz)) = registry_entry {
-                            let _ = model_download::download_piper_model_entry(
-                                &data_dir, &mf, &cf, &mu, &cu, sz,
-                            )
-                            .await;
-                        } else {
-                            out!(
-                                "  ⚠  Piper voice '{}' not in model catalog — cannot download",
-                                voice_filename
-                            );
+                        match resolved_voice.as_ref().and_then(|v| v.download.as_ref()) {
+                            Some(dl) => {
+                                let _ = model_download::download_piper_model_entry(
+                                    &data_dir,
+                                    &dl.onnx_filename,
+                                    &dl.config_filename,
+                                    &dl.onnx_url,
+                                    &dl.config_url,
+                                    dl.size_mb,
+                                )
+                                .await;
+                            }
+                            None => out!(
+                                "  ⚠  Piper voice '{}' has no catalog download — cannot fetch",
+                                settings.voice_tts_voice
+                            ),
                         }
                     }
 
@@ -4048,10 +3931,9 @@ async fn run_chat(
 
                     // Default: in-process. Loads the .onnx + .onnx.json via
                     // piper-rs and synthesises with zero subprocess overhead.
-                    #[cfg(not(feature = "legacy-subprocess"))]
                     {
                         if !model_path.exists() || !config_path.exists() {
-                            out!("  TTS:      piper unavailable (model or config missing) — falling back to print");
+                            out!("  Speak    voice unavailable — printing replies instead");
                             tts_unavailable("piper model or config missing")
                         } else {
                             match PiperRsOutput::new(model_path.clone(), config_path) {
@@ -4061,9 +3943,9 @@ async fn run_chat(
                                         None => out,
                                     };
                                     out!(
-                                        "  TTS:      piper-rs ({})",
+                                        "  Speak    {}",
                                         model_path
-                                            .file_name()
+                                            .file_stem()
                                             .unwrap_or_default()
                                             .to_string_lossy()
                                     );
@@ -4071,7 +3953,7 @@ async fn run_chat(
                                 }
                                 Err(e) => {
                                     out!(
-                                        "  TTS:      piper unavailable (load failed: {}) — falling back to print",
+                                        "  Speak    voice failed to load ({}) — printing replies instead",
                                         e
                                     );
                                     tts_unavailable(&format!("piper load failed: {e}"))
@@ -4081,44 +3963,46 @@ async fn run_chat(
                     }
 
                     // Legacy: subprocess `piper` binary.
-                    #[cfg(feature = "legacy-subprocess")]
-                    {
-                        if piper_process::find_binary(&data_dir).is_none() {
-                            out!("  📥 TTS binary not found — downloading...");
-                            match model_download::download_piper_binary(&data_dir).await {
-                                Ok(_) => {}
-                                Err(e) => out!("  ⚠  TTS binary download failed: {}", e),
-                            }
-                        }
-                        match piper_process::find_binary(&data_dir) {
-                            Some(bin) => {
-                                out!(
-                                    "  TTS:      piper ({})",
-                                    model_path.file_name().unwrap_or_default().to_string_lossy()
-                                );
-                                let mut out = PiperOutput::new(bin, model_path);
-                                if let Some(d) = espeak_data_dir {
-                                    out = out.with_espeak_data(d);
-                                }
-                                Arc::new(out) as Arc<dyn VoiceOutput>
-                            }
-                            None => {
-                                out!("  TTS:      piper unavailable (binary not found) — falling back to print");
-                                tts_unavailable("piper binary not found")
-                            }
-                        }
-                    }
                 }
             }
         }
-        _ => {
-            // Text output was explicitly selected (effective_tts != "piper"); this
-            // is not a failure, so no error event — text-only is the intended mode.
-            out!("  TTS:      print");
+        // `--tts none` is a documented choice, not a failure. Stay quiet.
+        "none" => {
+            out!("  Speak    off (--tts none) — replies are printed");
             text_fallback()
+        }
+        other => {
+            // Reached whenever no piper voice resolved. The old code treated
+            // this as a deliberate text-only choice and stayed quiet — but the
+            // desktop never chooses, it just spawns the child, so this arm was
+            // the whole "voice mode is silent and says nothing" symptom.
+            // Report it; silence must never be indistinguishable from success.
+            out!("  Speak    off — replies are printed");
+            // Name the setting that is actually wrong. `other` is
+            // `active_tts_model`, but the voice is chosen by `voice_tts_voice`,
+            // so reporting on `other` alone told a user who had set a voice
+            // that they had not configured one.
+            let configured_voice = settings.voice_tts_voice.trim();
+            let reason = if !configured_voice.is_empty() {
+                format!("voice '{configured_voice}' is not installed and matches no catalog entry")
+            } else if !other.is_empty() {
+                format!("TTS '{other}' did not resolve to an installed piper voice")
+            } else {
+                "no TTS voice configured".to_string()
+            };
+            tts_unavailable(&reason)
         }
     };
     chat_service = chat_service.with_voice_output(voice_out);
+
+    // The console is deliberately near-silent from here on (tracing is pinned
+    // to WARN for it), so point at the file that is not — every detail of the
+    // session lands there and it is the first thing to ask for when something
+    // goes wrong.
+    out!(
+        "  Log      {}",
+        data_dir.join("logs").join("pond.log").display()
+    );
 
     // ── Emit `ready` (contract) ────────────────────────────────────────────────
     // All models are loaded and every adapter is wired; announce readiness
@@ -4130,6 +4014,13 @@ async fn run_chat(
         write_ndjson_line(&WorkflowEvent::Ready {
             session_id: session_id.clone(),
         });
+
+        // Setup diagnostics, now that there is a session to attach them to.
+        for message in deferred_diagnostics.borrow().iter() {
+            write_ndjson_line(&WorkflowEvent::Error {
+                message: message.clone(),
+            });
+        }
 
         if let Err(e) = chat_service.run_loop().await {
             write_ndjson_line(&WorkflowEvent::Error {
@@ -4713,20 +4604,23 @@ fn ensure_onnx_runtime() {
          v{ORT_VERSION}/{archive_stem}.tgz"
     );
 
-    println!(
-        "  ⬇  ONNX Runtime v{ORT_VERSION} not found — downloading (~{ORT_APPROX_SIZE_MB} MB)..."
-    );
+    // stderr, not stdout: `chat --json-events` gives stdout to the NDJSON
+    // contract, and a download banner there corrupts the stream the desktop
+    // parses. model_download sends its progress to stderr for the same reason.
+    eprintln!("  Setup    downloading ONNX Runtime v{ORT_VERSION} (~{ORT_APPROX_SIZE_MB} MB), one time...");
 
     match download_and_extract_ort(&url, &lib_dir, &archive_stem) {
         Ok(lib_path) => {
-            println!("  ✅ ONNX Runtime installed to {}", lib_path.display());
+            eprintln!("  Setup    ONNX Runtime ready");
+            tracing::info!("ONNX Runtime installed to {}", lib_path.display());
             // SAFETY: single-threaded setup, before any worker spawns.
             unsafe { std::env::set_var("ORT_DYLIB_PATH", &lib_path) };
         }
         Err(e) => {
-            eprintln!("  ⚠  Failed to download ONNX Runtime: {e}");
-            eprintln!("     Embedding models and face recognition will be unavailable.");
-            eprintln!("     Install manually: brew install onnxruntime");
+            eprintln!("  Setup    FAILED to download ONNX Runtime: {e}");
+            eprintln!(
+                "           Voice output needs it. Install manually: brew install onnxruntime"
+            );
         }
     }
 }

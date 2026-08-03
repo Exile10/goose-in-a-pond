@@ -31,6 +31,18 @@ pub trait VoiceOutput: Send + Sync {
         Ok(())
     }
 
+    /// Mark the start of one turn's speech, clearing any prior interrupt.
+    ///
+    /// Interrupt state belongs to the TURN, not to an individual utterance.
+    /// `speak()` and `play_audio()` used to clear it on entry, so a barge-in
+    /// that fired during sentence one was forgotten by sentence two and the
+    /// rest of the reply played on regardless — the user had to interrupt
+    /// once per sentence and it still never stopped.
+    ///
+    /// Call once, before the first `speak()`/`play_audio()` of a turn.
+    /// Idempotent. Default is a no-op (PrintOutput / tests).
+    fn begin_utterance(&self) {}
+
     /// Immediately stop any in-progress speech playback.
     ///
     /// Called when the user interrupts with the wake word during TTS output.
@@ -44,25 +56,4 @@ pub trait VoiceOutput: Send + Sync {
 
     /// Stop the thinking tone. Idempotent — safe to call when no tone is playing.
     fn stop_thinking_tone(&self) {}
-
-    /// Start monitoring microphone input for speech energy during TTS playback.
-    ///
-    /// When the listener detects speech (RMS above a threshold), it sets the
-    /// internal interrupt flag — the same flag checked by `play_audio()` and
-    /// `speak()` — causing TTS to stop immediately (barge-in).
-    ///
-    /// Call `stop_barge_in_listener()` after TTS finishes to release the mic.
-    /// Default implementation is a no-op (for PrintOutput / tests).
-    fn start_barge_in_listener(&self) {}
-
-    /// Stop the speech-energy barge-in listener and release the microphone.
-    /// Idempotent — safe to call when no listener is active.
-    fn stop_barge_in_listener(&self) {}
-
-    /// Speak a short reassurance quip (e.g. "Let me think.") to fill silence
-    /// while the LLM is starting inference. Returns the quip text that was spoken.
-    /// Default implementation is a no-op that returns None (PrintOutput / tests).
-    async fn speak_quip(&self) -> Option<&'static str> {
-        None
-    }
 }

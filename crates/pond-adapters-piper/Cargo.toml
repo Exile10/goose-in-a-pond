@@ -6,9 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 # ── Build note ────────────────────────────────────────────────────────────────
-# Default build is in-process `piper-rs` (ONNX Runtime + espeak-ng phonemizer).
-# Subprocess fallback:
-#   cargo build -p pond-adapters-piper --features legacy-subprocess
+# In-process `piper-rs` (ONNX Runtime + espeak-ng phonemizer) is the only path.
 # CUDA on Jetson: piper-rs uses `ort` under the hood. ONNX Runtime CUDA EP is
 # loaded dynamically at runtime when JetPack's libonnxruntime.so is on
 # LD_LIBRARY_PATH. No cargo feature is wired here — the runtime EP probes the
@@ -16,11 +14,11 @@ license.workspace = true
 
 [features]
 default = []
-# Keep the old `Command::new(piper)` subprocess path compilable. Default builds
-# omit it and drop the `synthesize_blocking` / `speak_blocking` code paths.
-legacy-subprocess = []
+# `legacy-subprocess` (the `Command::new(piper)` path) was removed in 2026-08.
+# Synthesis is in-process via piper-rs only.
 
 [dependencies]
+pond-voice = { path = "../pond-voice" }
 pond-core   = { workspace = true }
 anyhow      = { workspace = true }
 async-trait = { workspace = true }
@@ -29,8 +27,6 @@ tracing     = { workspace = true }
 # rodio is isolated here — not added to workspace deps to avoid pulling
 # audio playback into every crate.
 rodio = "0.19"
-# cpal for microphone input monitoring (barge-in speech energy detection).
-cpal = "0.15"
 # In-process Piper TTS. Wraps ort (ONNX Runtime) + espeak-rs for phonemization.
 # Pinned at =0.2.0: requires `ort = "=2.0.0-rc.12"`. The workspace unifies on
 # rc.12 — `fastembed = "=5.16.0"` (pond-infra) and `pond-adapters-face-onnx`

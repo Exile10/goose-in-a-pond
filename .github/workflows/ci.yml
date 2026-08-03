@@ -77,6 +77,8 @@ jobs:
       - name: cargo clippy (fast crates)
         run: |
           cargo clippy \
+            -p pond-voice \
+            -p pond-audio \
             -p pond-core \
             -p pond-infra \
             -p pond-infra-scheduler \
@@ -96,6 +98,8 @@ jobs:
       - name: cargo test (fast crates)
         run: |
           cargo test \
+            -p pond-voice \
+            -p pond-audio \
             -p pond-core \
             -p pond-infra \
             -p pond-infra-scheduler \

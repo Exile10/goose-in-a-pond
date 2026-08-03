@@ -17,6 +17,12 @@ const PAIRED_TAGS: &[(&str, &str)] = &[
     ("<|channel>thought", "<channel|>"),
     ("<|tool_call>", "<tool_call|>"),
     ("<think>", "</think>"),
+    // `<thinking>` is a DISTINCT literal, not a prefix match for `<think>` —
+    // the closing `>` makes them disjoint, so order here does not matter.
+    // goose's own ThinkFilter handles both spellings; this one handled only
+    // `<think>`, so a model using the longer form had its entire reasoning
+    // spoken aloud in voice mode.
+    ("<thinking>", "</thinking>"),
     ("<thought>", "</thought>"),
 ];
 
@@ -26,6 +32,7 @@ const STANDALONE_SENTINELS: &[&str] = &[
     "<|eos|>",
     "<end_of_turn>",
     "</think>",
+    "</thinking>",
     "</thought>",
 ];
 
@@ -217,5 +224,44 @@ mod tests {
         let chunks: Vec<String> = raw.chars().map(|c| c.to_string()).collect();
         let refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
         assert_eq!(run(&refs), "Hello!");
+    }
+
+    /// Voice regression: reasoning read aloud.
+    ///
+    /// The engine-side filter is a PASS-THROUGH when thinking is disabled
+    /// (`ThinkingOutputFilter::push_text` returns the text untouched), and
+    /// voice mode disables thinking. Disabling it does not stop the model
+    /// reasoning — it only stops the engine stripping it — so the tags reach
+    /// this filter, which is the last thing standing between them and TTS.
+    #[test]
+    fn every_thinking_spelling_is_stripped_before_speech() {
+        for (open, close) in [
+            ("<think>", "</think>"),
+            ("<thinking>", "</thinking>"),
+            ("<thought>", "</thought>"),
+        ] {
+            let raw = format!("{open}step by step{close}The answer is 7.");
+            assert_eq!(
+                run(&[&raw]),
+                "The answer is 7.",
+                "{open} leaked into speech"
+            );
+        }
+    }
+
+    /// The tags are disjoint literals, so a longer spelling must not leave a
+    /// fragment behind from the shorter one matching its prefix.
+    #[test]
+    fn the_longer_spelling_leaves_no_fragment() {
+        let out = run(&["<thinking>hmm</thinking>Hi."]);
+        assert!(!out.contains("ing>"), "fragment left behind: {out:?}");
+        assert!(!out.contains('<'), "tag residue: {out:?}");
+        assert_eq!(out, "Hi.");
+    }
+
+    /// Split across chunk boundaries, as a token stream actually arrives.
+    #[test]
+    fn the_longer_spelling_survives_chunk_boundaries() {
+        assert_eq!(run(&["<think", "ing>hmm</think", "ing>Done."]), "Done.");
     }
 }

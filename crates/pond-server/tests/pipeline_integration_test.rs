@@ -19,8 +19,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use pond_adapters_ollama::OllamaProvider;
-#[cfg(feature = "legacy-subprocess")]
-use pond_adapters_whisper::WhisperInput;
 use pond_core::models::domain::message::Role;
 use pond_core::models::ports::voice_input::VoiceInput;
 use pond_core::models::ports::voice_output::VoiceOutput;
@@ -91,19 +89,6 @@ fn ollama_response(content: &str) -> serde_json::Value {
 
 // Only the `legacy-subprocess`-gated voice pipeline test builds a service via
 // this helper; gate it too so the default build has no dead-code warning.
-#[cfg(feature = "legacy-subprocess")]
-async fn make_chat_service(ollama_uri: &str, voice_out: Arc<CapturingVoiceOutput>) -> ChatService {
-    let agent = Arc::new(MockAgent::new());
-    let storage = Arc::new(InMemorySessionStorage::new());
-    let session_id = "test-session".to_string();
-    storage.create_session(session_id.clone()).await.unwrap();
-
-    let provider = Arc::new(OllamaProvider::new(Some(ollama_uri), Some("llama3.2")));
-
-    ChatService::new(agent, session_id, storage)
-        .with_provider(provider)
-        .with_voice_output(voice_out)
-}
 
 // ── Text mode pipeline ────────────────────────────────────────────────────────
 
@@ -223,54 +208,6 @@ async fn multi_turn_history_preserved_across_chat_once_calls() {
 ///
 /// Gated on `legacy-subprocess` because the test exercises the HTTP backend.
 /// The in-process backend has its own coverage in `pond-adapters-whisper`.
-#[cfg(feature = "legacy-subprocess")]
-#[tokio::test]
-async fn voice_mode_whisper_to_ollama_pipeline() {
-    // ── Mock whisper.cpp ──
-    let whisper_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/inference"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "text": " Ask not what your country can do for you"
-        })))
-        .mount(&whisper_server)
-        .await;
-
-    // ── Mock Ollama ──
-    let ollama_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/api/chat"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(ollama_response("A famous JFK quote.")),
-        )
-        .mount(&ollama_server)
-        .await;
-
-    // ── Transcribe the JFK WAV fixture through the mocked Whisper server ──
-    let whisper = WhisperInput::new(Some(&whisper_server.uri()));
-    let jfk_wav = load_jfk_wav();
-    let transcript = whisper
-        .transcribe_wav(jfk_wav)
-        .await
-        .expect("whisper transcription failed")
-        .expect("expected non-empty transcript");
-
-    assert!(
-        transcript.to_lowercase().contains("ask not"),
-        "transcript should contain JFK quote; got: {}",
-        transcript
-    );
-
-    // ── Feed the transcript to ChatService with mocked Ollama ──
-    let output = Arc::new(CapturingVoiceOutput::default());
-    let svc = make_chat_service(&ollama_server.uri(), output.clone()).await;
-    let reply = svc.chat_once(transcript).await.unwrap();
-
-    // chat_once() returns the LLM response directly; speak() is only called
-    // from run_loop(). We verify the transcript reached Ollama and the
-    // correct response came back.
-    assert_eq!(reply, "A famous JFK quote.");
-}
 
 /// Verify correct role assignment across all pipeline steps:
 /// user messages must be Role::User and LLM responses Role::Assistant.
@@ -313,60 +250,4 @@ async fn pipeline_message_roles_are_correct() {
     );
 }
 
-// ── Live full-loop smoke test ─────────────────────────────────────────────────
-
-/// Run with:
-///   `cargo test -p pond-server --test pipeline_integration_test -- --ignored live_full_voice_loop`
-///
-/// Requires:
-///   - A microphone
-///   - whisper.cpp server on port 9000 (`./server -m models/ggml-base.en.bin --port 9000`)
-///   - Ollama on port 11434 with llama3.2 pulled (`ollama pull llama3.2`)
-///   - piper binary at `/data/bin/piper` with en_US-lessac-medium model
-///
-/// The test runs a single chat turn: you speak a sentence, it gets transcribed
-/// by Whisper, answered by Ollama, and spoken back via Piper.
-#[cfg(feature = "legacy-subprocess")]
-#[tokio::test]
-#[ignore = "requires microphone, whisper.cpp, Ollama, and piper — full hardware stack"]
-async fn live_full_voice_loop() {
-    use pond_adapters_piper::PiperOutput;
-    use pond_core::models::services::instant_activation::InstantActivation;
-    use std::path::PathBuf;
-
-    let agent = Arc::new(MockAgent::new());
-    let storage = Arc::new(InMemorySessionStorage::new());
-    let session_id = "live-voice-test".to_string();
-    storage.create_session(session_id.clone()).await.unwrap();
-
-    let provider = Arc::new(OllamaProvider::new(None, Some("llama3.2")));
-    let whisper = Arc::new(WhisperInput::new(None)); // http://127.0.0.1:9000
-    let piper = Arc::new(PiperOutput::new(
-        PathBuf::from("/data/bin/piper"),
-        PathBuf::from("/data/models/tts/en_US-lessac-medium.onnx"),
-    ));
-
-    let svc = ChatService::new(agent, session_id, storage)
-        .with_provider(provider)
-        .with_voice_input(whisper)
-        .with_voice_output(piper)
-        .with_wake_word_detector(Arc::new(InstantActivation));
-
-    // Single-turn: listen once, think, speak back.
-    // The test just verifies the pipeline doesn't error out.
-    println!("Say something...");
-    // Use run_loop only in an external script; here we do one chat_once call
-    // after manually recording isn't feasible in a test.  Instead we confirm
-    // the service can be constructed with all real adapters.
-    let _ = svc; // constructed successfully
-}
-
 // ── Fixture ───────────────────────────────────────────────────────────────────
-
-#[cfg(feature = "legacy-subprocess")]
-fn load_jfk_wav() -> Vec<u8> {
-    let wav_path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/blobs/jfk.wav");
-    std::fs::read(&wav_path)
-        .expect("tests/blobs/jfk.wav not found — run `cargo test` from workspace root")
-}

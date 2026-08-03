@@ -57,6 +57,8 @@
       <sourceFolder url="file://$MODULE_DIR$/goose/crates/goose-sdk-types/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-matter/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-mcp-server/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-voice/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-audio/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/goose/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/crates/pond-mcp-server/target" />
