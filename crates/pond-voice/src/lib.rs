@@ -9,6 +9,7 @@
 //! See `docs/` and the module docs for what moved and from where.
 
 pub mod barge;
+pub mod control;
 pub mod dsp;
 pub mod text;
 pub mod turn;

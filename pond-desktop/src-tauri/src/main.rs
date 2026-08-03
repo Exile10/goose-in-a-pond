@@ -10,7 +10,6 @@ mod notifications;
 mod process;
 mod thought_filter;
 mod tray;
-mod tts_text;
 
 use audio::{AudioState, WakeListenerState};
 use chat_process::VoiceChatProcess;
