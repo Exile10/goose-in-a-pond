@@ -3,6 +3,8 @@
 //! These services govern how much conversation history fits into the model's
 //! context window and how it is shaped before each turn:
 //!
+//! - [`context_governor`] — resolves how big the active model's context window
+//!   actually is, and where that number came from.
 //! - [`context_budget`] — computes the token budget available for history,
 //!   memories, and tool declarations given the active model's context size.
 //! - [`context_compactor`] — summarises or drops older turns when the budget
@@ -16,6 +18,7 @@
 pub mod compact_encoding;
 pub mod context_budget;
 pub mod context_compactor;
+pub mod context_governor;
 pub mod context_monitor;
 pub mod image_history;
 pub mod turn_budget;
