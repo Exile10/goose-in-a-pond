@@ -31,7 +31,7 @@ use piper_rs::Piper;
 use pond_core::models::ports::voice_output::VoiceOutput;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
@@ -61,7 +61,12 @@ pub struct PiperRsOutput {
     /// recent value so callers and tests can read it cheaply.
     last_sample_rate: Mutex<Option<u32>>,
     /// Thinking-tone stop flag — shared with the background tone thread.
-    thinking_active: Arc<AtomicBool>,
+    /// Which turn the working tone belongs to, or [`TONE_OFF`].
+    thinking_for: Arc<AtomicU64>,
+    /// Monotonic turn counter. Advanced by `begin_utterance`, and the only
+    /// thing that lets audio already in flight recognise that it belongs to a
+    /// turn the user has moved on from.
+    utterance: Arc<AtomicU64>,
     /// Speech interrupt flag — set true to immediately stop TTS playback.
     /// Checked by `play_wav_on_handle()` every 50 ms during playback.
     speech_interrupted: Arc<AtomicBool>,
@@ -102,7 +107,9 @@ impl PiperRsOutput {
             model_path: RwLock::new(model_path),
             config_path: RwLock::new(config_path),
             last_sample_rate: Mutex::new(None),
-            thinking_active: Arc::new(AtomicBool::new(false)),
+            thinking_for: Arc::new(AtomicU64::new(crate::TONE_OFF)),
+            // Generations start at 1 so TONE_OFF (0) is never a real turn.
+            utterance: Arc::new(AtomicU64::new(1)),
             speech_interrupted: Arc::new(AtomicBool::new(false)),
             _audio_keeper: audio_keeper,
             audio_handle,
@@ -223,17 +230,32 @@ impl PiperRsOutput {
 #[async_trait]
 impl VoiceOutput for PiperRsOutput {
     fn start_thinking_tone(&self) {
-        start_thinking_tone_thread(self.thinking_active.clone());
+        let mine = self.utterance.load(Ordering::SeqCst);
+        // Already sounding for this turn: the turn asked twice, which is
+        // allowed and must not stack a second thread.
+        if self.thinking_for.swap(mine, Ordering::SeqCst) == mine {
+            return;
+        }
+        start_thinking_tone_thread(self.thinking_for.clone(), mine);
     }
 
     fn stop_thinking_tone(&self) {
-        self.thinking_active.store(false, Ordering::SeqCst);
+        self.thinking_for.store(crate::TONE_OFF, Ordering::SeqCst);
     }
 
     fn begin_utterance(&self) {
         // The one place a turn's interrupt state is cleared. See the port doc:
         // clearing it inside speak()/play_audio() made a barge-in last exactly
         // one sentence.
+        //
+        // Advancing the generation FIRST is what makes that clear safe. Two
+        // turns can be alive at once (a speculative job fired on a provisional
+        // transcript, plus the confirmed one), and cancelling the first is done
+        // by setting the interrupt flag — which this call then wipes. Without
+        // the generation, starting a turn un-cancelled its predecessor and both
+        // spoke. Audio already in flight compares against the generation it
+        // started under, so it stays cancelled.
+        self.utterance.fetch_add(1, Ordering::SeqCst);
         self.speech_interrupted.store(false, Ordering::SeqCst);
     }
 
@@ -275,22 +297,27 @@ impl VoiceOutput for PiperRsOutput {
             let part2 = pcm_to_wav(&pcm[offset..], sample_rate);
 
             let flag = self.speech_interrupted.clone();
+            let gen = self.utterance.clone();
             let handle = self.audio_handle.clone();
-            tokio::task::spawn_blocking(move || play_wav_on_handle(part1, &handle, &flag))
+            tokio::task::spawn_blocking(move || play_wav_on_handle(part1, &handle, &flag, &gen))
                 .await
                 .context("playback task panicked")??;
 
             if !self.speech_interrupted.load(Ordering::Relaxed) {
                 let flag = self.speech_interrupted.clone();
+                let gen = self.utterance.clone();
                 let handle = self.audio_handle.clone();
-                tokio::task::spawn_blocking(move || play_wav_on_handle(part2, &handle, &flag))
-                    .await
-                    .context("playback task panicked")??;
+                tokio::task::spawn_blocking(move || {
+                    play_wav_on_handle(part2, &handle, &flag, &gen)
+                })
+                .await
+                .context("playback task panicked")??;
             }
         } else {
             let flag = self.speech_interrupted.clone();
+            let gen = self.utterance.clone();
             let handle = self.audio_handle.clone();
-            tokio::task::spawn_blocking(move || play_wav_on_handle(wav, &handle, &flag))
+            tokio::task::spawn_blocking(move || play_wav_on_handle(wav, &handle, &flag, &gen))
                 .await
                 .context("playback task panicked")??;
         }
@@ -310,8 +337,9 @@ impl VoiceOutput for PiperRsOutput {
     async fn play_audio(&self, audio: Vec<u8>) -> Result<()> {
         // No interrupt reset here — see begin_utterance().
         let flag = self.speech_interrupted.clone();
+        let gen = self.utterance.clone();
         let handle = self.audio_handle.clone();
-        tokio::task::spawn_blocking(move || play_wav_on_handle(audio, &handle, &flag))
+        tokio::task::spawn_blocking(move || play_wav_on_handle(audio, &handle, &flag, &gen))
             .await
             .context("playback task panicked")?
     }

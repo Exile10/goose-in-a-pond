@@ -293,6 +293,22 @@ fn install_whisper_logging() {
     ONCE.call_once(whisper_rs::install_logging_hooks);
 }
 
+/// Remove a leading wake word from a command transcript.
+///
+/// Free-standing so the speculative worker thread and the ordinary path can
+/// share it without either needing a `&self`. Both must apply it, or the two
+/// transcripts they produce for the same audio will not compare equal.
+fn strip_wake_words(transcript: String, wake_words: &[String]) -> String {
+    if wake_words.is_empty() || transcript.is_empty() {
+        return transcript;
+    }
+    let stripped = pond_voice::text::strip_leading_wake_word(&transcript, wake_words);
+    if stripped != transcript {
+        tracing::debug!("ASR: wake word removed, command is {:?}", stripped);
+    }
+    stripped
+}
+
 /// Load a whisper.cpp context with platform-appropriate GPU settings.
 fn load_context(model_path: &Path) -> Result<WhisperContext> {
     install_whisper_logging();
@@ -470,6 +486,7 @@ impl WhisperRsInput {
         // done — cutting whisper's inference time out of time-to-first-token
         // instead of paying for it serially afterward (Q2-26).
         let ctx_for_speculative = ctx_arc.clone();
+        let spec_wake_words = self.wake_words_snapshot();
         let capture_result = tokio::task::spawn_blocking(move || -> Result<SpeechCapture> {
             if let Some(wav) = captured {
                 let (captured_samples, _captured_rate) = decode_wav_mono_f32(&wav)?;
@@ -487,9 +504,20 @@ impl WhisperRsInput {
             } else {
                 let speculative_spawn: Box<SpeculativeSpawn> = Box::new(move |samples, rate| {
                     let ctx = ctx_for_speculative.clone();
+                    let wake_words = spec_wake_words.clone();
                     std::thread::spawn(move || -> Result<String> {
                         let resampled = resample_to_16k(&samples, rate);
-                        Self::transcribe_samples(ctx, resampled)
+                        let transcript = Self::transcribe_samples(ctx, resampled)?;
+                        // Strip HERE, not at the call site. This transcript is
+                        // published twice — once as the speculative signal that
+                        // fires the LLM early, and again as the confirmed
+                        // transcript — and the caller only reuses that early
+                        // work if the two are byte-identical. Stripping one and
+                        // not the other made them differ on any turn containing
+                        // the wake word, so the speculative turn was always
+                        // discarded, and its half-spoken reply overlapped the
+                        // real one.
+                        Ok(strip_wake_words(transcript, &wake_words))
                     })
                 });
                 let (samples, sample_rate, speculative_transcript) = record_mono_f32_vad(
@@ -516,7 +544,9 @@ impl WhisperRsInput {
 
         let samples_result = match capture_result {
             SpeechCapture::Empty => return Ok(Some(String::new())),
-            SpeechCapture::Transcript(t) => return Ok(Some(self.without_wake_word(t))),
+            // Already stripped inside the speculative thread, so that the
+            // signal the caller acted on and this value cannot disagree.
+            SpeechCapture::Transcript(t) => return Ok(Some(t)),
             SpeechCapture::Samples(s) => s,
         };
 
@@ -537,15 +567,15 @@ impl WhisperRsInput {
     /// A no-op when no wake words are configured, or on a conversational
     /// follow-up turn, which never contains one.
     fn without_wake_word(&self, transcript: String) -> String {
-        let wake_words = self.wake_words.read().unwrap_or_else(|e| e.into_inner());
-        if wake_words.is_empty() || transcript.is_empty() {
-            return transcript;
-        }
-        let stripped = pond_voice::text::strip_leading_wake_word(&transcript, &wake_words);
-        if stripped != transcript {
-            tracing::debug!("ASR: wake word removed, command is {:?}", stripped);
-        }
-        stripped
+        strip_wake_words(transcript, &self.wake_words_snapshot())
+    }
+
+    /// A copy of the wake-word list, for handing to a worker thread.
+    fn wake_words_snapshot(&self) -> Vec<String> {
+        self.wake_words
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -586,6 +616,49 @@ impl WhisperBackend for WhisperRsInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The speculative job fires the LLM on a provisional transcript, and the
+    /// caller only reuses that work if the confirmed transcript is
+    /// byte-identical. Any transform applied to one and not the other breaks
+    /// the comparison silently: the speculative turn is discarded, a second
+    /// turn runs, and the user hears the tail of the first reply underneath
+    /// the second.
+    ///
+    /// Stripping the wake word is such a transform, so it lives in one shared
+    /// function that both paths call.
+    #[test]
+    fn both_transcripts_for_one_clip_get_identical_wake_word_treatment() {
+        let wake = vec!["goose".to_string()];
+        let heard = "Goose, turn the kitchen lights on.".to_string();
+
+        let speculative = strip_wake_words(heard.clone(), &wake);
+        let confirmed = strip_wake_words(heard, &wake);
+
+        assert_eq!(
+            speculative, confirmed,
+            "the reuse gate compares these directly"
+        );
+        assert_eq!(speculative, "turn the kitchen lights on.");
+    }
+
+    /// Applying the strip twice must not eat a second wake word, in case a
+    /// future path double-applies it.
+    #[test]
+    fn stripping_an_already_stripped_transcript_changes_nothing() {
+        let wake = vec!["goose".to_string()];
+        let once = strip_wake_words("goose, ask the goose".to_string(), &wake);
+        let twice = strip_wake_words(once.clone(), &wake);
+        assert_eq!(once, "ask the goose");
+        assert_eq!(twice, once, "a second pass must be a no-op");
+    }
+
+    /// With no wake words configured the transcript is untouched, byte for
+    /// byte — this is the conversational follow-up and the phone upload.
+    #[test]
+    fn no_configured_wake_words_leaves_the_transcript_alone() {
+        let heard = "What's the weather?".to_string();
+        assert_eq!(strip_wake_words(heard.clone(), &[]), heard);
+    }
 
     #[test]
     fn new_returns_err_on_missing_model() {
@@ -887,7 +960,7 @@ mod decode_profiles {
         };
         // Near-silence with a little noise is what provokes them.
         let noise: Vec<f32> = (0..16_000 * 3)
-            .map(|i| ((i as f32 * 0.7).sin() * 0.001))
+            .map(|i| (i as f32 * 0.7).sin() * 0.001)
             .collect();
         let out = WhisperRsInput::transcribe_samples_with(ctx, noise, TranscribeOpts::accurate())
             .expect("decode");

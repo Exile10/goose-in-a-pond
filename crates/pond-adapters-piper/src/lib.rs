@@ -17,7 +17,7 @@
 //! - `start_thinking_tone_thread` — the soft working tone
 
 use anyhow::{Context, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod in_process;
@@ -67,35 +67,53 @@ fn working_tone_cycle() -> Vec<f32> {
     out
 }
 
-/// Spawn the background working-tone thread.
+/// `thinking_for` value meaning "no tone should be playing".
 ///
-/// The `active` flag is shared with the thread and cleared by
-/// `stop_thinking_tone` to break the loop. Polled every 50 ms so the tone
-/// stops promptly when the first sentence of the answer is ready — a tone
-/// that outlives the wait is worse than no tone.
-pub(crate) fn start_thinking_tone_thread(active: Arc<AtomicBool>) {
-    // If already playing, don't spawn a second thread.
-    if active.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let flag = active;
+/// Generations start at 1, so zero can never collide with a real turn.
+pub(crate) const TONE_OFF: u64 = 0;
+
+/// Spawn the background working-tone thread for turn `mine`.
+///
+/// `thinking_for` names the turn the tone belongs to. The thread exits as soon
+/// as it stops being that turn — because it was stopped ([`TONE_OFF`]) or
+/// because a newer turn took over. Polled every 50 ms, so the tone ends
+/// promptly when the first sentence of the answer is ready; a tone that
+/// outlives its wait is worse than no tone.
+///
+/// This replaces a plain "is a tone playing" bool. Two turns can be alive at
+/// once — the speculative job fired on a provisional transcript, and the
+/// confirmed one — and against a bool their start/stop calls interleaved into
+/// a state that belonged to neither: a turn ending could silence the tone of
+/// the turn that had just started, and a turn starting inside the old thread's
+/// poll window could revive a thread that had already been told to stop,
+/// leaving a tone playing with no turn behind it. A generation is owned by
+/// exactly one turn, so neither is expressible.
+pub(crate) fn start_thinking_tone_thread(thinking_for: Arc<AtomicU64>, mine: u64) {
     std::thread::spawn(move || {
         use rodio::{OutputStream, Sink};
 
+        // Clear the claim on the way out of a failed start, but only if it is
+        // still ours — a newer turn may already have claimed it.
+        let release = |thinking_for: &AtomicU64| {
+            let _ =
+                thinking_for.compare_exchange(mine, TONE_OFF, Ordering::SeqCst, Ordering::SeqCst);
+        };
+
         let Ok((_stream, handle)) = OutputStream::try_default() else {
-            flag.store(false, Ordering::SeqCst);
+            release(&thinking_for);
             return;
         };
         let Ok(sink) = Sink::try_new(&handle) else {
-            flag.store(false, Ordering::SeqCst);
+            release(&thinking_for);
             return;
         };
         sink.set_volume(0.10);
 
         let cycle = working_tone_cycle();
         let polls_per_cycle = TONE_CYCLE_MS / 50;
+        let ours = |thinking_for: &AtomicU64| thinking_for.load(Ordering::Relaxed) == mine;
 
-        while flag.load(Ordering::Relaxed) {
+        while ours(&thinking_for) {
             sink.append(rodio::buffer::SamplesBuffer::new(
                 1,
                 TONE_RATE,
@@ -103,7 +121,7 @@ pub(crate) fn start_thinking_tone_thread(active: Arc<AtomicBool>) {
             ));
             for _ in 0..polls_per_cycle {
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                if !flag.load(Ordering::Relaxed) {
+                if !ours(&thinking_for) {
                     sink.stop();
                     return;
                 }
@@ -198,9 +216,13 @@ pub(crate) fn play_wav_on_handle(
     wav: Vec<u8>,
     handle: &rodio::OutputStreamHandle,
     interrupted: &AtomicBool,
+    utterance: &AtomicU64,
 ) -> Result<()> {
     use rodio::{Decoder, Sink};
     use std::io::Cursor;
+
+    // Which turn this audio belongs to, fixed at the moment playback starts.
+    let mine = utterance.load(Ordering::SeqCst);
 
     let cursor = Cursor::new(wav);
     let decoder = Decoder::new(cursor).context("Failed to decode WAV for playback")?;
@@ -211,6 +233,20 @@ pub(crate) fn play_wav_on_handle(
         if interrupted.load(Ordering::Relaxed) {
             sink.stop();
             tracing::debug!("TTS playback interrupted by barge-in");
+            return Ok(());
+        }
+        // A newer turn has begun, so this audio answers a question that is no
+        // longer the one being asked.
+        //
+        // The interrupt flag alone cannot cover this. `begin_utterance` CLEARS
+        // it for the incoming turn — so when a turn was cancelled by setting
+        // that flag and the next turn started within the 50 ms poll window,
+        // the cancellation was wiped before this loop ever saw it and the old
+        // audio played on underneath the new one. Two voices at once. The
+        // generation cannot be cleared by a later turn, only advanced past.
+        if utterance.load(Ordering::Relaxed) != mine {
+            sink.stop();
+            tracing::debug!("TTS playback dropped: it belongs to a superseded turn");
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -351,6 +387,156 @@ mod working_tone_tests {
             "{}ms of chime against {}ms of silence",
             TONE_CHIME_MS,
             TONE_CYCLE_MS - TONE_CHIME_MS
+        );
+    }
+}
+
+/// Tests for the turn-generation rules, driven directly against the atomics.
+///
+/// These need no audio device: the bug they cover is entirely in *when* the
+/// playback and tone loops decide to stop, and both decisions are pure
+/// functions of two atomics.
+#[cfg(test)]
+mod utterance_generation_tests {
+    use super::*;
+
+    /// Exactly the decision `play_wav_on_handle` makes on each 50 ms poll.
+    fn should_keep_playing(interrupted: &AtomicBool, utterance: &AtomicU64, mine: u64) -> bool {
+        !interrupted.load(Ordering::Relaxed) && utterance.load(Ordering::Relaxed) == mine
+    }
+
+    /// The reported bug, end to end.
+    ///
+    /// A speculative turn is speaking. It is cancelled by setting the interrupt
+    /// flag. The confirmed turn begins, and `begin_utterance` CLEARS that flag —
+    /// which, before the generation existed, resurrected the cancelled audio and
+    /// the user heard both replies at once.
+    #[test]
+    fn cancelled_audio_stays_cancelled_when_the_next_turn_begins() {
+        let interrupted = AtomicBool::new(false);
+        let utterance = AtomicU64::new(1);
+
+        // The speculative turn starts speaking under generation 1.
+        let speculative = utterance.load(Ordering::SeqCst);
+        assert!(should_keep_playing(&interrupted, &utterance, speculative));
+
+        // Its transcript did not match; cancel it.
+        interrupted.store(true, Ordering::SeqCst);
+        assert!(!should_keep_playing(&interrupted, &utterance, speculative));
+
+        // The confirmed turn begins: generation advances, interrupt clears.
+        utterance.fetch_add(1, Ordering::SeqCst);
+        interrupted.store(false, Ordering::SeqCst);
+
+        assert!(
+            !should_keep_playing(&interrupted, &utterance, speculative),
+            "the superseded turn's audio must not resume when the next turn clears the flag"
+        );
+        let confirmed = utterance.load(Ordering::SeqCst);
+        assert!(
+            should_keep_playing(&interrupted, &utterance, confirmed),
+            "the new turn must be free to speak"
+        );
+    }
+
+    /// Barge-in still has to work within a single turn.
+    #[test]
+    fn the_interrupt_flag_still_stops_the_current_turn() {
+        let interrupted = AtomicBool::new(false);
+        let utterance = AtomicU64::new(7);
+        let mine = 7;
+
+        assert!(should_keep_playing(&interrupted, &utterance, mine));
+        interrupted.store(true, Ordering::SeqCst);
+        assert!(!should_keep_playing(&interrupted, &utterance, mine));
+    }
+
+    /// Several sentences of one reply share a generation, so nothing about
+    /// speaking repeatedly within a turn cancels the turn.
+    #[test]
+    fn every_sentence_of_one_reply_plays() {
+        let interrupted = AtomicBool::new(false);
+        let utterance = AtomicU64::new(3);
+        let mine = 3;
+        for sentence in 0..5 {
+            assert!(
+                should_keep_playing(&interrupted, &utterance, mine),
+                "sentence {sentence} was dropped mid-reply"
+            );
+        }
+    }
+
+    // ── the working tone ──────────────────────────────────────────────────
+
+    /// Exactly the decision the tone thread makes on each poll.
+    fn tone_is_ours(thinking_for: &AtomicU64, mine: u64) -> bool {
+        thinking_for.load(Ordering::Relaxed) == mine
+    }
+
+    /// The stuck tone. An older thread, mid-poll when its turn ended, used to
+    /// see the flag set true again by the NEXT turn and carry on — leaving a
+    /// tone playing that no turn could stop, because the turn that owned it had
+    /// already finished stopping it.
+    #[test]
+    fn a_superseded_tone_thread_exits_instead_of_adopting_the_next_turn() {
+        let thinking_for = AtomicU64::new(TONE_OFF);
+
+        // Turn 1 starts a tone.
+        let first = 1u64;
+        thinking_for.store(first, Ordering::SeqCst);
+        assert!(tone_is_ours(&thinking_for, first));
+
+        // Turn 1 stops it, and turn 2 starts its own before thread 1 polls.
+        thinking_for.store(TONE_OFF, Ordering::SeqCst);
+        let second = 2u64;
+        thinking_for.store(second, Ordering::SeqCst);
+
+        assert!(
+            !tone_is_ours(&thinking_for, first),
+            "thread 1 must exit, not adopt turn 2's tone and play alongside thread 2"
+        );
+        assert!(tone_is_ours(&thinking_for, second));
+    }
+
+    /// Stopping is what silence means, and it must not depend on which turn
+    /// happens to call it.
+    #[test]
+    fn stopping_the_tone_silences_every_generation() {
+        let thinking_for = AtomicU64::new(5);
+        thinking_for.store(TONE_OFF, Ordering::SeqCst);
+        for generation in [1u64, 5, 9] {
+            assert!(!tone_is_ours(&thinking_for, generation));
+        }
+    }
+
+    /// A turn asking for the tone twice must not stack a second thread: the
+    /// swap returns the same generation, and `start_thinking_tone` bails.
+    #[test]
+    fn asking_twice_within_a_turn_starts_one_thread() {
+        let thinking_for = AtomicU64::new(TONE_OFF);
+        let mine = 4u64;
+
+        assert_ne!(
+            thinking_for.swap(mine, Ordering::SeqCst),
+            mine,
+            "first claim"
+        );
+        assert_eq!(
+            thinking_for.swap(mine, Ordering::SeqCst),
+            mine,
+            "second claim must be recognised as already ours"
+        );
+    }
+
+    /// Zero is reserved, so a real turn can never be mistaken for "no tone".
+    #[test]
+    fn no_real_turn_can_collide_with_the_off_sentinel() {
+        assert_eq!(TONE_OFF, 0);
+        let first_ever = AtomicU64::new(1);
+        assert_ne!(
+            first_ever.load(Ordering::SeqCst),
+            TONE_OFF,
+            "generations start at 1"
         );
     }
 }
