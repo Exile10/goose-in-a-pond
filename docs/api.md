@@ -216,7 +216,7 @@ Reports Goose agent status and loaded MCP tools. Useful for verifying the GIAP b
 
 Exchanges a session token between a GOTG mobile client and GIAP. Returns connection details.
 
-> **Status**: Token validation is currently a stub — any well-formed request succeeds. Full GIAP↔GOTG authentication is planned.
+> **Status**: Token validation is real. `SqliteHandshakeAdapter::validate_token` (`crates/pond-infra/src/sqlite_handshake.rs`) looks the token up by SHA-256 hash and accepts it only when it is unrevoked and unexpired, touching `last_seen_at` on success. Tokens are hashed at rest, and pairing is a two-phase HMAC challenge.
 
 **Request**
 ```json

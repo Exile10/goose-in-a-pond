@@ -170,8 +170,8 @@ Nested delegation is capped at depth 1 in v1. A subagent may not spawn.
 
 ### 3.6 The tool surface
 
-One new extension, `giap-orchestrator`, behind `ext_orchestrator_enabled` (making 16 registered
-extensions):
+One new extension, `giap-orchestrator`, behind `ext_orchestrator_enabled` (making 15 registered
+extensions — there are 14 today):
 
 - `list_roles` — what personas exist, and what each is for.
 - `delegate` — run a role against instructions. Synchronous by default; `background: true` only when

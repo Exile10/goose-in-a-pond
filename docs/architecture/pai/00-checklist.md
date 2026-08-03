@@ -118,3 +118,24 @@ Append here as work proceeds. Dated entries, newest last.
 - **Open:** the whole programme assumes one household per pond. PAI-7 states it as a deferral. If
   that assumption ever breaks, PAI-1's `ProfileScope::Household` is the type that has to change, and
   it is load-bearing for six of the eight.
+
+**2026-08-03 (later) — documentation debt cleared; still no feature code.**
+
+All six rows of the roadmap's documentation-debt table are done, each re-verified against code
+first. Corrected: `token_tracking.md` (real provider usage is the primary path, chars/4 is only the
+fallback when a provider emits no `Usage` events), `scheduling.md` (three `TaskKind` variants and
+twelve MCP tools, not two and seven), `api.md` (handshake token validation is real — SHA-256 lookup
+with revocation and expiry), `model_capabilities.md` (the sixth field, `tool_calling`), and
+`security/ports/policy.rs` (the loopback bypass is off by default behind `POND_DEV_ALLOW_LOOPBACK`
+since #94, not unconditional).
+
+**One of the six was my own error, not the repo's.** I had recorded that `CLAUDE.md` understated the
+extension count at 14 while `giap_registration.rs` registered 15. Recounting gives exactly **14**
+`register_builtin_extension` calls, so `CLAUDE.md` was right all along. The roadmap row is corrected
+and PAI-6 section 3.6 now says `giap-orchestrator` would make **15**, not 16. Worth noting as a
+warning: that claim was wrong in the first commit of a document whose whole value is being accurate,
+which is exactly why check 2.1.3 exists. Re-verify; do not trust a prior pass, including mine.
+
+**The build baseline is unblocked.** `goose/` can be populated from a clone of `jarida-io/Goose:main`
+when the submodule is uninitialized, which is what CI does. With it in place `cargo fmt --check`
+passes and `cargo test -p pond-core --lib` runs. Do this before assuming a cargo failure is yours.

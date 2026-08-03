@@ -4,11 +4,12 @@
 //!
 //! Today GIAP's privacy boundary is **implicit and diffuse**:
 //!
-//! - `pond-api`'s `auth_middleware` checks Bearer tokens but **bypasses
-//!   validation entirely for loopback** connections (see the loopback short-
-//!   circuit near the top of `auth_middleware` in
-//!   `crates/pond-api/src/middleware/mod.rs`, around lines 206-214). On a
-//!   single-device deployment everything on `127.0.0.1` is trusted.
+//! - `pond-api`'s `auth_middleware` checks Bearer tokens. It once bypassed
+//!   validation entirely for loopback connections; since #94 that bypass is
+//!   **off by default** and gated behind the `POND_DEV_ALLOW_LOOPBACK`
+//!   environment variable (see `dev_allow_loopback` in
+//!   `crates/pond-api/src/middleware/mod.rs`). Authentication is therefore
+//!   real, but it is still coarse: a valid token grants everything.
 //! - [`SecretRepository`](crate::security::ports::secret::SecretRepository)
 //!   guards key material, but is callable by anyone holding the `Arc` — there
 //!   is no per-extension scope on which secrets a caller may read.

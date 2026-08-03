@@ -182,7 +182,7 @@ documents worth keeping, so they are corrected as part of the workstream that to
 | `api.md:219` | "Token validation is currently a stub" | `SqliteHandshakeAdapter::validate_token` is real | PAI-2 |
 | `architecture/model_capabilities.md:14` | `ModelCapabilities` has five fields | Six — `tool_calling` is missing from the doc | PAI-3 |
 | `security/ports/policy.rs:6-11` | Describes the unconditional loopback bypass "at lines 206-214" | Removed in #94; now gated behind `POND_DEV_ALLOW_LOOPBACK` | PAI-2 |
-| `CLAUDE.md` | "14 `giap-*` extensions" | `giap_registration.rs` registers **15** | PAI-6 |
+| `CLAUDE.md` | "14 `giap-*` extensions" | Correct — `giap_registration.rs` has exactly 14 `register_builtin_extension` calls. My earlier claim of 15 was wrong; re-counted 2026-08-03 | n/a |
 
 ---
 
