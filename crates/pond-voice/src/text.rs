@@ -1603,3 +1603,91 @@ mod wake_word_tests {
         );
     }
 }
+
+// -- Whisper artifacts ------------------------------------------------------
+
+/// Remove Whisper non-speech tags (`[BLANK_AUDIO]`, `[MUSIC]`, `[NOISE]`, …)
+/// and return the remaining text trimmed.  If nothing real remains, returns "".
+pub fn strip_whisper_artifacts(text: &str) -> String {
+    // Strip all [BRACKETED_TAGS] — Whisper uses these for non-speech events.
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        if let Some(close) = rest[open..].find(']') {
+            rest = &rest[open + close + 1..];
+        } else {
+            rest = &rest[open..];
+            break;
+        }
+    }
+    out.push_str(rest);
+
+    // Strip (PARENTHESIZED TAGS) — e.g. (inaudible), (music), (laughing)
+    let mut cleaned = String::with_capacity(out.len());
+    let mut prest = out.as_str();
+    while let Some(open) = prest.find('(') {
+        cleaned.push_str(&prest[..open]);
+        if let Some(close) = prest[open..].find(')') {
+            prest = &prest[open + close + 1..];
+        } else {
+            prest = &prest[open..];
+            break;
+        }
+    }
+    cleaned.push_str(prest);
+
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return String::new();
+    }
+
+    // Reject common Whisper hallucinations on silence / noise.
+    let lower = cleaned.to_lowercase();
+    const EXACT_HALLUCINATIONS: &[&str] = &[
+        ".",
+        "..",
+        "...",
+        ",",
+        "!",
+        "?",
+        "thank you",
+        "thanks for watching",
+        "thanks for listening",
+        "thanks",
+        "you",
+        "bye",
+        "bye bye",
+        "okay",
+        "the end",
+        "subtitles by",
+        "subtitle",
+        "so",
+        "um",
+        "uh",
+        "hmm",
+        "huh",
+        "ah",
+        "oh",
+        "i'm sorry",
+        "i don't know",
+        "please subscribe",
+        "like and subscribe",
+    ];
+    if EXACT_HALLUCINATIONS.iter().any(|h| lower == *h) {
+        return String::new();
+    }
+
+    // Reject very short transcripts (1-2 chars) — almost always noise artifacts.
+    if cleaned.len() <= 2 {
+        return String::new();
+    }
+
+    // Reject if the transcript is just the same word/syllable repeated.
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    if words.len() >= 2 && words.iter().all(|w| *w == words[0]) {
+        return String::new();
+    }
+
+    cleaned.to_string()
+}

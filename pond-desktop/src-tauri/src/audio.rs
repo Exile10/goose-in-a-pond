@@ -955,7 +955,7 @@ fn wake_listener_thread(
                     }
                     if let Ok(t) = res.json::<Tr>() {
                         // Strip Whisper artifacts before matching
-                        let cleaned = crate::tts_text::strip_whisper_artifacts(&t.text);
+                        let cleaned = pond_voice::text::strip_whisper_artifacts(&t.text);
                         if cleaned.is_empty() {
                             tracing::debug!(
                                 "Wake ASR: artifact-only transcript stripped: {:?}",

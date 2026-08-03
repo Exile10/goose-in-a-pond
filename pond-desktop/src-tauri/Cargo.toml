@@ -17,6 +17,11 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# The voice text/DSP primitives, shared with the server rather than ported.
+# pond-voice is a LEAF crate (std only, no pond-core, no tokio, no cpal)
+# specifically so this separate workspace can depend on it — which is what
+# lets `tts_text.rs`, a 981-line hand-port of the same logic, be deleted.
+pond-voice = { path = "../../crates/pond-voice" }
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-window-state = "2"
