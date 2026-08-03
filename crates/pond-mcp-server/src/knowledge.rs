@@ -167,7 +167,13 @@ or listing options; for factual questions prefer get_wikipedia_article.")]
                 (lines.join("\n"), ui_items)
             }
             _ => (
-                format!("No Wikipedia articles found for '{}'.", query),
+                crate::format::format_no_results(
+                    &format!("Wikipedia articles for '{}'", query),
+                    &[
+                        "giap-discovery__search_web",
+                        "giap-knowledge__instant_answer",
+                    ],
+                ),
                 Vec::new(),
             ),
         };
@@ -321,10 +327,15 @@ before Wikipedia.")]
             )
         } else {
             eprintln!("[knowledge] instant_answer: no result for '{}'", query);
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No instant answer found for '{}'. Try get_wikipedia_article for a deeper lookup.",
-                query
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                crate::format::format_no_results(
+                    &format!("an instant answer for '{}'", query),
+                    &[
+                        "giap-knowledge__get_wikipedia_article",
+                        "giap-discovery__search_web",
+                    ],
+                ),
+            )]));
         };
 
         let _ = source_url; // consumed above in formatting
@@ -375,10 +386,15 @@ before Wikipedia.")]
         // 404 means the word was not found
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             eprintln!("[knowledge] define_word: word '{}' not found", word);
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "Word '{}' not found. Check spelling or try a different word.",
-                word,
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                crate::format::format_no_results(
+                    &format!("a dictionary definition of '{}'", word),
+                    &[
+                        "giap-knowledge__search_wikipedia",
+                        "giap-discovery__search_web",
+                    ],
+                ),
+            )]));
         }
 
         if !resp.status().is_success() {
@@ -497,10 +513,12 @@ recommendations, or 'who wrote X'.")]
 
         if items.is_empty() {
             eprintln!("[knowledge] search_books: no results for '{}'", query);
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No books found for '{}'. Try different keywords or check the spelling.",
-                query,
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                crate::format::format_no_results(
+                    &format!("books for '{}'", query),
+                    &["giap-discovery__search_web"],
+                ),
+            )]));
         }
 
         let header = format!("Books matching '{}':", query);
@@ -778,7 +796,15 @@ async fn resolve_word(params: &DefineWordParams) -> String {
 fn format_dictionary_response(body: &serde_json::Value, word: &str) -> String {
     let entries = match body.as_array() {
         Some(arr) if !arr.is_empty() => arr,
-        _ => return format!("Word '{}' not found.", word),
+        _ => {
+            return crate::format::format_no_results(
+                &format!("a dictionary definition of '{}'", word),
+                &[
+                    "giap-knowledge__search_wikipedia",
+                    "giap-discovery__search_web",
+                ],
+            )
+        }
     };
 
     let entry = &entries[0];
@@ -1055,7 +1081,13 @@ impl KnowledgeMcpServer {
                     "[wikipedia] fallback search returned no results for '{}'",
                     query
                 );
-                Ok(format!("No Wikipedia articles found for '{}'.", query))
+                Ok(crate::format::format_no_results(
+                    &format!("Wikipedia articles for '{}'", query),
+                    &[
+                        "giap-discovery__search_web",
+                        "giap-knowledge__instant_answer",
+                    ],
+                ))
             }
         }
     }
@@ -1348,7 +1380,14 @@ mod tests {
     fn format_dictionary_response_handles_empty_array() {
         let body: serde_json::Value = serde_json::json!([]);
         let result = format_dictionary_response(&body, "xyzzy");
-        assert!(result.contains("not found"));
+        // A miss must read as a dead end with a next step, not as a bare
+        // "not found" the model can synthesise into an apology.
+        assert!(result.contains("No results for"), "got: {result}");
+        assert!(result.contains("xyzzy"));
+        assert!(
+            result.contains("giap-discovery__search_web"),
+            "got: {result}"
+        );
     }
 
     // ── search_books tests ────────────────────────────────────────────────

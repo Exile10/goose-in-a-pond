@@ -312,7 +312,9 @@ If the user refers to \"it\", \"that\", \"there\", or \"tomorrow\" — resolve f
 {% if compact_prompt %}\
 Your tools are defined in the schema below. Use them for any live, real-time, or \
 factual data. Multiple calls for multi-part requests. Chain when results suggest next steps. \
-After a tool returns, synthesize immediately. Do not ask follow-ups.\
+After a successful tool result, synthesize immediately. Do not ask follow-ups. \
+An error, an empty result, or a \"not found\" is NOT an answer — call another tool \
+that could answer the question before telling the user you could not find it.\
 {% else %}\
 Your capabilities are defined by the tool schemas provided below. Each schema includes \
 the tool name, description (which tells you WHEN to use it), and parameters. \
@@ -336,11 +338,18 @@ When a tool result instructs you to call another tool, follow through immediatel
 Do not ask the user for permission. Continue calling tools until you have a complete answer. \
 A tool suggesting a next step is a workflow instruction — execute it.
 </tool-chaining>
+<tool-failure>
+An error, an empty result, or a \"not found\" is NOT the answer — it means that tool \
+could not help. Before telling the user you could not find something, check whether \
+another tool in your schema covers the same question, and call it. Do not re-call the \
+same tool with the same parameters. Say you could not find it only after every \
+applicable tool has come back empty.
+</tool-failure>
 <tool-synthesis>
-After receiving a tool result, IMMEDIATELY synthesize it into a helpful response. \
+After a successful tool result, IMMEDIATELY synthesize it into a helpful response. \
 Do not ask follow-up questions. Do not re-call the same tool with the same parameters. \
-The tool result IS the authoritative answer — present the key information conversationally. \
-Never echo raw tool output verbatim.
+A successful tool result IS the authoritative answer — present the key information \
+conversationally. Never echo raw tool output verbatim.
 </tool-synthesis>
 When unsure, check your tool schemas first. If a tool matches, use it. \
 Only if no tool can help should you tell the user honestly.
@@ -456,8 +465,12 @@ Multiple topics = multiple calls IN ONE RESPONSE. Emit all together for parallel
 <tool-chaining>
 Tool says call another? DO IT immediately. Keep going until complete.
 </tool-chaining>
+<tool-failure>
+Error, empty, or \"not found\" is NOT an answer. Call another tool that applies \
+first. Give up only once every applicable tool is exhausted.
+</tool-failure>
 <tool-synthesis>
-After results: synthesize directly. No follow-ups. No re-calls.
+After a successful result: synthesize directly. No follow-ups. No re-calls.
 </tool-synthesis>
 {% if has_tools and not native_tools_json %}
 Available tools:
@@ -538,7 +551,9 @@ resolve pronouns and references from earlier turns.
 {% if compact_prompt %}\
 Your tools are defined in the schema below. Use them for any live, real-time, or \
 factual data. Emit parallel calls for multi-part requests, chain when a result \
-directs a next step, and synthesize immediately after results — no follow-ups.\
+directs a next step, and synthesize immediately after a successful result — no \
+follow-ups. An error or empty result is NOT an answer — call another tool that \
+applies before reporting failure.\
 {% else %}\
 Your capabilities are defined entirely by the tool schemas below. Each schema specifies: \
 name, description (WHEN to use), and parameter definitions (WHAT to pass). \
@@ -560,8 +575,15 @@ When a tool result instructs you to call another tool, follow through immediatel
 do not ask the user for permission. Extract relevant data from the first result and \
 pass it to the next tool. Continue until you have a complete, actionable answer.
 </tool-chaining>
+<tool-failure>
+An error, an empty result, or a \"not found\" is NOT the answer — that tool could \
+not help. Before reporting failure, check whether another tool in your schema covers \
+the same question and call it. Do not re-call the same tool with the same parameters. \
+Report failure only after every applicable tool has come back empty. \
+Surface tool errors clearly and suggest remediation.
+</tool-failure>
 <tool-synthesis>
-After receiving results, synthesize immediately into a precise answer. \
+After a successful result, synthesize immediately into a precise answer. \
 Do not ask follow-up questions. Do not re-call with the same parameters. \
 Present key data points clearly. Cite sources when available.
 </tool-synthesis>
@@ -654,7 +676,9 @@ Earlier turns appear above in our conversation — I use them to remember what w
 {% if compact_prompt %}\
 My tools are in the schemas below — I use them for anything live or current, make \
 all calls for multi-part questions at once, follow chained tool instructions right \
-away, and give a direct answer as soon as results arrive.\
+away, and give a direct answer as soon as good results arrive. If a tool errors or \
+comes back empty, that is not the answer — I try another tool that could help before \
+I tell you I could not find it.\
 {% else %}\
 My tools are listed in the schemas below — each one tells me what it does and when \
 to use it. I read the descriptions to figure out which tool matches your question.
@@ -671,9 +695,15 @@ Sometimes a tool will tell me to call another tool for the full answer. When tha
 happens, I follow through right away without asking. I keep going until I have a \
 complete answer.
 </tool-chaining>
+<tool-failure>
+If a tool errors or comes back empty, that is not my answer — it just means that \
+tool could not help. Before I tell you I could not find something, I check whether \
+another tool of mine covers the same question, and I use it. I only say I could not \
+find it once I have tried everything that applies.
+</tool-failure>
 <tool-synthesis>
-Once I get tool results, I give you a direct answer right away. No 'would you like \
-to know more' — the result is the answer.
+Once I get a good tool result, I give you a direct answer right away. No 'would you \
+like to know more' — the result is the answer.
 </tool-synthesis>
 {% endif %}\
 {% if has_tools and not native_tools_json %}
@@ -1566,7 +1596,7 @@ mod tests {
     // ── Prompt schema v2 golden tests ────────────────────────────────────────
 
     /// All four built-in styles, by name, for golden-test iteration.
-    const ALL_STYLES: &[(&str, &str)] = &[
+    pub(super) const ALL_STYLES: &[(&str, &str)] = &[
         ("balanced", PROMPT_BALANCED),
         ("concise", PROMPT_CONCISE),
         ("technical", PROMPT_TECHNICAL),
@@ -1614,7 +1644,7 @@ mod tests {
     }
 
     /// PromptState for golden-test renders.
-    fn v2_state(compact: bool, tools: bool, native: bool) -> PromptState {
+    pub(super) fn v2_state(compact: bool, tools: bool, native: bool) -> PromptState {
         PromptState {
             compact_prompt: compact,
             available_tools: if tools {
@@ -1877,6 +1907,53 @@ mod tests {
                     "style '{name}' (compact={compact}): vision section must render verbatim"
                 );
             }
+        }
+    }
+
+    /// Retry after a fruitless tool call was inconsistent because the prompt
+    /// only licensed a follow-up when the tool result itself suggested one, and
+    /// exactly one tool in the whole server did that. Every style, in BOTH
+    /// tiers, must now say that an empty result is not an answer and that
+    /// another tool should be tried — the compact tier especially, since
+    /// `prompt_budget_ctx` clamps local/gguf to 8192 and the on-device model
+    /// never sees the verbose branch.
+    #[test]
+    fn every_style_and_tier_says_an_empty_result_is_not_an_answer() {
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                let out =
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                let lower = out.to_lowercase();
+                assert!(
+                    lower.contains("empty"),
+                    "style '{name}' (compact={compact}): must name the empty-result case"
+                );
+                assert!(
+                    lower.contains("another tool"),
+                    "style '{name}' (compact={compact}): must point at another tool"
+                );
+            }
+        }
+    }
+
+    /// The verbose tier carries the guidance as its own balanced section; a
+    /// stray unclosed tag would swallow everything after it.
+    #[test]
+    fn verbose_tier_tool_failure_section_is_balanced() {
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            let out = render_jinja_template(raw, &s, Some(&v2_state(false, false, false)), None);
+            assert_eq!(
+                out.matches("<tool-failure>").count(),
+                out.matches("</tool-failure>").count(),
+                "style '{name}': unbalanced <tool-failure>"
+            );
+            assert_eq!(
+                out.matches("<tool-failure>").count(),
+                1,
+                "style '{name}': expected exactly one <tool-failure> section"
+            );
         }
     }
 

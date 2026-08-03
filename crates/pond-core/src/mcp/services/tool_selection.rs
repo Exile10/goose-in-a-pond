@@ -80,32 +80,61 @@ impl ToolSelection {
     }
 }
 
-/// The text that gets embedded to represent a session's topic.
+/// Upper bound on any single embedded signal. Embedding models truncate anyway.
+const MAX_SIGNAL_CHARS: usize = 2000;
+
+/// The texts that represent a session's topic, each scored INDEPENDENTLY.
 ///
-/// The first user message plus the memories injected on that turn. The memories
-/// matter: they are what the assistant already knows about this user, so a
-/// session opening with "what about tomorrow?" still scores against the standing
-/// context rather than against nothing. Bounded because embedding models
-/// truncate anyway and a huge memory block would drown the actual question.
-pub fn selection_signal(first_message: &str, memories: &str) -> String {
-    const MAX_SIGNAL_CHARS: usize = 2000;
-    let mut signal = String::with_capacity(first_message.len() + memories.len() + 1);
-    signal.push_str(first_message.trim());
-    if !memories.trim().is_empty() {
-        signal.push('\n');
-        signal.push_str(memories.trim());
+/// Returns the question first, then the standing context, and they must never be
+/// concatenated. A 17-character question ("Check the weather") embedded together
+/// with a kilobyte of memories yields a vector dominated by the memories: the
+/// question's own topic drops below the threshold, nothing clears the bar, and
+/// the top-scorer rescue then hands the session whichever group the *memory
+/// blob* happens to resemble. Observed live — "Check the weather" selected
+/// `giap-schedule` and left `giap-weather` dormant, so the model had no weather
+/// tool at all.
+///
+/// Scored separately and combined with `max`, a specific question wins on its own
+/// merits, while a vague opener ("what about tomorrow?") still falls back to the
+/// standing context — which is why the memories were included in the first place.
+pub fn selection_signals(first_message: &str, memories: &str) -> Vec<String> {
+    [first_message, memories]
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            if s.len() <= MAX_SIGNAL_CHARS {
+                return s.to_string();
+            }
+            // Truncate on a char boundary — the signal is user text.
+            let cut = s
+                .char_indices()
+                .map(|(i, _)| i)
+                .take_while(|i| *i <= MAX_SIGNAL_CHARS)
+                .last()
+                .unwrap_or(0);
+            s[..cut].to_string()
+        })
+        .collect()
+}
+
+/// Combine per-signal scores into one score per group by taking the best.
+///
+/// `max` and not a mean: the signals are alternative descriptions of what the
+/// session is about, not parts of one description, so a strong match on either
+/// is a strong match. Averaging would reintroduce the dilution this split exists
+/// to remove.
+pub fn merge_scores(per_signal: &[Vec<GroupScore>]) -> Vec<GroupScore> {
+    let mut merged: Vec<GroupScore> = Vec::new();
+    for scores in per_signal {
+        for s in scores {
+            match merged.iter_mut().find(|m| m.extension == s.extension) {
+                Some(m) => m.score = m.score.max(s.score),
+                None => merged.push(s.clone()),
+            }
+        }
     }
-    if signal.len() > MAX_SIGNAL_CHARS {
-        // Truncate on a char boundary — the signal is user text.
-        let cut = signal
-            .char_indices()
-            .map(|(i, _)| i)
-            .take_while(|i| *i <= MAX_SIGNAL_CHARS)
-            .last()
-            .unwrap_or(0);
-        signal.truncate(cut);
-    }
-    signal
+    merged
 }
 
 /// The group descriptions to embed, intersected with what is registered.
@@ -421,21 +450,105 @@ mod tests {
         assert!(!kept.contains(&"giap-news__get_headlines".to_string()));
     }
 
+    /// The regression this split exists for: the question and the standing
+    /// context must reach the embedder as SEPARATE texts. Concatenated, a short
+    /// question is drowned by a long memory block and its own topic drops below
+    /// the threshold — live, "Check the weather" selected `giap-schedule` and
+    /// left `giap-weather` dormant.
     #[test]
-    fn signal_combines_message_and_memories() {
-        let s = selection_signal("what's the weather?", "- [identity] lives in Nairobi");
-        assert!(s.contains("weather"));
-        assert!(s.contains("Nairobi"));
+    fn question_and_memories_are_scored_separately() {
+        let sigs = selection_signals("Check the weather", "- [identity] lives in Nairobi");
+        assert_eq!(sigs.len(), 2);
+        assert_eq!(sigs[0], "Check the weather", "the question stands alone");
+        assert!(sigs[1].contains("Nairobi"));
+        assert!(
+            !sigs[0].contains("Nairobi"),
+            "the memories must never be folded into the question"
+        );
     }
 
     #[test]
-    fn signal_is_bounded_and_utf8_safe() {
+    fn an_empty_half_is_dropped_not_embedded() {
+        assert_eq!(selection_signals("hi", "   "), vec!["hi".to_string()]);
+        assert_eq!(selection_signals("  ", "mems"), vec!["mems".to_string()]);
+        assert!(selection_signals(" ", "").is_empty());
+    }
+
+    #[test]
+    fn signals_are_bounded_and_utf8_safe() {
         let memories = "e\u{301}".repeat(4000); // multi-byte, well over the cap
-        let s = selection_signal("hi", &memories);
-        assert!(s.len() <= 2001);
+        let sigs = selection_signals("hi", &memories);
+        assert_eq!(sigs.len(), 2);
+        assert!(sigs[1].len() <= 2001);
         // Truncation must not have split a char — the String is valid by
         // construction, so re-validating its chars is the assertion.
-        assert!(s.chars().count() > 0);
+        assert!(sigs[1].chars().count() > 0);
+    }
+
+    /// Merging takes the best per group, not the mean — averaging would put the
+    /// dilution back.
+    #[test]
+    fn merge_takes_the_best_score_per_group() {
+        let a = vec![
+            GroupScore {
+                extension: "giap-weather".into(),
+                score: 0.61,
+            },
+            GroupScore {
+                extension: "giap-schedule".into(),
+                score: 0.10,
+            },
+        ];
+        let b = vec![
+            GroupScore {
+                extension: "giap-weather".into(),
+                score: 0.05,
+            },
+            GroupScore {
+                extension: "giap-schedule".into(),
+                score: 0.31,
+            },
+        ];
+        let merged = merge_scores(&[a, b]);
+        let get = |e: &str| merged.iter().find(|m| m.extension == e).unwrap().score;
+        assert!((get("giap-weather") - 0.61).abs() < 1e-6);
+        assert!((get("giap-schedule") - 0.31).abs() < 1e-6);
+    }
+
+    /// End to end on the live failure: with the question scored on its own, the
+    /// weather group clears the bar and is selected.
+    #[test]
+    fn a_specific_question_selects_its_group_despite_unrelated_memories() {
+        let avail = available();
+        // Question signal: strongly on-topic for weather. Memory signal: noise
+        // about other things, mildly resembling schedule.
+        let question = vec![
+            GroupScore {
+                extension: "giap-weather".into(),
+                score: 0.62,
+            },
+            GroupScore {
+                extension: "giap-schedule".into(),
+                score: 0.08,
+            },
+        ];
+        let mems = vec![
+            GroupScore {
+                extension: "giap-weather".into(),
+                score: 0.04,
+            },
+            GroupScore {
+                extension: "giap-schedule".into(),
+                score: 0.17,
+            },
+        ];
+        let merged = merge_scores(&[question, mems]);
+        let sel = select_groups(&avail, Some(&merged), DEFAULT_RELEVANCE_THRESHOLD);
+        assert!(
+            sel.groups.contains(&"giap-weather".to_string()),
+            "got {:?}",
+            sel.groups
+        );
     }
 
     #[test]

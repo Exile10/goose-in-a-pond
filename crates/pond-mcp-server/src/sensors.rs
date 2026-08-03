@@ -112,14 +112,25 @@ impl SensorsMcpServer {
                 r.unit,
                 r.recorded_at.format("%Y-%m-%d %H:%M:%S UTC"),
             ))])),
-            Ok(None) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "No '{}' readings found for device '{}'. The sensor may not have reported yet.",
-                sensor_type, device_id,
-            ))])),
+            Ok(None) => Ok(CallToolResult::success(vec![Content::text(
+                crate::format::format_no_results(
+                    &format!(
+                        "a '{}' reading for device '{}' (the sensor may not have \
+                         reported yet, or the id may be wrong)",
+                        sensor_type, device_id
+                    ),
+                    &["giap-sensors__list_sensors"],
+                ),
+            )])),
             Err(e) => {
                 tracing::warn!(error = %e, device_id, sensor_type, "sensors: get_latest failed");
                 Ok(CallToolResult::success(vec![Content::text(
-                    "Failed to retrieve the sensor reading. Please try again.",
+                    crate::format::format_dead_end(
+                        "a sensor reading",
+                        "The sensor store could not be read. Every sensor tool uses \
+                         the same store, so no other tool will help — tell the user \
+                         the sensor data is unavailable right now.",
+                    ),
                 )]))
             }
         }
@@ -165,22 +176,35 @@ impl SensorsMcpServer {
             Err(e) => {
                 tracing::warn!(error = %e, device_id, sensor_type, "sensors: get_history failed");
                 return Ok(CallToolResult::success(vec![Content::text(
-                    "Failed to retrieve sensor history. Please try again.",
+                    crate::format::format_dead_end(
+                        "sensor history",
+                        "The sensor store could not be read. Every sensor tool uses \
+                         the same store, so no other tool will help — tell the user \
+                         the sensor data is unavailable right now.",
+                    ),
                 )]));
             }
         };
 
         if readings.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
-                "No '{}' history found for device '{}'{}.",
-                sensor_type,
-                device_id,
-                if since.is_some() || until.is_some() {
-                    " in the requested time range"
-                } else {
-                    ""
-                },
-            ))]));
+            return Ok(CallToolResult::success(vec![Content::text(
+                crate::format::format_no_results(
+                    &format!(
+                        "'{}' history for device '{}'{}",
+                        sensor_type,
+                        device_id,
+                        if since.is_some() || until.is_some() {
+                            " in the requested time range"
+                        } else {
+                            ""
+                        },
+                    ),
+                    &[
+                        "giap-sensors__get_sensor_reading",
+                        "giap-sensors__list_sensors",
+                    ],
+                ),
+            )]));
         }
 
         let unit = &readings[0].unit;
@@ -260,7 +284,12 @@ impl SensorsMcpServer {
             Err(e) => {
                 tracing::warn!(error = %e, "sensors: list_sensors failed");
                 Ok(CallToolResult::success(vec![Content::text(
-                    "Failed to list sensors. Please try again.",
+                    crate::format::format_dead_end(
+                        "the sensor list",
+                        "The sensor store could not be read. Every sensor tool uses \
+                         the same store, so no other tool will help — tell the user \
+                         the sensor data is unavailable right now.",
+                    ),
                 )]))
             }
         }
