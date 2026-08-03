@@ -1,0 +1,241 @@
+# PAI-2 — Privacy and security guardrails
+
+Requirement: *privacy and security guardrails to minimise data and secret exposure.* Part of the
+[Personal Agentic Intelligence programme](../personal-agentic-intelligence.md).
+Prerequisites: [PAI-1](./01-identity-and-profile-boundaries.md) — a guardrail needs a subject.
+
+Verified against code 2026-08-03.
+
+---
+
+## 1. What is true today
+
+### 1.1 What is already strong, and must not regress
+
+**Pairing and tokens.** Two-phase HMAC handshake where the six-digit code never crosses the wire
+(`security/ports/handshake.rs:1-161`, `pond-infra/src/sqlite_handshake.rs`). Only SHA-256 hashes of
+codes and tokens are persisted (`:5-12,164-165`); tokens are 32 `OsRng` bytes (`:96-98`);
+comparisons are constant-time via `subtle::ConstantTimeEq` (`:193,353`); TTLs are pairing 10 min,
+challenge 60 s, session 24 h, refresh 30 d (`:35-38`); five failed attempts lock out. The blanket
+loopback bypass was removed in #94 and now requires `POND_DEV_ALLOW_LOOPBACK=1`
+(`middleware/mod.rs:155-163,266-275`).
+
+**Egress visibility.** `shared/services/egress.rs` is the best privacy primitive in the codebase: a
+process-global request context attributes every outbound call to a session and tool (`:25-53`), and
+host classification (`:126-161`) uses a curated 17-entry `KNOWN_PUBLIC_SUFFIXES` allowlist where
+loopback is `Internal`, allowlisted hosts are `Public`, and **everything else defaults to
+`Sensitive`**. Suffix matching is exact-or-dotted, with a test proving
+`notwikipedia.org.evil.com` does not match (`:233-237`).
+
+**Sensitivity classification.** `PrivacySensitivity { Public < Internal < Sensitive < Secret }`
+(`security/domain/event.rs:56-67`) is ordered and queryable. The audit MCP server excludes `Secret`
+in the store query itself rather than post-filtering (`pond-mcp-server/src/audit.rs:36-38,104-113`),
+so row limits count only surfaceable events.
+
+**Retention.** `pond-infra/src/pruning.rs` runs every six hours: event log 30 d, sensor readings
+7 d, acknowledged camera events 14 d, 500 messages per session, orphaned face embeddings swept. Face
+embeddings are deliberately never auto-expired — "biometric data managed by the user" (`:14-19`).
+
+**Data minimisation already practised.** Memory embeddings are `#[serde(skip)]` and never appear in
+JSON. Face recognition retains vectors, never images. FCM pushes are **data-only wake pings** with
+no title or body, so content never transits Google (`fcm_push_relay.rs:1-26`). Secret *values* are
+never returned by the secrets REST API.
+
+### 1.2 The holes
+
+**The policy layer is inert.** `SecurityPolicy::allow` returns `Ok(true)` unconditionally in both
+implementations (`security/services/policy.rs:27-28`, `pond-infra/src/sqlite_security_policy.rs:62-64`).
+Every `.audit()` call site in the repository is inside a `#[cfg(test)]` module — `policy.rs:76,79`
+and `sqlite_security_policy.rs:125,151,182,200`. The file's own doc comment says so
+(`sqlite_security_policy.rs:11-16`).
+
+**API keys are in the settings table and returned over HTTP.** `api_key_guardian`, `api_key_gnews`,
+`api_key_finnhub`, `api_key_coingecko` and `searxng_url` are `Option<String>` fields on `Settings`
+(`settings.rs:652-668`) carrying only `#[serde(default)]` — no `skip_serializing`. `GET /settings`
+does `serde_json::to_value(settings)` (`routes.rs:2608`), so **it returns them in plaintext to any
+authenticated client**. Meanwhile a real `SecretRepository` port exists
+(`security/ports/secret.rs:10-21`) whose doc says "values are NEVER returned through the REST API".
+
+**There is no keyring.** Despite the filename, `pond-infra/src/keyring_secret_repository.rs`
+contains only `FileSecretRepository`: plaintext JSON at `<data_dir>/secrets.json`, chmod 0600, with
+environment variables taking precedence (`:51-58`). That is what production wires
+(`pond-server/src/main.rs:2353`). The `keyring` crate in the root `Cargo.toml` is a Goose submodule
+mirror entry, not a GIAP dependency.
+
+**There is no redaction.** Grep for `redact|PII|scrub|anonymi` over `crates/` returns only comments
+plus `pond-infra/src/push_token_log.rs`, which shortens push tokens for log lines. Nothing inspects
+memory content, chat text, or event attributes for personal data before storage.
+
+**There is no encryption at rest.** Both SQLite databases and `secrets.json` are plaintext; the only
+protection is the 0600 file mode.
+
+**Onboarding leaves auth holes open permanently.** `PUT /settings`, `POST /profiles` and
+`PATCH /profiles/{id}` are on the public allowlist (`middleware/mod.rs:165-201`) and stay there
+after onboarding completes.
+
+---
+
+## 2. The gap
+
+GIAP is excellent at *observing* privacy-relevant events and poor at *preventing* them. It knows
+which host a tool called and classifies it `Sensitive`; it cannot stop the call. It has an eight-scope
+authorisation model that authorises everything. It writes API keys into the same table it serves to
+clients. Requirement 8 asks for guardrails; today there are gauges.
+
+---
+
+## 3. Design
+
+### 3.1 Make the policy real, but land it in audit mode first
+
+`SecurityPolicy` becomes a deny-by-default matrix over the eight existing scopes ×
+`PrincipalKind` × profile. A new setting governs the transition:
+
+```
+security_policy_mode = "off" | "audit" | "enforce"     # default "audit"
+```
+
+- `off` — today's behaviour, for debugging.
+- `audit` — every decision is evaluated and **logged**, but a deny does not block. This is how the
+  matrix gets validated against real households before it can lock anyone out of their own pond.
+- `enforce` — denies bite.
+
+Landing in `audit` is the whole point. A rules matrix written from first principles will be wrong in
+ways only real traffic reveals, and an authorisation regression in a home assistant looks like the
+lights not turning on.
+
+`audit()` gets its first production call sites here, alongside PAI-1's cross-profile check.
+
+### 3.2 Secret hygiene
+
+1. `api_key_*` migrate from `Settings` to `SecretRepository`. `init_news_deps` and friends
+   (`giap_registration.rs:135-155`) already take a settings repo; they take a secret repo instead.
+2. `GET /settings` must not be able to regress. Add a build-breaking guard test in the same spirit
+   as `every_settings_field_is_dispositioned` (`settings.rs:1630-1795`): **no serialized `Settings`
+   key may match `*_key`, `*_token`, `*_secret`, `*_password`.** A guard test is the right tool here
+   because the failure mode is a future field added by someone who has not read this document.
+3. `FileSecretRepository` gains an encrypted backend (below). The file keeps its name honest — either
+   implement the keyring or rename the module. Rename is cheaper and clearer.
+
+### 3.3 A redactor with an explicit boundary
+
+New port `security/ports/redactor.rs`:
+
+```rust
+pub trait Redactor: Send + Sync {
+    /// Returns the text with detected personal data replaced, plus what was found.
+    fn redact(&self, text: &str, level: RedactionLevel) -> Redacted;
+}
+```
+
+Deterministic, rule-based adapter first (e-mail addresses, phone numbers, card and IBAN shapes,
+API-key shapes, postal addresses). No model in the loop — a redactor that costs a 20 tok/s inference
+call will be disabled by the first user who notices.
+
+Applied at exactly three chokepoints:
+
+1. Before a `MemoryFragment` is written.
+2. Before event `attributes` reach the event log.
+3. Before any body leaves the pond (PAI-8 connectors, webhooks).
+
+**Explicit non-goal, stated so nobody 'fixes' it later: the redactor is not applied to the model's
+own prompt.** Redacting the assistant's view of your life is what makes it useless. The privacy
+property GIAP offers is *the model runs on your hardware*, not *the model is blindfolded*. What
+redaction protects is the durable stores and anything that leaves.
+
+### 3.4 Encryption at rest, honestly scoped
+
+Full-database SQLCipher is a real lift: a different SQLite build, key custody, a Jetson cross-build,
+and `pond_system.db` is read on every turn and every session listing.
+
+**v1 encrypts what actually hurts**: `secrets.json` and connector tokens, with ChaCha20-Poly1305
+under a keyfile at `<data_dir>/secrets/master.key` (0600), generated on first run. This is a small,
+testable change that removes the "your Gmail refresh token is a plaintext string on a home server"
+problem, which is the one PAI-8 creates.
+
+The SQLCipher path for the full database is designed here and **deferred with its cost written
+down**, rather than promised. Re-open it when someone is prepared to own the cross-build.
+
+### 3.5 Egress becomes enforcement
+
+`record_egress` is promoted from observability to a gate:
+
+```
+network_mode = "open" | "allowlist" | "offline"        # default "open" for compatibility
+```
+
+`allowlist` refuses hosts that classify as `Sensitive` — reusing `KNOWN_PUBLIC_SUFFIXES` and the
+existing fail-Sensitive default, which is exactly the right polarity for this. `offline` refuses
+everything but loopback, which makes "prove it is not phoning home" a one-setting demonstration
+rather than a packet capture.
+
+Every new outbound adapter copies `traced_send` from `pond-adapters-weather/src/lib.rs:15-30`. A
+guard test asserts every crate with a `reqwest` dependency references `record_egress`.
+
+### 3.6 The outbound-action gate
+
+`giap-draft` is already unconditionally registered as a safety extension
+(`giap_registration.rs:64`) and already models save / list / approve / reject
+(`pond-mcp-server/src/draft.rs:97,167,200,248`). Every side-effecting action from a connector —
+send, post, publish, delete — routes through it, scoped to the acting profile. This is reuse of a
+mechanism that exists and is already trusted, not a new approval system.
+
+### 3.7 Close the onboarding holes
+
+`PUT /settings`, `POST /profiles` and `PATCH /profiles/{id}` leave the public allowlist once
+onboarding is complete. `middleware/onboarding_guard.rs` already knows that state.
+
+---
+
+## 4. Phases
+
+- **P1** `security_policy_mode` with `audit` default; the scope × principal matrix; first production
+  `allow`/`audit` call sites (shared with PAI-1 P4).
+- **P2** Secret migration off `Settings`; the `*_key|*_token|*_secret` guard test; module rename.
+- **P3** `Redactor` port + rule-based adapter; the three chokepoints; per-rule tests with real-shaped
+  false-positive cases (a UK postcode inside a normal sentence must not be mangled).
+- **P4** Keyfile encryption for secrets and connector tokens.
+- **P5** `network_mode` enforcement + the `reqwest`-implies-`record_egress` guard test.
+- **P6** Draft gate for outbound connector actions (lands with PAI-8).
+- **P7** Onboarding allowlist closure.
+- **P8** Flip default to `security_policy_mode = "enforce"` — only after a release in `audit` with
+  telemetry showing what would have been denied.
+- **DEFERRED** SQLCipher for the full database.
+
+---
+
+## 5. Invariants
+
+1. A deny is logged with its principal, scope, action and outcome — an unexplained refusal is worse
+   than no refusal.
+2. Secret values never appear in a REST response, a log line, an event attribute, or a prompt.
+3. The redactor never runs on the model's prompt.
+4. Egress classification stays fail-`Sensitive`. New allowlist entries are added deliberately, with
+   the exact-or-dotted matcher preserved.
+5. `enforce` mode never locks a user out of `/handshake/*` or `/health` — recovery must stay
+   reachable.
+
+---
+
+## 6. Deliberate deferrals
+
+- **Full-database encryption.** See 3.4.
+- **Model-based PII detection.** Costs inference on the critical path; the rule-based redactor
+  handles the shapes that actually leak.
+- **Per-extension capability sandboxing** (an extension declaring which scopes it needs). Attractive,
+  and much easier once the policy matrix exists — revisit after P8.
+
+---
+
+## 7. Verification
+
+- **Unit** — the policy matrix, one test per scope × principal-kind cell, including the recovery
+  routes that must never be denied.
+- **Guard tests** — no secret-shaped settings key is serialized; every `reqwest`-using crate
+  references `record_egress`. Both must fail the build, not warn.
+- **Redactor** — a corpus with true positives and deliberately hard negatives; assert idempotence
+  (redacting twice equals redacting once).
+- **Integration** — `network_mode = "offline"`, run a weather query, assert a clean refusal with an
+  actionable message rather than a timeout.
+- **Manual** — `GET /settings` on a pond with every API key set; assert not one key value appears in
+  the response body.
