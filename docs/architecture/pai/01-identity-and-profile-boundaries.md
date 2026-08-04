@@ -356,10 +356,40 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   There is also no explicit-identification route yet — `POST /sessions/{id}/identify-user` is
   face-only — so `Explicit` has no producer either. That is a small addition and it lands with the
   wiring.
-- **P4** Enforcement: reads and writes honour the scope; cross-profile access routes through
-  `SecurityPolicy::allow` + `::audit`, denied by default.
-- **P5** Guest degradation: memory injection, tool groups and draft rights gated.
-- **P6** `ProfileContext` from the session's profile; primary becomes the fallback.
+- **P4 — write side LANDED 2026-08-04; policy layer still designed.** Memory extraction now stamps
+  `profile_id` from the turn's scope, and refuses to write anything at all for a `Guest`.
+
+  **This was the phase the whole workstream turned on, and an audit found it missing.** Until it
+  landed, every production write path set `profile_id: None`, so `scope_sql`'s `Owner(id)` predicate
+  -- `profile_id = ? OR profile_id IS NULL` -- matched exactly the same rows as `Household`. The
+  read-side scoping in P1 and P3 was real plumbing with nothing flowing through it, and no test
+  caught it because the only fixtures producing an owned row set `profile_id` by hand, a state no
+  production path could reach. Three tests now assert attribution end to end, including that a
+  household turn stays unattributed so shared context survives a member's deletion.
+
+  Still outstanding for P4: the `SecurityPolicy::allow` / `::audit` deny matrix. Both
+  implementations return `Ok(true)` and have zero production call sites.
+
+  **Known hole, not yet closed: the `giap-memory` MCP tools bypass the scope entirely.**
+  `recall_memories`, `keyword_search` and **`forget_memory`** all pass `ProfileScope::Household`
+  directly. `MemoryMcpServer` is process-global with no per-turn session state, so a Guest turn gets
+  no memories *injected* and can still ask the model to call `recall_memories` and receive
+  everything -- or `forget_memory` and destroy it. Closing this needs the scope threaded into the
+  MCP server per turn, in the shape of the existing `ShimControls` per-session cell.
+- **P5 — memory gated 2026-08-04; tool groups and draft rights outstanding.** A `Guest` turn gets no
+  memory injection (read) and deposits no memory (write). Tool-group narrowing and draft-approval
+  rights are not yet gated, and the MCP bypass above is the same gap seen from the other side.
+
+  Separately, and belonging to [PAI-2](./02-privacy-and-security-guardrails.md) rather than here:
+  **`approve_draft` performs no ownership check at all.** Any session can approve any draft id.
+- **P6 — LANDED 2026-08-04.** `profile_context_for` builds the context from the resolved scope:
+  `Owner(id)` gives that member's preferences, `Household` falls back to
+  `settings.primary_profile_id`, and **`Guest` gets `None`** -- falling back to the primary member
+  there would greet a stranger by the owner's name. It rides `AgentRequest.profile_context` and the
+  adapter passes it to `build_prompt_partition`, replacing the `None` and its TODO.
+
+  KV-prefix safe: profile lines land in the dynamic suffix, which rides `<system-context>` in the
+  user message. A speaker switch mid-session costs no re-prefill.
 - **P7 — LANDED 2026-08-04, narrower than designed.** `DELETE /profiles/{id}` now checks existence
   (it returned 204 for an id that never existed, which made "did I delete the right person"
   unanswerable), counts before deleting, and reports per category. Sessions are reported under

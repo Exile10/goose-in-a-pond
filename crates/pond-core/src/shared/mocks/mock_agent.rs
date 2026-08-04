@@ -1,5 +1,4 @@
 use crate::models::ports::agent::{Agent, AgentRequest, AgentResponse, AgentStreamEvent};
-use crate::user_data::domain::profile::ProfileScope;
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::{BoxStream, StreamExt};
@@ -76,7 +75,8 @@ mod tests {
             images: Vec::new(),
             voice_mode: false,
             canvas_mode: false,
-            profile_scope: ProfileScope::Household,
+            profile_scope: crate::user_data::domain::profile::ProfileScope::Household,
+            profile_context: None,
         };
         let response = agent.chat(request).await.unwrap();
         assert_eq!(response.text, "Echo: Hello, Pond!");
@@ -93,7 +93,8 @@ mod tests {
             images: Vec::new(),
             voice_mode: false,
             canvas_mode: false,
-            profile_scope: ProfileScope::Household,
+            profile_scope: crate::user_data::domain::profile::ProfileScope::Household,
+            profile_context: None,
         };
         let mut stream = agent.chat_stream(request).await.unwrap();
 

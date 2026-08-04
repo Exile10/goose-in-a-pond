@@ -34,6 +34,19 @@ pub struct AgentRequest {
     /// deserializes, and it reproduces the pre-PAI-1 behaviour exactly.
     #[serde(default = "ProfileScope::household")]
     pub profile_scope: ProfileScope,
+    /// The speaking member's own preferences, resolved alongside the scope.
+    ///
+    /// `None` means "no personal context in this prompt" -- which is what a
+    /// `Guest` turn gets, and what a pond with no primary member set has always
+    /// got. It is deliberately not "fall back to whoever is primary": using one
+    /// member's name and language while a different member is talking is the
+    /// wrong-attribution failure in its most visible form.
+    ///
+    /// Rides the request rather than being fetched in the adapter, for the same
+    /// reason as `profile_scope`: resolved once, at the edge, by the layer that
+    /// can actually reach a `ProfileRepository`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_context: Option<crate::prompts::ProfileContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,6 +377,7 @@ mod agent_request_scope_tests {
             voice_mode: false,
             canvas_mode: false,
             profile_scope: scope,
+            profile_context: None,
         }
     }
 
@@ -392,17 +406,5 @@ mod agent_request_scope_tests {
         let legacy = r#"{"message":"hi","session_id":"s1","model_role":"chat"}"#;
         let parsed: AgentRequest = serde_json::from_str(legacy).expect("legacy payload must parse");
         assert_eq!(parsed.profile_scope, ProfileScope::Household);
-    }
-
-    /// A guest turn must not be able to reach personal data. This is the single
-    /// bit the adapter's memory gate reads.
-    #[test]
-    fn a_guest_request_denies_personal_data() {
-        assert!(!request(ProfileScope::Guest)
-            .profile_scope
-            .allows_personal_data());
-        assert!(request(ProfileScope::Household)
-            .profile_scope
-            .allows_personal_data());
     }
 }

@@ -2351,9 +2351,18 @@ impl GooseAdapter {
         // turn (legacy behavior, useful for debugging or HTTP-only providers
         // where KV-cache reuse doesn't apply).
         if settings.prefix_cache_prompt {
+            // PAI-1 P6. Resolved at the API edge and carried on the request:
+            // the adapter has no ProfileRepository, and giving it one would put
+            // "whose preferences are these" behind the same boundary the
+            // identity resolution deliberately sits in front of.
+            //
+            // KV-prefix safe: build_prompt_partition puts profile lines in the
+            // dynamic suffix, which rides <system-context> in the USER message,
+            // never the static prefix. So a speaker switch mid-session costs no
+            // re-prefill.
             let partition = build_prompt_partition(
                 &settings,
-                None, // ProfileContext — TODO: wire when profile port is available
+                request.profile_context.as_ref(),
                 &prompt_state,
                 &template_content,
             );
@@ -4717,6 +4726,7 @@ mod tests {
             voice_mode: false,
             canvas_mode: false,
             profile_scope: ProfileScope::Household,
+            profile_context: None,
         };
 
         let mut stream = adapter.chat_stream(request).await.unwrap();

@@ -61,7 +61,14 @@ impl MemoryExtractionService {
         user_message: &str,
         assistant_response: &str,
         session_id: Option<&str>,
+        scope: &ProfileScope,
     ) {
+        // A guest's words are not written down. This is the write half of guest
+        // degradation: the read half (no memory injection) would be pointless
+        // if the turn still deposited a fragment the household could recall.
+        if scope.excludes_everything() {
+            return;
+        }
         if user_message.len() < MIN_MESSAGE_LEN && assistant_response.len() < MIN_MESSAGE_LEN {
             return;
         }
@@ -231,6 +238,11 @@ impl MemoryExtractionService {
                 importance,
                 fact.corrects.clone(),
             );
+            // PAI-1: stamp the owner. Before this, every extracted memory was
+            // written with profile_id: None, which made `Owner(id)` reads select
+            // exactly the same rows as `Household` -- the scoping was real
+            // plumbing with nothing flowing through it.
+            fragment.profile_id = scope.owner_id().map(str::to_string);
             fragment.embedding = embedding;
 
             if let Err(e) = repo.add(fragment).await {
@@ -264,7 +276,7 @@ mod tests {
     const TURN_ASSISTANT: &str = "Noted — the pantry it is.";
 
     /// Extractor that always yields one fixed fact.
-    struct FixedExtractor(&'static str);
+    pub(super) struct FixedExtractor(pub(super) &'static str);
 
     #[async_trait]
     impl MemoryExtractor for FixedExtractor {
@@ -304,7 +316,14 @@ mod tests {
 
     async fn run_once(extractor: &dyn MemoryExtractor, repo: &MockMemoryRepository) {
         MemoryExtractionService::new(0)
-            .run(extractor, repo, TURN_USER, TURN_ASSISTANT, None)
+            .run(
+                extractor,
+                repo,
+                TURN_USER,
+                TURN_ASSISTANT,
+                None,
+                &ProfileScope::Household,
+            )
             .await;
     }
 
@@ -353,6 +372,7 @@ mod tests {
                 TURN_USER,
                 TURN_ASSISTANT,
                 None,
+                &ProfileScope::Household,
             )
             .await;
 
@@ -392,6 +412,7 @@ mod tests {
                 TURN_USER,
                 TURN_ASSISTANT,
                 None,
+                &ProfileScope::Household,
             )
             .await;
 
@@ -433,6 +454,7 @@ mod tests {
                 TURN_USER,
                 TURN_ASSISTANT,
                 None,
+                &ProfileScope::Household,
             )
             .await;
 
@@ -458,6 +480,7 @@ mod tests {
                 TURN_USER,
                 TURN_ASSISTANT,
                 None,
+                &ProfileScope::Household,
             )
             .await;
 
@@ -481,6 +504,7 @@ mod tests {
                 TURN_USER,
                 TURN_ASSISTANT,
                 None,
+                &ProfileScope::Household,
             )
             .await;
 
@@ -745,6 +769,7 @@ mod tests {
                 TURN_USER,
                 TURN_ASSISTANT,
                 None,
+                &ProfileScope::Household,
             )
             .await;
 
@@ -784,6 +809,108 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::tests::FixedExtractor;
+    use super::*;
+    use crate::user_data::mocks::mock_memory::MockMemoryRepository;
+
+    /// Before PAI-1 wired the write side, every extracted memory was stored
+    /// with `profile_id: None`. That made `Owner(id)` reads select exactly the
+    /// same rows as `Household` -- real plumbing with nothing flowing through
+    /// it. Nothing tested it, because the only fixtures that produced an owned
+    /// row set `profile_id` by hand, a state no production path could reach.
+    #[tokio::test]
+    async fn an_extracted_memory_is_stamped_with_its_owner() {
+        let repo = MockMemoryRepository::new();
+        let extractor = FixedExtractor("the boiler is a Vaillant ecoTEC");
+        let svc = MemoryExtractionService::new(0);
+
+        svc.run(
+            &extractor,
+            &repo,
+            "my boiler is a Vaillant ecoTEC and the code is F28",
+            "Noted, I will remember that about your boiler.",
+            Some("sess-1"),
+            &ProfileScope::Owner("jerry".to_string()),
+        )
+        .await;
+
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 50)
+            .await
+            .unwrap();
+        assert!(!stored.is_empty(), "extraction must have written something");
+        assert!(
+            stored
+                .iter()
+                .all(|f| f.profile_id.as_deref() == Some("jerry")),
+            "every extracted fragment must name its owner, got {:?}",
+            stored
+                .iter()
+                .map(|f| f.profile_id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The write half of guest degradation. Suppressing memory *injection* for
+    /// a guest is pointless if the turn still deposits a fragment the whole
+    /// household can recall afterwards.
+    #[tokio::test]
+    async fn a_guest_turn_writes_nothing_at_all() {
+        let repo = MockMemoryRepository::new();
+        let extractor = FixedExtractor("the boiler is a Vaillant ecoTEC");
+        let svc = MemoryExtractionService::new(0);
+
+        svc.run(
+            &extractor,
+            &repo,
+            "my boiler is a Vaillant ecoTEC and the code is F28",
+            "Noted, I will remember that about your boiler.",
+            Some("sess-1"),
+            &ProfileScope::Guest,
+        )
+        .await;
+
+        assert!(
+            repo.search_recent(&ProfileScope::Household, 50)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a guest's words must not be written down"
+        );
+    }
+
+    /// Household stays unattributed, which is what makes it shared context and
+    /// what every pre-PAI-1 row already is.
+    #[tokio::test]
+    async fn a_household_turn_stays_unattributed() {
+        let repo = MockMemoryRepository::new();
+        let extractor = FixedExtractor("the boiler is a Vaillant ecoTEC");
+        let svc = MemoryExtractionService::new(0);
+
+        svc.run(
+            &extractor,
+            &repo,
+            "the spare key is under the third plant pot on the left",
+            "Understood, I will remember where the spare key is.",
+            Some("sess-1"),
+            &ProfileScope::Household,
+        )
+        .await;
+
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 50)
+            .await
+            .unwrap();
+        assert!(!stored.is_empty());
+        assert!(
+            stored.iter().all(|f| f.profile_id.is_none()),
+            "household context must stay unattributed so it survives a member's deletion"
         );
     }
 }

@@ -1096,10 +1096,14 @@ mod tests {
                 .search_recent(&ProfileScope::Household, 50)
                 .await
                 .unwrap();
-            assert!(
-                (owned as usize) < all.len(),
-                "{who} must not own every row; owning the shared one would delete it with them"
+            // Exact, not `<`. A count that wrongly included the shared row
+            // would be 2 of 3 and still satisfy a `<` check, so the weaker
+            // assertion could not detect the bug it names.
+            assert_eq!(
+                owned, 1,
+                "{who} owns exactly their own row -- not the shared one, which survives them"
             );
+            assert_eq!(all.len(), 3, "fixture: two owned rows and one shared");
         }
     }
 

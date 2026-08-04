@@ -133,6 +133,7 @@ mod tests {
             voice_mode: false,
             canvas_mode: false,
             profile_scope: crate::user_data::domain::profile::ProfileScope::Household,
+            profile_context: None,
         }
     }
 

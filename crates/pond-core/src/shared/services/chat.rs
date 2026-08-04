@@ -225,6 +225,8 @@ pub struct ChatService {
     telemetry: Option<Arc<dyn crate::security::ports::telemetry::TelemetryPort>>,
     /// Model identifier for telemetry rows (the CLI knows `--model`).
     model_name: Option<String>,
+    /// Whose turns these are. See [`with_profile_scope`](Self::with_profile_scope).
+    profile_scope: ProfileScope,
 }
 
 /// Result of one non-persisting agent stream: the streamed/spoken text plus
@@ -278,6 +280,7 @@ impl ChatService {
             stdout_diagnostics: true,
             telemetry: None,
             model_name: None,
+            profile_scope: ProfileScope::Household,
         }
     }
 
@@ -307,6 +310,17 @@ impl ChatService {
     /// Attach the memory extraction pipeline so `persist_assistant_turn`
     /// automatically triggers extraction. Handlers that omit this call simply
     /// skip extraction — no silent data loss, no handler-level boilerplate.
+    /// The scope this session's turns are attributed to.
+    ///
+    /// Set by the handler from the same resolution that fills
+    /// `AgentRequest.profile_scope`, so a turn's memory is written under the
+    /// same identity it was read under. Defaults to `Household`, which is what
+    /// every path did before PAI-1.
+    pub fn with_profile_scope(mut self, scope: ProfileScope) -> Self {
+        self.profile_scope = scope;
+        self
+    }
+
     pub fn with_memory_extraction(
         mut self,
         extractor: Arc<dyn MemoryExtractor>,
@@ -475,12 +489,14 @@ impl ChatService {
             images: Vec::new(),
             voice_mode: false,
             canvas_mode: false,
-            // Voice is a shared surface and speaker identification does not
-            // exist (PAI-1 section 3.8). Household is what this path has
-            // always done; narrowing it to Guest would silently stop the
-            // assistant answering out loud about anything personal, which is
-            // a product decision and not one to make in a refactor.
-            profile_scope: ProfileScope::Household,
+            // Whatever the caller set. `chat_once` serves BOTH the
+            // non-streaming REST /chat handler and the voice loop, so a
+            // hardcoded Household here made one endpoint disagree with
+            // /chat/stream about the same speaker. The builder decides.
+            profile_scope: self.profile_scope.clone(),
+            // Voice has no speaker identification, so there is no member
+            // whose preferences these would be.
+            profile_context: None,
         };
         let response_text = self.agent.chat(request).await?.text;
 
@@ -815,6 +831,7 @@ impl ChatService {
             let user_msg = user_message.to_string();
             let asst_resp = assistant_text.to_string();
             let sid = self.session_id.clone();
+            let scope = self.profile_scope.clone();
             tokio::spawn(async move {
                 svc.run(
                     ext.as_ref(),
@@ -822,6 +839,7 @@ impl ChatService {
                     &user_msg,
                     &asst_resp,
                     Some(&sid),
+                    &scope,
                 )
                 .await;
             });
@@ -895,8 +913,13 @@ impl ChatService {
             images: Vec::new(),
             voice_mode: true,
             canvas_mode: false,
-            // Same reasoning as the turn above: no speaker identification.
-            profile_scope: ProfileScope::Household,
+            // As above -- the builder decides. Voice callers leave it at the
+            // Household default because there is no speaker identification
+            // (PAI-1 section 3.8); the REST handlers set a resolved scope.
+            profile_scope: self.profile_scope.clone(),
+            // Voice has no speaker identification, so there is no member
+            // whose preferences these would be.
+            profile_context: None,
         };
 
         // Clear any interrupt left over from the previous turn. Exactly once

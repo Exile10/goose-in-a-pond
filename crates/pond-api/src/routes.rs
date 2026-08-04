@@ -914,7 +914,11 @@ async fn chat(
 
     // Build ChatService — agent is always primary (GooseAdapter builds system
     // prompt from DB settings, manages history, handles MCP tools internally).
-    let service = ChatService::new(state.agent.clone(), session_id.clone(), storage.clone());
+    // Resolved exactly as /chat/stream does. Without this the two endpoints
+    // disagreed about the same speaker: the stream gave Guest, this gave the
+    // whole household.
+    let service = ChatService::new(state.agent.clone(), session_id.clone(), storage.clone())
+        .with_profile_scope(resolve_turn_scope(&state, &session_id).await);
 
     let response_text = service.chat_once(req.message).await.map_err(|e| {
         (
@@ -1197,21 +1201,14 @@ fn chat_stream_inner(
 
         // Build the system prompt
         let system_prompt = {
-            let profile_ctx: Option<ProfileContext> = if let Some(ref pid) = settings.primary_profile_id {
-                state.profile_repo.get(pid).await.ok().flatten().map(|p| {
-                    let prefs = &p.preferences;
-                    ProfileContext {
-                        preferred_name: prefs.get("preferred_name").cloned(),
-                        birthday: prefs.get("birthday").cloned(),
-                        language: prefs.get("language").cloned(),
-                        atypical_speech: prefs.get("accessibility_atypical_speech")
-                            .map(|v| v == "true")
-                            .unwrap_or(false),
-                    }
-                })
-            } else {
-                None
-            };
+            // NOTE: everything this block produces lands in `_system_prompt`,
+            // which is unused -- `AgentRequest` has no system-prompt field and
+            // the adapter builds its own. It is left in place because the
+            // file-template branch below is the only reader of
+            // `prompt_template_dir`, and deleting it is a separate change.
+            // The profile context that actually reaches the model rides
+            // `AgentRequest.profile_context`, built by `profile_context_for`.
+            let profile_ctx: Option<ProfileContext> = None;
 
             let file_template = match state.prompt_template_dir.as_ref() {
                 Some(dir) => tokio::fs::read_to_string(dir.join("system.md")).await.ok(),
@@ -1284,11 +1281,18 @@ fn chat_stream_inner(
 
         let model_role = "chat";
 
+        // The same verdict the AgentRequest carries, so a turn's memory is
+        // WRITTEN under the identity it was READ under. Extraction stamps
+        // `profile_id` from this; before it, every fragment was unattributed
+        // and `Owner(id)` reads matched exactly what `Household` did.
+        let turn_scope = resolve_turn_scope(&state, &session_id).await;
+
         let mut chat_service = pond_core::shared::services::chat::ChatService::new(
             state.agent.clone(),
             session_id.clone(),
             storage.clone(),
-        );
+        )
+        .with_profile_scope(turn_scope.clone());
         if let (Some(ext), Some(svc)) =
             (state.memory_extractor.clone(), state.memory_extraction_service.clone())
         {
@@ -1365,7 +1369,8 @@ fn chat_stream_inner(
             images: req.images.clone(),
             voice_mode: req.voice_mode,
             canvas_mode: req.canvas_mode,
-            profile_scope: resolve_turn_scope(&state, &session_id).await,
+            profile_scope: turn_scope.clone(),
+            profile_context: profile_context_for(&state, &turn_scope).await,
         };
 
         let mut full_text = String::new();
@@ -4597,22 +4602,37 @@ async fn delete_profile(
     // leave an id pointing at nobody -- and the one production reader of that
     // setting silently got `None` from the lookup, so the failure was
     // invisible. Clear it here, before the delete, while it is still true.
-    let cleared_primary = {
-        let settings = state.settings_repo.get().await.unwrap_or_default();
-        if settings.primary_profile_id.as_deref() == Some(id.as_str()) {
-            if let Err(e) = state
-                .settings_repo
-                .set_key("primary_profile_id", String::new())
-                .await
-            {
-                tracing::warn!(error = %e, profile_id = %id, "failed to clear primary_profile_id");
-                false
-            } else {
-                true
-            }
-        } else {
-            false
-        }
+    // Both failures here ABORT rather than fall through. `unwrap_or_default()`
+    // used to hide a read failure as `primary_profile_id: None`, so the
+    // comparison never matched, the clear never ran, and the delete proceeded --
+    // reintroducing the exact dangling reference this code exists to prevent,
+    // on the failure path, silently.
+    let settings = state.settings_repo.get().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!("could not read settings, so the member was not deleted: {e}")
+            })),
+        )
+    })?;
+    let cleared_primary = if settings.primary_profile_id.as_deref() == Some(id.as_str()) {
+        state
+            .settings_repo
+            .set_key("primary_profile_id", String::new())
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": format!(
+                            "could not clear primary_profile_id, so the member was not deleted: {e}"
+                        )
+                    })),
+                )
+            })?;
+        true
+    } else {
+        false
     };
 
     state.profile_repo.delete(&id).await.map_err(|e| {
@@ -7256,6 +7276,7 @@ async fn agent_chat_stream(
         // row inside the stream body, so resolving earlier would read the
         // identity of a session that does not exist yet and miss a binding
         // written by PUT /sessions/{id}/user against a freshly minted id.
+        let turn_scope = resolve_turn_scope(&state, &session_id).await;
         let request = AgentRequest {
             message,
             session_id: session_id.clone(),
@@ -7263,7 +7284,8 @@ async fn agent_chat_stream(
             images,
             voice_mode: false,
             canvas_mode: false,
-            profile_scope: resolve_turn_scope(&state, &session_id).await,
+            profile_scope: turn_scope.clone(),
+            profile_context: profile_context_for(&state, &turn_scope).await,
         };
 
         let mut agent_stream = match agent.chat_stream(request).await {
@@ -11360,6 +11382,46 @@ async fn resolve_turn_scope(state: &Arc<AppState>, session_id: &str) -> ProfileS
         household_has_multiple_members,
     })
     .scope
+}
+
+/// The speaking member's own preferences, for the prompt.
+///
+/// PAI-1 P6. Built from the scope [`resolve_turn_scope`] produced, so the
+/// assistant addresses whoever is actually talking:
+///
+/// - `Owner(id)` -- that member's preferences.
+/// - `Household` -- `settings.primary_profile_id`, the historical behaviour and
+///   the only sensible answer when nobody in particular has been identified.
+/// - `Guest` -- **`None`**. A visitor gets no personal context at all, which is
+///   the prompt half of guest degradation. Falling back to the primary member
+///   here would greet a stranger by the owner's name.
+///
+/// Returns `None` rather than an error throughout: a missing profile means no
+/// personal context, which is a safe prompt, not a failed turn.
+async fn profile_context_for(
+    state: &Arc<AppState>,
+    scope: &ProfileScope,
+) -> Option<ProfileContext> {
+    let profile_id = match scope {
+        ProfileScope::Owner(id) => id.clone(),
+        ProfileScope::Household => {
+            let settings = state.settings_repo.get().await.ok()?;
+            settings.primary_profile_id.filter(|id| !id.is_empty())?
+        }
+        ProfileScope::Guest => return None,
+    };
+
+    let profile = state.profile_repo.get(&profile_id).await.ok().flatten()?;
+    let prefs = &profile.preferences;
+    Some(ProfileContext {
+        preferred_name: prefs.get("preferred_name").cloned(),
+        birthday: prefs.get("birthday").cloned(),
+        language: prefs.get("language").cloned(),
+        atypical_speech: prefs
+            .get("accessibility_atypical_speech")
+            .map(|v| v == "true")
+            .unwrap_or(false),
+    })
 }
 
 /// Map a session-storage failure from an identity write onto a status code.
