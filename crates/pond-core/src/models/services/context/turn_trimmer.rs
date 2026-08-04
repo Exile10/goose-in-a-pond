@@ -10,10 +10,19 @@
 //! Tool results always travel with their turn — the model never sees an
 //! orphan tool result.
 //!
-//! Token estimation is chars/4, optionally tightened by feedback: when the
-//! previous turn's REAL prompt token count (from `TurnStats`) exceeded the
-//! budget, the effective budget shrinks proportionally so the estimate error
-//! self-corrects without a tokenizer dependency in pond-core.
+//! Token counting comes from the injected [`TokenCounter`] port, so pond-core
+//! still carries no tokenizer dependency of its own. Callers that can reach a
+//! real tokenizer pass one; everything else passes
+//! [`HeuristicTokenCounter`](super::token_counting::HeuristicTokenCounter),
+//! which is the chars/4 arithmetic this module used to hardcode.
+//!
+//! The feedback correction stays regardless of which counter is used, and it is
+//! load-bearing: no counter available here is *exact* (see the port's docs on
+//! why tiktoken against a Gemma GGUF is not), and an image contributes only its
+//! surrounding text to the estimate rather than the ~250 tokens it really
+//! costs. When the previous turn's REAL prompt count (from `TurnStats`)
+//! overshot the usable ceiling, the effective budget shrinks by that overshoot,
+//! which converges in one turn.
 //!
 //! # Images are deliberately NOT handled here
 //!
@@ -24,14 +33,15 @@
 //! add a second image rule inside this module — the two would drift, and the
 //! adapter's is the one the engine actually sees.
 //!
-//! Consequence for the estimate: an image contributes only the length of its
-//! surrounding text here, not the ~250 prompt tokens it really costs. The
-//! `last_real_prompt_tokens` feedback path is what absorbs that, and the cap
-//! bounds the error at one image.
+//! `MAX_HISTORY_REPLAY_IMAGES` is what bounds the resulting under-count: at one
+//! replayed image the estimate is short by roughly 250 tokens, not by a
+//! multiple of it.
 
 use std::borrow::Cow;
 
 use super::context_budget::{truncate_head_tail, CompactionProfile, TOOL_RESULT_MAX_CHARS};
+use super::token_counting::PER_MESSAGE_TOKEN_OVERHEAD;
+use crate::models::ports::token_counter::TokenCounter;
 
 /// Floor for the history budget after the overshoot correction. Below roughly
 /// this, a turn carries no usable context at all, and dropping to zero would
@@ -86,8 +96,11 @@ pub fn strip_system_context(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn estimate_tokens(messages: &[TrimMessage]) -> usize {
-    messages.iter().map(|m| m.text.len() / 4 + 4).sum()
+fn estimate_tokens(messages: &[TrimMessage], counter: &dyn TokenCounter) -> usize {
+    messages
+        .iter()
+        .map(|m| counter.count(&m.text) + PER_MESSAGE_TOKEN_OVERHEAD)
+        .sum()
 }
 
 /// Index of the first message of the LAST complete turn (a turn = a user
@@ -102,12 +115,13 @@ fn last_turn_start(messages: &[TrimMessage]) -> usize {
 /// Deterministically trim `messages` to fit within the profile's history
 /// budget. `rolling_summary`, when present, is spliced (or refreshed) as a
 /// summary message at the front. `last_real_prompt_tokens` is the previous
-/// turn's engine-reported prompt size, used to tighten the chars/4 estimate.
+/// turn's engine-reported prompt size, used to tighten `counter`'s estimate.
 pub fn trim_history(
     messages: Vec<TrimMessage>,
     profile: &CompactionProfile,
     rolling_summary: Option<&str>,
     last_real_prompt_tokens: Option<u32>,
+    counter: &dyn TokenCounter,
 ) -> TrimOutcome {
     let mut changed = false;
 
@@ -125,7 +139,7 @@ pub fn trim_history(
     //    declared budget alone already exceeded the window.
     // 2. When the engine's real prompt count for the LAST turn overshot the
     //    usable ceiling, subtract that overshoot. This is measured, not
-    //    estimated, so it corrects the chars/4 approximation in the direction
+    //    estimated, so it corrects the counter's approximation in the direction
     //    that matters and converges within one turn.
     let usable = profile.usable_prompt_tokens();
     let mut budget = if usable > 0 {
@@ -200,7 +214,7 @@ pub fn trim_history(
     //    until within budget.
     let mut dropped_turns = 0usize;
     loop {
-        let estimated = estimate_tokens(&msgs);
+        let estimated = estimate_tokens(&msgs, counter);
         if estimated <= budget {
             break;
         }
@@ -223,7 +237,7 @@ pub fn trim_history(
         changed = true;
     }
 
-    let estimated_tokens = estimate_tokens(&msgs);
+    let estimated_tokens = estimate_tokens(&msgs, counter);
     TrimOutcome {
         messages: msgs,
         dropped_turns,
@@ -258,6 +272,7 @@ pub fn plan_replay(
     messages: Vec<(TrimRole, String)>,
     profile: &CompactionProfile,
     rolling_summary: Option<&str>,
+    counter: &dyn TokenCounter,
 ) -> Vec<TrimMessage> {
     let mut rows: Vec<(TrimRole, String)> = messages
         .into_iter()
@@ -280,12 +295,13 @@ pub fn plan_replay(
             is_summary: false,
         })
         .collect();
-    trim_history(trim_input, profile, rolling_summary, None).messages
+    trim_history(trim_input, profile, rolling_summary, None, counter).messages
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::services::context::token_counting::HeuristicTokenCounter;
 
     fn profile(history_budget: usize) -> CompactionProfile {
         CompactionProfile {
@@ -324,7 +340,7 @@ mod tests {
         assert_eq!(p.usable_prompt_tokens(), 3328);
 
         let msgs: Vec<TrimMessage> = (0..40).map(|i| user(i, &"x".repeat(400))).collect();
-        let out = trim_history(msgs, &p, None, None);
+        let out = trim_history(msgs, &p, None, None, &HeuristicTokenCounter);
         // 1200 <= 3328, so the declared budget still applies here.
         assert!(out.estimated_tokens <= 1200, "got {}", out.estimated_tokens);
     }
@@ -336,7 +352,7 @@ mod tests {
     fn the_reserve_wins_when_it_is_tighter_than_the_declared_budget() {
         let p = profile_reserved(4000, 2048, 768); // usable = 1280
         let msgs: Vec<TrimMessage> = (0..40).map(|i| user(i, &"x".repeat(400))).collect();
-        let out = trim_history(msgs, &p, None, None);
+        let out = trim_history(msgs, &p, None, None, &HeuristicTokenCounter);
         assert!(
             out.estimated_tokens <= 1280,
             "history must fit the usable window, got {}",
@@ -352,9 +368,11 @@ mod tests {
         let p = profile_reserved(1200, 4096, 768); // usable = 3328
         let msgs: Vec<TrimMessage> = (0..40).map(|i| user(i, &"x".repeat(400))).collect();
 
-        let baseline = trim_history(msgs.clone(), &p, None, None).estimated_tokens;
+        let baseline =
+            trim_history(msgs.clone(), &p, None, None, &HeuristicTokenCounter).estimated_tokens;
         // Engine said the last prompt was 3,786 tokens — 458 over the ceiling.
-        let corrected = trim_history(msgs, &p, None, Some(3786)).estimated_tokens;
+        let corrected =
+            trim_history(msgs, &p, None, Some(3786), &HeuristicTokenCounter).estimated_tokens;
         assert!(
             corrected < baseline,
             "overshoot must tighten the budget: {corrected} vs {baseline}"
@@ -368,7 +386,7 @@ mod tests {
     fn the_budget_never_collapses_below_the_floor() {
         let p = profile_reserved(1200, 4096, 768);
         let msgs: Vec<TrimMessage> = (0..40).map(|i| user(i, &"x".repeat(400))).collect();
-        let out = trim_history(msgs, &p, None, Some(100_000));
+        let out = trim_history(msgs, &p, None, Some(100_000), &HeuristicTokenCounter);
         assert!(out.estimated_tokens > 0, "must keep the current turn");
     }
 
@@ -402,7 +420,7 @@ mod tests {
         let wrapped =
             "<system-context>\nToday is X\n</system-context>\n<user-message>hi</user-message>";
         let msgs = vec![user(0, wrapped), assistant(1, "hello"), user(2, wrapped)];
-        let out = trim_history(msgs, &profile(10_000), None, None);
+        let out = trim_history(msgs, &profile(10_000), None, None, &HeuristicTokenCounter);
         assert!(out.changed);
         assert!(!out.messages[0].text.contains("<system-context>"));
         assert!(out.messages[0]
@@ -416,7 +434,7 @@ mod tests {
     fn truncates_oversized_tool_results() {
         let big = format!("START{}END", "x".repeat(TOOL_RESULT_MAX_CHARS + 500));
         let msgs = vec![user(0, "check"), tool(1, &big), assistant(2, "done")];
-        let out = trim_history(msgs, &profile(10_000), None, None);
+        let out = trim_history(msgs, &profile(10_000), None, None, &HeuristicTokenCounter);
         assert!(out.changed);
         assert!(out.messages[1].text.len() < TOOL_RESULT_MAX_CHARS + 64);
         // Head+tail: the conclusion at the end of a tool result survives.
@@ -428,13 +446,25 @@ mod tests {
     #[test]
     fn splices_summary_at_front_and_refreshes_it() {
         let msgs = vec![user(0, "a"), assistant(1, "b")];
-        let out = trim_history(msgs, &profile(10_000), Some("we discussed ducks"), None);
+        let out = trim_history(
+            msgs,
+            &profile(10_000),
+            Some("we discussed ducks"),
+            None,
+            &HeuristicTokenCounter,
+        );
         assert!(out.messages[0].is_summary);
         assert!(out.messages[0].text.contains("<conversation-summary>"));
         assert!(out.messages[0].text.contains("we discussed ducks"));
 
         // Refresh replaces the body, does not duplicate.
-        let out2 = trim_history(out.messages, &profile(10_000), Some("now geese"), None);
+        let out2 = trim_history(
+            out.messages,
+            &profile(10_000),
+            Some("now geese"),
+            None,
+            &HeuristicTokenCounter,
+        );
         let summaries: Vec<_> = out2.messages.iter().filter(|m| m.is_summary).collect();
         assert_eq!(summaries.len(), 1);
         assert!(summaries[0].text.contains("now geese"));
@@ -453,7 +483,7 @@ mod tests {
             user(5, "latest question"),
             assistant(6, "latest answer"),
         ];
-        let out = trim_history(msgs, &profile(100), None, None);
+        let out = trim_history(msgs, &profile(100), None, None, &HeuristicTokenCounter);
         assert_eq!(out.dropped_turns, 2);
         // Whole turns went together: no leading tool/assistant orphans.
         assert_eq!(out.messages.first().unwrap().role, TrimRole::User);
@@ -469,7 +499,7 @@ mod tests {
     fn last_turn_survives_even_over_budget() {
         let huge = "y".repeat(4_000);
         let msgs = vec![user(0, &huge), assistant(1, &huge)];
-        let out = trim_history(msgs, &profile(50), None, None);
+        let out = trim_history(msgs, &profile(50), None, None, &HeuristicTokenCounter);
         assert_eq!(out.messages.len(), 2, "the current turn is never dropped");
     }
 
@@ -482,8 +512,20 @@ mod tests {
             user(2, "q"),
             assistant(3, "a"),
         ];
-        let once = trim_history(msgs, &profile(100), Some("sum"), None);
-        let twice = trim_history(once.messages.clone(), &profile(100), Some("sum"), None);
+        let once = trim_history(
+            msgs,
+            &profile(100),
+            Some("sum"),
+            None,
+            &HeuristicTokenCounter,
+        );
+        let twice = trim_history(
+            once.messages.clone(),
+            &profile(100),
+            Some("sum"),
+            None,
+            &HeuristicTokenCounter,
+        );
         assert!(!twice.changed, "second pass must be a no-op");
         assert_eq!(once.messages.len(), twice.messages.len());
     }
@@ -491,7 +533,7 @@ mod tests {
     #[test]
     fn unchanged_input_reports_changed_false() {
         let msgs = vec![user(0, "hi"), assistant(1, "hello")];
-        let out = trim_history(msgs, &profile(10_000), None, None);
+        let out = trim_history(msgs, &profile(10_000), None, None, &HeuristicTokenCounter);
         assert!(!out.changed);
         assert_eq!(out.dropped_turns, 0);
     }
@@ -507,9 +549,21 @@ mod tests {
             user(2, "q"),
             assistant(3, "a"),
         ];
-        let relaxed = trim_history(msgs.clone(), &profile(300), None, None);
+        let relaxed = trim_history(
+            msgs.clone(),
+            &profile(300),
+            None,
+            None,
+            &HeuristicTokenCounter,
+        );
         assert_eq!(relaxed.dropped_turns, 0);
-        let tightened = trim_history(msgs, &profile(300), None, Some(6144));
+        let tightened = trim_history(
+            msgs,
+            &profile(300),
+            None,
+            Some(6144),
+            &HeuristicTokenCounter,
+        );
         assert!(tightened.dropped_turns > 0);
     }
 
@@ -532,6 +586,7 @@ mod tests {
             ]),
             &profile(10_000),
             None,
+            &HeuristicTokenCounter,
         );
         assert_eq!(out.len(), 2);
         assert_eq!(out[1].role, TrimRole::Assistant);
@@ -542,8 +597,14 @@ mod tests {
     /// nothing at all — hydrating it would only duplicate the current turn.
     #[test]
     fn replay_of_only_user_messages_is_empty() {
-        assert!(plan_replay(rows(&[(TrimRole::User, "hello")]), &profile(10_000), None).is_empty());
-        assert!(plan_replay(vec![], &profile(10_000), None).is_empty());
+        assert!(plan_replay(
+            rows(&[(TrimRole::User, "hello")]),
+            &profile(10_000),
+            None,
+            &HeuristicTokenCounter
+        )
+        .is_empty());
+        assert!(plan_replay(vec![], &profile(10_000), None, &HeuristicTokenCounter).is_empty());
     }
 
     #[test]
@@ -556,6 +617,7 @@ mod tests {
             ]),
             &profile(10_000),
             None,
+            &HeuristicTokenCounter,
         );
         assert_eq!(out.len(), 2);
         assert_eq!(out[1].text, "real");
@@ -573,6 +635,7 @@ mod tests {
             ]),
             &profile(200),
             Some("earlier: the user set up two lamps"),
+            &HeuristicTokenCounter,
         );
         assert!(out[0].is_summary);
         assert!(out[0].text.contains("<conversation-summary>"));
@@ -590,13 +653,18 @@ mod tests {
             (TrimRole::User, "q2"),
             (TrimRole::Assistant, "a2"),
         ]);
-        let first = plan_replay(input.clone(), &profile(10_000), Some("s"));
+        let first = plan_replay(
+            input.clone(),
+            &profile(10_000),
+            Some("s"),
+            &HeuristicTokenCounter,
+        );
         let again: Vec<(TrimRole, String)> = first
             .iter()
             .filter(|m| !m.is_summary)
             .map(|m| (m.role, m.text.clone()))
             .collect();
-        let second = plan_replay(again, &profile(10_000), Some("s"));
+        let second = plan_replay(again, &profile(10_000), Some("s"), &HeuristicTokenCounter);
         assert_eq!(
             first.iter().map(|m| m.text.clone()).collect::<Vec<_>>(),
             second.iter().map(|m| m.text.clone()).collect::<Vec<_>>()

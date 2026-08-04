@@ -21,5 +21,6 @@ pub mod context_compactor;
 pub mod context_governor;
 pub mod context_monitor;
 pub mod image_history;
+pub mod token_counting;
 pub mod turn_budget;
 pub mod turn_trimmer;

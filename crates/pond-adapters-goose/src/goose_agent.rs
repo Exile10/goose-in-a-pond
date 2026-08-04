@@ -11,9 +11,11 @@ use pond_core::models::ports::agent::{
     Agent as AgentPort, AgentRequest, AgentResponse, AgentStreamEvent,
 };
 use pond_core::models::ports::embedding::EmbeddingProvider;
+use pond_core::models::ports::token_counter::TokenCounter as PondTokenCounter;
 use pond_core::models::services::context::context_governor::{
     ContextGovernor, ContextInputs, WindowResolution,
 };
+use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
 use pond_core::models::services::prompt_builder::build_prompt_partition;
 use pond_core::prompts::PromptState;
 use pond_core::user_data::domain::memory::{cosine_similarity, MemoryFragment};
@@ -215,6 +217,12 @@ pub struct GooseAdapter {
     /// Signature of the Goose env knobs currently exported, so `set_var` runs
     /// only when a setting actually changed rather than on every turn.
     last_env_signature: Mutex<String>,
+    /// Token counter for the trim/replay budget paths, built on first use.
+    ///
+    /// `None` inside the cell means construction failed and the caller falls
+    /// back to the chars/4 heuristic — a worse estimate is not a reason to fail
+    /// a turn, and the overshoot-feedback correction still bounds the error.
+    token_counter: tokio::sync::OnceCell<Option<crate::token_counter::TiktokenCounter>>,
     /// The context window last resolved for the active provider/model, with its
     /// provenance.
     ///
@@ -376,6 +384,7 @@ impl GooseAdapter {
             provider_configured_sessions: Mutex::new(HashSet::new()),
             last_thinking_param: Mutex::new(None),
             last_env_signature: Mutex::new(String::new()),
+            token_counter: tokio::sync::OnceCell::new(),
             last_window: Mutex::new(None),
             shim_controls: Arc::new(crate::provider_shim::ShimControls::default()),
             goose_session_map: Mutex::new(HashMap::new()),
@@ -653,7 +662,12 @@ impl GooseAdapter {
 
         // Trailing-user drop, blank filtering, budget cut and summary splice all
         // live in pond-core's `plan_replay` so they are unit-tested there.
-        let planned = plan_replay(rows, &profile, rolling_summary.as_deref());
+        let planned = plan_replay(
+            rows,
+            &profile,
+            rolling_summary.as_deref(),
+            self.token_counter().await,
+        );
         if planned.is_empty() {
             return;
         }
@@ -951,6 +965,33 @@ impl GooseAdapter {
 
     fn effective_context_window(provider: &str, model: &str, override_tokens: u32) -> usize {
         Self::resolve_window(provider, model, override_tokens).tokens
+    }
+
+    /// The token counter the budget paths use.
+    ///
+    /// Prefers the tiktoken-backed counter; falls back to the chars/4 heuristic
+    /// if it cannot be built. Neither is exact for a GGUF model — see
+    /// `crate::token_counter` for what exactness would cost — so the
+    /// overshoot-feedback correction in `turn_trimmer` stays load-bearing
+    /// either way.
+    async fn token_counter(&self) -> &dyn PondTokenCounter {
+        static HEURISTIC: HeuristicTokenCounter = HeuristicTokenCounter;
+        let built = self
+            .token_counter
+            .get_or_init(|| async {
+                match crate::token_counter::TiktokenCounter::new().await {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        tracing::warn!("token counter unavailable, falling back to chars/4: {e}");
+                        None
+                    }
+                }
+            })
+            .await;
+        match built {
+            Some(c) => c,
+            None => &HEURISTIC,
+        }
     }
 
     /// The window the HISTORY budgets should be derived from.
@@ -1545,7 +1586,13 @@ impl GooseAdapter {
             })
             .collect();
 
-        let outcome = trim_history(trim_input, &profile, rolling_summary.as_deref(), last_real);
+        let outcome = trim_history(
+            trim_input,
+            &profile,
+            rolling_summary.as_deref(),
+            last_real,
+            self.token_counter().await,
+        );
 
         // ── Live-history image cap (phase F2, live half) ──────────────────
         //
