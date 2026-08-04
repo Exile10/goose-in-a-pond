@@ -291,7 +291,28 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   unidentified session" today — and the only behaviour-preserving answer, `Household`, is precisely
   the scope-widening default invariant 2 calls a bug. That question belongs to P3, which decides it
   with the paired-device, explicit and face inputs in hand rather than from the stored row alone.
-- **P3 — resolver LANDED 2026-08-04, wiring outstanding.** `user_data/services/identity_resolution.rs`
+- **P3 — LANDED 2026-08-04.** Resolver in `user_data/services/identity_resolution.rs`; resolved once
+  per turn at the API edge by `resolve_turn_scope` and carried on `AgentRequest.profile_scope` into
+  the adapter, which uses it for all three memory searches. `PUT /sessions/{id}/user` added, so
+  `Explicit` finally has a producer.
+
+  **Resolved at the edge, carried down, never recomputed.** Two resolutions of one turn could
+  disagree, and the one nearer the data would silently win. `AgentRequest` was the right channel —
+  `voice_mode` and `canvas_mode` are the same pattern — and the field is non-optional in Rust with
+  no `Default` on the struct, so all **twelve** construction sites had to state a scope. The
+  compiler found one the recon pass had missed (`shared/services/delegation.rs`). Every failure in
+  `resolve_turn_scope` narrows: a storage error reads as unidentified, a profile-count error assumes
+  more than one member.
+
+  **Deliberately not used:** the process-global `set_current_session_id` / `current_session_id` pair
+  (`shared/services/egress.rs`). It is a `RwLock<String>`, not a task-local, and the SSE semaphore
+  permits more than one concurrent stream — so extending it for identity would attribute one
+  speaker's turn to another under load. That is precisely the failure this workstream exists to
+  prevent.
+
+  Original phase text, for the record:
+
+- **P3 (as designed) — resolver LANDED 2026-08-04, wiring outstanding.** `user_data/services/identity_resolution.rs`
   holds the chain as one pure function with `ResolutionInputs` / `ResolvedIdentity`. No call site
   consumes it yet; threading it through `AgentRequest` into `ChatService` is the remaining half.
 

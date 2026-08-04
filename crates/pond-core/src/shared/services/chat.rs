@@ -51,6 +51,7 @@ fn bare_tool_name(tool: &str) -> String {
 /// list. It was duplicated there, and a phrase added here did not work there.
 use pond_voice::control::{classify as classify_voice_command, VoiceCommand};
 
+use crate::user_data::domain::profile::ProfileScope;
 use pond_voice::control::is_control_phrase as is_dismissal_or_exit_phrase;
 
 /// Truncate a tool-result payload to the NDJSON contract's 2000-char cap.
@@ -474,6 +475,12 @@ impl ChatService {
             images: Vec::new(),
             voice_mode: false,
             canvas_mode: false,
+            // Voice is a shared surface and speaker identification does not
+            // exist (PAI-1 section 3.8). Household is what this path has
+            // always done; narrowing it to Guest would silently stop the
+            // assistant answering out loud about anything personal, which is
+            // a product decision and not one to make in a refactor.
+            profile_scope: ProfileScope::Household,
         };
         let response_text = self.agent.chat(request).await?.text;
 
@@ -888,6 +895,8 @@ impl ChatService {
             images: Vec::new(),
             voice_mode: true,
             canvas_mode: false,
+            // Same reasoning as the turn above: no speaker identification.
+            profile_scope: ProfileScope::Household,
         };
 
         // Clear any interrupt left over from the previous turn. Exactly once

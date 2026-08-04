@@ -1710,14 +1710,22 @@ impl GooseAdapter {
     async fn topical_memories(
         &self,
         message: &str,
+        scope: &ProfileScope,
         limit: usize,
     ) -> Vec<(MemoryFragment, Option<f32>)> {
+        // Short-circuit before embedding. A Guest turn can match nothing, and
+        // embedding the message anyway would spend CPU on a query whose only
+        // possible answer is "no rows" -- and would hand the raw utterance to
+        // the embedding provider for no reason.
+        if scope.excludes_everything() {
+            return Vec::new();
+        }
         if let Some(provider) = &self.embedding_provider {
             match provider.embed(message).await {
                 Ok(query_vector) => {
                     match self
                         .memory_repo
-                        .search_similar(&query_vector, &ProfileScope::Household, limit)
+                        .search_similar(&query_vector, scope, limit)
                         .await
                     {
                         Ok(hits) => {
@@ -1748,7 +1756,7 @@ impl GooseAdapter {
         }
         match self
             .memory_repo
-            .search_by_content(&keywords, &ProfileScope::Household, limit)
+            .search_by_content(&keywords, scope, limit)
             .await
         {
             Ok(hits) => hits.into_iter().map(|m| (m, None)).collect(),
@@ -2162,7 +2170,13 @@ impl GooseAdapter {
         // truncates in Rust — so a bigger limit is the same query and the same
         // arithmetic. Nothing downstream changes: the injection cap and the
         // token budget still decide what actually reaches the prompt.
-        let memory_limit = if settings.agent_memory_inject {
+        // PAI-1 P5: an unidentified speaker gets no memory injection at all.
+        // Gating here rather than at the queries means the whole fetch, rank
+        // and render pipeline is skipped, and it costs nothing in KV prefix --
+        // memories ride the user message's <system-context>, never the system
+        // prefix (see the comment at the block assembly below).
+        let turn_scope = request.profile_scope.clone();
+        let memory_limit = if settings.agent_memory_inject && turn_scope.allows_personal_data() {
             Some(settings.agent_memory_limit as usize)
         } else {
             None
@@ -2185,11 +2199,7 @@ impl GooseAdapter {
             // Recent memories (recency-based)
             async {
                 match candidate_limit {
-                    Some(limit) => {
-                        self.memory_repo
-                            .search_recent(&ProfileScope::Household, limit)
-                            .await
-                    }
+                    Some(limit) => self.memory_repo.search_recent(&turn_scope, limit).await,
                     None => Ok(vec![]),
                 }
             },
@@ -2198,7 +2208,10 @@ impl GooseAdapter {
             // and it happens inside this join! so it overlaps the other fetches.
             async {
                 match candidate_limit {
-                    Some(limit) => self.topical_memories(&request.message, limit).await,
+                    Some(limit) => {
+                        self.topical_memories(&request.message, &turn_scope, limit)
+                            .await
+                    }
                     None => vec![],
                 }
             },
@@ -4703,6 +4716,7 @@ mod tests {
             images: Vec::new(),
             voice_mode: false,
             canvas_mode: false,
+            profile_scope: ProfileScope::Household,
         };
 
         let mut stream = adapter.chat_stream(request).await.unwrap();

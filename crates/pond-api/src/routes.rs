@@ -42,6 +42,7 @@ use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::ports::device_registry::RegisterDeviceRequest;
 use pond_core::user_data::ports::scheduler::{CreateScheduleRequest, UpdateScheduleRequest};
 use pond_core::user_data::ports::session_storage::SessionStorageError;
+use pond_core::user_data::services::identity_resolution;
 use pond_core::user_data::services::onboarding::OnboardingService;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -307,7 +308,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route(
             "/sessions/{session_id}/user",
-            get(get_session_user_handler).delete(clear_session_user_handler),
+            get(get_session_user_handler)
+                .put(set_session_user_handler)
+                .delete(clear_session_user_handler),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -1362,6 +1365,7 @@ fn chat_stream_inner(
             images: req.images.clone(),
             voice_mode: req.voice_mode,
             canvas_mode: req.canvas_mode,
+            profile_scope: resolve_turn_scope(&state, &session_id).await,
         };
 
         let mut full_text = String::new();
@@ -7165,6 +7169,10 @@ async fn agent_chat_stream(
         let mut full_text = String::new();
         let mut tool_results: Vec<String> = Vec::new();
 
+        // Resolved here, not before the stream: this route creates the session
+        // row inside the stream body, so resolving earlier would read the
+        // identity of a session that does not exist yet and miss a binding
+        // written by PUT /sessions/{id}/user against a freshly minted id.
         let request = AgentRequest {
             message,
             session_id: session_id.clone(),
@@ -7172,6 +7180,7 @@ async fn agent_chat_stream(
             images,
             voice_mode: false,
             canvas_mode: false,
+            profile_scope: resolve_turn_scope(&state, &session_id).await,
         };
 
         let mut agent_stream = match agent.chat_stream(request).await {
@@ -11224,6 +11233,52 @@ async fn delete_user_biometrics(
     })))
 }
 
+/// Work out whose turn this is, once, at the edge.
+///
+/// PAI-1 P3. Called before the agent stream starts so the verdict can ride
+/// `AgentRequest` down rather than be recomputed nearer the data, where a
+/// second resolution could disagree with the first and the deeper one would
+/// silently win.
+///
+/// Every failure here narrows rather than widens. A session-storage error
+/// resolves as if nothing were bound, and a profile-list error is treated as
+/// "there may be more than one member" -- both give the more restrictive
+/// answer, per invariant 2.
+async fn resolve_turn_scope(state: &Arc<AppState>, session_id: &str) -> ProfileScope {
+    let identity = state
+        .session_storage
+        .get_session_identity(session_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                session_id,
+                "could not read session identity; treating the speaker as unidentified"
+            );
+            SessionIdentity::unknown()
+        });
+
+    let household_has_multiple_members = match state.profile_repo.list().await {
+        Ok(profiles) => profiles.len() > 1,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not count household members; assuming more than one"
+            );
+            true
+        }
+    };
+
+    identity_resolution::resolve(&identity_resolution::ResolutionInputs {
+        // No rung to resolve from: nothing links a paired device to a member.
+        // See identity_resolution's module docs.
+        paired_device_profile: None,
+        session: &identity,
+        household_has_multiple_members,
+    })
+    .scope
+}
+
 /// Map a session-storage failure from an identity write onto a status code.
 ///
 /// Only a genuinely missing session is a 404. Everything else -- a locked
@@ -11317,6 +11372,80 @@ async fn identify_session_user_handler(
         "confidence": result.confidence,
         "threshold":  face.match_threshold(),
         "bound":      bound,
+    })))
+}
+
+/// Body of `PUT /api/v1/sessions/:session_id/user`.
+#[derive(Debug, Deserialize)]
+struct SetSessionUserRequest {
+    profile_id: String,
+}
+
+/// PUT /api/v1/sessions/:session_id/user — say who is talking.
+///
+/// The deliberate counterpart to the wake-on-face hook: a household member
+/// picking themselves in the UI, or telling the assistant "this is Liz". That
+/// is stronger evidence than a face match and weaker than a device that signed
+/// the request, and [`IdentificationSource::Explicit`] records exactly that.
+///
+/// Without this route `Explicit` had no producer at all, so the resolution
+/// chain in `identity_resolution` could only ever reach its face rung.
+async fn set_session_user_handler(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Json(req): Json<SetSessionUserRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if req.profile_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "profile_id is required"})),
+        ));
+    }
+
+    // Same read-compare-write as the face path, and the same reason: a person
+    // saying who they are must not silently displace a device that proved it.
+    // A failed read refuses the write rather than assuming nobody is bound.
+    let existing = state
+        .session_storage
+        .get_session_identity(&session_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+
+    let proposed = SessionIdentity {
+        profile_id: Some(req.profile_id.clone()),
+        source: IdentificationSource::Explicit,
+        // Explicit identification carries no confidence. It is not "1.0" -- it
+        // is a different kind of claim, and a number invites averaging it
+        // against a face score.
+        confidence: None,
+    };
+
+    if !proposed.supersedes(&existing) {
+        return Ok(Json(json!({
+            "session_id": session_id,
+            "profile_id": existing.profile_id,
+            "identification_source": existing.source.as_str(),
+            "bound": false,
+            "reason": "a stronger identification already holds this session",
+        })));
+    }
+
+    state
+        .session_storage
+        .set_session_identity(&session_id, &proposed)
+        .await
+        .map_err(identity_write_error)?;
+
+    Ok(Json(json!({
+        "session_id": session_id,
+        "profile_id": req.profile_id,
+        "identification_source": IdentificationSource::Explicit.as_str(),
+        "bound": true,
     })))
 }
 
