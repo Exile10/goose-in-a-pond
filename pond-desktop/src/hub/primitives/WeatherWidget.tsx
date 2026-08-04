@@ -2,6 +2,7 @@ import { HubIco } from "./HubIco";
 import { HP_PATHS } from "./icons";
 import { sunEl } from "./HubIco";
 import { useHomeData } from "../state/hubDataStore";
+import { useNow } from "../state/useNow";
 
 interface WeatherWidgetProps {
   variant?: "card" | "hero";
@@ -43,7 +44,10 @@ export function dayPhaseFor(sunrise: string, sunset: string, now = new Date()): 
 
 export function WeatherWidget({ variant = "card" }: WeatherWidgetProps) {
   const w = useHomeData().weather;
-  const phase = dayPhaseFor(w.sunrise, w.sunset);
+  // Ticked rather than read once, so the card crosses into dusk/night on its
+  // own on a dashboard that is never reloaded.
+  const now = useNow();
+  const phase = dayPhaseFor(w.sunrise, w.sunset, now);
 
   return (
     <div className={`wx wx--${variant} wx--${phase}`}>

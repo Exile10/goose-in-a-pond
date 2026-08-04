@@ -89,9 +89,6 @@ export interface TodoItem {
 
 export interface HomeData {
   user: string;
-  time: string;
-  ampm: string;
-  date: string;
   weather: WeatherData;
   rooms: RoomData[];
   devices: DeviceData[];
@@ -105,9 +102,6 @@ export interface HomeData {
 
 export const HOME: HomeData = {
   user: "Jerry",
-  time: "8:50",
-  ampm: "AM",
-  date: "Monday, June 1",
   weather: {
     temp: 64,
     cond: "Partly cloudy",
