@@ -1133,3 +1133,101 @@ async fn reading_the_user_of_an_unknown_session_is_ok_and_says_nobody() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["profile_id"], serde_json::Value::Null);
 }
+
+/// `Explicit` had no producer before this route existed, so the resolution
+/// chain could only ever reach its face rung.
+#[tokio::test]
+async fn a_member_can_say_who_they_are_and_it_sticks() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+    let jerry = seed_profile(&app, "Jerry").await;
+
+    let body = body_json(
+        app.clone()
+            .oneshot(put(
+                "/api/v1/sessions/sess-1/user",
+                serde_json::json!({ "profile_id": jerry }),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["bound"], true);
+    assert_eq!(body["identification_source"], "explicit");
+
+    let identity = storage.get_session_identity("sess-1").await.unwrap();
+    assert_eq!(identity.profile_id.as_deref(), Some(jerry.as_str()));
+    assert_eq!(identity.source, IdentificationSource::Explicit);
+    assert_eq!(
+        identity.confidence, None,
+        "an explicit claim is not a confidence score"
+    );
+}
+
+/// The strength rule, over HTTP. Somebody typing a name must not displace a
+/// device that proved who it was.
+#[tokio::test]
+async fn saying_who_you_are_cannot_displace_a_paired_device() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+    let jerry = seed_profile(&app, "Jerry").await;
+    let liz = seed_profile(&app, "Liz").await;
+
+    storage
+        .set_session_identity(
+            "sess-1",
+            &SessionIdentity {
+                profile_id: Some(jerry.clone()),
+                source: IdentificationSource::PairedDevice,
+                confidence: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let body = body_json(
+        app.oneshot(put(
+            "/api/v1/sessions/sess-1/user",
+            serde_json::json!({ "profile_id": liz }),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(body["bound"], false);
+
+    let identity = storage.get_session_identity("sess-1").await.unwrap();
+    assert_eq!(
+        identity.profile_id.as_deref(),
+        Some(jerry.as_str()),
+        "the paired-device binding must survive"
+    );
+    assert_eq!(identity.source, IdentificationSource::PairedDevice);
+}
+
+#[tokio::test]
+async fn identifying_a_session_that_does_not_exist_is_404() {
+    let (app, _storage, _tmp) = make_app_with_sessions().await;
+    let resp = app
+        .oneshot(put(
+            "/api/v1/sessions/no-such-session/user",
+            serde_json::json!({ "profile_id": "whoever" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn an_empty_profile_id_is_rejected() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+    let resp = app
+        .oneshot(put(
+            "/api/v1/sessions/sess-1/user",
+            serde_json::json!({ "profile_id": "  " }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}

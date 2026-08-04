@@ -9,6 +9,7 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use pond_core::models::ports::agent::Agent;
 use pond_core::shared::domain::agent::AgentRequest;
+use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::domain::schedule::{TaskKind, TriggerAction};
 use pond_core::user_data::ports::device_control::DeviceControlPort;
 use pond_core::user_data::ports::schedule_execution::ScheduleExecutor;
@@ -64,6 +65,13 @@ impl AgentScheduleExecutor {
             images: vec![],
             voice_mode: false,
             canvas_mode: false,
+            // A scheduled task has no speaker to identify -- nobody is in the
+            // room. It inherits nothing: an explicit Household scope, because
+            // a reminder the household set up is household context. Per-member
+            // schedules would need an owner on the schedule itself, which does
+            // not exist (there is no schedules table at all; the scheduler is
+            // in-process).
+            profile_scope: ProfileScope::Household,
         };
 
         tracing::info!("[scheduler] executing prompt for task {task_id}");

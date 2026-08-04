@@ -6322,6 +6322,10 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 images: Vec::new(),
                 voice_mode: false,
                 canvas_mode: false,
+                // Local CLI on the device itself. Whoever ran it has shell
+                // access to the pond already, so a narrower scope would be
+                // theatre rather than a boundary.
+                profile_scope: ProfileScope::Household,
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -6386,6 +6390,8 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     images: Vec::new(),
                     voice_mode: false,
                     canvas_mode: false,
+                    // Same as the single-shot arm above.
+                    profile_scope: ProfileScope::Household,
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");

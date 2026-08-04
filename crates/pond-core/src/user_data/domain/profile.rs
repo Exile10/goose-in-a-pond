@@ -45,7 +45,8 @@ pub struct Profile {
 /// [`Household`](Self::Household), whose SQL is byte-identical to the old
 /// `None` branch. Nothing changes behaviourally until the resolution chain lands
 /// in P3 and enforcement in P4.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProfileScope {
     /// A specific household member, plus unattributed shared rows.
     Owner(String),
@@ -56,6 +57,14 @@ pub enum ProfileScope {
 }
 
 impl ProfileScope {
+    /// Named constructor for `serde(default)` attributes.
+    ///
+    /// Only for deserializing a payload written before a scope field existed.
+    /// Never reach for this in Rust code -- state the scope you mean.
+    pub fn household() -> Self {
+        ProfileScope::Household
+    }
+
     /// The profile id to filter on, when the scope narrows to one person.
     ///
     /// `Household` and `Guest` both return `None`, for opposite reasons —
@@ -127,5 +136,46 @@ mod profile_scope_tests {
         let owner = ProfileScope::Owner("jerry".into());
         assert!(!owner.excludes_everything());
         assert!(owner.allows_personal_data());
+    }
+}
+
+#[cfg(test)]
+mod scope_gating_tests {
+    use super::*;
+
+    /// The predicate the adapter's memory-injection gate is written against
+    /// (`goose_agent.rs`, `memory_limit`). Pinned here because that gate is a
+    /// boolean `&&` in a crate whose tests cannot construct a live turn, so
+    /// this is where the meaning is defended.
+    #[test]
+    fn only_a_guest_is_denied_personal_data() {
+        assert!(ProfileScope::Owner("jerry".into()).allows_personal_data());
+        assert!(ProfileScope::Household.allows_personal_data());
+        assert!(!ProfileScope::Guest.allows_personal_data());
+    }
+
+    /// A scope must survive a serialization round trip unchanged, because it
+    /// rides `AgentRequest` which is `Serialize`/`Deserialize`. A variant that
+    /// silently widened across that boundary would be undetectable.
+    #[test]
+    fn every_scope_round_trips_through_serde() {
+        for scope in [
+            ProfileScope::Owner("jerry".into()),
+            ProfileScope::Household,
+            ProfileScope::Guest,
+        ] {
+            let json = serde_json::to_string(&scope).expect("scope must serialize");
+            let back: ProfileScope = serde_json::from_str(&json).expect("scope must deserialize");
+            assert_eq!(back, scope, "round trip changed the scope: {json}");
+        }
+    }
+
+    /// The serde default exists only for payloads written before the field did.
+    /// It reproduces the pre-PAI-1 behaviour, and this pins that it has not
+    /// drifted into something narrower (which would break old requests) or
+    /// wider (there is nothing wider).
+    #[test]
+    fn the_serde_default_is_the_pre_pai1_behaviour() {
+        assert_eq!(ProfileScope::household(), ProfileScope::Household);
     }
 }

@@ -132,6 +132,7 @@ mod tests {
             images: vec![],
             voice_mode: false,
             canvas_mode: false,
+            profile_scope: crate::user_data::domain::profile::ProfileScope::Household,
         }
     }
 

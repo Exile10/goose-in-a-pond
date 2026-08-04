@@ -1,3 +1,4 @@
+use crate::user_data::domain::profile::ProfileScope;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -18,6 +19,21 @@ pub struct AgentRequest {
     /// render as visual cards on the user's screen.
     #[serde(default)]
     pub canvas_mode: bool,
+    /// Whose data this turn may reach.
+    ///
+    /// Resolved once, at the edge, by
+    /// [`identity_resolution::resolve`](crate::user_data::services::identity_resolution::resolve),
+    /// and carried down rather than recomputed -- two resolutions of one turn
+    /// could disagree, and the one nearer the data would win.
+    ///
+    /// There is **no `Default` on `AgentRequest`** and this field is not
+    /// optional in Rust, so every construction site has to say what it means.
+    /// That is deliberate: a scope is an authorisation decision, and the
+    /// compile error when a new caller appears is the review. The serde default
+    /// exists only so a request serialized before this field existed still
+    /// deserializes, and it reproduces the pre-PAI-1 behaviour exactly.
+    #[serde(default = "ProfileScope::household")]
+    pub profile_scope: ProfileScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,5 +348,61 @@ mod ndjson_golden_tests {
         // The embedded newline in content must be escaped, not literal.
         assert!(!line.contains('\n'), "line had a raw newline: {line:?}");
         assert!(line.contains("\\n"));
+    }
+}
+
+#[cfg(test)]
+mod agent_request_scope_tests {
+    use super::*;
+
+    fn request(scope: ProfileScope) -> AgentRequest {
+        AgentRequest {
+            message: "what did I say about the boiler".to_string(),
+            session_id: "s1".to_string(),
+            model_role: "chat".to_string(),
+            images: Vec::new(),
+            voice_mode: false,
+            canvas_mode: false,
+            profile_scope: scope,
+        }
+    }
+
+    /// The scope must survive the trip from the API edge to the adapter. It is
+    /// resolved once, at the edge, precisely so nothing downstream re-derives
+    /// it -- a second resolution could disagree and the deeper one would win.
+    #[test]
+    fn the_scope_survives_a_serde_round_trip() {
+        for scope in [
+            ProfileScope::Owner("jerry".into()),
+            ProfileScope::Household,
+            ProfileScope::Guest,
+        ] {
+            let json = serde_json::to_string(&request(scope.clone())).unwrap();
+            let back: AgentRequest = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.profile_scope, scope);
+        }
+    }
+
+    /// A request serialized before this field existed must still deserialize,
+    /// and must land on the behaviour that release had -- unfiltered household
+    /// access. Anything narrower would silently break stored payloads; there is
+    /// nothing wider.
+    #[test]
+    fn a_payload_from_before_the_field_existed_still_deserializes() {
+        let legacy = r#"{"message":"hi","session_id":"s1","model_role":"chat"}"#;
+        let parsed: AgentRequest = serde_json::from_str(legacy).expect("legacy payload must parse");
+        assert_eq!(parsed.profile_scope, ProfileScope::Household);
+    }
+
+    /// A guest turn must not be able to reach personal data. This is the single
+    /// bit the adapter's memory gate reads.
+    #[test]
+    fn a_guest_request_denies_personal_data() {
+        assert!(!request(ProfileScope::Guest)
+            .profile_scope
+            .allows_personal_data());
+        assert!(request(ProfileScope::Household)
+            .profile_scope
+            .allows_personal_data());
     }
 }
