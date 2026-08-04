@@ -6326,6 +6326,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 // access to the pond already, so a narrower scope would be
                 // theatre rather than a boundary.
                 profile_scope: ProfileScope::Household,
+                profile_context: None,
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -6392,6 +6393,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     canvas_mode: false,
                     // Same as the single-shot arm above.
                     profile_scope: ProfileScope::Household,
+                    profile_context: None,
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");

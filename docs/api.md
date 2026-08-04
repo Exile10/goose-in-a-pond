@@ -933,7 +933,83 @@ Merges preference keys into the profile. Existing keys not in the request are pr
 
 ### DELETE /profiles/{id}
 
-**Response 204** — no body
+Removes a household member and reports what went with them.
+
+**Response 200**
+```json
+{
+  "profile_id": "8133c258-3392-4f0e-ba36-3d28a51f23a4",
+  "display_name": "Liz",
+  "deleted":  { "memories": 42, "face_embeddings": 3 },
+  "released": { "sessions": 7 },
+  "cleared_primary_profile": false
+}
+```
+
+`deleted` and `released` are separate on purpose. Memories and face embeddings
+are removed (`ON DELETE CASCADE`). Sessions are **released** — the conversation
+survives, stripped of its attribution, because a conversation is not solely the
+speaker's. Household-scoped memories (`profile_id IS NULL`) are shared context
+and are never counted or removed.
+
+`cleared_primary_profile` is `true` when this member was `settings.primary_profile_id`,
+which is cleared before the delete so it cannot dangle.
+
+**Response 404** — no such profile.
+
+---
+
+## Session identity
+
+Who a chat session belongs to, and on what evidence. `identification_source` is
+one of `paired_device`, `explicit`, `face`, `unknown`, in descending order of
+strength — a weaker source may never take over a session a stronger one bound.
+
+### GET /sessions/{id}/user
+
+**Response 200** — an unidentified or unknown session reports nobody rather than
+erroring; "whose session is this" has a correct answer for a session that does
+not exist.
+```json
+{
+  "session_id": "sess-1",
+  "profile_id": null,
+  "identification_source": "unknown",
+  "confidence": null
+}
+```
+`confidence` is set only for `face`.
+
+### PUT /sessions/{id}/user
+
+Explicit identification — the member picked themselves, or said who they are.
+
+**Request** `{ "profile_id": "..." }`
+
+**Response 200** — `bound` is `false`, with the existing binding returned
+unchanged, when a stronger source already holds the session.
+```json
+{ "session_id": "sess-1", "profile_id": "...", "identification_source": "explicit", "bound": true }
+```
+
+**Response 400** — empty `profile_id`. **404** — no such session.
+
+### DELETE /sessions/{id}/user
+
+Releases the binding. `cleared` reports whether there was one.
+
+**Response 200** `{ "session_id": "sess-1", "cleared": true }` · **404** — no such session.
+
+### POST /sessions/{id}/identify-user
+
+Wake-on-face. Same multipart payload as `/faces/identify`, plus optional `bbox`.
+
+**Response 200** — `bound` is `false` when the match would downgrade a stronger
+binding, or when `identified` is `false`.
+```json
+{ "session_id": "sess-1", "identified": true, "profile_id": "...",
+  "confidence": 0.62, "threshold": 0.5, "bound": true }
+```
 
 ---
 

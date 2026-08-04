@@ -72,6 +72,8 @@ impl AgentScheduleExecutor {
             // not exist (there is no schedules table at all; the scheduler is
             // in-process).
             profile_scope: ProfileScope::Household,
+            // Nobody is in the room for a scheduled task.
+            profile_context: None,
         };
 
         tracing::info!("[scheduler] executing prompt for task {task_id}");

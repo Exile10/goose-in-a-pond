@@ -19,7 +19,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 1 | GIAP needs to be **proactive**, not just reactive | [PAI-7](./07-proactive-intelligence.md) | DESIGNED |
 | 2 | Requires the ability of the model to **think** | [PAI-5](./05-reasoning-and-thinking.md) | DESIGNED |
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
-| 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **P1, P2, P3, P7, P8 LANDED**; P5 half in; P4, P6 designed |
+| 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **P1, P2, P3, P6, P7, P8 LANDED**; P4/P5 part-landed with a named hole |
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2 LANDED**; P3-P6 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
@@ -29,8 +29,8 @@ They are equally weighted and mutually interdependent. `DESIGNED` means the docu
 current-state claims were verified against code; it does **not** mean any code has changed. `LANDED`
 is stamped per phase, and means the gates in 2.3 were run and passed.
 
-Implementation has begun: PAI-3 P1/P2 and PAI-1 P1/P2/P3/P7/P8 are in, with P5 half done.
-Everything else is still design only.
+Implementation has begun: PAI-3 P1/P2 and PAI-1 P1/P2/P3/P6/P7/P8 are in; P4 and P5 are part-landed
+with a named, unfixed hole each (see section 4). Everything else is still design only.
 
 ---
 
@@ -456,7 +456,51 @@ loudly and exposed it. That is three vacuous-test incidents in this programme; t
 an assertion that holds trivially when the setup is wrong. Assert the *positive* case too --
 "alice owns at least one row" -- not only the boundary.
 
-### Next: PAI-1 P4 (enforcement) and P6 (profile context), then PAI-3 P3
+**2026-08-04 (evening) — an audit agent found the defect the whole workstream turned on.**
+
+I ran two read-only agents: one adversarial review of the five landed commits, one sweep for client
+breakage. The review found something that invalidated a claim I had been making all session.
+
+**`ProfileScope::Owner` was a no-op in production.** Every memory write path set `profile_id: None`,
+so `scope_sql`'s `Owner(id)` predicate matched exactly the same rows as `Household`. Only `Guest`
+restricted anything. All the read-side scoping in P1 and P3 was real plumbing with nothing flowing
+through it -- resolve a session to Liz, ask what Jerry said, and you would get it.
+
+**No test caught it, and the reason generalises.** The fixtures that produce an owned row set
+`profile_id` by hand -- a state no production code path could reach. A test whose *fixture* is
+unreachable tests a system that does not exist. Worth adding to 2.2: ask not only "does this assert
+the right thing" but "could production ever produce this input".
+
+Fixed: extraction stamps the owner from the turn's scope and refuses to write for a `Guest`. Three
+tests assert it end to end, including that a `Household` turn stays unattributed so shared context
+survives a member's deletion.
+
+**Other findings acted on:** `POST /chat` never resolved a scope at all, so the same speaker got
+different answers from `/chat` and `/chat/stream` -- and my comment there wrongly blamed voice.
+`delete_profile` used `unwrap_or_default()` on the settings read, so a read failure meant the
+dangling `primary_profile_id` was never cleared and the delete proceeded anyway; both failure paths
+now abort. Four vacuous tests removed or strengthened, including one asserting that a function whose
+body is `ProfileScope::Household` returns `ProfileScope::Household`.
+
+**Findings recorded but NOT fixed**, both written into PAI-1's phase list:
+
+- The `giap-memory` MCP tools bypass the scope entirely -- including `forget_memory`, which deletes.
+  A guest gets no memories injected and can still have the model recall or destroy everything.
+- A real TOCTOU between `PUT /sessions/{id}/user` and `POST /identify-user`: both read `Unknown`,
+  both pass `supersedes`, and the later write wins regardless of rank. My comment claimed the only
+  loser was a competing face match on the same frame. That understated it.
+
+**The SIGILL landmine is real and I hit it.** `pond-api`'s test binary died with `signal: 4, SIGILL`
+after a rebuild -- the `target-cpu=native` artifact problem CLAUDE.md documents for CI. `RUSTFLAGS=""`
+fixes it and is now what I use for every gate, matching `ci.yml`. It costs a one-time rebuild of the
+goose rlib. Do not diagnose this as a code fault.
+
+**Client breakage check: none.** `pond-desktop` never calls profile-delete or any of the
+`/sessions/{id}/user` routes, and its API client already handles both 204 and 200-with-body. The
+breakage is documentation only -- `docs/api.md` still specifies `204 no body` for profile delete and
+documents none of the four session-identity routes.
+
+### Next: PAI-4's deny matrix, the MCP memory bypass, and the identity TOCTOU
 
 `TokenCounter` port, GGUF-backed adapter, chars/4 as the declared fallback, overshoot-feedback
 correction retained as the safety net. `turn_trimmer.rs:89-91` is the estimator to displace, and

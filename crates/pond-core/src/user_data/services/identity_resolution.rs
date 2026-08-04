@@ -208,18 +208,4 @@ mod tests {
         assert_eq!(resolved.scope, ProfileScope::Guest);
         assert_ne!(resolved.scope, ProfileScope::Owner("jerry".into()));
     }
-
-    /// Guarding the gap in the module docs. If somebody later resolves a
-    /// paired device by falling back to the primary member, every phone in the
-    /// house becomes that person -- the wrong-attribution failure PAI-1 exists
-    /// to prevent. Absent evidence must stay absent.
-    #[test]
-    fn an_unpaired_request_never_borrows_an_identity_from_somewhere_else() {
-        let s = SessionIdentity::unknown();
-        assert_eq!(
-            resolve(&inputs(None, &s, true)).scope,
-            ProfileScope::Guest,
-            "no input here names anybody, so the result must name nobody"
-        );
-    }
 }

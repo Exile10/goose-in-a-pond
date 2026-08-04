@@ -1268,7 +1268,12 @@ async fn deleting_a_member_reports_what_went_and_what_stayed() {
     // Sessions are RELEASED, never deleted -- a conversation is not solely the
     // speaker's. Reporting it under "deleted" would misdescribe what happened.
     assert_eq!(body["released"]["sessions"], 1);
-    assert_eq!(body["deleted"]["memories"], 0);
+    // Deliberately no equality assertion here: this fixture wires
+    // MockMemoryRepository, which does not override `count_for_profile`, so it
+    // returns the port default of 0 whatever the state. Asserting 0 would pass
+    // against a repository that cannot answer. The real count is covered in
+    // pond-infra, against SQL.
+    assert!(body["deleted"]["memories"].is_number());
 
     // and the session itself survived, unattributed
     let identity = storage.get_session_identity("sess-1").await.unwrap();
@@ -1350,4 +1355,68 @@ async fn deleting_someone_else_does_not_touch_the_primary_setting() {
 
     let settings = body_json(app.oneshot(get("/api/v1/settings")).await.unwrap()).await;
     assert_eq!(settings["primary_profile_id"], jerry);
+}
+
+// ── Profile context follows the speaker (PAI-1 P6) ───────────────────────────
+
+/// Before P6 the built prompt was bound as `_system_prompt` and the adapter
+/// passed `None`, so nothing profile-derived reached the model on either engine
+/// path. These assert the resolution that now feeds it.
+#[tokio::test]
+async fn profile_context_follows_the_identified_member_not_the_primary() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+
+    let jerry = seed_profile(&app, "Jerry").await;
+    let liz = seed_profile(&app, "Liz").await;
+    for (id, name) in [(&jerry, "Jay"), (&liz, "Lizzie")] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/api/v1/profiles/{id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(
+                            &serde_json::json!({ "preferences": { "preferred_name": name } }),
+                        )
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "preference write failed");
+    }
+
+    // Jerry is primary, but Liz is the one talking.
+    app.clone()
+        .oneshot(put(
+            "/api/v1/settings",
+            serde_json::json!({ "primary_profile_id": jerry }),
+        ))
+        .await
+        .unwrap();
+    app.clone()
+        .oneshot(put(
+            "/api/v1/sessions/sess-1/user",
+            serde_json::json!({ "profile_id": liz }),
+        ))
+        .await
+        .unwrap();
+
+    // The session resolves to Liz, which is what the prompt will be built from.
+    let body = body_json(
+        app.oneshot(get("/api/v1/sessions/sess-1/user"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        body["profile_id"], liz,
+        "the session must resolve to the member who identified, not the primary one"
+    );
+    assert_ne!(body["profile_id"], jerry);
 }

@@ -169,13 +169,4 @@ mod scope_gating_tests {
             assert_eq!(back, scope, "round trip changed the scope: {json}");
         }
     }
-
-    /// The serde default exists only for payloads written before the field did.
-    /// It reproduces the pre-PAI-1 behaviour, and this pins that it has not
-    /// drifted into something narrower (which would break old requests) or
-    /// wider (there is nothing wider).
-    #[test]
-    fn the_serde_default_is_the_pre_pai1_behaviour() {
-        assert_eq!(ProfileScope::household(), ProfileScope::Household);
-    }
 }

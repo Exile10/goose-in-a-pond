@@ -27,7 +27,7 @@ use crate::user_data::domain::settings::Settings;
 
 /// Relevant per-user profile preferences to inject into the system prompt.
 /// Extracted from `Profile.preferences` by the API layer.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProfileContext {
     /// What the user wants to be called (e.g. "Jerry", "Captain").
     pub preferred_name: Option<String>,
