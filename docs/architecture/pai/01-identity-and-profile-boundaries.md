@@ -91,12 +91,29 @@ makes P3 able to consult it on the chat path. No consumer exists yet; the map's 
 persistent is not the same as it being *used*, and this document does not claim otherwise until P3
 lands.
 
-### 1.5 Only one profile reaches the model
+### 1.5 No profile reaches the model at all
 
-`routes.rs:1191-1205` builds a `ProfileContext { preferred_name, birthday, language,
-atypical_speech }` from `settings.primary_profile_id` alone, rendered by `prompts.rs:1059-1103` and
-`models/services/prompt_builder.rs:148-179`. Other household members never influence the prompt,
-and the primary member's context is used even when someone else is talking.
+*(Corrected 2026-08-04. The original claim -- that the primary member's context reaches the prompt
+and other members' does not -- was too generous by one step.)*
+
+`chat_stream_inner` does build a `ProfileContext { preferred_name, birthday, language,
+atypical_speech }` from `settings.primary_profile_id`. It then binds the resulting prompt as
+`let mut _system_prompt` -- underscore-prefixed, deliberately unused -- and `AgentRequest` has no
+system-prompt field, so the agent builds its own. On the adapter side,
+`build_prompt_partition(&settings, None, ...)` passes `None` for the profile, with a TODO saying to
+wire it "when profile port is available".
+
+So **nothing profile-derived reaches the model on either engine path.** The renderers are real, the
+guard test `profile_context_goes_to_dynamic_suffix` is real, and neither is reachable from a live
+turn. `build_system_prompt_from_template_with_profile` has zero call sites anywhere.
+
+That makes P6 "wire it at all", not "switch its source".
+
+**The placement invariant does hold**, which is the good news: profile context and memories both
+ride the user message's `<system-context>` block, never the system prefix, so switching speakers
+mid-session costs no re-prefill. One latent risk -- `atypical_speech` is injected into the Tera
+context used to render the *static prefix*, so a template that ever wrote `{% if atypical_speech %}`
+would bake one profile bit into `prefix_hash`. No template does today.
 
 ### 1.6 Face recognition is real; speaker identification is not
 
@@ -343,9 +360,28 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   `SecurityPolicy::allow` + `::audit`, denied by default.
 - **P5** Guest degradation: memory injection, tool groups and draft rights gated.
 - **P6** `ProfileContext` from the session's profile; primary becomes the fallback.
-- **P7** Cascade delete with per-category counts.
-- **P8** Backfill: existing rows with `profile_id IS NULL` are treated as `Household`, not as the
-  primary member's. Conservative by design — a wrong attribution is worse than a shared one.
+- **P7 — LANDED 2026-08-04, narrower than designed.** `DELETE /profiles/{id}` now checks existence
+  (it returned 204 for an id that never existed, which made "did I delete the right person"
+  unanswerable), counts before deleting, and reports per category. Sessions are reported under
+  `released`, not `deleted` — a conversation is not solely the speaker's.
+
+  **The design's "cascade drafts and schedules" cannot be built.** `drafts` has no owner column at
+  all — it is keyed by `session_id` with no foreign key — and **there is no `schedules` table**; the
+  scheduler is `tokio-cron-scheduler`, in-process. Both would need an owner adding first.
+
+  **One real bug fixed on the way.** `settings.primary_profile_id` is a key-value row, not a foreign
+  key, so no cascade can reach it. Deleting the primary member left an id pointing at nobody — and
+  the single production reader silently got `None` from the lookup, so the dangling reference never
+  surfaced. It is cleared before the delete now, with a test in each direction.
+- **P8 — LANDED 2026-08-04 as a no-op, deliberately.** The semantics this phase asked for are
+  already what `scope_sql` does: `Owner(id)` matches `profile_id = ? OR profile_id IS NULL`, so a
+  legacy row reads as shared household context, and `count_for_profile` matches `profile_id = ?`
+  exactly, so nobody *owns* one. A member's deletion therefore cannot take shared context with them.
+
+  **No migration was written.** An `UPDATE` would only stamp a value into rows whose meaning is
+  already correct without it, and it would convert "never attributed" into "positively assigned",
+  destroying the distinction the next phase may need. The phase is closed by three tests pinning the
+  behaviour rather than by SQL — which is the honest form of "already true".
 
 ---
 

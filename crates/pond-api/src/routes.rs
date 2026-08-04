@@ -4546,14 +4546,97 @@ async fn update_profile_prefs(
 async fn delete_profile(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Existence check first. This used to return 204 for an id that never
+    // existed, which made "did I delete the right person" unanswerable.
+    let profile = state
+        .profile_repo
+        .get(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("no such profile: {id}")})),
+            )
+        })?;
+
+    // Count BEFORE deleting. Three of the four `profile_id` foreign keys
+    // cascade, so after the DELETE there is nothing left to count.
+    let memories = state
+        .memory_repo
+        .count_for_profile(&id)
+        .await
+        .unwrap_or_default();
+    let faces = match state.face_recognition.as_ref() {
+        Some(face) => face
+            .list_embeddings(&id)
+            .await
+            .map(|e| e.len() as u64)
+            .unwrap_or_default(),
+        None => 0,
+    };
+    let sessions = state
+        .session_storage
+        .list_sessions()
+        .await
+        .map(|all| {
+            all.iter()
+                .filter(|s| s.profile_id.as_deref() == Some(id.as_str()))
+                .count() as u64
+        })
+        .unwrap_or_default();
+
+    // `settings.primary_profile_id` is a key-value row, not a foreign key, so
+    // nothing in the database clears it. Deleting the primary member used to
+    // leave an id pointing at nobody -- and the one production reader of that
+    // setting silently got `None` from the lookup, so the failure was
+    // invisible. Clear it here, before the delete, while it is still true.
+    let cleared_primary = {
+        let settings = state.settings_repo.get().await.unwrap_or_default();
+        if settings.primary_profile_id.as_deref() == Some(id.as_str()) {
+            if let Err(e) = state
+                .settings_repo
+                .set_key("primary_profile_id", String::new())
+                .await
+            {
+                tracing::warn!(error = %e, profile_id = %id, "failed to clear primary_profile_id");
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    };
+
     state.profile_repo.delete(&id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
         )
     })?;
-    Ok(StatusCode::NO_CONTENT)
+
+    Ok(Json(json!({
+        "profile_id":   id,
+        "display_name": profile.display_name,
+        // What went with them. Sessions are RELEASED, not deleted -- a
+        // conversation is not solely the speaker's -- so it is reported under
+        // its own name rather than folded into a "deleted" total.
+        "deleted": {
+            "memories":        memories,
+            "face_embeddings": faces,
+        },
+        "released": {
+            "sessions": sessions,
+        },
+        "cleared_primary_profile": cleared_primary,
+    })))
 }
 
 // ── Sensor handlers ───────────────────────────────────────────────────────────

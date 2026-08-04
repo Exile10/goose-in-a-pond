@@ -45,6 +45,19 @@ pub trait MemoryRepository: Send + Sync {
     /// Delete a memory fragment by ID.
     async fn delete(&self, id: &str) -> Result<()>;
 
+    /// How many fragments belong to this member.
+    ///
+    /// Counts `profile_id = ?` **exactly** -- never the `IS NULL` rows that a
+    /// [`ProfileScope::Owner`] read also returns. Those are shared household
+    /// context, they survive the member, and reporting them as "deleted" would
+    /// be a lie told at the one moment the user most needs the number to be
+    /// true.
+    ///
+    /// [`ProfileScope::Owner`]: crate::user_data::domain::profile::ProfileScope::Owner
+    async fn count_for_profile(&self, _profile_id: &str) -> Result<u64> {
+        Ok(0) // default no-op for backward compat
+    }
+
     /// Return up to `limit` active fragments that have no stored embedding.
     ///
     /// Drives the startup embedding backfill

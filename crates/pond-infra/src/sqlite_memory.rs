@@ -284,6 +284,17 @@ impl MemoryRepository for SqliteMemoryRepository {
         Ok(scored.into_iter().map(|(_, f)| f).collect())
     }
 
+    async fn count_for_profile(&self, profile_id: &str) -> Result<u64> {
+        // Deliberately no `OR profile_id IS NULL`. See the port doc: those rows
+        // are shared household context and they outlive the member.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_fragments WHERE profile_id = ?")
+                .bind(profile_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count.max(0) as u64)
+    }
+
     async fn delete(&self, id: &str) -> Result<()> {
         sqlx::query("DELETE FROM memory_fragments WHERE id = ?")
             .bind(id)
@@ -1048,5 +1059,75 @@ mod tests {
             .find(|e| e.event_kind == MemoryEventKind::Extracted)
             .unwrap();
         assert_eq!(extracted.session_id.as_deref(), Some("sess-1"));
+    }
+
+    // ── Legacy-row semantics (PAI-1 P8) ──────────────────────────────────
+
+    /// P8 as designed called for a backfill migration. It is not needed: the
+    /// semantics it wanted are already what `scope_sql` does, and writing an
+    /// UPDATE would only stamp a value into rows whose meaning is already
+    /// correct without one.
+    ///
+    /// The rule is that a `profile_id IS NULL` row is **shared household
+    /// context**, not "unclassified, attribute it to somebody". So an owner
+    /// reads it, and nobody owns it.
+    #[tokio::test]
+    async fn a_legacy_unattributed_row_is_shared_not_owned() {
+        let (repo, _tmp) = repo_with_two_owners_and_a_shared_row().await;
+
+        // Both members see the shared row...
+        for who in ["alice", "bob"] {
+            let seen = repo
+                .search_recent(&ProfileScope::Owner(who.to_string()), 50)
+                .await
+                .unwrap();
+            assert!(
+                seen.iter().any(|f| f.profile_id.is_none()),
+                "{who} should see the unattributed household row"
+            );
+        }
+
+        // ...and neither of them owns it. This is what makes deleting a member
+        // safe: the count reported to the user, and the CASCADE that follows,
+        // both leave shared context alone.
+        for who in ["alice", "bob"] {
+            let owned = repo.count_for_profile(who).await.unwrap();
+            let all = repo
+                .search_recent(&ProfileScope::Household, 50)
+                .await
+                .unwrap();
+            assert!(
+                (owned as usize) < all.len(),
+                "{who} must not own every row; owning the shared one would delete it with them"
+            );
+        }
+    }
+
+    /// The count that member deletion reports must exclude shared rows, or the
+    /// number shown at the one moment it matters most is a lie.
+    #[tokio::test]
+    async fn the_per_member_count_excludes_shared_rows() {
+        let (repo, _tmp) = repo_with_two_owners_and_a_shared_row().await;
+
+        let a = repo.count_for_profile("alice").await.unwrap();
+        let b = repo.count_for_profile("bob").await.unwrap();
+        let everything = repo
+            .search_recent(&ProfileScope::Household, 100)
+            .await
+            .unwrap()
+            .len() as u64;
+
+        assert!(a >= 1 && b >= 1, "each member should own at least one row");
+        assert!(
+            a + b < everything,
+            "owned counts ({a} + {b}) must not account for every row ({everything}) -- \
+             the difference is the shared context that survives a deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn counting_a_member_who_owns_nothing_is_zero_not_an_error() {
+        let (repo, _tmp) = repo_with_two_owners_and_a_shared_row().await;
+        assert_eq!(repo.count_for_profile("nobody-at-all").await.unwrap(), 0);
     }
 }
