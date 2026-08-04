@@ -49,19 +49,47 @@ onboarding.
 So the column is a schema that has never been used. Every household member's memories are visible
 to every other one, and extraction attributes nothing.
 
-### 1.3 Sessions have no owner
+### 1.3 Sessions have no owner — but the column has been there all along
 
-`Session` — `user_data/domain/session.rs:61-77` — is `id`, `title`, two token counters,
-`model_name`, `created_at`, `updated_at`. There is no `profile_id`.
+*(Corrected 2026-08-04, while implementing P2. The original claim below was "there is no
+`profile_id`", which is wrong, and wrong in a way that matters.)*
+
+`Session` — the domain struct — was `id`, `title`, two token counters, `model_name`, `created_at`,
+`updated_at`. No `profile_id` **field**.
+
+The **column**, however, has existed since `0003_profiles.sql`, which created the `profiles` table
+and bolted `profile_id TEXT REFERENCES profiles(id)` onto `sessions` in the same file. The domain
+type never mapped it and `sqlite_session_storage.rs` never selected or wrote it. It was a **dead
+column** for thirty-four migrations.
+
+That is the same shape as the two other findings in this document — `memory.profile_id` written as
+`None` at every call site, and an identification endpoint whose output nothing reads. The schema
+keeps anticipating identity and the code never arrives. It also means P2 is smaller than specified:
+wiring, not a column addition.
+
+**And it carried a live trap.** The column was declared with no `ON DELETE` action, which SQLite
+reads as `NO ACTION`, while `Database::init` sets `PRAGMA foreign_keys = ON`. Harmless only while
+the column stayed NULL — the moment anything writes it, `DELETE FROM profiles WHERE id = ?` starts
+failing for any member who has ever spoken to the pond. Wiring the dead column without noticing this
+would have broken member deletion. See 3.2 for the fix.
 
 ### 1.4 The identification endpoint writes to a map nobody reads
 
-`POST /sessions/{id}/identify-user`, `GET|DELETE /sessions/{id}/user` (`routes.rs:296-305`,
-handlers `routes.rs:11216-11272`) write into
-`AppState.session_user_bindings: Arc<RwLock<HashMap<String, String>>>` (`pond-api/src/lib.rs:266`).
-Grep shows the map is touched at exactly three places outside test fixtures — `routes.rs:11236`,
-`:11255`, `:11268` — which are the three handlers themselves. **No chat, prompt, memory or tool
-path consults it**, and it is process-local, so it dies on restart.
+*(FIXED 2026-08-04 by P2. Kept, because the shape of the mistake is the point.)*
+
+`POST /sessions/{id}/identify-user` and `GET|DELETE /sessions/{id}/user` wrote into
+`AppState.session_user_bindings: Arc<RwLock<HashMap<String, String>>>`. Grep showed the map touched
+at exactly three places outside test fixtures — the three handlers themselves. **No chat, prompt,
+memory or tool path consulted it**, and it was process-local, so it died on restart.
+
+The endpoint therefore answered "who is in this session" with whatever it had last been told, by
+itself, since the last reboot. It had one caller: the same map's setter.
+
+P2 deletes the map and points all three handlers at `sessions.profile_id`. The binding is durable,
+carries its provenance, and is readable by anything that can reach session storage — which is what
+makes P3 able to consult it on the chat path. No consumer exists yet; the map's replacement being
+persistent is not the same as it being *used*, and this document does not claim otherwise until P3
+lands.
 
 ### 1.5 Only one profile reaches the model
 
@@ -126,18 +154,42 @@ conservatively during backfill.
 
 ### 3.2 Sessions get an owner and a provenance
 
-Migration `0037_session_profile.sql`:
+Migration `0037_session_identification.sql`. As landed — the `profile_id` line the original design
+called for is **not** in it, because 1.3 explains the column already exists:
 
 ```sql
-ALTER TABLE sessions ADD COLUMN profile_id TEXT REFERENCES profiles(id) ON DELETE SET NULL;
-ALTER TABLE sessions ADD COLUMN identification_source TEXT;  -- paired_device | face | explicit | unknown
-ALTER TABLE sessions ADD COLUMN identification_confidence REAL;
+ALTER TABLE sessions ADD COLUMN identification_source TEXT;      -- paired_device | explicit | face | unknown
+ALTER TABLE sessions ADD COLUMN identification_confidence REAL;  -- face matches only
+
+CREATE TRIGGER IF NOT EXISTS trg_profiles_delete_releases_sessions
+BEFORE DELETE ON profiles
+BEGIN
+    UPDATE sessions SET profile_id = NULL, identification_source = NULL,
+                        identification_confidence = NULL
+     WHERE profile_id = OLD.id;
+END;
 ```
 
 `identification_source` matters as much as `profile_id`. A session bound because a paired phone
 presented that member's token is a much stronger claim than one bound by a 0.62-confidence face
 match, and the policy layer must be able to tell them apart. This replaces
 `AppState.session_user_bindings` entirely — the in-memory map is deleted, not wrapped.
+
+Confidence is stored **only** for `face`. A paired-device binding is not "confidence 1.0" — it is a
+different kind of claim, and giving it a number invites somebody to average the two.
+
+**The trigger is not decoration.** It stands in for the `ON DELETE SET NULL` the original design
+assumed it could declare, which SQLite will not let us add to an existing column without rebuilding
+`sessions` — the hottest table in the database. A `BEFORE DELETE` trigger runs before the row is
+removed, so nothing references the profile by the time the delete is applied, and the semantics are
+identical. The session survives, stripped of its attribution; erasing the member's *content* is the
+separate, deliberate cascade in P7.
+
+Strength ordering is domain logic, not adapter logic: `SessionIdentity::supersedes` refuses to let a
+weaker source take over a session a stronger one bound. The case it exists for is concrete — a
+member's phone opens a session, then the room camera sees whoever walks past, and without the check
+a face match silently overwrites a cryptographic binding with a probabilistic one about a different
+person. Equal strength *does* supersede, so re-identification still works.
 
 Resolution order when a turn arrives:
 
@@ -188,9 +240,30 @@ invariant 1). Switching speakers mid-session therefore costs nothing in prefill.
 
 ### 3.7 Deletion actually deletes
 
-`DELETE /users/{profile_id}` today clears biometrics only (`routes.rs:11185-11205`). It must cascade
-memories, sessions, drafts, schedules and context items owned by that profile, and report counts per
-category. `Household`-scoped data survives — deleting a member does not delete the shopping list.
+`DELETE /users/{profile_id}` today clears biometrics only (`delete_user_biometrics` in `routes.rs`).
+It must cascade memories, sessions, drafts, schedules and context items owned by that profile, and
+report counts per category. `Household`-scoped data survives — deleting a member does not delete the
+shopping list.
+
+Most of the cascade already exists, found while implementing P1 and P2 rather than during the design
+pass. Every `profile_id` foreign key in the schema, and what it does on delete:
+
+| Table | Migration | On delete |
+|---|---|---|
+| `memory_fragments` | `0005` | `CASCADE` |
+| `face_embeddings` | `0013` | `CASCADE` |
+| `face_profile_thresholds` | `0014` | `CASCADE` |
+| `sessions` | `0003` | **nothing declared** -- so `NO ACTION`, until `0037`'s trigger |
+
+`sessions` was the only one of the four written without an action, which is exactly why it was the
+one that would have broken. A member's memories, faces and thresholds already vanish with them; P7
+has to *count* those, not delete them. The session releases to NULL instead, deliberately: a
+conversation is not solely the speaker's, and P7's job there is to decide what of its content goes,
+not whether the row does.
+
+So P7 is narrower than written — drafts, schedules, and the per-category counts. But the audit above
+is the part to keep: three of the four behaviours were decided years ago by migrations nobody
+remembered writing, and the fourth was decided by omission.
 
 ### 3.8 Speaker identification is scoped out, and said so
 
@@ -203,11 +276,21 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
 
 ## 4. Phases
 
-- **P1** `ProfileScope` domain type; `MemoryRepository` signature change from `Option<&str>` to
-  `&ProfileScope`; all current call sites pass `ProfileScope::Household` so behaviour is
-  **byte-identical** on landing. This is the refactor that makes every later phase small.
-- **P2** Migration `0037`; `Session.profile_id` + `identification_source` + confidence; delete
-  `AppState.session_user_bindings` and repoint its three handlers at the column.
+- **P1 — LANDED 2026-08-04.** `ProfileScope` domain type; `MemoryRepository` signature change from
+  `Option<&str>` to `&ProfileScope`; all current call sites pass `ProfileScope::Household` so
+  behaviour is **byte-identical** on landing. This is the refactor that makes every later phase
+  small.
+- **P2 — LANDED 2026-08-04.** Migration `0037_session_identification.sql` (provenance columns and
+  the delete trigger — `profile_id` was already there, see 1.3); `Session.profile_id`,
+  `SessionIdentity`, `IdentificationSource`, and the two `SessionStorage` methods that read and
+  write them; `AppState.session_user_bindings` deleted and its three handlers repointed at the
+  column.
+
+  P2 deliberately does **not** add a `SessionIdentity -> ProfileScope` conversion. Every session in
+  every existing pond is unattributed, so such a method would have to answer "what scope is an
+  unidentified session" today — and the only behaviour-preserving answer, `Household`, is precisely
+  the scope-widening default invariant 2 calls a bug. That question belongs to P3, which decides it
+  with the paired-device, explicit and face inputs in hand rather than from the stored row alone.
 - **P3** Resolution chain (paired device → explicit → face → guest) computed once per turn and
   threaded through `AgentRequest` into `ChatService`.
 - **P4** Enforcement: reads and writes honour the scope; cross-profile access routes through
@@ -243,6 +326,32 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
 ---
 
 ## 7. Verification
+
+### What P1 and P2 actually ran (2026-08-04)
+
+`cargo fmt --check`; `pond-core` 720 lib tests; `pond-infra` 181; `pond-mcp-server` 176; `pond-api`
+105 lib plus all 17 integration targets; `pond-adapters-goose` 103; `cargo check -p pond-server`;
+and a live server run against a real data directory.
+
+New tests, and what each would have to be broken for:
+
+| Where | Asserts |
+|---|---|
+| `session.rs` domain | every source round-trips; an unrecognised stored source degrades to `Unknown` and never upward; the rank order; a face match cannot take over a paired-device session; equal strength still supersedes so re-identification works |
+| `sqlite_session_storage.rs` | a new session is unattributed; identity round-trips including the face confidence; writing to a session that does not exist is `SessionNotFound`; reading one is not; **deleting a member with a live session succeeds and releases it**; identity cannot name a profile that does not exist |
+| `agent_data_integration_test.rs` | the same, over HTTP -- and specifically that a binding survives the process that made it, which is what the deleted in-memory map could never do |
+
+The integration tests go through the router rather than the repository on purpose. What P2 replaced
+was a map that no layer below HTTP ever saw, so a test beneath that boundary would have passed
+against the old code too.
+
+The `pond-api` integration targets had to be run **one target at a time**, deleting each ~600 MB
+test binary before building the next. Seventeen of them link Goose statically and together exceed
+this container's disk allowance. `cargo test -p pond-api` as a single invocation fails with
+`No space left on device`, which surfaces as a linker `Bus error` and reads exactly like a code
+fault. It is not one.
+
+### The plan
 
 - **Unit** — `ProfileScope` read/write matrix: `Owner(a)` cannot see `Owner(b)`; both see
   `Household`; `Guest` sees neither.

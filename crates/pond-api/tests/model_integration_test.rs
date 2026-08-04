@@ -161,7 +161,6 @@ async fn make_app_with_settings_repo() -> (
         notification_tx: tokio::sync::broadcast::channel(16).0,
         notification_queue: None,
         notification_sender: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,

@@ -219,12 +219,37 @@ onboarding is complete. `middleware/onboarding_guard.rs` already knows that stat
 ## 4. Phases
 
 - **P0 — do this first, ahead of any design work.** Make the auth allowlist method-aware. Every
-  entry in `is_public_route` is written as though it were method-scoped and none of them are, which
-  currently leaves `GET /settings` (all API keys) and `DELETE /profiles/{id}` reachable with no
-  token. Pass the `Method` alongside the path, enumerate `(Method, path)` pairs rather than paths,
-  and add a test asserting that every route in `protected_routes` requires a token — the
+  entry in `is_public_route` is written as though it were method-scoped and none of them are. Pass
+  the `Method` alongside the path, enumerate `(Method, path)` pairs rather than paths, and add a
+  test asserting that every route in `protected_routes` requires a token — the
   `public_routes.merge(protected_routes)` split gives a false sense of safety otherwise. This is a
   small, self-contained fix and it should not wait behind the policy-mode work.
+
+  **Reproduced against a running server, 2026-08-04.** Not inferred from reading the allowlist —
+  driven with `curl` against `pond-server serve`, no `Authorization` header, and with
+  `POND_DEV_ALLOW_LOOPBACK` unset so the loopback bypass was off:
+
+  | Request | Expected | Actual |
+  |---|---|---|
+  | `GET /api/v1/settings` | 401 | **200, with `api_key_gnews` and `api_key_finnhub` in plaintext** |
+  | `PUT /api/v1/settings` | 200 (deliberately public for onboarding) | 200 |
+  | `GET /api/v1/profiles` | 401 | **200, the whole household listed** |
+  | `DELETE /api/v1/profiles/{id}` | 401 | **204, member deleted** |
+  | `GET /api/v1/sessions` | 401 | 401 |
+  | `GET /api/v1/devices` | 401 | 401 |
+  | `GET /api/v1/memory` | 401 | 401 |
+
+  The last three matter as much as the first four: the auth layer *does* work, so this is not a
+  missing middleware. It is precisely the allowlist entries being matched on path alone.
+
+  The `PUT` row is what turns a read leak into a full chain — an unauthenticated caller on the LAN
+  can write a key through the onboarding hole and read it back through the path-matching hole. Both
+  halves were exercised in that order and both succeeded.
+
+  One qualifier, because it changes how urgent this looks on a fresh install: the key fields carry
+  `skip_serializing_if = "Option::is_none"`, so `GET /settings` leaks nothing until a key is
+  actually configured. The exposure is real for any pond whose owner has set one up, and invisible
+  before that.
 - **P1** `security_policy_mode` with `audit` default; the scope × principal matrix; first production
   `allow`/`audit` call sites (shared with PAI-1 P4).
 - **P2** Secret migration off `Settings`; the `*_key|*_token|*_secret` guard test; module rename.

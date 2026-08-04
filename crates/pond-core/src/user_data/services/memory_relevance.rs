@@ -14,7 +14,6 @@
 
 use crate::models::ports::embedding::EmbeddingProvider;
 use crate::user_data::domain::memory::MemoryFragment;
-use crate::user_data::domain::profile::ProfileScope;
 use crate::user_data::ports::memory_repository::MemoryRepository;
 use chrono::{DateTime, Utc};
 
@@ -474,6 +473,7 @@ pub async fn run_backfill(
 mod tests {
     use super::*;
     use crate::user_data::domain::memory::{MemoryLifecycle, MemorySegment};
+    use crate::user_data::domain::profile::ProfileScope;
     use crate::user_data::mocks::mock_memory::MockMemoryRepository;
     use chrono::Duration;
 

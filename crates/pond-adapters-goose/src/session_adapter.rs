@@ -45,6 +45,11 @@ fn goose_session_to_pond(gs: &GooseSession) -> Session {
     Session {
         id: gs.id.clone(),
         title: Some(gs.name.clone()),
+        // The engine's own session store knows nothing about household members;
+        // attribution lives only in `pond_system.db`. Reporting None here is
+        // correct -- inventing one from the primary profile is exactly the
+        // wrong-attribution failure PAI-1 exists to prevent.
+        profile_id: None,
         total_prompt_tokens: 0,
         total_completion_tokens: 0,
         model_name: None,

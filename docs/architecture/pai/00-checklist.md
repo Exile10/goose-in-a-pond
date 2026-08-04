@@ -19,7 +19,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 1 | GIAP needs to be **proactive**, not just reactive | [PAI-7](./07-proactive-intelligence.md) | DESIGNED |
 | 2 | Requires the ability of the model to **think** | [PAI-5](./05-reasoning-and-thinking.md) | DESIGNED |
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
-| 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | DESIGNED |
+| 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **P1, P2 LANDED**; P3-P8 designed |
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2 LANDED**; P3-P6 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
@@ -29,7 +29,7 @@ They are equally weighted and mutually interdependent. `DESIGNED` means the docu
 current-state claims were verified against code; it does **not** mean any code has changed. `LANDED`
 is stamped per phase, and means the gates in 2.3 were run and passed.
 
-Implementation has begun: PAI-3 P1 and P2 are in. Everything else is still design only.
+Implementation has begun: PAI-3 P1/P2 and PAI-1 P1/P2 are in. Everything else is still design only.
 
 ---
 
@@ -82,8 +82,46 @@ none.
 10. **Run the gates.** `cargo fmt --check`, then the fast-crate `cargo clippy` / `cargo test` set
     from `.github/workflows/ci.yml`, then `cargo check -p pond-server -p pond-adapters-goose` for
     anything touching the live path. Note the submodule caveat in section 3.
-11. **Clear the documentation debt** attached to the workstream (roadmap section 4) while you are
+11. **Run the live server** (section 2.4). Not optional for anything that changes a migration, a
+    route, a handler or startup wiring.
+12. **Clear the documentation debt** attached to the workstream (roadmap section 4) while you are
     in the file. It is one line each and it never gets cheaper.
+
+### 2.4 Live server verification
+
+Green unit tests are not evidence that the pond starts. Every test in this repo runs against a
+database built by applying every migration to an empty file, in one process, with the adapter under
+test constructed by hand. None of that exercises startup ordering, migration application against a
+database that already has rows, route registration, the auth middleware, or the wiring in
+`main.rs` — and those are where the last several defects in this programme actually were.
+
+Run this for any change touching a **migration, a route, a handler, or startup wiring**:
+
+1. **Build and start it against a scratch data dir**, so the run cannot touch a real pond:
+   ```bash
+   POND_DATA_DIR=/tmp/pond-live cargo run -p pond-server -- serve --port 4000
+   ```
+   Read the port it actually bound from `$POND_DATA_DIR/.runtime_api_port` — `--port` is a request,
+   and the fallback walks `4000..4009`.
+2. **Confirm the migration applied to a real file**, not just to a fresh in-memory fixture:
+   ```bash
+   sqlite3 "$POND_DATA_DIR/pond_system.db" "SELECT version, description, success FROM _sqlx_migrations ORDER BY version DESC LIMIT 3;"
+   ```
+   Then re-run the server against the **same** directory. A migration that only works on an empty
+   database is a migration that only works once, and every install after the first is an upgrade.
+3. **Exercise the routes you touched with real HTTP**, including the failure cases. A handler that
+   compiles and a handler that returns the right status for a missing row are different claims.
+4. **Read the logs, and read them for more than your own feature.** `WARN` and `ERROR` lines that
+   were already there are still findings. Two of this programme's real defects were visible in
+   startup output long before anyone looked.
+   ```bash
+   grep -iE 'error|warn|panic|failed' "$POND_DATA_DIR"/logs/*.log | grep -v <known-benign>
+   ```
+5. **Correct what the logs show**, in the same change. A log line you decided to ignore gets written
+   down in section 4 with the reason, or it will be rediscovered as new.
+
+`serve` shuts down on stdin EOF when detached, so background it with stdin held open (`sleep
+infinity | cargo run ... &`) or it exits immediately and looks like a crash.
 
 ---
 
@@ -99,6 +137,20 @@ none.
   build or the binary can SIGILL on the target.
 - **No emojis anywhere, including comments** — `no-emoji.test.ts` scans source and will fail the
   build.
+- **`pond-server` needs ALSA headers, and a stale apt index looks like "no apt access".**
+  `pond-server` depends unconditionally on `cpal`, so `alsa-sys` must find `libasound2-dev`; without
+  it the production-binary gate cannot run at all, and neither can `pond-voice`, `pond-audio`,
+  `pond-adapters-whisper` or `pond-adapters-piper`. A container may ship the runtime `libasound.so.2`
+  and not the headers. `apt-get install libasound2-dev` on a fresh container 404s on every mirror,
+  which reads as a sandbox restriction; it is a stale index. **Run `apt-get update` first.** I
+  recorded "no apt access" in a commit message on the strength of the 404 alone and it was wrong.
+- **Disk is a fixed allowance and the failure mode is disguised.** `cargo test -p pond-api` builds
+  seventeen integration binaries at ~600 MB each, because every one links Goose statically. That
+  alone exceeds the allowance. The symptom is
+  `collect2: fatal error: ld terminated with signal 7 [Bus error]` or `No space left on device` from
+  a random dependency — both read as a code fault or a broken toolchain. Run the targets one at a
+  time with `cargo test -p pond-api --test <name>`, deleting `target/debug/deps/<name>-*` between
+  runs. `df` shows low "Used" with zero "Avail" in this state; that is the allowance, not the disk.
 
 ---
 
@@ -259,6 +311,92 @@ that absence argument.
 
 **Line-number rot is systemic**, and PAI-3 caused some of it by editing the very files the docs
 cite. Prefer symbol names over `file:line` when writing these documents.
+
+**2026-08-04 — PAI-1 P1 and P2 LANDED.**
+
+P1: `ProfileScope { Owner | Household | Guest }`, and `MemoryRepository`'s five search methods now
+take `&ProfileScope` instead of `Option<&str>`. Every call site passes `Household`, whose SQL is
+byte-identical to the old `None` branch, so nothing changed behaviourally — which was the point.
+
+P2: migration `0037_session_identification.sql`, `SessionIdentity` / `IdentificationSource`, two new
+`SessionStorage` methods, and `AppState.session_user_bindings` deleted with its three handlers
+repointed at the column.
+
+**Three things the design doc got wrong, all found by code rather than by reading.**
+
+1. **`sessions.profile_id` already existed** — since migration `0003`, unwritten and unread for
+   thirty-four migrations. A dead column. The design called for adding it. P2 shrank to wiring.
+2. **Wiring it would have broken member deletion.** The 0003 column has no `ON DELETE` action, and
+   `Database::init` sets `PRAGMA foreign_keys = ON`. That is harmless only while the column is
+   always NULL. `0037` carries a `BEFORE DELETE` trigger standing in for the `ON DELETE SET NULL`
+   SQLite will not let us add in place, and a test proves deleting a member with a live session now
+   succeeds. **Nothing in the design pass predicted this.** The pattern worth generalising: a
+   column nothing writes has no observable constraints, so its declaration has never been tested.
+   Wiring a dead column is not a no-op — it activates whatever was declared around it.
+3. **Three of the four `profile_id` foreign keys already cascade on delete** -- `memory_fragments`
+   (`0005`), `face_embeddings` (`0013`), `face_profile_thresholds` (`0014`). `sessions` was the only
+   one declared without an action. Most of P7 turned out to be built; its real job is per-category
+   counts. The audit table is in PAI-1 section 3.7.
+
+**P2 deliberately ships no `SessionIdentity -> ProfileScope` conversion.** Every session in every
+existing pond is unattributed, so the method would have to answer "what scope is an unidentified
+session" today, and the only behaviour-preserving answer — `Household` — is exactly the
+scope-widening default invariant 2 calls a bug. P3 decides it with the paired-device, explicit and
+face inputs in hand. Shipping a default now would mean un-shipping it later.
+
+**Two defects found by reading my own diff, not by any test.** Both were in code that compiled and
+passed everything:
+
+- The identify handler read the existing binding with `unwrap_or_else(|_| unknown())`. A failed read
+  would then look like "nobody is bound", letting a weak face match take over a paired-device
+  session -- the exact downgrade `supersedes` was written to refuse. **A fallback default on an
+  authorisation input is a widening default**, and invariant 2 says access narrows on failure. Fixed
+  to refuse the write.
+- `set_session_identity` was updating `updated_at`. `list_sessions` orders by it, so a camera
+  recognising somebody would have reordered the user's chat history with no message sent. Metadata
+  about a session is not activity in it. Fixed, and pinned with a test.
+
+Neither was reachable by the tests I had written, because both are about what happens on a path the
+tests do not take. Worth budgeting review time for the diff itself, separately from the gates.
+
+**The live server run, which is now a standing gate (section 2.4).** Built `pond-server`, started it
+against a scratch data dir, and drove the routes with `curl`. All of it passed:
+
+- Migration `0037` applied to a real file, `success = 1`, and applied **once** across two starts.
+  Both provenance columns and the trigger are present in `sqlite_master`.
+- `GET /sessions/{id}/user` reports `profile_id: null, identification_source: "unknown"` for an
+  unidentified session; a bound session reports its owner, `face`, and the confidence.
+- `DELETE` on an unknown session is 404; `GET` on one is 200 and says nobody. The asymmetry is
+  deliberate and it now holds over HTTP, not just in a unit test.
+- **`DELETE /profiles/{id}` returned 204 with a session bound to that member**, and the session
+  survived with its attribution released. That is the foreign-key trap from finding 2, fixed and
+  proven live rather than argued.
+- A binding written before a restart was still there after it. The deleted in-memory map could not
+  have done that, which is the whole point of P2.
+
+**Two false passes in my own check script, caught by reading its output.** The first run reported
+PASS for `body.get("profile_id") is None` — against an `onboarding_required` error body, where every
+lookup returns None. **A check that passes because the request failed reports the opposite of the
+truth.** The script now asserts the status code first and only then any body predicate. Same class
+of error as the vacuous tiktoken tests in the PAI-3 P2 entry; it is worth assuming I have written
+one every time.
+
+**And the live run reproduced PAI-2's P0 from a running server**, with the loopback bypass off and
+no token: `GET /settings` returned API keys in plaintext, `GET /profiles` listed the household, and
+`DELETE /profiles/{id}` returned 204. Meanwhile `/sessions`, `/devices` and `/memory` correctly
+returned 401 — so the auth layer works and the defect is exactly the path-only allowlist match. Full
+table in PAI-2's P0 entry. This is what section 2.4 exists for: the defect was in the code the whole
+time, and one `curl` found it in seconds.
+
+Startup logs across three runs held two WARNs, both environmental rather than defects: the embedding
+model download is blocked by this container's proxy (403), and `auto_download` skips
+`llamafile/mock` because my own live-check onboarding set that as the chat model. Recorded so the
+next run does not rediscover them as new.
+
+**The environment claim I got wrong.** I recorded "this container has no apt access" in a commit
+message, on the strength of `apt-get install libasound2-dev` 404ing. It was a stale index;
+`apt-get update` fixed it in one command, and `pond-server` builds. Section 3 now records both this
+and the disk-allowance trap, which disguises itself as a linker bus error.
 
 ### Next: PAI-3 P3
 
