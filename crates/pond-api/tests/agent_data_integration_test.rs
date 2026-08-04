@@ -37,6 +37,7 @@ use pond_infra::sqlite_prompt_extra::SqlitePromptExtraRepository;
 use pond_infra::sqlite_prompt_template::SqlitePromptTemplateRepository;
 use pond_infra::sqlite_recipe::SqliteRecipeRepository;
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
+use pond_infra::sqlite_settings::SqliteSettingsRepository;
 use pond_infra::sqlite_skill::SqliteSkillRepository;
 use tower::ServiceExt;
 
@@ -161,7 +162,10 @@ async fn make_app_full(
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".into(),
         tts: None,
-        settings_repo: Arc::new(MockSettingsRepository::new()),
+        // Real repository, not the mock: these tests assert that deleting the
+        // primary member clears the settings row that names them, and an
+        // in-memory settings store cannot show that.
+        settings_repo: Arc::new(SqliteSettingsRepository::new(pool.clone())),
         // Real repository, not the mock: `sessions.profile_id` is a foreign key
         // into `profiles`, and an in-memory profile store cannot satisfy it.
         profile_repo: Arc::new(SqliteProfileRepository::new(pool.clone())),
@@ -1230,4 +1234,120 @@ async fn an_empty_profile_id_is_rejected() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── Member deletion (PAI-1 P7) ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn deleting_a_member_reports_what_went_and_what_stayed() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+    let jerry = seed_profile(&app, "Jerry").await;
+    storage
+        .set_session_identity(
+            "sess-1",
+            &SessionIdentity {
+                profile_id: Some(jerry.clone()),
+                source: IdentificationSource::Explicit,
+                confidence: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let body = body_json(
+        app.clone()
+            .oneshot(delete(&format!("/api/v1/profiles/{jerry}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(body["profile_id"], jerry);
+    assert_eq!(body["display_name"], "Jerry");
+    // Sessions are RELEASED, never deleted -- a conversation is not solely the
+    // speaker's. Reporting it under "deleted" would misdescribe what happened.
+    assert_eq!(body["released"]["sessions"], 1);
+    assert_eq!(body["deleted"]["memories"], 0);
+
+    // and the session itself survived, unattributed
+    let identity = storage.get_session_identity("sess-1").await.unwrap();
+    assert_eq!(identity.profile_id, None);
+    assert!(storage.get_session("sess-1").await.is_ok());
+}
+
+/// This used to return 204 for an id that never existed, which made "did I
+/// delete the right person" unanswerable.
+#[tokio::test]
+async fn deleting_a_member_who_does_not_exist_is_404() {
+    let (app, _storage, _tmp) = make_app_with_sessions().await;
+    let resp = app
+        .oneshot(delete("/api/v1/profiles/nobody"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `settings.primary_profile_id` is a key-value row, not a foreign key, so no
+/// cascade can reach it. Deleting the primary member used to leave an id
+/// pointing at nobody -- and the single production reader silently got `None`
+/// from the lookup, so nothing ever surfaced the dangling reference.
+#[tokio::test]
+async fn deleting_the_primary_member_clears_the_setting_that_named_them() {
+    let (app, _storage, _tmp) = make_app_with_sessions().await;
+    let jerry = seed_profile(&app, "Jerry").await;
+
+    let resp = app
+        .clone()
+        .oneshot(put(
+            "/api/v1/settings",
+            serde_json::json!({ "primary_profile_id": jerry }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "settings write failed");
+
+    let body = body_json(
+        app.clone()
+            .oneshot(delete(&format!("/api/v1/profiles/{jerry}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["cleared_primary_profile"], true);
+
+    let settings = body_json(app.oneshot(get("/api/v1/settings")).await.unwrap()).await;
+    let dangling = settings["primary_profile_id"].as_str().unwrap_or("");
+    assert!(
+        dangling.is_empty(),
+        "primary_profile_id still names a deleted member: {dangling}"
+    );
+}
+
+/// The counterpart: deleting a NON-primary member must leave the setting alone.
+#[tokio::test]
+async fn deleting_someone_else_does_not_touch_the_primary_setting() {
+    let (app, _storage, _tmp) = make_app_with_sessions().await;
+    let jerry = seed_profile(&app, "Jerry").await;
+    let liz = seed_profile(&app, "Liz").await;
+
+    app.clone()
+        .oneshot(put(
+            "/api/v1/settings",
+            serde_json::json!({ "primary_profile_id": jerry }),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_json(
+        app.clone()
+            .oneshot(delete(&format!("/api/v1/profiles/{liz}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["cleared_primary_profile"], false);
+
+    let settings = body_json(app.oneshot(get("/api/v1/settings")).await.unwrap()).await;
+    assert_eq!(settings["primary_profile_id"], jerry);
 }

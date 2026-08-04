@@ -19,7 +19,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 1 | GIAP needs to be **proactive**, not just reactive | [PAI-7](./07-proactive-intelligence.md) | DESIGNED |
 | 2 | Requires the ability of the model to **think** | [PAI-5](./05-reasoning-and-thinking.md) | DESIGNED |
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
-| 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **P1, P2 LANDED**; P3 half in; P4-P8 designed |
+| 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **P1, P2, P3, P7, P8 LANDED**; P5 half in; P4, P6 designed |
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2 LANDED**; P3-P6 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
@@ -29,7 +29,8 @@ They are equally weighted and mutually interdependent. `DESIGNED` means the docu
 current-state claims were verified against code; it does **not** mean any code has changed. `LANDED`
 is stamped per phase, and means the gates in 2.3 were run and passed.
 
-Implementation has begun: PAI-3 P1/P2 and PAI-1 P1/P2 are in. Everything else is still design only.
+Implementation has begun: PAI-3 P1/P2 and PAI-1 P1/P2/P3/P7/P8 are in, with P5 half done.
+Everything else is still design only.
 
 ---
 
@@ -422,7 +423,40 @@ excluded from, so this is not a weakening — but it does mean adding a second h
 silently changes what an unidentified voice can reach. If that should instead be an explicit setting,
 now is the time to say so, before P4 builds enforcement on top of it.
 
-### Next: PAI-1 P3 wiring, then PAI-3 P3
+**2026-08-04 (later still) — PAI-1 P3 wired, P7 and P8 landed. Five parallel recon agents.**
+
+I ran five read-only Explore agents in parallel over P3/P4/P5/P6/P7+P8 and then implemented
+serially. **Parallel implementation agents are not viable here** and it is worth writing down why:
+each needs its own cargo target dir, which means a fresh ~20 GB Goose build against a 2 GB
+allowance, and sharing one target dir just serialises them on the cargo lock. The win from
+multi-agent in this repo is read-only fan-out, not concurrent writes. Same conclusion PAI-6 reaches
+about on-device subagents: the benefit is isolation, not wall-clock.
+
+The recon paid for itself three times over:
+
+- **`ProfileContext` reaches the model nowhere.** `routes.rs` binds the built prompt as
+  `let mut _system_prompt` -- underscore-prefixed, deliberately unused -- and `goose_agent.rs`
+  passes `None` for the profile with a TODO. So this checklist's own claim that
+  `settings.primary_profile_id` "reaches the prompt" was **stale on both engine paths**. P6 is
+  therefore "wire it at all", not "switch its source". Corrected in PAI-1 section 1.5.
+- **P7 cannot cascade drafts or schedules.** `drafts` has no owner column (keyed by `session_id`, no
+  FK) and **there is no `schedules` table at all** -- the scheduler is in-process tokio-cron.
+- **`approve_draft` has no ownership check whatsoever.** Any session can approve any draft id. That
+  is a live authorisation defect, not a Guest-degradation gap, and it belongs to PAI-2 rather than
+  here.
+
+**The compiler found what a careful read-only sweep did not.** Making `AgentRequest.profile_scope`
+non-optional broke twelve construction sites; the recon inventory listed eleven. `delegation.rs`
+was the twelfth. Fan-out recon is good at mapping and still not a substitute for a type that
+refuses to compile.
+
+**Two more vacuous tests, again mine.** One P8 test used profile ids the fixture never creates, so
+its "owner sees the shared row" assertion passed against an empty result set. Its sibling failed
+loudly and exposed it. That is three vacuous-test incidents in this programme; the pattern is always
+an assertion that holds trivially when the setup is wrong. Assert the *positive* case too --
+"alice owns at least one row" -- not only the boundary.
+
+### Next: PAI-1 P4 (enforcement) and P6 (profile context), then PAI-3 P3
 
 `TokenCounter` port, GGUF-backed adapter, chars/4 as the declared fallback, overshoot-feedback
 correction retained as the safety net. `turn_trimmer.rs:89-91` is the estimator to displace, and
