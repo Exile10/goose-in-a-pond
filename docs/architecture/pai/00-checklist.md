@@ -19,7 +19,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 1 | GIAP needs to be **proactive**, not just reactive | [PAI-7](./07-proactive-intelligence.md) | DESIGNED |
 | 2 | Requires the ability of the model to **think** | [PAI-5](./05-reasoning-and-thinking.md) | DESIGNED |
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
-| 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **P1, P2 LANDED**; P3-P8 designed |
+| 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **P1, P2 LANDED**; P3 half in; P4-P8 designed |
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2 LANDED**; P3-P6 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
@@ -398,7 +398,31 @@ message, on the strength of `apt-get install libasound2-dev` 404ing. It was a st
 `apt-get update` fixed it in one command, and `pond-server` builds. Section 3 now records both this
 and the disk-allowance trap, which disguises itself as a linker bus error.
 
-### Next: PAI-3 P3
+**2026-08-04 (later) — PAI-1 P3 resolver landed; the chain has a missing rung.**
+
+`identity_resolution::resolve` is in, six tests, no call site yet — same shape as PAI-3 P1, domain
+first so the wiring is small.
+
+**Nothing links a paired device to a household member.** `session_tokens`, `push_tokens`,
+`pairing_codes` and `handshake_challenges` all lack a profile column; the pairing flow never asks
+who is pairing. That is the *strongest* rung of the designed chain and it does not exist. The input
+is honoured and fed `None` by everyone.
+
+**This is not only PAI-1's problem.** PAI-7 assumes it can address a notification to "the profile's
+devices" and gives that as the first real producer for the dormant targeted-notification path. It
+cannot, for the same reason. Capturing a member at pairing time unblocks both, and it should
+probably be its own small phase rather than buried in either.
+
+I did not fall back to `settings.primary_profile_id`. It would have made the chain look complete and
+attributed every phone in the house to one person.
+
+**One design decision worth arguing with.** An unidentified speaker resolves to `Household` in a
+one-member pond and `Guest` in a shared one. The two scopes only differ when there is somebody to be
+excluded from, so this is not a weakening — but it does mean adding a second household member
+silently changes what an unidentified voice can reach. If that should instead be an explicit setting,
+now is the time to say so, before P4 builds enforcement on top of it.
+
+### Next: PAI-1 P3 wiring, then PAI-3 P3
 
 `TokenCounter` port, GGUF-backed adapter, chars/4 as the declared fallback, overshoot-feedback
 correction retained as the safety net. `turn_trimmer.rs:89-91` is the estimator to displace, and
