@@ -203,7 +203,14 @@ Once occupancy is measured rather than estimated, `ContextHealth.should_compact`
   `routes.rs` keeps its live-capability fallback instead of regressing to the name heuristic.
   `GOOSE_CONTEXT_LIMIT` is still **written** — it feeds Ollama's `options.num_ctx` — but no longer
   read, guarded by a regression test.
-- **P2** `TokenCounter` port; GGUF-backed adapter; chars/4 as the declared fallback. Feedback
+- **P2 — LANDED, with its premise corrected.** `TokenCounter` port; `HeuristicTokenCounter`
+  (chars/4) as the declared fallback; a tiktoken-backed adapter on the live path. **Not** the
+  GGUF-backed adapter this phase originally specified — that tokenizer is unreachable (private
+  module in the fork; `pond-inference`'s belongs to the quarantined agent and would double-load the
+  model), so no counter reports `is_exact()`, and the feedback correction below stays load-bearing
+  rather than becoming a safety net. Exact counting is deferred with the fork-patch cost written
+  into `pond-adapters-goose/src/token_counter.rs`.
+- ~~**P2** `TokenCounter` port; GGUF-backed adapter; chars/4 as the declared fallback.~~ Feedback
   correction retained.
 - **P3** Populate `ModelRecord.context_length` in catalog providers; surface in the Models UI;
   wire as precedence rung 3.

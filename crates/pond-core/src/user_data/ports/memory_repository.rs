@@ -4,6 +4,7 @@ use crate::user_data::domain::memory::{
     MemoryEdge, MemoryEvent, MemoryEventKind, MemoryFragment, MemoryGraph, MemoryLifecycle,
     MemorySegment,
 };
+use crate::user_data::domain::profile::ProfileScope;
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -11,6 +12,13 @@ use async_trait::async_trait;
 ///
 /// When no `EmbeddingProvider` is wired, embeddings are `None` and
 /// `search_similar` falls back to `search_recent` (recency-ordered results).
+///
+/// # Scoping
+///
+/// Every read takes a [`ProfileScope`] rather than an `Option<&str>` profile id.
+/// The `Option` was the reason the household shared one memory pool: `None` was
+/// always reachable, so every production call site passed it. An enum makes each
+/// caller choose, and makes `Guest` — see nothing — expressible at all.
 #[async_trait]
 pub trait MemoryRepository: Send + Sync {
     /// Persist a new memory fragment.
@@ -19,7 +27,7 @@ pub trait MemoryRepository: Send + Sync {
     /// Return the `limit` most recent fragments for a profile, oldest-first.
     async fn search_recent(
         &self,
-        profile_id: Option<&str>,
+        scope: &ProfileScope,
         limit: usize,
     ) -> Result<Vec<MemoryFragment>>;
 
@@ -30,7 +38,7 @@ pub trait MemoryRepository: Send + Sync {
     async fn search_similar(
         &self,
         query_embedding: &[f32],
-        profile_id: Option<&str>,
+        scope: &ProfileScope,
         limit: usize,
     ) -> Result<Vec<MemoryFragment>>;
 
@@ -61,12 +69,12 @@ pub trait MemoryRepository: Send + Sync {
     async fn search_by_content(
         &self,
         keywords: &[String],
-        profile_id: Option<&str>,
+        scope: &ProfileScope,
         limit: usize,
     ) -> Result<Vec<MemoryFragment>> {
         // Default: fall back to search_recent for adapters that don't implement this.
         let _ = keywords;
-        self.search_recent(profile_id, limit).await
+        self.search_recent(scope, limit).await
     }
 
     // ── Segment-aware methods (default no-op impls for backward compat) ──
@@ -85,16 +93,16 @@ pub trait MemoryRepository: Send + Sync {
     async fn search_by_segment(
         &self,
         _segment: MemorySegment,
-        profile_id: Option<&str>,
+        scope: &ProfileScope,
         limit: usize,
     ) -> Result<Vec<MemoryFragment>> {
-        self.search_recent(profile_id, limit).await
+        self.search_recent(scope, limit).await
     }
 
     /// Retrieve all active memories that have decay fields for scoring.
     /// Used by the cleanup service to find archive/prune candidates.
-    async fn search_scoreable(&self, profile_id: Option<&str>) -> Result<Vec<MemoryFragment>> {
-        self.search_recent(profile_id, 1000).await
+    async fn search_scoreable(&self, scope: &ProfileScope) -> Result<Vec<MemoryFragment>> {
+        self.search_recent(scope, 1000).await
     }
 
     /// Batch update lifecycle for multiple memories at once.

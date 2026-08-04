@@ -1,5 +1,6 @@
 use crate::models::ports::agent::{Agent, AgentRequest, AgentResponse, AgentStreamEvent};
 use crate::user_data::domain::memory::MemoryFragment;
+use crate::user_data::domain::profile::ProfileScope;
 use crate::user_data::ports::memory_repository::MemoryRepository;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -43,7 +44,7 @@ impl MemoryAwareAgent {
         } else {
             let memories = self
                 .memory_repo
-                .search_recent(None, 10)
+                .search_recent(&ProfileScope::Household, 10)
                 .await
                 .unwrap_or_default();
             if memories.is_empty() {

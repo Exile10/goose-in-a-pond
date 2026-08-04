@@ -22,6 +22,7 @@
 use crate::user_data::domain::memory::{
     MemoryEventKind, MemoryFragment, MemoryLifecycle, MemorySegment,
 };
+use crate::user_data::domain::profile::ProfileScope;
 use crate::user_data::ports::memory_consolidator::{ConsolidationAction, MemoryConsolidator};
 use crate::user_data::ports::memory_repository::MemoryRepository;
 use crate::user_data::services::consolidation_schedule::MIN_MEMORIES_TO_CONSOLIDATE;
@@ -335,7 +336,10 @@ pub async fn run_consolidation(
     batch_size: usize,
 ) -> Result<(usize, usize)> {
     let started = std::time::Instant::now();
-    let selection = select_batch(repo.search_scoreable(None).await?, batch_size);
+    let selection = select_batch(
+        repo.search_scoreable(&ProfileScope::Household).await?,
+        batch_size,
+    );
 
     if selection.below_minimum() {
         return Ok((0, 0));
@@ -627,7 +631,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.merged, 1);
-        let stored = repo.search_recent(None, 10).await.unwrap();
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         let created = stored
             .iter()
             .find(|m| m.content == "name is Jerry")
@@ -662,7 +669,10 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = repo.search_recent(None, 10).await.unwrap();
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         let created = stored
             .iter()
             .find(|m| m.content == "prefers dark roast")
@@ -704,7 +714,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.split, 1);
-        let stored = repo.search_recent(None, 10).await.unwrap();
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
 
         let carrier = stored
             .iter()
