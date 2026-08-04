@@ -11,6 +11,9 @@ use pond_core::models::ports::agent::{
     Agent as AgentPort, AgentRequest, AgentResponse, AgentStreamEvent,
 };
 use pond_core::models::ports::embedding::EmbeddingProvider;
+use pond_core::models::services::context::context_governor::{
+    ContextGovernor, ContextInputs, WindowResolution,
+};
 use pond_core::models::services::prompt_builder::build_prompt_partition;
 use pond_core::prompts::PromptState;
 use pond_core::user_data::domain::memory::{cosine_similarity, MemoryFragment};
@@ -212,6 +215,17 @@ pub struct GooseAdapter {
     /// Signature of the Goose env knobs currently exported, so `set_var` runs
     /// only when a setting actually changed rather than on every turn.
     last_env_signature: Mutex<String>,
+    /// The context window last resolved for the active provider/model, with its
+    /// provenance.
+    ///
+    /// The budget paths (`trim_goose_history`, `hydrate_goose_session`) used to
+    /// read `GOOSE_CONTEXT_LIMIT` from the process environment and fall back to
+    /// a hardcoded 8192 — a value nobody guaranteed, since it is only exported
+    /// as a side effect of `apply_goose_env_knobs` and only when its signature
+    /// changes. This field is the same number, owned deliberately: written on
+    /// the settings path, read by the budget paths, never round-tripped through
+    /// the environment. See `docs/architecture/pai/03-context-governor.md`.
+    last_window: Mutex<Option<WindowResolution>>,
     /// Per-turn controls for the [`GiapProviderShim`] wrapped around every
     /// provider handed to Goose — GIAP's last-mile veto over the system
     /// prompt, Goose's `<turn-context>` message injection, and the tools list.
@@ -362,6 +376,7 @@ impl GooseAdapter {
             provider_configured_sessions: Mutex::new(HashSet::new()),
             last_thinking_param: Mutex::new(None),
             last_env_signature: Mutex::new(String::new()),
+            last_window: Mutex::new(None),
             shim_controls: Arc::new(crate::provider_shim::ShimControls::default()),
             goose_session_map: Mutex::new(HashMap::new()),
             loaded_sessions: Mutex::new(HashSet::new()),
@@ -633,11 +648,8 @@ impl GooseAdapter {
             .ok()
             .and_then(|(s, _)| s);
 
-        let effective_ctx: usize = std::env::var("GOOSE_CONTEXT_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8192);
-        let profile = CompactionProfile::from_context_window(effective_ctx);
+        let window = self.history_window().await;
+        let profile = CompactionProfile::from_context_window(window.tokens);
 
         // Trailing-user drop, blank filtering, budget cut and summary splice all
         // live in pond-core's `plan_replay` so they are unit-tested there.
@@ -795,11 +807,16 @@ impl GooseAdapter {
     /// restart. They are settings-derived, not provider-derived, so they belong
     /// on the settings path.
     fn apply_goose_env_knobs(&self, settings: &pond_core::user_data::domain::settings::Settings) {
-        let effective_ctx = Self::effective_context_window(
+        let resolution = Self::resolve_window(
             &settings.chat_provider,
             &settings.chat_model,
             settings.context_window_override,
         );
+        let effective_ctx = resolution.tokens;
+        // Stored BEFORE the signature guard below returns early: the budget
+        // paths read this field every turn, while the env knobs are only
+        // re-exported when something actually changed.
+        *self.last_window.lock().unwrap_or_else(|e| e.into_inner()) = Some(resolution);
         let knobs = goose_env_knobs(
             &settings.chat_provider,
             effective_ctx,
@@ -864,24 +881,10 @@ impl GooseAdapter {
     /// heuristic and forces a compaction loop. The value flows into
     /// GOOSE_CONTEXT_LIMIT and thus into Ollama's `options.num_ctx`, so the
     /// reported limit, the request's num_ctx, and the KV cache all agree.
-    /// Context size used for PROMPT-side budgets (template tier, memory
-    /// injection) — as opposed to history budgets.
     ///
-    /// For local in-process inference every preamble token is re-prefilled on
-    /// every turn (no KV prompt-session cache yet) at roughly 0.5–1K tok/s,
-    /// so a large context window must buy HISTORY room, not a more verbose
-    /// preamble: an unclamped 32K profile on the Mac selected the full
-    /// template tier + a 1.5K-token memory budget and produced a 9.4K-token
-    /// prompt (~17s TTFT) for a one-line question. Clamping to the 8K-class
-    /// profile keeps the compact tier + bounded memories regardless of how
-    /// big the KV cache is. HTTP providers keep the raw window — their
-    /// preamble is not paid for in local prefill.
-    fn prompt_budget_ctx(provider: &str, effective_ctx: usize) -> usize {
-        match provider {
-            "local" | "gguf" => effective_ctx.min(8192),
-            _ => effective_ctx,
-        }
-    }
+    /// The PROMPT-side clamp that used to live here as `prompt_budget_ctx` now
+    /// lives in `pond-core` as [`ContextGovernor::prompt_window`], unchanged —
+    /// its rationale moved with it.
 
     /// The context size the engine will ACTUALLY allocate for a local model,
     /// when the registry pins one.
@@ -904,48 +907,77 @@ impl GooseAdapter {
         entry.settings.context_size.map(|c| c as usize)
     }
 
-    fn effective_context_window(provider: &str, model: &str, override_tokens: u32) -> usize {
+    /// Resolve the window for a provider/model pair, reading the process-global
+    /// model registry for the pinned size.
+    fn resolve_window(provider: &str, model: &str, override_tokens: u32) -> WindowResolution {
         let pinned = match provider {
             "local" | "gguf" => Self::registry_context_size(model),
             _ => None,
         };
-        Self::resolve_context_window(provider, model, override_tokens, pinned)
+        Self::resolve_window_with(provider, model, override_tokens, pinned)
     }
 
     /// Precedence, extracted so it can be tested without the process-global
-    /// model registry: pinned local context > user override > per-provider
-    /// heuristic.
-    fn resolve_context_window(
+    /// model registry.
+    ///
+    /// The precedence itself lives in `pond-core`'s [`ContextGovernor`] so that
+    /// the trimmer, telemetry and the monitor cannot drift from it — this is
+    /// only the adapter's half, which supplies the registry value the domain
+    /// cannot reach.
+    fn resolve_window_with(
         provider: &str,
         model: &str,
         override_tokens: u32,
         pinned: Option<usize>,
-    ) -> usize {
-        // A pinned registry context_size outranks the user override here for
-        // the same reason it outranks it in the engine: it IS the allocation.
-        if let Some(ctx) = pinned {
-            return ctx;
+    ) -> WindowResolution {
+        ContextGovernor::resolve(&ContextInputs {
+            provider,
+            model,
+            override_tokens,
+            registry_pinned: pinned,
+            // Populated in PAI-3 P3, once catalog providers write it.
+            catalog_context_length: None,
+            // Deliberately absent on this path: it is settings-scoped and
+            // process-wide, and one session's last turn is not evidence about
+            // it. Session-scoped callers pass their own reading.
+            engine_reported: None,
+            // The adapter's own capability cache is stale on turn one (see
+            // `thinking_section_applies`), so the name heuristic is the more
+            // reliable answer here. Callers holding a live capability value
+            // supply it themselves.
+            capability_window: None,
+        })
+    }
+
+    fn effective_context_window(provider: &str, model: &str, override_tokens: u32) -> usize {
+        Self::resolve_window(provider, model, override_tokens).tokens
+    }
+
+    /// The window the HISTORY budgets should be derived from.
+    ///
+    /// Prefers the resolution cached by `apply_goose_env_knobs`, which runs on
+    /// the settings path before any turn reaches the trimmer. The settings load
+    /// is the cold path only — a session hydrated before the first turn has
+    /// configured a provider.
+    ///
+    /// Note this returns the RAW window, not the prompt-side clamp. History
+    /// budgets get the whole window on purpose; only the preamble is clamped.
+    /// Conflating the two silently grows the KV prefix on local providers.
+    async fn history_window(&self) -> WindowResolution {
+        if let Some(cached) = self
+            .last_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return cached;
         }
-        if override_tokens > 0 {
-            return override_tokens as usize;
-        }
-        match provider {
-            "local" | "gguf" => {
-                // Generous ceiling for an UNPINNED local model — the actual
-                // allocation is then constrained by the engine's memory
-                // estimate at inference time, not by this value.
-                // macOS M4 (18GB): yields ~16-40K depending on model.
-                32768
-            }
-            _ => {
-                // HTTP providers — use model-reported context window.
-                let caps =
-                    pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
-                        model,
-                    );
-                caps.context_window_tokens as usize
-            }
-        }
+        let settings = self.settings_repo.get().await.unwrap_or_default();
+        Self::resolve_window(
+            &settings.chat_provider,
+            &settings.chat_model,
+            settings.context_window_override,
+        )
     }
 
     /// Whether the ACTIVE model can accept image content.
@@ -1475,11 +1507,8 @@ impl GooseAdapter {
             None => None,
         };
 
-        let effective_ctx: usize = std::env::var("GOOSE_CONTEXT_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8192);
-        let profile = CompactionProfile::from_context_window(effective_ctx);
+        let window = self.history_window().await;
+        let profile = CompactionProfile::from_context_window(window.tokens);
         let last_real = self
             .last_prompt_tokens_handle()
             .lock()
@@ -2020,8 +2049,10 @@ impl GooseAdapter {
 
         // Settings-derived Goose knobs, re-applied every turn (cheaply — see
         // apply_goose_env_knobs) so toggling hybrid compaction or the context
-        // override takes effect immediately. Must run BEFORE anything that reads
-        // GOOSE_CONTEXT_LIMIT: session hydration and ModelConfig construction do.
+        // override takes effect immediately. Must still run BEFORE session
+        // hydration and ModelConfig construction: it exports GOOSE_CONTEXT_LIMIT
+        // for Goose's own use, and it populates `last_window`, which is where
+        // the GIAP-side budget paths now get the window from.
         self.apply_goose_env_knobs(&settings);
 
         // Goose maintains its own sessions.db with auto-generated IDs.
@@ -2178,7 +2209,7 @@ impl GooseAdapter {
                 .join(", ");
             // Derive compact_prompt from the PROMPT-side context budget: for
             // local inference the profile is clamped so a huge KV cache never
-            // selects the verbose tier (see prompt_budget_ctx).
+            // selects the verbose tier (see ContextGovernor::prompt_window).
             let effective_ctx = Self::effective_context_window(
                 &settings.chat_provider,
                 &settings.chat_model,
@@ -2186,7 +2217,7 @@ impl GooseAdapter {
             );
             let compact_prompt =
                 pond_core::models::services::context_budget::CompactionProfile::from_context_window(
-                    Self::prompt_budget_ctx(&settings.chat_provider, effective_ctx),
+                    ContextGovernor::prompt_window(&settings.chat_provider, effective_ctx),
                 )
                 .use_compact_prompt();
 
@@ -2361,7 +2392,7 @@ impl GooseAdapter {
         // Derive a CompactionProfile for MEMORY INJECTION from the
         // prompt-side context budget: local inference re-prefills every
         // injected memory token each turn, so the budget stays bounded even
-        // on a 32K context (see prompt_budget_ctx). History budgets elsewhere
+        // on a 32K context (see ContextGovernor::prompt_window). History budgets elsewhere
         // keep the real window.
         let effective_ctx = Self::effective_context_window(
             &settings.chat_provider,
@@ -2370,7 +2401,7 @@ impl GooseAdapter {
         );
         let compaction_profile =
             pond_core::models::services::context_budget::CompactionProfile::from_context_window(
-                Self::prompt_budget_ctx(&settings.chat_provider, effective_ctx),
+                ContextGovernor::prompt_window(&settings.chat_provider, effective_ctx),
             );
 
         if !memory_candidates.is_empty() {
@@ -3678,9 +3709,11 @@ mod tests {
     /// history the engine cannot hold, and llama.cpp truncates the prompt.
     #[test]
     fn a_pinned_local_context_outranks_a_larger_override() {
+        let r = GooseAdapter::resolve_window_with("local", "gemma-4-E2B-it", 16384, Some(4096));
+        assert_eq!(r.tokens, 4096);
         assert_eq!(
-            GooseAdapter::resolve_context_window("local", "gemma-4-E2B-it", 16384, Some(4096)),
-            4096
+            r.source,
+            pond_core::models::services::context::context_governor::WindowSource::Registry
         );
     }
 
@@ -3688,14 +3721,15 @@ mod tests {
     /// override as the escape hatch, then the generous ceiling.
     #[test]
     fn an_unpinned_local_model_falls_back_to_override_then_ceiling() {
-        assert_eq!(
-            GooseAdapter::resolve_context_window("local", "gemma-4-E2B-it", 16384, None),
-            16384
-        );
-        assert_eq!(
-            GooseAdapter::resolve_context_window("local", "gemma-4-E2B-it", 0, None),
-            32768
-        );
+        use pond_core::models::services::context::context_governor::WindowSource;
+
+        let overridden = GooseAdapter::resolve_window_with("local", "gemma-4-E2B-it", 16384, None);
+        assert_eq!(overridden.tokens, 16384);
+        assert_eq!(overridden.source, WindowSource::Override);
+
+        let ceiling = GooseAdapter::resolve_window_with("local", "gemma-4-E2B-it", 0, None);
+        assert_eq!(ceiling.tokens, 32768);
+        assert_eq!(ceiling.source, WindowSource::Heuristic);
     }
 
     /// HTTP providers have no registry to pin them; the model's own reported
@@ -3703,10 +3737,25 @@ mod tests {
     #[test]
     fn http_providers_are_unaffected_by_the_registry_rule() {
         assert_eq!(
-            GooseAdapter::resolve_context_window("ollama", "gemma4:e2b", 8192, None),
+            GooseAdapter::resolve_window_with("ollama", "gemma4:e2b", 8192, None).tokens,
             8192
         );
-        assert!(GooseAdapter::resolve_context_window("ollama", "gemma4:e2b", 0, None) > 0);
+        assert!(GooseAdapter::resolve_window_with("ollama", "gemma4:e2b", 0, None).tokens > 0);
+    }
+
+    /// The regression guard for PAI-3 P1: the budget paths must not recover the
+    /// context window from the process environment. `GOOSE_CONTEXT_LIMIT` is
+    /// still WRITTEN (it flows into Ollama's `options.num_ctx`), but nothing in
+    /// this adapter may read it back — that indirection is what let a Jetson
+    /// budget history against a phantom 8192.
+    #[test]
+    fn no_budget_path_reads_the_context_limit_from_the_environment() {
+        let src = include_str!("goose_agent.rs");
+        let body = src.split("mod tests").next().unwrap_or(src);
+        assert!(
+            !body.contains("env::var(\"GOOSE_CONTEXT_LIMIT\")"),
+            "context windows must come from ContextGovernor, not the environment"
+        );
     }
 
     // ── F1: image attachment onto the user message ───────────────────────
