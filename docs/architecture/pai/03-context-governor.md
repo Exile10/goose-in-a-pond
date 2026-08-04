@@ -196,8 +196,13 @@ Once occupancy is measured rather than estimated, `ContextHealth.should_compact`
 
 ## 4. Phases
 
-- **P1** `ContextGovernor` + `WindowResolution` + `WindowSource`; every one of the four call sites
-  repointed. The trimmer's `env`-with-8192 read is deleted.
+- **P1 — LANDED.** `ContextGovernor` + `WindowResolution` + `WindowSource`; every one of the four
+  call sites repointed. The trimmer's `env`-with-8192 read is deleted (there were **two** such
+  reads: `trim_goose_history` and session hydration). `prompt_budget_ctx` moved out of the adapter
+  into `ContextGovernor::prompt_window` unchanged. `ContextInputs` gained `capability_window` so
+  `routes.rs` keeps its live-capability fallback instead of regressing to the name heuristic.
+  `GOOSE_CONTEXT_LIMIT` is still **written** — it feeds Ollama's `options.num_ctx` — but no longer
+  read, guarded by a regression test.
 - **P2** `TokenCounter` port; GGUF-backed adapter; chars/4 as the declared fallback. Feedback
   correction retained.
 - **P3** Populate `ModelRecord.context_length` in catalog providers; surface in the Models UI;

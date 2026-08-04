@@ -20,7 +20,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 2 | Requires the ability of the model to **think** | [PAI-5](./05-reasoning-and-thinking.md) | DESIGNED |
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
 | 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | DESIGNED |
-| 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1 IN PROGRESS** |
+| 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1 LANDED**, P2-P6 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
 | 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | DESIGNED |
@@ -190,3 +190,39 @@ inside `context_governor.rs`; the adapter half cannot be written until the two r
 
 `cargo check -p pond-adapters-goose` is the gate for all of the above and is slow from cold —
 start it early.
+
+**2026-08-04 — PAI-3 P1 LANDED.**
+
+All four paths repointed; `prompt_budget_ctx` deleted from the adapter. Gates: `cargo fmt --check`
+clean, `pond-core` 707 passed, `pond-adapters-goose` 100 passed / 1 ignored, `cargo check` clean on
+`pond-api` and `pond-agent`.
+
+Corrections to what the previous entry assumed:
+
+- There were **two** env reads, not one — `trim_goose_history` and session hydration.
+- The replacement is an adapter-owned `last_window` field written by `apply_goose_env_knobs`
+  *before* its signature guard returns early, not a settings load per turn. A settings load remains
+  only as the cold path, for a session hydrated before any turn has configured a provider.
+- `routes.rs` fell back to live `agent.capabilities()`, which is better data than the name
+  heuristic. `ContextInputs::capability_window` exists so that path keeps its accuracy; precedence
+  there is unchanged (engine > override > caps).
+- `pond-agent` used `min(override, caps)` and now lets the override win. A real behaviour change,
+  taken deliberately because the crate is quarantined (Q2-05) and a fourth divergent precedence
+  would defeat the phase.
+
+**Two process lessons worth keeping.**
+
+Adding a field to `ContextInputs` broke an existing literal with `E0063`. That is the design
+working: every field is a precedence decision, so do **not** reach for `..Default::default()` at
+construction sites — the compile error is the review.
+
+A backgrounded `cargo ... | tail -N` reports the **exit code of `tail`**, so a run that failed to
+compile was reported as success. Never trust the status of a piped cargo run; capture per-command
+exit codes or read the output.
+
+### Next: PAI-3 P2
+
+`TokenCounter` port, GGUF-backed adapter, chars/4 as the declared fallback, overshoot-feedback
+correction retained as the safety net. `turn_trimmer.rs:89-91` is the estimator to displace, and
+`WindowSource::is_exact()` already exists to tell budget code when it can trust the window to the
+token.
