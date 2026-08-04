@@ -82,7 +82,7 @@ alone. The split is: `pond-core` owns *what may run and under what limits*; the 
    assistant, and it is the tool text a 2-4B on-device model will read and try to act on.
 2. **They bypass every boundary this programme is building.** They do not know about GIAP's
    tool-group narrowing (`mcp/domain/tool_group.rs`), the always-on draft gate, or profile scope.
-   `orchestrator.start_agent` would hand a fresh agent the full 59-tool surface that Phase D spent
+   `orchestrator.start_agent` would hand a fresh agent the full 61-tool surface that Phase D spent
    an entire phase narrowing to 17.
 3. **They are surface, and surface is the part that must survive a fork swap.** The programme's
    invariant 5 exists for this: anything that would need rewriting if Goose were replaced belongs in
@@ -170,8 +170,9 @@ Nested delegation is capped at depth 1 in v1. A subagent may not spawn.
 
 ### 3.6 The tool surface
 
-One new extension, `giap-orchestrator`, behind `ext_orchestrator_enabled` (making 15 registered
-extensions — there are 14 today):
+One new extension, `giap-orchestrator`, behind `ext_orchestrator_enabled` (making 16 registered
+extensions — there are **15** today, not 14; `giap-toolkit` registers via the `TOOLKIT_EXTENSION`
+const, so grepping for `"giap-*"` string literals undercounts it):
 
 - `list_roles` — what personas exist, and what each is for.
 - `delegate` — run a role against instructions. Synchronous by default; `background: true` only when

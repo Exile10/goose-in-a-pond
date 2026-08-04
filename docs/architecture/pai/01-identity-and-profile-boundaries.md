@@ -12,7 +12,8 @@ Verified against code 2026-08-03.
 
 ### 1.1 The type exists and does almost nothing
 
-`Profile` — `crates/pond-core/src/user_data/domain/profile.rs:12-22` — five fields:
+`Profile` — `crates/pond-core/src/user_data/domain/profile.rs` — six fields (I miscounted this as
+five originally; the quoted block below has always shown six):
 
 ```rust
 pub struct Profile {

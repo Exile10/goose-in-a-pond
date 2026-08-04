@@ -84,11 +84,23 @@ no idle timeout, no answer review, no telemetry, no context monitoring, no `turn
 its `done` payload (`:7223-7225`), and it calls plain `persist_assistant_turn` rather than
 `_with_extraction` — **so no memories are extracted from anything that route handles.**
 
-### 1.7 A known inconsistency, already documented
+### 1.7 The prompt/engine inconsistency is already fixed
 
-`context-and-reasoning-roadmap.md` records that prompt-level thinking and engine-level thinking are
-resolved separately, and that "prompt-off plus engine-on is the current (inconsistent) combination
-when thinking is disabled". Phase B4 landed the engine parameter; the inconsistency survives.
+I originally recorded this as an outstanding bug, on the strength of
+`context-and-reasoning-roadmap.md`. Re-checked 2026-08-04: **it is fixed, and that roadmap is the
+stale source.**
+
+One value drives both consumers. `goose_agent.rs` computes
+`let thinking_enabled = Self::thinking_section_applies(...)` once, hoisted specifically so it can
+feed `PromptState { thinking_enabled, .. }` *and* `ensure_provider_current(.., thinking_enabled)`,
+which stamps the engine's `enable_thinking` request-param. The comment above it says so outright:
+"Hoisted out of the PromptState block below because it now drives two things that must agree."
+
+The roadmap's neighbouring premise — that "engine-level `enable_thinking` is a registry default GIAP
+never sets" — is also no longer true.
+
+The one residual: `with_thinking_param` early-returns for providers other than `local`/`gguf`. That
+is deliberate and documented, and is a different thing from the roadmap's complaint.
 
 ---
 
@@ -131,7 +143,8 @@ every token.
 ### 3.2 Count reasoning tokens
 
 `UsageStats` gains `reasoning_tokens: Option<u32>`, persisted alongside the existing per-message
-counts (migration `0038`, extending `0029`'s columns). This closes the loop with PAI-3: the governor
+counts (the next free migration number — `0037` at the time of writing — extending `0029`'s
+columns). This closes the loop with PAI-3: the governor
 can then set `output_reserve_tokens` from **measured** reasoning behaviour for the active model
 rather than from a constant chosen to survive the worst case observed once on an Orin.
 
@@ -190,7 +203,8 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
 - **P1** `ChatEvent::Reasoning`; read `reasoning_content` in `pond-inference`; `GooseAdapter` emits
   `AgentStreamEvent::Thinking`. `ThoughtFilter` demoted to fallback.
 - **P2** `UsageStats.reasoning_tokens` + migration; surfaced in `turn_stats` and `/usage/summary`.
-- **P3** Unify the resolution so prompt and engine agree.
+- **P3 — ALREADY LANDED**, before this programme began. One `thinking_enabled` drives both the
+  prompt section and the engine param; see section 1.7. Nothing to do.
 - **P4** `reasoning_effort` tri-state mapped through the compaction profile; `brief` default on
   local.
 - **P5** `output_reserve_tokens` derived from measured reasoning behaviour rather than a constant

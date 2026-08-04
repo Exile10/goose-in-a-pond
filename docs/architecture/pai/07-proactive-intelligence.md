@@ -65,8 +65,9 @@ hope.
 `sched-{id}-{ts}` with `model_role: "task"` and calls `agent.chat()`, bounded by a `Semaphore`
 (`schedule_max_concurrent`, default 2).
 
-(`docs/architecture/scheduling.md` still describes two task kinds and seven MCP tools. There are three
-and twelve. Corrected as part of this workstream.)
+(`docs/architecture/scheduling.md` described two task kinds and seven MCP tools; there are three and
+twelve. **Already corrected** — that fix landed with the documentation-debt pass, not with this
+workstream.)
 
 ### 1.5 The outbound channel is one broadcast, and half of it is dormant
 
@@ -208,7 +209,7 @@ memory extraction, decay and consolidation already exist.
   freezer sensor at 6am and notify if above -15" does not depend on a 3B model correctly interpreting
   an English instruction at 6am.
 - **REST for sensor rules.** A first-class `/rules` surface rather than overloading `/schedules`.
-- **`docs/architecture/scheduling.md`** refreshed.
+- ~~`docs/architecture/scheduling.md` refreshed.~~ Done already.
 
 ---
 

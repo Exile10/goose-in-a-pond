@@ -20,15 +20,16 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 2 | Requires the ability of the model to **think** | [PAI-5](./05-reasoning-and-thinking.md) | DESIGNED |
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
 | 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | DESIGNED |
-| 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1 LANDED**, P2-P6 designed |
+| 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2 LANDED**; P3-P6 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
-| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | DESIGNED |
+| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | DESIGNED — **P0 is a live auth defect, fix first** |
 
 They are equally weighted and mutually interdependent. `DESIGNED` means the document exists and its
-current-state claims were verified against code. It does **not** mean any code has changed.
+current-state claims were verified against code; it does **not** mean any code has changed. `LANDED`
+is stamped per phase, and means the gates in 2.3 were run and passed.
 
-**Nothing has been implemented yet.** Every `crates/` and `pond-desktop/` change is still ahead.
+Implementation has begun: PAI-3 P1 and P2 are in. Everything else is still design only.
 
 ---
 
@@ -44,10 +45,15 @@ none.
    yet.
 2. **Check the prerequisites are LANDED, not merely DESIGNED.** PAI-6 with PAI-3 unlanded gives
    every subagent a context budget derived from a number four code paths disagree about.
-3. **Re-verify the current-state claims you are about to rely on.** Every document is stamped
-   *Verified against code 2026-08-03*. Line numbers rot faster than prose — grep for the symbol,
-   do not trust the `file:line`. If a claim is now false, fix the document in the same change; a
-   design doc that lies is worse than no design doc.
+3. **Re-verify the current-state claims you are about to rely on.** Every document carries a
+   verification date. Line numbers rot faster than prose — grep for the symbol, never trust the
+   `file:line`. If a claim is now false, fix the document in the same change; a design doc that lies
+   is worse than no design doc.
+
+   Two failure modes seen in practice, both mine: **counted claims** go wrong when you grep for a
+   pattern rather than the thing itself (the extension count was wrong twice because one
+   registration uses a const, not a string literal), and **a correction that makes a discrepancy
+   vanish** deserves more suspicion than one that creates work.
 4. **Re-read the seven cross-cutting invariants** in the master roadmap section 3. They bind all
    eight workstreams.
 
@@ -220,7 +226,41 @@ A backgrounded `cargo ... | tail -N` reports the **exit code of `tail`**, so a r
 compile was reported as success. Never trust the status of a piped cargo run; capture per-command
 exit codes or read the output.
 
-### Next: PAI-3 P2
+**2026-08-04 — PAI-3 P2 LANDED, and a four-way audit of all eight documents.**
+
+P2: `TokenCounter` port, `HeuristicTokenCounter`, tiktoken-backed adapter on the live path.
+**Exactness was not achievable** — the design assumed a GGUF tokenizer would be reachable and it is
+not (private module in the fork; `pond-inference`'s belongs to the quarantined agent and would
+double-load the model). Both counters report `is_exact() == false` and the overshoot-feedback
+correction stays load-bearing. Gates: fmt clean, pond-core 710, adapter 103, `pond-api` and
+`pond-agent` check clean.
+
+I then ran four parallel read-only agents over all eight design docs, one pair each. Worth repeating
+before any future phase — it found more than the phase itself did.
+
+**The security finding, which outranks everything else in this programme:** `is_public_route` is
+path-only while its entries read as method-scoped, and `public_routes.merge(protected_routes)` puts
+every route behind that single check. `GET /settings` returns all API keys, and
+`DELETE /profiles/{id}` deletes a household member, **with no token**. Now PAI-2 P0.
+
+**I had corrected a correct claim into a wrong one.** The extension count is **15**, not 14 — two
+agents found this independently. `giap-toolkit` registers through the `TOOLKIT_EXTENSION` const, so
+my `grep -oE '"giap-[a-z-]+"'` could not see it, and I "fixed" the roadmap in the wrong direction
+with confidence. Tool count is **61**, not 57. Lesson: **count call sites, not string literals**,
+and be most suspicious of a correction that makes a discrepancy disappear.
+
+Other corrections applied: PAI-5's prompt/engine thinking inconsistency is **already fixed** (its P3
+is a no-op); `GOOSE_AUTO_COMPACT_THRESHOLD` is not local-gated, only the tool-pair knob is; there is
+**no pairing lockout** and its absence is deliberate (a lockout would be a guest-triggerable DoS);
+`Profile` has six fields not five; `ModelRecord.context_length` *is* written for the curated GGUF
+catalog; PAI-8 undercounted the multipart upload routes (`/voice/calibrate` and
+`/sessions/{id}/identify-user` also take uploads), which matters because PAI-1 and PAI-2 lean on
+that absence argument.
+
+**Line-number rot is systemic**, and PAI-3 caused some of it by editing the very files the docs
+cite. Prefer symbol names over `file:line` when writing these documents.
+
+### Next: PAI-3 P3
 
 `TokenCounter` port, GGUF-backed adapter, chars/4 as the declared fallback, overshoot-feedback
 correction retained as the safety net. `turn_trimmer.rs:89-91` is the estimator to displace, and

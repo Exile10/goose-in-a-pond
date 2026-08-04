@@ -15,10 +15,18 @@ Verified against code 2026-08-03.
 **Pairing and tokens.** Two-phase HMAC handshake where the six-digit code never crosses the wire
 (`security/ports/handshake.rs:1-161`, `pond-infra/src/sqlite_handshake.rs`). Only SHA-256 hashes of
 codes and tokens are persisted (`:5-12,164-165`); tokens are 32 `OsRng` bytes (`:96-98`);
-comparisons are constant-time via `subtle::ConstantTimeEq` (`:193,353`); TTLs are pairing 10 min,
-challenge 60 s, session 24 h, refresh 30 d (`:35-38`); five failed attempts lock out. The blanket
-loopback bypass was removed in #94 and now requires `POND_DEV_ALLOW_LOOPBACK=1`
-(`middleware/mod.rs:155-163,266-275`).
+comparisons are constant-time (`ConstantTimeEq` for the code hash, `hmac::Mac::verify_slice` in
+`verify_mac` for the MAC); TTLs are pairing 10 min, challenge 60 s, session 24 h, refresh 30 d. The
+blanket loopback bypass was removed in #94 and now requires `POND_DEV_ALLOW_LOOPBACK=1`.
+
+I originally wrote "five failed attempts lock out". **That is wrong — there is no lockout, and its
+absence is deliberate.** `sqlite_handshake.rs` says so directly: a wrong guess "burns the challenge
+… and never touches the operator's pairing code, so there is no remote-triggerable lockout", the
+`pairing_codes` table has no attempt counter, and `bad_mac_attempts_do_not_lock_out_pairing_code`
+asserts it. Brute force is bounded instead by one-challenge-per-attempt plus a per-IP limiter of 10
+verify attempts per 60 s over a 30-per-60 s handshake bucket. That is the better design for a
+device on a home LAN — a lockout would hand any guest a denial-of-service against pairing — and the
+doc should not have implied a mechanism the authors consciously rejected.
 
 **Egress visibility.** `shared/services/egress.rs` is the best privacy primitive in the codebase: a
 process-global request context attributes every outbound call to a session and tool (`:25-53`), and
@@ -49,12 +57,33 @@ Every `.audit()` call site in the repository is inside a `#[cfg(test)]` module �
 and `sqlite_security_policy.rs:125,151,182,200`. The file's own doc comment says so
 (`sqlite_security_policy.rs:11-16`).
 
-**API keys are in the settings table and returned over HTTP.** `api_key_guardian`, `api_key_gnews`,
-`api_key_finnhub`, `api_key_coingecko` and `searxng_url` are `Option<String>` fields on `Settings`
-(`settings.rs:652-668`) carrying only `#[serde(default)]` — no `skip_serializing`. `GET /settings`
-does `serde_json::to_value(settings)` (`routes.rs:2608`), so **it returns them in plaintext to any
-authenticated client**. Meanwhile a real `SecretRepository` port exists
-(`security/ports/secret.rs:10-21`) whose doc says "values are NEVER returned through the REST API".
+**API keys are in the settings table and returned over HTTP to anyone.** `api_key_guardian`,
+`api_key_gnews`, `api_key_finnhub`, `api_key_coingecko` and `searxng_url` are `Option<String>`
+fields on `Settings` carrying only `#[serde(default)]` — no `skip_serializing`. `GET /settings` does
+`serde_json::to_value(settings)`, so it returns every one of them in plaintext. Meanwhile a real
+`SecretRepository` port exists (`security/ports/secret.rs`) whose doc says "values are NEVER
+returned through the REST API".
+
+I first wrote that this exposed the keys "to any authenticated client". **That was too generous.
+Re-checked 2026-08-04: no authentication is required at all.** See below.
+
+**The auth allowlist matches on path only, so several "protected" routes are public.**
+`is_public_route` (`pond-api/src/middleware/mod.rs`) receives just `path.path()` from
+`auth_middleware` — never the method — while its entries are written as though method-scoped:
+
+| Entry | Comment says | Actually public |
+|---|---|---|
+| `path == "/settings"` | "PUT /settings is public so onboarding steps can save before completion" | **`GET /settings` too — every API key, no token** |
+| `"/profiles"` | "POST — create profile during onboarding" | `GET /profiles` (enumerate the household) |
+| `path.starts_with("/profiles/")` | "PATCH /profiles/:id — update profile preferences during onboarding" | `GET /profiles/{id}` and **`DELETE /profiles/{id}`** |
+
+The `protected_routes` label in `routes.rs` is cosmetic: `public_routes.merge(protected_routes)`
+produces one router, and the single `auth_middleware` layer decides purely on the path string. So
+`delete_profile`, registered in the protected group, is reachable unauthenticated by anything that
+can open a socket to the pond.
+
+This is the most serious thing this workstream found, it is a live defect rather than a missing
+feature, and it should be fixed ahead of the rest of the phase list.
 
 **There is no keyring.** Despite the filename, `pond-infra/src/keyring_secret_repository.rs`
 contains only `FileSecretRepository`: plaintext JSON at `<data_dir>/secrets.json`, chmod 0600, with
@@ -189,6 +218,13 @@ onboarding is complete. `middleware/onboarding_guard.rs` already knows that stat
 
 ## 4. Phases
 
+- **P0 — do this first, ahead of any design work.** Make the auth allowlist method-aware. Every
+  entry in `is_public_route` is written as though it were method-scoped and none of them are, which
+  currently leaves `GET /settings` (all API keys) and `DELETE /profiles/{id}` reachable with no
+  token. Pass the `Method` alongside the path, enumerate `(Method, path)` pairs rather than paths,
+  and add a test asserting that every route in `protected_routes` requires a token — the
+  `public_routes.merge(protected_routes)` split gives a false sense of safety otherwise. This is a
+  small, self-contained fix and it should not wait behind the policy-mode work.
 - **P1** `security_policy_mode` with `audit` default; the scope × principal matrix; first production
   `allow`/`audit` call sites (shared with PAI-1 P4).
 - **P2** Secret migration off `Settings`; the `*_key|*_token|*_secret` guard test; module rename.
