@@ -37,9 +37,11 @@ use pond_core::user_data::domain::onboarding::OnboardingStep;
 use pond_core::user_data::domain::profile::CreateProfileRequest;
 use pond_core::user_data::domain::schedule::TaskKind;
 use pond_core::user_data::domain::sensor::{CameraEvent, SensorReading};
+use pond_core::user_data::domain::session::{IdentificationSource, SessionIdentity};
 use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::ports::device_registry::RegisterDeviceRequest;
 use pond_core::user_data::ports::scheduler::{CreateScheduleRequest, UpdateScheduleRequest};
+use pond_core::user_data::ports::session_storage::SessionStorageError;
 use pond_core::user_data::services::onboarding::OnboardingService;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -11222,15 +11224,30 @@ async fn delete_user_biometrics(
     })))
 }
 
+/// Map a session-storage failure from an identity write onto a status code.
+///
+/// Only a genuinely missing session is a 404. Everything else -- a locked
+/// database, a foreign key naming a profile that no longer exists -- is a
+/// server fault, and reporting it as "no such session" would send whoever is
+/// debugging it looking in the wrong place.
+fn identity_write_error(e: SessionStorageError) -> (StatusCode, Json<Value>) {
+    let status = match e {
+        SessionStorageError::SessionNotFound(_) => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(json!({"error": e.to_string()})))
+}
+
 /// POST /api/v1/sessions/:session_id/identify-user — wake-on-face hook.
 ///
 /// Accepts the same multipart payload as `/faces/identify` (plus optional
 /// `bbox` field).  On a confident match the identified `profile_id` is
-/// bound to the given session via the in-memory registry, so subsequent
-/// chat turns can personalise the system prompt to the recognised user.
+/// written to the session's own row, so the binding survives a restart and is
+/// readable by everything that can reach session storage.
 ///
-/// Returns the same body as `/faces/identify`, plus the `session_id` that
-/// was bound.  `identified=false` leaves the binding untouched.
+/// Returns the same body as `/faces/identify`, plus the `session_id` and
+/// whether the binding was actually applied.  `identified=false` leaves it
+/// untouched, and so does a match that would downgrade a stronger one.
 async fn identify_session_user_handler(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -11249,10 +11266,47 @@ async fn identify_session_user_handler(
         )
     })?;
 
+    // A face match is the WEAKEST source that can bind a session, so it must
+    // not silently take over one bound by a paired device or by the member
+    // saying so. Read, compare in the domain, then write.
+    //
+    // This is a read-modify-write and is therefore racy in principle. Two
+    // concurrent identifications of the same session would have to interleave
+    // inside a few milliseconds, and the loser is a competing face match on the
+    // same camera frame -- an outcome indistinguishable from either one winning
+    // cleanly. Locking the row for that is not worth the contention on a table
+    // every chat turn writes.
+    let mut bound = false;
     if result.identified {
         if let Some(pid) = result.profile_id.clone() {
-            let mut guard = state.session_user_bindings.write().await;
-            guard.insert(session_id.clone(), pid);
+            // NOT `unwrap_or(unknown())`. If the read fails we do not know what
+            // is bound, and treating "I could not tell" as "nobody is bound"
+            // lets this face match take over a paired-device session -- the
+            // exact downgrade `supersedes` exists to refuse. Access narrows on
+            // failure (invariant 2), so a broken read refuses the write.
+            let existing = state
+                .session_storage
+                .get_session_identity(&session_id)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({"error": e.to_string()})),
+                    )
+                })?;
+            let proposed = SessionIdentity {
+                profile_id: Some(pid),
+                source: IdentificationSource::Face,
+                confidence: result.confidence,
+            };
+            if proposed.supersedes(&existing) {
+                state
+                    .session_storage
+                    .set_session_identity(&session_id, &proposed)
+                    .await
+                    .map_err(identity_write_error)?;
+                bound = true;
+            }
         }
     }
 
@@ -11262,32 +11316,65 @@ async fn identify_session_user_handler(
         "profile_id": result.profile_id,
         "confidence": result.confidence,
         "threshold":  face.match_threshold(),
+        "bound":      bound,
     })))
 }
 
 /// GET /api/v1/sessions/:session_id/user — read the bound profile.
+///
+/// Reports the evidence alongside the id. A caller deciding what to show a
+/// speaker needs to know whether "this is Jerry" came from his phone's token or
+/// from a 0.6 face match, and a bare profile id cannot say.
 async fn get_session_user_handler(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let guard = state.session_user_bindings.read().await;
-    let profile_id = guard.get(&session_id).cloned();
+    let identity = state
+        .session_storage
+        .get_session_identity(&session_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
     Ok(Json(json!({
         "session_id": session_id,
-        "profile_id": profile_id,
+        "profile_id": identity.profile_id,
+        "identification_source": identity.source.as_str(),
+        "confidence": identity.confidence,
     })))
 }
 
 /// DELETE /api/v1/sessions/:session_id/user — release the binding.
+///
+/// Always available, whatever bound the session. Releasing an attribution
+/// narrows what the session may reach, so unlike setting one it needs no
+/// strength check -- there is no such thing as a downgrade to nobody.
 async fn clear_session_user_handler(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mut guard = state.session_user_bindings.write().await;
-    let removed = guard.remove(&session_id).is_some();
+    // Unlike the identify path, defaulting on a failed read is safe here: this
+    // value only decides what the response *reports*, and the release below
+    // runs unconditionally. A failure narrows access either way.
+    let had_binding = state
+        .session_storage
+        .get_session_identity(&session_id)
+        .await
+        .map(|i| i.profile_id.is_some())
+        .unwrap_or(false);
+
+    state
+        .session_storage
+        .set_session_identity(&session_id, &SessionIdentity::unknown())
+        .await
+        .map_err(identity_write_error)?;
+
     Ok(Json(json!({
         "session_id": session_id,
-        "cleared":    removed,
+        "cleared":    had_binding,
     })))
 }
 

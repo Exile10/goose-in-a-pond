@@ -22,14 +22,17 @@ use axum::http::{Method, Request, StatusCode};
 use pond_api::{build_router, AppState};
 use pond_core::shared::mocks::mock_agent::MockAgent;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
+use pond_core::user_data::domain::session::{IdentificationSource, SessionIdentity};
 use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
 use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
 use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
 use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
 use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 use pond_core::user_data::ports::onboarding::OnboardingRepository;
+use pond_core::user_data::ports::session_storage::SessionStorage;
 use pond_infra::db::Database;
 use pond_infra::mock_handshake::MockHandshake;
+use pond_infra::sqlite_profile::SqliteProfileRepository;
 use pond_infra::sqlite_prompt_extra::SqlitePromptExtraRepository;
 use pond_infra::sqlite_prompt_template::SqlitePromptTemplateRepository;
 use pond_infra::sqlite_recipe::SqliteRecipeRepository;
@@ -116,9 +119,26 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
     make_app_with_dispatcher(None).await
 }
 
+/// Same app, plus a handle on session storage.
+///
+/// Sessions have no create endpoint -- they are born from a chat turn -- so a
+/// test about session attribution has to seed one through the port. Profiles
+/// do have one, and these tests use it, so the foreign key is exercised the
+/// way production exercises it.
+async fn make_app_with_sessions() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempDir) {
+    make_app_full(None).await
+}
+
 async fn make_app_with_dispatcher(
     tool_dispatcher: Option<Arc<dyn pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher>>,
 ) -> (axum::Router, tempfile::TempDir) {
+    let (router, _storage, tmp) = make_app_full(tool_dispatcher).await;
+    (router, tmp)
+}
+
+async fn make_app_full(
+    tool_dispatcher: Option<Arc<dyn pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher>>,
+) -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
     let pool = db.system.clone();
@@ -127,20 +147,24 @@ async fn make_app_with_dispatcher(
     let mock_hs = MockHandshake::new();
     mock_hs.add_valid_token("test-token".to_string()).await;
 
+    let session_storage = Arc::new(SqliteSessionStorage::new(pool.clone()));
+
     let state = Arc::new(AppState {
         db: db,
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
         whisper_url: "http://127.0.0.1:9000".into(),
         transcribe_audio: None,
-        session_storage: Arc::new(SqliteSessionStorage::new(pool.clone())),
+        session_storage: session_storage.clone(),
         http_client: reqwest::Client::new(),
         agent: Arc::new(MockAgent::new()),
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".into(),
         tts: None,
         settings_repo: Arc::new(MockSettingsRepository::new()),
-        profile_repo: Arc::new(MockProfileRepository::new()),
+        // Real repository, not the mock: `sessions.profile_id` is a foreign key
+        // into `profiles`, and an in-memory profile store cannot satisfy it.
+        profile_repo: Arc::new(SqliteProfileRepository::new(pool.clone())),
         device_registry: Arc::new(NoDevices),
         commissioner: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
@@ -176,7 +200,6 @@ async fn make_app_with_dispatcher(
         notification_tx: tokio::sync::broadcast::channel(16).0,
         notification_queue: None,
         notification_sender: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
@@ -203,6 +226,7 @@ async fn make_app_with_dispatcher(
 
     (
         build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
+        session_storage,
         tmp,
     )
 }
@@ -399,7 +423,6 @@ async fn prompt_template_delete_system_returns_403() {
         notification_tx: tokio::sync::broadcast::channel(16).0,
         notification_queue: None,
         notification_sender: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
@@ -875,7 +898,6 @@ async fn returns_501_when_repos_not_configured() {
         notification_tx: tokio::sync::broadcast::channel(16).0,
         notification_queue: None,
         notification_sender: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
@@ -973,4 +995,141 @@ async fn invoke_tool_400_when_tool_missing() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── Session identity (PAI-1 P2) ──────────────────────────────────────────────
+//
+// These go through the router, not the repository, because the thing P2
+// replaced was an in-memory map that the repository layer never saw. A test
+// below the HTTP boundary would have passed against the old code too.
+
+/// Create a household member through the API and return their generated id.
+async fn seed_profile(app: &axum::Router, display_name: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/profiles",
+            serde_json::json!({ "display_name": display_name }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "profile create failed");
+    body_json(resp).await["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn session_user_reads_nobody_for_a_session_never_identified() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+
+    let resp = app
+        .oneshot(get("/api/v1/sessions/sess-1/user"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["profile_id"], serde_json::Value::Null);
+    assert_eq!(body["identification_source"], "unknown");
+}
+
+/// The old handler answered from a process-local map, so a restart erased the
+/// binding. This asserts the replacement is actually durable: a second router
+/// over the same database sees what the first one wrote.
+#[tokio::test]
+async fn a_binding_survives_the_process_that_made_it() {
+    let (app, storage, tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+    let jerry = seed_profile(&app, "Jerry").await;
+    storage
+        .set_session_identity(
+            "sess-1",
+            &SessionIdentity {
+                profile_id: Some(jerry.clone()),
+                source: IdentificationSource::Explicit,
+                confidence: None,
+            },
+        )
+        .await
+        .unwrap();
+    drop(storage);
+
+    // A fresh app over the same data dir stands in for a restart.
+    let db = Database::init(tmp.path()).await.unwrap();
+    let reopened = SqliteSessionStorage::new(db.system.clone());
+    let identity = reopened.get_session_identity("sess-1").await.unwrap();
+    assert_eq!(identity.profile_id.as_deref(), Some(jerry.as_str()));
+    assert_eq!(identity.source, IdentificationSource::Explicit);
+}
+
+#[tokio::test]
+async fn clearing_a_binding_releases_it_and_reports_whether_there_was_one() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+    let jerry = seed_profile(&app, "Jerry").await;
+    storage
+        .set_session_identity(
+            "sess-1",
+            &SessionIdentity {
+                profile_id: Some(jerry),
+                source: IdentificationSource::Face,
+                confidence: Some(0.8),
+            },
+        )
+        .await
+        .unwrap();
+
+    let body = body_json(
+        app.clone()
+            .oneshot(delete("/api/v1/sessions/sess-1/user"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["cleared"], true);
+
+    let body = body_json(
+        app.clone()
+            .oneshot(get("/api/v1/sessions/sess-1/user"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["profile_id"], serde_json::Value::Null);
+    assert_eq!(body["identification_source"], "unknown");
+
+    // Idempotent in effect, honest in its report.
+    let body = body_json(
+        app.oneshot(delete("/api/v1/sessions/sess-1/user"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["cleared"], false);
+}
+
+/// The old map accepted any session id, because it was a `HashMap`. Writing to
+/// a row that does not exist has to be an error, not a silent success -- an
+/// attribution accepted and then discarded is the exact failure PAI-1 exists to
+/// end.
+#[tokio::test]
+async fn clearing_a_binding_on_an_unknown_session_is_404() {
+    let (app, _storage, _tmp) = make_app_with_sessions().await;
+    let resp = app
+        .oneshot(delete("/api/v1/sessions/no-such-session/user"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Reading is deliberately more forgiving than writing: "whose session is
+/// this" has a correct answer for a session that does not exist.
+#[tokio::test]
+async fn reading_the_user_of_an_unknown_session_is_ok_and_says_nobody() {
+    let (app, _storage, _tmp) = make_app_with_sessions().await;
+    let resp = app
+        .oneshot(get("/api/v1/sessions/no-such-session/user"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["profile_id"], serde_json::Value::Null);
 }

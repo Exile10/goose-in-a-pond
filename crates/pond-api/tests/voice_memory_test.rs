@@ -147,7 +147,6 @@ async fn make_memory_app() -> (axum::Router, Arc<MockMemoryRepository>, tempfile
         notification_sender: None,
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         face_recognition: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
         memory_extractor: None,

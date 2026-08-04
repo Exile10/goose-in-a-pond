@@ -30,14 +30,23 @@ the eight requirements below is blocked on one of them.
 `Profile` exists (`crates/pond-core/src/user_data/domain/profile.rs`) with six fields and a
 CRUD repository. Everything downstream of it is unwired:
 
-- `MemoryFragment.profile_id` exists (`user_data/domain/memory.rs:100`) and `sqlite_memory.rs`
-  branches on it — but **every production call site passes `None`**:
-  `goose_agent.rs:1643,1674,2109`, `pond-mcp-server/src/memory.rs:100,133,372,443`,
-  `user_data/services/memory_extraction.rs:84,206`. One household, one memory pool.
-- `Session` (`user_data/domain/session.rs:61-77`) has no profile column at all.
-- `POST /sessions/{id}/identify-user` writes into `AppState.session_user_bindings`
-  (`pond-api/src/lib.rs:266`), an in-memory `HashMap` touched only by its own three handlers
-  (`routes.rs:11236,11255,11268`). **Nothing on the chat or prompt path reads it.**
+- `MemoryFragment.profile_id` exists (`user_data/domain/memory.rs`) and `sqlite_memory.rs` branches
+  on it — but **every production call site passed `None`**: `goose_agent.rs`,
+  `pond-mcp-server/src/memory.rs`, `user_data/services/memory_extraction.rs`. One household, one
+  memory pool.
+  **PARTLY FIXED 2026-08-04 by PAI-1 P1.** The five search methods take `&ProfileScope` now, so
+  "everything" is a deliberate, greppable act. Every call site still says `Household`; narrowing
+  them is P3 and P4.
+- ~~`Session` has no profile column at all.~~ **Wrong, and the truth was worse.** The column has
+  existed since migration `0003`, unwritten and unread for thirty-four migrations — a dead column,
+  the same failure as `memory.profile_id` and the identification map below.
+  **FIXED 2026-08-04 by PAI-1 P2**, which also had to add a delete trigger: the column's untested
+  `NO ACTION` foreign key would have started failing member deletion the moment anything wrote it.
+- `POST /sessions/{id}/identify-user` wrote into `AppState.session_user_bindings`, an in-memory
+  `HashMap` touched only by its own three handlers. **Nothing on the chat or prompt path read it.**
+  **FIXED 2026-08-04 by PAI-1 P2** — the map is deleted and the three handlers read and write the
+  session row, so a binding now survives a restart. Still nothing on the chat path consults it;
+  that is P3.
 - Only `settings.primary_profile_id` reaches the model (`routes.rs:1191-1205`).
 - Speaker identification is a design document (`docs/architecture/data_pipeline.md:502-577`) — no
   port, adapter, table, migration or crate exists.
@@ -124,7 +133,7 @@ PAI-3 Context governor ── PAI-4 Compaction ── PAI-5 Thinking │
 
 | Doc | Workstream | Requirement | Depends on | Status |
 |---|---|---|---|---|
-| [01](./pai/01-identity-and-profile-boundaries.md) | Identity and profile boundaries | Hard profile boundaries | — | DESIGNED |
+| [01](./pai/01-identity-and-profile-boundaries.md) | Identity and profile boundaries | Hard profile boundaries | — | **P1, P2 LANDED** |
 | [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | DESIGNED |
 | [03](./pai/03-context-governor.md) | Context governor | Large context, used fully | — | **P1, P2 LANDED** |
 | [04](./pai/04-smart-compaction.md) | Smart compaction | Smart compaction | 03 | DESIGNED |

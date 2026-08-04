@@ -256,14 +256,6 @@ pub struct AppState {
     /// members from camera frames).  `None` when no ONNX embedding model
     /// is configured — all face endpoints then return 503.
     pub face_recognition: Option<Arc<dyn FaceRecognition>>,
-    /// Wake-on-face session bindings: `session_id -> profile_id`.
-    ///
-    /// Populated by `POST /api/v1/sessions/:id/identify-user` when a camera
-    /// frame recognises a known face.  The prompt builder can then pull the
-    /// profile's name into the system prompt so the agent greets the right
-    /// household member by name.  Entries are transient (cleared on server
-    /// restart); re-identification is cheap enough to redo each session.
-    pub session_user_bindings: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     /// Limits concurrent SSE streams to prevent unbounded memory use from
     /// stalled or abandoned clients. Acquired at the start of `chat_stream`
     /// and `agent_chat_stream`; dropped when the stream ends or disconnects.

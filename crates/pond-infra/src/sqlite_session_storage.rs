@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use pond_core::models::domain::image_limits::extension_for_mime;
 use pond_core::models::domain::message::{ChatMessage, ImageAttachment, Role, ToolCallRecord};
-use pond_core::user_data::domain::session::{MessageAttachment, Session, SessionMessage};
+use pond_core::user_data::domain::session::{
+    IdentificationSource, MessageAttachment, Session, SessionIdentity, SessionMessage,
+};
 use pond_core::user_data::ports::session_storage::{SessionStorage, SessionStorageError};
 use sqlx::{Pool, Row, Sqlite};
 use std::collections::HashMap;
@@ -19,6 +21,7 @@ use std::path::{Path, PathBuf};
 struct SessionRow {
     id: String,
     title: Option<String>,
+    profile_id: Option<String>,
     total_prompt_tokens: i64,
     total_completion_tokens: i64,
     model_name: Option<String>,
@@ -76,6 +79,7 @@ impl TryFrom<SessionRow> for Session {
         Ok(Session {
             id: r.id,
             title: r.title,
+            profile_id: r.profile_id,
             total_prompt_tokens: r.total_prompt_tokens as u32,
             total_completion_tokens: r.total_completion_tokens as u32,
             model_name: r.model_name,
@@ -356,7 +360,7 @@ impl SessionStorage for SqliteSessionStorage {
 
     async fn get_session(&self, session_id: &str) -> Result<Session, SessionStorageError> {
         let row = sqlx::query_as::<_, SessionRow>(
-            "SELECT id, title, total_prompt_tokens, total_completion_tokens, model_name, created_at, updated_at FROM sessions WHERE id = ?",
+            "SELECT id, title, profile_id, total_prompt_tokens, total_completion_tokens, model_name, created_at, updated_at FROM sessions WHERE id = ?",
         )
         .bind(session_id)
         .fetch_optional(&self.pool)
@@ -441,6 +445,68 @@ impl SessionStorage for SqliteSessionStorage {
         .execute(&self.pool)
         .await
         .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_session_identity(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionIdentity, SessionStorageError> {
+        let row = sqlx::query(
+            "SELECT profile_id, identification_source, identification_confidence \
+             FROM sessions WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        let Some(row) = row else {
+            return Ok(SessionIdentity::unknown());
+        };
+
+        let stored: Option<String> = row.get("identification_source");
+        Ok(SessionIdentity {
+            profile_id: row.get("profile_id"),
+            // A NULL source is a legacy row, and legacy rows are unattributed.
+            source: stored
+                .as_deref()
+                .map(IdentificationSource::parse)
+                .unwrap_or(IdentificationSource::Unknown),
+            confidence: row
+                .get::<Option<f64>, _>("identification_confidence")
+                .map(|c| c as f32),
+        })
+    }
+
+    async fn set_session_identity(
+        &self,
+        session_id: &str,
+        identity: &SessionIdentity,
+    ) -> Result<(), SessionStorageError> {
+        // Deliberately does NOT touch `updated_at`. `list_sessions` orders by it,
+        // so bumping it here would push a conversation to the top of the user's
+        // history because a camera recognised somebody -- reordering what they
+        // see without a message having been sent. Attribution is metadata about
+        // the session, not activity in it.
+        let result = sqlx::query(
+            "UPDATE sessions SET \
+               profile_id                = ?, \
+               identification_source     = ?, \
+               identification_confidence = ? \
+             WHERE id = ?",
+        )
+        .bind(identity.profile_id.as_deref())
+        .bind(identity.source.as_str())
+        .bind(identity.confidence.map(|c| c as f64))
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(SessionStorageError::SessionNotFound(session_id.to_string()));
+        }
         Ok(())
     }
 
@@ -583,7 +649,7 @@ impl SessionStorage for SqliteSessionStorage {
 
     async fn list_sessions(&self) -> Result<Vec<Session>, SessionStorageError> {
         let rows = sqlx::query_as::<_, SessionRow>(
-            "SELECT id, title, total_prompt_tokens, total_completion_tokens, model_name, created_at, updated_at FROM sessions ORDER BY updated_at DESC",
+            "SELECT id, title, profile_id, total_prompt_tokens, total_completion_tokens, model_name, created_at, updated_at FROM sessions ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -1509,5 +1575,171 @@ mod tests {
         assert_eq!(msgs[0].prompt_tokens, None, "user rows carry no counts");
         assert_eq!(msgs[1].prompt_tokens, Some(1930));
         assert_eq!(msgs[1].completion_tokens, Some(87));
+    }
+
+    // ── Session identity (PAI-1 P2) ───────────────────────────────────────
+
+    /// `sessions.profile_id` has existed since migration 0003 and nothing ever
+    /// wrote it. This is the test that stops it being a dead column again.
+    #[tokio::test]
+    async fn a_new_session_is_unattributed_and_reads_back_that_way() {
+        let (s, _tmp) = make_storage().await;
+        let session = s.create_session("sess-1".to_string()).await.unwrap();
+        assert_eq!(session.profile_id, None);
+        assert_eq!(s.get_session("sess-1").await.unwrap().profile_id, None);
+        assert_eq!(
+            s.get_session_identity("sess-1").await.unwrap(),
+            SessionIdentity::unknown()
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_round_trips_including_the_face_confidence() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        insert_profile(&s, "jerry").await;
+        let before = s.get_session("sess-1").await.unwrap().updated_at;
+
+        s.set_session_identity(
+            "sess-1",
+            &SessionIdentity {
+                profile_id: Some("jerry".to_string()),
+                source: IdentificationSource::Face,
+                confidence: Some(0.62),
+            },
+        )
+        .await
+        .unwrap();
+
+        let read = s.get_session_identity("sess-1").await.unwrap();
+        assert_eq!(read.profile_id.as_deref(), Some("jerry"));
+        assert_eq!(
+            s.get_session("sess-1").await.unwrap().updated_at,
+            before,
+            "identifying a session must not reorder the user's chat history"
+        );
+        assert_eq!(read.source, IdentificationSource::Face);
+        assert!((read.confidence.unwrap() - 0.62).abs() < 1e-6);
+
+        // and the same fact is visible on the session itself, which is what
+        // the sessions list and every later scope decision will read.
+        assert_eq!(
+            s.get_session("sess-1").await.unwrap().profile_id.as_deref(),
+            Some("jerry")
+        );
+        assert_eq!(
+            s.list_sessions().await.unwrap()[0].profile_id.as_deref(),
+            Some("jerry")
+        );
+    }
+
+    /// An attribution that is accepted and then quietly dropped is exactly the
+    /// bug this phase exists to end, so a write against a session that does not
+    /// exist has to fail loudly.
+    #[tokio::test]
+    async fn identifying_a_session_that_does_not_exist_is_an_error() {
+        let (s, _tmp) = make_storage().await;
+        let err = s
+            .set_session_identity(
+                "no-such-session",
+                &SessionIdentity {
+                    profile_id: Some("jerry".to_string()),
+                    source: IdentificationSource::Explicit,
+                    confidence: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SessionStorageError::SessionNotFound(id) if id == "no-such-session"),
+            "expected SessionNotFound"
+        );
+    }
+
+    /// Reading identity for an unknown session is NOT an error -- "nobody" is a
+    /// correct answer to "whose session is this".
+    #[tokio::test]
+    async fn reading_identity_for_an_unknown_session_says_nobody() {
+        let (s, _tmp) = make_storage().await;
+        assert_eq!(
+            s.get_session_identity("no-such-session").await.unwrap(),
+            SessionIdentity::unknown()
+        );
+    }
+
+    /// Migration 0003 declared `profile_id REFERENCES profiles(id)` with no ON
+    /// DELETE action, and `Database::init` turns foreign keys on. That was
+    /// harmless only while the column stayed NULL. Now that it is written,
+    /// deleting a member who has ever spoken to the pond would fail the FK
+    /// check -- so 0037 carries a BEFORE DELETE trigger standing in for the ON
+    /// DELETE SET NULL that SQLite will not let us add in place.
+    #[tokio::test]
+    async fn deleting_a_profile_releases_their_sessions_instead_of_failing() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        insert_profile(&s, "jerry").await;
+        s.set_session_identity(
+            "sess-1",
+            &SessionIdentity {
+                profile_id: Some("jerry".to_string()),
+                source: IdentificationSource::Face,
+                confidence: Some(0.91),
+            },
+        )
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM profiles WHERE id = ?")
+            .bind("jerry")
+            .execute(&s.pool)
+            .await
+            .expect("deleting a member must not be blocked by their sessions");
+
+        // The conversation survives; only the attribution is gone. Erasing the
+        // content is a separate, deliberate cascade (PAI-1 P7).
+        let session = s.get_session("sess-1").await.unwrap();
+        assert_eq!(session.id, "sess-1");
+        assert_eq!(session.profile_id, None);
+        assert_eq!(
+            s.get_session_identity("sess-1").await.unwrap(),
+            SessionIdentity::unknown(),
+            "a released session must not keep a dangling source or confidence"
+        );
+    }
+
+    /// `profile_id` is a real foreign key, so identity cannot name a member who
+    /// does not exist. Worth pinning: it is the cheapest guard against a typo'd
+    /// or stale id becoming a permanent, unmatchable attribution.
+    #[tokio::test]
+    async fn identity_cannot_name_a_profile_that_does_not_exist() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        let err = s
+            .set_session_identity(
+                "sess-1",
+                &SessionIdentity {
+                    profile_id: Some("ghost".to_string()),
+                    source: IdentificationSource::Explicit,
+                    confidence: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SessionStorageError::StorageError(_)),
+            "expected the foreign key to reject an unknown profile, got {err:?}"
+        );
+    }
+
+    async fn insert_profile(s: &SqliteSessionStorage, id: &str) {
+        sqlx::query(
+            "INSERT INTO profiles (id, display_name, avatar_emoji, preferences) \
+             VALUES (?, ?, 'duck', '{}')",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(&s.pool)
+        .await
+        .expect("profiles row is required by the sessions.profile_id foreign key");
     }
 }

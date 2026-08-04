@@ -1,5 +1,7 @@
 use crate::models::domain::message::ImageAttachment;
-use crate::user_data::domain::session::{MessageAttachment, Session, SessionMessage};
+use crate::user_data::domain::session::{
+    MessageAttachment, Session, SessionIdentity, SessionMessage,
+};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -150,6 +152,44 @@ pub trait SessionStorage: Send + Sync {
         &self,
         _session_id: &str,
         _engine_session_id: &str,
+    ) -> Result<(), SessionStorageError> {
+        Ok(()) // default no-op for backward compat
+    }
+
+    /// Who this session is attributed to, and on what evidence.
+    ///
+    /// Returns [`SessionIdentity::unknown`] for a session that has never been
+    /// identified, which today is every session in every existing pond. That
+    /// is a real answer, not a missing one: "nobody has been identified" is
+    /// exactly what the caller needs to know, and returning it rather than an
+    /// `Option` removes the temptation to treat absence as permission.
+    ///
+    /// An unknown session id also reads as unattributed rather than erroring.
+    /// A read asking "whose session is this" has a correct answer for a session
+    /// that does not exist, and it is "nobody".
+    async fn get_session_identity(
+        &self,
+        _session_id: &str,
+    ) -> Result<SessionIdentity, SessionStorageError> {
+        Ok(SessionIdentity::unknown()) // default no-op for backward compat
+    }
+
+    /// Record who a session belongs to.
+    ///
+    /// This does NOT decide whether the new identification should win over
+    /// whatever is already stored -- that is a policy question and it lives in
+    /// [`SessionIdentity::supersedes`], in the domain. An adapter that made the
+    /// choice itself would put the rule beyond the reach of a pond-core test.
+    ///
+    /// Unlike the tool-group and engine-session pairings, this one is stored on
+    /// the `sessions` row itself, so it genuinely requires the row to exist.
+    /// Implementations return [`SessionStorageError::SessionNotFound`] rather
+    /// than succeeding silently -- an attribution that was accepted and then
+    /// discarded is the failure mode this whole phase exists to end.
+    async fn set_session_identity(
+        &self,
+        _session_id: &str,
+        _identity: &SessionIdentity,
     ) -> Result<(), SessionStorageError> {
         Ok(()) // default no-op for backward compat
     }

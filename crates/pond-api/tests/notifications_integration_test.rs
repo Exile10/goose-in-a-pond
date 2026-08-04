@@ -121,7 +121,6 @@ async fn make_app() -> Harness {
         notification_tx,
         notification_queue: Some(queue.clone()),
         notification_sender: Some(sender.clone()),
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
