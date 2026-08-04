@@ -127,6 +127,13 @@ pub struct ContextInputs<'a> {
     pub catalog_context_length: Option<u32>,
     /// The engine's own report from a previous turn of this session.
     pub engine_reported: Option<EngineWindow>,
+    /// A live capability-reported window, when the caller holds one.
+    ///
+    /// Used at the heuristic rung in place of re-deriving from the model name.
+    /// It is the same *kind* of answer — a declared window rather than an
+    /// allocation — but a better-informed one, since the adapter populates
+    /// capabilities from the active model rather than from a substring match.
+    pub capability_window: Option<u32>,
 }
 
 /// A resolved window and its provenance.
@@ -186,10 +193,16 @@ impl ContextGovernor {
             };
         }
 
-        // 5. Name heuristic. The only rung that may return the conservative
-        //    4096 default.
+        // 5. Heuristic. A caller-supplied capability window beats re-deriving
+        //    from the model name; otherwise fall back to the name. This is the
+        //    only rung that may return the conservative 4096 default.
+        let tokens = inputs
+            .capability_window
+            .filter(|c| *c > 0)
+            .map(|c| c as usize)
+            .unwrap_or_else(|| Self::heuristic_window(inputs.provider, inputs.model));
         WindowResolution {
-            tokens: Self::heuristic_window(inputs.provider, inputs.model),
+            tokens,
             source: WindowSource::Heuristic,
         }
     }
@@ -338,6 +351,38 @@ mod tests {
         let r = ContextGovernor::resolve(&i);
         assert_eq!(r.tokens, 5000);
         assert_eq!(r.source, WindowSource::Override);
+    }
+
+    #[test]
+    fn a_capability_window_is_preferred_over_the_name_heuristic() {
+        let mut i = inputs("ollama", "some-unknown-model");
+        i.capability_window = Some(16384);
+
+        let r = ContextGovernor::resolve(&i);
+        // Still the heuristic RUNG — it is a declared window, not an
+        // allocation — but a better-informed answer than 4096 from the name.
+        assert_eq!(r.tokens, 16384);
+        assert_eq!(r.source, WindowSource::Heuristic);
+        assert!(!r.is_exact());
+    }
+
+    #[test]
+    fn a_capability_window_still_loses_to_the_override() {
+        let mut i = inputs("ollama", "some-unknown-model");
+        i.capability_window = Some(16384);
+        i.override_tokens = 2048;
+
+        let r = ContextGovernor::resolve(&i);
+        assert_eq!(r.tokens, 2048);
+        assert_eq!(r.source, WindowSource::Override);
+    }
+
+    #[test]
+    fn a_zero_capability_window_falls_back_to_the_name() {
+        let mut i = inputs("ollama", "some-unknown-model");
+        i.capability_window = Some(0);
+
+        assert_eq!(ContextGovernor::resolve(&i).tokens, 4096);
     }
 
     #[test]

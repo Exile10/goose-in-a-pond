@@ -19,6 +19,9 @@ use axum::{
 use pond_core::mcp::ports::extension_manager::ExtensionInfo;
 use pond_core::models::domain::message::ChatMessage;
 use pond_core::models::ports::provider::LlmProvider;
+use pond_core::models::services::context::context_governor::{
+    ContextGovernor, ContextInputs, EngineWindow,
+};
 use pond_core::prompts::{
     build_system_prompt_with_profile, builtin_template_content, render_template, sanitize_field,
     ProfileContext,
@@ -1670,15 +1673,25 @@ fn chat_stream_inner(
                     .unwrap_or(0);
 
                 // Prefer the engine-reported context window over settings/capability
-                // guesses; the engine knows the real n_ctx it allocated.
-                let context_limit = turn_stats
-                    .as_ref()
-                    .and_then(|s| s.context_limit_tokens)
-                    .unwrap_or(if settings.context_window_override > 0 {
-                        settings.context_window_override
-                    } else {
-                        state.agent.capabilities().context_window_tokens
-                    });
+                // guesses; the engine knows the real n_ctx it allocated. The
+                // precedence itself lives in pond-core's ContextGovernor so this
+                // telemetry cannot drift from what the trimmer actually budgeted
+                // against (PAI-3).
+                let context_limit = ContextGovernor::resolve(&ContextInputs {
+                    provider: &settings.chat_provider,
+                    model: &settings.chat_model,
+                    override_tokens: settings.context_window_override,
+                    // Not reachable from the API layer; the adapter owns the
+                    // registry lookup and reports the result via TurnStats.
+                    registry_pinned: None,
+                    catalog_context_length: None,
+                    engine_reported: turn_stats
+                        .as_ref()
+                        .and_then(|s| s.context_limit_tokens)
+                        .map(|t| EngineWindow::new(settings.chat_model.clone(), t)),
+                    capability_window: Some(state.agent.capabilities().context_window_tokens),
+                })
+                .tokens as u32;
                 let context_used = turn_stats
                     .as_ref()
                     .and_then(|s| s.context_used_tokens)
