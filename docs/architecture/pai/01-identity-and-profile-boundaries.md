@@ -291,8 +291,33 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   unidentified session" today — and the only behaviour-preserving answer, `Household`, is precisely
   the scope-widening default invariant 2 calls a bug. That question belongs to P3, which decides it
   with the paired-device, explicit and face inputs in hand rather than from the stored row alone.
-- **P3** Resolution chain (paired device → explicit → face → guest) computed once per turn and
-  threaded through `AgentRequest` into `ChatService`.
+- **P3 — resolver LANDED 2026-08-04, wiring outstanding.** `user_data/services/identity_resolution.rs`
+  holds the chain as one pure function with `ResolutionInputs` / `ResolvedIdentity`. No call site
+  consumes it yet; threading it through `AgentRequest` into `ChatService` is the remaining half.
+
+  **The strongest rung of the chain cannot be built.** Nothing in the schema links a paired device
+  to a household member: `session_tokens` stores `device_id` and `client_id` and no profile, and
+  neither do `push_tokens`, `pairing_codes` or `handshake_challenges`. The pairing flow never asks
+  who is pairing. So `paired_device_profile` is an input the resolver honours and every caller feeds
+  `None`.
+
+  Deliberately **not** worked around. Falling back to `settings.primary_profile_id` would attribute
+  every phone in the house to one person — the wrong-attribution failure this whole workstream
+  exists to prevent, and worse than admitting we do not know. Capturing a member at pairing time is
+  its own change, and it is also what [PAI-7](./07-proactive-intelligence.md) needs before it can
+  address a notification to "that profile's devices"; that document assumes the link exists.
+
+  **What an unidentified speaker resolves to.** `Household` while the pond has one member, `Guest`
+  once it has more than one. This looks like a fudge and is not: `Household` and `Guest` differ only
+  when there is somebody to be excluded from, so in a one-member pond they describe the same rows.
+  Resolving to `Guest` unconditionally would make a working single-user assistant refuse to remember
+  anything about its only user, which is a regression rather than a boundary. It does mean **adding
+  a second household member is the moment a pond's privacy posture changes**, which belongs in
+  release notes.
+
+  There is also no explicit-identification route yet — `POST /sessions/{id}/identify-user` is
+  face-only — so `Explicit` has no producer either. That is a small addition and it lands with the
+  wiring.
 - **P4** Enforcement: reads and writes honour the scope; cross-profile access routes through
   `SecurityPolicy::allow` + `::audit`, denied by default.
 - **P5** Guest degradation: memory injection, tool groups and draft rights gated.
