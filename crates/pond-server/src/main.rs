@@ -61,6 +61,7 @@ use pond_core::shared::services::in_process_event_bus::InProcessEventBus;
 use pond_core::shared::services::print_output::{PrintOutput, SilentOutput};
 use pond_core::shared::services::stdin_input::StdinInput;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
+use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::ports::session_storage::SessionStorage;
 use pond_core::user_data::ports::settings::SettingsRepository as _;
 use pond_core::user_data::services::onboarding::OnboardingService;
@@ -4328,7 +4329,7 @@ async fn run_consolidation_pipeline(
     use pond_core::user_data::services::consolidation_schedule::MIN_MEMORIES_TO_CONSOLIDATE;
     use pond_core::user_data::services::memory_consolidation as consolidation;
 
-    let memories = match repo.search_scoreable(None).await {
+    let memories = match repo.search_scoreable(&ProfileScope::Household).await {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!("consolidation: failed to load memories: {e}");
@@ -6733,7 +6734,7 @@ async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
 
     match action {
         MemoryAction::List { limit } => {
-            let fragments = repo.search_recent(None, limit).await?;
+            let fragments = repo.search_recent(&ProfileScope::Household, limit).await?;
             if fragments.is_empty() {
                 println!("No memory fragments found.");
                 return Ok(());

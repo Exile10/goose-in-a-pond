@@ -34,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::extension_manager::GiapGooseExtensionManager;
 use crate::giap_registration::registered_extensions;
+use pond_core::user_data::domain::profile::ProfileScope;
 
 /// Minimal hard-coded fallback — used only when the DB has no template for the
 /// current `prompt_style`. Not a full system prompt: just enough to be safe.
@@ -1716,7 +1717,7 @@ impl GooseAdapter {
                 Ok(query_vector) => {
                     match self
                         .memory_repo
-                        .search_similar(&query_vector, None, limit)
+                        .search_similar(&query_vector, &ProfileScope::Household, limit)
                         .await
                     {
                         Ok(hits) => {
@@ -1747,7 +1748,7 @@ impl GooseAdapter {
         }
         match self
             .memory_repo
-            .search_by_content(&keywords, None, limit)
+            .search_by_content(&keywords, &ProfileScope::Household, limit)
             .await
         {
             Ok(hits) => hits.into_iter().map(|m| (m, None)).collect(),
@@ -2184,7 +2185,11 @@ impl GooseAdapter {
             // Recent memories (recency-based)
             async {
                 match candidate_limit {
-                    Some(limit) => self.memory_repo.search_recent(None, limit).await,
+                    Some(limit) => {
+                        self.memory_repo
+                            .search_recent(&ProfileScope::Household, limit)
+                            .await
+                    }
                     None => Ok(vec![]),
                 }
             },

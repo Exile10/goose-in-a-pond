@@ -57,6 +57,7 @@ use pond_core::user_data::domain::skill::UserSkill;
 
 use crate::middleware::onboarding_guard::require_onboarding_complete;
 use crate::{AppState, DownloadEntry, ModelStatusEntry};
+use pond_core::user_data::domain::profile::ProfileScope;
 
 // ───────────────────────── REST API Routes ─────────────────────────
 
@@ -9090,7 +9091,11 @@ async fn delete_prompt_extra(
 // ── Memories ──────────────────────────────────────────────────────────────────
 
 async fn list_memories(State(state): State<Arc<AppState>>) -> impl axum::response::IntoResponse {
-    match state.memory_repo.search_recent(None, 50).await {
+    match state
+        .memory_repo
+        .search_recent(&ProfileScope::Household, 50)
+        .await
+    {
         Ok(memories) => Json(json!(memories)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

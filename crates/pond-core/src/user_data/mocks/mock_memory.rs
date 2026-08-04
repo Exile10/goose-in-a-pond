@@ -4,6 +4,7 @@ use crate::models::ports::embedding::EmbeddingProvider;
 use crate::user_data::domain::memory::{
     cosine_similarity, MemoryEventKind, MemoryFragment, MemoryLifecycle, MemorySegment,
 };
+use crate::user_data::domain::profile::ProfileScope;
 use crate::user_data::ports::memory_repository::MemoryRepository;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -24,6 +25,21 @@ impl MockEmbeddingProvider {
 impl Default for MockEmbeddingProvider {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// In-memory twin of `sqlite_memory::scope_sql`.
+///
+/// These two must agree or every mock-backed test is testing a fiction. The
+/// rule: an `Owner` sees their own rows plus unattributed shared ones, a
+/// `Household` sees everything, and a `Guest` sees nothing.
+fn scope_matches(f: &MemoryFragment, scope: &ProfileScope) -> bool {
+    match scope {
+        ProfileScope::Owner(id) => {
+            f.profile_id.as_deref() == Some(id.as_str()) || f.profile_id.is_none()
+        }
+        ProfileScope::Household => true,
+        ProfileScope::Guest => false,
     }
 }
 
@@ -111,16 +127,13 @@ impl MemoryRepository for MockMemoryRepository {
 
     async fn search_recent(
         &self,
-        profile_id: Option<&str>,
+        scope: &ProfileScope,
         limit: usize,
     ) -> Result<Vec<MemoryFragment>> {
         let fragments = self.fragments.read().await;
         let mut results: Vec<MemoryFragment> = fragments
             .iter()
-            .filter(|f| match profile_id {
-                Some(pid) => f.profile_id.as_deref() == Some(pid),
-                None => true,
-            })
+            .filter(|f| scope_matches(f, scope))
             .cloned()
             .collect();
         // newest first, then truncate
@@ -132,7 +145,7 @@ impl MemoryRepository for MockMemoryRepository {
     async fn search_similar(
         &self,
         query_embedding: &[f32],
-        profile_id: Option<&str>,
+        scope: &ProfileScope,
         limit: usize,
     ) -> Result<Vec<MemoryFragment>> {
         let scored: Vec<(f32, MemoryFragment)> = {
@@ -140,10 +153,7 @@ impl MemoryRepository for MockMemoryRepository {
             fragments
                 .iter()
                 .filter(|f| is_active(f))
-                .filter(|f| match profile_id {
-                    Some(pid) => f.profile_id.as_deref() == Some(pid),
-                    None => true,
-                })
+                .filter(|f| scope_matches(f, scope))
                 .filter_map(|f| {
                     let emb = f.embedding.as_ref()?;
                     Some((cosine_similarity(query_embedding, emb), f.clone()))
@@ -154,7 +164,7 @@ impl MemoryRepository for MockMemoryRepository {
         // Same contract as the SQLite adapter: with nothing embedded at all,
         // degrade to recency rather than returning an empty result.
         if scored.is_empty() {
-            return self.search_recent(profile_id, limit).await;
+            return self.search_recent(scope, limit).await;
         }
 
         let mut scored = scored;
@@ -291,7 +301,10 @@ mod tests {
             "Hello world".to_string(),
         );
         repo.add(frag).await.unwrap();
-        let results = repo.search_recent(Some("profile1"), 10).await.unwrap();
+        let results = repo
+            .search_recent(&ProfileScope::Owner("profile1".into()), 10)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "Hello world");
     }
@@ -302,6 +315,10 @@ mod tests {
         let frag = MemoryFragment::from_chat("del-id".to_string(), None, None, "temp".to_string());
         repo.add(frag).await.unwrap();
         repo.delete("del-id").await.unwrap();
-        assert!(repo.search_recent(None, 10).await.unwrap().is_empty());
+        assert!(repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

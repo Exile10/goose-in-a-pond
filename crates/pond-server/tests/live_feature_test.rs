@@ -17,6 +17,7 @@
 
 use pond_core::models::ports::provider::LlmProvider;
 use pond_core::user_data::domain::memory::{MemoryFragment, MemorySegment, MemoryTier};
+use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::ports::memory_extractor::MemoryExtractor;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use pond_infra::db::Database;
@@ -160,7 +161,10 @@ async fn live_extraction_stores_to_sqlite() {
         )
         .await;
 
-    let memories = repo.search_recent(None, 20).await.unwrap();
+    let memories = repo
+        .search_recent(&ProfileScope::Household, 20)
+        .await
+        .unwrap();
     println!("[live-test] stored {} memories in SQLite:", memories.len());
     for m in &memories {
         println!(
@@ -224,7 +228,10 @@ async fn live_extraction_then_cleanup_cycle() {
         )
         .await;
 
-    let before = repo.search_recent(None, 20).await.unwrap();
+    let before = repo
+        .search_recent(&ProfileScope::Household, 20)
+        .await
+        .unwrap();
     println!("[live-test] before cleanup: {} memories", before.len());
 
     // Run cleanup — fresh memories should NOT be pruned
@@ -234,7 +241,10 @@ async fn live_extraction_then_cleanup_cycle() {
             .unwrap();
     println!("[live-test] cleanup: scanned={scanned}, archived={archived}, pruned={pruned}");
 
-    let after = repo.search_recent(None, 20).await.unwrap();
+    let after = repo
+        .search_recent(&ProfileScope::Household, 20)
+        .await
+        .unwrap();
     assert_eq!(
         before.len(),
         after.len(),
@@ -279,7 +289,10 @@ async fn live_consolidation_merges_duplicates() {
 
     let consolidator = pond_server::llm_memory_consolidator::LlmMemoryConsolidator::new(live);
 
-    let before = repo.search_scoreable(None).await.unwrap();
+    let before = repo
+        .search_scoreable(&ProfileScope::Household)
+        .await
+        .unwrap();
     println!(
         "[live-test] before consolidation: {} memories",
         before.len()
@@ -295,7 +308,10 @@ async fn live_consolidation_merges_duplicates() {
 
     println!("[live-test] consolidation: merged={merged}, pruned={pruned}");
 
-    let after = repo.search_recent(None, 20).await.unwrap();
+    let after = repo
+        .search_recent(&ProfileScope::Household, 20)
+        .await
+        .unwrap();
     println!(
         "[live-test] after consolidation: {} active memories",
         after.len()
