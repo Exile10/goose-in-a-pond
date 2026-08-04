@@ -25,8 +25,11 @@ Verified against code 2026-08-03.
   `sessions.rolling_summary` (migration `0030`) and the trimmer splices it as
   `<conversation-summary>`. **Turns read it; they never wait for it.**
 
-GIAP also disables Goose's competing machinery on this path: `GOOSE_AUTO_COMPACT_THRESHOLD = "1.0"`
-and `GOOSE_TOOL_PAIR_SUMMARIZATION = "false"` for local/gguf (`goose_agent.rs:120-160`).
+GIAP also disables Goose's competing machinery on this path, in `goose_env_knobs`. Note the two
+knobs are gated differently, which I originally ran together: `GOOSE_AUTO_COMPACT_THRESHOLD = "1.0"`
+is set for **every** provider whenever `hybrid_compaction_enabled` is on, while
+`GOOSE_TOOL_PAIR_SUMMARIZATION = "false"` is `local`/`gguf` only — the code's reason being that "an
+HTTP provider's spare capacity is not ours to save".
 
 ### 1.2 Compaction is model-tier-aware and nothing else
 

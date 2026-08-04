@@ -1,6 +1,7 @@
 # Personal Agentic Intelligence — programme roadmap
 
-State of the world verified against code on 2026-08-03, and the design programme for the eight
+State of the world verified against code on 2026-08-03 and re-audited 2026-08-04 (section 1.4 and
+the status table below carry the corrections), and the design programme for the eight
 capabilities that turn GIAP from a very good reactive assistant into a personal agentic
 intelligence.
 
@@ -26,7 +27,7 @@ the eight requirements below is blocked on one of them.
 
 ### 1.1 There is no subject
 
-`Profile` exists (`crates/pond-core/src/user_data/domain/profile.rs:12`) with five fields and a
+`Profile` exists (`crates/pond-core/src/user_data/domain/profile.rs`) with six fields and a
 CRUD repository. Everything downstream of it is unwired:
 
 - `MemoryFragment.profile_id` exists (`user_data/domain/memory.rs:100`) and `sqlite_memory.rs`
@@ -51,8 +52,17 @@ single `.audit()` call site in the repository is inside a `#[cfg(test)]` module.
 Alongside that: no general-purpose redaction exists anywhere (the only redaction in the tree is
 `pond-infra/src/push_token_log.rs`, which shortens push tokens for logging); there is no encryption
 at rest; and `api_key_guardian` / `_gnews` / `_finnhub` / `_coingecko` are plain `Option<String>`
-fields on `Settings` (`settings.rs:652-668`) carrying only `#[serde(default)]` — so
-`GET /settings`, which serializes the whole struct (`routes.rs:2608`), **returns them**.
+fields on `Settings` carrying only `#[serde(default)]` — so `GET /settings`, which serializes the
+whole struct, **returns them**.
+
+**And it returns them to anybody.** Found during the 2026-08-04 audit, not in the original pass:
+`is_public_route` matches on the request path alone — `auth_middleware` never passes it the method —
+while its entries are commented as though method-scoped ("PUT /settings is public so onboarding can
+save", "POST — create profile during onboarding"). `public_routes.merge(protected_routes)` then
+puts everything behind that one check, so the `protected_routes` label decides nothing. The
+consequences are `GET /settings` (every API key) and `DELETE /profiles/{id}` reachable **with no
+token at all**. This is a live defect rather than a gap, and it is [PAI-2](./pai/02-privacy-and-security-guardrails.md)'s
+new P0.
 
 ### 1.3 There is no initiative
 
@@ -69,14 +79,20 @@ fields on `Settings` (`settings.rs:652-668`) carrying only `#[serde(default)]` �
 
 ### 1.4 There is no honest accounting
 
-- Four different resolution orders answer "how big is the context window": `goose_agent.rs:907-949`,
-  `pond-agent/src/agent.rs:375`, `routes.rs:1674-1685`, and — worst — the live trimmer, which reads
-  `std::env::var("GOOSE_CONTEXT_LIMIT")` and **falls back to a hardcoded 8192**
-  (`goose_agent.rs:1478-1481`).
-- Token estimation is `len/4 + 4` (`turn_trimmer.rs:89`), corrected one turn late.
-- `ModelRecord.context_length` exists (`models/domain/model_record.rs:108`) and is written as
-  `None` by every production path (`model_service.rs:383,532`, `routes.rs:3174`). No budget code
-  reads it.
+- ~~Four different resolution orders answer "how big is the context window", worst of them the live
+  trimmer reading `std::env::var("GOOSE_CONTEXT_LIMIT")` with a hardcoded 8192 fallback.~~
+  **FIXED 2026-08-04 by PAI-3 P1.** `ContextGovernor` owns the precedence, all four sites are
+  repointed, and `no_budget_path_reads_the_context_limit_from_the_environment` keeps the env read
+  from coming back.
+- ~~Token estimation is `len/4 + 4`, corrected one turn late.~~ **PARTLY FIXED by PAI-3 P2.** A
+  `TokenCounter` port now carries it, with a tiktoken-backed adapter on the live path and chars/4 as
+  the declared fallback. The "corrected one turn late" half stands and is now load-bearing on
+  purpose: no reachable counter is *exact* for a GGUF model.
+- `ModelRecord.context_length` exists (`models/domain/model_record.rs`). **Correction:** it is *not*
+  written as `None` by every path — `gguf_record()` in
+  `pond-server/src/composite_model_catalog_provider.rs` writes a real value for the curated GGUF
+  catalog. A reader now exists too (`ContextInputs.catalog_context_length`), but every call site
+  still passes `None`, so nothing feeds it yet. That wiring is PAI-3 P3.
 - `reasoning_content` is parsed by llama.cpp and dropped: the identifier appears exactly once in
   `crates/`, in a comment (`pond-inference/src/provider.rs:422`).
 - `AgentStreamEvent::Thinking` has **four consumers and zero producers**
@@ -110,7 +126,7 @@ PAI-3 Context governor ── PAI-4 Compaction ── PAI-5 Thinking │
 |---|---|---|---|---|
 | [01](./pai/01-identity-and-profile-boundaries.md) | Identity and profile boundaries | Hard profile boundaries | — | DESIGNED |
 | [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | DESIGNED |
-| [03](./pai/03-context-governor.md) | Context governor | Large context, used fully | — | DESIGNED |
+| [03](./pai/03-context-governor.md) | Context governor | Large context, used fully | — | **P1, P2 LANDED** |
 | [04](./pai/04-smart-compaction.md) | Smart compaction | Smart compaction | 03 | DESIGNED |
 | [05](./pai/05-reasoning-and-thinking.md) | Reasoning and thinking | Ability to think | 03, 04 | DESIGNED |
 | [06](./pai/06-multi-agent-orchestration.md) | Multi-agent orchestration | Multi-agent orchestration | 01, 02, 03, 04 | DESIGNED |
@@ -175,14 +191,16 @@ good it looks in isolation.
 Several existing documents now assert things the code contradicts. Accuracy is what makes these
 documents worth keeping, so they are corrected as part of the workstream that touches them.
 
-| Document | Claim | Reality | Fixed in |
+All of these are now **done**. Kept as a record of what was corrected and why.
+
+| Document | Claim | Reality | Status |
 |---|---|---|---|
-| `architecture/token_tracking.md:28` | "Real token counts are not available from Goose's `AgentEvent` stream" | Migration `0029_message_token_counts` and `TurnStats` landed; they are | PAI-3 |
-| `architecture/scheduling.md:38` | `TaskKind` has two variants; seven MCP tools | Three variants (`SensorTrigger`); twelve tools | PAI-7 |
-| `api.md:219` | "Token validation is currently a stub" | `SqliteHandshakeAdapter::validate_token` is real | PAI-2 |
-| `architecture/model_capabilities.md:14` | `ModelCapabilities` has five fields | Six — `tool_calling` is missing from the doc | PAI-3 |
-| `security/ports/policy.rs:6-11` | Describes the unconditional loopback bypass "at lines 206-214" | Removed in #94; now gated behind `POND_DEV_ALLOW_LOOPBACK` | PAI-2 |
-| `CLAUDE.md` | "14 `giap-*` extensions" | Correct — `giap_registration.rs` has exactly 14 `register_builtin_extension` calls. My earlier claim of 15 was wrong; re-counted 2026-08-03 | n/a |
+| `architecture/token_tracking.md:28` | "Real token counts are not available from Goose's `AgentEvent` stream" | Migration `0029_message_token_counts` and `TurnStats` landed; they are | FIXED |
+| `architecture/scheduling.md:38` | `TaskKind` has two variants; seven MCP tools | Three variants (`SensorTrigger`); twelve tools | FIXED |
+| `api.md:219` | "Token validation is currently a stub" | `SqliteHandshakeAdapter::validate_token` is real | FIXED |
+| `architecture/model_capabilities.md:14` | `ModelCapabilities` has five fields | Six — `tool_calling` was missing from the doc | FIXED |
+| `security/ports/policy.rs:6-11` | Describes the unconditional loopback bypass "at lines 206-214" | Removed in #94; now gated behind `POND_DEV_ALLOW_LOOPBACK` | FIXED |
+| `CLAUDE.md` | "14 `giap-*` extensions", "57 tools" | **15** and **61**. I twice got this wrong before counting properly: `giap-toolkit` registers via the `TOOLKIT_EXTENSION` const, so a grep for `"giap-*"` string literals misses it. Count `register_builtin_extension(` call sites instead | FIXED 2026-08-04 |
 
 ---
 
