@@ -98,6 +98,29 @@ describe("Add device — Matter vs other", () => {
     expect(screen.getByText("Setup code")).toBeTruthy();
   });
 
+  it("shows the pairing-mode guidance verbatim, since it is the fix as well as the reason", async () => {
+    // The server's wording for the commonest commissioning failure — a device
+    // whose 15-minute pairing window has closed. It is actionable copy, so the
+    // UI must not summarise or truncate it.
+    const guidance =
+      "No device found in pairing mode. Put the device into pairing mode and try again — " +
+      "a Matter device stops accepting new connections about 15 minutes after it starts.";
+    mocked(api.commissionDevice).mockRejectedValue(new Error(guidance));
+    await openModal();
+
+    fireEvent.change(await screen.findByPlaceholderText(/20202021/), {
+      target: { value: "20202021" },
+    });
+    fireEvent.click(screen.getByText("Commission"));
+
+    // Matched in fragments rather than as one string: the copy contains an em
+    // dash and wraps, so an exact-node match would be asserting the layout.
+    expect(await screen.findByText(/No device found in pairing mode/)).toBeTruthy();
+    expect(screen.getByText(/15 minutes after it starts/)).toBeTruthy();
+    // The code stays put: the device is what needs attention, not the input.
+    expect((screen.getByPlaceholderText(/20202021/) as HTMLInputElement).value).toBe("20202021");
+  });
+
   it("switching to 'Other device' restores the manual fields and registers", async () => {
     mocked(api.registerDevice).mockResolvedValue({ id: "d1", name: "Pi" });
     await openModal();

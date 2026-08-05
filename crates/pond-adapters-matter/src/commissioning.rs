@@ -40,6 +40,20 @@ const COMMISSION_TIMEOUT: Duration = Duration::from_secs(180);
 /// still finishing — reporting a failure for a removal that actually happened.
 const DECOMMISSION_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// The pre-flight probe is a local mDNS browse, so it answers in well under a
+/// second when anything is advertising. Bounded low on purpose: its whole value
+/// is being cheaper than the 30s discovery timeout it saves, and a probe that
+/// hangs must not add to the wait.
+const DISCOVER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What the user is told when nothing is advertising itself for pairing. The
+/// 15 minutes is the Matter commissioning window: a device advertises
+/// `_matterc._udp` for roughly that long after it boots and then stops, which
+/// makes "it was pairable earlier" the normal way to arrive here.
+const NOTHING_IN_PAIRING_MODE: &str =
+    "No device found in pairing mode. Put the device into pairing mode and try again — a Matter \
+     device stops accepting new connections about 15 minutes after it starts.";
+
 pub struct MatterCommissioner {
     client: Arc<MatterClient>,
 }
@@ -47,6 +61,39 @@ pub struct MatterCommissioner {
 impl MatterCommissioner {
     pub fn new(client: Arc<MatterClient>) -> Self {
         Self { client }
+    }
+
+    /// Refuse early, and legibly, when nothing is in pairing mode.
+    ///
+    /// Both commissioning commands find the device over mDNS, so "nothing is
+    /// advertising" settles the whole call. Left to the controller it does not
+    /// look like that: it waits out a 30-second CHIP discovery timeout and
+    /// answers "Commissioning failed for node N", with the actual reason
+    /// ("Mdns discovery timed out") written only to its own log file on disk.
+    /// That is the most common way commissioning fails, because a device stops
+    /// advertising ~15 minutes after it boots, and it is the one failure a user
+    /// can fix in ten seconds — if anything tells them what it is.
+    ///
+    /// A probe that itself fails proves nothing, so it never blocks the attempt:
+    /// an unexpected payload or a slow controller falls through to the real
+    /// commission rather than inventing a reason to refuse.
+    async fn refuse_when_nothing_is_pairable(&self) -> Result<()> {
+        let found = match self
+            .client
+            .send_command_with_timeout("discover", json!({}), DISCOVER_TIMEOUT)
+            .await
+        {
+            Ok(result) => result.as_array().map(Vec::len),
+            Err(e) => {
+                tracing::warn!(error = %e, "matter: could not probe for commissionable devices");
+                None
+            }
+        };
+
+        if found == Some(0) {
+            anyhow::bail!(NOTHING_IN_PAIRING_MODE);
+        }
+        Ok(())
     }
 
     /// Write the user-chosen name to the device's NodeLabel. Best-effort: if the
@@ -71,6 +118,9 @@ impl DeviceCommissioningPort for MatterCommissioner {
         code: SetupCode,
         name: Option<String>,
     ) -> Result<CommissionedDevice> {
+        // Before the 30-second wait, not after it: the answer is already known.
+        self.refuse_when_nothing_is_pairable().await?;
+
         let (command, args) = match code {
             SetupCode::PairingCode(code) => ("commission_with_code", json!({ "code": code })),
             SetupCode::Passcode(pin) => ("commission_on_network", json!({ "setup_pin_code": pin })),
