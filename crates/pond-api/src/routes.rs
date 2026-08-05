@@ -67,6 +67,15 @@ use pond_core::user_data::domain::profile::ProfileScope;
 /// Builds the full REST API router with onboarding-aware middleware
 pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     // ───────────── Public routes (accessible before onboarding) ─────────────
+    //
+    // "Public" here means "not behind `require_onboarding_complete`". Whether a
+    // route answers a caller with no bearer token is a SEPARATE question,
+    // decided by `middleware::PUBLIC_ROUTES` -- and since PAI-2 P7 the answer
+    // depends on the pond's state: the wizard's writes (`PUT /settings`,
+    // `POST /profiles`, `PATCH /profiles/{id}`, `POST /onboard/*`,
+    // `/voice/calibrate`) stop answering anonymous callers once onboarding
+    // completes. Adding a route here means classifying it there; four tests
+    // fail the build otherwise.
     let public_routes = Router::new()
         .route("/health", get(health))
         .route("/handshake", post(handshake_handler))

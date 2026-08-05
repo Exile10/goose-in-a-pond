@@ -23,7 +23,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2 LANDED**; P3-P6 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
-| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0-P5 LANDED**; P6-P8 designed |
+| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0-P5, P7 LANDED**; P6, P8 designed |
 
 They are equally weighted and mutually interdependent. `DESIGNED` means the document exists and its
 current-state claims were verified against code; it does **not** mean any code has changed. `LANDED`
@@ -803,3 +803,78 @@ from it.
 `.runtime_api_port` after 180s" is `ensure_onnx_runtime` downloading ~30 MB into a fresh scratch
 directory, not a hang in your feature. Export `ORT_DYLIB_PATH` at an existing copy. The comment
 above the start block says so; I lost a full run to not reading it.
+
+**2026-08-05 (last of the day) — PAI-2 P7. The closure had to be reversible, and that decided the
+design.**
+
+The obvious implementation of "close the onboarding holes" is a flag: remember that this pond has
+been set up, and stop answering the wizard's writes. It is wrong, and one route is what makes it
+wrong. `POST /onboard/reset` is public and stays reachable after onboarding because it is the
+recovery lever for a misconfigured pond — and it works by making the pond *not onboarded* again, so
+the wizard's writes have to come back. A flag never comes back. Reset would have succeeded, dropped
+the pond to the wizard, and left `PUT /settings`, `POST /profiles` and `POST /onboard/complete`
+shut, with reflashing the device as the only repair. **Generalise: before closing a door, find the
+route whose whole purpose is to reopen it.** The mirror of that error is leaving reset
+unconditionally public, which makes the closure decorative — reset, then walk in. Both readings are
+defects; neither is a trade-off. Reset is loopback-only once the pond is onboarded, which is not a
+new boundary: `handshake_pairing_code` and `handshake_issue_pairing_code` already refuse a
+non-loopback peer inside the handler, so a pond that has lost every token can only be re-paired from
+the host anyway.
+
+**I was told to use a defaulted trait method and I should not have been.** The plan gave
+`OnboardingRepository::is_complete` a default body reading `get_current_step`. Eight implementors,
+mostly test stubs — and a stub that inherits "not onboarded" makes every onboarding write route
+public wherever it is used. That is a widening default, which is this programme's own most-repeated
+bug, and PAI-1 invariant 2 exists to forbid it. The method is required instead. The compiler named
+all eight in one pass and each one said what it meant. **A default on a trait that answers a
+security question is a decision made by whoever forgot to override it.**
+
+**A scope-widening default, found by asking what happens when the read fails.**
+`SqlxOnboardingRepository::get_current_step` ends `.ok()??`: a database error becomes `None`, and
+`None` means "not started" to every consumer — the exact state in which every onboarding write hole
+is open. Keying auth on that answer would have reopened all of them on a set-up pond for as long as
+SQLite returned `BUSY`. The port now has `is_complete() -> Result<bool>` and the gate treats a
+failed read as onboarded. Add to 2.2: **when a new decision starts reading an existing value, read
+what that value does on failure, not only what it means on success.**
+
+**And a trap worth remembering for any port with an `Arc` blanket impl.** `AppState` holds
+`Arc<dyn OnboardingRepository>`, so method resolution picks the impl on `Arc` before the concrete
+adapter. A default plus a SQLite override would have compiled, read correctly, and never executed
+the override — the default body would have run on the `Arc`, called `get_current_step`, and answered
+"not onboarded". Requiring the method makes deleting the forwarding arm a compile error.
+
+**A compile-time guard cannot ask a state-dependent question, so change the question, not the
+guard.** The three `PUBLIC_ROUTES` drift guards parse `routes.rs` with `include_str!` and have no
+pond to read. Picking a state would have reported the other state's answer as safety. They now ask
+`reachable_without_token_in_some_state` — the worst case, the only thing a static check can answer
+honestly — and a fourth guard pins the exact list of state-dependent entries so a route cannot
+change class quietly. None was weakened to fit.
+
+**The plan said close `POST /tts`; the shipped clients said otherwise.** It looks like an onboarding
+hole — the wizard's voice preview is why it is public — but `playTtsSentence` (WebVoiceBackend.ts)
+and `fetch_tts_bytes` (audio_cmd.rs) both call it with no `Authorization` header long after setup,
+so closing it makes the assistant mute on a set-up pond. `POST /voice/calibrate` *is* closed,
+because `calibrateWakeWord` does attach the token. The difference between the two decisions is that
+I opened the client and read it. **Before narrowing a route, grep the clients that call it — a
+classification derived from what the route is for is a guess about what calls it.**
+
+**Third instance of a test asserting the right thing about the wrong fixture.**
+`put_settings_without_a_token_is_still_allowed` ran against `OnboardingStep::Completed` and asserted
+the write stays open. The assertion was correct for a pond mid-onboarding and described the hole for
+a pond that was set up. P0 found the same family from the gate side
+(`settings_is_blocked_before_onboarding`); this one came from the fixture side. Both times the test
+name was true and the setup was the lie. The same fixture also had to stop using
+`MockSettingsRepository`, which silently drops `chat_model` — the field `complete_onboarding`
+refuses to proceed without — so a wizard round trip against it could never have finished.
+
+**The mutation, and what it printed.** Replacing the live read with a process-wide `EVER_ONBOARDED`
+latch failed `reset_then_recover_is_not_a_one_way_door` at step 3: `after a reset the wizard must be
+able to save again, left: 401, right: 200`. That is the one-way door, named, in the message. A guard
+for this class of defect is worth nothing until you have watched it print that.
+
+Gates: fmt clean; `pond-core` 783 + 5, `pond-infra` 214 + 3 + 3, `pond-api` 112 lib + all 17
+integration targets; clippy clean on the fast set; `cargo check -p pond-server
+-p pond-adapters-goose`; `scripts/live-test.sh --ui` green, and its no-bypass auth section now
+asserts the PAIR (`PUT /settings` 200 with no token before `POST /onboard/complete`, 401 after) plus
+the whole reset-then-recover round trip over real HTTP. Asserting only the 401 would pass on a
+server that never started.
