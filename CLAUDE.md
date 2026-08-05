@@ -106,6 +106,96 @@ npm run tauri build    # native desktop app bundle
 - E2E mocks use origin-agnostic `**/api/**` globs and pin the API base via `window.__GIAP_SERVER_URL__` in `tests/e2e/helpers/api-mocks.ts` (`mockAllApiRoutes`). `page.route` is **last-registered-wins** — register catch-alls before specific routes.
 - In a plain browser the app defaults its API base to `window.location.origin` (so the single-executable dashboard works same-origin over the LAN); the Tauri shell injects `window.__GIAP_SERVER_URL__` for a local server. See `defaultServerUrl()` in `PondApiClient.ts`.
 
+### Live testing — required before claiming anything works
+
+**Green unit tests are not evidence that the pond starts.** Every test in the Rust
+workspace runs against a database built by applying every migration to an empty file,
+in one process, with the adapter under test constructed by hand. None of that
+exercises startup ordering, migration application against a database that already has
+rows, route registration, the auth middleware, or the wiring in `main.rs` — which is
+where several real defects have been.
+
+```bash
+scripts/live-test.sh                 # build, start on a scratch data dir, assert, dig logs
+scripts/live-test.sh --ui            # also build the web UI and drive it with Playwright
+scripts/live-test.sh --no-build      # reuse the existing binary
+scripts/live-test.sh --keep          # leave the server up to poke at by hand
+```
+
+Run it for **any change touching a migration, a route, a handler, or startup wiring**.
+It does six things, and each exists because the alternative missed something real:
+
+1. **Builds with `RUSTFLAGS=""`**, matching `ci.yml`. See the target-cpu landmine below.
+2. **Starts against a scratch `POND_DATA_DIR`**, so a test run can never touch a real
+   pond, and reads the port back from `.runtime_api_port` rather than assuming 4000.
+3. **Asserts over real HTTP** (`scripts/live_checks.py`) — including the failure cases.
+   A handler that compiles and a handler that returns the right status for a missing
+   row are different claims.
+4. **Restarts against the same directory**, which now has rows. A migration that only
+   works on an empty database works exactly once, and every install after the first is
+   an upgrade.
+5. **Re-runs the auth checks on a second server with the loopback bypass OFF.** This is
+   not fussiness: with `POND_DEV_ALLOW_LOOPBACK` set, every auth assertion passes
+   regardless of what the allowlist does.
+6. **Digs the logs**, for more than your own feature. `WARN` and `ERROR` lines that were
+   already there are still findings.
+
+**Two rules for writing live checks.**
+
+- **Assert the status code before any body predicate.** A check written as
+  `body.get("profile_id") is None` passes against an error payload, where every lookup
+  returns `None` — so it reports the opposite of the truth. `expect()` in
+  `live_checks.py` enforces the ordering; use it.
+- **Ask whether production could ever produce your fixture.** A test whose *fixture* is
+  unreachable tests a system that does not exist. `ProfileScope::Owner` was a no-op in
+  production for a whole phase because every fixture that produced an owned row set
+  `profile_id` by hand, which no code path did.
+
+### Live UI testing (Playwright against a real server)
+
+`npx playwright test` runs `tests/e2e/`, which mocks **every** API call with
+`page.route()` against the Vite dev server. That is the right shape for component
+behaviour and it **cannot catch an API contract change** — the mock keeps returning the
+old shape long after the server stopped producing it.
+
+`tests/e2e-live/` mocks nothing. It drives the dashboard the server actually serves,
+talking to the server that actually built it:
+
+```bash
+cd pond-desktop && npm ci && npm run build          # or the server serves the placeholder
+POND_LIVE_URL=http://127.0.0.1:4000 npx playwright test --config=playwright.live.config.ts
+```
+
+`scripts/live-test.sh --ui` does all of that in one command. The live config has no
+`webServer` block on purpose — the server is owned by the script, which also does the
+restart and no-bypass passes that Playwright should not be driving. `retries: 0`, also
+on purpose: a live test that passes on the second attempt is telling you something
+about startup ordering, and retrying hides it.
+
+**The first thing it asserts is that the page is not the placeholder.** `build.rs` emits
+a stub carrying `data-giap-placeholder` when `pond-desktop/dist` was never built, and a
+binary shipping it looks like a working server until somebody opens a browser.
+
+**Know what has no UI before writing a UI test for it.** PAI-1's identity work is
+API-only: `pond-desktop/src` calls exactly one profile route, `GET /api/v1/profiles`.
+There is no household-member removal, no session-identity binding, and no wake-on-face
+control in the shipped app. A Playwright test of that feature would exercise nothing —
+grep `pond-desktop/src` for the routes first, and if nothing calls them, say so in the
+report instead of writing a test that passes vacuously.
+
+### macOS specifics
+
+Both scripts run on macOS and Linux. On a Mac:
+
+- `libasound2-dev` is a Linux-only concern. If a build fails on `alsa-sys` there, that
+  is the Linux path; on macOS `cpal` uses CoreAudio and needs nothing installed.
+- `TMPDIR` is not `/tmp` — the script honours it, so scratch data lands in the real
+  per-user temp dir. Anything hardcoding `/tmp` will silently diverge.
+- Chromium for Playwright installs per-user via `npx playwright install chromium`;
+  there is no system-wide `PLAYWRIGHT_BROWSERS_PATH` unless you set one.
+- `pkill -f pond-server` matches your own shell's command line on macOS more eagerly
+  than on Linux. The script tracks PIDs instead; do the same by hand.
+
 ### Single-executable / Jetson build
 `pond-server` embeds `pond-desktop/dist` at compile time (`crates/pond-api/build.rs` + `routes.rs` via `include_dir`), so a release build is a **single self-contained executable** (build the UI first, or you get the `build.rs` placeholder). Build scripts:
 ```bash
