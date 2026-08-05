@@ -82,9 +82,10 @@ Re-checked 2026-08-04: no authentication is required at all.** See below.
 *(FIXED 2026-08-05 by P0. Kept in full, because the shape of the mistake is the point and because
 the table below is the reproduction record. `is_public_route` now takes a `&Method` and matches a
 `PUBLIC_ROUTES: &[(Method, &str)]` table segment-wise; three compile-time guards fail the build if
-the table and the router drift. Everything in the table below now requires a token — except
-`PUT /settings`, `POST /profiles` and `PATCH /profiles/{id}`, which stay public for onboarding and
-are P7's job.)*
+the table and the router drift. Everything in the table below now requires a token. `PUT /settings`,
+`POST /profiles` and `PATCH /profiles/{id}` stayed public for onboarding until P7 landed later the
+same day; each entry now carries an `Exposure` class and those three answer a caller with no token
+only while onboarding is incomplete. There are four compile-time guards now, not three.)*
 
 `is_public_route` (`pond-api/src/middleware/mod.rs`) received just `path.path()` from
 `auth_middleware` — never the method — while its entries were written as though method-scoped:
@@ -135,9 +136,14 @@ protection is the 0600 file mode.
 > a `chmod`; `secret_crypto::write_private` creates the temporary with mode 0600
 > and renames instead.
 
-**Onboarding leaves auth holes open permanently.** `PUT /settings`, `POST /profiles` and
-`PATCH /profiles/{id}` are on the public allowlist (`middleware/mod.rs:165-201`) and stay there
-after onboarding completes.
+**Onboarding left auth holes open permanently — CLOSED by P7, 2026-08-05.** `PUT /settings`,
+`POST /profiles` and `PATCH /profiles/{id}` were on the public allowlist and stayed there after
+onboarding completed, so an unauthenticated caller anywhere on the LAN could rewrite settings and
+edit any household member's preferences on a pond set up months earlier. Every allowlist entry now
+carries an `Exposure` class and those three close the moment onboarding completes. Recorded here
+because the citation this paragraph carried — `middleware/mod.rs:165-201` — was already stale when
+P7 read it: those lines are `dev_allow_loopback`, not the table. Grep for `PUBLIC_ROUTES`, never for
+a line number.
 
 ---
 
@@ -345,6 +351,31 @@ approval system.
 `PUT /settings`, `POST /profiles` and `PATCH /profiles/{id}` leave the public allowlist once
 onboarding is complete. `middleware/onboarding_guard.rs` already knows that state.
 
+**The design as written above is incomplete, and the missing piece is `POST /onboard/reset`.** Reset
+is public and stays reachable after onboarding, because it is the recovery lever for a misconfigured
+pond. It also *undoes* the closure by design: after a reset the pond is not onboarded, so the three
+routes above are open again. That leaves two failure modes, and a design has to get past both:
+
+- If the closure is a **latch** ("this pond has been onboarded before"), reset is a one-way door.
+  The reset succeeds, the pond drops back to the wizard, and the wizard's three writes stay shut
+  forever. The only repair is reflashing the device.
+- If reset stays **unconditionally public**, the closure is decorative. An anonymous caller resets
+  the pond and walks in through the holes the reset reopened.
+
+So: the gate reads onboarding state **live**, on every state-dependent request, with no cache and no
+`Settings` flag — and reset itself becomes public-while-onboarding plus **loopback-only afterwards**.
+Loopback is not a new trust boundary here: `handshake_pairing_code` and
+`handshake_issue_pairing_code` already refuse a non-loopback peer inside the handler, so a pond that
+has lost every token can only be re-paired from the host already, and `is_identity_assertion_proven`
+states the same rule — whoever is at the console already has the box. Recovery gains no requirement
+it did not have.
+
+One consequence for the guards: the allowlist becomes state-dependent, and a compile-time table
+check cannot express "public only while onboarding is incomplete". The guards therefore ask the only
+question a static check can answer honestly — *could this route ever answer without a token, in some
+state* — which is the worst case, and a fourth guard pins the classification itself so a route
+cannot change class quietly.
+
 ---
 
 ## 4. Phases
@@ -543,10 +574,12 @@ onboarding is complete. `middleware/onboarding_guard.rs` already knows that stat
   `api_key_mutation_probe` fails it by name. An escape hatch, `NOT_ACTUALLY_SECRET`, takes a reason
   — so a false positive is a one-line documented exemption rather than a motive to delete the guard.
 
-  **This does not close the write half.** `PUT /settings` is still public and unauthenticated, so a
-  LAN caller can still write settings on an already-onboarded pond. That is P7's job, and it is the
-  reason P7 lands last. P0 closed the read; P2 removed the credentials from what the read returns;
-  neither touches the write.
+  **This did not close the write half — P7 did, later the same day.** When P2 landed, `PUT
+  /settings` was still public and unauthenticated, so a LAN caller could write settings on an
+  already-onboarded pond; that was the reason P7 landed last. P0 closed the read; P2 removed the
+  credentials from what the read returns; P7 closed the write, which now answers a caller with no
+  token only while onboarding is running. Read the two entries together: this paragraph described
+  the tree as it stood between the two commits, not as it stands now.
 
   Landed by hand after the implementing agent was killed mid-phase by an account spend limit. Its
   work compiled and was substantially complete; I ran the gates it never reached, mutation-tested
@@ -739,7 +772,83 @@ onboarding is complete. `middleware/onboarding_guard.rs` already knows that stat
 - **P6** Draft gate for outbound connector actions (lands with PAI-8), **and P3's third
   chokepoint** — redaction before a body leaves the pond, which has no call site to wire until
   PAI-8 creates one.
-- **P7** Onboarding allowlist closure.
+- **P7 — LANDED 2026-08-05.** `PUBLIC_ROUTES` entries carry an `Exposure`: `Always`,
+  `UntilOnboarded`, or `UntilOnboardedThenHostOnly`. Nine entries are state-dependent — `PUT
+  /settings`, `POST /profiles`, `PATCH /profiles/{id}`, `POST /onboard`, `/onboard/complete`,
+  `/onboard/step/{name}`, both `/voice/calibrate` methods, and `POST /onboard/reset` in its own
+  class. `GET /onboard/status` stays `Always`: a client must be able to ask whether it needs the
+  wizard before it has anything to authenticate with.
+
+  **Reset is the whole phase.** It stays reachable after onboarding, from the host only, and the
+  gate reads onboarding state live on every state-dependent request so the closure re-opens the
+  instant a reset lands. Section 3.7 records why both alternatives — a latch, or an unconditionally
+  public reset — are defects rather than trade-offs.
+  `reset_then_recover_is_not_a_one_way_door` drives the whole cycle (closed, reset from loopback,
+  reopened, re-completed, closed again) on ONE router with no restart, which is what makes it a
+  latch test rather than a state test.
+
+  **Designed with a defaulted trait method; shipped without one.** The plan gave
+  `OnboardingRepository::is_complete` a default body reading `get_current_step`. That is this repo's
+  own named bug class: eight implementors, mostly test stubs, and a stub inheriting "not onboarded"
+  makes every onboarding write route public wherever it is used. PAI-1 invariant 2 says access
+  narrows on failure, and a default cannot know which way is narrow for the adapter it lands on. The
+  method is **required**, so the compiler named all eight and each one decided out loud. Tedious,
+  and correct.
+
+  **A scope-widening default was found on the way.** `SqlxOnboardingRepository::get_current_step`
+  ends `.ok()??`, so a database error is reported as "not started" — and "not started" is exactly
+  the state in which every onboarding write hole is open. Keying auth on that would have re-opened
+  all of them on a fully set-up pond whenever SQLite returned `BUSY`. `is_complete() -> Result<bool>`
+  lets the error out and `pond_is_onboarded` treats a failed read as *onboarded*, i.e. closed. There
+  are two tests: one in `pond-infra` that drops the table and asserts the two methods genuinely
+  disagree about it, and one in `pond-api` that drives `PUT /settings` through the middleware
+  against a repository that cannot read, and gets a 401.
+
+  **The `Arc` blanket impl forwards it explicitly.** `AppState` holds
+  `Arc<dyn OnboardingRepository>`, and method resolution picks the impl on `Arc` before the concrete
+  adapter — so a defaulted method would have run the default body on the `Arc` while the SQLite
+  override it was written for never executed, and nothing about the code would have looked wrong.
+  Requiring the method makes deleting that arm a compile error rather than a silent behaviour
+  change.
+
+  **The guards changed shape, because the question changed.**
+  `every_protected_route_requires_a_token` now asks `reachable_without_token_in_some_state` — a
+  compile-time check has no pond to read, and a guard that picked one state would report the other
+  state's answer as safety. `public_router_and_allowlist_agree` compares the union of all three
+  classes against the router. A fourth guard, `the_public_route_classification_is_pinned`, asserts
+  the exact list of state-dependent entries, so moving a route between classes is an edit somebody
+  has to write down. None was weakened or deleted.
+
+  **`POST /tts` is deliberately NOT closed, and the plan said to close it.** The wizard's voice
+  preview is why it is public, which makes it look like an onboarding hole. Two shipped callers
+  speak through it with no `Authorization` header long after setup — `playTtsSentence` in
+  `pond-desktop/src/modes/voice/WebVoiceBackend.ts` and `fetch_tts_bytes` in
+  `pond-desktop/src-tauri/src/commands/audio_cmd.rs` — so closing it would leave the assistant mute
+  on a set-up pond. That those two are unauthenticated is a real finding; the fix is to give them
+  the token, a client change, not an allowlist change. `POST /voice/calibrate` *is* closed because
+  `calibrateWakeWord` in `PondApiClient.ts` attaches the bearer token — checked, not assumed, and
+  that check is the only difference between the two decisions.
+
+  **One existing test asserted precisely the behaviour this removes**:
+  `put_settings_without_a_token_is_still_allowed` ran against `OnboardingStep::Completed`. Its
+  assertion was right and its *fixture* was the hole. It is now two tests, one per state — the same
+  lesson as `settings_is_blocked_before_onboarding` in P0, arriving from the fixture side. The
+  onboarding fixture also swapped `MockSettingsRepository` for the real SQLite one: the mock stores
+  a hand-written subset of `Settings` and drops `chat_model`, which `complete_onboarding` refuses to
+  proceed without, so a wizard round trip against it could never finish — a fixture production
+  cannot produce.
+
+  **Mutation-tested.** Replacing the live read in `pond_is_onboarded` with a latch (a process-wide
+  `EVER_ONBOARDED` flag set on the first completed read) fails
+  `reset_then_recover_is_not_a_one_way_door` at step 3 with `assertion left == right failed: after a
+  reset the wizard must be able to save again, left: 401, right: 200` — the one-way door, named.
+  Restored; `cargo fmt --check` clean and 16/16 green afterwards.
+
+  Gates: fmt clean; pond-core 783 + 5, pond-infra 214 + 3 + 3, pond-api 112 lib + all 17 integration
+  targets green; clippy clean on the fast set; `cargo check -p pond-server -p pond-adapters-goose`
+  clean; `scripts/live-test.sh --ui` green including the no-bypass auth pass, which now asserts the
+  PAIR — `PUT /settings` returns 200 with no token *before* `POST /onboard/complete` and 401 after —
+  plus the full reset-then-recover round trip over real HTTP.
 - **P8** Flip default to `security_policy_mode = "enforce"` — only after a release in `audit` with
   telemetry showing what would have been denied.
 - **DEFERRED** SQLCipher for the full database.

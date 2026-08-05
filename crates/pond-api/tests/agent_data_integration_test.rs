@@ -56,6 +56,13 @@ impl OnboardingRepository for CompletedOnboarding {
     async fn reset(&self) -> anyhow::Result<()> {
         Ok(())
     }
+    // PAI-2 P7 made this a required trait method rather than a defaulted one:
+    // a default would have to answer from `get_current_step`, and a stub that
+    // answers "not onboarded" makes every onboarding write route public
+    // wherever it is used. The name of this stub is the answer.
+    async fn is_complete(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
 }
 
 struct NoDevices;

@@ -3,8 +3,10 @@
 //! Run: cargo test -p pond-api --test onboarding_integration_test
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tower::ServiceExt;
 
@@ -14,7 +16,6 @@ use pond_core::user_data::domain::onboarding::OnboardingStep;
 use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
 use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
 use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
-use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
 use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 use pond_core::user_data::ports::onboarding::OnboardingRepository;
 use pond_infra::mock_handshake::MockHandshake;
@@ -51,6 +52,18 @@ impl OnboardingRepository for MockRepo {
         *self.step.lock().unwrap() = None;
         Ok(())
     }
+
+    // Required, not defaulted (PAI-2 P7): a stub that inherited "not
+    // onboarded" would make every onboarding write route public in whatever
+    // test used it. This one tracks the same cell the rest of the mock does,
+    // which is what makes `reset_then_recover_is_not_a_one_way_door` a real
+    // round trip rather than a fixed answer.
+    async fn is_complete(&self) -> anyhow::Result<bool> {
+        Ok(matches!(
+            self.step.lock().ok().and_then(|g| *g),
+            Some(OnboardingStep::Completed)
+        ))
+    }
 }
 
 struct MockDeviceRegistry;
@@ -85,20 +98,50 @@ impl DeviceRegistry for MockDeviceRegistry {
     }
 }
 
+/// A repository that cannot read its own table.
+///
+/// `get_current_step` has no way to say so -- it returns `None`, which every
+/// consumer reads as "not started", which is the state in which every
+/// onboarding write route is public. This stub is the fixture for the branch of
+/// `pond_is_onboarded` that refuses to inherit that answer.
+struct UnreadableRepo;
+
+#[async_trait::async_trait]
+impl OnboardingRepository for UnreadableRepo {
+    async fn get_current_step(&self) -> Option<OnboardingStep> {
+        None
+    }
+    async fn save_step(&self, _: OnboardingStep) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn reset(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn is_complete(&self) -> anyhow::Result<bool> {
+        Err(anyhow::anyhow!("database is locked"))
+    }
+}
+
 async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile::TempDir) {
+    app_with_repo(Arc::new(MockRepo::new(step))).await
+}
+
+async fn app_with_repo(
+    onboarding_repo: Arc<dyn OnboardingRepository + Send + Sync>,
+) -> (axum::Router, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
 
     let session_storage: Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage> =
         Arc::new(pond_infra::sqlite_session_storage::SqliteSessionStorage::new(db.system.clone()));
+    let settings_pool = db.system.clone();
 
     let mock_hs = MockHandshake::new();
     mock_hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
         db: Arc::new(db),
-        onboarding_repo: Arc::new(MockRepo::new(step))
-            as Arc<dyn OnboardingRepository + Send + Sync>,
+        onboarding_repo,
         handshake: Arc::new(mock_hs),
         whisper_url: "http://127.0.0.1:9000".to_string(),
         transcribe_audio: None,
@@ -108,7 +151,14 @@ async fn app_with_step(step: Option<OnboardingStep>) -> (axum::Router, tempfile:
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".to_string(),
         tts: None,
-        settings_repo: Arc::new(MockSettingsRepository::new()),
+        // The real repository, not the mock. `MockSettingsRepository` silently
+        // drops `chat_model` -- it stores a hand-written subset of the struct --
+        // and `complete_onboarding` refuses with 400 when `chat_model` is
+        // empty. A wizard round trip against that mock can never finish, so it
+        // is a fixture production cannot produce.
+        settings_repo: Arc::new(pond_infra::sqlite_settings::SqliteSettingsRepository::new(
+            settings_pool,
+        )),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(MockDeviceRegistry),
         commissioner: None,
@@ -306,30 +356,220 @@ async fn get_settings_without_a_token_is_unauthorized() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// The other half of the same fix: the write onboarding depends on stays open.
-///
-/// If this ever starts returning 401, the wizard cannot save anything before a
-/// device has paired, and onboarding deadlocks on a pond nobody can finish
-/// setting up.
-#[tokio::test]
-async fn put_settings_without_a_token_is_still_allowed() {
-    let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
-    let res: Response = app
+/// Enough of a `Settings` patch that `POST /onboard/complete` accepts it --
+/// the handler refuses to lift the onboarding guard on a half-set-up pond.
+const FULL_SETUP: &str =
+    r#"{"user_name":"Jerry","assistant_name":"Goose","timezone":"UTC","chat_model":"mock"}"#;
+
+async fn put_settings_no_token(app: &axum::Router, body: &'static str) -> StatusCode {
+    app.clone()
         .oneshot(
             Request::builder()
                 .method("PUT")
                 .uri("/api/v1/settings")
                 .header("Content-Type", "application/json")
-                .body(Body::from(r#"{"user_name":"Onboarding"}"#))
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// Anonymous `POST /onboard/reset` from a named peer, which is what production
+/// supplies via `into_make_service_with_connect_info`.
+async fn reset_no_token(app: &axum::Router, peer: SocketAddr) -> StatusCode {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/onboard/reset")
+                .extension(ConnectInfo(peer))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+const AT_THE_POND: SocketAddr = SocketAddr::new(
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+    51234,
+);
+const ON_THE_LAN: SocketAddr = SocketAddr::new(
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 50)),
+    44321,
+);
+
+/// The other half of P0's fix: the write onboarding depends on stays open --
+/// while onboarding is running.
+///
+/// If this ever returns 401, the wizard cannot save anything before a device
+/// has paired, and onboarding deadlocks on a pond nobody can finish setting up.
+///
+/// This test used to assert the same thing on a COMPLETED pond, which is
+/// exactly the hole PAI-2 P7 closes. The fixture, not the assertion, was the
+/// part that was wrong.
+#[tokio::test]
+async fn put_settings_without_a_token_is_allowed_while_the_wizard_is_running() {
+    let (app, _tmp) = app_with_step(Some(OnboardingStep::Basics)).await;
+    assert_ne!(
+        put_settings_no_token(&app, FULL_SETUP).await,
+        StatusCode::UNAUTHORIZED,
+        "PUT /settings must stay reachable without a token mid-onboarding, or the \
+         wizard cannot save"
+    );
+}
+
+/// PAI-2 P7: and it closes the moment the pond is set up.
+///
+/// Before this, an unauthenticated caller anywhere on the LAN could rewrite the
+/// assistant's settings on a pond that finished onboarding months ago.
+#[tokio::test]
+async fn put_settings_without_a_token_is_refused_once_onboarded() {
+    let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
+    assert_eq!(
+        put_settings_no_token(&app, FULL_SETUP).await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// PAI-2 P7's real acceptance test: the closure must not be a latch.
+///
+/// `POST /onboard/reset` stays reachable after onboarding because it is the
+/// recovery lever for a misconfigured pond. Getting back out of a reset needs
+/// `PUT /settings` + `POST /profiles` + `POST /onboard/complete`, all of which
+/// P7 closes on an onboarded pond. If the gate remembered "this pond was
+/// onboarded once" instead of reading the state live, reset would be the last
+/// useful request the pond ever accepted and the only repair would be a
+/// reflash. The whole cycle runs on ONE router with no restart, which is what
+/// makes it a latch test rather than a state test.
+#[tokio::test]
+async fn reset_then_recover_is_not_a_one_way_door() {
+    let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
+
+    // 1. Set up: the wizard's writes do not answer an anonymous caller.
+    assert_eq!(
+        put_settings_no_token(&app, FULL_SETUP).await,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 2. The operator at the pond resets it -- no token, loopback peer. The
+    //    same trust boundary `handshake_issue_pairing_code` already uses to
+    //    decide who may pair a new device.
+    assert_eq!(
+        reset_no_token(&app, AT_THE_POND).await,
+        StatusCode::OK,
+        "reset must stay reachable from the host, or a pond misconfigured badly \
+         enough to lose every token can only be fixed by reflashing it"
+    );
+
+    // 3. The door reopened, same router, no restart. A latch fails here.
+    assert_eq!(
+        put_settings_no_token(&app, FULL_SETUP).await,
+        StatusCode::OK,
+        "after a reset the wizard must be able to save again"
+    );
+
+    let res: Response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/profiles")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"display_name":"Jerry"}"#))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_ne!(
+    assert_eq!(
         res.status(),
-        StatusCode::UNAUTHORIZED,
-        "PUT /settings must stay reachable without a token, or onboarding cannot save"
+        StatusCode::CREATED,
+        "POST /profiles must reopen after a reset -- the wizard creates the first \
+         household member before anything can pair"
     );
+
+    // 4. ...and finish, which is what re-arms the closure.
+    let res: Response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/onboard/complete")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 5. Closed again. A gate that only ever opens is the same defect wearing
+    //    the other face.
+    assert_eq!(
+        put_settings_no_token(&app, FULL_SETUP).await,
+        StatusCode::UNAUTHORIZED,
+        "the closure must re-arm when onboarding completes again"
+    );
+}
+
+/// On failure, access NARROWS -- asserted through the middleware, not just at
+/// the adapter.
+///
+/// `SqlxOnboardingRepository::get_current_step` ends `.ok()??`, so a database
+/// error reads as "not started", and "not started" is exactly the state in
+/// which the wizard's writes answer anonymous callers. If `pond_is_onboarded`
+/// inherited that reading, a transient `SQLITE_BUSY` would re-open every hole
+/// this phase closes, on a pond set up months ago, for as long as the read kept
+/// failing. `pond-infra` proves the adapter reports the error; this proves the
+/// auth layer closes when it gets one.
+#[tokio::test]
+async fn an_unreadable_onboarding_table_closes_the_write_holes_rather_than_opening_them() {
+    let (app, _tmp) = app_with_repo(Arc::new(UnreadableRepo)).await;
+    assert_eq!(
+        put_settings_no_token(&app, FULL_SETUP).await,
+        StatusCode::UNAUTHORIZED,
+        "a pond whose onboarding state cannot be read must refuse the wizard's \
+         writes, not offer them to anyone who asks"
+    );
+}
+
+/// The assertion that makes the rest of P7 mean anything.
+///
+/// Reset re-opens every onboarding write hole by design. If it answered an
+/// anonymous caller on the LAN, the closure would be decorative: reset, then
+/// walk in through the holes the reset reopened.
+#[tokio::test]
+async fn reset_from_the_lan_without_a_token_is_refused_once_onboarded() {
+    let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
+    assert_eq!(
+        reset_no_token(&app, ON_THE_LAN).await,
+        StatusCode::UNAUTHORIZED,
+        "an unauthenticated phone on the LAN must not be able to factory-reset the pond"
+    );
+}
+
+/// And the dashboard's own "Start over" control keeps working from anywhere,
+/// because it holds a token. `handleRestartOnboarding` calls `resetOnboarding()`
+/// while the session token is still set -- sign-out is a separate button -- so
+/// this is the path the shipped UI actually takes.
+#[tokio::test]
+async fn the_dashboard_can_still_restart_setup_with_its_token() {
+    let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
+    let res: Response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/onboard/reset")
+                .header("Authorization", "Bearer test-token")
+                .extension(ConnectInfo(ON_THE_LAN))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
 }
 
 // ─────────────────────────────────────────────────────────────────

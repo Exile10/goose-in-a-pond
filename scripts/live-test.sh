@@ -285,10 +285,24 @@ if [ "$AUTH_OK" -eq 1 ]; then
   # right answer and is measuring the wrong gate.
   #
   # Both writes below are themselves on the public allowlist, which is why they
-  # work without a token -- that is the onboarding hole, not an accident here.
-  curl -s -o /dev/null -X PUT "http://127.0.0.1:$AUTH_PORT/api/v1/settings" \
+  # work without a token. Since PAI-2 P7 that is no longer a hole: they are
+  # classified Exposure::UntilOnboarded, so they answer only while this pond is
+  # still being set up -- which it is, on a fresh $AUTH_DIR. The P7 block after
+  # the route loop asserts they stop answering once this lift has landed.
+  # The BEFORE half of P7's pair, and it is not decoration. Asserting only the
+  # 401 after onboarding passes on a server that never started, on a route that
+  # does not exist, and on an allowlist that closed PUT /settings
+  # unconditionally -- which would deadlock every fresh install on a pond
+  # nobody can finish setting up.
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "http://127.0.0.1:$AUTH_PORT/api/v1/settings" \
     -H 'Content-Type: application/json' \
-    -d '{"user_name":"AuthProbe","assistant_name":"Goose","timezone":"UTC","chat_model":"mock"}'
+    -d '{"user_name":"AuthProbe","assistant_name":"Goose","timezone":"UTC","chat_model":"mock"}')
+  if [ "$code" = "200" ]; then
+    printf '  PASS  PUT    /settings             open with no token while the wizard runs\n'
+  else
+    printf '  FAIL  PUT    /settings returned %s BEFORE onboarding -- the wizard cannot save\n' "$code"
+    RC=1
+  fi
   curl -s -o /dev/null -X POST "http://127.0.0.1:$AUTH_PORT/api/v1/onboard/complete"
 
   for route in /settings /profiles /sessions /devices /memory; do
@@ -302,6 +316,75 @@ if [ "$AUTH_OK" -eq 1 ]; then
            RC=1 ;;
     esac
   done
+
+  # ── PAI-2 P7: the onboarding holes close, and a reset reopens them ─────────
+  #
+  # This pond was onboarded a few lines above, by the two writes that had to be
+  # public to do it. Those same writes must now be refused. Unit tests cover the
+  # table; only this covers the middleware, the onboarding repository and a real
+  # SQLite file agreeing about what state the pond is in.
+  #
+  # This section is in the AUTH_OK block on purpose: the loopback bypass is OFF
+  # for this server. Under POND_DEV_ALLOW_LOOPBACK every assertion here passes
+  # regardless of what the allowlist does, which is the opposite of the truth.
+  for spec in "PUT /settings" "POST /profiles" "PATCH /profiles/live-p7" \
+              "POST /onboard" "POST /onboard/complete" "POST /onboard/step/Basics"; do
+    m="${spec%% *}"; route="${spec#* }"
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X "$m" \
+      -H 'Content-Type: application/json' -d '{}' \
+      "http://127.0.0.1:$AUTH_PORT/api/v1$route")
+    if [ "$code" = "401" ]; then
+      printf '  PASS  %-6s %-22s requires a token once onboarded\n' "$m" "$route"
+    else
+      printf '  FAIL  %-6s %-22s returned %s with NO TOKEN\n' "$m" "$route" "$code"
+      RC=1
+    fi
+  done
+
+  # ...but the status probe must NOT close. A client has to be able to ask
+  # whether it needs the wizard before it has anything to authenticate with.
+  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$AUTH_PORT/api/v1/onboard/status")
+  if [ "$code" = "200" ]; then
+    printf '  PASS  GET    /onboard/status        stays public in every state\n'
+  else
+    printf '  FAIL  GET    /onboard/status returned %s -- a client cannot tell whether to onboard\n' "$code"
+    RC=1
+  fi
+
+  # The one-way-door check, end to end. curl runs on the host, which is exactly
+  # the boundary reset uses -- the same one that issues pairing codes.
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$AUTH_PORT/api/v1/onboard/reset")
+  if [ "$code" = "200" ]; then
+    printf '  PASS  POST   /onboard/reset         still reachable from the host\n'
+
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "http://127.0.0.1:$AUTH_PORT/api/v1/settings" \
+      -H 'Content-Type: application/json' \
+      -d '{"user_name":"AuthProbe","assistant_name":"Goose","timezone":"UTC","chat_model":"mock"}')
+    if [ "$code" = "200" ]; then
+      printf '  PASS  PUT    /settings             reopened after the reset\n'
+    else
+      printf '  FAIL  PUT    /settings returned %s after a reset -- this pond is UNRECOVERABLE\n' "$code"
+      RC=1
+    fi
+
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$AUTH_PORT/api/v1/onboard/complete")
+    if [ "$code" != "200" ]; then
+      printf '  FAIL  POST   /onboard/complete returned %s after a reset\n' "$code"
+      RC=1
+    fi
+
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "http://127.0.0.1:$AUTH_PORT/api/v1/settings" \
+      -H 'Content-Type: application/json' -d '{"user_name":"AuthProbe"}')
+    if [ "$code" = "401" ]; then
+      printf '  PASS  PUT    /settings             closed again after re-onboarding\n'
+    else
+      printf '  FAIL  PUT    /settings returned %s -- the closure did not re-arm\n' "$code"
+      RC=1
+    fi
+  else
+    printf '  FAIL  POST   /onboard/reset returned %s from the host -- recovery is gone\n' "$code"
+    RC=1
+  fi
 fi
 kill -9 "$AUTH_PID" 2>/dev/null; wait "$AUTH_PID" 2>/dev/null
 AUTH_PID=""

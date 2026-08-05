@@ -94,6 +94,11 @@ mod tests {
             *guard = None;
             Ok(())
         }
+
+        async fn is_complete(&self) -> Result<bool> {
+            let guard = self.step.lock().map_err(mutex_error)?;
+            Ok(matches!(*guard, Some(OnboardingStep::Completed)))
+        }
     }
 
     #[tokio::test]
