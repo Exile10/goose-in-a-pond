@@ -23,6 +23,21 @@ pub const TOOL_SELECTION_MODE_ALL: &str = "all";
 /// session, chosen once at session start (Phase D2).
 pub const TOOL_SELECTION_MODE_RELEVANT: &str = "relevant";
 
+/// `security_policy_mode`: no evaluation, no audit trail. Debugging only.
+pub const SECURITY_POLICY_MODE_OFF: &str = "off";
+/// `security_policy_mode`: evaluate and record every decision, block none.
+pub const SECURITY_POLICY_MODE_AUDIT: &str = "audit";
+/// `security_policy_mode`: denials bite.
+pub const SECURITY_POLICY_MODE_ENFORCE: &str = "enforce";
+
+/// The accepted values of `security_policy_mode`, for validation and for the
+/// error message a rejected write gets back.
+pub const SECURITY_POLICY_MODES: &[&str] = &[
+    SECURITY_POLICY_MODE_OFF,
+    SECURITY_POLICY_MODE_AUDIT,
+    SECURITY_POLICY_MODE_ENFORCE,
+];
+
 /// One factory default that CHANGED after installs already existed.
 ///
 /// Settings are a flat key-value table and a default only applies when the key
@@ -491,6 +506,24 @@ pub struct Settings {
     #[serde(default = "Settings::default_tool_selection_mode")]
     pub tool_selection_mode: String,
 
+    /// How hard the `SecurityPolicy` bites: `"off" | "audit" | "enforce"`.
+    ///
+    /// Defaults to `"audit"`, and that default is the whole design. A rules
+    /// matrix written from first principles is wrong in ways only real traffic
+    /// reveals, and an authorisation regression in a home assistant does not
+    /// look like a 403 — it looks like the lights not turning on. So every
+    /// decision is evaluated and recorded, and none of them block, until the
+    /// audit log says what `enforce` would actually have broken.
+    ///
+    /// - `off` — no evaluation, no audit entries. For debugging only.
+    /// - `audit` — evaluate, record the verdict, never block.
+    /// - `enforce` — denials bite.
+    ///
+    /// Flipping the default to `enforce` is PAI-2 P8 and is gated on a release
+    /// spent in `audit` with telemetry to read.
+    #[serde(default = "Settings::default_security_policy_mode")]
+    pub security_policy_mode: String,
+
     /// When true, recent memory fragments are injected into the system prompt each turn
     #[serde(default = "Settings::default_agent_memory_inject")]
     pub agent_memory_inject: bool,
@@ -791,6 +824,7 @@ impl Default for Settings {
             agent_timeout_secs: Self::default_agent_timeout_secs(),
             prefix_cache_prompt: Self::default_prefix_cache_prompt(),
             tool_selection_mode: Self::default_tool_selection_mode(),
+            security_policy_mode: Self::default_security_policy_mode(),
             agent_memory_inject: Self::default_agent_memory_inject(),
             agent_memory_limit: Self::default_agent_memory_limit(),
             tool_output_compaction: Self::default_tool_output_compaction(),
@@ -1067,6 +1101,10 @@ impl Settings {
     fn default_tool_selection_mode() -> String {
         // "all" so this first landing changes nothing for existing installs.
         TOOL_SELECTION_MODE_ALL.to_string()
+    }
+    fn default_security_policy_mode() -> String {
+        // Audit, never enforce, on a first landing. See the field docs.
+        SECURITY_POLICY_MODE_AUDIT.to_string()
     }
     fn default_prefix_cache_prompt() -> bool {
         true
@@ -1630,6 +1668,11 @@ mod tests {
     fn every_settings_field_is_dispositioned() {
         // Advanced retention knobs, tuned via backend/config — intentionally no UI.
         const HEADLESS_BY_DESIGN: &[&str] = &[
+            // The privacy policy's rollout lever (PAI-2 P1). An operator knob
+            // while the matrix is being validated against real households; it
+            // gets a UI only if it survives to `enforce` (PAI-2 P8), and giving
+            // it one now would invite flipping a half-validated matrix on.
+            "security_policy_mode",
             // Hybrid-compaction rollout flags: operator knobs for the
             // deterministic-trim + idle-summary pipeline; flipped via the
             // settings API during on-device burn-in, no UI control planned.

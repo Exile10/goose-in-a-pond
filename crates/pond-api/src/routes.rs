@@ -11522,15 +11522,108 @@ struct SetSessionUserRequest {
 ///
 /// Without this route `Explicit` had no producer at all, so the resolution
 /// chain in `identity_resolution` could only ever reach its face rung.
+/// Evaluate, record, and report whether a caller may claim a session belongs to
+/// a named member.
+///
+/// The mode comes from settings on every call rather than being cached: an
+/// operator flipping `security_policy_mode` is doing it precisely because
+/// something is wrong, and a cached value would make the flip take effect at
+/// some unpredictable later point.
+///
+/// **The audit entry records the verdict, not merely the effect.** In `audit`
+/// mode a refusal still proceeds, so `ok` is `true` for exactly the requests
+/// `enforce` would have blocked; a log that carried only `ok` would read
+/// "permitted" for all of them and could not answer what flipping the mode
+/// would break. `verdict` distinguishes `allow` from `would_deny`.
+async fn evaluate_identity_assertion(
+    state: &Arc<AppState>,
+    principal: Option<pond_core::security::ports::policy::Principal>,
+    asserted_profile_id: &str,
+) -> anyhow::Result<pond_core::security::ports::policy::PolicyDecision> {
+    use pond_core::security::ports::policy as pol;
+
+    let mode = pol::PolicyMode::parse(&state.settings_repo.get().await?.security_policy_mode);
+    if mode == pol::PolicyMode::Off {
+        return Ok(pol::PolicyDecision::permit(mode));
+    }
+
+    // A request that reached a protected handler with no principal attached is
+    // a wiring fault, not an anonymous caller. Treat it as the least privileged
+    // thing available rather than as permission: access narrows on failure
+    // (PAI-1 invariant 2).
+    let principal = principal.unwrap_or_else(pol::Principal::internal);
+
+    let decision = if pol::is_identity_assertion_proven(&principal, asserted_profile_id) {
+        pol::PolicyDecision::permit(mode)
+    } else {
+        pol::PolicyDecision::refuse(mode, pol::REASON_UNPROVEN_IDENTITY)
+    };
+
+    if let Some(policy) = &state.security_policy {
+        policy
+            .audit(
+                &principal,
+                &format!("identify_session:{}", decision.verdict()),
+                pol::scopes::SESSION,
+                decision.allowed,
+            )
+            .await;
+    }
+    if decision.would_deny() {
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "policy_would_deny",
+            scope = pol::scopes::SESSION,
+            reason = decision.denied_reason,
+            "security policy would have denied this in enforce mode"
+        );
+    }
+    Ok(decision)
+}
+
 async fn set_session_user_handler(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
     Json(req): Json<SetSessionUserRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if req.profile_id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "profile_id is required"})),
+        ));
+    }
+
+    // ── PAI-1 P4 / PAI-2 P1: the policy's first production call site ────────
+    //
+    // This route takes a profile_id from the request BODY and binds it at
+    // Explicit strength. Afterwards every turn in the session resolves to that
+    // member's scope and their memories are injected. There was no ownership
+    // check of any kind, so any paired device could declare itself any
+    // household member and read their data -- cross-profile access laundered
+    // through the session row rather than through a query parameter.
+    //
+    // Nothing can PROVE an identity yet: no schema links a paired device to a
+    // member. So in `enforce` this refuses every remote explicit
+    // identification, which is why the mode ships as `audit` -- it records who
+    // asserted what, which is exactly the evidence needed before anyone flips
+    // it. See is_identity_assertion_proven for why this rule, and not a
+    // scope-by-principal-kind matrix.
+    let decision = evaluate_identity_assertion(&state, principal.map(|e| e.0), &req.profile_id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not evaluate the security policy"})),
+            )
+        })?;
+    if !decision.allowed {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "not permitted to identify this session as that member",
+                "reason": decision.denied_reason,
+            })),
         ));
     }
 

@@ -353,6 +353,7 @@ impl SettingsRepository for SqliteSettingsRepository {
             }
         );
         upsert!("tool_selection_mode", &settings.tool_selection_mode);
+        upsert!("security_policy_mode", &settings.security_policy_mode);
         // Memory tuning
         upsert!(
             "memory_consolidation_mode",
@@ -842,6 +843,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "prefix_cache_prompt" => s.prefix_cache_prompt = value == "true",
         "tool_output_compaction" => s.tool_output_compaction = value == "true",
         "tool_selection_mode" => s.tool_selection_mode = value.to_string(),
+        "security_policy_mode" => s.security_policy_mode = value.to_string(),
         // Memory lifecycle
         "memory_extraction_enabled" => s.memory_extraction_enabled = value == "true",
         "memory_cleanup_enabled" => s.memory_cleanup_enabled = value == "true",
