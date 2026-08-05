@@ -306,8 +306,24 @@ existing fail-Sensitive default, which is exactly the right polarity for this. `
 everything but loopback, which makes "prove it is not phoning home" a one-setting demonstration
 rather than a packet capture.
 
-Every new outbound adapter copies `traced_send` from `pond-adapters-weather/src/lib.rs:15-30`. A
-guard test asserts every crate with a `reqwest` dependency references `record_egress`.
+Every new outbound adapter uses `egress::begin` / `EgressCall::finish` (P5) rather than copying
+`traced_send` from `pond-adapters-weather`. Verified 2026-08-05: `traced_send` is at lines 12-31 of
+`pond-adapters-weather/src/lib.rs`, not 15-30 -- cite the symbol, not the range.
+
+**The guard as originally specified is not implementable, and the correction matters.** "Every crate
+with a `reqwest` dependency references `record_egress`" fails for 8 of the 11 such crates on the day
+it lands, and most of what it flags is a health probe against a model server on 127.0.0.1. A guard
+that reports loopback as egress gets switched off within a week. `crates/pond-core/tests/egress_guard.rs`
+therefore forces a three-way classification of every HTTP-sending FILE -- `EGRESS_TRACKED` (checked
+by symbol), `LOOPBACK_ONLY` (checked by reading every URL literal in the file, so the claim is
+mechanical rather than a comment), `UNGATED_SENDERS` (enumerated, capped, shrink-only) -- and keeps
+the crate-level rule in the only form that holds: every `reqwest` crate owns at least one classified
+file, which is what catches a sender using `Client::execute` or `reqwest::blocking`.
+
+**`network_mode = "offline"` is not yet a complete claim.** Six real-egress files are still ungated
+(HF/GitHub model downloads, OAuth token refresh, Spotify, the vision-encoder download, the MCP
+connectivity probe). They are enumerated in `UNGATED_SENDERS`; P5 is not done until that list is
+empty, and the cap is what stops it becoming a parking lot.
 
 ### 3.6 The outbound-action gate
 
@@ -605,7 +621,9 @@ onboarding is complete. `middleware/onboarding_guard.rs` already knows that stat
 
   **Two things found on the way.** Neither webhook path calls `record_egress`, so a webhook fire is
   invisible to the activity API — recorded, not fixed here, because it belongs to P5's
-  `reqwest`-implies-`record_egress` guard. And `memory_extraction.rs` logged every stored fact's raw
+  `reqwest`-implies-`record_egress` guard. (No longer true as of 2026-08-05: P5 routes both webhook
+  executors through `egress::begin`/`finish`, so a webhook fire is both gated and recorded.)
+  And `memory_extraction.rs` logged every stored fact's raw
   content at INFO, which is the level the on-disk log file keeps; that one **is** fixed here,
   because a second plaintext copy of every memory with none of the store's scoping, none of its
   retention and none of chokepoint 1's redaction is exactly what this phase exists to stop. It never
@@ -649,7 +667,75 @@ onboarding is complete. `middleware/onboarding_guard.rs` already knows that stat
   directory, `POND_SECRET_KEY_FILE` to relocate). In-place migration, atomic tmp+rename, and a
   locked-not-emptied failure mode. See the LANDED block in 3.4 for the threat model and the
   key-loss story. Coverage of the four `api_key_*` fields still waits on P2.
-- **P5** `network_mode` enforcement + the `reqwest`-implies-`record_egress` guard test.
+- **P5 — LANDED 2026-08-05, gating five of eighteen senders, and saying so.** `NetworkMode`,
+  `egress_verdict`, `check_egress`, `EgressDenied` and `EgressCall`/`begin`/`finish` in
+  `shared/services/egress.rs`; `network_mode` on `Settings` with the full five-point plumbing;
+  installed in `serve()` beside the early settings load and re-installed by `PUT /settings`, so a
+  network restriction does not need a reboot to apply.
+
+  **What shipped differs from what was designed in two ways worth stating.** The phase was written
+  as "`network_mode` enforcement", which reads as though the setting existed; it did not — grep for
+  `network_mode` returned nothing outside the vendored goose tree, so this phase created it. And
+  `record_egress` had seven call sites in three files against **eleven** crates declaring `reqwest`,
+  so the promised guard could not be the crate-level one. See 3.5.
+
+  **`offline` is not yet a complete claim, and the code says so out loud.** Five sender files are
+  gated (`pond-mcp-server/http.rs`, which covers all fifteen knowledge/news/finance/discovery tools;
+  `pond-adapters-weather`; `fcm_push_relay` at both the token exchange and the send, because a token
+  cached before the mode tightened would otherwise keep pushing; and **both** webhook executors,
+  which are separate code and neither of which recorded egress at all before this — a scheduled
+  webhook POSTs the whole task payload to a URL the user typed in and appeared in no activity feed).
+  Six remain: HF/GitHub model downloads, the OAuth refresh loop, Spotify, the HF blob cache, the
+  vision-encoder download and the MCP connectivity probe. They are enumerated in `UNGATED_SENDERS`
+  in `crates/pond-core/tests/egress_guard.rs` under a cap that only moves down, and they belong to
+  P6. The remaining seven senders are loopback-only — ollama on 11434, llamafile on 8080 — and a
+  guard that reported those as egress would be switched off inside a week.
+
+  **The parse deliberately widens and the API deliberately narrows.** `NetworkMode::parse` falls
+  back to `open` on an unrecognised value, unlike `PolicyMode::parse`, because `PolicyMode` has a
+  middle tier (`audit`) that is wrong in neither direction and this setting does not: absorbing a
+  typo into `allowlist` would take a home assistant off the internet with no diagnostic anyone could
+  act on. `PUT /api/v1/settings` refuses an unrecognised `network_mode` with 422 — that is the
+  narrowing half of the bargain, and it is what makes the permissive fallback safe. Everything else
+  fails closed: an unparseable URL becomes `"unknown"`, which `classify_host` already calls
+  `Sensitive`, which both restrictive modes refuse.
+
+  **Mutation-tested, and the main guard failed its first mutation.** `production_source` was written
+  as "everything before the first `#[cfg(test)]`", which is what the convention looks like. Adding a
+  real `.send()` to `pond-api/src/middleware/mod.rs` **below** its trailing `mod tests` left the
+  guard green — and eleven files in this tree already carry more than one `#[cfg(test)]`, so the
+  truncation was silently discarding production code between them. It now removes `#[cfg(test)]`
+  items rather than truncating, and the same mutation fails with `these files send HTTP and are in
+  no list: ["crates/pond-api/src/middleware/mod.rs"]`. Vacuity: pointing `workspace_root` at a
+  non-existent directory fails four tests on `no .../crates -- this guard scans the workspace and
+  cannot run without it`, rather than reporting an empty set as clean. Other mutations: a
+  `https://metrics.example.com` literal added to `pond-adapters-ollama` fails
+  `loopback_exemptions_contain_no_third_party_url` naming the URL; disabling the `NETWORK_MODES`
+  check makes the API test fail `200 != 422`; dropping the `upsert!` line makes
+  `roundtrip_persists_every_field` fail with `network_mode: wrote "open-probe", read back "open"`;
+  making the `Allowlist` arm permit everything fails the nine-cell matrix on `allowlist must refuse
+  a Sensitive host`.
+
+  **The live check found a real defect and then found a second one in itself.** `GET /api/v1/weather`
+  rendered its error with `{e}`, which prints only the outermost `anyhow` context — so a refused
+  call read `Failed to fetch weather: weather API request failed` and was indistinguishable from
+  open-meteo being down. It renders `{e:#}` now, and the live run asserts the message names the
+  setting, the mode and the host. The second defect was mine: the section opened with a warm-up
+  `GET /weather` as a "does the provider exist" control, and `OpenMeteoWeatherAdapter` caches for 15
+  minutes, so the refusal that followed was served out of memory and the gate was never consulted.
+  The control is now the error message itself, which costs no round trip and cannot be cached.
+  `section_network_mode` / `section_network_mode_after_restart` in `scripts/live_checks.py` carry
+  both halves; the restart pass is where they have to live, because the weather provider is built
+  once at startup from stored settings.
+
+  Also fixed here: `MockSettingsRepository` round-trips `network_mode`. It overlays a hand-picked
+  subset of fields, so without that the API test would have asserted a value that was never stored —
+  the same reasoning already written beside `mic_enabled` in that file.
+
+  Gates: fmt clean; pond-core 786 + 5 guard, pond-infra 213 + 3 + 3, pond-api 6 settings tests,
+  pond-infra-scheduler, pond-mcp-server, pond-adapters-weather all green;
+  `cargo check -p pond-server -p pond-adapters-goose` clean; `scripts/live-test.sh --ui` green,
+  11 restart-pass checks, 0 failed.
 - **P6** Draft gate for outbound connector actions (lands with PAI-8), **and P3's third
   chokepoint** — redaction before a body leaves the pond, which has no call site to wire until
   PAI-8 creates one.
@@ -687,8 +773,10 @@ onboarding is complete. `middleware/onboarding_guard.rs` already knows that stat
 
 - **Unit** — the policy matrix, one test per scope × principal-kind cell, including the recovery
   routes that must never be denied.
-- **Guard tests** — no secret-shaped settings key is serialized; every `reqwest`-using crate
-  references `record_egress`. Both must fail the build, not warn.
+- **Guard tests** — no secret-shaped settings key is serialized; every HTTP-sending source file is
+  classified as tracked, loopback-only, or knowingly ungated. Both must fail the build, not warn.
+  Corrected 2026-08-05: the crate-level form of the second guard ("every `reqwest`-using crate
+  references `record_egress`") is not implementable — see 3.5.
 - **Redactor** — a corpus with true positives and deliberately hard negatives; assert idempotence
   (redacting twice equals redacting once).
 - **Integration** — `network_mode = "offline"`, run a weather query, assert a clean refusal with an

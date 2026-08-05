@@ -38,6 +38,21 @@ pub const SECURITY_POLICY_MODES: &[&str] = &[
     SECURITY_POLICY_MODE_ENFORCE,
 ];
 
+/// `network_mode`: record every outbound call, refuse none.
+pub const NETWORK_MODE_OPEN: &str = "open";
+/// `network_mode`: refuse hosts that classify as privacy-`Sensitive`.
+pub const NETWORK_MODE_ALLOWLIST: &str = "allowlist";
+/// `network_mode`: refuse everything that is not loopback.
+pub const NETWORK_MODE_OFFLINE: &str = "offline";
+
+/// The accepted values of `network_mode`, for validation and for the error
+/// message a rejected write gets back.
+pub const NETWORK_MODES: &[&str] = &[
+    NETWORK_MODE_OPEN,
+    NETWORK_MODE_ALLOWLIST,
+    NETWORK_MODE_OFFLINE,
+];
+
 /// One factory default that CHANGED after installs already existed.
 ///
 /// Settings are a flat key-value table and a default only applies when the key
@@ -524,6 +539,28 @@ pub struct Settings {
     #[serde(default = "Settings::default_security_policy_mode")]
     pub security_policy_mode: String,
 
+    /// How hard outbound HTTP is gated: `"open" | "allowlist" | "offline"`.
+    ///
+    /// - `open` - every outbound call is recorded, none is refused.
+    /// - `allowlist` - refuse hosts that classify as privacy-`Sensitive`,
+    ///   which is every host that is neither loopback nor on the curated
+    ///   public-API list in `shared::services::egress`.
+    /// - `offline` - refuse everything except loopback, which turns "prove it
+    ///   is not phoning home" into one setting rather than a packet capture.
+    ///
+    /// Defaults to `open` because that is what every existing install already
+    /// does; nothing was gated before this landed, so any other default would
+    /// break a working pond on upgrade. That makes this a scope-WIDENING
+    /// default only in the sense that it preserves the status quo -- the
+    /// narrowing this phase owes is at the edge: `PUT /settings` refuses an
+    /// unrecognised value rather than absorbing it.
+    ///
+    /// Read `docs/architecture/pai/02-privacy-and-security-guardrails.md` 3.5
+    /// before widening the curated list: the fail-`Sensitive` default is what
+    /// makes `allowlist` mean anything.
+    #[serde(default = "Settings::default_network_mode")]
+    pub network_mode: String,
+
     /// When true, recent memory fragments are injected into the system prompt each turn
     #[serde(default = "Settings::default_agent_memory_inject")]
     pub agent_memory_inject: bool,
@@ -832,6 +869,7 @@ impl Default for Settings {
             prefix_cache_prompt: Self::default_prefix_cache_prompt(),
             tool_selection_mode: Self::default_tool_selection_mode(),
             security_policy_mode: Self::default_security_policy_mode(),
+            network_mode: Self::default_network_mode(),
             agent_memory_inject: Self::default_agent_memory_inject(),
             agent_memory_limit: Self::default_agent_memory_limit(),
             tool_output_compaction: Self::default_tool_output_compaction(),
@@ -1108,6 +1146,11 @@ impl Settings {
     fn default_security_policy_mode() -> String {
         // Audit, never enforce, on a first landing. See the field docs.
         SECURITY_POLICY_MODE_AUDIT.to_string()
+    }
+    fn default_network_mode() -> String {
+        // Open: nothing was gated before this landed, so anything stricter
+        // breaks a working pond on upgrade. See the field docs.
+        NETWORK_MODE_OPEN.to_string()
     }
     fn default_prefix_cache_prompt() -> bool {
         true
@@ -1839,6 +1882,12 @@ mod tests {
             // gets a UI only if it survives to `enforce` (PAI-2 P8), and giving
             // it one now would invite flipping a half-validated matrix on.
             "security_policy_mode",
+            // The egress gate's rollout lever (PAI-2 P5). Headless for the same
+            // reason security_policy_mode is: while six real-egress call sites
+            // are still ungated (see crates/pond-core/tests/egress_guard.rs),
+            // a UI switch labelled "offline" would promise more than the code
+            // delivers. It gets a control when that list is empty.
+            "network_mode",
             // Hybrid-compaction rollout flags: operator knobs for the
             // deterministic-trim + idle-summary pipeline; flipped via the
             // settings API during on-device burn-in, no UI control planned.

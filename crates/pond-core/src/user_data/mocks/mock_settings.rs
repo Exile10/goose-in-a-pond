@@ -106,6 +106,12 @@ fn build_settings(store: &HashMap<String, String>) -> Settings {
     if let Some(v) = store.get("prompt_addendum") {
         s.prompt_addendum = v.clone();
     }
+    // Egress gate (PAI-2 P5). Same reason mic_enabled is here: a mock that
+    // silently returns the default makes "does the network restriction stick"
+    // pass without the value ever having been stored.
+    if let Some(v) = store.get("network_mode") {
+        s.network_mode = v.clone();
+    }
     s
 }
 
@@ -164,6 +170,7 @@ impl SettingsRepository for MockSettingsRepository {
                 .to_string(),
         );
         store.insert("prompt_addendum".into(), settings.prompt_addendum.clone());
+        store.insert("network_mode".into(), settings.network_mode.clone());
         Ok(())
     }
 

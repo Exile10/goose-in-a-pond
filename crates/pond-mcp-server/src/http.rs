@@ -32,7 +32,11 @@ pub fn build_http_client() -> Client {
 /// Perform a traced `GET` request. The destination host, the in-flight tool and
 /// session, the status, and the wall-clock latency are recorded to the event
 /// store (see module docs).
-pub async fn traced_get(client: &Client, url: &str) -> reqwest::Result<reqwest::Response> {
+///
+/// Returns `anyhow::Result` rather than `reqwest::Result` because the network
+/// gate can refuse before a socket is opened, and a refusal is not a transport
+/// error -- there is no honest `reqwest::Error` to synthesise for it.
+pub async fn traced_get(client: &Client, url: &str) -> anyhow::Result<reqwest::Response> {
     traced_get_with(client, url, |b| b).await
 }
 
@@ -43,7 +47,7 @@ pub async fn traced_get_with<F>(
     client: &Client,
     url: &str,
     customize: F,
-) -> reqwest::Result<reqwest::Response>
+) -> anyhow::Result<reqwest::Response>
 where
     F: FnOnce(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
 {
@@ -56,7 +60,12 @@ async fn send_traced(
     builder: reqwest::RequestBuilder,
     method: &str,
     url: &str,
-) -> reqwest::Result<reqwest::Response> {
+) -> anyhow::Result<reqwest::Response> {
+    // PAI-2 P5: the gate runs BEFORE the request. A refusal never opens a
+    // socket, and `check_egress` records it as `egress.denied` so the activity
+    // feed shows what was stopped, not just what got through.
+    egress::check_egress(url)?;
+
     let host = egress::extract_host(url);
     let tool = egress::current_tool();
     let session_id = egress::current_session_id();
@@ -91,7 +100,7 @@ async fn send_traced(
     // Durable, queryable egress record (#113).
     egress::record_egress(url, method, status, latency_ms);
 
-    result
+    Ok(result?)
 }
 
 #[cfg(test)]

@@ -495,6 +495,136 @@ def section_secret_store_after_restart():
     )
 
 
+def section_network_mode():
+    """PAI-2 P5, first pass -- the setting exists, and a typo cannot reach it.
+
+    Also arms the restart pass: the weather provider is built ONCE, at startup,
+    from stored settings, so a server that boots without a location has
+    `weather_provider = None` and answers `{"enabled": false}` with a 200 no
+    matter what the gate does. Turning weather on here is what gives the second
+    server something real to refuse.
+    """
+    print("\n=== P5: network_mode at the edge ===")
+
+    code, body = call("GET", "/api/v1/settings")
+    if not expect(
+        "network_mode is on Settings and defaults to open",
+        code,
+        200,
+        body,
+        ("value", isinstance(body, dict) and body.get("network_mode") == "open"),
+    ):
+        return
+
+    # NetworkMode::parse widens on an unrecognised value on purpose, so this
+    # 422 is the only thing standing between a typo and a gate that is off.
+    code, body = call("PUT", "/api/v1/settings", {"network_mode": "offlien"})
+    expect("an unrecognised network_mode is refused at the edge", code, 422, body)
+
+    code, body = call("GET", "/api/v1/settings")
+    expect(
+        "the refused value did not reach the store",
+        code,
+        200,
+        body,
+        ("still open", isinstance(body, dict) and body.get("network_mode") == "open"),
+    )
+
+    # Arm the restart pass. Coordinates are left at 0 deliberately: the adapter
+    # geocodes the name, so this exercises BOTH open-meteo hosts.
+    code, body = call(
+        "PUT",
+        "/api/v1/settings",
+        {"weather_enabled": True, "weather_location_name": "Kisumu"},
+    )
+    expect(
+        "weather is enabled for the restart pass",
+        code,
+        200,
+        body,
+        ("enabled", isinstance(body, dict) and body.get("weather_enabled") is True),
+    )
+
+
+def section_network_mode_after_restart():
+    """PAI-2 P5, restart pass -- does `offline` actually refuse, and say so?
+
+    This is the assertion the phase rests on and it cannot be made anywhere
+    else. The unit tests call `egress_verdict` directly; the integration test
+    drives a mock repository. Only here is the gate installed by `main.rs`,
+    re-installed by the real `PUT /settings` handler, and consulted by an
+    adapter the server wired itself.
+
+    A TIMEOUT IS A FAILURE OF THIS PHASE, NOT A PASS. A gate that works by
+    letting the request hang until open-meteo gives up is not a gate, so the
+    refusal is asserted by its MESSAGE -- which also makes this check
+    independent of whether the machine running it has internet at all.
+
+    DO NOT put a warm-up `GET /api/v1/weather` in front of the refusal as a
+    "does the provider exist" control. The first version of this section did,
+    and it reported PASS-then-FAIL for a reason worth remembering:
+    `OpenMeteoWeatherAdapter` caches for 15 minutes, so the control served the
+    second call out of memory and the gate was never consulted at all. The
+    control is the message instead -- an error naming `open-meteo.com` can only
+    have come from a provider that exists and was about to call it, and it
+    costs no network round trip to establish.
+    """
+    print("\n=== P5: the gate refuses, live ===")
+
+    code, body = call("PUT", "/api/v1/settings", {"network_mode": "offline"})
+    if not expect(
+        "network_mode=offline is accepted and applied without a restart",
+        code,
+        200,
+        body,
+        ("value", isinstance(body, dict) and body.get("network_mode") == "offline"),
+    ):
+        return
+
+    code, body = call("GET", "/api/v1/weather")
+    detail = json.dumps(body) if not isinstance(body, str) else body
+    expect(
+        "an offline pond refuses the weather call",
+        code,
+        502,
+        body,
+        ("names the setting", "network_mode" in detail),
+        ("names the mode", "offline" in detail),
+        ("names the host", "open-meteo.com" in detail),
+    )
+
+    # Put it back, and prove the gate is a gate and not a one-way door. The
+    # call may still fail on a machine with no internet -- what must NOT
+    # survive is the refusal.
+    code, body = call("PUT", "/api/v1/settings", {"network_mode": "open"})
+    if not expect(
+        "network_mode=open is restored",
+        code,
+        200,
+        body,
+        ("value", isinstance(body, dict) and body.get("network_mode") == "open"),
+    ):
+        return
+
+    code, body = call("GET", "/api/v1/weather")
+    detail = json.dumps(body) if not isinstance(body, str) else body
+    check(
+        "the refusal stops when the mode is relaxed",
+        "network_mode" not in detail,
+        detail,
+    )
+    # And it is a real provider on the other side of the gate, not a stub that
+    # answers `{"enabled": false}` without touching the network. A 502 is
+    # accepted here and only here: this run may be on a machine with no
+    # internet, and that is not this phase's failure.
+    check(
+        "the weather provider behind the gate is real",
+        (code == 200 and isinstance(body, dict) and body.get("enabled") is True)
+        or code == 502,
+        "HTTP %s: %s" % (code, detail),
+    )
+
+
 def section_redaction():
     """PAI-2 P3 -- does the redactor sit on the write path production wired?
 
@@ -567,6 +697,7 @@ def main():
     """
     if len(sys.argv) > 1 and sys.argv[1] == "restart":
         section_secret_store_after_restart()
+        section_network_mode_after_restart()
     else:
         section_schema()
         jerry, liz = section_identity()
@@ -574,6 +705,7 @@ def main():
         section_legacy_rows(jerry)
         section_secret_store()
         section_redaction()
+        section_network_mode()
 
     failed = [label for label, ok, _ in results if not ok]
     print("\n%d checks run, %d failed" % (len(results), len(failed)))

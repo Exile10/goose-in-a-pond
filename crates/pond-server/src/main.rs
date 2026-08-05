@@ -973,6 +973,13 @@ async fn run_server(
     let settings_repo_early = SqliteSettingsRepository::new(db.system.clone());
     let settings = settings_repo_early.get().await.unwrap_or_default();
 
+    // PAI-2 P5: the egress gate reads a process-global, so it must be installed
+    // before any adapter exists to make an outbound call. `PUT /settings`
+    // re-installs it, so a change takes effect without a restart.
+    pond_core::shared::services::egress::set_network_mode(
+        pond_core::shared::services::egress::NetworkMode::parse(&settings.network_mode),
+    );
+
     // Override agent_backend from DB settings (UI can change it without CLI restart).
     // CLI flag takes precedence only when explicitly set to something other than "goose".
     let agent_backend = if agent_backend == "goose" && !settings.agent_backend.is_empty() {

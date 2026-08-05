@@ -21,13 +21,18 @@ use serde::{Deserialize, Serialize};
 pub(crate) async fn traced_send(
     builder: reqwest::RequestBuilder,
     url: &str,
-) -> reqwest::Result<reqwest::Response> {
+) -> anyhow::Result<reqwest::Response> {
+    // PAI-2 P5: gate first. open-meteo is on the curated public list, so
+    // `allowlist` permits it and `offline` does not -- which is the whole
+    // point: an offline pond stops asking a third party where the user lives.
+    pond_core::shared::services::egress::check_egress(url)?;
+
     let start = std::time::Instant::now();
     let result = builder.send().await;
     let latency_ms = start.elapsed().as_millis() as u64;
     let status = result.as_ref().ok().map(|r| r.status().as_u16());
     pond_core::shared::services::egress::record_egress(url, "GET", status, latency_ms);
-    result
+    Ok(result?)
 }
 
 // ── Current weather ──────────────────────────────────────────────────────────

@@ -38,13 +38,18 @@ impl TaskExecutor for WebhookTaskExecutor {
             .ok_or_else(|| anyhow::anyhow!("task {task_id}: payload missing 'webhook_url'"))?
             .to_string();
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("task {task_id}: webhook POST failed: {e}"))?;
+        // PAI-2 P5. A scheduled webhook POSTs the whole task payload to a URL
+        // the user typed in: the most direct exfiltration path in the tree, and
+        // until now it appeared in no activity feed at all. `begin` gates and
+        // starts the clock; `finish` records the outcome either way, so a
+        // webhook that times out is still visible.
+        let call = pond_core::shared::services::egress::begin(&url, "POST")
+            .map_err(|e| anyhow::anyhow!("task {task_id}: {e}"))?;
+
+        let sent = self.client.post(&url).json(&payload).send().await;
+        call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+
+        let resp = sent.map_err(|e| anyhow::anyhow!("task {task_id}: webhook POST failed: {e}"))?;
 
         if !resp.status().is_success() {
             bail!("task {task_id}: webhook returned {}", resp.status());

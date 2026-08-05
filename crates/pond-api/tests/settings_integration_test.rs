@@ -445,3 +445,82 @@ async fn settings_response_never_carries_a_secret_shaped_key() {
         "the value an old client sent came straight back out of GET /settings"
     );
 }
+
+/// PAI-2 P5. `NetworkMode::parse` widens on an unrecognised value, on purpose --
+/// a typo must not silently take a home assistant off the internet. That makes
+/// this 422 the only thing standing between a typo and a gate that is quietly
+/// off, so it is asserted here rather than left to the parser.
+///
+/// The status code is asserted BEFORE any body predicate: a body-shape check
+/// alone passes against an error payload, where every lookup returns `None`.
+#[tokio::test]
+async fn put_settings_refuses_an_unrecognised_network_mode() {
+    let (app, _tmp) = make_app().await;
+
+    async fn put(app: &axum::Router, body: serde_json::Value) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/settings")
+                    .header("content-type", "application/json")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn stored_mode(app: &axum::Router) -> String {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/settings")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json.get("network_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("GET /settings carried no network_mode: {json}"))
+            .to_string()
+    }
+
+    // Positive control first: the field exists and defaults to the open,
+    // status-quo-preserving value. Without this the assertions below could pass
+    // against a Settings struct that never grew the field.
+    assert_eq!(stored_mode(&app).await, "open");
+
+    let bad = put(&app, serde_json::json!({ "network_mode": "offlien" })).await;
+    assert_eq!(
+        bad.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an unrecognised network_mode must be refused, not absorbed into \"open\""
+    );
+    assert_eq!(
+        stored_mode(&app).await,
+        "open",
+        "the refused value must not have reached the store"
+    );
+
+    // ...and a recognised value still round-trips, or the guard has locked the
+    // setting out entirely, which is a different bug wearing the same green.
+    let good = put(&app, serde_json::json!({ "network_mode": "offline" })).await;
+    assert_eq!(good.status(), StatusCode::OK);
+    assert_eq!(stored_mode(&app).await, "offline");
+
+    // The handler installs the mode process-wide. Put it back, so a later test
+    // in this binary does not inherit an offline pond.
+    let restore = put(&app, serde_json::json!({ "network_mode": "open" })).await;
+    assert_eq!(restore.status(), StatusCode::OK);
+}

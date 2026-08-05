@@ -32,7 +32,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use pond_core::mcp::ports::notification::Notification;
 use pond_core::mcp::ports::notification_relay::NotificationRelay;
-use pond_core::shared::services::egress::record_egress;
+use pond_core::shared::services::egress::{check_egress, record_egress};
 use pond_core::user_data::domain::push_token::PushPlatform;
 use pond_core::user_data::ports::push_token::PushTokenRepository;
 use serde::Deserialize;
@@ -176,6 +176,12 @@ impl FcmPushRelay {
         )
         .context("signing FCM auth assertion")?;
 
+        // PAI-2 P5: `oauth2.googleapis.com` classifies Sensitive, so both
+        // restrictive modes refuse it -- an offline pond does not exchange a
+        // signed assertion with Google, which is the visible half of the
+        // promise the setting makes.
+        check_egress(&self.account.token_uri)?;
+
         let started = Instant::now();
         let response = self
             .http
@@ -252,6 +258,11 @@ impl NotificationRelay for FcmPushRelay {
         let access_token = self.access_token().await?;
         let url = fcm_send_url(&self.fcm_base, &self.account.project_id);
         let body = wake_message(&stored.token, notification);
+
+        // PAI-2 P5: gate the send too, not only the token exchange -- a token
+        // cached before the mode was tightened would otherwise keep pushing for
+        // the rest of its lifetime.
+        check_egress(&url)?;
 
         let started = Instant::now();
         let response = self
