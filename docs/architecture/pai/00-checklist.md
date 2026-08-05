@@ -23,7 +23,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2 LANDED**; P3-P6 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
-| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0, P1, P2, P4 LANDED**; P3, P5-P8 designed |
+| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0, P1, P2, P3, P4 LANDED**; P5-P8 designed |
 
 They are equally weighted and mutually interdependent. `DESIGNED` means the document exists and its
 current-state claims were verified against code; it does **not** mean any code has changed. `LANDED`
@@ -757,3 +757,39 @@ plaintext rows in `settings` until P2 moves them, so "GIAP encrypts your API key
 Gates: fmt clean, clippy and test green on the fast set (`pond-infra` 202 lib, up from 188), `cargo check` on
 `pond-server` + `pond-adapters-goose`, and `scripts/live-test.sh --ui` green end to end including
 the new restart pass.
+
+**2026-08-05 — PAI-2 P3 (redaction). The reusable lesson is about where a guard lives.**
+
+The rules were the easy half. The wiring was the half that was wrong, twice, in a plan whose author
+had read the code carefully: `run_server` builds the memory repository once, but `main.rs` builds it
+four times, and three of those are write paths reachable from `pond chat`, the voice loop and
+`pond memories add`. `SqliteSecurityPolicy` is handed its own independently constructed
+`SqliteEventLog`, so wrapping the shared binding covered every event except the audit trail. Both
+mistakes compile, run, and look right in review. Grep for the CONSTRUCTOR across the whole file, not
+for the binding you were told about.
+
+**A guard belongs where CI runs it, not where the code is.** `ci.yml` has no `cargo test -p
+pond-server`, so any wiring guard written next to `main.rs` would never fire on a pull request. The
+guard for this phase reads `main.rs` with `include_str!` from `crates/pond-infra/tests/` — no
+dependency edge, no link, and it runs in the fast pass. It found a fourth bypass on its first
+execution. The same technique is available to P6 for the "an outbound body path has appeared and
+nothing redacts it" guard that P3's own risk list said could not be written.
+
+**Watch a guard fail before believing it.** Four mutations were run and all four produced messages
+that name the defect: the audit sink unwrapped (`main.rs:2593 builds a write-path SqliteEventLog
+outside RedactingEventLog`), `set_egress_sink` rebound to a fresh log, the UK inward-letter set
+replaced with `is_ascii_alphabetic` (`mangled: Play B2 3AM by the band when I get home.`), and one
+`MemoryRepository` forward deleted.
+
+**A negative test is the product decision.** A redactor that eats ordinary prose is worse than none,
+because the user stops trusting the transcript and turns it off. Every rule here has a real-shaped
+false positive next to its positive, and it is the negatives that shaped the code: no dot in the
+phone separators (IP addresses), a trunk prefix required on bare digit runs (epoch timestamps), Luhn
+required on card-length runs (order numbers), the real inward-letter set on postcodes (`B2 3AM`),
+and an unprefixed 64-hex secret deliberately left undetected because a git SHA is indistinguishable
+from it.
+
+**Live-run trap, already documented and still worth repeating.** `live-test.sh` dying at "never wrote
+`.runtime_api_port` after 180s" is `ensure_onnx_runtime` downloading ~30 MB into a fresh scratch
+directory, not a hang in your feature. Export `ORT_DYLIB_PATH` at an existing copy. The comment
+above the start block says so; I lost a full run to not reading it.

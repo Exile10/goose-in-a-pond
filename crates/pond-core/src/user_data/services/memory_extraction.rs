@@ -249,7 +249,17 @@ impl MemoryExtractionService {
                 tracing::warn!("[memory-extraction] failed to store fact: {e}");
             } else {
                 stored += 1;
-                tracing::info!("[memory-extraction] stored: {content:?}");
+                // PAI-2 P3: the fact itself is not logged. This line is INFO,
+                // and INFO is what the on-disk log file under <data_dir>/logs
+                // keeps, so every extracted memory was landing in plaintext in
+                // a second place -- with none of the store's scoping, none of
+                // its retention, and none of chokepoint 1's redaction. The id
+                // correlates the line with the row; the row is the record.
+                tracing::info!(
+                    memory_id = %id,
+                    chars = content.chars().count(),
+                    "[memory-extraction] stored a fact"
+                );
                 existing.push(content.to_lowercase());
                 let _ = repo
                     .log_event(MemoryEventKind::Extracted, &id, session_id, None)

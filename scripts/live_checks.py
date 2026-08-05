@@ -495,6 +495,62 @@ def section_secret_store_after_restart():
     )
 
 
+def section_redaction():
+    """PAI-2 P3 -- does the redactor sit on the write path production wired?
+
+    Every redaction unit test builds the decorator by hand. This one goes in
+    over HTTP, at the default level, with no configuration, and reads the row
+    back out of SQLite -- so it fails if `run_server` binds the raw
+    `SqliteMemoryRepository`, which is the one thing those unit tests cannot
+    see and the one thing that compiles perfectly either way.
+
+    Both halves matter. A redactor that eats ordinary prose is worse than none,
+    because the user stops trusting the transcript and turns it off, so the
+    negative is asserted BYTE-FOR-BYTE rather than by absence of a placeholder.
+    """
+    print("\n=== P3: redaction on the real memory write path ===")
+
+    key = "sk-livecheckabcdefghijklmnopqrstuv"
+    prose = "I grew up near B2 3AM and the hub is at 192.168.1.50."
+    content = "stripe key %s -- %s" % (key, prose)
+
+    code, body = call(
+        "POST", "/api/v1/memories", {"content": content, "source": "live-check"}
+    )
+    # 201, not 200. The handler echoes back the fragment it BUILT, which still
+    # holds the credential -- the decorator redacts on the way into the store,
+    # and it is the stored row that is asserted on below. Reading the response
+    # body here would have reported the opposite of the truth.
+    if not expect("a memory with a credential in it is accepted", code, 201, body):
+        return
+
+    con = db()
+    rows = con.execute(
+        "SELECT content FROM memory_fragments WHERE source = 'live-check'"
+    ).fetchall()
+    con.close()
+
+    if not check("the fragment reached pond_system.db", len(rows) == 1, str(rows)):
+        return
+    stored = rows[0][0]
+
+    check(
+        "the credential is not in the stored row",
+        key not in stored,
+        "the raw key is in pond_system.db: %s" % stored,
+    )
+    check(
+        "the credential was replaced, not deleted",
+        "[redacted:api-key]" in stored,
+        stored,
+    )
+    check(
+        "ordinary prose came through byte for byte",
+        stored.endswith(prose),
+        "prose was mangled -- stored: %s" % stored,
+    )
+
+
 def main():
     """Auth is NOT checked here.
 
@@ -517,6 +573,7 @@ def main():
         section_deletion(jerry, liz)
         section_legacy_rows(jerry)
         section_secret_store()
+        section_redaction()
 
     failed = [label for label, ok, _ in results if not ok]
     print("\n%d checks run, %d failed" % (len(results), len(failed)))
