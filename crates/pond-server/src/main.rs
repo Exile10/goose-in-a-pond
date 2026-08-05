@@ -3683,6 +3683,22 @@ async fn run_chat(
             .with_stdout_diagnostics(false);
     }
 
+    // Live mic-level reporting for the voice-mode UI orb (wait + recording
+    // states). Only meaningful under --json-events — the desktop shell is the
+    // only consumer of this NDJSON contract.
+    let audio_level_sink: Option<Arc<pond_adapters_whisper::ThrottledAudioLevelSink>> =
+        if json_events {
+            Some(Arc::new(pond_adapters_whisper::ThrottledAudioLevelSink::new(
+                Box::new(|rms: f32| {
+                    write_ndjson_line(&pond_core::shared::domain::agent::WorkflowEvent::AudioLevel {
+                        rms,
+                    });
+                }),
+            )))
+        } else {
+            None
+        };
+
     // ── Wire LLM provider (no-goose-agent fallback only) ────────────────────────
     // When GooseAdapter is active it selects the provider internally via the DB.
     // This block runs only in builds without the goose-agent feature.
@@ -3767,7 +3783,13 @@ async fn run_chat(
     let whisper_backend: Option<Arc<WhisperRsInput>> = if input == "whisper" {
         match &whisper_model_path {
             Some(p) => match WhisperRsInput::new(p.clone()) {
-                Ok(w) => Some(Arc::new(w)),
+                Ok(w) => {
+                    let w = match &audio_level_sink {
+                        Some(sink) => w.with_audio_level_sink(sink.clone()),
+                        None => w,
+                    };
+                    Some(Arc::new(w))
+                }
                 Err(e) => {
                     // Whisper was explicitly requested but failed to load. Under
                     // --json-events, out! is a no-op, so a bare warning would leave
@@ -3855,11 +3877,14 @@ async fn run_chat(
             ..KeywordDetectorConfig::default()
         };
 
-        let detector = Arc::new(
+        let mut detector_builder =
             WhisperKeywordDetector::new(backend.clone() as Arc<dyn WhisperBackend>, trigger)
                 .with_transcriptions(transcriptions)
-                .with_config(kws_config),
-        );
+                .with_config(kws_config);
+        if let Some(sink) = &audio_level_sink {
+            detector_builder = detector_builder.with_audio_level_sink(sink.clone());
+        }
+        let detector = Arc::new(detector_builder);
         // The detector captures audio from before it fired, so the wake word
         // is inside the command clip. Hand the transcriber the detector's own
         // resolved trigger list so it strips exactly what matched.
@@ -3969,6 +3994,10 @@ async fn run_chat(
                                 Ok(out) => {
                                     let out = match espeak_data_dir {
                                         Some(d) => out.with_espeak_data(d),
+                                        None => out,
+                                    };
+                                    let out = match &audio_level_sink {
+                                        Some(sink) => out.with_audio_level_sink(sink.clone()),
                                         None => out,
                                     };
                                     out!(
@@ -5904,8 +5933,16 @@ async fn sync_assignments_to_settings(
                     .await;
             }
             "tts" => {
+                // The TTS engine gate elsewhere checks active_tts_model.starts_with("piper")
+                // — a bare catalog slug (e.g. "en-lessac-medium") never satisfies that, so
+                // it must be stored prefixed for piper voices.
+                let stored_active_model = if category == "tts_piper" {
+                    format!("piper-{model_name}")
+                } else {
+                    model_name.to_string()
+                };
                 let _ = settings_repo
-                    .set_key("active_tts_model", model_name.to_string())
+                    .set_key("active_tts_model", stored_active_model)
                     .await;
                 // For piper models also sync voice_tts_voice to the .onnx filename.
                 if category == "tts_piper" {

@@ -31,7 +31,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 use crate::{
     decode_wav_mono_f32, record_mono_f32_until_silence, record_mono_f32_vad, resample_to_16k,
-    strip_whisper_artifacts, SpeculativeSpawn, WhisperBackend,
+    strip_whisper_artifacts, SpeculativeSpawn, ThrottledAudioLevelSink, WhisperBackend,
 };
 
 /// Outcome of the blocking audio-capture step in `listen()`.
@@ -83,6 +83,8 @@ pub struct WhisperRsInput {
     /// the runtime, where tokio's `blocking_write` panics outright. Nothing
     /// awaits while holding it.
     wake_words: std::sync::RwLock<Vec<String>>,
+    /// Optional live mic-level reporter, fed from the VAD recording loop.
+    audio_level_sink: Option<Arc<ThrottledAudioLevelSink>>,
 }
 
 impl WhisperRsInput {
@@ -109,6 +111,7 @@ impl WhisperRsInput {
             silence_ms: DEFAULT_SILENCE_MS,
             captured: Mutex::new(None),
             wake_words: std::sync::RwLock::new(Vec::new()),
+            audio_level_sink: None,
         })
     }
 
@@ -136,6 +139,13 @@ impl WhisperRsInput {
     /// Override the end-of-speech silence threshold.
     pub fn with_silence_ms(mut self, ms: u64) -> Self {
         self.silence_ms = ms;
+        self
+    }
+
+    /// Report live mic RMS level through `sink` while waiting for speech
+    /// onset and while recording the user's utterance.
+    pub fn with_audio_level_sink(mut self, sink: Arc<ThrottledAudioLevelSink>) -> Self {
+        self.audio_level_sink = Some(sink);
         self
     }
 
@@ -471,6 +481,7 @@ impl WhisperRsInput {
         let captured = self.captured.lock().unwrap().take();
         let max_record = self.duration_secs;
         let silence_ms = self.silence_ms;
+        let audio_level_sink = self.audio_level_sink.clone();
 
         // Acquire the read guard so a concurrent rebuild_with does not swap
         // the context out from under us mid-inference.
@@ -526,6 +537,7 @@ impl WhisperRsInput {
                     silence_ms,
                     Some(&*speculative_spawn),
                     on_speculative_event.as_deref(),
+                    audio_level_sink.as_deref(),
                 )?;
                 if samples.is_empty() {
                     return Ok(SpeechCapture::Empty);

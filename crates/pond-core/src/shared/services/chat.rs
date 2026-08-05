@@ -1862,6 +1862,9 @@ impl ChatService {
             WorkflowEvent::Error { message } => {
                 tracing::debug!("Workflow error: {}", message);
             }
+            WorkflowEvent::AudioLevel { .. } => {
+                // High-frequency — do not trace per-level (same as Token).
+            }
         }
 
         if let Some(sink) = &self.event_sink {

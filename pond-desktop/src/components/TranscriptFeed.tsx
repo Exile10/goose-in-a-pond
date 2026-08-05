@@ -73,7 +73,7 @@ export function TranscriptFeed({
                   {msg.role === "user" ? "You" : "Pond"}
                 </Chip>
               )}
-              <p style={{ ...styles.text, fontSize: compact ? "12px" : "13px" }}>
+              <p style={{ ...styles.text, fontSize: compact ? "11px" : "13px", padding: compact ? "4px 8px" : styles.text.padding }}>
                 {msg.text || (msg.role === "agent" ? <ThinkingPlaceholder compact /> : "")}
               </p>
             </div>
