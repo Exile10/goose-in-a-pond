@@ -154,9 +154,12 @@ pub struct AppState {
     pub profile_repo: Arc<dyn ProfileRepository + Send + Sync>,
     /// Device registry for GOTG devices and other connected hardware.
     pub device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
-    /// Matter commissioning, when a controller is wired (None = Matter off).
-    pub commissioner:
-        Option<Arc<dyn pond_core::user_data::ports::device_commissioning::DeviceCommissioningPort>>,
+    /// The Matter integration, reconciled at runtime from the `matter_enabled`
+    /// setting. `None` only in builds and tests that wire no Matter support at
+    /// all — "switched off" is a state of the runtime, not the absence of one,
+    /// so that an unreachable controller can be reported as such instead of
+    /// being mistaken for "Matter is not enabled".
+    pub matter: Option<Arc<dyn pond_core::user_data::ports::matter_runtime::MatterRuntimePort>>,
     /// Memory fragment repository for semantic/recency-based retrieval.
     pub memory_repo: Arc<dyn MemoryRepository + Send + Sync>,
     /// Embedding provider — `None` until a real embedding model is configured.

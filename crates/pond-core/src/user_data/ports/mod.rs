@@ -7,6 +7,7 @@ pub mod draft;
 pub mod face_detector;
 pub mod face_embedding_extractor;
 pub mod face_recognition;
+pub mod matter_runtime;
 pub mod memory_consolidator;
 pub mod memory_extractor;
 pub mod memory_repository;

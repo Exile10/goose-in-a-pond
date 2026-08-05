@@ -133,6 +133,11 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
   await page.route("**/api/v1/devices", (route) =>
     route.fulfill({ json: { devices: [] } }),
   );
+  // The Devices tab reads this on mount for its Matter section. Off is the
+  // default a fresh Pond is in.
+  await page.route("**/api/v1/matter/status", (route) =>
+    route.fulfill({ json: { enabled: false, url: "ws://127.0.0.1:5580/ws", state: "disabled" } }),
+  );
 
   // Music. `now-playing` is POLLED by the hub, so leaving it unmocked does not
   // fail the music tests — it fails whichever unrelated test happens to assert

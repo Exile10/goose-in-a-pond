@@ -10,8 +10,11 @@ use anyhow::Result;
 use futures::{SinkExt, StreamExt};
 use pond_core::shared::ports::event_bus::{BusEvent, EventBus};
 use pond_core::shared::services::in_process_event_bus::InProcessEventBus;
-use pond_core::user_data::ports::device_control::DeviceControlPort;
+use pond_core::user_data::ports::device_control::{
+    DeviceControlOutcome, DeviceControlPort, DeviceStatePatch,
+};
 use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
+use pond_core::user_data::ports::matter_runtime::{MatterRuntimePort, MatterState, MatterStatus};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -21,6 +24,7 @@ use crate::bridge::{run_matter_bridge, run_matter_supervisor};
 use crate::client::MatterClient;
 use crate::commissioning::MatterCommissioner;
 use crate::control::{MatterDeviceControl, NodeCache, SharedMatterClient};
+use crate::runtime::MatterRuntime;
 use pond_core::user_data::ports::device_commissioning::{DeviceCommissioningPort, SetupCode};
 
 // ── Mock matter-server ───────────────────────────────────────────────────────
@@ -615,4 +619,332 @@ async fn send_command_honours_its_timeout_argument() {
         start.elapsed() < Duration::from_secs(2),
         "timed out on the 200ms argument, not COMMAND_TIMEOUT"
     );
+}
+
+// ── Runtime reconciliation ───────────────────────────────────────────────────
+
+/// A mock that serves connection after connection, so enable → disable →
+/// enable can be observed. Reports how many times it was connected to, which
+/// is how "did the runtime churn the connection?" is asserted.
+async fn mock_reconnectable_server(node: Value) -> (String, Arc<Mutex<usize>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+    let connections = Arc::new(Mutex::new(0usize));
+    let connections_srv = connections.clone();
+
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let node = node.clone();
+            let connections_conn = connections_srv.clone();
+            tokio::spawn(async move {
+                // Only completed handshakes count. The controller-readiness
+                // probe (`is_running`) opens a bare TCP connection and drops
+                // it, which would otherwise read as a second client.
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                *connections_conn.lock().unwrap() += 1;
+                ws.send(Message::Text(
+                    json!({"fabric_id": 1, "schema_version": 11})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    let mid = frame["message_id"].as_str().unwrap().to_string();
+                    let result = match frame["command"].as_str().unwrap() {
+                        "start_listening" => json!([node]),
+                        "commission_with_code" | "commission_on_network" => node.clone(),
+                        _ => Value::Null,
+                    };
+                    ws.send(Message::Text(
+                        json!({"message_id": mid, "result": result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+            });
+        }
+    });
+
+    (url, connections)
+}
+
+fn test_runtime() -> Arc<MatterRuntime> {
+    MatterRuntime::new(
+        std::env::temp_dir().join("giap-matter-runtime-test"),
+        Arc::new(InMemoryRegistry::default()) as Arc<dyn DeviceRegistry + Send + Sync>,
+        Arc::new(InProcessEventBus::new()) as Arc<dyn EventBus>,
+    )
+}
+
+/// Poll until the runtime reaches a state the predicate accepts, or fail. The
+/// reconciler is asynchronous by design, so tests observe it, never assume it.
+async fn wait_for(runtime: &MatterRuntime, want: impl Fn(&MatterState) -> bool) -> MatterStatus {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = runtime.status().await;
+        if want(&status.state) {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "runtime never settled; stuck at {:?}",
+            status.state
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The whole point of the runtime: Matter comes up from a settings change, with
+/// no process restart, and commissioning works the moment it reports Connected.
+#[tokio::test]
+async fn enabling_connects_and_exposes_a_commissioner() {
+    let (url, _connections) = mock_reconnectable_server(light_node_json()).await;
+    let runtime = test_runtime();
+
+    assert_eq!(runtime.status().await.state, MatterState::Disabled);
+    assert!(runtime.commissioner().await.is_none());
+
+    runtime.apply(true, url.clone());
+    let status = wait_for(&runtime, |s| *s == MatterState::Connected).await;
+    assert!(status.enabled);
+    assert_eq!(status.url, url);
+
+    let commissioner = runtime
+        .commissioner()
+        .await
+        .expect("a connected runtime exposes its commissioner");
+    let device = commissioner
+        .commission(SetupCode::Passcode(20202021), None)
+        .await
+        .unwrap();
+    assert_eq!(device.device_id, "matter-2");
+}
+
+/// Turning Matter off has to actually stop it: a commissioner left behind would
+/// keep the API reporting success against a controller nobody asked for.
+#[tokio::test]
+async fn disabling_tears_down_and_re_enabling_reconnects() {
+    let (url, connections) = mock_reconnectable_server(light_node_json()).await;
+    let runtime = test_runtime();
+
+    runtime.apply(true, url.clone());
+    wait_for(&runtime, |s| *s == MatterState::Connected).await;
+
+    runtime.apply(false, url.clone());
+    let status = wait_for(&runtime, |s| *s == MatterState::Disabled).await;
+    assert!(!status.enabled);
+    assert!(runtime.commissioner().await.is_none());
+    // The URL stays visible so the UI's controller field is not blanked.
+    assert_eq!(status.url, url);
+
+    runtime.apply(true, url.clone());
+    wait_for(&runtime, |s| *s == MatterState::Connected).await;
+    assert!(runtime.commissioner().await.is_some());
+    assert_eq!(
+        *connections.lock().unwrap(),
+        2,
+        "re-enabling opens a second connection"
+    );
+}
+
+/// Saving Settings re-sends every field, so an unchanged Matter section must
+/// not drop and re-open a working connection.
+#[tokio::test]
+async fn re_applying_the_same_state_while_connected_does_not_churn() {
+    let (url, connections) = mock_reconnectable_server(light_node_json()).await;
+    let runtime = test_runtime();
+
+    runtime.apply(true, url.clone());
+    wait_for(&runtime, |s| *s == MatterState::Connected).await;
+
+    for _ in 0..3 {
+        runtime.apply(true, url.clone());
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(runtime.status().await.state, MatterState::Connected);
+    assert_eq!(
+        *connections.lock().unwrap(),
+        1,
+        "an unchanged desired state must not reconnect"
+    );
+}
+
+/// The bug this whole change exists to kill: an enabled-but-unreachable
+/// controller used to be indistinguishable from "Matter is not enabled".
+#[tokio::test]
+async fn an_unreachable_controller_reports_the_failure_not_off() {
+    let runtime = test_runtime();
+    // `.invalid` never resolves, and a non-loopback host is never auto-started,
+    // so this fails fast without touching the controller installer.
+    runtime.apply(true, "ws://matter-controller.invalid:5580/ws".into());
+
+    let status = wait_for(&runtime, |s| matches!(s, MatterState::Unreachable { .. })).await;
+    assert!(
+        status.enabled,
+        "still enabled — it is the link that is down"
+    );
+    let MatterState::Unreachable { error } = status.state else {
+        unreachable!()
+    };
+    assert!(
+        error.contains("matter-controller.invalid"),
+        "the reported error names what could not be reached: {error}"
+    );
+    assert!(runtime.commissioner().await.is_none());
+}
+
+/// Retrying is `apply` with the same values — which only reconnects because the
+/// runtime compares against what is actually running, not against the request.
+#[tokio::test]
+async fn re_applying_after_a_failure_retries() {
+    let (url, connections) = mock_reconnectable_server(light_node_json()).await;
+    let runtime = test_runtime();
+
+    runtime.apply(true, "ws://matter-controller.invalid:5580/ws".into());
+    wait_for(&runtime, |s| matches!(s, MatterState::Unreachable { .. })).await;
+
+    runtime.apply(true, url.clone());
+    wait_for(&runtime, |s| *s == MatterState::Connected).await;
+    assert_eq!(*connections.lock().unwrap(), 1);
+}
+
+/// Shutdown must leave nothing running — an orphaned controller outlives the
+/// Pond, including under `systemctl stop`.
+#[tokio::test]
+async fn shutdown_clears_the_runtime() {
+    let (url, _connections) = mock_reconnectable_server(light_node_json()).await;
+    let runtime = test_runtime();
+
+    runtime.apply(true, url);
+    wait_for(&runtime, |s| *s == MatterState::Connected).await;
+
+    runtime.shutdown().await;
+
+    assert!(runtime.commissioner().await.is_none());
+}
+
+// ── Switchable device control ────────────────────────────────────────────────
+
+/// Records every verb it is asked for, including the optional ones, so the
+/// facade's forwarding can be asserted rather than assumed.
+#[derive(Default)]
+struct RecordingControl {
+    calls: Mutex<Vec<String>>,
+}
+
+impl RecordingControl {
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn ok(&self, call: String, device_id: &str) -> Result<DeviceControlOutcome> {
+        self.calls.lock().unwrap().push(call);
+        Ok(DeviceControlOutcome::new(
+            device_id,
+            DeviceStatePatch::default(),
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl DeviceControlPort for RecordingControl {
+    async fn set_power(&self, id: &str, on: bool) -> Result<DeviceControlOutcome> {
+        self.ok(format!("set_power({id},{on})"), id)
+    }
+    async fn set_brightness(&self, id: &str, pct: u8) -> Result<DeviceControlOutcome> {
+        self.ok(format!("set_brightness({id},{pct})"), id)
+    }
+    async fn set_target_temp(&self, id: &str, c: f32) -> Result<DeviceControlOutcome> {
+        self.ok(format!("set_target_temp({id},{c})"), id)
+    }
+    async fn set_locked(&self, id: &str, locked: bool) -> Result<DeviceControlOutcome> {
+        self.ok(format!("set_locked({id},{locked})"), id)
+    }
+    async fn set_color(&self, id: &str, hue: u16, sat: u8) -> Result<DeviceControlOutcome> {
+        self.ok(format!("set_color({id},{hue},{sat})"), id)
+    }
+    async fn set_fan_speed(&self, id: &str, pct: u8) -> Result<DeviceControlOutcome> {
+        self.ok(format!("set_fan_speed({id},{pct})"), id)
+    }
+    async fn set_position(&self, id: &str, pct: u8) -> Result<DeviceControlOutcome> {
+        self.ok(format!("set_position({id},{pct})"), id)
+    }
+}
+
+/// While Matter is off the facade is the logging stub — every verb, including
+/// the optional ones that would otherwise default to "unsupported".
+#[tokio::test]
+async fn control_falls_back_to_the_stub_while_matter_is_off() {
+    let runtime = test_runtime();
+    let stub = Arc::new(RecordingControl::default());
+    let control = runtime.device_control(stub.clone() as Arc<dyn DeviceControlPort>);
+
+    control.set_power("matter-2", true).await.unwrap();
+    control.set_brightness("matter-2", 40).await.unwrap();
+    control.set_target_temp("thermo", 21.5).await.unwrap();
+    control.set_locked("front-door", true).await.unwrap();
+    control.set_color("matter-2", 120, 80).await.unwrap();
+    control.set_fan_speed("fan-1", 50).await.unwrap();
+    control.set_position("blind-1", 30).await.unwrap();
+
+    assert_eq!(
+        stub.calls(),
+        vec![
+            "set_power(matter-2,true)",
+            "set_brightness(matter-2,40)",
+            "set_target_temp(thermo,21.5)",
+            "set_locked(front-door,true)",
+            "set_color(matter-2,120,80)",
+            "set_fan_speed(fan-1,50)",
+            "set_position(blind-1,30)",
+        ]
+    );
+}
+
+/// Once connected the same facade drives the fabric — without the agent, MCP
+/// server, or tool wiring being rebuilt, since they all hold this one `Arc`.
+#[tokio::test]
+async fn control_switches_to_matter_once_connected() {
+    let (url, _connections) = mock_reconnectable_server(light_node_json()).await;
+    let runtime = test_runtime();
+    let stub = Arc::new(RecordingControl::default());
+    let control = runtime.device_control(stub.clone() as Arc<dyn DeviceControlPort>);
+
+    runtime.apply(true, url);
+    wait_for(&runtime, |s| *s == MatterState::Connected).await;
+    // The bridge's initial sync has to land before endpoints resolve.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    control.set_power("matter-2", true).await.unwrap();
+    assert!(
+        stub.calls().is_empty(),
+        "a connected runtime must not fall back to the stub"
+    );
+
+    // And back to the stub when Matter is turned off again.
+    runtime.apply(false, String::new());
+    wait_for(&runtime, |s| *s == MatterState::Disabled).await;
+    control.set_power("matter-2", false).await.unwrap();
+    assert_eq!(stub.calls(), vec!["set_power(matter-2,false)"]);
+}
+
+/// An install enabled before the Matter section existed could carry a blank
+/// address. It must say so, not surface an opaque URL-parse failure.
+#[tokio::test]
+async fn an_empty_controller_address_is_reported_plainly() {
+    let runtime = test_runtime();
+    runtime.apply(true, String::new());
+
+    let status = wait_for(&runtime, |s| matches!(s, MatterState::Unreachable { .. })).await;
+    let MatterState::Unreachable { error } = status.state else {
+        unreachable!()
+    };
+    assert!(error.contains("no Matter controller address"), "{error}");
 }
