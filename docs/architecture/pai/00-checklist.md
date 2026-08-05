@@ -19,19 +19,20 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 1 | GIAP needs to be **proactive**, not just reactive | [PAI-7](./07-proactive-intelligence.md) | DESIGNED |
 | 2 | Requires the ability of the model to **think** | [PAI-5](./05-reasoning-and-thinking.md) | DESIGNED |
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
-| 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **P1-P3, P5-P8 LANDED**; P4 all but the `SecurityPolicy` deny matrix |
+| 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **COMPLETE — P1-P8 LANDED** |
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2 LANDED**; P3-P6 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
-| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0 LANDED**; P1-P8 designed |
+| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0 LANDED, P1 partial**; P2-P8 designed |
 
 They are equally weighted and mutually interdependent. `DESIGNED` means the document exists and its
 current-state claims were verified against code; it does **not** mean any code has changed. `LANDED`
 is stamped per phase, and means the gates in 2.3 were run and passed.
 
-Implementation has begun: PAI-3 P1/P2, PAI-1 P1-P3 and P5-P8, and PAI-2 P0. PAI-1 P4 has its write
-side, its guest gate and a race-free identity write; what remains of it is the `SecurityPolicy` deny
-matrix, which is shared with PAI-2 P1. Everything else is still design only.
+**PAI-1 is COMPLETE** as of 2026-08-05: P1-P8 all landed, including P4's policy layer and the
+repair of P5, which was recorded as landed while being inert on every default install. PAI-3 P1/P2
+and PAI-2 P0 are landed, and PAI-2 P1 has its mode and its first production call site. Everything
+else is still design only.
 
 ---
 
@@ -652,3 +653,44 @@ be version-incompatible (need ORT 1.24.2)`. macOS-side ORT version, unrelated to
 present on every run (it is a 30s timeout, so it is load-dependent). The other WARN,
 `auto_download` skipping `llamafile/mock`, is the live check's own onboarding write and was already
 recorded on 2026-08-04.
+
+**2026-08-05 — PAI-1 COMPLETE. P4 landed; P5 was found inert and repaired.**
+
+Two things I would want the next person to take from this rather than the code.
+
+**A phase can be stamped LANDED and be inert.** P5's tool-group denial sat inside
+`resolve_session_tool_groups`, reachable only from the `tool_selection_is_relevant()` branch, while
+`default_tool_selection_mode()` returns `"all"`. Every test exercised the branch the feature lives
+in, which is the natural thing to test and the reason nobody noticed that the default configuration
+never enters it. For a day, a `Guest` on any default pond kept `giap-memory` and could read or
+`forget_memory` the whole household. Add to 2.2: **verify a phase against the DEFAULT configuration,
+not only against the code path it added.** "I tested the feature" and "the feature is reachable" are
+different claims, and the second is the one that matters.
+
+**The specified deny matrix would have been theatre, and building it would have felt like progress.**
+Eight scopes x three `PrincipalKind`s is twenty-four cells and every one has to be `allow` — each
+kind genuinely needs each scope, and denying `Internal` breaks background work silently. Keying on
+`PrincipalKind` cannot express the thing that actually discriminates, which is whether a caller has
+*proved* the identity it claims. So P4 landed one rule that means something —
+`is_identity_assertion_proven` — against the live hole recon turned up: `PUT /sessions/{id}/user`
+took a `profile_id` from the request body and bound it at `Explicit` strength with **no ownership
+check at all**, after which every turn resolved to that member's scope. Any paired device could be
+any member. Worth generalising: **when a specified design produces a uniform answer in every cell,
+the axis is wrong, not the rules.**
+
+`allowed` and `denied_reason` are deliberately separate on `PolicyDecision`. In `audit` a refusal
+still proceeds, so recording only the effect would log "permitted" for exactly the requests
+`enforce` would block, and the audit trail could not answer what flipping the mode would break.
+`verdict()` reports `allow` / `would_deny` / `deny`. This is the same failure family as the three
+false readings the live harness produced earlier today, and it is now four for this session.
+
+**What PAI-1 completing does NOT mean.** `enforce` refuses every remote explicit identification,
+because nothing can prove an identity — no schema links a paired device to a member, and that is its
+own phase (Jerry's call, recorded above). The mode ships as `audit` for exactly that reason. Also
+still open and unchanged: the `giap-memory` MCP tools pass `ProfileScope::Household` directly, so an
+*Owner's* tool calls remain unscoped; the guest gate covers a visitor, not one member reading
+another's through a tool call. Closing it still needs a per-turn cell in the MCP server.
+
+Gates: `pond-core` 751, `pond-api` 109 lib + 39 in `agent_data_integration_test`, `pond-infra` 188,
+`pond-adapters-goose` 103 lib with all test targets building again, fmt clean, and
+`scripts/live-test.sh --ui` green end to end.
