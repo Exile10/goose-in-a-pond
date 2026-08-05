@@ -3,6 +3,7 @@ import { Button, Separator } from "@heroui/react";
 import {
   Monitor, Cpu, Activity, Power, Settings, Plus, X, Radio, Smartphone,
   Lightbulb, Lock, Thermometer, Fan, Blinds,
+  PlugZap, WashingMachine, Waves, Wind, MonitorPlay, Bot, BellRing,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import type { Device } from "../api/types";
@@ -28,13 +29,26 @@ function DeviceIcon({ kind }: { kind: string | undefined }) {
   if (kind === "thermostat") return <Thermometer size={22} />;
   if (kind === "fan")        return <Fan size={22} />;
   if (kind === "covering")   return <Blinds size={22} />;
+  // Types the node states for itself via its Matter Descriptor. Without these a
+  // dishwasher arrives wearing a lightbulb, because On/Off is all a cluster can
+  // say about it.
+  if (kind === "plug")       return <PlugZap size={22} />;
+  if (kind === "appliance")  return <WashingMachine size={22} />;
+  if (kind === "pump")       return <Waves size={22} />;
+  if (kind === "air")        return <Wind size={22} />;
+  if (kind === "media")      return <MonitorPlay size={22} />;
+  if (kind === "vacuum")     return <Bot size={22} />;
+  if (kind === "alarm")      return <BellRing size={22} />;
   return <Monitor size={22} />;
 }
 
 function iconClass(kind: string | undefined, isOnline: boolean): string {
   if (!isOnline) return "device-card__icon";
   if (kind === "host")   return "device-card__icon device-card__icon--host";
-  if (kind === "sensor") return "device-card__icon device-card__icon--sensor";
+  // An alarm reads as a sensor: it is a thing that reports, not one you drive.
+  if (kind === "sensor" || kind === "alarm") {
+    return "device-card__icon device-card__icon--sensor";
+  }
   return "device-card__icon device-card__icon--edge";
 }
 

@@ -366,6 +366,57 @@ async fn a_light_still_goes_through_on_off() {
     assert_eq!(frames[0]["args"]["command_name"], "On");
 }
 
+/// A sensor is knowable the moment it joins, not whenever it next changes.
+///
+/// `start_listening` hands over every current attribute, but readings used to
+/// come only from later `attribute_updated` events — so a freshly commissioned
+/// sensor sitting at a steady value was in the device list while every question
+/// about its reading answered "none recorded", which reads as "no such device".
+#[tokio::test]
+async fn a_sensor_reports_its_current_value_as_soon_as_it_is_synced() {
+    // Built by hand rather than with `start_adapter`: the subscription has to
+    // exist before the initial sync, which is the moment under test.
+    let (url, _received) = mock_matter_server(
+        json!([{
+            "node_id": 12,
+            "available": true,
+            "attributes": { "1/1026/0": 2150 }   // Temperature, 21.50 C
+        }]),
+        vec![],
+    )
+    .await;
+    let (client, events) = MatterClient::connect(&url).await.unwrap();
+    let cache: NodeCache = Arc::new(RwLock::new(HashMap::new()));
+    let registry = Arc::new(InMemoryRegistry::default());
+    let bus = Arc::new(InProcessEventBus::new());
+
+    use futures::StreamExt as _;
+    let mut stream = bus.subscribe();
+
+    tokio::spawn(run_matter_bridge(
+        client,
+        events,
+        cache,
+        registry as Arc<dyn DeviceRegistry + Send + Sync>,
+        bus.clone() as Arc<dyn EventBus>,
+    ));
+
+    let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("a reading within the deadline — no attribute_updated was ever pushed")
+        .expect("bus open");
+    let BusEvent::Sensor(reading) = &event else {
+        panic!("expected a sensor reading, got {event:?}");
+    };
+    assert_eq!(reading.device_id, "matter-12");
+    assert_eq!(reading.sensor_type, "temperature");
+    assert!(
+        (reading.value - 21.5).abs() < f64::EPSILON,
+        "{}",
+        reading.value
+    );
+}
+
 /// #195 acceptance: a Matter occupancy update becomes a bus sensor event that
 /// a #92 automation rule matches — the full sensor → rule chain with zero
 /// physical hardware.
