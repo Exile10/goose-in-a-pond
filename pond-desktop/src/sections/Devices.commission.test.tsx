@@ -141,6 +141,32 @@ describe("Matter section — turning the fabric on", () => {
     expect((await screen.findByTestId("matter-state")).textContent).toBe("Starting…");
   });
 
+  it("carries the controller address as a value, not just a placeholder", async () => {
+    render(<Devices />);
+    const input = (await screen.findByLabelText("Controller address")) as HTMLInputElement;
+
+    // The placeholder is the same string as the default address, so anything
+    // that asserts on displayed text passes even when nothing is set. The value
+    // is the only thing separating "configured" from "blank".
+    await waitFor(() => expect(input.value).toBe("ws://127.0.0.1:5580/ws"));
+    expect(input.placeholder).toBe(input.value);
+  });
+
+  it("leaves the field visibly empty when the runtime reports no address", async () => {
+    mocked(api.getMatterStatus).mockResolvedValue({
+      enabled: false,
+      url: "",
+      state: "disabled",
+    });
+    render(<Devices />);
+    const input = (await screen.findByLabelText("Controller address")) as HTMLInputElement;
+
+    // Supplying the default is the server's job (an empty stored value resolves
+    // to it there). The UI must not paper over a genuinely empty address, or
+    // the user is back to a filled-looking field that fails to save.
+    await waitFor(() => expect(input.value).toBe(""));
+  });
+
   it("saves the toggle and re-reads what actually happened", async () => {
     mocked(api.getMatterStatus).mockResolvedValue(matterStatus("disabled"));
     render(<Devices />);
