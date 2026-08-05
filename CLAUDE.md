@@ -195,6 +195,12 @@ Both scripts run on macOS and Linux. On a Mac:
   there is no system-wide `PLAYWRIGHT_BROWSERS_PATH` unless you set one.
 - `pkill -f pond-server` matches your own shell's command line on macOS more eagerly
   than on Linux. The script tracks PIDs instead; do the same by hand.
+- **Check nothing else is already on port 4000 before a live run**:
+  `lsof -nP -iTCP:4000-4009 -sTCP:LISTEN`. A `serve --native` left running has no
+  `POND_DATA_DIR`, so it is on the *real* data directory. `live-test.sh` now reads
+  `.runtime_api_port`, fails hard when it is absent, and refuses to drive a listener
+  whose pid it did not start — it previously assumed 4000 and wrote `user_name=LiveTest`
+  and `chat_model=mock` into a real pond.
 
 ### Single-executable / Jetson build
 `pond-server` embeds `pond-desktop/dist` at compile time (`crates/pond-api/build.rs` + `routes.rs` via `include_dir`), so a release build is a **single self-contained executable** (build the UI first, or you get the `build.rs` placeholder). Build scripts:
