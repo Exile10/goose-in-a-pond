@@ -2777,6 +2777,43 @@ impl GooseAdapter {
             allowed_tools
         };
 
+        // ── 6d. PAI-1 P5, enforced in BOTH selection modes ───────────────────
+        //
+        // The group-level subtraction lives inside `resolve_session_tool_groups`,
+        // which is only reached from the `tool_selection_is_relevant()` branch
+        // above. `default_tool_selection_mode()` is "all", so on a DEFAULT
+        // install that branch never runs and this set went to the model
+        // untouched -- a Guest kept `giap-memory` and could recall, search or
+        // `forget_memory` the entire household. P5 was recorded as landed while
+        // being inert on every default pond.
+        //
+        // This set is what gets published to the shim, so it is the only place
+        // every mode converges. Subtracting here is idempotent with the
+        // group-level pass, which stays because it also keeps withheld groups
+        // out of the dormant-groups note.
+        let allowed_tools = if turn_scope.excludes_everything() {
+            let before = allowed_tools.len();
+            let kept: HashSet<String> =
+                pond_core::mcp::services::tool_selection::subtract_guest_denied_tools(
+                    allowed_tools.iter(),
+                )
+                .into_iter()
+                .collect();
+            if kept.len() != before {
+                tracing::info!(
+                    target: "giap::trace",
+                    kind = "guest_tools_withheld",
+                    session_id = %session_id,
+                    removed = before - kept.len(),
+                    kept = kept.len(),
+                    "unidentified speaker: personal-data tools withheld from the turn"
+                );
+            }
+            kept
+        } else {
+            allowed_tools
+        };
+
         tracing::debug!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
 
         // Publish the allow-set to this SESSION's shim controls — anything Goose
