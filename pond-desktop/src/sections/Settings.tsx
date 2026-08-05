@@ -586,12 +586,39 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
   const [addKind, setAddKind]       = useState<"stdio" | "sse">("stdio");
   const [addCmd, setAddCmd]         = useState("");
   const [adding, setAdding]         = useState(false);
+  // API keys live in the secret store, which returns key NAMES only -- there is
+  // no way to read a value back, by design. So the row shows whether a key is
+  // configured, accepts a replacement, and can clear it. It never renders one.
+  const [secretKeys, setSecretKeys]   = useState<string[]>([]);
+  const [secretDraft, setSecretDraft] = useState<Record<string, string>>({});
+  const [secretBusy, setSecretBusy]   = useState<string | null>(null);
+
+  function loadSecrets() {
+    api.listSecretKeys().then(setSecretKeys).catch(() => setSecretKeys([]));
+  }
+
+  async function saveSecret(key: string) {
+    const value = (secretDraft[key] ?? "").trim();
+    if (!value) return;
+    setSecretBusy(key);
+    try {
+      await api.setSecret(key, value);
+      setSecretDraft((d) => ({ ...d, [key]: "" }));
+      loadSecrets();
+    } catch (e) { setError(String(e)); } finally { setSecretBusy(null); }
+  }
+
+  async function clearSecret(key: string) {
+    setSecretBusy(key);
+    try { await api.deleteSecret(key); loadSecrets(); }
+    catch (e) { setError(String(e)); } finally { setSecretBusy(null); }
+  }
 
   function load() {
     setLoading(true);
     api.listExtensions().then((r) => setExtensions(r.extensions)).catch((e) => setError(String(e))).finally(() => setLoading(false));
   }
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); loadSecrets(); }, []);
 
   async function toggle(name: string, enabled: boolean) {
     try { await api.toggleExtension(name, enabled); setExtensions((prev) => prev.map((e) => e.name === name ? { ...e, enabled } : e)); } catch (e) { setError(String(e)); }
@@ -620,11 +647,14 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
     ["Sensors","Read stored IoT sensor data: latest reading, history, and list sensors","ext_sensor_enabled"],
   ] as const;
 
+  // The second element is the SECRET-STORE key name, not a Settings field: the
+  // SCREAMING_SNAKE env-var spelling the repository already uses
+  // (BRAVE_API_KEY, SPOTIFY_ACCESS_TOKEN) and which secret_migration writes.
   const API_KEYS = [
-    ["Guardian (news)","api_key_guardian","Enables the Guardian news source for the News tools"],
-    ["GNews","api_key_gnews","Enables GNews headline search for the News tools"],
-    ["Finnhub (stocks)","api_key_finnhub","Enables stock quotes in the Finance tools"],
-    ["CoinGecko (crypto)","api_key_coingecko","Enables crypto prices in the Finance tools"],
+    ["Guardian (news)","GUARDIAN_API_KEY","Enables the Guardian news source for the News tools"],
+    ["GNews","GNEWS_API_KEY","Enables GNews headline search for the News tools"],
+    ["Finnhub (stocks)","FINNHUB_API_KEY","Enables stock quotes in the Finance tools"],
+    ["CoinGecko (crypto)","COINGECKO_API_KEY","Enables crypto prices in the Finance tools"],
   ] as const;
 
   return (
@@ -656,11 +686,30 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
         </Row>
       </Section>
       <Section title="API Keys / Integrations">
-        {API_KEYS.map(([label, key, hint]) => (
-          <Row key={key} label={label} hint={hint}>
-            <input type="password" autoComplete="off" className="native-input" value={String((s as Record<string, unknown>)[key] ?? "")} onChange={(e) => patch(key as keyof SettingsType, e.target.value === "" ? null : e.target.value)} placeholder="Paste key" />
-          </Row>
-        ))}
+        {API_KEYS.map(([label, key, hint]) => {
+          const configured = secretKeys.includes(key);
+          const draft = secretDraft[key] ?? "";
+          return (
+            <Row key={key} label={label} hint={hint}>
+              <div className="settings-inline-row">
+                <span className="muted-12">{configured ? "Configured" : "Not set"}</span>
+                <input
+                  type="password"
+                  autoComplete="off"
+                  className="native-input"
+                  aria-label={`${label} API key`}
+                  value={draft}
+                  onChange={(e) => setSecretDraft((d) => ({ ...d, [key]: e.target.value }))}
+                  placeholder={configured ? "Paste a new key to replace" : "Paste key"}
+                />
+                <Button variant="outline" isDisabled={secretBusy === key || !draft.trim()} onPress={() => saveSecret(key)}>Save</Button>
+                {configured && (
+                  <Button variant="outline" aria-label={`Clear ${label} API key`} isDisabled={secretBusy === key} onPress={() => clearSecret(key)}><Trash2 size={14} /></Button>
+                )}
+              </div>
+            </Row>
+          );
+        })}
         <Row label="SearXNG URL" hint="Self-hosted SearXNG instance for private web search (Discovery tools)">
           <input className="native-input" value={s.searxng_url ?? ""} onChange={(e) => patch("searxng_url", e.target.value === "" ? null : e.target.value)} placeholder="http://localhost:8888" />
         </Row>

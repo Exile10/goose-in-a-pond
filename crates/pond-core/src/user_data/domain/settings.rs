@@ -677,26 +677,33 @@ pub struct Settings {
     #[serde(default = "Settings::default_tool_request_detection")]
     pub tool_request_detection: bool,
 
-    // ── API keys ─────────────────────────────────────────────────────────
-    // Optional API keys for external data services. Tools degrade gracefully
-    // (fewer sources, rate-limited fallbacks) when keys are absent.
-    /// The Guardian Open Platform API key.
-    #[serde(default)]
-    pub api_key_guardian: Option<String>,
-
-    /// GNews API key.
-    #[serde(default)]
-    pub api_key_gnews: Option<String>,
-
-    /// Finnhub stock/market data API key.
-    #[serde(default)]
-    pub api_key_finnhub: Option<String>,
-
-    /// CoinGecko crypto API key (optional — demo tier works without one).
-    #[serde(default)]
-    pub api_key_coingecko: Option<String>,
-
+    // ── API keys: NOT HERE, deliberately (PAI-2 P2) ──────────────────────
+    //
+    // `api_key_guardian`, `api_key_gnews`, `api_key_finnhub` and
+    // `api_key_coingecko` used to live on this struct. `GET /api/v1/settings`
+    // does `serde_json::to_value(settings)`, so every configured key was in the
+    // response body, and at the time this moved `PUT /settings` was on
+    // `PUBLIC_ROUTES` for onboarding, so a caller with no token could write one
+    // and (before PAI-2 P0) read it straight back. Even once that write path is
+    // closed, a credential on this struct is a credential in a REST response
+    // body and a plaintext row in `pond_system.db`.
+    //
+    // Credential material now lives in `SecretRepository`
+    // (`pond-core/src/security/ports/secret.rs`), which returns key NAMES and
+    // existence only, behind the protected `/api/v1/secrets` routes. The secret
+    // names are `GUARDIAN_API_KEY`, `GNEWS_API_KEY`, `FINNHUB_API_KEY` and
+    // `COINGECKO_API_KEY`; `pond_infra::secret_migration` moves whatever an
+    // existing pond had in its settings table across on first start.
+    //
+    // `no_settings_field_is_secret_shaped` fails the build if anyone adds one
+    // back. Do not silence it with `skip_serializing_if` —
+    // `every_declared_settings_field_is_serialized` fails on that too.
     /// Self-hosted SearXNG instance URL for web/news search.
+    ///
+    /// Stays on `Settings`: it is an endpoint the user needs to see and edit,
+    /// not a credential. If a deployment ever needs `user:pass@host` in this
+    /// URL it belongs in the secret store instead, and this comment is where
+    /// that decision gets revisited.
     #[serde(default)]
     pub searxng_url: Option<String>,
 
@@ -855,10 +862,6 @@ impl Default for Settings {
             multi_tool_enabled: false,
             tool_call_validation: Self::default_tool_call_validation(),
             tool_request_detection: Self::default_tool_request_detection(),
-            api_key_guardian: None,
-            api_key_gnews: None,
-            api_key_finnhub: None,
-            api_key_coingecko: None,
             searxng_url: None,
             ext_memory_enabled: true,
             ext_schedule_enabled: true,
@@ -1485,13 +1488,25 @@ mod tests {
     }
 
     #[test]
-    fn new_api_key_fields_default_to_none() {
+    fn searxng_url_defaults_to_none() {
         let s: Settings = serde_json::from_str("{}").unwrap();
-        assert!(s.api_key_guardian.is_none());
-        assert!(s.api_key_gnews.is_none());
-        assert!(s.api_key_finnhub.is_none());
-        assert!(s.api_key_coingecko.is_none());
         assert!(s.searxng_url.is_none());
+    }
+
+    /// An old client (or a stale phone build) still sends `api_key_guardian`.
+    /// That must be ignored, not rejected: the field is gone, and a 422 here
+    /// would break every settings save from a client that has not been updated.
+    #[test]
+    fn a_legacy_api_key_field_is_ignored_not_fatal() {
+        let json = r#"{"api_key_guardian": "legacy-key", "searxng_url": "http://localhost:8888"}"#;
+        let s: Settings =
+            serde_json::from_str(json).expect("unknown fields must not fail the save");
+        assert_eq!(s.searxng_url, Some("http://localhost:8888".to_string()));
+        let round_tripped = serde_json::to_value(&s).unwrap();
+        assert!(
+            round_tripped.get("api_key_guardian").is_none(),
+            "a legacy key must not survive a deserialize/serialize round trip"
+        );
     }
 
     #[test]
@@ -1500,19 +1515,6 @@ mod tests {
         assert!(s.ext_news_enabled);
         assert!(s.ext_finance_enabled);
         assert!(s.ext_discovery_enabled);
-    }
-
-    #[test]
-    fn api_keys_deserialize_when_present() {
-        let json =
-            r#"{"api_key_guardian": "test-guardian-key", "searxng_url": "http://localhost:8888"}"#;
-        let s: Settings = serde_json::from_str(json).unwrap();
-        assert_eq!(s.api_key_guardian, Some("test-guardian-key".to_string()));
-        assert_eq!(s.searxng_url, Some("http://localhost:8888".to_string()));
-        // Others still None
-        assert!(s.api_key_gnews.is_none());
-        assert!(s.api_key_finnhub.is_none());
-        assert!(s.api_key_coingecko.is_none());
     }
 
     #[test]
@@ -1562,8 +1564,8 @@ mod tests {
         // Other new toggles keep their defaults
         assert!(s.ext_finance_enabled);
         assert!(s.ext_discovery_enabled);
-        // API keys still None
-        assert!(s.api_key_guardian.is_none());
+        // searxng_url still None
+        assert!(s.searxng_url.is_none());
     }
 
     /// #105: voice requests get the tighter turn cap; text keeps the full budget.
@@ -1651,6 +1653,170 @@ mod tests {
         assert_eq!(s.effective_max_turns(true), s.agent_max_turns);
     }
 
+    /// The source of this file, so the structural guards below can compare what
+    /// is DECLARED against what is SERIALIZED. `include_str!` resolves relative
+    /// to this file, so this is this file. It is textual inclusion into a string
+    /// literal, so there is no module recursion.
+    const SETTINGS_SOURCE: &str = include_str!("settings.rs");
+
+    /// Words that mark a field name as carrying credential material.
+    ///
+    /// Matched against `_`-separated SEGMENTS, not as a suffix. The shape that
+    /// actually leaked was `api_key_guardian`, which ends in neither `_key` nor
+    /// `_token`; a suffix test would have missed all four.
+    const SECRET_WORDS: &[&str] = &[
+        "key",
+        "keys",
+        "token",
+        "tokens",
+        "secret",
+        "secrets",
+        "password",
+        "passwords",
+        "credential",
+        "credentials",
+        "apikey",
+        "passphrase",
+    ];
+
+    fn is_secret_shaped(field: &str) -> bool {
+        field.split('_').any(|seg| SECRET_WORDS.contains(&seg))
+    }
+
+    /// Serialized keys whose NAME is secret-shaped but whose VALUE is not
+    /// credential material. Every entry is a deliberate exemption and should be
+    /// argued in review; the list is meant to stay very short.
+    const NOT_ACTUALLY_SECRET: &[&str] = &[
+        // A token BUDGET (a `u32`), not a bearer token.
+        "llm_max_tokens",
+    ];
+
+    /// PAI-2 P2, section 3.2 item 2.
+    ///
+    /// `GET /api/v1/settings` serialises this whole struct, so a secret-shaped
+    /// field on `Settings` is a secret in a REST response body. Four
+    /// `api_key_*` fields were exactly that. This test is what stops the next
+    /// person adding a fifth.
+    #[test]
+    fn no_settings_field_is_secret_shaped() {
+        // Positive control FIRST: prove the detector detects. A guard whose
+        // predicate silently matches nothing passes for the wrong reason, and
+        // this programme has four recorded instances of exactly that.
+        assert!(
+            is_secret_shaped("api_key_guardian"),
+            "the detector must flag the shape that actually leaked"
+        );
+        assert!(is_secret_shaped("gmail_refresh_token"));
+        assert!(is_secret_shaped("db_password"));
+        assert!(is_secret_shaped("client_secret"));
+        assert!(!is_secret_shaped("home_name"));
+        assert!(!is_secret_shaped("voice_wake_word"));
+        assert!(!is_secret_shaped("searxng_url"));
+
+        let value = serde_json::to_value(Settings::default()).expect("serialize Settings");
+        let keys: Vec<String> = value
+            .as_object()
+            .expect("Settings serializes to a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+
+        // No stale exemptions, and no useless ones.
+        for exempt in NOT_ACTUALLY_SECRET {
+            assert!(
+                keys.iter().any(|k| k == exempt),
+                "exempt field `{exempt}` is not a real Settings field (stale entry — remove it)"
+            );
+            assert!(
+                is_secret_shaped(exempt),
+                "field `{exempt}` is not secret-shaped, so exempting it is noise — remove it"
+            );
+        }
+
+        let offenders: Vec<&String> = keys
+            .iter()
+            .filter(|k| is_secret_shaped(k) && !NOT_ACTUALLY_SECRET.contains(&k.as_str()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "secret-shaped Settings field(s) {offenders:?}. GET /api/v1/settings serialises this \
+             struct wholesale, so the value would be returned in a REST response body, and it \
+             would sit in plaintext in pond_system.db. Put credential material in \
+             SecretRepository (security/ports/secret.rs) and expose it through /api/v1/secrets, \
+             which returns key names only. If the value is genuinely not a credential, add it to \
+             NOT_ACTUALLY_SECRET with a reason."
+        );
+    }
+
+    /// Field names declared on `pub struct Settings`, parsed from source.
+    fn declared_field_names() -> Vec<String> {
+        let start = SETTINGS_SOURCE.find("pub struct Settings {").expect(
+            "could not find `pub struct Settings {` — this parser is broken, not the struct",
+        );
+        let body = &SETTINGS_SOURCE[start..];
+        let end = body
+            .find("\n}")
+            .expect("could not find the end of the Settings struct");
+        body[..end]
+            .lines()
+            .filter_map(|line| {
+                let name = line.trim().strip_prefix("pub ")?.split(':').next()?.trim();
+                (!name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                .then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    /// Closes the hole in every other guard in this file.
+    ///
+    /// `no_settings_field_is_secret_shaped` and
+    /// `every_settings_field_is_dispositioned` both enumerate the SERIALIZED
+    /// keys of `Settings::default()`. A field carrying
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` is absent from that
+    /// enumeration whenever it is `None` — which is exactly what
+    /// `Settings::default()` is. So a future `api_key_*` field with that
+    /// attribute would pass both guards and still be serialised, in plaintext,
+    /// the moment a user configured it. Comparing declarations against
+    /// serialized keys is what makes the other two mean what they say.
+    #[test]
+    fn every_declared_settings_field_is_serialized() {
+        let declared = declared_field_names();
+        // The parser must not silently match nothing.
+        assert!(
+            declared.len() > 90,
+            "source parse found only {} fields — the parser is broken",
+            declared.len()
+        );
+
+        let value = serde_json::to_value(Settings::default()).expect("serialize Settings");
+        let serialized: std::collections::BTreeSet<String> = value
+            .as_object()
+            .expect("Settings serializes to a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+
+        let missing: Vec<&String> = declared
+            .iter()
+            .filter(|d| !serialized.contains(*d))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "declared but not serialized {missing:?}. A `skip_serializing`, `skip_serializing_if` \
+             or `rename` on one of these hides it from no_settings_field_is_secret_shaped and \
+             from every_settings_field_is_dispositioned, which are the only things standing \
+             between a new credential field and GET /api/v1/settings."
+        );
+        assert_eq!(
+            declared.len(),
+            serialized.len(),
+            "serialized keys {serialized:?} do not match declared fields {declared:?}"
+        );
+    }
+
     /// Completeness / disposition guard (Phase 4 — "Consistent").
     ///
     /// Every field serialized from `Settings` MUST be classified as either
@@ -1706,10 +1872,6 @@ mod tests {
             "agent_memory_inject",
             "agent_memory_limit",
             "agent_timeout_secs",
-            "api_key_coingecko",
-            "api_key_finnhub",
-            "api_key_gnews",
-            "api_key_guardian",
             "assistant_name",
             "assistant_personality",
             "cameras_enabled",

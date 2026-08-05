@@ -177,8 +177,10 @@ impl McpToolDispatcher {
             recipe_repo,
         );
         let device_control_server = DeviceControlMcpServer::new(device_control, device_registry);
-        let news_server = NewsMcpServer::new(http_client.clone(), settings_repo.clone());
-        let finance_server = FinanceMcpServer::new(http_client.clone(), settings_repo.clone());
+        // News and finance take no settings repo: their API keys live in the
+        // secret store (PAI-2 P2), read through `crate::secrets`.
+        let news_server = NewsMcpServer::new(http_client.clone());
+        let finance_server = FinanceMcpServer::new(http_client.clone());
         let discovery_server = DiscoveryMcpServer::new(http_client, settings_repo);
         let draft_server = DraftMcpServer::new(draft_repo);
 
@@ -766,11 +768,11 @@ mod tests {
             ),
             (
                 "giap-news__",
-                Box::new(NewsMcpServer::new(http_client.clone(), settings.clone())),
+                Box::new(NewsMcpServer::new(http_client.clone())),
             ),
             (
                 "giap-finance__",
-                Box::new(FinanceMcpServer::new(http_client.clone(), settings.clone())),
+                Box::new(FinanceMcpServer::new(http_client.clone())),
             ),
             (
                 "giap-discovery__",

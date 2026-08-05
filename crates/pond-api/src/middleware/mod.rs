@@ -527,6 +527,11 @@ mod tests {
     fn the_pai2_p0_leaks_are_closed() {
         // GET /settings serialises the whole Settings struct -- it returned
         // api_key_gnews and api_key_finnhub in plaintext, with no token.
+        // Those fields no longer exist: PAI-2 P2 moved every credential to the
+        // SecretRepository, so grepping for them here finds only this note.
+        // The route stays protected regardless -- the struct still carries
+        // personal configuration, and P0's defect was the allowlist, not the
+        // payload.
         assert!(!is_public_route(&Method::GET, "/api/v1/settings"));
         // ...while the PUT that onboarding needs stays open. This pairing is
         // the entire point of the change: same path, different answer.

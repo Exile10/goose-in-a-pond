@@ -394,7 +394,38 @@ onboarding is complete. `middleware/onboarding_guard.rs` already knows that stat
   still serialized into the body. That is P2, and it is untouched.**
 - **P1** `security_policy_mode` with `audit` default; the scope × principal matrix; first production
   `allow`/`audit` call sites (shared with PAI-1 P4).
-- **P2** Secret migration off `Settings`; the `*_key|*_token|*_secret` guard test; module rename.
+- **P2 — LANDED 2026-08-05.** The four `api_key_*` fields are off `Settings` entirely and live in
+  `SecretRepository`, which P4 had already encrypted the hour before — so the migrated values landed
+  as ciphertext and never sat in plaintext in between. That ordering was not luck: P4 and P2 both
+  wanted `keyring_secret_repository.rs`, and P2 rewriting it wholesale would have silently removed
+  the encryption AND destroyed every stored secret while compiling with every test green. P4 owned
+  the file's body; P2 only renamed it to `file_secret_repository.rs`.
+
+  `secret_migration::migrate_api_keys_to_secret_repository` copies a configured key into the secret
+  store, proves the write landed, and only then clears the settings row — key-first, never
+  delete-first, so an interruption strands nothing. It uses `list_keys()` rather than `has()` as the
+  already-migrated predicate, because `has()` consults environment variables and would report a
+  same-named env var as "already stored", deleting the settings row without ever copying the value.
+  `api_key_coingecko` has no reader anywhere in the codebase, and its value is migrated anyway: a
+  configured key that vanishes on upgrade is worse than a dead field.
+
+  **The durable part is `no_settings_field_is_secret_shaped`**, which fails the build when anyone
+  adds a `*_key`/`*_token`/`*_secret` field to `Settings`, with an error naming the field and
+  pointing at `SecretRepository`. Mutation-tested rather than assumed: adding
+  `api_key_mutation_probe` fails it by name. An escape hatch, `NOT_ACTUALLY_SECRET`, takes a reason
+  — so a false positive is a one-line documented exemption rather than a motive to delete the guard.
+
+  **This does not close the write half.** `PUT /settings` is still public and unauthenticated, so a
+  LAN caller can still write settings on an already-onboarded pond. That is P7's job, and it is the
+  reason P7 lands last. P0 closed the read; P2 removed the credentials from what the read returns;
+  neither touches the write.
+
+  Landed by hand after the implementing agent was killed mid-phase by an account spend limit. Its
+  work compiled and was substantially complete; I ran the gates it never reached, mutation-tested
+  its guard, reverted six regenerated Playwright screenshots it had picked up incidentally, and
+  stamped this entry. Gates: fmt clean, pond-core 753, pond-infra 205, pond-mcp-server 177,
+  pond-api 109 lib + 5 settings integration.
+- **P3** `Redactor` port + rule-based adapter; the three chokepoints; per-rule tests with real-shaped
 - **P3** `Redactor` port + rule-based adapter; the three chokepoints; per-rule tests with real-shaped
   false-positive cases (a UK postcode inside a normal sentence must not be mangled).
 - **P4 LANDED 2026-08-05** Keyfile encryption for secrets and connector tokens. XChaCha20-Poly1305

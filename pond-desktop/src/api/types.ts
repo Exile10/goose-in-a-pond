@@ -194,11 +194,9 @@ export interface Settings {
   ext_vision_enabled?: boolean;
   ext_sensor_enabled?: boolean;
 
-  // API keys for keyed services
-  api_key_guardian?: string | null;
-  api_key_gnews?: string | null;
-  api_key_finnhub?: string | null;
-  api_key_coingecko?: string | null;
+  // API keys are NOT on Settings (PAI-2 P2). They live in the secret store and
+  // are managed through listSecretKeys / setSecret / deleteSecret; the server
+  // never returns a secret VALUE, only whether the key is set.
   searxng_url?: string | null;
 
   // Data retention
