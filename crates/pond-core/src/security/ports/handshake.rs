@@ -123,6 +123,21 @@ pub trait Handshake: Send + Sync {
     /// Validate an existing session token.
     async fn validate_token(&self, token: &str) -> Result<bool>;
 
+    /// The `client_id` a valid token was issued to, if this adapter can say.
+    ///
+    /// [`validate_token`](Self::validate_token) answers only yes or no, so a
+    /// caller that has authenticated a request still cannot name who made it —
+    /// which is why `Principal::token(..)` had nothing to populate it with and
+    /// no `Principal` was ever constructed in production.
+    ///
+    /// Defaulted to `Ok(None)` so adapters that cannot answer (and every
+    /// existing implementor) need no change: "I do not know" is a truthful
+    /// answer, and an audit entry saying `token:<unknown>` is better than one
+    /// naming a client id that was inferred.
+    async fn client_id_for_token(&self, _token: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Revoke a session token (disconnect a client).
     async fn revoke_token(&self, token: &str) -> Result<()>;
 

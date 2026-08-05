@@ -229,6 +229,25 @@ impl Handshake for SqliteHandshakeAdapter {
         ))
     }
 
+    /// Same predicate as [`validate_token`](Self::validate_token) — unexpired
+    /// and unrevoked — but returns the `client_id` rather than a bool, so an
+    /// authenticated request can name its caller. Deliberately does NOT touch
+    /// `last_seen_at`: this is a lookup about a request already validated, not
+    /// a second use of the token.
+    async fn client_id_for_token(&self, token: &str) -> Result<Option<String>> {
+        let token_hash = Self::sha256_hex(token.as_bytes());
+        let now = Self::now().to_rfc3339();
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT client_id FROM session_tokens
+             WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
+        )
+        .bind(&token_hash)
+        .bind(&now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(client_id,)| client_id))
+    }
+
     async fn validate_token(&self, token: &str) -> Result<bool> {
         let token_hash = Self::sha256_hex(token.as_bytes());
         let now = Self::now().to_rfc3339();

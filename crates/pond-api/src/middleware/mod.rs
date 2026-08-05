@@ -8,6 +8,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use pond_core::security::ports::policy::Principal;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -330,6 +331,8 @@ pub async fn auth_middleware(
             .map(|ci| ci.0.ip().is_loopback())
             .unwrap_or(false);
         if is_loopback {
+            let mut req = req;
+            req.extensions_mut().insert(Principal::loopback());
             return Ok(next.run(req).await);
         }
     }
@@ -346,6 +349,33 @@ pub async fn auth_middleware(
         return Err(AuthError::InvalidToken);
     }
 
+    // Name the caller for anything downstream that has to make an authorization
+    // decision. Until now `validate_token` answered only yes/no, so a handler
+    // could know a request was authenticated and still not know who sent it --
+    // which is why no `Principal` was ever constructed in production and
+    // `SecurityPolicy::allow` had no call site it could reason from.
+    //
+    // An adapter that cannot name the client returns None, and the principal
+    // says so rather than guessing. `proven_profile_id` stays None on every
+    // path here: nothing links a token to a household member yet, and inventing
+    // that link is the misattribution this whole workstream exists to prevent.
+    let client_id = state
+        .handshake
+        .client_id_for_token(&token)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "unknown".to_string());
+    let mut principal = Principal::token(client_id);
+    if let Some(ci) = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+    {
+        principal = principal.with_remote_addr(ci.0.to_string());
+    }
+
+    let mut req = req;
+    req.extensions_mut().insert(principal);
     Ok(next.run(req).await)
 }
 

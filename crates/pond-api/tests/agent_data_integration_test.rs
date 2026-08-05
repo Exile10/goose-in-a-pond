@@ -1420,3 +1420,82 @@ async fn profile_context_follows_the_identified_member_not_the_primary() {
     );
     assert_ne!(body["profile_id"], jerry);
 }
+
+// ── PAI-1 P4 / PAI-2 P1: the identity-assertion policy ──────────────────────
+
+/// The default is `audit`, and audit must never block. Every other test in this
+/// file binds a session without a token and would fail if it did.
+#[tokio::test]
+async fn identifying_a_session_is_permitted_in_the_default_audit_mode() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage
+        .create_session("sess-audit".to_string())
+        .await
+        .unwrap();
+    let profile_id = seed_profile(&app, "Liz").await;
+
+    let resp = app
+        .oneshot(put(
+            "/api/v1/sessions/sess-audit/user",
+            serde_json::json!({ "profile_id": profile_id }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "audit mode must record and proceed, never block"
+    );
+    assert_eq!(body_json(resp).await["bound"], true);
+}
+
+/// The gate actually bites. Without this the policy is a check nobody has ever
+/// seen fire, which is indistinguishable from one that cannot.
+///
+/// Nothing links a paired device to a member, so no remote caller can prove the
+/// identity it asserts -- which is exactly why the shipped default is `audit`
+/// and not this.
+#[tokio::test]
+async fn identifying_a_session_is_refused_in_enforce_mode() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage
+        .create_session("sess-enforce".to_string())
+        .await
+        .unwrap();
+    let profile_id = seed_profile(&app, "Liz").await;
+
+    let flip = app
+        .clone()
+        .oneshot(put(
+            "/api/v1/settings",
+            serde_json::json!({ "security_policy_mode": "enforce" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(flip.status(), StatusCode::OK, "could not flip the mode");
+
+    let resp = app
+        .oneshot(put(
+            "/api/v1/sessions/sess-enforce/user",
+            serde_json::json!({ "profile_id": profile_id }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "enforce mode must refuse an identity the caller cannot prove"
+    );
+
+    // And the refusal is real, not cosmetic: the session stayed unattributed.
+    let after = storage
+        .get_session_identity("sess-enforce")
+        .await
+        .expect("identity read failed");
+    assert_eq!(
+        after.profile_id, None,
+        "the binding was written despite the refusal"
+    );
+}
