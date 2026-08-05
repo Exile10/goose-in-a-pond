@@ -367,8 +367,41 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   production path could reach. Three tests now assert attribution end to end, including that a
   household turn stays unattributed so shared context survives a member's deletion.
 
-  Still outstanding for P4: the `SecurityPolicy::allow` / `::audit` deny matrix. Both
-  implementations return `Ok(true)` and have zero production call sites.
+  **P4 COMPLETE 2026-08-05.** `security_policy_mode` (`off | audit | enforce`, default `audit`),
+  `PolicyMode` / `PolicyDecision` in the port, and a first production call site.
+
+  **The deny matrix was not built as specified, deliberately.** Section 3.1 of PAI-2 asks for eight
+  scopes x three `PrincipalKind`s. Worked through cell by cell, all twenty-four are `allow`: every
+  kind legitimately needs every scope for something that exists in the code today, and denying
+  `Internal` anything breaks background work silently rather than returning an error to anybody. A
+  matrix of twenty-four allows is not a control, it is a table that looks like one. **The axis that
+  discriminates is whether a caller has *proved* the identity it claims** — `PrincipalKind` cannot
+  express that, which is why the matrix keyed on it comes out empty.
+
+  So the rule is `is_identity_assertion_proven`, and its call site is `PUT /sessions/{id}/user`,
+  which **took a `profile_id` from the request body and bound it at `Explicit` strength with no
+  ownership check at all**. Any paired device could declare itself any household member; every
+  subsequent turn then resolved to that member's scope and injected their memories. That is
+  cross-profile access laundered through the session row rather than through a query parameter, and
+  it is the honest first production call site 3.4 asks for. The memory reads were not: `Owner` is
+  constructed in exactly one place, `identity_resolution::resolve`, always from the session's own
+  binding — so a check there would have had nothing to deny.
+
+  **`allowed` and `denied_reason` are separate, and that is the load-bearing detail.** In `audit` a
+  refusal does not block, so `allowed` is `true` for exactly the requests `enforce` would have
+  stopped. An audit entry recording only the effect would read "permitted" for all of them and could
+  not answer the one question the mode exists to answer. `PolicyDecision::verdict()` reports
+  `allow` / `would_deny` / `deny`.
+
+  **Nothing can prove an identity yet**, so `enforce` currently refuses every remote explicit
+  identification. That is the correct reading, and it is why the default is `audit`: the missing
+  rung is the device-to-member link, which is its own phase.
+
+  `Principal` gains `proven_profile_id` (3.3) and is constructed in production for the first time,
+  in `auth_middleware`. That required `Handshake::client_id_for_token`, defaulted to `Ok(None)` so
+  no existing implementor changes — `validate_token` answers only yes/no, so a handler could know a
+  request was authenticated and still not know who sent it, which is why no `Principal` had ever
+  been built.
 
   **The identity write is now race-free.** `set_session_identity_if_stronger` does the rank
   comparison inside the `UPDATE`, building the `CASE` from `IdentificationSource::ALL_RANKED` so the
@@ -388,8 +421,28 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   the process-global `set_current_session_id`, a `RwLock<String>` that the SSE semaphore already
   permits more than one turn to race on. Using it would trade a guest hole for a misattribution
   bug. Deferred until there is a per-turn cell to hang it on.
-- **P5 — LANDED 2026-08-04.** A `Guest` turn gets no memory injection (read), deposits no memory
-  (write), and is never given the personal-data tool groups.
+- **P5 — landed 2026-08-04, INERT until 2026-08-05.** A `Guest` turn gets no memory injection
+  (read), deposits no memory (write), and is never given the personal-data tool groups.
+
+  **The tool-group half did not work on any default install, for a day.** The subtraction sits
+  inside `resolve_session_tool_groups`, which is only reached from the
+  `settings.tool_selection_is_relevant()` branch in `goose_agent` — and `default_tool_selection_mode()`
+  returns `"all"`. The `else` branch returns `allowed_tools` untouched, and *that* set is what gets
+  published to the provider shim. So on a default pond a `Guest` kept `giap-memory`, `giap-draft`,
+  `giap-audit`, `giap-vision` and `giap-sensors`, and could recall, keyword-search or
+  `forget_memory` the entire household — the exact hole this phase was written to close, left open
+  by the phase that closed it.
+
+  Fixed by subtracting at the **tool** level after both branches converge
+  (`tool_selection::subtract_guest_denied_tools`), which is the only point every mode passes
+  through. Idempotent, so the group-level pass stays — it still keeps withheld groups out of the
+  dormant-groups note.
+
+  **Why it was missed, which is the part worth keeping:** the phase was verified against the code
+  path it added, not against the default configuration. Every test exercised the `relevant` branch
+  because that is the branch the feature lives in. A guard now asserts that every name on the
+  denylist is a real catalog extension, because a typo there is invisible in exactly the same way —
+  the filter would simply never match, and the denial would look present while protecting nothing.
 
   `groups_denied_to_guests()` in `mcp/domain/tool_group.rs` names them: `giap-memory`, `giap-draft`,
   `giap-audit`, `giap-vision`, `giap-sensors`. The adapter subtracts them **after** `select_groups`,
