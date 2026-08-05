@@ -921,6 +921,8 @@ async fn run_server(
     native: bool,
     drain_handle: tracing_setup::LogDrainHandle,
 ) -> Result<()> {
+    use pond_core::user_data::ports::matter_runtime::MatterRuntimePort;
+
     println!("  ╔═══════════════════════════════════════╗");
     println!(
         "  ║   🦆  Goose In A Pond  v{}         ║",
@@ -2131,96 +2133,53 @@ async fn run_server(
     #[cfg(not(feature = "pond-agent"))]
     let pond_agent_active = false;
 
-    // Device actuation backend (#195): the Matter controller when configured
-    // and reachable, else the logging stub. The bridge halves (event stream +
-    // node cache) are spawned further down where the EventBus exists.
-    // Holds the controller GIAP started, if any. Kept until shutdown, where it
-    // is killed explicitly: kill_on_drop alone is not enough because a signal
-    // (Ctrl-C / SIGTERM) terminates the process without unwinding, so the
-    // destructor never runs and the controller would orphan.
-    #[cfg(feature = "goose-agent")]
-    let mut matter_server_child: Option<tokio::process::Child>;
+    // Event bus (#91/#109), created here because the Matter runtime below
+    // publishes sensor updates onto it. Its durable log bridge is wired further
+    // down, once the logs DB handle is in scope.
+    let event_bus: Arc<dyn pond_core::shared::ports::event_bus::EventBus> =
+        Arc::new(InProcessEventBus::new());
 
-    // Matter commissioning, available only once a controller is connected.
-    // `None` means "Matter is off", which the API turns into a clear 503 rather
-    // than a confusing failure when someone submits a setup code.
-    type Commissioner =
-        Option<Arc<dyn pond_core::user_data::ports::device_commissioning::DeviceCommissioningPort>>;
-    #[cfg(feature = "goose-agent")]
-    let mut matter_commissioner: Commissioner = None;
-    #[cfg(not(feature = "goose-agent"))]
-    let matter_commissioner: Commissioner = None;
+    // Device actuation backend (#195): Matter when it is switched on and a
+    // controller is reachable, else the logging stub.
+    //
+    // Which of the two is live is the runtime's decision and can change at any
+    // moment, because `matter_enabled` is a user-facing toggle rather than a
+    // boot-time constant. `device_control` is therefore a facade — one `Arc`
+    // that the agent, the MCP server, and the tool wiring hold for the life of
+    // the process while the backend behind it is swapped underneath.
+    //
+    // The runtime also owns the bridge (fabric node sync plus sensor attribute
+    // updates onto the EventBus) and the controller process, so both come and
+    // go with the toggle rather than with the process.
+    type MatterRuntimeHandle =
+        Option<Arc<dyn pond_core::user_data::ports::matter_runtime::MatterRuntimePort>>;
+    type DeviceControl = Arc<dyn pond_core::user_data::ports::device_control::DeviceControlPort>;
 
     #[cfg(feature = "goose-agent")]
-    let (device_control, matter_bridge_parts): (
-        Arc<dyn pond_core::user_data::ports::device_control::DeviceControlPort>,
-        Option<(
-            Arc<pond_adapters_matter::MatterClient>,
-            tokio::sync::mpsc::Receiver<pond_adapters_matter::MatterEvent>,
-            pond_adapters_matter::NodeCache,
-            pond_adapters_matter::SharedMatterClient,
-        )>,
-    ) = if settings.matter_enabled && !settings.matter_ws_url.trim().is_empty() {
-        // Auto-setup: install + start a controller when the URL is loopback and
-        // nothing is serving it yet. A remote URL is someone else's server, and
-        // an already-live port is reused as-is.
-        matter_server_child =
-            match pond_adapters_matter::local_port_from_ws_url(settings.matter_ws_url.trim()) {
-                Some(port) => {
-                    match pond_adapters_matter::ensure_matter_server(
-                        &data_dir,
-                        port,
-                        std::time::Duration::from_secs(120),
-                    )
-                    .await
-                    {
-                        Ok(child) => child,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Matter controller auto-setup failed");
-                            None
-                        }
-                    }
-                }
-                None => None,
-            };
-
-        match pond_adapters_matter::MatterClient::connect(settings.matter_ws_url.trim()).await {
-            Ok((client, events)) => {
-                let cache: pond_adapters_matter::NodeCache =
-                    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-                tracing::info!(url = %settings.matter_ws_url, "Matter controller connected");
-                // Same connection commissions new devices onto the fabric.
-                matter_commissioner = Some(Arc::new(
-                    pond_adapters_matter::MatterCommissioner::new(client.clone()),
-                ));
-                let control = Arc::new(pond_adapters_matter::MatterDeviceControl::new(
-                    client.clone(),
-                    cache.clone(),
-                ));
-                // The supervisor swaps this handle on reconnect so the control
-                // keeps working across a matter-server restart (#195).
-                let client_handle = control.client_handle();
-                (control, Some((client, events, cache, client_handle)))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Matter controller unreachable; device control falls back to the logging stub"
-                );
-                (
-                    Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
-                    None,
-                )
-            }
-        }
-    } else {
-        // Matter disabled: nothing to install, nothing to start.
-        matter_server_child = None;
-        (
-            Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
-            None,
-        )
+    let (matter_runtime, device_control): (MatterRuntimeHandle, DeviceControl) = {
+        let runtime = pond_adapters_matter::MatterRuntime::new(
+            data_dir.clone(),
+            device_registry.clone(),
+            event_bus.clone(),
+        );
+        let control = runtime.device_control(Arc::new(
+            pond_infra::logging_device_control::LoggingDeviceControl::new(),
+        ));
+        // Converge to the persisted setting. Returns immediately by design: a
+        // first enable installs and starts a controller, and serving must not
+        // wait minutes on that. The Devices tab shows the progress.
+        runtime.apply(
+            settings.matter_enabled,
+            settings.matter_ws_url.trim().to_string(),
+        );
+        (Some(runtime as Arc<dyn MatterRuntimePort>), control)
     };
+
+    #[cfg(not(feature = "goose-agent"))]
+    let (matter_runtime, device_control): (MatterRuntimeHandle, DeviceControl) = (
+        None,
+        Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
+    );
 
     let (agent, extension_manager, _tool_caller, tool_registry) = if pond_agent_active {
         // Build PondAgent directly — no Goose, no llama backend conflict.
@@ -2563,12 +2522,11 @@ async fn run_server(
         device_control.clone(),
     )));
 
-    // Event bus + durable event log (#91/#109). The bus is shared with AppState
-    // for publishing on ingest; a background bridge subscribes to it and appends
-    // every bus event (sensor/camera/device) into the unified `events` table, so
-    // events written in normal operation are queryable from pond_logs.db.
-    let event_bus: Arc<dyn pond_core::shared::ports::event_bus::EventBus> =
-        Arc::new(InProcessEventBus::new());
+    // Durable event log (#91/#109). The bus (created above, with the Matter
+    // runtime) is shared with AppState for publishing on ingest; a background
+    // bridge subscribes to it and appends every bus event (sensor/camera/device)
+    // into the unified `events` table, so events written in normal operation are
+    // queryable from pond_logs.db.
     // One shared event store: the bus→log bridge writes to it, and the activity
     // query API (#114) reads from it via AppState.
     let event_log: Arc<dyn pond_core::security::ports::event_log::EventLog> =
@@ -2690,30 +2648,6 @@ async fn run_server(
         tokio::spawn(pond_infra_scheduler::run_rules_engine(
             event_bus.subscribe(),
             sched,
-        ));
-    }
-
-    // Matter bridge (#195): syncs commissioned fabric nodes into the device
-    // registry and turns sensor attribute updates into BusEvent::Sensor, so
-    // #92 rules and the activity feed react to Matter sensors natively.
-    #[cfg(feature = "goose-agent")]
-    if let Some((matter_client, matter_events, matter_cache, matter_client_handle)) =
-        matter_bridge_parts
-    {
-        let registry = device_registry.clone();
-        let bus = event_bus.clone();
-        let matter_url = settings.matter_ws_url.trim().to_string();
-        // Supervised: on connection loss it reconnects with backoff and swaps
-        // the fresh client into the control's handle (#195), so a matter-server
-        // restart no longer needs a pond-server restart. Never returns.
-        tokio::spawn(pond_adapters_matter::run_matter_supervisor(
-            matter_url,
-            matter_client_handle,
-            matter_client,
-            matter_events,
-            matter_cache,
-            registry,
-            bus,
         ));
     }
 
@@ -2856,7 +2790,7 @@ async fn run_server(
         tts,
         settings_repo,
         profile_repo,
-        commissioner: matter_commissioner,
+        matter: matter_runtime.clone(),
         device_registry,
         memory_repo,
         embedding_provider,
@@ -3096,13 +3030,11 @@ async fn run_server(
     }
 
     // Stop the matter-server GIAP started, if any. kill_on_drop does not fire on
-    // the signal path (the process exits without unwinding), so kill it here —
-    // otherwise the controller orphans and survives the Pond, including under
-    // `systemctl stop`.
-    #[cfg(feature = "goose-agent")]
-    if let Some(mut child) = matter_server_child.take() {
-        tracing::info!("stopping matter-server controller");
-        let _ = child.start_kill();
+    // the signal path (the process exits without unwinding), so the runtime is
+    // asked to kill it here — otherwise the controller orphans and survives the
+    // Pond, including under `systemctl stop`.
+    if let Some(matter) = &matter_runtime {
+        matter.shutdown().await;
     }
 
     Ok(())

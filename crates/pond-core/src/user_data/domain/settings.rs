@@ -1645,10 +1645,6 @@ mod tests {
             // that also requires a `vision-onnx` build; UI wiring comes with
             // the Models-tab vision section, not before.
             "vision_classifier_model",
-            // Matter controller connection (#195): operator knobs until the
-            // Devices tab grows a Matter section.
-            "matter_enabled",
-            "matter_ws_url",
         ];
         // Everything else is surfaced in the desktop UI (Settings tabs / hub
         // views / onboarding) and mirrored in the TS Settings type.
@@ -1697,6 +1693,8 @@ mod tests {
             "llm_max_tokens",
             "llm_provider",
             "llm_temperature",
+            "matter_enabled",
+            "matter_ws_url",
             "memory_archive_threshold",
             "memory_cleanup_enabled",
             "memory_cleanup_interval_hours",
