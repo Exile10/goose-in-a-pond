@@ -78,6 +78,22 @@ build if it and the router ever disagree. The secrets-on-`Settings` half of this
 untouched and remains PAI-2 P2: the fix stops `GET /settings` being *reachable*, not the keys being
 *on the struct*.
 
+> **Three more of this section's claims went false on 2026-08-05 and were not struck through at the
+> time. Corrected while landing PAI-2 P1**, because a roadmap that overstates the danger is read
+> the same way as one that understates it — sceptically, and then not at all.
+>
+> - **"Every `.audit()` call site is inside `#[cfg(test)]`" is no longer true.** There are two
+>   production call sites: `evaluate_identity_assertion` in `pond-api/src/routes.rs`, and the draft
+>   decision gate in `pond-mcp-server/src/draft.rs`. `SecurityPolicy::allow` does still return
+>   `Ok(true)` unconditionally — both gates decide with pure rules in
+>   `security/ports/policy.rs` and use the port for the audit trail, which is what `audit` mode is.
+> - **"There is no encryption at rest" is half false.** `secrets.json` is an XChaCha20-Poly1305
+>   envelope since PAI-2 P4. Both SQLite databases are still plaintext, and that is a recorded
+>   deferral rather than an oversight.
+> - **The four `api_key_*` fields are off `Settings`** since PAI-2 P2 and live in `SecretRepository`;
+>   a build-breaking guard rejects any new secret-shaped field. `GET /settings` no longer serialises
+>   a key because there is no longer a key on the struct.
+
 ### 1.3 There is no initiative
 
 - The event bus is a closed three-variant enum — `Sensor | Camera | Device`
@@ -139,7 +155,7 @@ PAI-3 Context governor ── PAI-4 Compaction ── PAI-5 Thinking │
 | Doc | Workstream | Requirement | Depends on | Status |
 |---|---|---|---|---|
 | [01](./pai/01-identity-and-profile-boundaries.md) | Identity and profile boundaries | Hard profile boundaries | — | **COMPLETE — P1-P8 LANDED** |
-| [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | **P0, P4 LANDED; P1 partial** (mode + first call site); P2-P3, P5-P8 designed |
+| [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | **P0, P1, P2, P4 LANDED**; P3, P5-P8 designed |
 | [03](./pai/03-context-governor.md) | Context governor | Large context, used fully | — | **P1, P2 LANDED** |
 | [04](./pai/04-smart-compaction.md) | Smart compaction | Smart compaction | 03 | DESIGNED |
 | [05](./pai/05-reasoning-and-thinking.md) | Reasoning and thinking | Ability to think | 03, 04 | DESIGNED |

@@ -23,7 +23,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2 LANDED**; P3-P6 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
-| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0, P4 LANDED; P1 partial**; P2-P3, P5-P8 designed |
+| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0, P1, P2, P4 LANDED**; P3, P5-P8 designed |
 
 They are equally weighted and mutually interdependent. `DESIGNED` means the document exists and its
 current-state claims were verified against code; it does **not** mean any code has changed. `LANDED`
@@ -31,8 +31,9 @@ is stamped per phase, and means the gates in 2.3 were run and passed.
 
 **PAI-1 is COMPLETE** as of 2026-08-05: P1-P8 all landed, including P4's policy layer and the
 repair of P5, which was recorded as landed while being inert on every default install. PAI-3 P1/P2
-and PAI-2 P0 are landed, PAI-2 P1 has its mode and its first production call site, and PAI-2 P4
-encrypts `secrets.json` at rest as of 2026-08-05. Everything else is still design only.
+and PAI-2 P0 are landed, PAI-2 P4 encrypts `secrets.json` at rest, and PAI-2 P1 is complete: the
+mode, the identity-assertion call site, and the draft-decision gate that gives a staged action an
+owner. Everything else is still design only.
 
 One consequence of P4 worth knowing before you go looking for it: `giap.sh doctor` now FAILs on
 every pond that has not yet been restarted on a P4 binary, because the store on those really is
@@ -453,9 +454,11 @@ The recon paid for itself three times over:
   therefore "wire it at all", not "switch its source". Corrected in PAI-1 section 1.5.
 - **P7 cannot cascade drafts or schedules.** `drafts` has no owner column (keyed by `session_id`, no
   FK) and **there is no `schedules` table at all** -- the scheduler is in-process tokio-cron.
+  *(Drafts half fixed 2026-08-05 by PAI-2 P1, migration 0038 + a `BEFORE DELETE ON profiles`
+  trigger. Schedules half still true.)*
 - **`approve_draft` has no ownership check whatsoever.** Any session can approve any draft id. That
   is a live authorisation defect, not a Guest-degradation gap, and it belongs to PAI-2 rather than
-  here.
+  here. *(CLOSED 2026-08-05 by PAI-2 P1 -- see that document's P1 entry.)*
 
 **The compiler found what a careful read-only sweep did not.** Making `AgentRequest.profile_scope`
 non-optional broke twelve construction sites; the recon inventory listed eleven. `delegation.rs`
@@ -528,6 +531,15 @@ tool calls. The only mechanism available is `set_current_session_id`, a process-
 `RwLock<String>` that the SSE semaphore already permits more than one turn to race on. Using it
 would trade a guest hole for a misattribution bug, which is the worse of the two.
 
+**"The only mechanism available" was wrong, and PAI-2 P1 found the other one on 2026-08-05.** Goose
+stamps `agent-session-id` into every `CallToolRequest`'s `Meta`; rmcp serialises it as the wire
+`_meta` and hands it to the tool handler in `RequestContext.meta`. That is per-call and race-free,
+needs no Goose patch, and is what `giap-draft` now resolves its speaker from
+(`crates/pond-mcp-server/src/session_meta.rs`). `giap-memory` and `giap-toolkit` still read the
+raced global; adopting the reader is the follow-up. The lesson generalises: **"there is nowhere to
+hang the identity" is a claim about the transport, and transports carry more than the parameters
+you were looking at.**
+
 **The TOCTOU.** `set_session_identity_if_stronger` does the rank comparison inside the `UPDATE`,
 building the `CASE` from `IdentificationSource::ALL_RANKED` so the ordering stays domain policy. A
 test pins `ALL_RANKED` against `rank()` in both directions -- if they ever drift, the conditional
@@ -571,6 +583,13 @@ now answered, so nothing downstream has to guess:
    with none — so the check and the layer meant to express it land together, in `audit` mode first
    per PAI-2's own plan. It stays a known live hole until then: any session can approve any draft id,
    and the guest tool-group gate does nothing about one member approving another's.
+
+   **Done 2026-08-05, and the call was right for a reason I had not anticipated.** Landing it with
+   the policy layer forced the question "who is the caller?", and the answer turned out not to exist
+   yet: `drafts` had no owner column *and* its `session_id` was a model-supplied parameter
+   defaulting to `"default"`. A standalone handler patch would have compared the approver's session
+   against a field that is the same string for every draft on the pond, passed its tests, and shipped
+   a check that could never fire.
 
 **2026-08-05 — first macOS run of `live-test.sh`. It wrote to a real pond, and that is the finding.**
 

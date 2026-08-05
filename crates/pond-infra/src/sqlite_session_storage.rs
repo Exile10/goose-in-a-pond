@@ -413,6 +413,25 @@ impl SessionStorage for SqliteSessionStorage {
         Ok(())
     }
 
+    async fn get_session_id_for_engine(
+        &self,
+        engine_session_id: &str,
+    ) -> Result<Option<String>, SessionStorageError> {
+        // Newest pairing wins. engine_session_id is not declared UNIQUE and the
+        // table is written from paths that run before a sessions row exists, so
+        // a stale duplicate is possible; taking the most recent is the only
+        // answer that stays right after a re-pair.
+        let row = sqlx::query(
+            "SELECT session_id FROM engine_session_map WHERE engine_session_id = ? \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(engine_session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        Ok(row.map(|r| r.get("session_id")))
+    }
+
     async fn get_engine_session_id(
         &self,
         session_id: &str,
@@ -988,6 +1007,26 @@ mod tests {
             "pairing must survive a restart"
         );
         assert_eq!(reopened.get_engine_session_id("other").await.unwrap(), None);
+    }
+
+    /// PAI-2 P1: a builtin MCP tool call carries the ENGINE's session id, so a
+    /// draft decision has to walk this map backwards to find a speaker.
+    #[tokio::test]
+    async fn the_engine_session_reverse_lookup_finds_the_giap_session() {
+        let (s, _tmp) = make_storage().await;
+        s.set_engine_session_id("giap-1", "20260805_4")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_session_id_for_engine("20260805_4").await.unwrap(),
+            Some("giap-1".to_string())
+        );
+        assert_eq!(s.get_session_id_for_engine("nope").await.unwrap(), None);
+        assert_eq!(
+            s.get_session_id_for_engine("").await.unwrap(),
+            None,
+            "a blank engine id must not match a row"
+        );
     }
 
     #[tokio::test]
