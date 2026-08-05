@@ -68,8 +68,15 @@ I first wrote that this exposed the keys "to any authenticated client". **That w
 Re-checked 2026-08-04: no authentication is required at all.** See below.
 
 **The auth allowlist matches on path only, so several "protected" routes are public.**
-`is_public_route` (`pond-api/src/middleware/mod.rs`) receives just `path.path()` from
-`auth_middleware` — never the method — while its entries are written as though method-scoped:
+*(FIXED 2026-08-05 by P0. Kept in full, because the shape of the mistake is the point and because
+the table below is the reproduction record. `is_public_route` now takes a `&Method` and matches a
+`PUBLIC_ROUTES: &[(Method, &str)]` table segment-wise; three compile-time guards fail the build if
+the table and the router drift. Everything in the table below now requires a token — except
+`PUT /settings`, `POST /profiles` and `PATCH /profiles/{id}`, which stay public for onboarding and
+are P7's job.)*
+
+`is_public_route` (`pond-api/src/middleware/mod.rs`) received just `path.path()` from
+`auth_middleware` — never the method — while its entries were written as though method-scoped:
 
 | Entry | Comment says | Actually public |
 |---|---|---|
@@ -295,10 +302,18 @@ onboarding is complete. `middleware/onboarding_guard.rs` already knows that stat
   can write a key through the onboarding hole and read it back through the path-matching hole. Both
   halves were exercised in that order and both succeeded.
 
-  One qualifier, because it changes how urgent this looks on a fresh install: the key fields carry
-  `skip_serializing_if = "Option::is_none"`, so `GET /settings` leaks nothing until a key is
-  actually configured. The exposure is real for any pond whose owner has set one up, and invisible
-  before that.
+  One qualifier, because it changes how urgent this looks on a fresh install: `GET /settings` leaks
+  no key *value* until a key is actually configured. The exposure is real for any pond whose owner
+  has set one up, and invisible before that.
+
+  **The reason I first gave for that qualifier was wrong, and it contradicted section 1.2 of this
+  same document.** I wrote that the key fields carry `skip_serializing_if = "Option::is_none"`.
+  They do not — verified 2026-08-05, all four `api_key_*` fields carry only `#[serde(default)]`,
+  exactly as 1.2 says. An unset key is therefore *serialized as `null`* rather than omitted, which
+  happens to leak no value and is not the mechanism I claimed. Worth recording because the two
+  halves of one document disagreed and the wrong half was the one attached to the reassuring
+  conclusion. **P0 put a bearer token in front of this route; the keys are still on the struct and
+  still serialized into the body. That is P2, and it is untouched.**
 - **P1** `security_policy_mode` with `audit` default; the scope × principal matrix; first production
   `allow`/`audit` call sites (shared with PAI-1 P4).
 - **P2** Secret migration off `Settings`; the `*_key|*_token|*_secret` guard test; module rename.
