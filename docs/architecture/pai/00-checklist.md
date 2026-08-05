@@ -635,6 +635,16 @@ carrying forward rather than repeating:
 - **The stale "FAILS BY DESIGN" epilogue is gone from `live-test.sh`.** It told the next person that
   an auth failure was expected. Leaving it would have trained them to ignore the one section most
   likely to catch a real regression.
+- **A test was passing for the wrong reason, and only the fix could reveal it.**
+  `settings_is_blocked_before_onboarding` asserted 403 with no token — which held only because
+  `GET /settings` was public, so the request reached the onboarding guard instead of being refused
+  at auth. Correct status, wrong gate. This is the fourth member of this programme's family of
+  tests that assert something true for a reason that is not the one claimed, and the first found by
+  a *fix* rather than by an audit. Add to 2.2: when a change makes a test fail, check whether the
+  test was ever measuring what its name says before assuming the change is at fault.
+
+Gates: `pond-api` 109 lib and 137 across all 17 integration targets (135 + 2), `pond-core` 736, fmt
+and clippy clean, `cargo build -p pond-server` via the live run.
 
 **One new WARN appeared in the log dig and is environmental, recorded so it is not rediscovered:**
 `embedding provider failed to init: embedding provider init timed out after 30 s — ONNX Runtime may
