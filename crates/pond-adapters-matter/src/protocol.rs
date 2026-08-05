@@ -40,6 +40,14 @@ pub const CLUSTER_OCCUPANCY: u32 = 1030;
 pub const ATTR_OCCUPIED_HEATING_SETPOINT: u32 = 18;
 /// FanControl `PercentSetting` attribute id — a 0–100 write, no command.
 pub const ATTR_FAN_PERCENT_SETTING: u32 = 2;
+/// FanControl `FanMode` attribute id. A fan has no On/Off cluster to switch, so
+/// this is where its power lives.
+pub const ATTR_FAN_MODE: u32 = 0;
+/// `FanMode` values GIAP writes. The enum also carries Low/Medium/High (1–3),
+/// which speed changes go through `PercentSetting` for instead — the server
+/// keeps the two in step, so there is no need to pick a discrete step here.
+pub const FAN_MODE_OFF: u8 = 0;
+pub const FAN_MODE_ON: u8 = 4;
 
 /// A commissioned node as reported by `start_listening` / node events.
 #[derive(Debug, Clone, Deserialize)]
@@ -163,6 +171,15 @@ pub fn node_to_device(node: &MatterNode) -> Device {
     if has(CLUSTER_ON_OFF) {
         capabilities.push("power".to_string());
     }
+    if has(CLUSTER_FAN_CONTROL) {
+        // A Matter fan need not implement On/Off at all — the Virtual Fan does
+        // not — so without this it advertised no capabilities and "turn on the
+        // fan" had nothing to aim at. `FanMode` is its power switch.
+        if !has(CLUSTER_ON_OFF) {
+            capabilities.push("power".to_string());
+        }
+        capabilities.push("fan_speed".to_string());
+    }
     if has(CLUSTER_LEVEL_CONTROL) {
         capabilities.push("brightness".to_string());
     }
@@ -177,6 +194,10 @@ pub fn node_to_device(node: &MatterNode) -> Device {
         "lock"
     } else if has(CLUSTER_THERMOSTAT) {
         "thermostat"
+    } else if has(CLUSTER_FAN_CONTROL) {
+        // Ahead of the On/Off check: a fan that does implement On/Off is still
+        // a fan, and calling it a light gives the model the wrong vocabulary.
+        "fan"
     } else if has(CLUSTER_ON_OFF) {
         "light"
     } else if has(CLUSTER_OCCUPANCY)
@@ -285,6 +306,49 @@ pub fn position_open_to_lift_100ths(percent_open: u8) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Matter Virtual Device's fan, as commissioned on 2026-08-05: Fan
+    /// Control on endpoint 1 and **no On/Off cluster at all**, which is what
+    /// left it with no capabilities and unreachable by "turn on the fan".
+    fn fan_node() -> MatterNode {
+        serde_json::from_value(json!({
+            "node_id": 18,
+            "available": true,
+            "attributes": {
+                "0/40/5": "Living Room Fan",
+                "1/514/0": 0,
+                "1/514/2": 0,
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_fan_without_on_off_is_still_powerable_and_typed_as_a_fan() {
+        let device = node_to_device(&fan_node());
+        assert_eq!(device.device_type, "fan", "not a light, and not untyped");
+        // Power comes from FanMode here; fan_speed from PercentSetting.
+        assert_eq!(device.capabilities, vec!["power", "fan_speed"]);
+        assert_eq!(
+            endpoints_with_cluster(&fan_node(), CLUSTER_FAN_CONTROL),
+            vec![1]
+        );
+        assert!(endpoints_with_cluster(&fan_node(), CLUSTER_ON_OFF).is_empty());
+    }
+
+    #[test]
+    fn a_fan_that_does_implement_on_off_reports_power_once() {
+        let mut node = fan_node();
+        node.attributes.insert("1/6/0".to_string(), json!(false));
+
+        let device = node_to_device(&node);
+        assert_eq!(device.device_type, "fan", "a fan with a switch is a fan");
+        assert_eq!(
+            device.capabilities,
+            vec!["power", "fan_speed"],
+            "power must not be listed twice when both clusters are present"
+        );
+    }
 
     fn light_node() -> MatterNode {
         serde_json::from_value(json!({
