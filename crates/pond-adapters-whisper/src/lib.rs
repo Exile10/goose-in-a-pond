@@ -261,6 +261,7 @@ pub(crate) fn record_mono_f32_vad(
     silence_ms: u64,
     speculative_spawn: Option<&SpeculativeSpawn>,
     on_speculative_event: Option<&(dyn Fn(SpeculativeSignal) + Send + Sync)>,
+    audio_level_sink: Option<&ThrottledAudioLevelSink>,
 ) -> Result<(Vec<f32>, u32, Option<String>)> {
     const SPEECH_RMS: f32 = 0.010; // onset threshold — lowered for better sensitivity
     const SILENCE_RMS: f32 = 0.005; // end-of-speech threshold (hysteresis)
@@ -354,6 +355,9 @@ pub(crate) fn record_mono_f32_vad(
             let start = buf.len().saturating_sub(recent);
             rms_energy(&buf[start..])
         };
+        if let Some(sink) = audio_level_sink {
+            sink.maybe_emit(rms);
+        }
 
         if rms >= SPEECH_RMS {
             speech_detected = true;
@@ -392,6 +396,9 @@ pub(crate) fn record_mono_f32_vad(
             let start = buf.len().saturating_sub(recent);
             rms_energy(&buf[start..])
         };
+        if let Some(sink) = audio_level_sink {
+            sink.maybe_emit(rms);
+        }
 
         match vad.on_rms(rms, SILENCE_RMS) {
             VadEvent::SpawnSpeculative => {
@@ -565,6 +572,9 @@ pub struct WhisperKeywordDetector {
     triggers: Vec<String>,
     prompt: String,
     config: KeywordDetectorConfig,
+    /// Optional live mic-level reporter, fed from the detection loop's own
+    /// RMS computation (wait state + post-trigger capture).
+    audio_level_sink: Option<Arc<ThrottledAudioLevelSink>>,
 }
 
 impl WhisperKeywordDetector {
@@ -578,7 +588,15 @@ impl WhisperKeywordDetector {
             triggers: vec![normalize_transcript(&raw)],
             prompt,
             config: KeywordDetectorConfig::default(),
+            audio_level_sink: None,
         }
+    }
+
+    /// Report live mic RMS level through `sink` while waiting for the wake
+    /// word and while capturing trailing command audio after it fires.
+    pub fn with_audio_level_sink(mut self, sink: Arc<ThrottledAudioLevelSink>) -> Self {
+        self.audio_level_sink = Some(sink);
+        self
     }
 
     /// Load calibrated transcription variants collected during onboarding.
@@ -667,12 +685,19 @@ use pond_voice::text::normalize_transcript;
 /// Returns 0.0 for an empty slice.
 use pond_voice::dsp::rms as rms_energy;
 
+// ThrottledAudioLevelSink now lives in pond-core (shared::domain::agent) so
+// the piper adapter (TTS output amplitude) can reuse it too, without one
+// adapter crate depending on another. Re-exported here so existing call
+// sites in this file don't need to change their references.
+pub use pond_core::shared::domain::agent::ThrottledAudioLevelSink;
+
 #[async_trait]
 impl StreamingWakeWordDetector for WhisperKeywordDetector {
     async fn wait_for_activation_with_audio(&self) -> Result<WakeWordActivation> {
         let backend = self.backend.clone();
         let triggers = self.triggers.clone();
         let config = self.config.clone();
+        let audio_level_sink = self.audio_level_sink.clone();
 
         // `run_loop` races this future against the turn and drops it when the
         // turn wins. Dropping a `spawn_blocking` JoinHandle DETACHES the task —
@@ -684,9 +709,11 @@ impl StreamingWakeWordDetector for WhisperKeywordDetector {
         let stop = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = StopOnDrop(stop.clone());
 
-        tokio::task::spawn_blocking(move || detection_loop(backend, triggers, config, stop))
-            .await
-            .map_err(|e| anyhow!("detection thread panicked: {}", e))?
+        tokio::task::spawn_blocking(move || {
+            detection_loop(backend, triggers, config, stop, audio_level_sink)
+        })
+        .await
+        .map_err(|e| anyhow!("detection thread panicked: {}", e))?
     }
 
     fn activation_prompt(&self) -> &str {
@@ -736,6 +763,7 @@ fn detection_loop(
     triggers: Vec<String>,
     config: KeywordDetectorConfig,
     stop: Arc<AtomicBool>,
+    audio_level_sink: Option<Arc<ThrottledAudioLevelSink>>,
 ) -> Result<WakeWordActivation> {
     // ── Open continuous audio stream ─────────────────────────────────────────
     // Privacy gate: refuse to OPEN the device, so the OS microphone indicator
@@ -835,12 +863,15 @@ fn detection_loop(
         }
 
         // ── Energy gate — skip silent windows before hitting whisper ──────────
-        if config.energy_threshold > 0.0 {
-            let rms = rms_energy(&snapshot);
-            if rms < config.energy_threshold {
-                tracing::trace!("KWS: silent window skipped (rms={:.4})", rms);
-                continue;
-            }
+        // RMS is computed unconditionally (not just when the gate is active)
+        // so the audio-level sink still gets readings when energy_threshold is 0.
+        let window_rms = rms_energy(&snapshot);
+        if let Some(sink) = &audio_level_sink {
+            sink.maybe_emit(window_rms);
+        }
+        if config.energy_threshold > 0.0 && window_rms < config.energy_threshold {
+            tracing::trace!("KWS: silent window skipped (rms={:.4})", window_rms);
+            continue;
         }
 
         // Transcribe the window via the backend (in-process or HTTP).
@@ -903,14 +934,21 @@ fn detection_loop(
                 }
                 elapsed_ms += poll_ms;
 
+                // Computed unconditionally (not just when the VAD-silence gate
+                // below is active) so the audio-level sink keeps reporting
+                // through the whole post-trigger capture window.
+                let recent_rms = {
+                    let r = ring.lock().unwrap();
+                    let recent_samples = (sample_rate as u64 * poll_ms / 1000) as usize;
+                    let start = r.len().saturating_sub(recent_samples);
+                    let chunk: Vec<f32> = r.range(start..).copied().collect();
+                    rms_energy(&chunk)
+                };
+                if let Some(sink) = &audio_level_sink {
+                    sink.maybe_emit(recent_rms);
+                }
+
                 if config.post_trigger_silence_ms > 0 && config.silence_threshold > 0.0 {
-                    let recent_rms = {
-                        let r = ring.lock().unwrap();
-                        let recent_samples = (sample_rate as u64 * poll_ms / 1000) as usize;
-                        let start = r.len().saturating_sub(recent_samples);
-                        let chunk: Vec<f32> = r.range(start..).copied().collect();
-                        rms_energy(&chunk)
-                    };
                     if recent_rms < config.silence_threshold {
                         silent_for_ms += poll_ms;
                         if silent_for_ms >= config.post_trigger_silence_ms {

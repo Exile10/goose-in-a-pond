@@ -190,8 +190,10 @@ export class PondApiClient {
 
   // ── Internal helpers ───────────────────────────────────────
 
-  private headers(extra?: Record<string, string>): Record<string, string> {
-    const h: Record<string, string> = { "Content-Type": "application/json", ...extra };
+  private headers(method: string, extra?: Record<string, string>): Record<string, string> {
+    // Content-Type on a bodyless GET forces an unnecessary CORS preflight on
+    // every read call — omit it there; POST/PUT/PATCH bodies still need it.
+    const h: Record<string, string> = method === "GET" ? { ...extra } : { "Content-Type": "application/json", ...extra };
     if (this.token) h["Authorization"] = `Bearer ${this.token}`;
     return h;
   }
@@ -203,7 +205,7 @@ export class PondApiClient {
     try {
       const res = await fetch(`${this.base}${path}`, {
         method,
-        headers: this.headers(),
+        headers: this.headers(method),
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: controller.signal,
       });
@@ -286,7 +288,7 @@ export class PondApiClient {
     await this.ensureTokenFresh();
     const res = await fetch(`${this.base}/api/v1/tts`, {
       method: "POST",
-      headers: this.headers(),
+      headers: this.headers("POST"),
       body: JSON.stringify({ text }),
     });
     if (!res.ok) {
@@ -567,7 +569,7 @@ export class PondApiClient {
   async *streamConsolidation(): AsyncGenerator<import("./types").ConsolidationEvent> {
     const res = await fetch(`${this.base}/api/v1/memory/consolidate`, {
       method: "POST",
-      headers: this.headers(),
+      headers: this.headers("POST"),
     });
     if (!res.ok || !res.body) return;
     const reader = res.body.getReader();

@@ -257,8 +257,7 @@ describe("useVoiceSession — start/stop lifecycle", () => {
     expect(stateActions.some((a) => a.payload === "idle")).toBe(true);
   });
 
-  it("startSession handles invoke rejection by dispatching error and auto-clearing", async () => {
-    vi.useFakeTimers();
+  it("startSession handles invoke rejection by dispatching a persistent error", async () => {
     const useVoiceSession = await getHook();
     _invoke = vi.fn().mockRejectedValue(new Error("spawn failed"));
 
@@ -271,12 +270,13 @@ describe("useVoiceSession — start/stop lifecycle", () => {
     expect(dispatchedOfType("SET_VOICE_ERROR").length).toBeGreaterThan(0);
     expect(dispatchedOfType("SET_VOICE_STATE").some((a) => a.payload === "error")).toBe(true);
 
-    // After 4000ms the error should auto-clear
-    act(() => { vi.advanceTimersByTime(4100); });
-    expect(dispatchedOfType("SET_VOICE_STATE").some((a) => a.payload === "idle")).toBe(true);
-    expect(dispatchedOfType("SET_VOICE_ERROR").some((a) => a.payload === null)).toBe(true);
+    // startSession's own optimistic "idle" dispatch fires once before the
+    // invoke rejects — but with no auto-clear timer, nothing should reset
+    // voiceState/voiceError back to idle/null afterward.
+    const idleCount = dispatchedOfType("SET_VOICE_STATE").filter((a) => a.payload === "idle").length;
+    expect(idleCount).toBe(1);
+    expect(dispatchedOfType("SET_VOICE_ERROR").some((a) => a.payload === null)).toBe(false);
 
-    vi.useRealTimers();
     cleanup();
   });
 });
@@ -597,8 +597,7 @@ describe("useVoiceSession — voice-session-ended handling", () => {
     expect(dispatchedOfType("SET_VOICE_STATE").some((a) => a.payload === "idle")).toBe(true);
   });
 
-  it("voice-session-ended with non-zero code surfaces an error", async () => {
-    vi.useFakeTimers();
+  it("voice-session-ended with non-zero code surfaces a persistent error", async () => {
     const useVoiceSession = await getHook();
     _invoke = vi.fn().mockResolvedValue("s1");
 
@@ -619,11 +618,9 @@ describe("useVoiceSession — voice-session-ended handling", () => {
     expect(errorActions[0].payload).toMatch(/code 1/);
     expect(dispatchedOfType("SET_VOICE_STATE").some((a) => a.payload === "error")).toBe(true);
 
-    // Auto-clears after 4s
-    act(() => { vi.advanceTimersByTime(4100); });
-    expect(dispatchedOfType("SET_VOICE_STATE").some((a) => a.payload === "idle")).toBe(true);
+    // No auto-clear timer anymore — stays in error state until dismissed/retried.
+    expect(dispatchedOfType("SET_VOICE_STATE").some((a) => a.payload === "idle")).toBe(false);
 
-    vi.useRealTimers();
     cleanup();
   });
 
@@ -712,7 +709,7 @@ describe("useVoiceSession — voice-session-ended handling", () => {
   });
 });
 
-describe("useVoiceSession — flashError deduplication (finding 30+39)", () => {
+describe("useVoiceSession — audio-level reactivity", () => {
   beforeEach(() => {
     clearDispatched();
     for (const key of Object.keys(_listeners)) {
@@ -723,11 +720,53 @@ describe("useVoiceSession — flashError deduplication (finding 30+39)", () => {
 
   afterEach(() => {
     cleanup();
-    vi.useRealTimers();
   });
 
-  it("overlapping errors do not cause duplicate timers fighting each other", async () => {
-    vi.useFakeTimers();
+  it("voice-audio-level updates audioLevel", async () => {
+    const useVoiceSession = await getHook();
+    _invoke = vi.fn().mockResolvedValue("s1");
+
+    const { result } = renderHook(() => useVoiceSession(), { wrapper });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(result.current.audioLevel).toBe(0);
+
+    act(() => { emitTauriEvent("voice-audio-level", { rms: 0.37 }); });
+    expect(result.current.audioLevel).toBe(0.37);
+  });
+
+  it("voice-session-ended resets audioLevel to 0", async () => {
+    const useVoiceSession = await getHook();
+    _invoke = vi.fn().mockResolvedValue("s1");
+
+    const { result } = renderHook(() => useVoiceSession(), { wrapper });
+    await act(async () => { await Promise.resolve(); });
+
+    act(() => { emitTauriEvent("voice-ready", { session_id: "s1" }); });
+    act(() => { emitTauriEvent("voice-audio-level", { rms: 0.5 }); });
+    expect(result.current.audioLevel).toBe(0.5);
+
+    act(() => {
+      emitTauriEvent("voice-session-ended", { code: null, reason: "stdin_eof", session_id: "s1" });
+    });
+    expect(result.current.audioLevel).toBe(0);
+  });
+});
+
+describe("useVoiceSession — flashError persistence", () => {
+  beforeEach(() => {
+    clearDispatched();
+    for (const key of Object.keys(_listeners)) {
+      delete _listeners[key];
+    }
+    _nextId = 0;
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("overlapping errors both surface and neither auto-clears", async () => {
     const useVoiceSession = await getHook();
     _invoke = vi.fn().mockResolvedValue("s1");
 
@@ -740,16 +779,11 @@ describe("useVoiceSession — flashError deduplication (finding 30+39)", () => {
     act(() => { emitTauriEvent("voice-error", { message: "error 1" }); });
     act(() => { emitTauriEvent("voice-error", { message: "error 2" }); });
 
-    // Advance past first timer window but not second
-    act(() => { vi.advanceTimersByTime(3000); });
-    // Error state should NOT have been cleared yet (second timer replaced first)
+    const errorPayloads = dispatchedOfType("SET_VOICE_ERROR").map((a) => a.payload);
+    expect(errorPayloads).toEqual(["error 1", "error 2"]);
+    // No timer of any kind clears the state — it stays in error.
     const idleActions = dispatchedOfType("SET_VOICE_STATE").filter((a) => a.payload === "idle");
     expect(idleActions).toHaveLength(0);
-
-    // Advance to clear the second timer
-    act(() => { vi.advanceTimersByTime(1100); });
-    const idleAfter = dispatchedOfType("SET_VOICE_STATE").filter((a) => a.payload === "idle");
-    expect(idleAfter.length).toBeGreaterThan(0);
   });
 });
 

@@ -14,11 +14,12 @@
 // appropriate hook for the runtime.
 // ────────────────────────────────────────────────────────────
 
-import React, { useEffect } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Button } from "@heroui/react";
-import { ChevronLeft, Mic, Square, Trash2, Radio } from "lucide-react";
+import { ChevronLeft, Mic, Square, Trash2, Radio, Volume2, RotateCcw } from "lucide-react";
 import { VoiceOrb } from "../../components/VoiceOrb";
 import { TranscriptFeed } from "../../components/TranscriptFeed";
+import { VoiceSwitcher } from "../../components/VoiceSwitcher";
 import { useAppState, useAppDispatch } from "../../state/AppContext";
 import { useVoicePipeline } from "./useVoicePipeline";
 import { useVoiceSession } from "./useVoiceSession";
@@ -82,25 +83,54 @@ function VoiceModeChildProcess() {
   const isConnecting = session.connecting;
   const isError     = voiceState === "error";
   const serverDown  = !state.serverOnline;
+  const [isSwitcherOpen, setSwitcherOpen] = useState(false);
 
-  // Start the session on mount; stop it on every cleanup.
-  // No startedRef guard — the effect is symmetric so React StrictMode's
-  // dev double-invoke (mount -> cleanup -> mount) results in
-  // start/stop/start and lands with a live session.  The Rust-side
-  // is_active() check prevents a double-spawn on the second start.
+  // Fire a one-shot flash on the orb the moment the child confirms it heard
+  // the wake word (wait -> recording), so wake-word detection has a visible
+  // beat instead of just a silent state-label change.
+  const prevVoiceStateRef = useRef(voiceState);
+  const [pulseKey, setPulseKey] = useState(0);
   useEffect(() => {
-    session.startSession();
+    if (prevVoiceStateRef.current === "wait" && voiceState === "recording") {
+      setPulseKey((k) => k + 1);
+    }
+    prevVoiceStateRef.current = voiceState;
+  }, [voiceState]);
+
+  // Start the session on mount; stop it on cleanup — but defer the stop by
+  // one tick so a fast remount (React StrictMode's dev double-invoke, or the
+  // user quickly leaving and re-entering the screen) can cancel it instead
+  // of tearing the session down and spawning another. Without this, every
+  // such remount killed a live child and started a new one within ~100ms:
+  // fast enough to crash @tauri-apps/api's event bridge when an in-flight
+  // Rust event raced the listener teardown (`listeners[eventId]` goes
+  // undefined), and too fast for any session to survive long enough to do
+  // anything.
+  const pendingStopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (pendingStopRef.current !== null) {
+      // A remount landed before the deferred stop fired — cancel it and
+      // keep the session that's already running instead of restarting it.
+      clearTimeout(pendingStopRef.current);
+      pendingStopRef.current = null;
+    } else {
+      session.startSession();
+    }
 
     return () => {
-      // Stop when VoiceMode unmounts (user navigates back to GUI).
-      session.stopSession();
+      pendingStopRef.current = setTimeout(() => {
+        pendingStopRef.current = null;
+        // Stop when VoiceMode unmounts (user navigates back to GUI).
+        session.stopSession();
+      }, 0);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const stateLabel = serverDown
     ? "Server offline"
     : isConnecting
-      ? "Connecting…"
+      ? "Starting voice session…"
       : isError && state.voiceError
         ? state.voiceError
         : STATE_LABELS[voiceState] ?? "Tap to talk";
@@ -133,6 +163,14 @@ function VoiceModeChildProcess() {
         )}
         <Button
           variant="ghost" size="sm"
+          onPress={() => setSwitcherOpen((o) => !o)}
+          aria-label="Switch voice"
+        >
+          <Volume2 size={13} />
+        </Button>
+        <VoiceSwitcher isOpen={isSwitcherOpen} onClose={() => setSwitcherOpen(false)} />
+        <Button
+          variant="ghost" size="sm"
           onPress={session.clearConversation}
           isDisabled={state.transcript.length === 0}
           aria-label="Clear conversation"
@@ -141,9 +179,15 @@ function VoiceModeChildProcess() {
         </Button>
       </div>
 
-      {/* Stage: orb + state label + live caption */}
+      {/* Stage: orb + state label + live caption. Transcript panel removed
+          for now (was pushing the orb out of view) — being rebuilt. */}
       <div className="vm-stage">
-        <VoiceOrb state={isConnecting ? "idle" : voiceState} size="xl" audioLevel={0} />
+        <VoiceOrb
+          state={isConnecting ? "idle" : voiceState}
+          size="xl"
+          audioLevel={session.audioLevel}
+          pulseKey={pulseKey}
+        />
 
         <div className="vm-state-row">
           {isConnecting && (
@@ -161,29 +205,26 @@ function VoiceModeChildProcess() {
         )}
       </div>
 
-      {/* Transcript panel */}
-      {state.transcript.length > 0 && (
-        <div className="vm-transcript">
-          <TranscriptFeed
-            messages={state.transcript}
-            contextCards={state.contextCards}
-            compact
-          />
-        </div>
-      )}
-
       {/* Action bar */}
       <div className="vm-action-bar">
         {isError && (
-          <Button
-            variant="ghost"
-            onPress={() => {
-              dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
-              dispatch({ type: "SET_VOICE_ERROR", payload: null });
-            }}
-          >
-            Dismiss
-          </Button>
+          <>
+            <Button
+              variant="ghost"
+              onPress={() => {
+                dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
+                dispatch({ type: "SET_VOICE_ERROR", payload: null });
+              }}
+            >
+              Dismiss
+            </Button>
+            <Button
+              variant="ghost"
+              onPress={() => session.startSession()}
+            >
+              <RotateCcw size={13} /> Retry
+            </Button>
+          </>
         )}
 
         {!isConnecting && !isError && session.sessionActive && (
