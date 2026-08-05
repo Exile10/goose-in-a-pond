@@ -36,15 +36,14 @@ use pond_core::user_data::ports::device_commissioning::DeviceCommissioningPort;
 use pond_core::user_data::ports::device_control::{DeviceControlOutcome, DeviceControlPort};
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use pond_core::user_data::ports::matter_runtime::{MatterRuntimePort, MatterState, MatterStatus};
-use tokio::process::Child;
 use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 
-use crate::bridge::run_matter_supervisor;
+use crate::bridge::{run_matter_supervisor, SupervisorConfig};
 use crate::client::{MatterClient, MatterEvent};
 use crate::commissioning::MatterCommissioner;
 use crate::control::{MatterDeviceControl, NodeCache};
-use crate::server_setup::{ensure_running, local_port_from_ws_url};
+use crate::server_setup::{ensure_running, local_port_from_ws_url, SharedServerChild};
 
 /// How long to wait for a freshly installed controller to start listening.
 /// Matches the budget the startup path used before this became reconcilable.
@@ -206,13 +205,18 @@ struct Reconciler {
     stopped: Arc<tokio::sync::Notify>,
 }
 
-/// What is currently running, owned exclusively by the reconciler task.
+/// What is currently running, owned by the reconciler task.
 #[derive(Default)]
 struct Running {
     /// The controller GIAP started, if any. Killed explicitly on teardown:
     /// `kill_on_drop` does not fire on the signal path, where the process exits
     /// without unwinding, and the controller would outlive the Pond.
-    child: Option<Child>,
+    ///
+    /// Shared with the supervisor rather than held outright: when the
+    /// supervisor finds the process dead it starts a replacement and parks the
+    /// new handle here, so teardown kills the controller that is actually
+    /// running instead of a handle to something that exited long ago.
+    child: SharedServerChild,
     supervisor: Option<JoinHandle<()>>,
 }
 
@@ -310,7 +314,7 @@ async fn reconcile_loop(mut rx: watch::Receiver<Desired>, r: Reconciler) {
 
 /// Everything a successful connect produced.
 struct Connected {
-    child: Option<Child>,
+    child: SharedServerChild,
     supervisor: JoinHandle<()>,
     commissioner: Arc<dyn DeviceCommissioningPort>,
     control: Arc<MatterDeviceControl>,
@@ -328,10 +332,13 @@ async fn connect(r: &Reconciler, url: &str) -> Result<Connected> {
 
     // Only a loopback URL is GIAP's to install and run; anything else is
     // someone else's controller and is used as-is.
-    let child = match local_port_from_ws_url(url) {
+    let started = match local_port_from_ws_url(url) {
         Some(port) => ensure_running(&r.data_dir, port, CONTROLLER_READY_TIMEOUT).await?,
         None => None,
     };
+    // One cell, two writers: this connect puts the first handle in, and the
+    // supervisor replaces it if it ever has to restart the process.
+    let child: SharedServerChild = Arc::new(tokio::sync::Mutex::new(started));
 
     let (client, events): (Arc<MatterClient>, tokio::sync::mpsc::Receiver<MatterEvent>) =
         MatterClient::connect(url).await?;
@@ -343,9 +350,14 @@ async fn connect(r: &Reconciler, url: &str) -> Result<Connected> {
 
     // Supervised: on connection loss it reconnects with backoff and swaps the
     // fresh client into the control's handle, so a matter-server restart no
-    // longer needs a pond-server restart.
+    // longer needs a pond-server restart. It also restarts the controller
+    // itself when reconnecting alone stops being enough.
     let supervisor = tokio::spawn(run_matter_supervisor(
-        url.to_string(),
+        SupervisorConfig {
+            url: url.to_string(),
+            data_dir: r.data_dir.clone(),
+            child: child.clone(),
+        },
         control.client_handle(),
         client,
         events,
@@ -371,12 +383,24 @@ async fn teardown(running: &mut Running, r: &Reconciler) {
     if let Some(supervisor) = running.supervisor.take() {
         // The supervisor reconnects forever by design, so it is aborted rather
         // than awaited — otherwise disabling Matter would leave a task racing
-        // to re-open the connection just torn down.
+        // to re-open the connection just torn down. Aborting it first also
+        // means it cannot revive a controller between here and the kill below.
         supervisor.abort();
     }
-    if let Some(mut child) = running.child.take() {
+    stop_controller(&running.child).await;
+}
+
+/// Kill the controller GIAP started, whichever process that currently is.
+///
+/// Reads the handle out of the shared cell rather than taking a `Child` by
+/// value: after a respawn the handle from `connect` refers to a process that
+/// exited long ago, and killing that one would leave the live controller
+/// running past the Pond. Empty cell means GIAP started nothing — the user's
+/// own controller is theirs to stop.
+pub(crate) async fn stop_controller(child: &SharedServerChild) {
+    if let Some(mut running) = child.lock().await.take() {
         tracing::info!("matter: stopping the controller GIAP started");
-        let _ = child.start_kill();
+        let _ = running.start_kill();
     }
 }
 
