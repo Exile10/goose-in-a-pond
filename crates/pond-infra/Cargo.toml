@@ -37,6 +37,10 @@ once_cell = { workspace = true }
 chacha20poly1305 = { workspace = true }
 
 [dev-dependencies]
+# `test-mocks` only in dev-deps: the one consumer is `secret_migration`'s
+# `#[cfg(test)]` module, which drives `MockSettingsRepository`. Unlike
+# pond-server, nothing here reaches for a mock outside `cfg(test)`.
+pond-core = { workspace = true, features = ["test-mocks"] }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
 serde_json = { workspace = true }

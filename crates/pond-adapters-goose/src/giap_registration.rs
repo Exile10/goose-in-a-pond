@@ -137,13 +137,15 @@ pub fn register_giap_extensions(
     let shared_http = pond_mcp_server::build_http_client();
 
     if settings.ext_news_enabled {
-        pond_mcp_server::init_news_deps(shared_http.clone(), settings_repo.clone());
+        // No settings repo: the Guardian and GNews keys live in the secret
+        // store, installed by `init_secret_deps` in pond-server (PAI-2 P2).
+        pond_mcp_server::init_news_deps(shared_http.clone());
         register_builtin_extension("giap-news", pond_mcp_server::spawn_news_server);
         registered.push("giap-news".into());
     }
 
     if settings.ext_finance_enabled {
-        pond_mcp_server::init_finance_deps(shared_http.clone(), settings_repo.clone());
+        pond_mcp_server::init_finance_deps(shared_http.clone());
         register_builtin_extension("giap-finance", pond_mcp_server::spawn_finance_server);
         registered.push("giap-finance".into());
     }

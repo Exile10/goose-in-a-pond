@@ -176,6 +176,11 @@ impl SettingsRepository for MockSettingsRepository {
         Ok(())
     }
 
+    async fn delete_key(&self, key: &str) -> Result<()> {
+        self.store.write().await.remove(key);
+        Ok(())
+    }
+
     async fn mark_user_set(&self, keys: &HashSet<String>) -> Result<()> {
         // Mirrors the adapter: only keys that already have a value are marked.
         let store = self.store.read().await;

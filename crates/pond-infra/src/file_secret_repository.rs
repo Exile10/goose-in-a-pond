@@ -9,6 +9,11 @@ use tokio::sync::RwLock;
 
 /// Encrypted file-based secret store at `$DATA_DIR/secrets.json`.
 ///
+/// This module was called `keyring_secret_repository` and there has never been
+/// a keyring in it (PAI-2 section 1.2, "There is no keyring"). Renamed in PAI-2
+/// P2 rather than left to imply a protection that did not exist; what does
+/// protect the file is P4's encryption, described below.
+///
 /// The file holds an XChaCha20-Poly1305 envelope (see [`crate::secret_crypto`])
 /// under a 32-byte key at `$DATA_DIR/secrets/master.key`, mode 0600 inside a
 /// 0700 directory, generated on first construction.
@@ -204,6 +209,11 @@ impl SecretRepository for FileSecretRepository {
         self.persist().await
     }
 
+    /// The FILE store only — deliberately does not consult the environment,
+    /// unlike [`SecretRepository::get`] and [`SecretRepository::has`].
+    /// [`crate::secret_migration`] uses this rather than `has()` to decide
+    /// whether a key has really been copied, because an env var of the same
+    /// name would otherwise look like evidence of a copy that never happened.
     async fn list_keys(&self) -> Result<Vec<String>> {
         let cache = self.cache.read().await;
         Ok(cache.keys().cloned().collect())

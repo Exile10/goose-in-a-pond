@@ -335,6 +335,13 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
     }
     return route.fulfill({ json: { keys: [] } });
   });
+  // The COLLECTION route. `secrets/**` above has a literal slash before the
+  // wildcard, so it does not match the bare `/api/v1/secrets` the Tools tab
+  // calls on mount (PAI-2 P2). Registered last on purpose: page.route is
+  // last-registered-wins, and this pattern is the more specific of the two.
+  await page.route("**/api/v1/secrets", (route) =>
+    route.fulfill({ json: { keys: [] } }),
+  );
 
   // Extensions secrets endpoint
   await page.route("**/api/v1/extensions/*/secrets", (route) => {

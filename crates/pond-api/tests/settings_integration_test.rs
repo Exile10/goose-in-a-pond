@@ -344,3 +344,104 @@ async fn get_weather_reports_disabled_without_provider() {
 
     assert_eq!(json.get("enabled").and_then(|v| v.as_bool()), Some(false));
 }
+
+/// PAI-2 P2: no credential material may come back out of `GET /settings`.
+///
+/// The handler is `serde_json::to_value(settings)` with no DTO and no
+/// redaction, so this is a property of the struct, not of the handler. The
+/// pond-core guard `no_settings_field_is_secret_shaped` asserts the same thing
+/// against `Settings::default()`; this one asserts it over real HTTP, after a
+/// write, which is the only version that would have caught a redaction that
+/// applied to the default but not to a configured value.
+#[tokio::test]
+async fn settings_response_never_carries_a_secret_shaped_key() {
+    let (app, _tmp) = make_app().await;
+
+    // An old client (or a stale phone build) still sends the legacy field.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings")
+                .header("content-type", "application/json")
+                .header("Authorization", "Bearer test-token")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "api_key_guardian": "leaked-guardian-key",
+                        "assistant_name": "Jarvis"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "an unknown field must not break the save for a client that has not been updated"
+    );
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/settings")
+                .header("Authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let obj = body.as_object().expect("settings is a JSON object");
+
+    // POSITIVE CONTROL, first: the request really reached the settings store.
+    // Without this, an error payload or an empty object satisfies both of the
+    // negative assertions below and the test reports the opposite of the truth.
+    assert_eq!(
+        obj.get("assistant_name").and_then(|v| v.as_str()),
+        Some("Jarvis"),
+        "the GET did not return real settings, so nothing below means anything"
+    );
+
+    const SECRET_WORDS: &[&str] = &[
+        "key",
+        "keys",
+        "token",
+        "tokens",
+        "secret",
+        "secrets",
+        "password",
+        "passwords",
+        "credential",
+        "credentials",
+        "apikey",
+        "passphrase",
+    ];
+    // A token BUDGET, not a bearer token. Mirrors NOT_ACTUALLY_SECRET in
+    // pond-core's guard; if the two ever disagree, one of them is wrong.
+    const NOT_ACTUALLY_SECRET: &[&str] = &["llm_max_tokens"];
+
+    let leaked: Vec<&String> = obj
+        .keys()
+        .filter(|k| {
+            k.split('_').any(|seg| SECRET_WORDS.contains(&seg))
+                && !NOT_ACTUALLY_SECRET.contains(&k.as_str())
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "GET /api/v1/settings returned secret-shaped field(s): {leaked:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&bytes).contains("leaked-guardian-key"),
+        "the value an old client sent came straight back out of GET /settings"
+    );
+}

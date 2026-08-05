@@ -2353,7 +2353,7 @@ async fn run_server(
     let secret_repo: Option<
         Arc<dyn pond_core::security::ports::secret::SecretRepository + Send + Sync>,
     > = {
-        match pond_infra::keyring_secret_repository::FileSecretRepository::new(&data_dir) {
+        match pond_infra::file_secret_repository::FileSecretRepository::new(&data_dir) {
             Ok(repo) => {
                 tracing::info!(
                     store = %data_dir.join("secrets.json").display(),
@@ -2387,6 +2387,43 @@ async fn run_server(
             }
         }
     };
+
+    // Hand the SAME instance to the MCP tool servers. One instance per process
+    // is a requirement, not tidiness: `FileSecretRepository` caches
+    // secrets.json in memory and rewrites it whole on `set`, so a second
+    // instance would serve a stale cache and clobber this one's writes.
+    // `spawn_news_server` / `spawn_finance_server` only fire at chat time, so
+    // installing here (after the agent backend was built) is in time.
+    if let Some(repo) = &secret_repo {
+        pond_mcp_server::init_secret_deps(repo.clone());
+
+        // PAI-2 P2: move any API key an existing pond already had in its
+        // settings table. The fields are gone from `Settings`, so an unmigrated
+        // row is simply ignored by `apply_key` — to the user that looks like
+        // their key vanished.
+        match pond_infra::secret_migration::migrate_api_keys_to_secret_repository(
+            &settings_repo,
+            repo,
+        )
+        .await
+        {
+            Ok(report) => {
+                if !report.left_in_place.is_empty() {
+                    tracing::warn!(
+                        keys = ?report.left_in_place,
+                        "API-key migration could not complete for these settings rows; they were \
+                         left in place so the values are not lost. They are no longer read."
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("API-key migration failed: {e}"),
+        }
+    } else {
+        tracing::warn!(
+            "no secret repository: third-party API keys are unavailable this run and the \
+             settings-to-secrets migration did not run"
+        );
+    }
 
     // Marketplace — curated registry of installable extensions.
     // Initialized before MCP auto-connect so startup can look up required_secrets.

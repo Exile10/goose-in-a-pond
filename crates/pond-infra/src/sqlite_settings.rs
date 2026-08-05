@@ -301,23 +301,10 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
-        // API keys
-        upsert!(
-            "api_key_guardian",
-            settings.api_key_guardian.as_deref().unwrap_or("")
-        );
-        upsert!(
-            "api_key_gnews",
-            settings.api_key_gnews.as_deref().unwrap_or("")
-        );
-        upsert!(
-            "api_key_finnhub",
-            settings.api_key_finnhub.as_deref().unwrap_or("")
-        );
-        upsert!(
-            "api_key_coingecko",
-            settings.api_key_coingecko.as_deref().unwrap_or("")
-        );
+        // API keys are NOT here: PAI-2 P2 moved them to `SecretRepository`.
+        // See `crate::secret_migration` for the one-time move of any row an
+        // existing pond already had. `searxng_url` is an endpoint, not a
+        // credential, and stays.
         upsert!("searxng_url", settings.searxng_url.as_deref().unwrap_or(""));
         // Embedding
         upsert!("active_embedding_model", &settings.active_embedding_model);
@@ -606,6 +593,14 @@ impl SettingsRepository for SqliteSettingsRepository {
         .bind(value)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn delete_key(&self, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -928,35 +923,10 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         // Data
         "telemetry_enabled" => s.telemetry_enabled = value == "true",
         "compact_encoding" => s.compact_encoding = value == "true",
-        // API keys
-        "api_key_guardian" => {
-            s.api_key_guardian = if value.is_empty() {
-                None
-            } else {
-                Some(value.to_string())
-            };
-        }
-        "api_key_gnews" => {
-            s.api_key_gnews = if value.is_empty() {
-                None
-            } else {
-                Some(value.to_string())
-            };
-        }
-        "api_key_finnhub" => {
-            s.api_key_finnhub = if value.is_empty() {
-                None
-            } else {
-                Some(value.to_string())
-            };
-        }
-        "api_key_coingecko" => {
-            s.api_key_coingecko = if value.is_empty() {
-                None
-            } else {
-                Some(value.to_string())
-            };
-        }
+        // `api_key_*` has no arm: PAI-2 P2 moved that material to
+        // `SecretRepository`. A legacy row left behind by a failed migration
+        // falls through to the `_ => {}` arm below and is ignored rather than
+        // re-hydrated onto a struct that `GET /settings` serialises.
         "searxng_url" => {
             s.searxng_url = if value.is_empty() {
                 None

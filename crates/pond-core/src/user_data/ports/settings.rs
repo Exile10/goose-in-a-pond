@@ -40,6 +40,18 @@ pub trait SettingsRepository: Send + Sync {
     /// [`SettingsRepository::mark_user_set`] for that.
     async fn set_key(&self, key: &str, value: String) -> Result<()>;
 
+    /// Delete a single setting row. Deleting an absent key is not an error.
+    ///
+    /// The default is `Err`, not `Ok(())`, and that is the point. Its only
+    /// caller is PAI-2 P2's one-time move of API-key material into the
+    /// `SecretRepository`, which deletes the ONLY other copy of a user's key.
+    /// A default `Ok(())` would let an adapter that cannot delete report that
+    /// it had, and the caller would believe the row was gone. Refusing means
+    /// the migration leaves the row in place, which is the safe direction.
+    async fn delete_key(&self, _key: &str) -> Result<()> {
+        anyhow::bail!("delete_key is not implemented for this SettingsRepository")
+    }
+
     /// Record that the user DELIBERATELY chose these keys.
     ///
     /// A stored row means only "something wrote this key" — server-side
