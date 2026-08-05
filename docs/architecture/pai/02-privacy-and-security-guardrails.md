@@ -218,7 +218,43 @@ onboarding is complete. `middleware/onboarding_guard.rs` already knows that stat
 
 ## 4. Phases
 
-- **P0 — do this first, ahead of any design work.** Make the auth allowlist method-aware. Every
+- **P0 — LANDED 2026-08-05.** `is_public_route` takes a `&Method`, and the allowlist is a
+  `PUBLIC_ROUTES: &[(Method, &str)]` table whose `{brace}` segments match exactly one path segment.
+  The four reproduced leaks are closed: `GET /settings` and `GET /profiles` now 401, while the
+  `PUT /settings` and `POST /profiles` that onboarding needs stay open — same paths, different
+  answers, which is the whole point. `DELETE /profiles/{id}` was public because of a
+  `starts_with("/profiles/")` prefix test that also covered `GET` and every other method on any
+  sub-path; segment-wise matching ends that.
+
+  **Three build-breaking guards, because the allowlist and the router are two lists that must agree
+  and nothing structurally forced them to.** All three parse `routes.rs` through `include_str!`, so
+  they run at compile time with no runtime file IO and cannot drift:
+  `every_protected_route_requires_a_token` (P0's stated acceptance test),
+  `public_router_and_allowlist_agree` (drift in *either* direction — a public route missing from the
+  allowlist 401s during onboarding, an allowlist entry with no route is an exemption that outlives
+  its reason), and `the_pai2_p0_leaks_are_closed`, which states the four leaks as the HTTP requests
+  that leaked.
+
+  **Two exceptions are real** and are listed individually rather than skipped by prefix, so a third
+  `/oauth/*` route cannot join them silently: `GET /oauth/callback` (the browser arrives from the
+  provider with no token; the PKCE state nonce authenticates it) and `POST /oauth/refresh` (checked
+  against `internal_extension_token` inside the handler). Both live in the *protected* router, which
+  is why "every route in `protected_routes` requires a token" could not be a blanket assertion — the
+  router's split is about **onboarding**, and `is_public_route` is about **auth**. Two different
+  axes that read like one.
+
+  **The guards were mutation-tested rather than trusted.** Re-adding `(Method::GET, "/settings")` to
+  the table fails all three, with the offending route named. Worth the two minutes: this programme
+  has three recorded vacuous-test incidents, and a guard that cannot fail is worse than none because
+  it reads as coverage.
+
+  Verified live: `scripts/live-test.sh --ui` passes end to end — all five probed routes 401 with no
+  token and the bypass off, 37 API checks, 4/4 live UI. `pond-api` 109 lib tests (105 + 4), fmt and
+  clippy clean.
+
+  Original phase text, for the record:
+
+- **P0 (as designed) — do this first, ahead of any design work.** Make the auth allowlist method-aware. Every
   entry in `is_public_route` is written as though it were method-scoped and none of them are. Pass
   the `Method` alongside the path, enumerate `(Method, path)` pairs rather than paths, and add a
   test asserting that every route in `protected_routes` requires a token — the
