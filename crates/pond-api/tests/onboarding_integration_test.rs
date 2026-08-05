@@ -267,12 +267,69 @@ async fn settings_is_blocked_before_onboarding() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/settings")
+                // The token is what makes this measure the ONBOARDING gate.
+                // Auth runs first, so without it the answer is 401 and this
+                // test says nothing about onboarding at all. Every sibling
+                // here already carried one; this test did not need to while
+                // `GET /settings` was wrongly on the public allowlist
+                // (PAI-2 P0), because it never reached auth to be stopped.
+                .header("Authorization", "Bearer test-token")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
+}
+
+/// PAI-2 P0, over real HTTP rather than against `is_public_route` directly.
+///
+/// `GET /settings` serialises the whole `Settings` struct, API keys included,
+/// and answered **200 with no token at all** until the allowlist became
+/// method-aware. The unit guards in `middleware` prove the table is right; this
+/// proves the request is actually refused once it has been through the router,
+/// the middleware stack and the onboarding guard in their real order.
+#[tokio::test]
+async fn get_settings_without_a_token_is_unauthorized() {
+    let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
+    let res: Response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Onboarding is complete, so 403 cannot be masking this: the only thing
+    // left to refuse the request is auth.
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The other half of the same fix: the write onboarding depends on stays open.
+///
+/// If this ever starts returning 401, the wizard cannot save anything before a
+/// device has paired, and onboarding deadlocks on a pond nobody can finish
+/// setting up.
+#[tokio::test]
+async fn put_settings_without_a_token_is_still_allowed() {
+    let (app, _tmp) = app_with_step(Some(OnboardingStep::Completed)).await;
+    let res: Response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"user_name":"Onboarding"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "PUT /settings must stay reachable without a token, or onboarding cannot save"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────
