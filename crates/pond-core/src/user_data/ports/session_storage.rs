@@ -194,6 +194,36 @@ pub trait SessionStorage: Send + Sync {
         Ok(()) // default no-op for backward compat
     }
 
+    /// Write an identity **only if** it is at least as strong as what is stored.
+    ///
+    /// The read-compare-write in the handlers is not safe on its own. Two
+    /// requests can both read `Unknown` and both pass
+    /// [`SessionIdentity::supersedes`], after which the later write wins
+    /// whatever its rank -- so a face match landing a millisecond after a
+    /// member tapped "this is Liz" takes the session, for a different person,
+    /// on weaker evidence. That is the exact downgrade `supersedes` exists to
+    /// refuse, and it is reachable today.
+    ///
+    /// Implementations must do the comparison inside the write itself. Returns
+    /// `true` when the write happened, `false` when a stronger identification
+    /// already held the session -- which is a normal outcome, not an error.
+    ///
+    /// The default implementation is **not** race-free; it falls back to the
+    /// unconditional write so mocks and legacy adapters keep compiling. Real
+    /// adapters override it.
+    async fn set_session_identity_if_stronger(
+        &self,
+        session_id: &str,
+        identity: &SessionIdentity,
+    ) -> Result<bool, SessionStorageError> {
+        let existing = self.get_session_identity(session_id).await?;
+        if !identity.supersedes(&existing) {
+            return Ok(false);
+        }
+        self.set_session_identity(session_id, identity).await?;
+        Ok(true)
+    }
+
     /// The tool GROUPS (MCP extension names) selected for this session, if any.
     ///
     /// Phase D2 chooses a session's tool surface once, from its opening message,

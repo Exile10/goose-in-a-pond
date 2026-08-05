@@ -19,7 +19,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 1 | GIAP needs to be **proactive**, not just reactive | [PAI-7](./07-proactive-intelligence.md) | DESIGNED |
 | 2 | Requires the ability of the model to **think** | [PAI-5](./05-reasoning-and-thinking.md) | DESIGNED |
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
-| 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **P1, P2, P3, P6, P7, P8 LANDED**; P4/P5 part-landed with a named hole |
+| 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **P1-P3, P5-P8 LANDED**; P4 all but the `SecurityPolicy` deny matrix |
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2 LANDED**; P3-P6 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
@@ -29,8 +29,9 @@ They are equally weighted and mutually interdependent. `DESIGNED` means the docu
 current-state claims were verified against code; it does **not** mean any code has changed. `LANDED`
 is stamped per phase, and means the gates in 2.3 were run and passed.
 
-Implementation has begun: PAI-3 P1/P2 and PAI-1 P1/P2/P3/P6/P7/P8 are in; P4 and P5 are part-landed
-with a named, unfixed hole each (see section 4). Everything else is still design only.
+Implementation has begun: PAI-3 P1/P2, and PAI-1 P1-P3 and P5-P8. PAI-1 P4 has its write side, its
+guest gate and a race-free identity write; what remains of it is the `SecurityPolicy` deny matrix,
+which is shared with PAI-2 P1. Everything else is still design only.
 
 ---
 
@@ -500,7 +501,37 @@ goose rlib. Do not diagnose this as a code fault.
 breakage is documentation only -- `docs/api.md` still specifies `204 no body` for profile delete and
 documents none of the four session-identity routes.
 
-### Next: PAI-4's deny matrix, the MCP memory bypass, and the identity TOCTOU
+**2026-08-04 (late) — PAI-1's two named holes closed.**
+
+**The guest-reachable memory tools.** Closed one layer above where the audit found them.
+`recall_memories` and `forget_memory` carry no session of their own and `MemoryMcpServer` is
+process-global, so there is nowhere inside them to check. Instead a `Guest` session is never given
+`giap-memory` (or draft, audit, vision, sensors) at all -- subtracted **after** `select_groups`,
+since those groups are `core` and selection puts them back unconditionally.
+
+Worth remembering as a shape: **when the thing you want to check has no identity, move the check to
+the layer that hands it out.**
+
+I did not thread a scope into the MCP server per turn, which would additionally scope an *Owner*'s
+tool calls. The only mechanism available is `set_current_session_id`, a process-global
+`RwLock<String>` that the SSE semaphore already permits more than one turn to race on. Using it
+would trade a guest hole for a misattribution bug, which is the worse of the two.
+
+**The TOCTOU.** `set_session_identity_if_stronger` does the rank comparison inside the `UPDATE`,
+building the `CASE` from `IdentificationSource::ALL_RANKED` so the ordering stays domain policy. A
+test pins `ALL_RANKED` against `rank()` in both directions -- if they ever drift, the conditional
+write would enforce one ordering while every in-memory check enforced another, and the disagreement
+would only ever show up as an occasional unreproducible downgrade.
+
+Zero rows updated is ambiguous between "no such session" and "not superseded", so the adapter
+disambiguates with a follow-up count rather than guessing. One is a 404, the other a normal refusal.
+
+**Two disk incidents in one session, both disguised.** A `cc` linker failure on `pond-mcp-server`
+that was the allowance, not the code; and the SIGILL earlier that was `target-cpu=native`. Section 3
+covers both. The pattern: **on this container, a build failure is more likely to be the environment
+than your change** -- check `df` and `RUSTFLAGS` before reading the diff.
+
+### Next: the `SecurityPolicy` deny matrix (PAI-1 P4 / PAI-2 P1), then PAI-3 P3
 
 `TokenCounter` port, GGUF-backed adapter, chars/4 as the declared fallback, overshoot-feedback
 correction retained as the safety net. `turn_trimmer.rs:89-91` is the estimator to displace, and

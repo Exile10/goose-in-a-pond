@@ -11479,34 +11479,21 @@ async fn identify_session_user_handler(
     let mut bound = false;
     if result.identified {
         if let Some(pid) = result.profile_id.clone() {
-            // NOT `unwrap_or(unknown())`. If the read fails we do not know what
-            // is bound, and treating "I could not tell" as "nobody is bound"
-            // lets this face match take over a paired-device session -- the
-            // exact downgrade `supersedes` exists to refuse. Access narrows on
-            // failure (invariant 2), so a broken read refuses the write.
-            let existing = state
-                .session_storage
-                .get_session_identity(&session_id)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": e.to_string()})),
-                    )
-                })?;
             let proposed = SessionIdentity {
                 profile_id: Some(pid),
                 source: IdentificationSource::Face,
                 confidence: result.confidence,
             };
-            if proposed.supersedes(&existing) {
-                state
-                    .session_storage
-                    .set_session_identity(&session_id, &proposed)
-                    .await
-                    .map_err(identity_write_error)?;
-                bound = true;
-            }
+            // One atomic conditional write, not read-compare-write. Two
+            // requests could both read `Unknown` and both pass `supersedes`,
+            // after which the later write won whatever its rank -- so a face
+            // match landing a millisecond after somebody tapped "this is Liz"
+            // took the session, for a different person, on weaker evidence.
+            bound = state
+                .session_storage
+                .set_session_identity_if_stronger(&session_id, &proposed)
+                .await
+                .map_err(identity_write_error)?;
         }
     }
 
@@ -11547,20 +11534,6 @@ async fn set_session_user_handler(
         ));
     }
 
-    // Same read-compare-write as the face path, and the same reason: a person
-    // saying who they are must not silently displace a device that proved it.
-    // A failed read refuses the write rather than assuming nobody is bound.
-    let existing = state
-        .session_storage
-        .get_session_identity(&session_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
-
     let proposed = SessionIdentity {
         profile_id: Some(req.profile_id.clone()),
         source: IdentificationSource::Explicit,
@@ -11570,7 +11543,21 @@ async fn set_session_user_handler(
         confidence: None,
     };
 
-    if !proposed.supersedes(&existing) {
+    // Atomic, for the same reason as the face path above.
+    let bound = state
+        .session_storage
+        .set_session_identity_if_stronger(&session_id, &proposed)
+        .await
+        .map_err(identity_write_error)?;
+
+    if !bound {
+        // Report what actually holds the session, read after the refusal so it
+        // reflects the state that won rather than a pre-write guess.
+        let existing = state
+            .session_storage
+            .get_session_identity(&session_id)
+            .await
+            .unwrap_or_else(|_| SessionIdentity::unknown());
         return Ok(Json(json!({
             "session_id": session_id,
             "profile_id": existing.profile_id,
@@ -11579,12 +11566,6 @@ async fn set_session_user_handler(
             "reason": "a stronger identification already holds this session",
         })));
     }
-
-    state
-        .session_storage
-        .set_session_identity(&session_id, &proposed)
-        .await
-        .map_err(identity_write_error)?;
 
     Ok(Json(json!({
         "session_id": session_id,

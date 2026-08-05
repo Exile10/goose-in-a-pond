@@ -1812,6 +1812,7 @@ impl GooseAdapter {
         giap_session_id: &str,
         first_message: &str,
         memories: &str,
+        scope: &ProfileScope,
     ) -> Vec<String> {
         use pond_core::mcp::services::tool_selection as sel;
 
@@ -1887,11 +1888,34 @@ impl GooseAdapter {
             _ => None,
         };
 
-        let selection = sel::select_groups(
+        let mut selection = sel::select_groups(
             &available,
             scores.as_deref(),
             sel::DEFAULT_RELEVANCE_THRESHOLD,
         );
+
+        // PAI-1 P5. An unidentified speaker never gets the personal-data
+        // groups, whatever the scorer decided. Subtracted AFTER selection on
+        // purpose: `giap-memory` and `giap-draft` are core, so filtering the
+        // candidates going in would not stick -- `select_groups` puts core
+        // groups back unconditionally.
+        //
+        // This is the layer that actually closes the hole. Suppressing memory
+        // injection stops a guest being TOLD anything; removing the tools stops
+        // the model being ABLE to look. `recall_memories` and `forget_memory`
+        // carry no session of their own, so there is nowhere lower to check.
+        if scope.excludes_everything() {
+            let denied = pond_core::mcp::domain::tool_group::groups_denied_to_guests();
+            let before = selection.groups.len();
+            selection.groups.retain(|g| !denied.contains(&g.as_str()));
+            if selection.groups.len() != before {
+                tracing::info!(
+                    session_id = %giap_session_id,
+                    removed = before - selection.groups.len(),
+                    "unidentified speaker: personal-data tool groups withheld"
+                );
+            }
+        }
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             if let Some(scores) = scores.as_deref() {
@@ -2713,6 +2737,7 @@ impl GooseAdapter {
                     &session_id,
                     &request.message,
                     &memory_block_for_user_msg,
+                    &turn_scope,
                 )
                 .await;
             let selected: HashSet<String> =
