@@ -16,7 +16,15 @@
 //! shared handle the control port reads, and re-runs the bridge — which calls
 //! `start_listening` again and resyncs the fabric. A matter-server restart no
 //! longer needs a pond-server restart.
+//!
+//! Reconnecting only recovers a controller that is up. When the controller
+//! *process* has died there is nothing to reconnect to, so after
+//! [`RESPAWN_AFTER`] consecutive failures the supervisor re-runs the local
+//! controller setup before the next attempt, and keeps doing so on that cadence
+//! until it is back. A killed matter-server no longer needs the user to toggle
+//! Matter off and on.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,12 +37,46 @@ use tokio::sync::mpsc;
 use crate::client::{MatterClient, MatterEvent};
 use crate::control::{NodeCache, SharedMatterClient};
 use crate::protocol::{node_to_device, sensor_reading_from_update, MatterNode};
+use crate::server_setup::{revive_local_controller, Revival, SharedServerChild};
 
 /// Reconnect backoff bounds. Exponential from `RECONNECT_BASE` doubling to
 /// `RECONNECT_MAX`, with equal jitter so several Ponds pointed at one restarted
 /// matter-server don't reconnect in lockstep.
 const RECONNECT_BASE: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
+
+/// Consecutive reconnect failures before the supervisor stops assuming the
+/// controller is merely unreachable and tries to restart it. Three is past the
+/// blip a restarting controller causes (~3.5s of backoff) while still well
+/// inside the time a user would wait before reaching for the toggle themselves.
+const RESPAWN_AFTER: u32 = 3;
+
+/// How long a revived controller gets to start listening. Shorter than the
+/// startup budget: by the time the supervisor runs, the venv already exists, so
+/// this waits on a process start rather than on a `pip install`.
+const RESPAWN_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Where the supervisor reconnects to, and what it needs to bring the
+/// controller back when reconnecting is not enough.
+pub struct SupervisorConfig {
+    /// The matter-server WebSocket URL. Also decides whether the controller is
+    /// GIAP's to restart: only a loopback URL is.
+    pub url: String,
+    /// GIAP's data dir — where the controller's venv and fabric storage live.
+    pub data_dir: PathBuf,
+    /// The controller GIAP started, if any. A respawn replaces the dead handle
+    /// here, so the reconciler's teardown still kills the live process.
+    pub child: SharedServerChild,
+}
+
+/// Should the reconnect about to be made (1-based `attempt`) re-run controller
+/// setup first? True on the attempt following every [`RESPAWN_AFTER`] failures,
+/// so a controller that stays dead keeps being retried for as long as the
+/// outage lasts rather than once and never again. Pure, so the schedule is
+/// unit-testable without sleeping.
+fn should_respawn_controller(attempt: u32) -> bool {
+    attempt > 1 && (attempt - 1).is_multiple_of(RESPAWN_AFTER)
+}
 
 /// Backoff delay for reconnect attempt `attempt` (1-based), with equal jitter.
 /// Pure so the schedule is unit-testable without sleeping.
@@ -166,11 +208,15 @@ pub async fn run_matter_bridge(
 /// keeps working without being rebuilt), and re-runs the bridge — which calls
 /// `start_listening` again and resyncs every node into the cache and registry.
 ///
+/// When reconnecting keeps failing it also revives the controller itself — see
+/// [`should_respawn_controller`] — because a process that has exited will never
+/// answer a reconnect, however long the loop runs.
+///
 /// `client` / `events` are the already-established initial connection (from the
 /// startup connect, which also decided Matter-vs-logging-stub). This never
 /// returns while the process lives; it is expected to be `tokio::spawn`ed.
 pub async fn run_matter_supervisor(
-    url: String,
+    config: SupervisorConfig,
     client_cell: SharedMatterClient,
     mut client: Arc<MatterClient>,
     mut events: mpsc::Receiver<MatterEvent>,
@@ -178,6 +224,12 @@ pub async fn run_matter_supervisor(
     registry: Arc<dyn DeviceRegistry + Send + Sync>,
     bus: Arc<dyn EventBus>,
 ) {
+    let SupervisorConfig {
+        url,
+        data_dir,
+        child,
+    } = config;
+
     loop {
         match run_matter_bridge(
             client.clone(),
@@ -196,6 +248,26 @@ pub async fn run_matter_supervisor(
         // the next run_matter_bridge calls start_listening.
         let mut attempt: u32 = 1;
         let (new_client, new_events) = loop {
+            // Enough failures in a row means the controller is probably gone
+            // rather than busy — reconnecting cannot fix that, restarting can.
+            if should_respawn_controller(attempt) {
+                match revive_local_controller(&data_dir, &url, &child, RESPAWN_READY_TIMEOUT).await
+                {
+                    Ok(Revival::Restarted) => tracing::info!(
+                        url = %url,
+                        "matter: controller was not running; restarted it"
+                    ),
+                    // Reused: the controller is up, so the fault is in the
+                    // connection and the backoff below is the right answer.
+                    // NotLocal: another host's controller, not ours to restart.
+                    Ok(Revival::Reused | Revival::NotLocal) => {}
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "matter: controller restart failed; will retry with the next attempts"
+                    ),
+                }
+            }
+
             let delay = reconnect_backoff(attempt, rand::random::<f64>());
             tokio::time::sleep(delay).await;
             match MatterClient::connect(&url).await {
@@ -239,5 +311,25 @@ mod backoff_tests {
         // [15s, 30s].
         let full = reconnect_backoff(20, 1.0);
         assert!(full >= Duration::from_secs(15) && full <= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn controller_revival_waits_for_repeated_failures_then_keeps_retrying() {
+        // A controller merely restarting is back within a couple of attempts.
+        // Reviving on those would race its own startup and, worse, treat every
+        // ordinary blip as a dead process.
+        assert!(!should_respawn_controller(1));
+        assert!(!should_respawn_controller(2));
+        assert!(!should_respawn_controller(3));
+
+        // Three failures in a row: try reviving before the fourth attempt.
+        assert!(should_respawn_controller(4));
+
+        // Still dead: keep trying on the same cadence rather than giving up
+        // after one go, which would leave Matter down for the whole outage.
+        assert!(!should_respawn_controller(5));
+        assert!(!should_respawn_controller(6));
+        assert!(should_respawn_controller(7));
+        assert!(should_respawn_controller(10));
     }
 }
