@@ -796,7 +796,18 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "vision_classifier_model" => s.vision_classifier_model = value.to_string(),
         // Matter (#195)
         "matter_enabled" => s.matter_enabled = value == "true",
-        "matter_ws_url" => s.matter_ws_url = value.to_string(),
+        // An empty row must not defeat the default. `get` starts from
+        // `Settings::default()` and overwrites it row by row, so a stored empty
+        // string would leave no address at all — and the Devices tab renders
+        // the default as the input's *placeholder*, making a blank field
+        // indistinguishable from a set one. The user then gets "must be a
+        // WebSocket URL" about a field that looks filled in. Blank means "never
+        // chosen", which is what the default is for.
+        "matter_ws_url" => {
+            if !value.trim().is_empty() {
+                s.matter_ws_url = value.to_string();
+            }
+        }
         // Privacy / sensor access
         "mic_enabled" => s.mic_enabled = value == "true",
         "cameras_enabled" => s.cameras_enabled = value == "true",
@@ -1018,6 +1029,42 @@ mod tests {
         assert!(!got.cameras_enabled);
         assert!(got.cloud_fallback_enabled);
         assert_eq!(got.home_name, "The Anyumba Home");
+    }
+
+    /// A stored empty Matter address must not defeat the default. `get` starts
+    /// from `Settings::default()` and overwrites row by row, so an empty row
+    /// used to leave no address at all — and because the Devices tab renders
+    /// the default as the input's *placeholder*, the user saw a filled-looking
+    /// field and an error saying it was invalid.
+    #[tokio::test]
+    async fn an_empty_matter_url_falls_back_to_the_default() {
+        let repo = fresh_repo().await;
+        let default_url = Settings::default().matter_ws_url;
+        assert!(!default_url.is_empty(), "the default is the fallback here");
+
+        repo.set_key("matter_ws_url", String::new()).await.unwrap();
+        assert_eq!(repo.get().await.unwrap().matter_ws_url, default_url);
+
+        // Whitespace is just as blank to the user, and to the URL parser.
+        repo.set_key("matter_ws_url", "   ".to_string())
+            .await
+            .unwrap();
+        assert_eq!(repo.get().await.unwrap().matter_ws_url, default_url);
+    }
+
+    /// The fallback must not swallow a real address: someone running the
+    /// controller on another host has to keep the URL they chose.
+    #[tokio::test]
+    async fn a_stored_matter_url_still_wins_over_the_default() {
+        let repo = fresh_repo().await;
+
+        repo.set_key("matter_ws_url", "ws://192.168.1.50:5580/ws".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get().await.unwrap().matter_ws_url,
+            "ws://192.168.1.50:5580/ws"
+        );
     }
 
     /// Perturb every scalar field of a serialised `Settings` to a value that
