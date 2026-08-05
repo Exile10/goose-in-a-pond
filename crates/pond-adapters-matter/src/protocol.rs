@@ -26,12 +26,22 @@ pub const CLUSTER_BASIC_INFORMATION: u32 = 40;
 /// NodeLabel — the writable, user-assigned name on Basic Information. Preferred
 /// by [`node_to_device`] over the vendor ProductName.
 pub const ATTR_NODE_LABEL: u32 = 5;
+/// Descriptor — every endpoint has one, and its DeviceTypeList states what the
+/// endpoint *is*. The authority on device type: clusters describe what can be
+/// driven, which is a different question (an On/Off plug and an On/Off bulb are
+/// the same cluster).
+pub const CLUSTER_DESCRIPTOR: u32 = 29;
+pub const CLUSTER_AIR_QUALITY: u32 = 91;
+pub const CLUSTER_SMOKE_CO_ALARM: u32 = 92;
 pub const CLUSTER_BOOLEAN_STATE: u32 = 69;
 pub const CLUSTER_DOOR_LOCK: u32 = 257;
 pub const CLUSTER_WINDOW_COVERING: u32 = 258;
 pub const CLUSTER_FAN_CONTROL: u32 = 514;
 pub const CLUSTER_THERMOSTAT: u32 = 513;
 pub const CLUSTER_COLOR_CONTROL: u32 = 768;
+pub const CLUSTER_ILLUMINANCE: u32 = 1024;
+pub const CLUSTER_PRESSURE: u32 = 1027;
+pub const CLUSTER_FLOW: u32 = 1028;
 pub const CLUSTER_TEMPERATURE: u32 = 1026;
 pub const CLUSTER_HUMIDITY: u32 = 1029;
 pub const CLUSTER_OCCUPANCY: u32 = 1030;
@@ -48,6 +58,83 @@ pub const ATTR_FAN_MODE: u32 = 0;
 /// keeps the two in step, so there is no need to pick a discrete step here.
 pub const FAN_MODE_OFF: u8 = 0;
 pub const FAN_MODE_ON: u8 = 4;
+
+/// Matter device type ids (Descriptor DeviceTypeList), grouped onto the GIAP
+/// types the UI has icons for. Ids are from the Matter Device Library; the
+/// grouping is ours — a dishwasher and a washing machine are both "appliance"
+/// as far as anything GIAP shows or says is concerned.
+const DEVICE_TYPES: &[(u32, &str)] = &[
+    // Lighting
+    (0x0100, "light"), // On/Off Light
+    (0x0101, "light"), // Dimmable Light
+    (0x010C, "light"), // Colour Temperature Light
+    (0x010D, "light"), // Extended Colour Light
+    // Plugs — the pair of clusters alone cannot tell these from a bulb, which
+    // is why a plug used to arrive wearing a lightbulb.
+    (0x010A, "plug"), // On/Off Plug-in Unit
+    (0x010B, "plug"), // Dimmable Plug-in Unit
+    // Closures
+    (0x000A, "lock"),     // Door Lock
+    (0x0202, "covering"), // Window Covering
+    // Climate and air
+    (0x0301, "thermostat"), // Thermostat
+    (0x0072, "thermostat"), // Room Air Conditioner
+    (0x002B, "fan"),        // Fan
+    (0x002C, "air"),        // Air Purifier
+    // Sensors
+    (0x0015, "sensor"), // Contact Sensor
+    (0x002D, "sensor"), // Air Quality Sensor
+    (0x0106, "sensor"), // Light Sensor
+    (0x0107, "sensor"), // Occupancy Sensor
+    (0x0302, "sensor"), // Temperature Sensor
+    (0x0305, "sensor"), // Pressure Sensor
+    (0x0306, "sensor"), // Flow Sensor
+    (0x0307, "sensor"), // Humidity Sensor
+    // An alarm is not a sensor to a user: it is the thing that wakes them.
+    (0x0076, "alarm"), // Smoke/CO Alarm
+    // Appliances
+    (0x0073, "appliance"), // Laundry Washer
+    (0x0075, "appliance"), // Dishwasher
+    (0x0074, "vacuum"),    // Robotic Vacuum Cleaner
+    (0x0303, "pump"),      // Pump
+    // Media
+    (0x0023, "media"), // Casting Video Player
+    (0x0028, "media"), // Basic Video Player
+];
+
+/// The GIAP device type stated by the node itself, if it says.
+///
+/// Endpoint 0 is the Root Node (0x0016) on every device and never describes the
+/// application, so it is skipped. The first application endpoint that names a
+/// type GIAP knows wins; a composed device (a fan inside an air purifier) is
+/// reported as whatever its first endpoint claims, which is what its own UI
+/// calls it.
+pub fn device_type_from_descriptor(node: &MatterNode) -> Option<&'static str> {
+    let mut endpoints: Vec<(u16, &Value)> = node
+        .attributes
+        .iter()
+        .filter_map(|(key, value)| {
+            let mut parts = key.split('/');
+            let endpoint: u16 = parts.next()?.parse().ok()?;
+            let cluster: u32 = parts.next()?.parse().ok()?;
+            let attribute: u32 = parts.next()?.parse().ok()?;
+            (cluster == CLUSTER_DESCRIPTOR && attribute == 0 && endpoint != 0)
+                .then_some((endpoint, value))
+        })
+        .collect();
+    endpoints.sort_by_key(|(endpoint, _)| *endpoint);
+
+    endpoints.into_iter().find_map(|(_, value)| {
+        // DeviceTypeList entries are structs keyed by field number; "0" is the
+        // device type id, "1" its revision.
+        value.as_array()?.iter().find_map(|entry| {
+            let id = entry.get("0").and_then(Value::as_u64)? as u32;
+            DEVICE_TYPES
+                .iter()
+                .find_map(|(known, giap)| (*known == id).then_some(*giap))
+        })
+    })
+}
 
 /// A commissioned node as reported by `start_listening` / node events.
 #[derive(Debug, Clone, Deserialize)]
@@ -190,7 +277,11 @@ pub fn node_to_device(node: &MatterNode) -> Device {
         capabilities.push("lock".to_string());
     }
 
-    let device_type = if has(CLUSTER_DOOR_LOCK) {
+    // The node's own word first. Clusters can only say what is drivable, which
+    // is why every On/Off appliance used to arrive as a light.
+    let device_type = if let Some(stated) = device_type_from_descriptor(node) {
+        stated
+    } else if has(CLUSTER_DOOR_LOCK) {
         "lock"
     } else if has(CLUSTER_THERMOSTAT) {
         "thermostat"
@@ -260,6 +351,19 @@ pub fn sensor_reading_from_update(
         CLUSTER_TEMPERATURE => ("temperature", value.as_i64()? as f64 / 100.0, "C"),
         // Hundredths of a percent.
         CLUSTER_HUMIDITY => ("humidity", value.as_i64()? as f64 / 100.0, "%"),
+        // Lux, reported as a log-scaled value; the raw measurement is what a
+        // rule threshold compares, so it is passed through unconverted.
+        CLUSTER_ILLUMINANCE => ("illuminance", value.as_i64()? as f64, "lux"),
+        // Tenths of a kPa.
+        CLUSTER_PRESSURE => ("pressure", value.as_i64()? as f64 / 10.0, "kPa"),
+        // Tenths of a cubic metre per hour.
+        CLUSTER_FLOW => ("flow", value.as_i64()? as f64 / 10.0, "m3/h"),
+        // An ordinal: 0 unknown, 1 good, rising to 6 extremely poor. Kept as
+        // the ordinal rather than invented units, so the scale stays the
+        // device's own.
+        CLUSTER_AIR_QUALITY => ("air_quality", value.as_u64()? as f64, "level"),
+        // Alarm state: 0 normal, non-zero means it is sounding.
+        CLUSTER_SMOKE_CO_ALARM => ("smoke_alarm", value.as_u64()? as f64, "state"),
         _ => return None,
     };
 
@@ -348,6 +452,121 @@ mod tests {
             vec!["power", "fan_speed"],
             "power must not be listed twice when both clusters are present"
         );
+    }
+
+    /// A node that states its type the way every real one does: Descriptor
+    /// (cluster 29) attribute 0 on the application endpoint. `device` is the
+    /// Matter device type id.
+    fn described_node(node_id: u64, device: u32, extra: &[(&str, Value)]) -> MatterNode {
+        let mut attributes = json!({
+            "0/29/0": [{ "0": 22, "1": 1 }],
+            "1/29/0": [{ "0": device, "1": 1 }],
+        });
+        for (path, value) in extra {
+            attributes[path] = value.clone();
+        }
+        serde_json::from_value(json!({
+            "node_id": node_id,
+            "available": true,
+            "attributes": attributes,
+        }))
+        .unwrap()
+    }
+
+    /// The regression that started this: a plug and a bulb are both On/Off, so
+    /// cluster inference called every plug a light and the UI drew a lightbulb
+    /// on it. The node says which it is.
+    #[test]
+    fn a_plug_is_a_plug_even_though_it_looks_like_a_light() {
+        let plug = described_node(30, 0x010A, &[("1/6/0", json!(false))]);
+        assert_eq!(node_to_device(&plug).device_type, "plug");
+
+        // And the bulb it was indistinguishable from is still a light.
+        let bulb = described_node(31, 0x0100, &[("1/6/0", json!(false))]);
+        assert_eq!(node_to_device(&bulb).device_type, "light");
+    }
+
+    /// The types that used to land as the generic "matter" with a Monitor icon.
+    #[test]
+    fn appliances_alarms_and_coverings_get_their_own_types() {
+        for (id, want) in [
+            (0x0075u32, "appliance"), // Dishwasher
+            (0x0073, "appliance"),    // Laundry Washer
+            (0x0303, "pump"),         // Pump
+            (0x0028, "media"),        // Basic Video Player
+            (0x0074, "vacuum"),       // Robotic Vacuum
+            (0x0076, "alarm"),        // Smoke/CO Alarm
+            (0x0202, "covering"),     // Window Covering
+            (0x002C, "air"),          // Air Purifier
+            (0x002D, "sensor"),       // Air Quality Sensor
+        ] {
+            let node = described_node(40, id, &[]);
+            assert_eq!(
+                node_to_device(&node).device_type,
+                want,
+                "device type 0x{id:04X}"
+            );
+        }
+    }
+
+    /// Endpoint 0 is the Root Node on every device. Reading it would type the
+    /// whole fabric as one thing.
+    #[test]
+    fn the_root_endpoint_is_not_mistaken_for_the_device() {
+        let node = described_node(41, 0x0075, &[]);
+        assert_eq!(device_type_from_descriptor(&node), Some("appliance"));
+
+        // A node with only the root endpoint states nothing about itself.
+        let root_only: MatterNode = serde_json::from_value(json!({
+            "node_id": 42,
+            "available": true,
+            "attributes": { "0/29/0": [{ "0": 22, "1": 1 }] },
+        }))
+        .unwrap();
+        assert_eq!(device_type_from_descriptor(&root_only), None);
+    }
+
+    /// A node with no readable descriptor — an older device, or one whose
+    /// descriptor GIAP does not recognise — must behave exactly as before.
+    #[test]
+    fn without_a_descriptor_the_cluster_inference_still_decides() {
+        assert_eq!(device_type_from_descriptor(&light_node()), None);
+        assert_eq!(node_to_device(&light_node()).device_type, "light");
+
+        // An unknown device type id falls through to the clusters too.
+        let unknown = described_node(43, 0xBEEF, &[("1/6/0", json!(false))]);
+        assert_eq!(node_to_device(&unknown).device_type, "light");
+    }
+
+    #[test]
+    fn the_added_sensor_clusters_produce_readings_with_their_units() {
+        let cases = [
+            (
+                CLUSTER_ILLUMINANCE,
+                json!(1200),
+                "illuminance",
+                1200.0,
+                "lux",
+            ),
+            (CLUSTER_PRESSURE, json!(1013), "pressure", 101.3, "kPa"),
+            (CLUSTER_FLOW, json!(25), "flow", 2.5, "m3/h"),
+            (CLUSTER_AIR_QUALITY, json!(3), "air_quality", 3.0, "level"),
+            (
+                CLUSTER_SMOKE_CO_ALARM,
+                json!(1),
+                "smoke_alarm",
+                1.0,
+                "state",
+            ),
+        ];
+        for (cluster, raw, kind, value, unit) in cases {
+            let reading = sensor_reading_from_update(9, &format!("1/{cluster}/0"), &raw)
+                .unwrap_or_else(|| panic!("cluster {cluster} should report"));
+            assert_eq!(reading.sensor_type, kind);
+            assert!((reading.value - value).abs() < f64::EPSILON, "{kind}");
+            assert_eq!(reading.unit, unit);
+            assert_eq!(reading.device_id, "matter-9");
+        }
     }
 
     fn light_node() -> MatterNode {
