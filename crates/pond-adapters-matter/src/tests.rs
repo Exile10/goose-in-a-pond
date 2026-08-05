@@ -157,6 +157,20 @@ fn light_node_json() -> Value {
     })
 }
 
+/// The Matter Virtual Device's fan as commissioned on 2026-08-05: Fan Control
+/// on endpoint 1, and no On/Off cluster anywhere on the node.
+fn fan_node_json() -> Value {
+    json!({
+        "node_id": 18,
+        "available": true,
+        "attributes": {
+            "0/40/5": "Living Room Fan",
+            "1/514/0": 0,
+            "1/514/2": 0
+        }
+    })
+}
+
 fn occupancy_node_json() -> Value {
     json!({
         "node_id": 7,
@@ -305,6 +319,55 @@ async fn control_rejects_unknown_devices_and_capabilities() {
         received.lock().unwrap().is_empty(),
         "nothing reached the fabric"
     );
+}
+
+/// The bug the Virtual Fan exposed: `set_power` resolved On/Off and nothing
+/// else, so a fan — which need not implement On/Off at all — could never be
+/// switched on. Its power is the `FanMode` attribute.
+#[tokio::test]
+async fn set_power_on_a_fan_writes_fan_mode() {
+    let (client, cache, _registry, _bus, received) =
+        start_adapter(json!([fan_node_json()]), vec![]).await;
+    let control = MatterDeviceControl::new(client, cache);
+
+    let outcome = control.set_power("matter-18", true).await.unwrap();
+    assert_eq!(outcome.applied.on, Some(true));
+
+    let frames = received.lock().unwrap().clone();
+    assert_eq!(frames.len(), 1, "exactly one write reached the fabric");
+    let args = &frames[0]["args"];
+    assert_eq!(frames[0]["command"], "write_attribute");
+    assert_eq!(args["node_id"], 18);
+    // endpoint/cluster/attribute — FanMode on the fan's endpoint.
+    assert_eq!(args["attribute_path"], "1/514/0");
+    assert_eq!(args["value"], 4, "FanMode On");
+}
+
+#[tokio::test]
+async fn turning_a_fan_off_writes_fan_mode_off() {
+    let (client, cache, _registry, _bus, received) =
+        start_adapter(json!([fan_node_json()]), vec![]).await;
+    let control = MatterDeviceControl::new(client, cache);
+
+    control.set_power("matter-18", false).await.unwrap();
+
+    let frames = received.lock().unwrap().clone();
+    assert_eq!(frames[0]["args"]["value"], 0, "FanMode Off");
+}
+
+/// A light must keep using On/Off: the fan branch is a fallback for nodes that
+/// lack that cluster, never a replacement for the command that already works.
+#[tokio::test]
+async fn a_light_still_goes_through_on_off() {
+    let (client, cache, _registry, _bus, received) =
+        start_adapter(json!([light_node_json()]), vec![]).await;
+    let control = MatterDeviceControl::new(client, cache);
+
+    control.set_power("matter-2", true).await.unwrap();
+
+    let frames = received.lock().unwrap().clone();
+    assert_eq!(frames[0]["command"], "device_command");
+    assert_eq!(frames[0]["args"]["command_name"], "On");
 }
 
 /// #195 acceptance: a Matter occupancy update becomes a bus sensor event that

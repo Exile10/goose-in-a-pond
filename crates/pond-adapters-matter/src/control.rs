@@ -17,9 +17,9 @@ use crate::client::MatterClient;
 use crate::protocol::{
     brightness_to_level, celsius_to_setpoint, endpoints_with_cluster, hue_to_matter,
     node_id_from_device_id, position_open_to_lift_100ths, saturation_to_matter, MatterNode,
-    ATTR_FAN_PERCENT_SETTING, ATTR_OCCUPIED_HEATING_SETPOINT, CLUSTER_COLOR_CONTROL,
+    ATTR_FAN_MODE, ATTR_FAN_PERCENT_SETTING, ATTR_OCCUPIED_HEATING_SETPOINT, CLUSTER_COLOR_CONTROL,
     CLUSTER_DOOR_LOCK, CLUSTER_FAN_CONTROL, CLUSTER_LEVEL_CONTROL, CLUSTER_ON_OFF,
-    CLUSTER_THERMOSTAT, CLUSTER_WINDOW_COVERING,
+    CLUSTER_THERMOSTAT, CLUSTER_WINDOW_COVERING, FAN_MODE_OFF, FAN_MODE_ON,
 };
 
 /// Shared node cache: the bridge keeps it current from server events; the
@@ -57,8 +57,14 @@ impl MatterDeviceControl {
         self.client.read().await.clone()
     }
 
-    /// Resolve a GIAP device id to `(node_id, endpoint)` for `cluster`.
-    async fn resolve(&self, device_id: &str, cluster: u32) -> Result<(u64, u16)> {
+    /// Resolve a GIAP device id to `(node_id, endpoint)` for `cluster`, or
+    /// `None` when the node simply does not carry that cluster.
+    ///
+    /// Separate from [`Self::resolve`] so a caller that can drive a device two
+    /// ways — a fan is switched through FanMode, a light through On/Off — can
+    /// ask "does it have this one?" without swallowing the errors that mean
+    /// something genuinely wrong: a malformed id, or a node off the fabric.
+    async fn resolve_opt(&self, device_id: &str, cluster: u32) -> Result<Option<(u64, u16)>> {
         let node_id = node_id_from_device_id(device_id).ok_or_else(|| {
             anyhow!(
                 "'{device_id}' is not a Matter device id (expected \"matter-<node>\"; \
@@ -69,10 +75,16 @@ impl MatterDeviceControl {
         let node = nodes
             .get(&node_id)
             .ok_or_else(|| anyhow!("Matter node {node_id} is not commissioned on this fabric"))?;
-        let endpoint = *endpoints_with_cluster(node, cluster)
+        Ok(endpoints_with_cluster(node, cluster)
             .first()
-            .ok_or_else(|| anyhow!("Matter node {node_id} does not support this capability"))?;
-        Ok((node_id, endpoint))
+            .map(|endpoint| (node_id, *endpoint)))
+    }
+
+    /// Resolve a GIAP device id to `(node_id, endpoint)` for `cluster`.
+    async fn resolve(&self, device_id: &str, cluster: u32) -> Result<(u64, u16)> {
+        self.resolve_opt(device_id, cluster)
+            .await?
+            .ok_or_else(|| anyhow!("Matter device '{device_id}' does not support this capability"))
     }
 
     async fn command(
@@ -103,15 +115,36 @@ impl MatterDeviceControl {
 #[async_trait]
 impl DeviceControlPort for MatterDeviceControl {
     async fn set_power(&self, device_id: &str, on: bool) -> Result<DeviceControlOutcome> {
-        let (node, ep) = self.resolve(device_id, CLUSTER_ON_OFF).await?;
-        self.command(
-            node,
-            ep,
-            CLUSTER_ON_OFF,
-            if on { "On" } else { "Off" },
-            json!({}),
-        )
-        .await?;
+        if let Some((node, ep)) = self.resolve_opt(device_id, CLUSTER_ON_OFF).await? {
+            self.command(
+                node,
+                ep,
+                CLUSTER_ON_OFF,
+                if on { "On" } else { "Off" },
+                json!({}),
+            )
+            .await?;
+        } else if let Some((node, ep)) = self.resolve_opt(device_id, CLUSTER_FAN_CONTROL).await? {
+            // A fan's power is `FanMode`, written rather than commanded. Most
+            // fans (the Virtual Fan included) implement no On/Off cluster at
+            // all, so without this branch "turn on the fan" could only fail.
+            self.client()
+                .await
+                .send_command(
+                    "write_attribute",
+                    json!({
+                        "node_id": node,
+                        "attribute_path": format!("{ep}/{CLUSTER_FAN_CONTROL}/{ATTR_FAN_MODE}"),
+                        "value": if on { FAN_MODE_ON } else { FAN_MODE_OFF },
+                    }),
+                )
+                .await?;
+        } else {
+            return Err(anyhow!(
+                "Matter device '{device_id}' cannot be switched on or off"
+            ));
+        }
+
         Ok(DeviceControlOutcome::new(
             device_id,
             DeviceStatePatch {
