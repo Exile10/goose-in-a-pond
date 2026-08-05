@@ -155,7 +155,7 @@ PAI-3 Context governor ── PAI-4 Compaction ── PAI-5 Thinking │
 | Doc | Workstream | Requirement | Depends on | Status |
 |---|---|---|---|---|
 | [01](./pai/01-identity-and-profile-boundaries.md) | Identity and profile boundaries | Hard profile boundaries | — | **COMPLETE — P1-P8 LANDED** |
-| [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | **P0, P1, P2, P4 LANDED**; P3, P5-P8 designed |
+| [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | **P0-P5 LANDED**; P6-P8 designed |
 | [03](./pai/03-context-governor.md) | Context governor | Large context, used fully | — | **P1, P2 LANDED** |
 | [04](./pai/04-smart-compaction.md) | Smart compaction | Smart compaction | 03 | DESIGNED |
 | [05](./pai/05-reasoning-and-thinking.md) | Reasoning and thinking | Ability to think | 03, 04 | DESIGNED |
@@ -202,9 +202,13 @@ good it looks in isolation.
 3. **Deny by default, widen explicitly.** Every failure path in tool selection already widens to
    all tools; every failure path in *access* must narrow to none. Where those two conflict, access
    wins.
-4. **Egress is tracked at the adapter.** Any crate that reaches the network with its own
-   `reqwest::Client` calls `record_egress` — copy `traced_send` from
-   `pond-adapters-weather/src/lib.rs:15-30`.
+4. **Egress is tracked at the adapter, and now gated there too.** Any crate that reaches the
+   network with its own `reqwest::Client` goes through `egress::begin` / `EgressCall::finish`
+   (PAI-2 P5), which checks `network_mode` before the socket opens and records the call either way.
+   Verified 2026-08-05: `crates/pond-core/tests/egress_guard.rs` fails the build for an HTTP-sending
+   source file that is in none of its three classification lists. The old wording — "copy
+   `traced_send` from `pond-adapters-weather/src/lib.rs:15-30`" — was wrong twice over: the line
+   range had rotted by nine lines, and copying a helper is not a guarantee.
 5. **The domain owns policy; adapters own mechanism.** Anything that would have to be rewritten if
    Goose were swapped out belongs in `pond-core` behind a port.
 6. **Settings fields are dispositioned or the build fails.**

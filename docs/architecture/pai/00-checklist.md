@@ -23,7 +23,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2 LANDED**; P3-P6 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
-| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0, P1, P2, P3, P4 LANDED**; P5-P8 designed |
+| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0-P5 LANDED**; P6-P8 designed |
 
 They are equally weighted and mutually interdependent. `DESIGNED` means the document exists and its
 current-state claims were verified against code; it does **not** mean any code has changed. `LANDED`
@@ -33,7 +33,17 @@ is stamped per phase, and means the gates in 2.3 were run and passed.
 repair of P5, which was recorded as landed while being inert on every default install. PAI-3 P1/P2
 and PAI-2 P0 are landed, PAI-2 P4 encrypts `secrets.json` at rest, and PAI-2 P1 is complete: the
 mode, the identity-assertion call site, and the draft-decision gate that gives a staged action an
-owner. Everything else is still design only.
+owner. **PAI-2 P5 landed 2026-08-05**: `network_mode` (`open`/`allowlist`/`offline`) now refuses an
+outbound call before the socket opens, at five of the eighteen HTTP-sending files in the tree.
+Everything else is still design only.
+
+Read `UNGATED_SENDERS` in `crates/pond-core/tests/egress_guard.rs` before you tell anyone
+`network_mode = "offline"` means offline. Six real-egress files are still ungated — model
+downloads, the OAuth refresh loop, Spotify, the HF blob cache, the vision-encoder download, the MCP
+connectivity probe — and they belong to P6. The list is capped and the cap only moves down. Note
+also that the guard classifies FILES, not crates: the crate-level rule the design asked for ("every
+`reqwest`-using crate references `record_egress`") would have failed for eight of eleven crates on
+the day it landed, and most of what it flagged was a health probe on 127.0.0.1.
 
 One consequence of P4 worth knowing before you go looking for it: `giap.sh doctor` now FAILs on
 every pond that has not yet been restarted on a P4 binary, because the store on those really is

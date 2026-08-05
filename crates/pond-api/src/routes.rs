@@ -2690,6 +2690,26 @@ async fn update_settings(
         )
     })?;
 
+    // Reject an unrecognised network_mode. `NetworkMode::parse` deliberately
+    // falls back to "open" rather than to a restrictive mode, so a typo that
+    // reached the store would silently be no gate at all. Refusing it here is
+    // the narrowing half of that bargain -- and refusing at the edge is also
+    // the only place a user finds out, since the parse fallback is a log line.
+    if let Some(mode) = patch.get("network_mode").and_then(|v| v.as_str()) {
+        if !pond_core::user_data::domain::settings::NETWORK_MODES.contains(&mode) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": format!(
+                        "network_mode {:?} is not one of {:?}",
+                        mode,
+                        pond_core::user_data::domain::settings::NETWORK_MODES
+                    )
+                })),
+            ));
+        }
+    }
+
     // Reject agent_backend="pond" — backend is quarantined (Q2-05, not production-ready).
     if patch.get("agent_backend").and_then(|v| v.as_str()) == Some("pond") {
         return Err((
@@ -2792,6 +2812,14 @@ async fn update_settings(
     // restart — a privacy control the user has to reboot to apply is not one.
     pond_core::models::domain::mic_gate::set_mic_enabled(merged.mic_enabled);
 
+    // Same reasoning as the mic gate directly above: a network restriction the
+    // user has to restart the pond to apply is not one. Unconditional rather
+    // than keyed on the patch, because it is a cheap idempotent write and a
+    // missed re-install is a privacy control that silently did not take.
+    pond_core::shared::services::egress::set_network_mode(
+        pond_core::shared::services::egress::NetworkMode::parse(&merged.network_mode),
+    );
+
     // Hot-reload the ModelRouter whenever any provider/model field changes.
     let provider_keys = [
         "chat_provider",
@@ -2859,16 +2887,21 @@ async fn get_weather(
         return Ok(Json(json!({ "enabled": false })));
     };
 
+    // `{e:#}` renders the whole anyhow chain, not just the outermost context.
+    // With `{e}` this said "weather API request failed" and nothing else, so a
+    // call the egress gate REFUSED was indistinguishable from open-meteo being
+    // down -- and PAI-2's rule is that a refusal has to be actionable. The
+    // reason, the mode and the host all live further down the chain.
     let current = provider.current().await.map_err(|e| {
         (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": format!("Failed to fetch weather: {}", e)})),
+            Json(json!({"error": format!("Failed to fetch weather: {e:#}")})),
         )
     })?;
     let forecast = provider.forecast(4).await.map_err(|e| {
         (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": format!("Failed to fetch forecast: {}", e)})),
+            Json(json!({"error": format!("Failed to fetch forecast: {e:#}")})),
         )
     })?;
 
