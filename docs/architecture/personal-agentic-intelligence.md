@@ -64,14 +64,19 @@ at rest; and `api_key_guardian` / `_gnews` / `_finnhub` / `_coingecko` are plain
 fields on `Settings` carrying only `#[serde(default)]` — so `GET /settings`, which serializes the
 whole struct, **returns them**.
 
-**And it returns them to anybody.** Found during the 2026-08-04 audit, not in the original pass:
-`is_public_route` matches on the request path alone — `auth_middleware` never passes it the method —
-while its entries are commented as though method-scoped ("PUT /settings is public so onboarding can
-save", "POST — create profile during onboarding"). `public_routes.merge(protected_routes)` then
-puts everything behind that one check, so the `protected_routes` label decides nothing. The
-consequences are `GET /settings` (every API key) and `DELETE /profiles/{id}` reachable **with no
-token at all**. This is a live defect rather than a gap, and it is [PAI-2](./pai/02-privacy-and-security-guardrails.md)'s
-new P0.
+**And it used to return them to anybody.** Found during the 2026-08-04 audit, not in the original
+pass: `is_public_route` matched on the request path alone — `auth_middleware` never passed it the
+method — while its entries were commented as though method-scoped ("PUT /settings is public so
+onboarding can save", "POST — create profile during onboarding").
+`public_routes.merge(protected_routes)` then puts everything behind that one check, so the
+`protected_routes` label decided nothing. The consequences were `GET /settings` (every API key) and
+`DELETE /profiles/{id}` reachable **with no token at all**.
+
+**Fixed 2026-08-05** — [PAI-2](./pai/02-privacy-and-security-guardrails.md) P0. The allowlist is now
+a `(Method, path)` table with segment-wise wildcard matching, and three compile-time guards fail the
+build if it and the router ever disagree. The secrets-on-`Settings` half of this section is
+untouched and remains PAI-2 P2: the fix stops `GET /settings` being *reachable*, not the keys being
+*on the struct*.
 
 ### 1.3 There is no initiative
 
@@ -134,7 +139,7 @@ PAI-3 Context governor ── PAI-4 Compaction ── PAI-5 Thinking │
 | Doc | Workstream | Requirement | Depends on | Status |
 |---|---|---|---|---|
 | [01](./pai/01-identity-and-profile-boundaries.md) | Identity and profile boundaries | Hard profile boundaries | — | **P1-P3, P5-P8 LANDED**; P4 partial |
-| [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | DESIGNED |
+| [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | **P0 LANDED**; P1-P8 designed |
 | [03](./pai/03-context-governor.md) | Context governor | Large context, used fully | — | **P1, P2 LANDED** |
 | [04](./pai/04-smart-compaction.md) | Smart compaction | Smart compaction | 03 | DESIGNED |
 | [05](./pai/05-reasoning-and-thinking.md) | Reasoning and thinking | Ability to think | 03, 04 | DESIGNED |

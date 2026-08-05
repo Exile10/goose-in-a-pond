@@ -325,10 +325,12 @@ if [ "$RC" -eq 0 ]; then
 else
   echo "live test FAILED (rc=$RC)"
   echo
-  echo "NOTE: this script currently FAILS BY DESIGN on the auth section."
-  echo "GET /settings and GET /profiles answer with no token -- PAI-2 P0, a"
-  echo "live defect in is_public_route, which matches on path while its entries"
-  echo "read as method-scoped. It is not a regression in your change. When P0"
-  echo "lands, this section should go green and stay green."
+  # This script used to fail by design here: GET /settings and GET /profiles
+  # answered with no token, which was PAI-2 P0. That landed, and the auth
+  # section is expected to be GREEN from now on. A failure in it is a real
+  # regression -- treat it as one, and start at is_public_route.
+  echo "The auth section is expected to pass. PAI-2 P0 (the path-only"
+  echo "is_public_route allowlist) has landed, so a FAIL there is a regression,"
+  echo "not the known defect. Start at PUBLIC_ROUTES in pond-api/src/middleware."
 fi
 exit "$RC"

@@ -23,15 +23,15 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2 LANDED**; P3-P6 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
-| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | DESIGNED — **P0 is a live auth defect, fix first** |
+| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0 LANDED**; P1-P8 designed |
 
 They are equally weighted and mutually interdependent. `DESIGNED` means the document exists and its
 current-state claims were verified against code; it does **not** mean any code has changed. `LANDED`
 is stamped per phase, and means the gates in 2.3 were run and passed.
 
-Implementation has begun: PAI-3 P1/P2, and PAI-1 P1-P3 and P5-P8. PAI-1 P4 has its write side, its
-guest gate and a race-free identity write; what remains of it is the `SecurityPolicy` deny matrix,
-which is shared with PAI-2 P1. Everything else is still design only.
+Implementation has begun: PAI-3 P1/P2, PAI-1 P1-P3 and P5-P8, and PAI-2 P0. PAI-1 P4 has its write
+side, its guest gate and a race-free identity write; what remains of it is the `SecurityPolicy` deny
+matrix, which is shared with PAI-2 P1. Everything else is still design only.
 
 ---
 
@@ -613,3 +613,32 @@ never ran while the run still reported on the sections that had.
 **Fixed and re-run clean:** 37 API checks / 0 failed, restart OK, migrations applied once, 4/4 live UI
 tests, one benign WARN in the log dig (`auto_download` skipping `llamafile/mock`, which is the live
 check's own onboarding write). `rc=1` remains, from the auth section alone, exactly by design.
+
+**2026-08-05 — PAI-2 P0 LANDED. `scripts/live-test.sh` is green end to end for the first time.**
+
+`is_public_route` takes a `&Method`; the allowlist is a `(Method, &str)` table with segment-wise
+`{brace}` matching. Details and the exception rationale are in PAI-2's P0 entry. Three points worth
+carrying forward rather than repeating:
+
+- **The router's public/protected split is about ONBOARDING; `is_public_route` is about AUTH.** They
+  read like one axis and are two. That is why P0's own acceptance test — "every route in
+  `protected_routes` requires a token" — could not be written as a blanket assertion:
+  `GET /oauth/callback` and `POST /oauth/refresh` sit in the protected router and are legitimately
+  reachable without a bearer token, each guarded by something else. Anyone writing that test from the
+  design text alone would have concluded it had found two more leaks.
+- **The guards were mutation-tested.** Re-adding `(Method::GET, "/settings")` to the table fails all
+  three, naming the route. Given three recorded vacuous-test incidents in this programme, a guard is
+  not evidence until it has been made to fail — and this one parses source text, which is exactly the
+  kind of check that silently matches nothing. A `routes.len() > 50` assertion pins that too; the
+  parser currently sees 100 protected registrations, and a sweep confirmed every one uses a verb it
+  recognises (no `any`/`head`/`options` routers exist to slip past it).
+- **The stale "FAILS BY DESIGN" epilogue is gone from `live-test.sh`.** It told the next person that
+  an auth failure was expected. Leaving it would have trained them to ignore the one section most
+  likely to catch a real regression.
+
+**One new WARN appeared in the log dig and is environmental, recorded so it is not rediscovered:**
+`embedding provider failed to init: embedding provider init timed out after 30 s — ONNX Runtime may
+be version-incompatible (need ORT 1.24.2)`. macOS-side ORT version, unrelated to this change and not
+present on every run (it is a 30s timeout, so it is load-dependent). The other WARN,
+`auto_download` skipping `llamafile/mock`, is the live check's own onboarding write and was already
+recorded on 2026-08-04.
