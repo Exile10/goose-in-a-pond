@@ -2346,21 +2346,43 @@ async fn run_server(
         tracing::info!("schedule executor initialized — agent-prompt schedules are now active");
     }
 
-    // Secret storage — file-based at $DATA_DIR/secrets.json (0o600 permissions).
-    // Initialized before MCP auto-connect so startup can resolve OAuth tokens.
+    // Secret storage — $DATA_DIR/secrets.json, encrypted with XChaCha20-Poly1305
+    // under $DATA_DIR/secrets/master.key (0600, 0700 directory, overridable with
+    // POND_SECRET_KEY_FILE). Initialized before MCP auto-connect so startup can
+    // resolve OAuth tokens.
     let secret_repo: Option<
         Arc<dyn pond_core::security::ports::secret::SecretRepository + Send + Sync>,
     > = {
         match pond_infra::keyring_secret_repository::FileSecretRepository::new(&data_dir) {
             Ok(repo) => {
                 tracing::info!(
-                    "secret repository initialized at {}/secrets.json",
-                    data_dir.display()
+                    store = %data_dir.join("secrets.json").display(),
+                    key_file = %pond_infra::secret_crypto::key_path(&data_dir).display(),
+                    "secret repository initialized (encrypted at rest)"
                 );
                 Some(Arc::new(repo))
             }
             Err(e) => {
-                tracing::warn!("failed to initialize secret repository: {e}");
+                // A locked store is not the same failure as a broken one, and
+                // the difference decides what the operator should do next. The
+                // repository stays None either way: with no repository the
+                // secret routes answer 503 and nothing in this process can
+                // overwrite the ciphertext, which is still sitting there
+                // recoverable if the key turns up.
+                if let Some(locked) =
+                    e.downcast_ref::<pond_infra::secret_crypto::SecretStoreLocked>()
+                {
+                    tracing::error!("{locked}");
+                    tracing::error!(
+                        "no API key or connector token can be read or written until that key \
+                         is restored. If it is genuinely gone the secrets cannot be recovered \
+                         by anyone, including us: move {} aside, restart, then re-enter API \
+                         keys and re-authorise connectors.",
+                        locked.store_path.display()
+                    );
+                } else {
+                    tracing::warn!("failed to initialize secret repository: {e}");
+                }
                 None
             }
         }

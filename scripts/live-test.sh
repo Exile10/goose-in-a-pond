@@ -160,6 +160,16 @@ if [ "$DO_UI" -eq 1 ]; then
 fi
 
 # ── Start ────────────────────────────────────────────────────────────────────
+#
+# If startup dies at "never wrote .runtime_api_port after 180s", check this
+# before reading any diff: `ensure_onnx_runtime` resolves ORT into $DATA_DIR/lib,
+# and $DATA_DIR is a fresh scratch directory on every run -- so it downloads
+# ~30 MB from GitHub Releases each time, and on a slow link that alone exceeds
+# the timeout. It is not a hang in your feature. Export ORT_DYLIB_PATH (its
+# resolution step 1) at an existing copy, e.g. the one in the real data dir:
+#
+#   export ORT_DYLIB_PATH="$HOME/Library/Application Support/goose-in-a-pond/lib/libonnxruntime.<ver>.dylib"
+#
 mkdir -p "$DATA_DIR"
 say "starting pond-server against $DATA_DIR"
 
@@ -224,6 +234,14 @@ rows = con.execute(
 print("migrations applied more than once:", rows or "none")
 assert not rows, "a migration was applied twice"
 PY
+  # The database is not the only thing this pass has to prove survives. Since
+  # PAI-2 P4 the secret store is an encrypted file, and a store the pond can
+  # write but not re-open is invisible on a first start -- the process that
+  # encrypted it is the one reading it back out of its own cache. Only the
+  # second server can tell you.
+  if [ -f scripts/live_checks.py ]; then
+    POND_DATA_DIR="$DATA_DIR" python3 scripts/live_checks.py restart || RC=$?
+  fi
 else
   echo "RESTART FAILED -- a migration that only works on an empty database" >&2
   tail -30 "$DATA_DIR/server2.out" >&2

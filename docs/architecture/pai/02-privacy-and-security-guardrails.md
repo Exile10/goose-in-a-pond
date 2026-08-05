@@ -98,12 +98,25 @@ environment variables taking precedence (`:51-58`). That is what production wire
 (`pond-server/src/main.rs:2353`). The `keyring` crate in the root `Cargo.toml` is a Goose submodule
 mirror entry, not a GIAP dependency.
 
+> **Half corrected, 2026-08-05 (P4).** The store is no longer plaintext — see 3.4. The filename is
+> still a lie and there is still no keyring; renaming the module is P2's job. The env-var precedence
+> is unchanged and deliberate. The `file:line` anchors above have rotted and are kept only as a
+> record of what was read on 2026-08-03; grep for `FileSecretRepository`, not for a line number.
+
 **There is no redaction.** Grep for `redact|PII|scrub|anonymi` over `crates/` returns only comments
 plus `pond-infra/src/push_token_log.rs`, which shortens push tokens for log lines. Nothing inspects
 memory content, chat text, or event attributes for personal data before storage.
 
 **There is no encryption at rest.** Both SQLite databases and `secrets.json` are plaintext; the only
 protection is the 0600 file mode.
+
+> **Superseded in part, 2026-08-05 (P4).** `secrets.json` is now an
+> XChaCha20-Poly1305 envelope under `<data_dir>/secrets/master.key`. Both SQLite
+> databases are still plaintext and remain so — full-database encryption is the
+> recorded deferral in 3.4, not an oversight. The 0600 mode was also being
+> applied *after* the write, so the file existed world-readable for the width of
+> a `chmod`; `secret_crypto::write_private` creates the temporary with mode 0600
+> and renames instead.
 
 **Onboarding leaves auth holes open permanently.** `PUT /settings`, `POST /profiles` and
 `PATCH /profiles/{id}` are on the public allowlist (`middleware/mod.rs:165-201`) and stay there
@@ -184,13 +197,78 @@ redaction protects is the durable stores and anything that leaves.
 Full-database SQLCipher is a real lift: a different SQLite build, key custody, a Jetson cross-build,
 and `pond_system.db` is read on every turn and every session listing.
 
-**v1 encrypts what actually hurts**: `secrets.json` and connector tokens, with ChaCha20-Poly1305
-under a keyfile at `<data_dir>/secrets/master.key` (0600), generated on first run. This is a small,
-testable change that removes the "your Gmail refresh token is a plaintext string on a home server"
-problem, which is the one PAI-8 creates.
+**v1 encrypts what actually hurts**: `secrets.json` and connector tokens, with XChaCha20-Poly1305
+under a keyfile at `<data_dir>/secrets/master.key` (0600, in a 0700 directory), generated on first
+run. This is a small, testable change that removes the "your Gmail refresh token is a plaintext
+string on a home server" problem, which is the one PAI-8 creates.
 
 The SQLCipher path for the full database is designed here and **deferred with its cost written
 down**, rather than promised. Re-open it when someone is prepared to own the cross-build.
+
+**LANDED 2026-08-05.** What shipped, and the parts the design above did not answer:
+
+- **XChaCha20-Poly1305, not ChaCha20-Poly1305.** The 192-bit extended nonce is drawn at random for
+  every write, so there is no counter to persist and no collision argument to make. Same crate
+  (`chacha20poly1305 0.10`, already in `Cargo.lock` via `nostr` under the goose submodule), same
+  default features, no extra build cost on a Jetson.
+- **Coverage is bounded by P2.** Connector tokens were already in `SecretRepository` — the OAuth
+  callback writes `access_token`/`refresh_token` through `repo.set` — so P4 covers them today. The
+  four `api_key_*` fields are still rows in the plaintext `settings` table in `pond_system.db` and
+  stay plaintext until P2 moves them. P4 did not need P2 to land; P2 decides how much P4 protects.
+- **Threat model, said plainly.** This protects a *copy of the file*: a backup set, an rsync that
+  excludes the key, a support bundle, a database handed to someone for debugging. It does not
+  protect a running pond, which must decrypt to hand a token to an extension subprocess. And in the
+  default layout it does not protect a stolen Jetson either, because the key is in the same data
+  directory as the ciphertext — `POND_SECRET_KEY_FILE` exists so an operator can separate them, and
+  that is the only configuration in which this beats someone walking off with the board. Anything
+  in the UI that implies more than this is wrong.
+- **Key generation.** Eager, at repository construction, not lazily on first write. A fresh pond
+  therefore has a key to back up from day one, and the first `set` cannot fail for a reason
+  unrelated to the secret being set. The key is stored base64-encoded with a trailing newline so a
+  human can copy it into a password manager — that is the only backup path this design offers, and
+  a key nobody can read out is a key nobody backs up.
+- **Migration.** In place, at the same path. Order is: load-or-create the key and `fsync` it, then
+  encrypt into `secrets.json.tmp`, `fsync`, `rename`, `fsync` the directory. An interruption at any
+  point leaves either the intact plaintext file or the complete ciphertext — never a half-written
+  store, and never ciphertext whose key was not durable first. A plaintext file that does not parse
+  is now an **error**, where the old code called `unwrap_or_default()` and turned a corrupt store
+  into an empty one on the next write.
+- **The ordering has a test, which the plan for this phase said it would not.** That was worth
+  arguing with: key-before-ciphertext is the single property standing between an interruption and
+  permanently unopenable secrets, and "documented and implemented, not tested" is how it quietly
+  gets reversed by a later refactor. `the_key_is_durable_before_any_ciphertext_is_written` makes the
+  ordering observable by forcing the ciphertext write to fail — it pre-creates `secrets.json.tmp`
+  as a *directory*, which defeats the `create_new(true)` in `write_private` and stands in for the
+  ENOSPC or EIO that would cause this in the field — then asserts the key file is already on disk,
+  already loadable, and the plaintext store is untouched. Reversing the order was tried: it is the
+  **only** test in the suite that fails, which is exactly why it had to exist.
+- **`FileSecretRepository` has a hand-written `Debug` that redacts.** Deriving it would have printed
+  the master key and every secret value; the tests below call `expect_err`, which formats the struct,
+  so the derived version would have put the key straight into test output the first time a
+  construction unexpectedly succeeded. Not a hypothetical — it happened while writing the mutation
+  test for the locked-store guard.
+- **Downgrading past this commit destroys the store, and nothing can stop it.** A pre-P4
+  `FileSecretRepository::new` parses `secrets.json` with `serde_json::from_str(...).unwrap_or_default()`.
+  Handed an envelope it does not understand, it yields an **empty map, with no error and no log
+  line** — and the next `set` writes a plaintext file over the ciphertext. That is the same
+  fail-open this phase removed, running in the opposite direction, and the old binary is the one
+  doing it, so no code here can prevent it. If you must roll back below this commit, copy
+  `secrets.json` and `secrets/master.key` somewhere else first. It is also the reason the migration
+  forward is automatic rather than prompted: leaving the plaintext file in place to be polite would
+  mean leaving a real Spotify refresh token readable on disk indefinitely, which is the problem.
+- **Key loss: the secrets are gone.** There is no escrow, no recovery code, nothing to ask support
+  for. The store refuses to open (`SecretStoreLocked`) rather than starting empty, precisely so that
+  a temporarily misplaced key does not become permanent loss on the next write. It surfaces in three
+  places: two `ERROR` lines at startup naming the key path and the remediation, a `503` from every
+  `/secrets` route (so the Extensions view in `pond-desktop` shows the store as unavailable rather
+  than as empty), and a `giap.sh doctor` FAIL that spells out the recovery — move `secrets.json`
+  aside, restart, re-enter keys, re-authorise connectors.
+- **Jetson specifics.** The rootfs is usually on removable media, which makes "stolen device" mean
+  "pulled the SD card" and makes the key-beside-ciphertext default worth stating out loud. Power is
+  removed by whoever is nearest the socket, which is why the directory `fsync` after the rename is
+  there. There is no fTPM or secure element exposed on an Orin Nano devkit, so there is no hardware
+  sealing to fall back on. Write volume is unchanged from the plaintext store (whole file per set),
+  so flash wear is not a new concern.
 
 ### 3.5 Egress becomes enforcement
 
@@ -319,7 +397,11 @@ onboarding is complete. `middleware/onboarding_guard.rs` already knows that stat
 - **P2** Secret migration off `Settings`; the `*_key|*_token|*_secret` guard test; module rename.
 - **P3** `Redactor` port + rule-based adapter; the three chokepoints; per-rule tests with real-shaped
   false-positive cases (a UK postcode inside a normal sentence must not be mangled).
-- **P4** Keyfile encryption for secrets and connector tokens.
+- **P4 LANDED 2026-08-05** Keyfile encryption for secrets and connector tokens. XChaCha20-Poly1305
+  envelope at `<data_dir>/secrets.json`, key at `<data_dir>/secrets/master.key` (0600 in a 0700
+  directory, `POND_SECRET_KEY_FILE` to relocate). In-place migration, atomic tmp+rename, and a
+  locked-not-emptied failure mode. See the LANDED block in 3.4 for the threat model and the
+  key-loss story. Coverage of the four `api_key_*` fields still waits on P2.
 - **P5** `network_mode` enforcement + the `reqwest`-implies-`record_egress` guard test.
 - **P6** Draft gate for outbound connector actions (lands with PAI-8).
 - **P7** Onboarding allowlist closure.

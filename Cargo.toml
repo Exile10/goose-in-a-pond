@@ -104,6 +104,12 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["http2"] }
 base64 = "0.22.1"
 bytes = "1"
+# Secret-store encryption (PAI-2 P4). Already in Cargo.lock at 0.10.1 via
+# nostr under the goose submodule, so this adds no download and no new C
+# toolchain requirement on a Jetson build. Default features are wanted:
+# `alloc` for the Vec-returning Aead methods and `getrandom` for aead::OsRng,
+# which resolves to rand_core 0.6 and so matches pond-infra's pinned rand 0.8.
+chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 croner = "2.2"
 clap = { version = "4", features = ["derive"] }
