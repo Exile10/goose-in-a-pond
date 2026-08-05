@@ -421,6 +421,15 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   the process-global `set_current_session_id`, a `RwLock<String>` that the SSE semaphore already
   permits more than one turn to race on. Using it would trade a guest hole for a misattribution
   bug. Deferred until there is a per-turn cell to hang it on.
+
+  > **The "only mechanism available" clause was wrong. Corrected 2026-08-05 by PAI-2 P1.** There is
+  > a race-free per-call channel and it needs no Goose patch: Goose injects `agent-session-id` into
+  > every `CallToolRequest`'s `Meta`, rmcp serialises extension-level `Meta` as the wire `_meta` and
+  > swaps it into the `RequestContext.meta` handed to the tool handler. `giap-draft` reads it
+  > (`crates/pond-mcp-server/src/session_meta.rs`) and resolves a speaker from it. The verdict on
+  > `set_current_session_id` stands -- it is still a raced global and still must not be used for
+  > identity -- but "deferred until there is a per-turn cell" is satisfied, and `giap-memory` can
+  > adopt the same reader.
 - **P5 — landed 2026-08-04, INERT until 2026-08-05.** A `Guest` turn gets no memory injection
   (read), deposits no memory (write), and is never given the personal-data tool groups.
 
@@ -462,6 +471,13 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   Separately, and belonging to [PAI-2](./02-privacy-and-security-guardrails.md) rather than here:
   **`approve_draft` performs no ownership check at all.** Any session can approve any draft id. The
   group gate keeps a *guest* away from it; it does nothing about one member approving another's.
+
+  > **CLOSED 2026-08-05 by PAI-2 P1**, where Jerry decided it belonged. Drafts have an owner
+  > (migration 0038), the caller is resolved from the engine session in the MCP request `_meta`, and
+  > `is_draft_decision_permitted` refuses a foreign draft -- audited under `audit`, blocked under
+  > `enforce`. `list_drafts` was scoping by a model-supplied `session_id` that defaulted to
+  > `"default"`, which is what made a foreign draft id enumerable in the first place; that is fixed
+  > in the same change.
 - **P6 — LANDED 2026-08-04.** `profile_context_for` builds the context from the resolved scope:
   `Owner(id)` gives that member's preferences, `Household` falls back to
   `settings.primary_profile_id`, and **`Guest` gets `None`** -- falling back to the primary member
@@ -478,6 +494,14 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   **The design's "cascade drafts and schedules" cannot be built.** `drafts` has no owner column at
   all — it is keyed by `session_id` with no foreign key — and **there is no `schedules` table**; the
   scheduler is `tokio-cron-scheduler`, in-process. Both would need an owner adding first.
+
+  > **Half of that is no longer true, 2026-08-05.** PAI-2 P1's migration 0038 gives `drafts` a
+  > `profile_id`, and a `BEFORE DELETE ON profiles` trigger expires a departed member's pending
+  > drafts and then releases the column — so the drafts cascade exists, landed with the ownership
+  > rule that needed the column anyway rather than as a separate pass. It is a trigger, not an
+  > `ON DELETE` action, because 0018 declared no foreign key and adding one means rebuilding the
+  > table; the delete was never going to fail, so the trigger is there for the semantics. The
+  > schedules half stands: there is still no `schedules` table.
 
   **One real bug fixed on the way.** `settings.primary_profile_id` is a key-value row, not a foreign
   key, so no cascade can reach it. Deleting the primary member left an id pointing at nobody — and

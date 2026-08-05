@@ -144,6 +144,23 @@ pub trait SessionStorage: Send + Sync {
         Ok(None) // default no-op for backward compat
     }
 
+    /// The GIAP session paired to an engine session id, if any.
+    ///
+    /// The inverse of [`get_engine_session_id`](Self::get_engine_session_id).
+    /// Needed because a builtin MCP tool call carries the ENGINE's session id
+    /// in its request `_meta`, and a draft decision has to resolve that to a
+    /// speaker.
+    ///
+    /// The default returns `Ok(None)` -- "unresolvable". That is the narrowing
+    /// answer, so a mock or legacy adapter that does not override it causes a
+    /// refusal, never a permission.
+    async fn get_session_id_for_engine(
+        &self,
+        _engine_session_id: &str,
+    ) -> Result<Option<String>, SessionStorageError> {
+        Ok(None)
+    }
+
     /// Record the engine session paired with this GIAP session (idempotent
     /// upsert). Deliberately not keyed to a `sessions` row: the pairing is also
     /// established on paths (direct tool calls, the voice child) that can run

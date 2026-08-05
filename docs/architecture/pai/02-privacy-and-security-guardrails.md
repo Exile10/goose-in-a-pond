@@ -288,11 +288,18 @@ guard test asserts every crate with a `reqwest` dependency references `record_eg
 
 ### 3.6 The outbound-action gate
 
-`giap-draft` is already unconditionally registered as a safety extension
-(`giap_registration.rs:64`) and already models save / list / approve / reject
-(`pond-mcp-server/src/draft.rs:97,167,200,248`). Every side-effecting action from a connector —
-send, post, publish, delete — routes through it, scoped to the acting profile. This is reuse of a
-mechanism that exists and is already trusted, not a new approval system.
+`giap-draft` is unconditionally registered as a safety extension (grep
+`register_builtin_extension("giap-draft"` in `giap_registration.rs`) and models save / list /
+approve / reject (grep `async fn approve_draft` in `pond-mcp-server/src/draft.rs`). Every
+side-effecting action from a connector — send, post, publish, delete — routes through it, scoped to
+the acting profile. This is reuse of a mechanism that exists and is already trusted, not a new
+approval system.
+
+> **Two corrections, 2026-08-05.** The `draft.rs:97,167,200,248` citation above had rotted — two of
+> the four line numbers were wrong when P1 went looking. Grep for the symbol, as this section now
+> does. And "scoped to the acting profile" was aspirational rather than descriptive: until P1 there
+> was no acting profile on a draft at all. `drafts` had no owner column, and the `session_id` it did
+> have was a value the *model* filled in, defaulting to the literal `"default"`. See the P1 entry.
 
 ### 3.7 Close the onboarding holes
 
@@ -394,6 +401,88 @@ onboarding is complete. `middleware/onboarding_guard.rs` already knows that stat
   still serialized into the body. That is P2, and it is untouched.**
 - **P1** `security_policy_mode` with `audit` default; the scope × principal matrix; first production
   `allow`/`audit` call sites (shared with PAI-1 P4).
+
+  **Mode and first call site LANDED 2026-08-05** (`PolicyMode`, `PolicyDecision`,
+  `is_identity_assertion_proven`, `Principal.proven_profile_id`, and
+  `evaluate_identity_assertion` in `routes.rs`).
+
+  **Second call site LANDED 2026-08-05 — the draft-decision gate.** This is the one Jerry decided
+  belonged here rather than in a standalone handler patch, so that `approve_draft`'s missing
+  ownership check and the layer meant to express it would land together, in `audit` first.
+
+  What shipped, and where it differs from the sketch above:
+
+  - **Migration 0038** adds `drafts.profile_id` and `drafts.identification_source` (the same
+    vocabulary `sessions.identification_source` uses, so a decision taken on a 0.62 face match stays
+    distinguishable from one taken on a paired token), plus an index on `(profile_id, status)` and
+    one on `engine_session_map(engine_session_id)`, which had none.
+  - **Existing rows are stated, not left implicit.** Every draft that already exists is pending, in
+    the `"default"` bucket, with no owner. Leaving them pending would hand the first person to say
+    "approve" after the upgrade the right to run somebody else's staged shell command — the exact
+    outcome this phase exists to prevent. They are set to `expired`, which finally gives
+    `DraftStatus::Expired` a producer. Owned-by-nobody-and-approvable-by-anybody was the defensible
+    alternative and it is rejected in writing, in the migration. The cost is real and small: a user
+    mid-confirmation across a restart is told the draft expired and asks again. A `BEFORE DELETE ON
+    profiles` trigger expires and then releases a departed member's pending drafts, in that order —
+    releasing first would hide the rows from the expiry.
+  - **The rule is `is_draft_decision_permitted`**, in `security/ports/policy.rs` next to
+    `is_identity_assertion_proven` so the two are read together. Unresolvable caller: refuse.
+    `Guest`: refuse, behind the tool-group denylist rather than instead of it — PAI-1 P5 shows that
+    gate can go inert for a day without anyone noticing. `Owner(id)` decides only its own.
+    `Household` decides anything, because `identity_resolution::resolve` only yields `Household` on
+    a **one-member** pond and refusing there would break the assistant for its only user while
+    protecting nobody. An **unowned** draft falls back to the session that staged it, which is
+    weaker than an owner match and is deliberately not an outright refusal: refusing every unowned
+    draft would make the feature permanently unusable on any pond whose speakers are not identified,
+    which is a regression dressed as a control.
+  - **The caller is read from the MCP request `_meta`, not from a global and not from the model.**
+    This is the part the design did not anticipate and it corrects a claim PAI-1 recorded twice.
+    Goose stamps `agent-session-id` into every `CallToolRequest`'s `Meta`; rmcp serialises it as the
+    wire `_meta` and swaps it into the `RequestContext.meta` the tool handler receives. So a
+    process-global builtin **does** have a race-free per-call session channel, and
+    `set_current_session_id` — a `RwLock<String>` that `Semaphore::new(4)` chat streams race — was
+    never the only option. Using that global here would have traded an authorisation hole for a
+    misattribution bug. `crates/pond-mcp-server/src/session_meta.rs` is the reader, and the other
+    process-global builtins (`giap-memory`, `giap-toolkit`) can adopt it.
+  - **`save_draft` and `list_drafts` were fixed on the way, and had to be.** The `session_id` tool
+    *parameter* is model-supplied and defaulted to `"default"`, so every draft on every pond sat in
+    one bucket and `list_drafts` read everybody's out of it — which is what made an id enumerable
+    and the approve hole exploitable. Both now scope by the engine session; the parameter survives
+    in the schema as advisory and loses to it. `save_draft` stamps the owner from the resolved
+    scope, so the column is populated by production code rather than only by fixtures.
+  - **`reject_draft` had no guard at all** — not existence, not status — so it would flip an
+    already-approved draft to rejected long after the action was authorised. `approve` and `reject`
+    now share one `decide()` path, so the ownership check cannot be added to one and forgotten on
+    the other.
+  - **Audit-mode telemetry:** every decision records `draft_approve:allow|would_deny|deny` (and the
+    `reject` equivalents) through `SecurityPolicy::audit` under a new `scopes::DRAFT`, and a
+    `would_deny` also emits `kind = "policy_would_deny"` at WARN. That is the evidence P8 needs
+    before the default flips to `enforce`.
+  - **Deviation from the plan:** no `PrincipalKind::AgentTurn`. A tool call has no HTTP principal,
+    so the audit line uses `Principal::internal()` and carries the engine session in the action
+    string. Inventing a principal kind whose `proven_profile_id` is still `None` would have looked
+    like proof and been none.
+
+  **Mutation-tested, not assumed.** Restoring the hole (`ProfileScope::Owner(_) => Ok(())`) fails
+  three tests at three layers: the rule test (`Ok(())` vs
+  `Err("draft belongs to a different household member")`), the tool test (`Approved` vs `Pending`
+  under enforce), and the SQLite chain test. Flipping the comparison to `!=` fails it the other way
+  — `the_owner_may_still_approve_their_own_draft_under_enforce` reports the deny text — which is the
+  check that separates "the rule discriminates" from "the rule refuses everything".
+
+  **`crates/pond-infra/tests/draft_ownership_chain.rs` exists because of this programme's recorded
+  vacuity failure.** `ProfileScope::Owner` was inert in production for a whole phase while every
+  test passed, because the fixtures set the owner column by hand and no code path did. That test
+  builds two members, binds a session through `set_session_identity_if_stronger` (what
+  `PUT /sessions/:id/user` calls) and pairs an engine session through `set_engine_session_id` (what
+  every turn calls), then asserts an engine session id resolves to a **named** member. If it
+  resolved to `Household` or `None`, `save_draft` would stamp NULL forever and every deny test in
+  `policy.rs` would still pass.
+
+  Gates: fmt clean; `cargo test -p pond-core -p pond-infra -p pond-mcp-server -p pond-api` green;
+  `cargo check -p pond-server -p pond-adapters-goose` clean; `scripts/live-test.sh --ui`. 0038 was
+  additionally replayed by hand against a database carrying a pre-existing pending draft, since a
+  migration that only works on an empty file works exactly once.
 - **P2 — LANDED 2026-08-05.** The four `api_key_*` fields are off `Settings` entirely and live in
   `SecretRepository`, which P4 had already encrypted the hour before — so the migrated values landed
   as ciphertext and never sat in plaintext in between. That ordering was not luck: P4 and P2 both

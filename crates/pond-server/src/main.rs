@@ -2576,6 +2576,25 @@ async fn run_server(
             )),
         ));
 
+    // PAI-2 P1, second production call site: the draft MCP server is a
+    // process-wide singleton with no principal of its own. What it does get,
+    // per tool call, is the engine session id in the MCP request `_meta`. This
+    // authority is what turns that id into a speaker, reads
+    // `security_policy_mode` fresh, and records the decision. Installed here
+    // rather than in register_giap_extensions because it needs three
+    // repositories that registration does not carry, and after `security_policy`
+    // so draft decisions land in the same audit trail as identity assertions.
+    // The server is not spawned until the first turn, so this is in time.
+    pond_mcp_server::init_draft_authority(Some(Arc::new(
+        pond_core::security::services::draft_authority::RepoDraftAuthority::new(
+            settings_repo.clone(),
+            session_storage.clone(),
+            profile_repo.clone(),
+            security_policy.clone(),
+        ),
+    )
+        as Arc<dyn pond_core::security::ports::draft_authority::DraftAuthority>));
+
     // Start routing WARN+ tracing events into the SQLite event log.
     // _file_guard must live until run_server returns so the background file
     // writer keeps flushing log output to disk.

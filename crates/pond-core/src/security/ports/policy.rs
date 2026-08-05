@@ -28,6 +28,7 @@
 //! (per-profile memory access, per-extension secret scopes, notification
 //! consent) lands here later without re-architecting the request path.
 
+use crate::user_data::domain::profile::ProfileScope;
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -53,6 +54,8 @@ pub mod scopes {
     pub const SENSOR: &str = "sensor";
     /// Camera frames and events.
     pub const CAMERA: &str = "camera";
+    /// Side-effecting actions staged for confirmation.
+    pub const DRAFT: &str = "draft";
 }
 
 /// Origin of a request crossing the privacy/security boundary.
@@ -258,6 +261,81 @@ pub fn is_identity_assertion_proven(principal: &Principal, asserted_profile_id: 
 pub const REASON_UNPROVEN_IDENTITY: &str =
     "session identity asserted by a principal that has not proved it";
 
+/// The second rule with a meaningful deny: may this caller decide a draft?
+///
+/// `approve_draft` looked a draft up by id, checked only that it was pending,
+/// and approved it. Any session could approve any draft id -- and the id space
+/// is enumerable, because `list_drafts` scoped by a `session_id` the MODEL
+/// supplied, defaulting to the literal "default", so every draft on the pond
+/// sat in one shared bucket. The guest tool-group gate keeps a VISITOR away
+/// from these tools; it does nothing about one member approving another's.
+///
+/// # The order, and why each rung exists
+///
+/// 1. **No actor** -- the engine supplied no session, or the session could not
+///    be resolved. Refuse. Access narrows on failure (PAI-1 invariant 2), and
+///    an unresolvable caller is the definition of failure here.
+/// 2. **`Guest`** -- never. Belt and braces behind the tool-group denylist: if
+///    a future selection mode leaks `giap-draft` to a visitor again (it did,
+///    for a day, in PAI-1 P5), the tool itself still refuses.
+/// 3. **An owned draft** -- `Owner(id)` may decide only its own. `Household`
+///    may decide any, because
+///    [`identity_resolution::resolve`](crate::user_data::services::identity_resolution::resolve)
+///    only yields `Household` when the pond has ONE member, and refusing there
+///    would break the assistant for its only user while protecting nobody.
+/// 4. **An unowned draft** -- fall back to the session that staged it. This is
+///    weaker than an owner match and it is deliberately not refused outright:
+///    until `save_draft` can resolve a speaker on every pond, refusing would
+///    make the safety feature permanently unusable, which is a regression
+///    dressed as a control. Deciding another session's unowned draft is exactly
+///    the reported hole, and that is what this closes.
+///
+/// Returns the reason on refusal so the caller does not re-derive it.
+pub fn is_draft_decision_permitted(
+    actor: Option<&ProfileScope>,
+    actor_session_id: &str,
+    draft_owner: Option<&str>,
+    draft_session_id: &str,
+) -> Result<(), &'static str> {
+    let Some(actor) = actor else {
+        return Err(REASON_UNRESOLVED_ACTOR);
+    };
+    if actor_session_id.trim().is_empty() {
+        return Err(REASON_UNRESOLVED_ACTOR);
+    }
+    if matches!(actor, ProfileScope::Guest) {
+        return Err(REASON_GUEST_DRAFT_DECISION);
+    }
+    match draft_owner {
+        Some(owner) => match actor {
+            ProfileScope::Owner(id) if id == owner => Ok(()),
+            ProfileScope::Owner(_) => Err(REASON_FOREIGN_DRAFT),
+            // Single-member pond: there is no other member to protect from.
+            ProfileScope::Household => Ok(()),
+            ProfileScope::Guest => Err(REASON_GUEST_DRAFT_DECISION),
+        },
+        None => {
+            if actor_session_id == draft_session_id {
+                Ok(())
+            } else {
+                Err(REASON_UNOWNED_DRAFT)
+            }
+        }
+    }
+}
+
+/// The caller could not be resolved to anyone at all.
+pub const REASON_UNRESOLVED_ACTOR: &str = "draft decided by a caller that could not be resolved";
+
+/// The draft belongs to a different household member.
+pub const REASON_FOREIGN_DRAFT: &str = "draft belongs to a different household member";
+
+/// The draft has no owner and was staged in a different session.
+pub const REASON_UNOWNED_DRAFT: &str = "unowned draft decided from a session that did not stage it";
+
+/// An unidentified speaker may not decide a staged action.
+pub const REASON_GUEST_DRAFT_DECISION: &str = "draft decided by an unidentified speaker";
+
 /// Driven Port: authorization decisions and audit at the privacy boundary.
 ///
 /// See the [module docs](self) for why this port exists and how it is adopted.
@@ -368,6 +446,87 @@ mod policy_rule_tests {
     #[test]
     fn internal_may_not_assert_a_member() {
         assert!(!is_identity_assertion_proven(&Principal::internal(), "liz"));
+    }
+
+    // ── The draft-decision rule ────────────────────────────────────────────
+
+    /// The hole as reported, from the other direction: two members, and the
+    /// one who did not stage the action tries to run it.
+    #[test]
+    fn a_member_may_not_decide_another_members_draft() {
+        let liz = ProfileScope::Owner("liz".into());
+        assert_eq!(
+            is_draft_decision_permitted(Some(&liz), "sess-a", Some("jerry"), "sess-a"),
+            Err(REASON_FOREIGN_DRAFT),
+            "same session is not the boundary: two speakers share a voice session"
+        );
+        assert_eq!(
+            is_draft_decision_permitted(Some(&liz), "sess-b", Some("liz"), "sess-a"),
+            Ok(()),
+            "her own draft, from her phone, is still hers"
+        );
+    }
+
+    #[test]
+    fn an_unowned_draft_may_only_be_decided_from_the_session_that_staged_it() {
+        let anyone = ProfileScope::Owner("liz".into());
+        assert_eq!(
+            is_draft_decision_permitted(Some(&anyone), "sess-a", None, "sess-a"),
+            Ok(())
+        );
+        assert_eq!(
+            is_draft_decision_permitted(Some(&anyone), "sess-b", None, "sess-a"),
+            Err(REASON_UNOWNED_DRAFT),
+            "the reported hole: any session approving any draft id"
+        );
+    }
+
+    #[test]
+    fn a_guest_and_an_unresolvable_caller_are_both_refused() {
+        assert_eq!(
+            is_draft_decision_permitted(Some(&ProfileScope::Guest), "sess-a", None, "sess-a"),
+            Err(REASON_GUEST_DRAFT_DECISION),
+            "a visitor may not run a staged action even in its own session"
+        );
+        assert_eq!(
+            is_draft_decision_permitted(Some(&ProfileScope::Household), "", None, ""),
+            Err(REASON_UNRESOLVED_ACTOR),
+            "a blank session is not a session; two unresolvable callers must not match"
+        );
+        assert_eq!(
+            is_draft_decision_permitted(None, "sess-a", Some("liz"), "sess-a"),
+            Err(REASON_UNRESOLVED_ACTOR)
+        );
+    }
+
+    /// The `Household` arm is the backwards-compatibility rung, and the second
+    /// half of this test is the part that matters: a rule arm no production
+    /// fixture can reach is this programme's recorded vacuity failure
+    /// (`ProfileScope::Owner`, PAI-1). So assert the arm is reachable through
+    /// the real resolver, not only through a hand-built scope.
+    #[test]
+    fn household_decides_anything_because_a_household_pond_has_one_member() {
+        assert_eq!(
+            is_draft_decision_permitted(
+                Some(&ProfileScope::Household),
+                "sess-a",
+                Some("the-only-member"),
+                "sess-b"
+            ),
+            Ok(())
+        );
+        use crate::user_data::domain::session::SessionIdentity;
+        use crate::user_data::services::identity_resolution::{resolve, ResolutionInputs};
+        let unknown = SessionIdentity::unknown();
+        assert_eq!(
+            resolve(&ResolutionInputs {
+                paired_device_profile: None,
+                session: &unknown,
+                household_has_multiple_members: false,
+            })
+            .scope,
+            ProfileScope::Household
+        );
     }
 
     /// Every constructor must leave the proved identity empty. Populating it

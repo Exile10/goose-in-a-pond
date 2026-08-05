@@ -4,6 +4,7 @@
 //! schedule creation, device control), it saves a draft instead of executing directly.
 //! The user reviews pending drafts and approves or rejects them.
 
+use crate::user_data::domain::session::IdentificationSource;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +14,12 @@ pub struct Draft {
     /// Unique draft identifier.
     pub id: String,
     /// Session in which this draft was created.
+    ///
+    /// Since PAI-2 P1 this is the ENGINE session id, taken from the MCP request
+    /// `_meta` key `agent-session-id`. It used to be whatever the model put in
+    /// the `session_id` tool parameter, which was almost always the literal
+    /// "default" -- so it was never a scope, and treating it as one is what let
+    /// list_drafts read every session's drafts out of one bucket.
     pub session_id: String,
     /// Action type tag (e.g. "shell_command", "file_write", "schedule_create").
     pub kind: String,
@@ -20,6 +27,18 @@ pub struct Draft {
     pub summary: String,
     /// JSON string with all parameters needed to execute the action.
     pub payload: String,
+    /// The household member whose turn staged this action.
+    ///
+    /// `None` means the owner could not be resolved when the draft was staged --
+    /// the engine supplied no session, or the session is unattributed. It is
+    /// NOT "shared household context", which is what `None` means on a memory
+    /// fragment. An unowned draft narrows: see
+    /// [`is_draft_decision_permitted`](crate::security::ports::policy::is_draft_decision_permitted).
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    /// How that owner was established. Never dropped (PAI-1 invariant 3).
+    #[serde(default)]
+    pub identification_source: Option<IdentificationSource>,
     /// Current lifecycle status.
     pub status: DraftStatus,
     /// When the draft was created.
@@ -88,6 +107,8 @@ mod tests {
         let draft = Draft {
             id: "draft_abc123".to_string(),
             session_id: "sess_1".to_string(),
+            profile_id: Some("liz".to_string()),
+            identification_source: Some(IdentificationSource::Explicit),
             kind: "shell_command".to_string(),
             summary: "List files in /tmp".to_string(),
             payload: r#"{"command":"ls /tmp"}"#.to_string(),
