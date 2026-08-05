@@ -1579,7 +1579,7 @@ async fn run_server(
 
     // Install the sensor MCP server's storage handle — `spawn_sensor_server`
     // only fires at chat time.
-    pond_mcp_server::init_sensor_deps(sensor_storage.clone());
+    pond_mcp_server::init_sensor_deps(sensor_storage.clone(), device_registry.clone());
 
     // Spawn background memory decay/cleanup task
     if settings.memory_cleanup_enabled {
@@ -3235,7 +3235,10 @@ async fn run_chat(
     // "spawn_sensor_server called before init_sensor_deps" and then failed to
     // load giap-sensors — the extension was simply missing from voice, with
     // an error on the console saying so.
-    pond_mcp_server::init_sensor_deps(Arc::new(SqliteSensorStorage::new(db.logs.clone())));
+    pond_mcp_server::init_sensor_deps(
+        Arc::new(SqliteSensorStorage::new(db.logs.clone())),
+        Arc::new(SqliteDeviceRegistry::new(db.system.clone())),
+    );
 
     // Load settings and model registry early — drives provider, model, TTS, and wake word.
     // Falls back to Settings::default() when the DB has no rows yet (first run).

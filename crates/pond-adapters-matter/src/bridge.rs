@@ -100,8 +100,21 @@ async fn sync_node(
     node: MatterNode,
     nodes: &NodeCache,
     registry: &Arc<dyn DeviceRegistry + Send + Sync>,
+    bus: &Arc<dyn EventBus>,
 ) {
     let device = node_to_device(&node);
+
+    // Publish what the node already reports, before waiting on it to change.
+    // `start_listening` hands over every current attribute, so a sensor that
+    // sits at a steady value is knowable immediately — otherwise it exists in
+    // the device list while every question about its reading is answered "none
+    // recorded", which reads as "that device is not here".
+    for (path, value) in &node.attributes {
+        if let Some(reading) = sensor_reading_from_update(node.node_id, path, value) {
+            bus.publish(BusEvent::Sensor(reading));
+        }
+    }
+
     nodes.write().await.insert(node.node_id, node);
 
     match registry.get_device(&device.id).await {
@@ -154,7 +167,7 @@ pub async fn run_matter_bridge(
         "matter: fabric nodes discovered"
     );
     for node in initial_nodes {
-        sync_node(node, &nodes, &registry).await;
+        sync_node(node, &nodes, &registry, &bus).await;
     }
 
     while let Some(MatterEvent { event, data }) = events.recv().await {
@@ -184,7 +197,7 @@ pub async fn run_matter_bridge(
             }
             "node_added" | "node_updated" => {
                 if let Ok(node) = serde_json::from_value::<MatterNode>(data) {
-                    sync_node(node, &nodes, &registry).await;
+                    sync_node(node, &nodes, &registry, &bus).await;
                 }
             }
             "node_removed" => {
