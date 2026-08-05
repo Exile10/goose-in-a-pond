@@ -1319,9 +1319,21 @@ async fn run_server(
     let device_registry: Arc<
         dyn pond_core::user_data::ports::device_registry::DeviceRegistry + Send + Sync,
     > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+    // PAI-2 P3: the deterministic redactor. Rule-based, no model in the loop.
+    // Built here so it is in scope for both chokepoints below.
+    let redactor: Arc<dyn pond_core::security::ports::redactor::Redactor> =
+        Arc::new(pond_infra::rule_redactor::RuleRedactor::new());
+    // Chokepoint 1: every memory write, whatever wrote it. Wrapping the one
+    // construction covers extraction, the giap-memory MCP tool, POST /memories
+    // and consolidation -- and a writer nobody has added yet.
     let memory_repo: Arc<
         dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync,
-    > = Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+    > = Arc::new(
+        pond_core::user_data::services::redacting_memory_repository::RedactingMemoryRepository::new(
+            Arc::new(SqliteMemoryRepository::new(db.system.clone())),
+            redactor.clone(),
+        ),
+    );
     let draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync> =
         Arc::new(SqliteDraftRepository::new(db.system.clone()));
     let sensor_storage: Arc<
@@ -2568,11 +2580,20 @@ async fn run_server(
 
     // Privacy/security boundary hook — audits into the unified event log (#108)
     // as `Auth` events, so a policy decision is correlatable with the rest of a
-    // session. Default-allow; nothing calls `audit` yet (see the adapter docs).
+    // session.
+    //
+    // This sink is a SEPARATE Arc from the shared `event_log` below, so it gets
+    // its own chokepoint-2 wrapper. Leaving it raw would have been a bypass by
+    // the one component whose entire job is the audit trail: P1 classifies
+    // these rows `Sensitive` precisely because they carry a `token:<client_id>`
+    // principal label and a remote address.
     let security_policy: Option<Arc<dyn pond_core::security::ports::policy::SecurityPolicy>> =
         Some(Arc::new(
             pond_infra::sqlite_security_policy::SqliteSecurityPolicy::new(Arc::new(
-                SqliteEventLog::new(db.logs.clone()),
+                pond_core::security::services::redacting_event_log::RedactingEventLog::new(
+                    Arc::new(SqliteEventLog::new(db.logs.clone())),
+                    redactor.clone(),
+                ),
             )),
         ));
 
@@ -2650,8 +2671,17 @@ async fn run_server(
         Arc::new(InProcessEventBus::new());
     // One shared event store: the bus→log bridge writes to it, and the activity
     // query API (#114) reads from it via AppState.
-    let event_log: Arc<dyn pond_core::security::ports::event_log::EventLog> =
-        Arc::new(SqliteEventLog::new(db.logs.clone()));
+    // Chokepoint 2: attributes are redacted on the way in, and a finding raises
+    // the event's sensitivity -- which excludes it from the audit MCP reads and
+    // shortens its retention. Both narrow. This is also the binding
+    // `set_egress_sink` reads a hundred lines below, so every outbound-call
+    // record goes through the redactor without egress knowing.
+    let event_log: Arc<dyn pond_core::security::ports::event_log::EventLog> = Arc::new(
+        pond_core::security::services::redacting_event_log::RedactingEventLog::new(
+            Arc::new(SqliteEventLog::new(db.logs.clone())),
+            redactor.clone(),
+        ),
+    );
     // Push-token store (#95) — built here, before `db` is moved into AppState.
     let push_token_repo: Arc<dyn pond_core::user_data::ports::push_token::PushTokenRepository> =
         Arc::new(pond_infra::sqlite_push_token::SqlitePushTokenRepository::new(db.system.clone()));
@@ -3533,9 +3563,18 @@ async fn run_chat(
     let settings_repo_arc: Arc<
         dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
     > = Arc::new(SqliteSettingsRepository::new(db.system.clone()));
+    // Chokepoint 1 again. This entry point hands `memory_repo` to
+    // `build_goose_backend`, which registers `giap-memory` -- so a CLI or voice
+    // session writes memories exactly like the server does, and leaving the
+    // repo raw here would be a hole in the chokepoint that nothing warns about.
     let memory_repo: Arc<
         dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync,
-    > = Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+    > = Arc::new(
+        pond_core::user_data::services::redacting_memory_repository::RedactingMemoryRepository::new(
+            Arc::new(SqliteMemoryRepository::new(db.system.clone())),
+            Arc::new(pond_infra::rule_redactor::RuleRedactor::new()),
+        ),
+    );
     let skill_repo: Arc<dyn pond_core::user_data::ports::skill::UserSkillRepository + Send + Sync> =
         Arc::new(SqliteSkillRepository::new(db.system.clone()));
     let recipe_repo: Arc<
@@ -6312,9 +6351,16 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let settings_repo: Arc<
         dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
     > = Arc::new(SqliteSettingsRepository::new(db.system.clone()));
+    // Chokepoint 1 again, for the same reason as the voice path: all three
+    // arms below reach `build_goose_backend`, so all three can write a memory.
     let memory_repo: Arc<
         dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync,
-    > = Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+    > = Arc::new(
+        pond_core::user_data::services::redacting_memory_repository::RedactingMemoryRepository::new(
+            Arc::new(SqliteMemoryRepository::new(db.system.clone())),
+            Arc::new(pond_infra::rule_redactor::RuleRedactor::new()),
+        ),
+    );
     let skill_repo: Arc<dyn pond_core::user_data::ports::skill::UserSkillRepository + Send + Sync> =
         Arc::new(SqliteSkillRepository::new(db.system.clone()));
     let recipe_repo: Arc<
@@ -6815,7 +6861,14 @@ async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
 
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
-    let repo = SqliteMemoryRepository::new(db.system.clone());
+    // Chokepoint 1: `memories add` is a direct write path into the same store
+    // the server writes to, and it takes its content straight from argv --
+    // which is where a shell-history copy of a credential comes from.
+    let repo =
+        pond_core::user_data::services::redacting_memory_repository::RedactingMemoryRepository::new(
+            Arc::new(SqliteMemoryRepository::new(db.system.clone())),
+            Arc::new(pond_infra::rule_redactor::RuleRedactor::new()),
+        );
 
     match action {
         MemoryAction::List { limit } => {

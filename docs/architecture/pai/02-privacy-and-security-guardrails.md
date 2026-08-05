@@ -51,13 +51,24 @@ never returned by the secrets REST API.
 
 ### 1.2 The holes
 
-**The policy layer is inert.** `SecurityPolicy::allow` returns `Ok(true)` unconditionally in both
+**The policy layer is inert.**
+*(FIXED 2026-08-05 by P1. There are two production `audit` call sites now — the identity-assertion
+gate in `routes.rs` and the draft-decision gate — and `is_identity_assertion_proven` /
+`is_draft_decision_permitted` are real rules. The mode still defaults to `audit`, so nothing is
+blocked yet; that is P8's flip. The paragraph is kept because it is the baseline the phase list was
+written against.)*
+
+`SecurityPolicy::allow` returned `Ok(true)` unconditionally in both
 implementations (`security/services/policy.rs:27-28`, `pond-infra/src/sqlite_security_policy.rs:62-64`).
 Every `.audit()` call site in the repository is inside a `#[cfg(test)]` module — `policy.rs:76,79`
 and `sqlite_security_policy.rs:125,151,182,200`. The file's own doc comment says so
 (`sqlite_security_policy.rs:11-16`).
 
-**API keys are in the settings table and returned over HTTP to anyone.** `api_key_guardian`,
+**API keys are in the settings table and returned over HTTP to anyone.**
+*(FIXED 2026-08-05 by P2. All four fields are off `Settings` and in `SecretRepository`, and
+`no_settings_field_is_secret_shaped` fails the build if anyone puts one back.)*
+
+`api_key_guardian`,
 `api_key_gnews`, `api_key_finnhub`, `api_key_coingecko` and `searxng_url` are `Option<String>`
 fields on `Settings` carrying only `#[serde(default)]` — no `skip_serializing`. `GET /settings` does
 `serde_json::to_value(settings)`, so it returns every one of them in plaintext. Meanwhile a real
@@ -92,9 +103,15 @@ can open a socket to the pond.
 This is the most serious thing this workstream found, it is a live defect rather than a missing
 feature, and it should be fixed ahead of the rest of the phase list.
 
-**There is no keyring.** Despite the filename, `pond-infra/src/keyring_secret_repository.rs`
-contains only `FileSecretRepository`: plaintext JSON at `<data_dir>/secrets.json`, chmod 0600, with
-environment variables taking precedence (`:51-58`). That is what production wires
+**There is no keyring.**
+*(Partly FIXED 2026-08-05. There is still no OS keyring — that was the cheaper-and-clearer call
+recorded in 3.2 — but the file has been renamed `pond-infra/src/file_secret_repository.rs` so its
+name is honest, and P4 replaced the plaintext JSON with an XChaCha20-Poly1305 envelope under a
+keyfile. Grep for `FileSecretRepository::new`; the line number below has rotted.)*
+
+Despite the filename, `pond-infra/src/keyring_secret_repository.rs`
+contained only `FileSecretRepository`: plaintext JSON at `<data_dir>/secrets.json`, chmod 0600, with
+environment variables taking precedence (`:51-58`). That is what production wired
 (`pond-server/src/main.rs:2353`). The `keyring` crate in the root `Cargo.toml` is a Goose submodule
 mirror entry, not a GIAP dependency.
 
@@ -186,6 +203,12 @@ Applied at exactly three chokepoints:
 1. Before a `MemoryFragment` is written.
 2. Before event `attributes` reach the event log.
 3. Before any body leaves the pond (PAI-8 connectors, webhooks).
+
+*(Updated 2026-08-05 by P3. 1 and 2 are landed, as port decorators — and 2 covers three separate
+`EventLog` `Arc`s, not one: the shared binding, the egress sink that reads it, and the
+`SqliteSecurityPolicy` audit sink, which is constructed independently. **3 has no call site to wire.**
+No connector exists, the live webhook arm sends no body, and the body-carrying executor is never
+constructed. It moves to P6. See the P3 entry in section 5.)*
 
 **Explicit non-goal, stated so nobody 'fixes' it later: the redactor is not applied to the model's
 own prompt.** Redacting the assistant's view of your life is what makes it useless. The privacy
@@ -514,16 +537,122 @@ onboarding is complete. `middleware/onboarding_guard.rs` already knows that stat
   its guard, reverted six regenerated Playwright screenshots it had picked up incidentally, and
   stamped this entry. Gates: fmt clean, pond-core 753, pond-infra 205, pond-mcp-server 177,
   pond-api 109 lib + 5 settings integration.
-- **P3** `Redactor` port + rule-based adapter; the three chokepoints; per-rule tests with real-shaped
-- **P3** `Redactor` port + rule-based adapter; the three chokepoints; per-rule tests with real-shaped
-  false-positive cases (a UK postcode inside a normal sentence must not be mangled).
+- **P3 — LANDED 2026-08-05, at two chokepoints of three.** `Redactor` in
+  `security/ports/redactor.rs`; the kinds, the level and every accept/reject rule in
+  `security/domain/redaction.rs`; `RuleRedactor` in `pond-infra`. The split is the point: the
+  adapter's regexes only *propose* candidates and `candidate_is_real` decides, so replacing the
+  engine moves no decision. Luhn, IBAN mod-97 and the real UK inward-letter set are what stop the
+  rules eating prose, and each is a pure `&str -> bool` in core with its own false-positive test.
+  "B2 3AM" matches every loose postcode regex ever written and is not a postcode, because M is not
+  an inward letter.
+
+  Wired as **decorators over the ports**, not as edits at call sites:
+  `RedactingMemoryRepository` (level `Secrets`) wraps **all four** `memory_repo` constructions in
+  `main.rs`, covering extraction, the `giap-memory` MCP tool, `POST /memories`, consolidation and
+  any writer nobody has added yet; `RedactingEventLog` (level `Full`) wraps **both** write-path
+  `EventLog` `Arc`s.
+
+  The plan I started from claimed one memory construction and one event log. Both counts were
+  wrong, and both errors fail open:
+
+  * `SqliteSecurityPolicy` is handed its own, independently constructed `SqliteEventLog`, several
+    dozen lines above the shared `event_log` binding. Wrapping only the shared one would have left
+    every row P1 writes — carrying a `token:<client_id>` principal label and a remote address, and
+    classified `Sensitive` for exactly that reason — bypassing the redactor, by the one component
+    whose entire job is the audit trail.
+  * `run_chat`, `run_agent_cmd` and `run_memories_cmd` each build their own `memory_repo`. The
+    first two hand it to `build_goose_backend`, which registers `giap-memory`, so a CLI or voice
+    session writes memories exactly like the server does; `pond memories add` writes one straight
+    from `argv`, which is where a shell-history copy of a credential comes from. `run_server` being
+    the only construction was true of `run_server` and false of `main.rs`.
+
+  Wrapping the shared binding also covers egress: `pond_mcp_server::set_egress_sink(event_log.clone())`
+  reads it about a hundred lines below, so outbound URLs — the richest source of query-string PII in
+  the system — go through the redactor without `record_egress` knowing. The three remaining raw
+  `SqliteEventLog` constructions, the ones handed to `init_audit_deps` in `run_server`, `run_chat`
+  and `run_agent_cmd`, are deliberately left alone: they are `.into_dyn()` read handles for the
+  `giap-audit` extension, not write paths, and redacting a read handle scrubs nothing on the way in
+  and double-scrubs on the way out.
+
+  **A source-level guard holds all of that**, because none of it fails to compile:
+  `pond-infra/tests/redaction_chokepoints_are_wired.rs` reads `main.rs` with `include_str!` and
+  asserts every `SqliteMemoryRepository::new(` is inside a `RedactingMemoryRepository::new(`, every
+  non-`.into_dyn()` `SqliteEventLog::new(` is inside a `RedactingEventLog::new(`, and that
+  `set_egress_sink` still takes the wrapped `event_log` binding — the last one because **P5 lands
+  next and reads that binding**, and a P5 that builds its own log compiles perfectly. It lives in
+  `pond-infra` rather than `pond-server` for an unglamorous reason: `ci.yml` does not run
+  `cargo test -p pond-server`, so a guard there would never fire on a pull request. It found the
+  `run_memories_cmd` write path on its first run.
+
+  **The levels differ and that is a decision, not an oversight.** Memory is read back into the
+  model's context, so redacting an email address there is the blindfolding this document's own
+  non-goal rejects; a credential is different — it rotates, it is never worth recalling, and its
+  presence in a durable store is pure liability. Event attributes are telemetry nobody recalls, so
+  they run at `Full`. A finding also **raises** the event's `PrivacySensitivity`, which narrows on
+  both axes at once: the audit MCP read path excludes `Secret` at the store, and `pruning.rs` caps
+  `Sensitive`/`Secret` at 7 days against 30. A memory whose finding was `Secret` also has its
+  embedding cleared, because a vector computed over the secret is a durable derivative of it; the
+  relevance backfill re-embeds from the now-redacted `content`, so it is self-healing.
+
+  **The third chokepoint does not exist.** Verified 2026-08-05, not inferred: `rg -ril connector
+  crates/` returns nothing — PAI-8 is DESIGNED only. The live webhook arm
+  (`schedule_executors.rs`, `TaskKind::Webhook`) does `.post(webhook_url).send()` with **no body at
+  all**. The one executor that does send a body, `WebhookTaskExecutor::execute` in
+  `pond-infra-scheduler`, is referenced exactly once in the repository — by its own `pub use` — and
+  is never constructed. Wiring a redactor into either would have redacted nothing while reading as
+  coverage, which is the failure PAI-1 P4 named when it refused to build a matrix of twenty-four
+  allows. It lands with **P6**, alongside PAI-8, and P6 now owns it.
+
+  **Two things found on the way.** Neither webhook path calls `record_egress`, so a webhook fire is
+  invisible to the activity API — recorded, not fixed here, because it belongs to P5's
+  `reqwest`-implies-`record_egress` guard. And `memory_extraction.rs` logged every stored fact's raw
+  content at INFO, which is the level the on-disk log file keeps; that one **is** fixed here,
+  because a second plaintext copy of every memory with none of the store's scoping, none of its
+  retention and none of chokepoint 1's redaction is exactly what this phase exists to stop. It never
+  reached `pond_logs.db` — the drain gates INFO on the `giap::trace` target and that line used the
+  default one — so the file under `<data_dir>/logs` was the whole exposure, which is also the copy
+  nobody prunes.
+
+  Deliberately not added: a `redaction_mode` setting. The level is an associated const on each
+  decorator, so changing a chokepoint's posture is a one-line reviewable diff rather than a runtime
+  knob that has to be classified in `UI_WIRED` or `HEADLESS_BY_DESIGN`. Declared limitation: an
+  unprefixed 64-hex-character secret is **not** detected, because it is indistinguishable from a git
+  SHA and eating every commit hash out of a developer's memories is the "worse than none" failure
+  this phase is built to avoid.
+
+  Mutation-tested, all three halves — the wiring first, because that is where the bypass lives.
+  Replacing the audit sink's wrapper with the raw `SqliteEventLog` makes
+  `every_event_log_write_sink_goes_through_the_redactor` fail with `main.rs:2593 builds a write-path
+  SqliteEventLog outside RedactingEventLog`. Rebinding `set_egress_sink` to a fresh log — the P5
+  hazard — fails two guards, one of them naming the rebind. Rules: replacing the inward-letter check
+  in `is_uk_postcode` with a plain `is_ascii_alphabetic` makes
+  `ordinary_smart_home_prose_is_untouched` fail with
+  `mangled: Play B2 3AM by the band when I get home.` and
+  `a_postcode_shaped_phrase_in_prose_is_not_a_postcode` fail with `B2 3AM must not read as a
+  postcode`. Forwarding: deleting the `count_for_profile` forward makes
+  `every_memory_repository_method_is_forwarded` fail by name — that guard exists because 18 of the
+  port's 22 methods have default bodies, so a missing forward compiles and silently answers `Ok(0)`
+  instead of reaching SQLite. Gates: fmt clean; pond-core 778 + 3 integration, pond-infra 213 + 3
+  wiring; `cargo check -p pond-server -p pond-adapters-goose` clean; `scripts/live-test.sh --ui`
+  green. That run now carries `section_redaction` in `scripts/live_checks.py`: it POSTs a memory
+  containing a credential and a postcode-shaped phrase over real HTTP at the default level with no
+  configuration, then reads the row back out of `memory_fragments` and asserts the credential is
+  gone, the placeholder is there, and the prose ends byte-for-byte as sent. That is the assertion
+  the unit tests cannot make, because they construct the decorator themselves and never ask what
+  `run_server` bound.
+
+  Note for anyone whose live run dies at "never wrote `.runtime_api_port` after 180s": that is the
+  ONNX-runtime download into the fresh scratch directory, which `live-test.sh` documents right above
+  the start block. Export `ORT_DYLIB_PATH` at an existing copy. It is not a hang in the feature.
 - **P4 LANDED 2026-08-05** Keyfile encryption for secrets and connector tokens. XChaCha20-Poly1305
   envelope at `<data_dir>/secrets.json`, key at `<data_dir>/secrets/master.key` (0600 in a 0700
   directory, `POND_SECRET_KEY_FILE` to relocate). In-place migration, atomic tmp+rename, and a
   locked-not-emptied failure mode. See the LANDED block in 3.4 for the threat model and the
   key-loss story. Coverage of the four `api_key_*` fields still waits on P2.
 - **P5** `network_mode` enforcement + the `reqwest`-implies-`record_egress` guard test.
-- **P6** Draft gate for outbound connector actions (lands with PAI-8).
+- **P6** Draft gate for outbound connector actions (lands with PAI-8), **and P3's third
+  chokepoint** — redaction before a body leaves the pond, which has no call site to wire until
+  PAI-8 creates one.
 - **P7** Onboarding allowlist closure.
 - **P8** Flip default to `security_policy_mode = "enforce"` — only after a release in `audit` with
   telemetry showing what would have been denied.
