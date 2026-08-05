@@ -248,8 +248,21 @@ onboarding is complete. `middleware/onboarding_guard.rs` already knows that stat
   has three recorded vacuous-test incidents, and a guard that cannot fail is worse than none because
   it reads as coverage.
 
+  **The fix exposed a test that had been passing for the wrong reason.**
+  `settings_is_blocked_before_onboarding` sent no token and asserted 403. It passed only *because*
+  `GET /settings` was on the public allowlist: the request went straight through auth and was
+  stopped by the onboarding guard. Once auth could refuse it, the assertion saw 401 — the correct
+  answer — and the test was the thing that had to change. Every sibling in that file already carried
+  a bearer token for exactly this reason; this one never needed one, because it could not reach auth
+  to be stopped by it. **A test asserting the right status for the wrong reason is indistinguishable
+  from a correct one until the reason moves**, which is the same lesson as the unreachable
+  `ProfileScope::Owner` fixtures, arriving from the opposite direction.
+
   Verified live: `scripts/live-test.sh --ui` passes end to end — all five probed routes 401 with no
-  token and the bypass off, 37 API checks, 4/4 live UI. `pond-api` 109 lib tests (105 + 4), fmt and
+  token and the bypass off, 37 API checks, 4/4 live UI. `pond-api` 109 lib tests (105 + 4) and 137
+  across all 17 integration targets (135 + 2: `GET /settings` unauthorised over real HTTP with
+  onboarding complete so a 403 cannot mask it, and `PUT /settings` still open — if that one ever
+  401s, onboarding deadlocks on a pond nobody can finish setting up). `pond-core` 736. fmt and
   clippy clean.
 
   Original phase text, for the record:
