@@ -31,6 +31,10 @@ base64 = { workspace = true }
 dirs = { workspace = true }
 subtle = { workspace = true }
 once_cell = { workspace = true }
+# PAI-2 P4: XChaCha20-Poly1305 for $DATA_DIR/secrets.json. Its getrandom
+# feature pulls rand_core 0.6, which is the same rand_core the `rand = "0.8"`
+# above resolves to -- see the E0464 note in [dev-dependencies].
+chacha20poly1305 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

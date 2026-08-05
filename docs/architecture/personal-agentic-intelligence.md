@@ -139,7 +139,7 @@ PAI-3 Context governor ── PAI-4 Compaction ── PAI-5 Thinking │
 | Doc | Workstream | Requirement | Depends on | Status |
 |---|---|---|---|---|
 | [01](./pai/01-identity-and-profile-boundaries.md) | Identity and profile boundaries | Hard profile boundaries | — | **COMPLETE — P1-P8 LANDED** |
-| [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | **P0 LANDED, P1 partial** (mode + first call site); P2-P8 designed |
+| [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | **P0, P4 LANDED; P1 partial** (mode + first call site); P2-P3, P5-P8 designed |
 | [03](./pai/03-context-governor.md) | Context governor | Large context, used fully | — | **P1, P2 LANDED** |
 | [04](./pai/04-smart-compaction.md) | Smart compaction | Smart compaction | 03 | DESIGNED |
 | [05](./pai/05-reasoning-and-thinking.md) | Reasoning and thinking | Ability to think | 03, 04 | DESIGNED |
@@ -227,6 +227,8 @@ All of these are now **done**. Kept as a record of what was corrected and why.
   workstream here depends on it. PAI-8 ingests from cloud accounts; it never sends prompts to them.
 - **It does not promise full-database encryption.** PAI-2 encrypts the high-sensitivity stores and
   writes down the SQLCipher migration path with its cost, rather than claiming a property the
-  build system cannot currently deliver on a Jetson cross-build.
+  build system cannot currently deliver on a Jetson cross-build. As of P4 (2026-08-05) that means
+  `secrets.json` only: both SQLite databases are still plaintext, and by default the key sits in
+  the same directory as the ciphertext, so this protects a copied file rather than a stolen board.
 - **It does not promise first-party WhatsApp.** PAI-8 is explicit about which messaging sources
   have a sane official read API and which require a bridge the user runs themselves.

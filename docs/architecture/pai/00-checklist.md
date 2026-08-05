@@ -23,7 +23,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2 LANDED**; P3-P6 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
-| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0 LANDED, P1 partial**; P2-P8 designed |
+| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0, P4 LANDED; P1 partial**; P2-P3, P5-P8 designed |
 
 They are equally weighted and mutually interdependent. `DESIGNED` means the document exists and its
 current-state claims were verified against code; it does **not** mean any code has changed. `LANDED`
@@ -31,8 +31,12 @@ is stamped per phase, and means the gates in 2.3 were run and passed.
 
 **PAI-1 is COMPLETE** as of 2026-08-05: P1-P8 all landed, including P4's policy layer and the
 repair of P5, which was recorded as landed while being inert on every default install. PAI-3 P1/P2
-and PAI-2 P0 are landed, and PAI-2 P1 has its mode and its first production call site. Everything
-else is still design only.
+and PAI-2 P0 are landed, PAI-2 P1 has its mode and its first production call site, and PAI-2 P4
+encrypts `secrets.json` at rest as of 2026-08-05. Everything else is still design only.
+
+One consequence of P4 worth knowing before you go looking for it: `giap.sh doctor` now FAILs on
+every pond that has not yet been restarted on a P4 binary, because the store on those really is
+plaintext. That is the check working. Do not downgrade it to a warning.
 
 ---
 
@@ -694,3 +698,43 @@ another's through a tool call. Closing it still needs a per-turn cell in the MCP
 Gates: `pond-core` 751, `pond-api` 109 lib + 39 in `agent_data_integration_test`, `pond-infra` 188,
 `pond-adapters-goose` 103 lib with all test targets building again, fmt clean, and
 `scripts/live-test.sh --ui` green end to end.
+
+**2026-08-05 (later) — PAI-2 P4: the secret store is encrypted, and the interesting part was not the
+cipher.**
+
+`secrets.json` is now an XChaCha20-Poly1305 envelope under `<data_dir>/secrets/master.key`. The
+crate was already in `Cargo.lock` and the cipher choice took ten minutes. What took the rest was the
+same failure family as everything else in this programme: the old constructor parsed the file with
+`serde_json::from_str(&content).unwrap_or_default()`, so a file it could not read became an **empty
+store**, with no error and no log line, and the next `set()` wrote over it. On failure, access
+widened. That is the P0 allowlist bug wearing different clothes, and it is now five for this
+programme.
+
+**A guarantee whose only evidence is a comment is not a guarantee.** The plan for this phase said
+the migration ordering — key durable *before* ciphertext, the property standing between a power cut
+and secrets nobody can ever open — was implemented and documented but not testable without fault
+injection it was not adding. It is testable: force the ciphertext write to fail (pre-create
+`secrets.json.tmp` as a *directory*, defeating `create_new(true)`) and assert the key is already on
+disk. Reversing the order fails that test **and no other**, which is the whole argument for writing
+it. When a plan says a property cannot be tested, the useful question is what would have to be true
+for it to be observable, not whether the prose is convincing.
+
+**A first start proves nothing about an on-disk format.** The process that encrypted the file is the
+one reading it back, out of a cache it never dropped. `live-test.sh` restarted the server and then
+asserted only over the database, so the store had no restart coverage at all; it now leaves a secret
+behind on the first pass and reads it back on the second. Verified by swapping the key between the
+two starts.
+
+**Two operational facts that will bite somebody.** Downgrading below this commit destroys the store:
+an older binary hits that `unwrap_or_default()`, reads the envelope as empty, and writes plaintext
+over it. And `giap.sh doctor` now FAILs on every pond not yet restarted on a P4 binary, mine
+included — those stores really are plaintext, and the check is right.
+
+**Say what it protects, not what it sounds like.** Key and ciphertext share a directory by default,
+so this defends a copied file, a backup, a support bundle — not a running pond, and not a lifted SD
+card unless `POND_SECRET_KEY_FILE` puts the key elsewhere. The four `api_key_*` fields are still
+plaintext rows in `settings` until P2 moves them, so "GIAP encrypts your API keys" is not yet true.
+
+Gates: fmt clean, clippy and test green on the fast set (`pond-infra` 202 lib, up from 188), `cargo check` on
+`pond-server` + `pond-adapters-goose`, and `scripts/live-test.sh --ui` green end to end including
+the new restart pass.

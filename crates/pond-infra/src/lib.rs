@@ -8,6 +8,7 @@ pub mod mock_handshake;
 pub mod onboarding;
 pub mod pruning;
 pub(crate) mod push_token_log;
+pub mod secret_crypto;
 pub mod sqlite_device_registry;
 pub mod sqlite_draft;
 pub mod sqlite_event_log;

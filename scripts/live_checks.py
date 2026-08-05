@@ -23,6 +23,13 @@ PORT_FILE = os.path.join(DATA_DIR, ".runtime_api_port")
 
 results = []
 
+# Written on the first pass and read back on the restart pass. The name is
+# deliberately unlike anything a shell would export: `SecretRepository::has`
+# consults the process environment before the store, so a plausible name would
+# let this check pass on somebody's environment rather than on the store.
+RESTART_CANARY_KEY = "LIVE_TEST_SECRET_ACROSS_RESTART"
+RESTART_CANARY_VALUE = "live-test-restart-canary"
+
 
 def check(label, ok, detail=""):
     results.append((label, bool(ok), detail))
@@ -371,6 +378,123 @@ def section_legacy_rows(jerry):
             )
 
 
+def section_secret_store():
+    """PAI-2 P4 -- the secret store on disk must be ciphertext.
+
+    Every unit test for this builds a FileSecretRepository by hand in one
+    process against an empty tempdir. That is exactly the shape of test this
+    programme has been burned by: it cannot see startup wiring, and it cannot
+    see the file a server that has been restarted once actually leaves behind.
+    This drives the real route on the real server and then reads the bytes.
+
+    The store and key existence checks are not padding. Without them,
+    "the plaintext value is not in the file" passes trivially when there is no
+    file at all -- which is the failure mode, not the success one.
+    """
+    store = os.path.join(DATA_DIR, "secrets.json")
+    key = os.path.join(DATA_DIR, "secrets", "master.key")
+    canary = "live-test-plaintext-canary"
+
+    code, body = call(
+        "PUT", "/api/v1/secrets/LIVE_TEST_SECRET", {"value": canary}
+    )
+    if not expect(
+        "PUT /secrets/{key} stores a value",
+        code,
+        200,
+        body,
+        ("reports stored", isinstance(body, dict) and body.get("stored") is True),
+    ):
+        return
+
+    if not check("secrets.json exists after a write", os.path.exists(store), store):
+        return
+
+    raw = open(store, "rb").read()
+    check("the secret store is non-empty", len(raw) > 0, "%d bytes" % len(raw))
+    check(
+        "the secret store is a v1 envelope, not a plaintext map",
+        b"giap-secret-envelope-v1" in raw,
+        raw[:160].decode("utf-8", "replace"),
+    )
+    check(
+        "the canary value is not in the file bytes",
+        canary.encode() not in raw,
+        "the plaintext value is on disk",
+    )
+
+    if check("the master key file exists", os.path.exists(key), key):
+        mode = oct(os.stat(key).st_mode & 0o777)
+        check("master.key is 0o600", mode == "0o600", mode)
+        dmode = oct(os.stat(os.path.dirname(key)).st_mode & 0o777)
+        check("the key directory is 0o700", dmode == "0o700", dmode)
+
+    code, body = call("GET", "/api/v1/secrets/LIVE_TEST_SECRET/exists")
+    expect(
+        "the value reads back through the API",
+        code,
+        200,
+        body,
+        ("exists", isinstance(body, dict) and body.get("exists") is True),
+    )
+
+    code, body = call("DELETE", "/api/v1/secrets/LIVE_TEST_SECRET")
+    expect("the live-test secret is cleaned up", code, 204, body)
+
+    # Deliberately NOT deleted: section_secret_store_after_restart reads it back
+    # from the second server. Without something surviving this pass, the restart
+    # check would be asserting over a store it had just created itself.
+    code, body = call(
+        "PUT", "/api/v1/secrets/" + RESTART_CANARY_KEY, {"value": RESTART_CANARY_VALUE}
+    )
+    expect("a secret is left behind for the restart pass", code, 200, body)
+
+
+def section_secret_store_after_restart():
+    """PAI-2 P4 -- the second server can still open what the first one wrote.
+
+    This is the check the phase actually rests on, and it only exists on the
+    restart pass. A first start that writes an envelope proves nothing: the
+    process that encrypted it is the one reading it back, out of an in-memory
+    cache it never dropped. The failure this catches is a store the pond can
+    write but not re-open -- which, because the old code path parsed with
+    `unwrap_or_default()`, would have presented as a pond that simply forgot
+    every API key and OAuth token, with no error anywhere.
+
+    A locked store answers 503 here rather than 200-with-false, so the status
+    check catches it either way.
+    """
+    store = os.path.join(DATA_DIR, "secrets.json")
+    if not check(
+        "a secret store survived the restart", os.path.exists(store), store
+    ):
+        return
+
+    raw = open(store, "rb").read()
+    check(
+        "the store is still a v1 envelope after a restart",
+        b"giap-secret-envelope-v1" in raw,
+        raw[:160].decode("utf-8", "replace"),
+    )
+    check(
+        "the restart canary is not in the file bytes",
+        RESTART_CANARY_VALUE.encode() not in raw,
+        "the plaintext value is on disk",
+    )
+
+    code, body = call("GET", "/api/v1/secrets/" + RESTART_CANARY_KEY + "/exists")
+    expect(
+        "the secret written before the restart is readable after it",
+        code,
+        200,
+        body,
+        (
+            "exists",
+            isinstance(body, dict) and body.get("exists") is True,
+        ),
+    )
+
+
 def main():
     """Auth is NOT checked here.
 
@@ -379,11 +503,20 @@ def main():
     regardless of what the allowlist does. The script runs a second server
     without the bypass for that section -- a check that passes because the
     bypass is on reports the opposite of the truth.
+
+    Invoked with the argument `restart`, this runs only the sections that mean
+    something on a SECOND server against the same data directory. The identity
+    and deletion sections are first-pass only: they create profiles by name and
+    would collide with the rows they left behind.
     """
-    section_schema()
-    jerry, liz = section_identity()
-    section_deletion(jerry, liz)
-    section_legacy_rows(jerry)
+    if len(sys.argv) > 1 and sys.argv[1] == "restart":
+        section_secret_store_after_restart()
+    else:
+        section_schema()
+        jerry, liz = section_identity()
+        section_deletion(jerry, liz)
+        section_legacy_rows(jerry)
+        section_secret_store()
 
     failed = [label for label, ok, _ in results if not ok]
     print("\n%d checks run, %d failed" % (len(results), len(failed)))

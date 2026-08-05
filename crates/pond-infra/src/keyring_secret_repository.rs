@@ -1,48 +1,179 @@
-use anyhow::Result;
+use crate::secret_crypto::{self, SecretStoreLocked};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
+use chacha20poly1305::Key;
 use pond_core::security::ports::secret::SecretRepository;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::RwLock;
 
-/// File-based secret store at `$DATA_DIR/secrets.json` with 0o600 permissions.
+/// Encrypted file-based secret store at `$DATA_DIR/secrets.json`.
+///
+/// The file holds an XChaCha20-Poly1305 envelope (see [`crate::secret_crypto`])
+/// under a 32-byte key at `$DATA_DIR/secrets/master.key`, mode 0600 inside a
+/// 0700 directory, generated on first construction.
+///
+/// **Read the threat model in [`crate::secret_crypto`] before assuming this
+/// protects more than it does.** It protects the file. It does not protect a
+/// running pond, and in the default layout it does not protect a stolen device
+/// either, because the key sits in the same directory as the ciphertext.
 ///
 /// Env vars take highest priority: if `std::env::var(key)` succeeds, the file
 /// store is skipped entirely. This matches Goose's 3-tier fallback pattern
 /// (keyring → file → env) but inverts the priority so explicit env overrides
-/// always win — useful for CI and container deployments.
+/// always win — useful for CI and container deployments. Encryption changes
+/// nothing about that ordering: an env-supplied secret was never on disk here.
 pub struct FileSecretRepository {
     path: PathBuf,
+    key: Key,
     cache: RwLock<HashMap<String, String>>,
 }
 
 impl FileSecretRepository {
+    /// Open, and on a first run create, the encrypted store.
+    ///
+    /// Three shapes can be on disk. All three are handled explicitly, because
+    /// the convenient default in each case destroys data:
+    ///
+    /// 1. **Nothing.** Generate the key now rather than lazily, so a fresh pond
+    ///    has a key to back up from day one and the first `set` cannot fail for
+    ///    a reason that has nothing to do with the secret being set.
+    /// 2. **An envelope.** Decrypt it. If the key is missing, or does not
+    ///    authenticate, return [`SecretStoreLocked`] and touch nothing. The
+    ///    tempting alternative — start empty and carry on — turns a temporarily
+    ///    misplaced key file into permanent data loss on the next write.
+    /// 3. **A legacy plaintext map.** Migrate it in place. The ordering is
+    ///    load-or-create the key and fsync it *first*, then encrypt into
+    ///    `secrets.json.tmp`, fsync, and rename. An interruption at any point
+    ///    leaves either the intact plaintext file or the complete ciphertext,
+    ///    never a half-written store and never ciphertext without a key. A
+    ///    plaintext file that does not parse is an error, not an empty store:
+    ///    the previous code called `unwrap_or_default()` there, which meant a
+    ///    corrupt file became an empty one on the next `set`.
     pub fn new(data_dir: &std::path::Path) -> Result<Self> {
         let path = data_dir.join("secrets.json");
-        let cache = if path.exists() {
-            let content = std::fs::read_to_string(&path)?;
-            serde_json::from_str(&content).unwrap_or_default()
-        } else {
-            HashMap::new()
+        let key_path = secret_crypto::key_path(data_dir);
+
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading {}", path.display()));
+            }
         };
-        Ok(Self {
-            path,
-            cache: RwLock::new(cache),
-        })
+
+        match raw.as_deref().map(str::trim) {
+            None | Some("") => {
+                let key = secret_crypto::create_key_if_absent(&key_path)?;
+                Ok(Self {
+                    path,
+                    key,
+                    cache: RwLock::new(HashMap::new()),
+                })
+            }
+            Some(text) if secret_crypto::looks_encrypted(text) => {
+                let key = match secret_crypto::load_key(&key_path) {
+                    Ok(Some(k)) => k,
+                    Ok(None) => {
+                        return Err(SecretStoreLocked {
+                            store_path: path,
+                            key_path,
+                            reason: "the key file does not exist".to_string(),
+                        }
+                        .into())
+                    }
+                    Err(e) => {
+                        return Err(SecretStoreLocked {
+                            store_path: path,
+                            key_path,
+                            reason: format!("{e:#}"),
+                        }
+                        .into())
+                    }
+                };
+                let json = match secret_crypto::decrypt(&key, text) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return Err(SecretStoreLocked {
+                            store_path: path,
+                            key_path,
+                            reason: format!("{e:#}"),
+                        }
+                        .into())
+                    }
+                };
+                let cache: HashMap<String, String> = serde_json::from_str(&json)
+                    .context("decrypted secret store is not a JSON object of strings")?;
+                Ok(Self {
+                    path,
+                    key,
+                    cache: RwLock::new(cache),
+                })
+            }
+            Some(text) => {
+                let cache: HashMap<String, String> =
+                    serde_json::from_str(text).with_context(|| {
+                        format!(
+                            "{} is neither an encrypted store nor a readable plaintext one. \
+                             Refusing to open it as an empty store, because the next write \
+                             would overwrite whatever is in there. Move it aside by hand to \
+                             start over.",
+                            path.display()
+                        )
+                    })?;
+                let key = secret_crypto::create_key_if_absent(&key_path)?;
+                Self::write_store(&path, &key, &cache)?;
+                tracing::info!(
+                    keys = cache.len(),
+                    store = %path.display(),
+                    key_file = %key_path.display(),
+                    "migrated the plaintext secret store to an encrypted one"
+                );
+                Ok(Self {
+                    path,
+                    key,
+                    cache: RwLock::new(cache),
+                })
+            }
+        }
+    }
+
+    /// Encrypt and atomically replace the store.
+    ///
+    /// Synchronous on purpose. It is a few kilobytes on a path that runs when a
+    /// human saves an API key or an OAuth callback lands, and `new` needs the
+    /// same routine outside an async context.
+    fn write_store(
+        path: &std::path::Path,
+        key: &Key,
+        cache: &HashMap<String, String>,
+    ) -> Result<()> {
+        let json = serde_json::to_string(cache)?;
+        let envelope = secret_crypto::encrypt(key, &json)?;
+        secret_crypto::write_private(path, envelope.as_bytes())
     }
 
     async fn persist(&self) -> Result<()> {
         let cache = self.cache.read().await;
-        let json = serde_json::to_string_pretty(&*cache)?;
-        tokio::fs::write(&self.path, &json).await?;
-        // Set file permissions to 0o600 (owner read/write only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&self.path, perms)?;
-        }
-        Ok(())
+        Self::write_store(&self.path, &self.key, &cache)
+    }
+}
+
+/// Hand-written rather than derived, and it must stay that way.
+///
+/// `#[derive(Debug)]` here would print the master key and every secret value
+/// the moment anybody wrote `{:?}` or called `.expect()` on a `Result` holding
+/// one — which is exactly how a secret ends up in a log file or a panic
+/// message. That is not hypothetical: `expect_err` in the tests below prints
+/// this struct, so a derived impl would have put the master key in the test
+/// output. Only the store path is real here; the rest is redacted.
+impl std::fmt::Debug for FileSecretRepository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileSecretRepository")
+            .field("path", &self.path)
+            .field("key", &"<redacted>")
+            .field("cache", &"<redacted>")
+            .finish()
     }
 }
 
@@ -165,5 +296,184 @@ mod tests {
         let meta = std::fs::metadata(tmp.path().join("secrets.json")).unwrap();
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "secrets.json should be owner-only rw");
+    }
+
+    // ── PAI-2 P4: encryption at rest ────────────────────────────────────────
+    //
+    // Secret names below are deliberately distinctive: `get` consults the
+    // process environment first, so a test keyed on a plausible name like
+    // `TOKEN` could pass or fail on somebody's shell rather than on this code.
+
+    #[tokio::test]
+    async fn the_stored_value_is_not_in_the_file_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = FileSecretRepository::new(tmp.path()).unwrap();
+        repo.set("GIAP_TEST_CANARY", "plaintext-canary-value")
+            .await
+            .unwrap();
+
+        let raw = std::fs::read(tmp.path().join("secrets.json")).unwrap();
+        // Guard the vacuous pass: an absent or empty file trivially "does not
+        // contain" the value, which is how a test like this reports success
+        // while the feature is missing.
+        assert!(!raw.is_empty(), "secrets.json was never written");
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        assert!(
+            crate::secret_crypto::looks_encrypted(&text),
+            "secrets.json is not an envelope: {text}"
+        );
+        let needle = b"plaintext-canary-value";
+        assert!(
+            !raw.windows(needle.len()).any(|w| w == needle),
+            "the secret value is on disk in the clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_plaintext_store_is_migrated_on_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("secrets.json");
+        std::fs::write(&store, r#"{"GIAP_TEST_LEGACY":"legacy-value"}"#).unwrap();
+
+        let repo = FileSecretRepository::new(tmp.path()).unwrap();
+        assert_eq!(
+            repo.get("GIAP_TEST_LEGACY").await.unwrap().as_deref(),
+            Some("legacy-value"),
+            "migration lost the value"
+        );
+
+        let raw = std::fs::read_to_string(&store).unwrap();
+        assert!(
+            crate::secret_crypto::looks_encrypted(&raw),
+            "the store was left in plaintext: {raw}"
+        );
+        assert!(
+            !raw.contains("legacy-value"),
+            "the plaintext value survived the migration"
+        );
+        assert!(
+            tmp.path().join("secrets").join("master.key").exists(),
+            "migrated to ciphertext without writing a key"
+        );
+    }
+
+    /// The migration ordering guarantee, with the ciphertext write forced to
+    /// fail so the ordering is observable.
+    ///
+    /// This is the one that prevents unrecoverable loss. If the key were made
+    /// durable *after* the ciphertext, a power cut in between would leave a
+    /// pond holding an envelope nobody can ever open. Every other test here
+    /// passes under that reordering, because on a run that is not interrupted
+    /// both files end up on disk and nothing can tell which was written first.
+    ///
+    /// So the write of `secrets.json` is sabotaged: `write_private` creates
+    /// `secrets.json.tmp` with `create_new(true)`, and a *directory* at that
+    /// path makes the create fail — which is a stand-in for the ENOSPC or EIO
+    /// that would cause this in the field. Construction must then fail with the
+    /// key already on disk and the plaintext store untouched, which is the only
+    /// state from which a retry can succeed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_key_is_durable_before_any_ciphertext_is_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("secrets.json");
+        let key_path = tmp.path().join("secrets").join("master.key");
+        let legacy = r#"{"GIAP_TEST_ORDER":"order-value"}"#;
+        std::fs::write(&store, legacy).unwrap();
+
+        // Make the ciphertext write fail, and only the ciphertext write.
+        std::fs::create_dir(tmp.path().join("secrets.json.tmp")).unwrap();
+
+        let err = FileSecretRepository::new(tmp.path())
+            .expect_err("the migration must fail when it cannot write the ciphertext");
+        // Not a locked store: this is a write failure, and conflating the two
+        // would send the operator hunting for a key that is right there.
+        assert!(
+            err.downcast_ref::<SecretStoreLocked>().is_none(),
+            "a failed write was reported as a locked store: {err:#}"
+        );
+
+        assert!(
+            key_path.exists(),
+            "the key was not durable before the ciphertext write was attempted -- \
+             an interruption here would have produced an envelope with no key"
+        );
+        assert!(
+            crate::secret_crypto::load_key(&key_path).unwrap().is_some(),
+            "the key file exists but does not load, so it is not usable for a retry"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&store).unwrap(),
+            legacy,
+            "the plaintext store was damaged by a migration that did not complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_plaintext_store_is_refused_not_emptied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("secrets.json");
+        std::fs::write(&store, "this is not json").unwrap();
+
+        assert!(
+            FileSecretRepository::new(tmp.path()).is_err(),
+            "a corrupt store must not open as an empty one -- the next set() would overwrite it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&store).unwrap(),
+            "this is not json",
+            "the unreadable store was modified"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_key_locks_the_store_and_leaves_the_ciphertext_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("secrets.json");
+        let key = tmp.path().join("secrets").join("master.key");
+
+        {
+            let repo = FileSecretRepository::new(tmp.path()).unwrap();
+            repo.set("GIAP_TEST_GONE", "value-behind-a-lost-key")
+                .await
+                .unwrap();
+        }
+        let before = std::fs::read(&store).unwrap();
+        std::fs::remove_file(&key).unwrap();
+
+        let err = FileSecretRepository::new(tmp.path())
+            .expect_err("a store whose key is gone must not open");
+        assert!(
+            err.downcast_ref::<SecretStoreLocked>().is_some(),
+            "expected SecretStoreLocked, got: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&store).unwrap(),
+            before,
+            "the ciphertext was modified while the store was locked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_key_locks_rather_than_silently_reinitialising() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let repo = FileSecretRepository::new(tmp.path()).unwrap();
+            repo.set("GIAP_TEST_WRONGKEY", "v").await.unwrap();
+        }
+
+        // A well-formed key that is simply not this store's key.
+        let other = tempfile::tempdir().unwrap();
+        let _ = FileSecretRepository::new(other.path()).unwrap();
+        let wrong =
+            std::fs::read_to_string(other.path().join("secrets").join("master.key")).unwrap();
+        std::fs::write(tmp.path().join("secrets").join("master.key"), wrong).unwrap();
+
+        let err =
+            FileSecretRepository::new(tmp.path()).expect_err("a wrong key must not open the store");
+        assert!(
+            err.downcast_ref::<SecretStoreLocked>().is_some(),
+            "expected SecretStoreLocked, got: {err:#}"
+        );
     }
 }
