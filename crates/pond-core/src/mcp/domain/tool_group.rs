@@ -173,6 +173,39 @@ pub fn find_group(extension: &str) -> Option<&'static ToolGroup> {
 }
 
 /// Extension names of the always-on core groups.
+/// Groups an unidentified speaker must never be given, whatever the scorer says.
+///
+/// PAI-1 P5. Suppressing memory *injection* for a guest is only half a boundary:
+/// the model can be asked to call `recall_memories` and read the household's
+/// memory directly, or `forget_memory` and destroy it. Neither tool has any
+/// notion of a session, so the only place to stop it is before the guest's
+/// session is given the group at all.
+///
+/// `giap-memory` and `giap-draft` are both `core`, so `select_groups` will
+/// always put them back -- the caller has to subtract this list *after*
+/// selection, not filter the candidates going in.
+///
+/// Deliberately a denylist, not an allowlist. A new group is far more likely to
+/// be neutral (weather, news, a unit converter) than personal, and a new
+/// *personal* group is exactly the kind of change whose author should have to
+/// think about this list. An allowlist would silently deny every new group to
+/// guests and be discovered as a bug report.
+pub fn groups_denied_to_guests() -> &'static [&'static str] {
+    &[
+        // Reads and deletes the household's long-term memory.
+        "giap-memory",
+        // Approves and rejects staged actions -- and `approve_draft` performs
+        // no ownership check of its own.
+        "giap-draft",
+        // What data left the device, and when. A visitor's business it is not.
+        "giap-audit",
+        // Who has been seen on camera, and when.
+        "giap-vision",
+        // Sensor history: when the house was empty, when somebody came home.
+        "giap-sensors",
+    ]
+}
+
 pub fn core_group_names() -> Vec<&'static str> {
     TOOL_GROUPS
         .iter()
@@ -246,5 +279,60 @@ mod tests {
     fn only_catalog_extensions_are_recognised() {
         assert!(is_catalog_extension("giap-vision"));
         assert!(!is_catalog_extension("some-user-mcp-server"));
+    }
+}
+
+#[cfg(test)]
+mod guest_denylist_tests {
+    use super::*;
+
+    #[test]
+    fn every_denied_group_actually_exists() {
+        for name in groups_denied_to_guests() {
+            assert!(
+                TOOL_GROUPS.iter().any(|g| g.extension == *name),
+                "denylist names a group that does not exist: {name} -- a typo here \
+                 silently grants a guest the access it was meant to deny"
+            );
+        }
+    }
+
+    /// The denylist is only useful because it removes groups `select_groups`
+    /// puts back. If none of them were core, the list would be doing nothing
+    /// the scorer was not already doing.
+    #[test]
+    fn the_denylist_covers_groups_that_are_otherwise_unremovable() {
+        let core = core_group_names();
+        let denied_core: Vec<_> = groups_denied_to_guests()
+            .iter()
+            .filter(|n| core.contains(n))
+            .collect();
+        assert!(
+            !denied_core.is_empty(),
+            "no denied group is core, so subtracting after selection is pointless"
+        );
+        assert!(
+            denied_core.contains(&&"giap-memory"),
+            "giap-memory is core and reads the household's memory; it must be denied"
+        );
+    }
+
+    /// A guest is meant to stay useful -- weather, time, knowledge, the lights.
+    /// Denying everything would be a boundary nobody keeps switched on.
+    #[test]
+    fn a_guest_keeps_the_neutral_groups() {
+        let denied = groups_denied_to_guests();
+        for neutral in [
+            "giap-weather",
+            "giap-knowledge",
+            "giap-device-control",
+            "giap-toolkit",
+            "giap-system",
+        ] {
+            assert!(
+                !denied.contains(&neutral),
+                "{neutral} carries no personal data and a guest should keep it"
+            );
+        }
     }
 }

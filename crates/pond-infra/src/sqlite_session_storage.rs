@@ -510,6 +510,63 @@ impl SessionStorage for SqliteSessionStorage {
         Ok(())
     }
 
+    async fn set_session_identity_if_stronger(
+        &self,
+        session_id: &str,
+        identity: &SessionIdentity,
+    ) -> Result<bool, SessionStorageError> {
+        // The rank comparison happens INSIDE the update, so two concurrent
+        // identifications cannot both win off the same stale read. The ranking
+        // itself is policy and lives in the domain -- this builds the CASE from
+        // `IdentificationSource::ALL_RANKED` rather than restating the order,
+        // and a test pins the two together.
+        let cases: String = IdentificationSource::ALL_RANKED
+            .iter()
+            .map(|(name, rank)| format!("WHEN '{name}' THEN {rank}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // A NULL source is a legacy row: unattributed, so anything beats it.
+        // The literal must be >= the weakest real rank, hence ALL_RANKED's len.
+        let unattributed = IdentificationSource::ALL_RANKED.len();
+
+        let sql = format!(
+            "UPDATE sessions SET \
+               profile_id                = ?, \
+               identification_source     = ?, \
+               identification_confidence = ? \
+             WHERE id = ? \
+               AND ? <= (CASE COALESCE(identification_source, '') {cases} ELSE {unattributed} END)"
+        );
+
+        let result = sqlx::query(&sql)
+            .bind(identity.profile_id.as_deref())
+            .bind(identity.source.as_str())
+            .bind(identity.confidence.map(|c| c as f64))
+            .bind(session_id)
+            .bind(identity.source.rank() as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        if result.rows_affected() > 0 {
+            return Ok(true);
+        }
+
+        // Zero rows is ambiguous: either the session does not exist, or a
+        // stronger identification holds it. The caller needs those apart --
+        // one is a 404 and the other is a normal refusal.
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        if exists == 0 {
+            return Err(SessionStorageError::SessionNotFound(session_id.to_string()));
+        }
+        Ok(false)
+    }
+
     async fn get_session_tool_groups(
         &self,
         session_id: &str,
@@ -1741,5 +1798,127 @@ mod tests {
         .execute(&s.pool)
         .await
         .expect("profiles row is required by the sessions.profile_id foreign key");
+    }
+
+    // ── Race-free identity writes (PAI-1 P4) ─────────────────────────────
+
+    /// The read-compare-write this replaced could lose: two requests both read
+    /// `Unknown`, both passed `supersedes`, and the later write won whatever
+    /// its rank. Here the comparison is inside the UPDATE, so the stale caller
+    /// simply does not match.
+    #[tokio::test]
+    async fn a_weaker_source_cannot_win_even_from_a_stale_read() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        insert_profile(&s, "jerry").await;
+        insert_profile(&s, "liz").await;
+
+        // Somebody taps "this is Jerry".
+        assert!(s
+            .set_session_identity_if_stronger(
+                "sess-1",
+                &SessionIdentity {
+                    profile_id: Some("jerry".into()),
+                    source: IdentificationSource::Explicit,
+                    confidence: None,
+                },
+            )
+            .await
+            .unwrap());
+
+        // A camera frame, decided against the state BEFORE that write, tries
+        // to bind a different person on weaker evidence.
+        assert!(
+            !s.set_session_identity_if_stronger(
+                "sess-1",
+                &SessionIdentity {
+                    profile_id: Some("liz".into()),
+                    source: IdentificationSource::Face,
+                    confidence: Some(0.62),
+                },
+            )
+            .await
+            .unwrap(),
+            "a face match must not take a session an explicit claim holds"
+        );
+
+        let held = s.get_session_identity("sess-1").await.unwrap();
+        assert_eq!(held.profile_id.as_deref(), Some("jerry"));
+        assert_eq!(held.source, IdentificationSource::Explicit);
+    }
+
+    #[tokio::test]
+    async fn an_equal_or_stronger_source_still_wins() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        insert_profile(&s, "jerry").await;
+        insert_profile(&s, "liz").await;
+
+        for (source, who) in [
+            (IdentificationSource::Face, "jerry"),
+            // equal strength: re-identification, the endpoint's normal case
+            (IdentificationSource::Face, "liz"),
+            // stronger
+            (IdentificationSource::Explicit, "jerry"),
+            (IdentificationSource::PairedDevice, "liz"),
+        ] {
+            assert!(
+                s.set_session_identity_if_stronger(
+                    "sess-1",
+                    &SessionIdentity {
+                        profile_id: Some(who.into()),
+                        source,
+                        confidence: None,
+                    },
+                )
+                .await
+                .unwrap(),
+                "{:?} should have been accepted",
+                source
+            );
+            assert_eq!(
+                s.get_session_identity("sess-1").await.unwrap().source,
+                source
+            );
+        }
+    }
+
+    /// A legacy row has a NULL source and is unattributed, so anything binds it.
+    #[tokio::test]
+    async fn anything_binds_a_legacy_row_with_no_source() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        insert_profile(&s, "jerry").await;
+        assert!(s
+            .set_session_identity_if_stronger(
+                "sess-1",
+                &SessionIdentity {
+                    profile_id: Some("jerry".into()),
+                    source: IdentificationSource::Face,
+                    confidence: Some(0.5),
+                },
+            )
+            .await
+            .unwrap());
+    }
+
+    /// Zero rows updated is ambiguous between "no such session" and "not
+    /// superseded". The caller needs them apart -- one is a 404, the other a
+    /// normal refusal -- so the adapter disambiguates rather than guessing.
+    #[tokio::test]
+    async fn a_conditional_write_to_a_missing_session_is_still_not_found() {
+        let (s, _tmp) = make_storage().await;
+        let err = s
+            .set_session_identity_if_stronger(
+                "no-such-session",
+                &SessionIdentity {
+                    profile_id: None,
+                    source: IdentificationSource::Explicit,
+                    confidence: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionStorageError::SessionNotFound(id) if id == "no-such-session"));
     }
 }

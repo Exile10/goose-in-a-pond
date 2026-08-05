@@ -370,18 +370,45 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   Still outstanding for P4: the `SecurityPolicy::allow` / `::audit` deny matrix. Both
   implementations return `Ok(true)` and have zero production call sites.
 
-  **Known hole, not yet closed: the `giap-memory` MCP tools bypass the scope entirely.**
-  `recall_memories`, `keyword_search` and **`forget_memory`** all pass `ProfileScope::Household`
-  directly. `MemoryMcpServer` is process-global with no per-turn session state, so a Guest turn gets
-  no memories *injected* and can still ask the model to call `recall_memories` and receive
-  everything -- or `forget_memory` and destroy it. Closing this needs the scope threaded into the
-  MCP server per turn, in the shape of the existing `ShimControls` per-session cell.
-- **P5 — memory gated 2026-08-04; tool groups and draft rights outstanding.** A `Guest` turn gets no
-  memory injection (read) and deposits no memory (write). Tool-group narrowing and draft-approval
-  rights are not yet gated, and the MCP bypass above is the same gap seen from the other side.
+  **The identity write is now race-free.** `set_session_identity_if_stronger` does the rank
+  comparison inside the `UPDATE`, building the `CASE` from `IdentificationSource::ALL_RANKED` so the
+  ordering stays domain policy and a test pins the two together. The read-compare-write it replaced
+  could lose: two requests both read `Unknown`, both passed `supersedes`, and the later write won
+  whatever its rank -- so a face match landing a millisecond after somebody tapped "this is Liz"
+  took the session, for a different person, on weaker evidence. Reachable in production, and my
+  original comment claimed the only loser was a competing face match on the same camera frame.
+
+  **The `giap-memory` bypass is closed at the tool-group layer, not in the MCP server.**
+  `recall_memories`, `keyword_search` and `forget_memory` still pass `ProfileScope::Household`
+  directly, because `MemoryMcpServer` is process-global with no per-turn session. So the fix is one
+  layer up: a `Guest` session is never given the group, and cannot call the tools at all. See P5.
+
+  Threading a scope into the MCP server per turn remains worth doing -- it would also scope an
+  *Owner*'s tool calls, which the group gate does not -- but the only mechanism available today is
+  the process-global `set_current_session_id`, a `RwLock<String>` that the SSE semaphore already
+  permits more than one turn to race on. Using it would trade a guest hole for a misattribution
+  bug. Deferred until there is a per-turn cell to hang it on.
+- **P5 — LANDED 2026-08-04.** A `Guest` turn gets no memory injection (read), deposits no memory
+  (write), and is never given the personal-data tool groups.
+
+  `groups_denied_to_guests()` in `mcp/domain/tool_group.rs` names them: `giap-memory`, `giap-draft`,
+  `giap-audit`, `giap-vision`, `giap-sensors`. The adapter subtracts them **after** `select_groups`,
+  because `giap-memory` and `giap-draft` are `core` and selection puts core groups back
+  unconditionally -- filtering the candidates going in would not stick.
+
+  This is the layer that actually closes the MCP hole. Suppressing memory injection stops a guest
+  being *told* anything; removing the tools stops the model being *able* to look. `recall_memories`
+  and `forget_memory` carry no session of their own, so there is nowhere lower to check.
+
+  Deliberately a **denylist**, not an allowlist: a new group is far more likely to be neutral than
+  personal, and a new *personal* group is exactly the change whose author should have to think about
+  this list. An allowlist would silently deny every new group to guests and surface as a bug report.
+  A guest keeps weather, knowledge, device control, the toolkit and system time -- useful to a
+  visitor without being a disclosure channel.
 
   Separately, and belonging to [PAI-2](./02-privacy-and-security-guardrails.md) rather than here:
-  **`approve_draft` performs no ownership check at all.** Any session can approve any draft id.
+  **`approve_draft` performs no ownership check at all.** Any session can approve any draft id. The
+  group gate keeps a *guest* away from it; it does nothing about one member approving another's.
 - **P6 — LANDED 2026-08-04.** `profile_context_for` builds the context from the resolved scope:
   `Owner(id)` gives that member's preferences, `Household` falls back to
   `settings.primary_profile_id`, and **`Guest` gets `None`** -- falling back to the primary member

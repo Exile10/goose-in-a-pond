@@ -110,6 +110,18 @@ impl IdentificationSource {
         }
     }
 
+    /// Every source paired with its rank, strongest first.
+    ///
+    /// Exists so an adapter can push the comparison into a query without
+    /// re-deciding the ordering. The ranking is policy and stays here; the
+    /// adapter transports numbers.
+    pub const ALL_RANKED: &'static [(&'static str, u8)] = &[
+        ("paired_device", 0),
+        ("explicit", 1),
+        ("face", 2),
+        ("unknown", 3),
+    ];
+
     /// Strength, lower is stronger. Only meaningful in comparison.
     pub fn rank(&self) -> u8 {
         match self {
@@ -294,5 +306,40 @@ mod session_identity_tests {
     #[test]
     fn a_new_session_is_unattributed() {
         assert_eq!(Session::new("s1".to_string()).profile_id, None);
+    }
+}
+
+#[cfg(test)]
+mod ranked_table_tests {
+    use super::*;
+
+    /// `ALL_RANKED` is transported into SQL, so it has to agree with `rank()`
+    /// exactly. If they drift, a conditional write enforces one ordering while
+    /// every in-memory check enforces another -- and the disagreement would
+    /// only ever surface as an occasional, unreproducible downgrade.
+    #[test]
+    fn the_ranked_table_agrees_with_rank_and_covers_every_source() {
+        for source in [
+            IdentificationSource::PairedDevice,
+            IdentificationSource::Explicit,
+            IdentificationSource::Face,
+            IdentificationSource::Unknown,
+        ] {
+            let entry = IdentificationSource::ALL_RANKED
+                .iter()
+                .find(|(name, _)| *name == source.as_str())
+                .unwrap_or_else(|| panic!("ALL_RANKED is missing {}", source.as_str()));
+            assert_eq!(
+                entry.1,
+                source.rank(),
+                "ALL_RANKED and rank() disagree about {}",
+                source.as_str()
+            );
+        }
+        assert_eq!(
+            IdentificationSource::ALL_RANKED.len(),
+            4,
+            "a new source was added without a rank for the SQL comparison"
+        );
     }
 }
