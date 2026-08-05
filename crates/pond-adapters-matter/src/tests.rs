@@ -530,6 +530,9 @@ async fn mock_commissioning_server(node: Value) -> (String, ReceivedCommands) {
             // (write_attribute, remove_node) succeeds with null.
             let result = match frame["command"].as_str().unwrap() {
                 "commission_with_code" | "commission_on_network" => node.clone(),
+                // The pre-flight probe: one device is advertising, so
+                // commissioning proceeds.
+                "discover" => json!([{ "instance_name": "MOCKDEVICE" }]),
                 _ => Value::Null,
             };
             ws.send(Message::Text(
@@ -543,6 +546,107 @@ async fn mock_commissioning_server(node: Value) -> (String, ReceivedCommands) {
     });
 
     (url, received)
+}
+
+/// A mock whose mDNS view is empty: nothing is advertising itself for pairing.
+/// It still answers the commissioning commands, so a test can prove the attempt
+/// was refused before it reached them rather than merely failing later.
+async fn mock_unpairable_server(node: Value) -> (String, ReceivedCommands) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+    let received: ReceivedCommands = Arc::new(Mutex::new(Vec::new()));
+    let received_srv = received.clone();
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        ws.send(Message::Text(
+            json!({"fabric_id": 1, "schema_version": 11})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+        while let Some(Ok(Message::Text(text))) = ws.next().await {
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            let mid = frame["message_id"].as_str().unwrap().to_string();
+            received_srv.lock().unwrap().push(frame.clone());
+            let result = match frame["command"].as_str().unwrap() {
+                "discover" => json!([]),
+                "commission_with_code" | "commission_on_network" => node.clone(),
+                _ => Value::Null,
+            };
+            ws.send(Message::Text(
+                json!({"message_id": mid, "result": result})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        }
+    });
+
+    (url, received)
+}
+
+/// The failure that cost hours on 2026-08-05: the device's 15-minute
+/// commissioning window had closed, so discovery found nothing and the
+/// controller answered a bare "Commissioning failed for node N" after a 30s
+/// timeout — with the real reason only in its own log file. The user is now
+/// told what happened and what to do, without the wait.
+#[tokio::test]
+async fn commissioning_with_nothing_in_pairing_mode_says_so_and_says_it_early() {
+    let (url, received) = mock_unpairable_server(light_node_json()).await;
+    let (client, _events) = MatterClient::connect(&url).await.unwrap();
+    let commissioner = MatterCommissioner::new(client);
+
+    let error = commissioner
+        .commission(SetupCode::Passcode(20202021), None)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("pairing mode"),
+        "the message names the actual problem: {error}"
+    );
+    assert!(
+        error.contains("15 minutes"),
+        "and the window that explains why it was pairable earlier: {error}"
+    );
+
+    // Refused on the probe, so the 30-second discovery timeout is never
+    // entered — that speed is the point, not a side effect.
+    let commands: Vec<String> = received
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|f| f["command"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(commands, vec!["discover"], "nothing else was attempted");
+}
+
+/// The probe must not become a second way to fail. A controller that answers it
+/// with something unexpected proves nothing about the device, so commissioning
+/// goes ahead exactly as before.
+#[tokio::test]
+async fn an_unusable_probe_answer_does_not_block_commissioning() {
+    // The general mock answers every non-commissioning command with null.
+    let (url, _received) = mock_matter_server(json!([]), vec![]).await;
+    let (client, _events) = MatterClient::connect(&url).await.unwrap();
+    let commissioner = MatterCommissioner::new(client);
+
+    let error = commissioner
+        .commission(SetupCode::Passcode(20202021), None)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        !error.contains("pairing mode"),
+        "a null probe answer must not be reported as an empty network: {error}"
+    );
 }
 
 /// A named commission writes the name to the device's NodeLabel and returns it
