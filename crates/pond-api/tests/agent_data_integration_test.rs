@@ -1499,3 +1499,92 @@ async fn identifying_a_session_is_refused_in_enforce_mode() {
         "the binding was written despite the refusal"
     );
 }
+
+// ── PAI-1 P4 / PAI-2 P1: the policy's first production call site ────────────
+//
+// `PUT /sessions/{id}/user` took a profile_id from the request BODY and bound
+// it at Explicit strength with no ownership check, so any paired device could
+// declare itself any household member and have that member's memories injected
+// into every later turn.
+//
+// These go through the router because the check lives between the auth
+// middleware (which supplies the Principal) and the handler. A test below HTTP
+// would have no principal at all and would prove nothing about either.
+
+/// The gate bites. Without this test the check is a rule nobody has watched
+/// fire — and a `SecurityPolicy` that has never denied anything is exactly the
+/// shape of the inert `Ok(true)` this phase exists to replace.
+#[tokio::test]
+async fn enforce_mode_refuses_an_identity_the_caller_cannot_prove() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage
+        .create_session("sess-policy".to_string())
+        .await
+        .unwrap();
+    let liz = seed_profile(&app, "Liz").await;
+
+    let resp = app
+        .clone()
+        .oneshot(put(
+            "/api/v1/settings",
+            serde_json::json!({ "security_policy_mode": "enforce" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "could not switch to enforce");
+
+    // The caller holds a valid token and has proved no membership, which is
+    // every remote caller today: nothing links a device to a member.
+    let resp = app
+        .clone()
+        .oneshot(put(
+            "/api/v1/sessions/sess-policy/user",
+            serde_json::json!({ "profile_id": liz }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // ...and the refusal is real, not cosmetic: nobody was bound.
+    let resp = app
+        .oneshot(get("/api/v1/sessions/sess-policy/user"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["profile_id"], serde_json::Value::Null);
+}
+
+/// The shipped default. The SAME assertion the test above refuses must succeed
+/// here, or `audit` is silently enforcing and the rollout plan is a fiction.
+#[tokio::test]
+async fn audit_mode_allows_the_very_assertion_enforce_refuses() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage
+        .create_session("sess-audit".to_string())
+        .await
+        .unwrap();
+    let liz = seed_profile(&app, "Liz").await;
+
+    // No mode is set, so this is the default the product ships with.
+    let resp = app
+        .clone()
+        .oneshot(put(
+            "/api/v1/sessions/sess-audit/user",
+            serde_json::json!({ "profile_id": liz }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "audit mode must not block -- that is the whole point of landing in it"
+    );
+
+    // Assert the positive case too. "Not a 403" would also hold if the handler
+    // had stopped binding anything at all.
+    let resp = app
+        .oneshot(get("/api/v1/sessions/sess-audit/user"))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["profile_id"], liz);
+}
