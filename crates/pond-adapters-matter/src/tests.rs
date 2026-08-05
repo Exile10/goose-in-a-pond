@@ -878,33 +878,44 @@ impl DeviceControlPort for RecordingControl {
     }
 }
 
-/// While Matter is off the facade is the logging stub — every verb, including
-/// the optional ones that would otherwise default to "unsupported".
+/// The stub answers every verb with success, so a Matter device must never
+/// reach it: routing `matter-18` there while Matter was off reported a fan as
+/// switched on when nothing had been sent anywhere, and the agent relayed that
+/// to the user. Devices on other transports are exactly what the stub is for,
+/// so those still fall through.
 #[tokio::test]
-async fn control_falls_back_to_the_stub_while_matter_is_off() {
+async fn a_matter_device_is_refused_while_matter_is_off_but_others_fall_back() {
     let runtime = test_runtime();
     let stub = Arc::new(RecordingControl::default());
     let control = runtime.device_control(stub.clone() as Arc<dyn DeviceControlPort>);
 
-    control.set_power("matter-2", true).await.unwrap();
-    control.set_brightness("matter-2", 40).await.unwrap();
+    let refused = control
+        .set_power("matter-2", true)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("Matter is off") && refused.contains("matter-2"),
+        "the refusal names the state and the device: {refused}"
+    );
+    assert!(control.set_brightness("matter-2", 40).await.is_err());
+    assert!(control.set_color("matter-2", 120, 80).await.is_err());
+
+    // Non-Matter ids are the stub's job and still get there.
     control.set_target_temp("thermo", 21.5).await.unwrap();
     control.set_locked("front-door", true).await.unwrap();
-    control.set_color("matter-2", 120, 80).await.unwrap();
     control.set_fan_speed("fan-1", 50).await.unwrap();
     control.set_position("blind-1", 30).await.unwrap();
 
     assert_eq!(
         stub.calls(),
         vec![
-            "set_power(matter-2,true)",
-            "set_brightness(matter-2,40)",
             "set_target_temp(thermo,21.5)",
             "set_locked(front-door,true)",
-            "set_color(matter-2,120,80)",
             "set_fan_speed(fan-1,50)",
             "set_position(blind-1,30)",
-        ]
+        ],
+        "no Matter call reached the stub"
     );
 }
 
@@ -928,11 +939,13 @@ async fn control_switches_to_matter_once_connected() {
         "a connected runtime must not fall back to the stub"
     );
 
-    // And back to the stub when Matter is turned off again.
+    // Turning Matter off does not hand Matter devices back to the stub. With no
+    // controller there is nothing that could carry the command, and the stub's
+    // success would be a lie the agent repeats to the user.
     runtime.apply(false, String::new());
     wait_for(&runtime, |s| *s == MatterState::Disabled).await;
-    control.set_power("matter-2", false).await.unwrap();
-    assert_eq!(stub.calls(), vec!["set_power(matter-2,false)"]);
+    assert!(control.set_power("matter-2", false).await.is_err());
+    assert!(stub.calls().is_empty(), "still nothing reached the stub");
 }
 
 /// An install enabled before the Matter section existed could carry a blank
