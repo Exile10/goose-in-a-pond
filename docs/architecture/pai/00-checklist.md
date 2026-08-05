@@ -146,6 +146,12 @@ infinity | cargo run ... &`) or it exits immediately and looks like a crash.
   and not the headers. `apt-get install libasound2-dev` on a fresh container 404s on every mirror,
   which reads as a sandbox restriction; it is a stale index. **Run `apt-get update` first.** I
   recorded "no apt access" in a commit message on the strength of the 404 alone and it was wrong.
+- **A stray `pond-server` on port 4000 silently hijacks `scripts/live-test.sh`.** Check before
+  running it: `lsof -nP -iTCP:4000-4009 -sTCP:LISTEN`. A long-lived `serve --native` with no
+  `POND_DATA_DIR` runs against the *real* data directory, and the script used to assume port 4000 —
+  so every assertion, and both onboarding writes, went to that pond instead of the scratch one. The
+  script now reads `.runtime_api_port`, fails hard when it is absent, and refuses to drive a
+  listener whose pid it did not start. See the 2026-08-05 entry in section 4.
 - **Disk is a fixed allowance and the failure mode is disguised.** `cargo test -p pond-api` builds
   seventeen integration binaries at ~600 MB each, because every one links Goose statically. That
   alone exceeds the allowance. The symptom is
@@ -537,3 +543,73 @@ than your change** -- check `df` and `RUSTFLAGS` before reading the diff.
 correction retained as the safety net. `turn_trimmer.rs:89-91` is the estimator to displace, and
 `WindowSource::is_exact()` already exists to tell budget code when it can trust the window to the
 token.
+
+**2026-08-05 — the three open decisions are closed. Jerry's calls, recorded verbatim in intent.**
+
+The previous three entries each ended by asking for a decision rather than taking one. All three are
+now answered, so nothing downstream has to guess:
+
+1. **Capturing a household member at pairing time gets its own phase.** Not folded into PAI-1 and not
+   into PAI-7, both of which need it. Burying it in either makes the other's dependency invisible in
+   the status ledger — and it is self-contained anyway: a migration, one question in the pairing
+   flow, and a resolver input that already exists and is fed `None` by every caller. PAI-1's
+   `paired_device_profile` and PAI-7's "that profile's devices" both become live when it lands.
+2. **The unidentified-speaker posture stays implicit, and gets documented.** `Household` in a
+   one-member pond, `Guest` once there are two — no setting. The argument in PAI-1 P3 holds: the two
+   scopes only describe different rows when there is somebody to be excluded from, so in a one-member
+   pond they are the same rows. It belongs in release notes, not in `Settings`. **Consequence for
+   P4:** enforcement is being built on a posture the user never explicitly chose, so the audit-mode
+   telemetry PAI-2 P1 collects is the thing that has to reveal it if the call was wrong.
+3. **`approve_draft`'s missing ownership check belongs to PAI-2, with the deny matrix.** Not
+   hoisted into P0 alongside the auth allowlist, and not landed as a standalone handler patch.
+   It becomes a real production call site for `SecurityPolicy::allow`, which today returns `Ok(true)`
+   with none — so the check and the layer meant to express it land together, in `audit` mode first
+   per PAI-2's own plan. It stays a known live hole until then: any session can approve any draft id,
+   and the guest tool-group gate does nothing about one member approving another's.
+
+**2026-08-05 — first macOS run of `live-test.sh`. It wrote to a real pond, and that is the finding.**
+
+The script's own header promises "a scratch `POND_DATA_DIR` so it can never touch a real pond." That
+promise did not hold, and the way it failed is worth more than the fix.
+
+A `pond-server serve --native` had been running on this Mac for four days, with no `POND_DATA_DIR`,
+holding port 4000. The script hardcoded `PORT=4000`, waited 60s for `.runtime_api_port`, and on
+timeout **kept the assumed port and carried on**. Its own scratch server had meanwhile fallen back to
+4001. So every HTTP assertion, and both onboarding lift writes, went to the real pond:
+`PUT /settings {"user_name":"LiveTest","chat_model":"mock",...}` overwrote four real settings rows.
+Restored from surviving evidence — `primary_profile_id`'s display name, `active_llm_model`, and the
+model on the last 113 sessions — with a timestamped `.bak` of the database taken first.
+
+**The 60s timeout was not arbitrary and was still wrong.** `.runtime_api_port` is written right after
+`bind_with_fallback`, which on a cold macOS start lands *about* 60s in. The wait was sitting exactly
+on the boundary. But the timeout length is the small half of the bug: the real defect is that
+expiring was **not fatal**. Falling back to an assumed port is a widening default in the same family
+invariant 2 names — on failure it reached *more*, not less.
+
+**Three false readings this produced, all of which looked like real findings:**
+
+- `no such table: _sqlx_migrations` — read as "migration 0037 did not apply". `sqlite3.connect`
+  *creates* an empty database when the path does not exist, so a wrong data dir is indistinguishable
+  from a failed migration. `db()` now refuses to invent one.
+- Five `FAIL GET /... returned 000 with NO TOKEN` — read as a catastrophic auth hole. It was the
+  auth-probe server not having finished starting; the health wait had no failure check and the route
+  loop ran regardless. Exactly the class this suite's own docstring warns about: **a check that fails
+  because the request failed reports the opposite of the truth.** Same trap, one layer out.
+- A Playwright console-error failure — read as a UI defect. It was the browser driving the *real*
+  server, which has no loopback bypass, so six calls 401'd. Once the port resolved correctly, all four
+  live UI tests passed with **no change to the spec**. Worth recording as a near miss: the obvious
+  move was to filter 401s out of that assertion, which would have masked the port bug permanently and
+  left a correct test weaker.
+
+The generalisable lesson, and it is the same one as `ProfileScope::Owner`: **ask what the check does
+when its setup is wrong.** A harness that cannot tell "the thing I am testing is broken" from "I am
+not testing the thing" reports the second as the first, confidently, while the parts that never ran
+report nothing at all.
+
+`live_checks.py` now resolves the port once and treats its absence as fatal setup rather than a
+per-check failure — previously a `FileNotFoundError` escaped mid-`section_identity`, so P3 through P8
+never ran while the run still reported on the sections that had.
+
+**Fixed and re-run clean:** 37 API checks / 0 failed, restart OK, migrations applied once, 4/4 live UI
+tests, one benign WARN in the log dig (`auto_download` skipping `llamafile/mock`, which is the live
+check's own onboarding write). `rc=1` remains, from the auth section alone, exactly by design.

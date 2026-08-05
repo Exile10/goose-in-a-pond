@@ -41,7 +41,11 @@ for arg in "$@"; do
 done
 
 SERVER_PID=""
+AUTH_PID=""
 cleanup() {
+  # The auth-probe server is never meant to outlive the run, even under --keep:
+  # it exists only for the no-bypass pass and holding it open serves nothing.
+  [ -n "$AUTH_PID" ] && kill -9 "$AUTH_PID" 2>/dev/null
   if [ -n "$SERVER_PID" ] && [ "$KEEP" -eq 0 ]; then
     kill -9 "$SERVER_PID" 2>/dev/null
   fi
@@ -55,6 +59,77 @@ cleanup() {
 trap cleanup EXIT
 
 say() { printf '\n=== %s ===\n' "$1"; }
+
+# ── Server lifecycle ─────────────────────────────────────────────────────────
+#
+# Every helper below exists because the first macOS run of this script drove a
+# DIFFERENT pond-server than the one it started, and wrote to a real pond.
+#
+# A `pond-server serve --native` had been running for four days on port 4000
+# against the real data directory. This script assumed 4000, waited 60s for
+# `.runtime_api_port`, gave up SILENTLY, kept the assumed port, and sent its
+# onboarding lift -- `PUT /settings {"user_name":"LiveTest","chat_model":"mock"}`
+# -- to that server. The scratch POND_DATA_DIR this script's header promises was
+# never in the loop. Four real settings rows were overwritten.
+#
+# The rule that follows, and the reason these are three separate checks:
+# never assume a port; read the one the server published; fail hard when it
+# publishes none; and prove the listener is our own child before sending a
+# single request to it.
+
+# The port is written immediately after `bind_with_fallback`, which on a cold
+# macOS start lands ~60s in -- exactly the old timeout, which is why it expired
+# rather than failing. A missing port file is now fatal, never a fallback.
+wait_for_port_file() {
+  local dir="$1" label="$2" log="$3" tries="${4:-180}"
+  for _ in $(seq 1 "$tries"); do
+    [ -s "$dir/.runtime_api_port" ] && return 0
+    sleep 1
+  done
+  echo "FATAL: $label never wrote .runtime_api_port after ${tries}s." >&2
+  echo "       Refusing to guess a port -- guessing one is how this script" >&2
+  echo "       previously wrote to a real pond." >&2
+  tail -30 "$log" >&2 2>/dev/null
+  return 1
+}
+
+# `lsof -t` lists the pids holding the port. Ours must be among them; anything
+# else means a foreign server answers on it and every assertion would be about
+# somebody else's pond.
+assert_port_owned_by() {
+  local port="$1" pid="$2" label="$3" holders
+  holders="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | tr '\n' ' ')"
+  case " $holders " in
+    *" $pid "*) return 0 ;;
+  esac
+  echo "FATAL: port $port is held by pid(s) [${holders:-none}], not $label (pid $pid)." >&2
+  echo "       Refusing to drive a pond-server this script did not start." >&2
+  return 1
+}
+
+wait_for_health() {
+  local port="$1" label="$2" tries="${3:-90}"
+  for _ in $(seq 1 "$tries"); do
+    curl -sf -o /dev/null "http://127.0.0.1:$port/api/v1/health" && return 0
+    sleep 1
+  done
+  echo "FATAL: $label never became healthy on port $port after ${tries}s." >&2
+  return 1
+}
+
+# Resolve a just-started server: its real port, its health, and that it is ours.
+# Sets the global PORT_RESOLVED on success.
+resolve_server() {
+  local dir="$1" pid="$2" label="$3"
+  # Assigned separately: within a single `local`, the default for `log` is
+  # expanded before `dir` exists, and under `set -u` that aborts the run.
+  local log="${4:-$dir/server.out}"
+  wait_for_port_file "$dir" "$label" "$log" || return 1
+  PORT_RESOLVED="$(tr -d ' \n' < "$dir/.runtime_api_port")"
+  wait_for_health "$PORT_RESOLVED" "$label" || { tail -30 "$log" >&2; return 1; }
+  assert_port_owned_by "$PORT_RESOLVED" "$pid" "$label" || return 1
+  return 0
+}
 
 # ── Build ────────────────────────────────────────────────────────────────────
 #
@@ -97,28 +172,17 @@ POND_DATA_DIR="$DATA_DIR" POND_DEV_ALLOW_LOOPBACK=1 RUST_LOG=info \
   > "$DATA_DIR/server.out" 2>&1 < /dev/zero &
 SERVER_PID=$!
 
-# --port is a request, not a promise: the fallback walks 4000..4009 and the
-# port it actually bound is written to .runtime_api_port.
-for _ in $(seq 1 60); do
-  [ -f "$DATA_DIR/.runtime_api_port" ] && break
-  sleep 1
-done
-if [ -f "$DATA_DIR/.runtime_api_port" ]; then
-  PORT="$(cat "$DATA_DIR/.runtime_api_port")"
-fi
-
-for _ in $(seq 1 60); do
-  curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/v1/health" && break
-  sleep 1
-done
-curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/v1/health" || {
-  echo "server never became healthy. Last 30 lines:" >&2
-  tail -30 "$DATA_DIR/server.out" >&2
-  exit 1
-}
-echo "healthy on port $PORT (pid $SERVER_PID)"
+# --port is a request, not a promise: the fallback walks 4000..4009 and the port
+# it actually bound is written to .runtime_api_port. Read it, never assume it.
+resolve_server "$DATA_DIR" "$SERVER_PID" "pond-server" || exit 1
+PORT="$PORT_RESOLVED"
+echo "healthy on port $PORT (pid $SERVER_PID, data $DATA_DIR)"
 
 # Onboarding fronts every non-public route; lift it or everything 403s.
+#
+# These two writes are the ones that reached a real pond when the port was
+# assumed. They stay here, but they now run only AFTER resolve_server has
+# proved this port belongs to the scratch server we started.
 curl -s -o /dev/null -X PUT "http://127.0.0.1:$PORT/api/v1/settings" \
   -H 'Content-Type: application/json' \
   -d '{"user_name":"LiveTest","assistant_name":"Goose","timezone":"UTC","chat_model":"mock"}'
@@ -140,16 +204,16 @@ fi
 # directory, which now has rows.
 say "restart against the populated database"
 kill -9 "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null
+# Drop the old server's port file, or resolve_server returns instantly with a
+# stale port and the restart is verified against whatever now holds it.
+rm -f "$DATA_DIR/.runtime_api_port"
 POND_DATA_DIR="$DATA_DIR" POND_DEV_ALLOW_LOOPBACK=1 RUST_LOG=info \
   "$BIN" serve --port "$PORT" --static-dir pond-desktop/dist \
   > "$DATA_DIR/server2.out" 2>&1 < /dev/zero &
 SERVER_PID=$!
-for _ in $(seq 1 60); do
-  curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/v1/health" && break
-  sleep 1
-done
-if curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/v1/health"; then
-  echo "restart OK"
+if resolve_server "$DATA_DIR" "$SERVER_PID" "pond-server (restart)" "$DATA_DIR/server2.out"; then
+  PORT="$PORT_RESOLVED"
+  echo "restart OK on port $PORT"
   python3 - "$DATA_DIR" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1] + "/pond_system.db")
@@ -173,40 +237,64 @@ fi
 # running it against the server above would report the opposite of the truth.
 say "auth allowlist (no token, no loopback bypass)"
 AUTH_DIR="$DATA_DIR-auth"
-AUTH_PORT=$((PORT + 20))
 mkdir -p "$AUTH_DIR"
 POND_DATA_DIR="$AUTH_DIR" RUST_LOG=warn \
-  "$BIN" serve --port "$AUTH_PORT" > "$AUTH_DIR/server.out" 2>&1 < /dev/zero &
+  "$BIN" serve --port "$((PORT + 20))" > "$AUTH_DIR/server.out" 2>&1 < /dev/zero &
 AUTH_PID=$!
-for _ in $(seq 1 60); do
-  curl -sf -o /dev/null "http://127.0.0.1:$AUTH_PORT/api/v1/health" && break
-  sleep 1
-done
 
-# Onboarding must be complete here too, or `require_onboarding_complete`
-# returns 403 BEFORE auth is evaluated and every route below looks protected
-# whether it is or not. Found by running this script: the first version
-# reported FAIL for /settings and /profiles on a 403, which reads like the
-# right answer and is measuring the wrong gate.
-#
-# Both writes below are themselves on the public allowlist, which is why they
-# work without a token -- that is the onboarding hole, not an accident here.
-curl -s -o /dev/null -X PUT "http://127.0.0.1:$AUTH_PORT/api/v1/settings" \
-  -H 'Content-Type: application/json' \
-  -d '{"user_name":"AuthProbe","assistant_name":"Goose","timezone":"UTC","chat_model":"mock"}'
-curl -s -o /dev/null -X POST "http://127.0.0.1:$AUTH_PORT/api/v1/onboard/complete"
+# The old version waited 60s for health and then ran the route loop REGARDLESS.
+# When the server was not up yet, all five routes reported
+#   FAIL  GET /settings  returned 000 with NO TOKEN
+# which reads exactly like a catastrophic auth hole and is actually "no server
+# answered". Same class of error as the body-predicate trap this suite warns
+# about: a check that fails because the request failed reports the opposite of
+# the truth. A server that does not start is now its own distinct failure.
+AUTH_OK=0
+if resolve_server "$AUTH_DIR" "$AUTH_PID" "auth-probe server"; then
+  AUTH_OK=1
+  AUTH_PORT="$PORT_RESOLVED"
+else
+  echo "  ERROR  the auth-probe server never came up, so the five route checks" >&2
+  echo "         below did NOT run. This is not an auth finding." >&2
+  RC=1
+fi
 
-for route in /settings /profiles /sessions /devices /memory; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$AUTH_PORT/api/v1$route")
-  case "$code" in
-    401) printf '  PASS  GET %-10s requires a token\n' "$route" ;;
-    403) printf '  SKIP  GET %-10s 403 -- onboarding guard fired before auth\n' "$route" ;;
-    *)   printf '  FAIL  GET %-10s returned %s with NO TOKEN\n' "$route" "$code"
-         RC=1 ;;
-  esac
-done
+if [ "$AUTH_OK" -eq 1 ]; then
+  # Onboarding must be complete here too, or `require_onboarding_complete`
+  # returns 403 BEFORE auth is evaluated and every route below looks protected
+  # whether it is or not. Found by running this script: the first version
+  # reported FAIL for /settings and /profiles on a 403, which reads like the
+  # right answer and is measuring the wrong gate.
+  #
+  # Both writes below are themselves on the public allowlist, which is why they
+  # work without a token -- that is the onboarding hole, not an accident here.
+  curl -s -o /dev/null -X PUT "http://127.0.0.1:$AUTH_PORT/api/v1/settings" \
+    -H 'Content-Type: application/json' \
+    -d '{"user_name":"AuthProbe","assistant_name":"Goose","timezone":"UTC","chat_model":"mock"}'
+  curl -s -o /dev/null -X POST "http://127.0.0.1:$AUTH_PORT/api/v1/onboard/complete"
+
+  for route in /settings /profiles /sessions /devices /memory; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$AUTH_PORT/api/v1$route")
+    case "$code" in
+      401) printf '  PASS  GET %-10s requires a token\n' "$route" ;;
+      403) printf '  SKIP  GET %-10s 403 -- onboarding guard fired before auth\n' "$route" ;;
+      000) printf '  ERROR GET %-10s no response -- the server died mid-section\n' "$route"
+           RC=1 ;;
+      *)   printf '  FAIL  GET %-10s returned %s with NO TOKEN\n' "$route" "$code"
+           RC=1 ;;
+    esac
+  done
+fi
 kill -9 "$AUTH_PID" 2>/dev/null; wait "$AUTH_PID" 2>/dev/null
-rm -rf "$AUTH_DIR"
+AUTH_PID=""
+# Keep the probe's log when it failed to start or when --keep was asked for.
+# Deleting it unconditionally is what left the first macOS failure with no
+# evidence at all to diagnose from.
+if [ "$AUTH_OK" -eq 1 ] && [ "$KEEP" -eq 0 ]; then
+  rm -rf "$AUTH_DIR"
+else
+  echo "  auth-probe data kept at $AUTH_DIR"
+fi
 
 # ── Logs ─────────────────────────────────────────────────────────────────────
 #

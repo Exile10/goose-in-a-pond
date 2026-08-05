@@ -32,9 +32,35 @@ def check(label, ok, detail=""):
     return bool(ok)
 
 
+_PORT = None
+
+
 def api_port():
-    with open(PORT_FILE) as fh:
-        return fh.read().strip()
+    """The port the server actually bound, read once from .runtime_api_port.
+
+    This used to open the file on every single call and let a FileNotFoundError
+    escape. On the first macOS run the file had not been written yet -- the
+    server publishes it after `bind_with_fallback`, which is ~60s into a cold
+    start -- so the suite died with a traceback partway through section_identity
+    and sections P3 onward never ran at all. A missing port file is a fatal
+    setup problem, not a per-check failure, so it is reported as one.
+    """
+    global _PORT
+    if _PORT is None:
+        try:
+            with open(PORT_FILE) as fh:
+                _PORT = fh.read().strip()
+        except FileNotFoundError:
+            sys.exit(
+                "FATAL: %s does not exist, so there is no way to know which port the\n"
+                "server bound. Never guess one -- live-test.sh guessed 4000 once and\n"
+                "drove a different pond-server that happened to be holding it.\n"
+                "live-test.sh is meant to resolve this before invoking these checks."
+                % PORT_FILE
+            )
+        if not _PORT:
+            sys.exit("FATAL: %s is empty." % PORT_FILE)
+    return _PORT
 
 
 def call(method, path, body=None, token=None):
@@ -67,6 +93,20 @@ def expect(label, code, want, body, *predicates):
 
 
 def db():
+    """Open the pond's system database, refusing to invent one.
+
+    `sqlite3.connect` CREATES an empty database when the path does not exist, so
+    a wrong or unwritten POND_DATA_DIR surfaced as `no such table:
+    _sqlx_migrations` -- which reads as "the migration did not apply" and is
+    actually "there is no database here". That misdiagnosis cost a whole run.
+    """
+    if not os.path.exists(DB):
+        sys.exit(
+            "FATAL: no database at %s.\n"
+            "The server either has not finished starting or is writing somewhere\n"
+            "else entirely. This is NOT a migration failure -- do not read it as one."
+            % DB
+        )
     return sqlite3.connect(DB)
 
 
