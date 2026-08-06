@@ -21,7 +21,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
 | 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **COMPLETE — P1-P8 LANDED** |
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1-P4, P6 LANDED** (P3 completed by P3b 2026-08-06); **P5 code landed 2026-08-06, awaiting the on-device TTFT measurement that decides it** |
-| 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | **P1 LANDED 2026-08-06** (`ModelClass` + strategy dispatch, domain only — P2 is its first consumer); P2-P7 designed |
+| 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | **P1, P4 LANDED 2026-08-06** (P1 `ModelClass` + strategy dispatch, domain only — P2 is its first consumer; P4 compact-on-resume gate, wired to the session reopen, refreshing the rolling summary); P2, P3, P5-P7 designed |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
 | 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0-P5, P7 LANDED** (P3, P5 partial); P6, P8 designed |
 
@@ -1113,3 +1113,75 @@ Gates: `cargo fmt --check` clean, `cargo clippy -p pond-core --all-targets` with
 `cargo test -p pond-core` 733 lib + 5 + 3 ignored, and `cargo check -p pond-server
 -p pond-adapters-goose` clean. No live-server run: the phase touches no migration, no route, no
 handler and no startup wiring, and adds no `Settings` field.
+
+---
+
+**2026-08-06 — PAI-4 P4. A gap is not a resume; a person is.**
+
+`models/services/context/resume_compaction.rs` — `should_run(ResumeGateInputs) -> GateDecision`,
+`idle_threshold_from_secs`, `idle_gap_since`, five skip reasons. 14 tests; `pond-core` 747 lib, up
+from 733. New headless setting `resume_compaction_idle_secs`, full five-part ritual. Called from
+`spawn_resume_compaction` in `routes.rs`, fired by `GET /api/v1/sessions/:id/messages`.
+
+**The one-line rule in 3.2 hides the bug it would have caused.** It reads
+`session resumed && idle_gap > resume_compaction_idle_secs -> compact`, and if `idle_gap` is the
+only input, then at boot every stored session satisfies it — starting the server would compact the
+entire history store and call each one a resume. That is consolidation's "never on startup" guard
+wearing a different costume, and it needed a different implementation, not the same one: consolidation
+asks "has a user done anything since I started?", which a background loop can answer. Here the gate
+is not on a loop at all. `ResumeGateInputs::reopened` is set from a request somebody made, and
+nothing in `pond-core` can set it from a timer. Generalisable: **when you port a guard, port the
+question it answers, not the field it reads.**
+
+**"Run full compaction on resume" could not be implemented as written, and the reason is that
+compaction is two mechanisms with opposite timing.** The deterministic trimmer is a function of the
+turn being assembled — there is nothing to pre-run and, being deterministic and model-free, nothing
+to save. So the design's stated motive ("today compaction happens *during* the first turn back,
+while the user waits on a token stream") does not describe what hybrid compaction actually costs a
+turn. What it does describe, once you go looking, is a real hole one layer over: the idle
+summary loop in `main.rs` skips any session whose `updated_at` predates process start, so a
+conversation from before the last restart keeps a summary frozen at that restart, and the trimmer
+splices the stale one into every turn until four fresh messages accumulate. That is what P4 fixes,
+and I have said so in the phase stamp rather than claiming the larger thing. The large tier's
+re-summarisation is P2's; this gate will call it when it exists.
+
+**Both fallbacks lengthen, because short is the direction that costs.** 30 minutes for the default
+(15x `summary_idle_secs`, 2x consolidation's inactivity threshold — the point at which the rest of
+the system already considers the household asleep). `MIN_RESUME_IDLE_SECS = 300` floors a stored `0`,
+which would otherwise mean "every reopen is a resume". `idle_gap_since` returns `Duration::ZERO` for
+a future timestamp, so a skewed clock or a restored backup reads as *active*, never as stale. A
+threshold that is too long only means the user pays what they already pay; one that is too short
+spends a model call between every pair of turns on the device least able to afford it.
+
+**Invariant 1 is held by where the code runs, not by a promise.** Both database reads the gate needs
+happen inside the spawned task, so the reopen returns at exactly the speed it did before; the refresh
+races a watcher on `last_user_activity` and persists nothing if cancelled. The in-flight set that
+stops two rapid reopens queueing two model calls is process-local on purpose — a database row would
+survive a `kill -9` and strand the session as permanently compacting.
+
+**Three mutations.** Deleting the `reopened` check failed `a_huge_gap_alone_is_not_a_resume`
+(`left: Run, right: Skip(NotAReopen)`) and `no_single_precondition_can_be_dropped` with
+*"the gate ran with `reopened` unsatisfied"*. Dropping the `.max(MIN_RESUME_IDLE_SECS)` floor failed
+`a_stored_zero_is_floored_rather_than_treated_as_no_threshold`: *"a stored 0 disabled the idle
+threshold entirely — left: 0ns, right: 300s"*. Removing the `apply_key` arm failed pond-infra's
+`roundtrip_persists_every_field` with *"resume_compaction_idle_secs: wrote 1807, read back
+Some(Number(1800))"* — the settings ritual's own guard, checked because the field is the part of
+this phase the compiler is least able to protect. A fourth, removing the `HEADLESS_BY_DESIGN` entry,
+failed `every_settings_field_is_dispositioned` by name. All four restored; `git status --porcelain`
+lists only the five files this phase owns.
+
+**Learned, and not from the phase text.** `get_messages_paginated`'s doc comment says "returns the
+100 most recent messages"; the SQL is `ORDER BY created_at ASC LIMIT ? OFFSET ?`, so the default page
+is the *oldest* hundred. I had drafted the gap check against the last message of the page and it
+would have measured the age of the conversation's opening line on any session over 100 messages —
+i.e. it would have said "resume" forever. The gap is read from `sessions.updated_at` instead. The
+doc comment is still wrong and is not mine to fix in this phase; it is recorded here so the next
+person reads the SQL.
+
+Gates: `cargo fmt --check` clean; `cargo clippy -p pond-core -p pond-infra -p pond-api
+--all-targets` with no new warnings in the touched files; `cargo test -p pond-core` 747 lib + 5 + 3
+ignored, `-p pond-infra` 214 + 3 + 4 + 1 ignored, `-p pond-api` 263 across 19 binaries; `cargo check
+-p pond-server -p pond-adapters-goose` clean. No live-server run, and that is a gap rather than a
+judgement: the phase adds a `Settings` field and a route side effect, both of which
+`scripts/live-test.sh` exists to catch, and the integration assertion section 7 asks for — that the
+refresh completes before the first token of the next turn — needs a real server and a real model.

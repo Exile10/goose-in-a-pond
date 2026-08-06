@@ -2068,7 +2068,140 @@ async fn get_session_messages(
         })
         .collect();
 
+    // PAI-4 P4: opening a session is the resume signal. Never awaited — see
+    // `spawn_resume_compaction`.
+    spawn_resume_compaction(&state, &session_id, offset, messages.len());
+
     Ok(Json(json!({ "messages": list })))
+}
+
+/// Sessions with a resume compaction currently in flight.
+///
+/// Process-local, because the hazard is process-local: two rapid reopens of the
+/// same session would each spawn a refresh, and on the serial on-device engine
+/// the second queues behind the first while the user's first turn queues behind
+/// both. A row in the database would be worse, not better — it would outlive a
+/// `kill -9` and strand the session as permanently "compacting".
+static RESUME_COMPACTIONS_IN_FLIGHT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// PAI-4 P4 — compact a session on resume, before its first turn back.
+///
+/// `docs/architecture/pai/04-smart-compaction.md` 3.2: a session reopened after
+/// a gap is about to pay a full prefill whatever happens, so reshaping its
+/// history now costs the user nothing. What it buys today is the rolling
+/// summary: the idle refresh loop in `pond-server` skips every session whose
+/// `updated_at` predates process start (its "never at startup" guard), so a
+/// conversation from before the last restart carries a summary that stops where
+/// it stopped — and the trimmer splices that stale summary into every turn until
+/// four new messages accumulate. Refreshing while the user is still reading the
+/// history closes that, and does it off the token stream.
+///
+/// Three properties this must have, and how each is obtained:
+///
+/// - **It never blocks the reopen** (invariant 1). Everything below, including
+///   the two database reads the gate needs, happens inside the spawned task, so
+///   `GET /sessions/:id/messages` returns at exactly the speed it did before.
+/// - **It is never triggered by a clock.** The gate's `reopened` input is the
+///   startup guard: at boot every stored session has a gap of days, and a rule
+///   that asked only about the gap would compact the whole store on startup.
+///   Only a request a person made sets it.
+/// - **A user turn reclaims the engine immediately.** The refresh races a
+///   watcher on `last_user_activity`, the same contract the idle summary loop
+///   uses; a cancelled refresh persists nothing.
+fn spawn_resume_compaction(
+    state: &Arc<AppState>,
+    session_id: &str,
+    offset: usize,
+    page_len: usize,
+) {
+    let state = state.clone();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        use pond_core::models::services::context::resume_compaction as resume;
+
+        let Ok(settings) = state.settings_repo.get().await else {
+            return;
+        };
+        let Ok(session) = state.session_storage.get_session(&session_id).await else {
+            return;
+        };
+        let provider = state.llm_provider.read().await.clone();
+
+        let decision = resume::should_run(resume::ResumeGateInputs {
+            enabled: settings.hybrid_compaction_enabled,
+            // A page request with an offset is scroll-back through history the
+            // user is already reading, not a reopen.
+            reopened: offset == 0,
+            has_prior_history: page_len > 0,
+            idle_gap: resume::idle_gap_since(session.updated_at, chrono::Utc::now()),
+            idle_threshold: resume::idle_threshold_from_secs(settings.resume_compaction_idle_secs),
+            summariser_available: provider.is_some(),
+        });
+
+        if let resume::GateDecision::Skip(reason) = decision {
+            tracing::trace!(
+                target: "giap::trace",
+                kind = "resume_compaction_skipped",
+                session_id = %session_id,
+                reason = reason.as_str(),
+            );
+            return;
+        }
+        let Some(provider) = provider else { return };
+
+        // Claim the session, or leave it to the pass already running.
+        {
+            let mut in_flight = match RESUME_COMPACTIONS_IN_FLIGHT.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if !in_flight.insert(session_id.clone()) {
+                return;
+            }
+        }
+
+        // Abort the moment the user starts typing — the on-device engine is
+        // serial, and this pass must never be what a turn waits behind.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let baseline = state.last_user_activity.read().await.elapsed();
+        let watcher_activity = state.last_user_activity.clone();
+        let watcher_cancel = cancel.clone();
+        let watcher = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if watcher_activity.read().await.elapsed() < baseline {
+                    watcher_cancel.cancel();
+                    break;
+                }
+            }
+        });
+
+        let svc = pond_core::shared::services::session_summary::SessionSummaryService::new(
+            provider,
+            state.session_storage.clone(),
+        );
+        match svc.refresh(&session_id, &cancel).await {
+            Ok(outcome) => tracing::info!(
+                target: "giap::trace",
+                kind = "resume_compaction",
+                session_id = %session_id,
+                outcome = ?outcome,
+            ),
+            Err(e) => tracing::debug!("resume compaction failed for {session_id}: {e}"),
+        }
+        watcher.abort();
+
+        match RESUME_COMPACTIONS_IN_FLIGHT.lock() {
+            Ok(mut g) => {
+                g.remove(&session_id);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove(&session_id);
+            }
+        }
+    });
 }
 
 /// Percent-encode the few characters that would break a path segment.

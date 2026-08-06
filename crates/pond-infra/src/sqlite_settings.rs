@@ -269,6 +269,10 @@ impl SettingsRepository for SqliteSettingsRepository {
             }
         );
         upsert!("summary_idle_secs", settings.summary_idle_secs.to_string());
+        upsert!(
+            "resume_compaction_idle_secs",
+            settings.resume_compaction_idle_secs.to_string()
+        );
         // Answer review
         upsert!("review_mode", &settings.review_mode);
         upsert!("review_max_rounds", settings.review_max_rounds.to_string());
@@ -786,6 +790,11 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "summary_idle_secs" => {
             if let Ok(v) = value.parse() {
                 s.summary_idle_secs = v;
+            }
+        }
+        "resume_compaction_idle_secs" => {
+            if let Ok(v) = value.parse() {
+                s.resume_compaction_idle_secs = v;
             }
         }
         // Answer review
