@@ -22,6 +22,11 @@ use crate::protocol::{
     CLUSTER_THERMOSTAT, CLUSTER_WINDOW_COVERING,
 };
 
+/// How long the device is given to accept a timed interaction. Matches what
+/// python-matter-server uses for its own timed commands; the window only has to
+/// outlast one round trip on a local network.
+const TIMED_INTERACTION_TIMEOUT_MS: u32 = 5000;
+
 /// Shared node cache: the bridge keeps it current from server events; the
 /// control port reads it to resolve endpoints per cluster.
 pub type NodeCache = Arc<RwLock<HashMap<u64, MatterNode>>>;
@@ -83,18 +88,58 @@ impl MatterDeviceControl {
         name: &str,
         payload: serde_json::Value,
     ) -> Result<()> {
+        self.command_inner(node_id, endpoint, cluster, name, payload, None)
+            .await
+    }
+
+    /// A command the cluster requires to be sent as a *timed* interaction.
+    ///
+    /// Matter makes this mandatory for the security-relevant clusters — a lock
+    /// must not be openable by a command that was replayed or delayed — and
+    /// rejects a plain one with `NeedsTimedInteraction (0xc6)`. Kept separate
+    /// from [`Self::command`] so only the clusters that demand it pay for the
+    /// extra round trip.
+    async fn timed_command(
+        &self,
+        node_id: u64,
+        endpoint: u16,
+        cluster: u32,
+        name: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        self.command_inner(
+            node_id,
+            endpoint,
+            cluster,
+            name,
+            payload,
+            Some(TIMED_INTERACTION_TIMEOUT_MS),
+        )
+        .await
+    }
+
+    async fn command_inner(
+        &self,
+        node_id: u64,
+        endpoint: u16,
+        cluster: u32,
+        name: &str,
+        payload: serde_json::Value,
+        timed_timeout_ms: Option<u32>,
+    ) -> Result<()> {
+        let mut args = json!({
+            "node_id": node_id,
+            "endpoint_id": endpoint,
+            "cluster_id": cluster,
+            "command_name": name,
+            "payload": payload,
+        });
+        if let Some(ms) = timed_timeout_ms {
+            args["timed_request_timeout_ms"] = json!(ms);
+        }
         self.client()
             .await
-            .send_command(
-                "device_command",
-                json!({
-                    "node_id": node_id,
-                    "endpoint_id": endpoint,
-                    "cluster_id": cluster,
-                    "command_name": name,
-                    "payload": payload,
-                }),
-            )
+            .send_command("device_command", args)
             .await?;
         Ok(())
     }
@@ -172,7 +217,7 @@ impl DeviceControlPort for MatterDeviceControl {
 
     async fn set_locked(&self, device_id: &str, locked: bool) -> Result<DeviceControlOutcome> {
         let (node, ep) = self.resolve(device_id, CLUSTER_DOOR_LOCK).await?;
-        self.command(
+        self.timed_command(
             node,
             ep,
             CLUSTER_DOOR_LOCK,

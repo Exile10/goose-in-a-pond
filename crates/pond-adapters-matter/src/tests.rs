@@ -153,6 +153,18 @@ fn light_node_json() -> Value {
     })
 }
 
+/// A door lock: DoorLock on endpoint 1, LockState on attribute 0.
+fn lock_node_json() -> Value {
+    json!({
+        "node_id": 33,
+        "available": true,
+        "attributes": {
+            "0/40/5": "Front Door",
+            "1/257/0": 1
+        }
+    })
+}
+
 fn occupancy_node_json() -> Value {
     json!({
         "node_id": 7,
@@ -300,6 +312,47 @@ async fn control_rejects_unknown_devices_and_capabilities() {
     assert!(
         received.lock().unwrap().is_empty(),
         "nothing reached the fabric"
+    );
+}
+
+/// Locks were unusable: Matter requires lock and unlock to be sent as a *timed*
+/// interaction — a command that was replayed or delayed must not open a door —
+/// and rejects a plain one with `NeedsTimedInteraction (0xc6)`. GIAP sent plain
+/// commands, so `set_locked` failed on every lock, virtual or real.
+#[tokio::test]
+async fn locking_sends_a_timed_interaction() {
+    let (client, cache, _registry, _bus, received) =
+        start_adapter(json!([lock_node_json()]), vec![]).await;
+    let control = MatterDeviceControl::new(client, cache);
+
+    let outcome = control.set_locked("matter-33", false).await.unwrap();
+    assert_eq!(outcome.applied.locked, Some(false));
+
+    let frames = received.lock().unwrap().clone();
+    let args = &frames[0]["args"];
+    assert_eq!(frames[0]["command"], "device_command");
+    assert_eq!(args["command_name"], "UnlockDoor");
+    assert_eq!(
+        args["timed_request_timeout_ms"], 5000,
+        "without this the controller answers NeedsTimedInteraction: {args}"
+    );
+}
+
+/// Only the clusters that demand it pay for the extra round trip — a light is
+/// still switched with a plain command.
+#[tokio::test]
+async fn other_commands_stay_untimed() {
+    let (client, cache, _registry, _bus, received) =
+        start_adapter(json!([light_node_json()]), vec![]).await;
+    let control = MatterDeviceControl::new(client, cache);
+
+    control.set_power("matter-2", true).await.unwrap();
+
+    let frames = received.lock().unwrap().clone();
+    assert!(
+        frames[0]["args"].get("timed_request_timeout_ms").is_none(),
+        "a light needs no timed interaction: {}",
+        frames[0]["args"]
     );
 }
 
