@@ -166,7 +166,7 @@ PAI-3 Context governor ── PAI-4 Compaction ── PAI-5 Thinking │
 |---|---|---|---|---|
 | [01](./pai/01-identity-and-profile-boundaries.md) | Identity and profile boundaries | Hard profile boundaries | — | **COMPLETE — P1-P8 LANDED** |
 | [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | **P0-P5, P7 LANDED** (P3, P5 partial); P6, P8 designed |
-| [03](./pai/03-context-governor.md) | Context governor | Large context, used fully | — | **P1-P4, P6 LANDED** (P3 completed by P3b 2026-08-06); P5 needs on-device TTFT measurement |
+| [03](./pai/03-context-governor.md) | Context governor | Large context, used fully | — | **P1-P4, P6 LANDED** (P3 completed by P3b 2026-08-06); **P5 code landed 2026-08-06, awaiting the on-device TTFT measurement that decides it** |
 | [04](./pai/04-smart-compaction.md) | Smart compaction | Smart compaction | 03 | DESIGNED |
 | [05](./pai/05-reasoning-and-thinking.md) | Reasoning and thinking | Ability to think | 03, 04 | DESIGNED |
 | [06](./pai/06-multi-agent-orchestration.md) | Multi-agent orchestration | Multi-agent orchestration | 01, 02, 03, 04 | DESIGNED |

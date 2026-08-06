@@ -160,17 +160,30 @@ pub fn trim_history(
     // reacts by compacting the conversation out from under us (a path that
     // ignores GOOSE_AUTO_COMPACT_THRESHOLD, so it cannot be turned off).
     //
-    // 1. Never promise more history than fits alongside the output reserve.
-    //    The tier constants are flat — 1,200 tokens at the 4K tier — and were
-    //    blind to a preamble that measures ~3,250 tokens on the Orin, i.e. the
-    //    declared budget alone already exceeded the window.
+    // 1. Never promise more history than fits alongside the output reserve AND
+    //    the preamble. This clamp used to subtract only the reserve, which was
+    //    never sufficient and PAI-3 P4 said so before deferring the fix to P5:
+    //    at an 8,192 window the profile declares 1,024 + 3,000 + 500 + 4,000 =
+    //    8,524 tokens, and a reserve-only clamp let history claim 7,168 of them
+    //    on top of a preamble that was still going to be sent. The preamble
+    //    allowance is now subtracted here, via `usable_history_tokens`, which on
+    //    a local provider is the CLAMPED allowance — see
+    //    `CompactionProfile::for_windows`. Floored at MIN_HISTORY_TOKENS so a
+    //    preamble wider than the window squeezes history rather than erasing the
+    //    message being answered.
     // 2. When the engine's real prompt count for the LAST turn overshot the
     //    usable ceiling, subtract that overshoot. This is measured, not
     //    estimated, so it corrects the counter's approximation in the direction
-    //    that matters and converges within one turn.
+    //    that matters and converges within one turn. The comparison stays
+    //    against `usable_prompt_tokens` — the engine reports the WHOLE prompt,
+    //    preamble included, so the history-only ceiling would report an
+    //    overshoot on every turn that merely used its budget.
     let usable = profile.usable_prompt_tokens();
     let mut budget = if usable > 0 {
-        profile.history_token_budget.min(usable)
+        profile
+            .history_token_budget
+            .min(profile.usable_history_tokens())
+            .max(MIN_HISTORY_TOKENS)
     } else {
         profile.history_token_budget
     };
@@ -355,6 +368,7 @@ mod tests {
             // budget they pass in; the reserve has its own tests below.
             output_reserve_tokens: 0,
             context_window_tokens: 3072,
+            prompt_window_tokens: 3072,
         }
     }
 
@@ -368,6 +382,7 @@ mod tests {
             history_token_budget: history_budget,
             output_reserve_tokens: reserve,
             context_window_tokens: ctx,
+            prompt_window_tokens: ctx,
         }
     }
 
@@ -413,6 +428,76 @@ mod tests {
             "history must fit the usable window, got {}",
             out.estimated_tokens
         );
+    }
+
+    /// PAI-3 P5. The declared history budget is capped by what is left once the
+    /// preamble has been paid for, not merely by what is left once the output
+    /// reserve has been. Without this, a real 8,192-token profile lets history
+    /// claim 7,168 tokens on top of a 3,500-token preamble it is also going to
+    /// send — 10,668 against an 8,192-token window, which is the mid-generation
+    /// overrun `output_reserve_tokens` exists to prevent, arriving by the other
+    /// door.
+    #[test]
+    fn the_history_clamp_subtracts_the_preamble_not_just_the_output_reserve() {
+        // The real 8,192 profile, not a hand-built fixture: the point is that
+        // the numbers the system actually ships are over-committed.
+        let p = CompactionProfile::from_context_window(8_192);
+        assert_eq!(p.history_token_budget, 4_000);
+        assert_eq!(p.usable_prompt_tokens(), 7_168);
+        assert_eq!(p.usable_history_tokens(), 3_668);
+
+        // ~2,000 tokens of history offered; the clamp must cut it to 3,668, and
+        // more to the point must never let it reach 7,168.
+        let msgs: Vec<TrimMessage> = (0..40).map(|i| user(i, &"x".repeat(1_000))).collect();
+        let out = trim_history(
+            msgs,
+            &p,
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+        );
+        assert!(
+            out.estimated_tokens <= 3_668,
+            "history claimed {} tokens, past the {} the preamble leaves it",
+            out.estimated_tokens,
+            p.usable_history_tokens()
+        );
+        assert!(
+            out.dropped_turns > 0,
+            "nothing was dropped, so the clamp never bound"
+        );
+        // And the whole prompt now fits the window it was budgeted for.
+        assert!(
+            out.estimated_tokens
+                + p.system_prompt_budget
+                + p.memory_token_budget
+                + p.output_reserve_tokens
+                <= p.context_window_tokens,
+            "budgeted prompt still overruns the window"
+        );
+    }
+
+    /// The other half: a preamble allowance wider than the window must squeeze
+    /// history to the floor, never below it, because the message being answered
+    /// still has to travel.
+    #[test]
+    fn a_preamble_wider_than_the_window_squeezes_history_to_the_floor() {
+        // usable = 1,280; preamble allowance 1,700 -> usable_history saturates
+        // to 0, and the floor takes over.
+        let p = profile_reserved(4_000, 2_048, 768);
+        assert_eq!(p.usable_history_tokens(), 0);
+        let msgs: Vec<TrimMessage> = (0..40).map(|i| user(i, &"x".repeat(400))).collect();
+        let out = trim_history(
+            msgs,
+            &p,
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+        );
+        assert!(out.estimated_tokens > 0, "must keep the current turn");
+        assert_eq!(out.messages.len(), 1, "only the current turn survives");
     }
 
     /// Measured feedback: when the engine reports a real prompt that overshot
