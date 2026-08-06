@@ -146,11 +146,14 @@ export function Skills() {
                 </div>
                 <Switch
                   size="sm"
-                  color="secondary"
                   isSelected={s.active}
-                  onValueChange={() => toggle(s.id, s.active)}
+                  onChange={() => toggle(s.id, s.active)}
                   aria-label={`Enable ${s.name}`}
-                />
+                >
+                  <Switch.Content>
+                    <Switch.Control><Switch.Thumb /></Switch.Control>
+                  </Switch.Content>
+                </Switch>
                 <Button
                   isIconOnly
                   size="sm"

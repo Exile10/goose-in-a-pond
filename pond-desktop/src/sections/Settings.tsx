@@ -200,7 +200,7 @@ function IdentityTab({
       <Section title="Location & Weather">
         <Row label="Enable weather" hint="Allow the assistant to fetch current weather for your location">
           <Switch isSelected={s.weather_enabled ?? false} onChange={(v) => patch("weather_enabled", v)}>
-            <Switch.Control><Switch.Thumb /></Switch.Control>
+            <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content>
           </Switch>
         </Row>
         <Row label="Location name" hint="Human-readable name (e.g. Nairobi, Kenya)">
@@ -414,8 +414,8 @@ function ModelsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k:
         <>
           <Section title="Response quality">
             <Row label="Thinking mode"><select className="native-select" value={s.thinking_mode ?? "auto"} onChange={(e) => patch("thinking_mode", e.target.value)}><option value="auto">Auto</option><option value="on">Always on</option><option value="off">Off</option></select></Row>
-            <Row label="Show thinking steps"><Switch isSelected={s.show_thinking ?? false} onChange={(v) => patch("show_thinking", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-            <Row label="Show turn stats" hint="Display inference timing and context usage below each response"><Switch isSelected={s.show_turn_stats ?? false} onChange={(v) => patch("show_turn_stats", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+            <Row label="Show thinking steps"><Switch isSelected={s.show_thinking ?? false} onChange={(v) => patch("show_thinking", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+            <Row label="Show turn stats" hint="Display inference timing and context usage below each response"><Switch isSelected={s.show_turn_stats ?? false} onChange={(v) => patch("show_turn_stats", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
             <Row label="Answer review"><select className="native-select" value={s.review_mode ?? "off"} onChange={(e) => patch("review_mode", e.target.value)}><option value="off">Off</option><option value="auto">Auto</option><option value="on">Always on</option></select></Row>
             <Row label="Review rounds"><select className="native-select" value={s.review_max_rounds ?? 1} onChange={(e) => patch("review_max_rounds", Number(e.target.value))}><option value={1}>1 round</option><option value={2}>2 rounds</option><option value={3}>3 rounds</option></select></Row>
             <Row label="Review quality bar"><select className="native-select" value={s.review_pass_threshold ?? 3} onChange={(e) => patch("review_pass_threshold", Number(e.target.value))}><option value={2}>2 – Lenient</option><option value={3}>3 – Balanced</option><option value={4}>4 – Strict</option><option value={5}>5 – Very strict</option></select></Row>
@@ -466,7 +466,7 @@ function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof S
       </Section>
       <Section title="Custom System Prompt">
         <Row label="Enable custom prompt">
-          <Switch isSelected={customEnabled} onChange={(v) => { setCustomEnabled(v); if (!v) patch("custom_system_prompt", null); }}><Switch.Control><Switch.Thumb /></Switch.Control></Switch>
+          <Switch isSelected={customEnabled} onChange={(v) => { setCustomEnabled(v); if (!v) patch("custom_system_prompt", null); }}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch>
         </Row>
         <Row label="System prompt" hint="Replaces the built-in system prompt entirely">
           <div className="pos-relative">
@@ -505,23 +505,23 @@ function AgentTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
       </Section>
       {devMode && (
         <Section title="Performance">
-          <Row label="Fast path" hint="Skip redundant processing steps for simple queries"><Switch isSelected={s.fast_path_enabled ?? true} onChange={(v) => patch("fast_path_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+          <Row label="Fast path" hint="Skip redundant processing steps for simple queries"><Switch isSelected={s.fast_path_enabled ?? true} onChange={(v) => patch("fast_path_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
           <Row label="Max turns" hint="Tool-calling steps allowed per request (0 = unlimited; the idle timeout still applies)"><input type="number" role="spinbutton" className="native-input" min={0} max={500} value={s.agent_max_turns ?? 50} onChange={(e) => patch("agent_max_turns", Number(e.target.value))} /></Row>
           <Row label="Idle timeout" hint="Abort a turn only after this many seconds with no output (0 disables)"><div className="settings-inline-row"><input type="number" role="spinbutton" className="native-input native-input--w100" min={0} max={3600} value={s.agent_timeout_secs ?? 300} onChange={(e) => patch("agent_timeout_secs", Number(e.target.value))} /><span className="muted-12">seconds</span></div></Row>
-          <Row label="Tool output compaction"><Switch isSelected={s.tool_output_compaction ?? true} onChange={(v) => patch("tool_output_compaction", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-          <Row label="Prompt cache reuse"><Switch isSelected={s.prefix_cache_prompt ?? true} onChange={(v) => patch("prefix_cache_prompt", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+          <Row label="Tool output compaction"><Switch isSelected={s.tool_output_compaction ?? true} onChange={(v) => patch("tool_output_compaction", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+          <Row label="Prompt cache reuse"><Switch isSelected={s.prefix_cache_prompt ?? true} onChange={(v) => patch("prefix_cache_prompt", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
         </Section>
       )}
       <Section title="Memory">
-        <Row label="Remember context"><Switch isSelected={memInject} onChange={(v) => patch("agent_memory_inject", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+        <Row label="Remember context"><Switch isSelected={memInject} onChange={(v) => patch("agent_memory_inject", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
         <Row label="How much to recall"><input type="number" role="spinbutton" className="native-input" disabled={!memInject} min={1} max={20} value={s.agent_memory_limit ?? 5} onChange={(e) => patch("agent_memory_limit", Number(e.target.value))} /></Row>
-        <Row label="Auto-extract memories"><Switch isSelected={s.memory_extraction_enabled ?? true} onChange={(v) => patch("memory_extraction_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-        <Row label="Memory cleanup"><Switch isSelected={s.memory_cleanup_enabled ?? true} onChange={(v) => patch("memory_cleanup_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-        <Row label="Auto-consolidation"><Switch isSelected={s.memory_consolidation_enabled ?? false} onChange={(v) => patch("memory_consolidation_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+        <Row label="Auto-extract memories"><Switch isSelected={s.memory_extraction_enabled ?? true} onChange={(v) => patch("memory_extraction_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+        <Row label="Memory cleanup"><Switch isSelected={s.memory_cleanup_enabled ?? true} onChange={(v) => patch("memory_cleanup_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+        <Row label="Auto-consolidation"><Switch isSelected={s.memory_consolidation_enabled ?? false} onChange={(v) => patch("memory_consolidation_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
         {devMode && (
           <>
             <Row label="Consolidation mode"><select className="native-select" value={s.memory_consolidation_mode ?? "single"} onChange={(e) => patch("memory_consolidation_mode", e.target.value)}><option value="single">Single-pass (fast)</option><option value="adversarial">Adversarial (3-stage)</option></select></Row>
-            <Row label="Memory graph"><Switch isSelected={s.memory_graph_enabled ?? false} onChange={(v) => patch("memory_graph_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+            <Row label="Memory graph"><Switch isSelected={s.memory_graph_enabled ?? false} onChange={(v) => patch("memory_graph_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
           </>
         )}
       </Section>
@@ -558,9 +558,9 @@ function DataTab({ s, patch, serverUrl, onServerUrlChange, devMode }: { s: Parti
       {devMode && (
         <>
           <Section title="Telemetry">
-            <Row label="Usage telemetry"><Switch isSelected={s.telemetry_enabled ?? true} onChange={(v) => patch("telemetry_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-            <Row label="Context monitoring"><Switch isSelected={s.context_monitor_enabled ?? true} onChange={(v) => patch("context_monitor_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-            <Row label="Compact encoding"><Switch isSelected={s.compact_encoding ?? true} onChange={(v) => patch("compact_encoding", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+            <Row label="Usage telemetry"><Switch isSelected={s.telemetry_enabled ?? true} onChange={(v) => patch("telemetry_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+            <Row label="Context monitoring"><Switch isSelected={s.context_monitor_enabled ?? true} onChange={(v) => patch("context_monitor_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+            <Row label="Compact encoding"><Switch isSelected={s.compact_encoding ?? true} onChange={(v) => patch("compact_encoding", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
           </Section>
           <Section title="Cloud cost comparison">
             <Row label="Input price"><div className="settings-inline-row"><span className="muted-12">$</span><input type="number" role="spinbutton" step={0.1} className="native-input native-input--w100" min={0} value={s.cloud_input_price_per_million ?? 2.5} onChange={(e) => patch("cloud_input_price_per_million", Number(e.target.value))} /><span className="muted-12">/ 1M tokens</span></div></Row>
@@ -632,14 +632,14 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
       <Section title="Built-in Tool Modules">
         {EXT_TOOLS.map(([label, hint, key]) => (
           <Row key={key} label={label} hint={hint}>
-            <Switch isSelected={(s as Record<string, unknown>)[key] !== false} onChange={(v) => patch(key as keyof SettingsType, v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch>
+            <Switch isSelected={(s as Record<string, unknown>)[key] !== false} onChange={(v) => patch(key as keyof SettingsType, v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch>
           </Row>
         ))}
       </Section>
       <Section title="Vision / Cameras">
         <Row label="Enable vision" hint="On-device camera event detection (motion, objects) via the vision MCP server">
           <Switch isSelected={s.vision_enabled ?? false} onChange={(v) => patch("vision_enabled", v)}>
-            <Switch.Control><Switch.Thumb /></Switch.Control>
+            <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content>
           </Switch>
         </Row>
         <Row label="Camera URL" hint="RTSP/HTTP stream or device path">
@@ -668,13 +668,13 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
       {devMode && (
         <>
           <Section title="Tool behaviour">
-            <Row label="Tool result cache"><Switch isSelected={s.tool_cache_enabled ?? true} onChange={(v) => patch("tool_cache_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-            <Row label="Tool call validation"><Switch isSelected={s.tool_call_validation ?? true} onChange={(v) => patch("tool_call_validation", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-            <Row label="Tool request detection"><Switch isSelected={s.tool_request_detection ?? true} onChange={(v) => patch("tool_request_detection", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-            <Row label="Multi-tool"><Switch isSelected={s.multi_tool_enabled ?? false} onChange={(v) => patch("multi_tool_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+            <Row label="Tool result cache"><Switch isSelected={s.tool_cache_enabled ?? true} onChange={(v) => patch("tool_cache_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+            <Row label="Tool call validation"><Switch isSelected={s.tool_call_validation ?? true} onChange={(v) => patch("tool_call_validation", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+            <Row label="Tool request detection"><Switch isSelected={s.tool_request_detection ?? true} onChange={(v) => patch("tool_request_detection", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+            <Row label="Multi-tool"><Switch isSelected={s.multi_tool_enabled ?? false} onChange={(v) => patch("multi_tool_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
           </Section>
           <Section title="Scheduling">
-            <Row label="Result notifications"><Switch isSelected={s.schedule_result_notify ?? true} onChange={(v) => patch("schedule_result_notify", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+            <Row label="Result notifications"><Switch isSelected={s.schedule_result_notify ?? true} onChange={(v) => patch("schedule_result_notify", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
             <Row label="Max concurrent"><input type="number" role="spinbutton" className="native-input native-input--w80" min={1} max={10} value={s.schedule_max_concurrent ?? 2} onChange={(e) => patch("schedule_max_concurrent", Number(e.target.value))} /></Row>
             <Row label="History per task"><input type="number" role="spinbutton" className="native-input native-input--w80" min={5} max={500} value={s.schedule_max_runs_per_task ?? 50} onChange={(e) => patch("schedule_max_runs_per_task", Number(e.target.value))} /></Row>
           </Section>
@@ -700,7 +700,7 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
         <div className="ext-list">
           {extensions.map((ext) => (
             <div key={ext.name} className="ext-row">
-              <Switch isSelected={ext.enabled} onChange={() => toggle(ext.name, !ext.enabled)} aria-label={`Toggle ${ext.name}`}><Switch.Control><Switch.Thumb /></Switch.Control></Switch>
+              <Switch isSelected={ext.enabled} onChange={() => toggle(ext.name, !ext.enabled)} aria-label={`Toggle ${ext.name}`}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch>
               <div className="ext-row__body">
                 <div className="ext-row__title-row">
                   <span className="ext-row__name">{ext.name}</span>
