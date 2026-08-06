@@ -16,7 +16,7 @@
 //! ```
 
 use pond_core::models::ports::provider::LlmProvider;
-use pond_core::user_data::domain::memory::{MemoryFragment, MemorySegment, MemoryTier};
+use pond_core::user_data::domain::memory::{MemoryFragment, MemorySegment};
 use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::ports::memory_extractor::MemoryExtractor;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
@@ -158,6 +158,10 @@ async fn live_extraction_stores_to_sqlite() {
             "I prefer dark mode and I'm allergic to peanuts",
             "I'll remember that! Dark mode it is, and I'll keep the peanut allergy in mind.",
             Some("test-session"),
+            // The scope the live voice/CLI path actually carries. Not `Guest`:
+            // `run` returns early on `excludes_everything`, which is correct
+            // behaviour but a different assertion from the one below.
+            &ProfileScope::Household,
         )
         .await;
 
@@ -225,6 +229,7 @@ async fn live_extraction_then_cleanup_cycle() {
             "My birthday is March 5th and my favorite color is blue",
             "Got it! I'll remember your birthday and color preference.",
             Some("test-sess"),
+            &ProfileScope::Household,
         )
         .await;
 
