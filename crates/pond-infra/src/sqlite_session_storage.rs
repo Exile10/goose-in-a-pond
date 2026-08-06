@@ -40,6 +40,7 @@ struct MessageRow {
     created_at: String,
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
 }
 
 // ── Conversion helpers ────────────────────────────────────────────────────────
@@ -114,6 +115,7 @@ impl TryFrom<MessageRow> for SessionMessage {
             created_at: parse_dt(&r.created_at),
             prompt_tokens: r.prompt_tokens.map(|v| v as u32),
             completion_tokens: r.completion_tokens.map(|v| v as u32),
+            reasoning_tokens: r.reasoning_tokens.map(|v| v as u32),
         })
     }
 }
@@ -644,8 +646,8 @@ impl SessionStorage for SqliteSessionStorage {
         sqlx::query(
             "INSERT INTO session_messages \
                  (id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
-                  prompt_tokens, completion_tokens) \
-             VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)",
+                  prompt_tokens, completion_tokens, reasoning_tokens) \
+             VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?)",
         )
         .bind(&message.id)
         .bind(&session_id)
@@ -655,6 +657,7 @@ impl SessionStorage for SqliteSessionStorage {
         .bind(&tool_calls_json)
         .bind(message.prompt_tokens.map(|v| v as i64))
         .bind(message.completion_tokens.map(|v| v as i64))
+        .bind(message.reasoning_tokens.map(|v| v as i64))
         .execute(&self.pool)
         .await
         .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
@@ -680,7 +683,7 @@ impl SessionStorage for SqliteSessionStorage {
 
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
-             prompt_tokens, completion_tokens \
+             prompt_tokens, completion_tokens, reasoning_tokens \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at ASC, rowid ASC",
@@ -744,7 +747,7 @@ impl SessionStorage for SqliteSessionStorage {
 
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
-             prompt_tokens, completion_tokens \
+             prompt_tokens, completion_tokens, reasoning_tokens \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at ASC, rowid ASC \
@@ -770,7 +773,7 @@ impl SessionStorage for SqliteSessionStorage {
         // Fetch newest-first, then reverse to return chronological order.
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
-             prompt_tokens, completion_tokens \
+             prompt_tokens, completion_tokens, reasoning_tokens \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at DESC, rowid DESC \
@@ -1671,6 +1674,77 @@ mod tests {
         assert_eq!(msgs[0].prompt_tokens, None, "user rows carry no counts");
         assert_eq!(msgs[1].prompt_tokens, Some(1930));
         assert_eq!(msgs[1].completion_tokens, Some(87));
+    }
+
+    /// PAI-5 P2, migration 0039. Two claims in one, and the second is the one
+    /// that would rot silently: reasoning is stored ALONGSIDE the provider's
+    /// completion count and does not disturb it, and a row written without a
+    /// reasoning count reads back `None` rather than `Some(0)`. PAI-5 P5 sizes
+    /// an output reserve from this column, and "nobody counted" read as "no
+    /// thinking happened" would bias every reserve downwards.
+    #[tokio::test]
+    async fn reasoning_tokens_round_trip_beside_the_provider_counts() {
+        let tmp = tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        let pool = db.system.clone();
+        let s = SqliteSessionStorage::new(db.system);
+        s.create_session("reason".to_string()).await.unwrap();
+
+        s.add_message(
+            "reason".to_string(),
+            SessionMessage::new(
+                "a1".to_string(),
+                "reason".to_string(),
+                ChatMessage::assistant("thought about it"),
+            )
+            .with_token_counts(Some(1930), Some(87))
+            .with_reasoning_tokens(Some(412)),
+        )
+        .await
+        .unwrap();
+        // A row from a path that carries no reasoning: NULL, not zero.
+        s.add_message(
+            "reason".to_string(),
+            SessionMessage::new(
+                "a2".to_string(),
+                "reason".to_string(),
+                ChatMessage::assistant("did not think about it"),
+            )
+            .with_token_counts(Some(20), Some(4)),
+        )
+        .await
+        .unwrap();
+
+        // The row shape every pre-0039 message has: written by an INSERT that
+        // never mentions the column at all. This is the case the column's
+        // absent DEFAULT is FOR, and the only way to reach it from a unit test
+        // — the adapter always binds the column, so binding NULL through it
+        // would pass just as happily against `DEFAULT 0`.
+        sqlx::query(
+            "INSERT INTO session_messages (id, session_id, role, content, created_at) \
+             VALUES ('a3', 'reason', 'assistant', 'written before 0039', datetime('now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let msgs = s.get_messages("reason").await.unwrap();
+        assert_eq!(msgs[0].reasoning_tokens, Some(412));
+        assert_eq!(
+            msgs[0].completion_tokens,
+            Some(87),
+            "reasoning was folded into the completion count instead of riding beside it"
+        );
+        assert_eq!(
+            msgs[1].reasoning_tokens, None,
+            "an uncounted row must stay NULL; Some(0) would claim the turn did no thinking"
+        );
+        assert_eq!(
+            msgs[2].reasoning_tokens, None,
+            "a row written without the column read back as a counted zero — migration 0039 \
+             has grown a DEFAULT, and every message written before this phase now claims \
+             its turn did no thinking. PAI-5 P5 sizes an output reserve from that."
+        );
     }
 
     // ── Session identity (PAI-1 P2) ───────────────────────────────────────

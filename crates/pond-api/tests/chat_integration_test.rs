@@ -688,6 +688,7 @@ impl pond_core::models::ports::agent::Agent for StatsEmittingMockAgent {
                 usage: Some(pond_core::models::ports::provider::UsageStats {
                     prompt_tokens: 1000,
                     completion_tokens: 88,
+                    reasoning_tokens: Some(240),
                 }),
                 stats: Some(stats),
             });

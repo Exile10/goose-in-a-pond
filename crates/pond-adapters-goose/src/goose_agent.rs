@@ -236,7 +236,7 @@ pub struct GooseAdapter {
     /// `None` inside the cell means construction failed and the caller falls
     /// back to the chars/4 heuristic — a worse estimate is not a reason to fail
     /// a turn, and the overshoot-feedback correction still bounds the error.
-    token_counter: tokio::sync::OnceCell<Option<crate::token_counter::TiktokenCounter>>,
+    token_counter: tokio::sync::OnceCell<Option<Arc<crate::token_counter::TiktokenCounter>>>,
     /// The context window last resolved for the active provider/model, with its
     /// provenance.
     ///
@@ -1239,22 +1239,40 @@ impl GooseAdapter {
     /// either way.
     async fn token_counter(&self) -> &dyn PondTokenCounter {
         static HEURISTIC: HeuristicTokenCounter = HeuristicTokenCounter;
-        let built = self
-            .token_counter
+        match self.token_counter_cell().await {
+            Some(c) => c.as_ref(),
+            None => &HEURISTIC,
+        }
+    }
+
+    /// The same counter, as an owned handle.
+    ///
+    /// The turn stream is an `async_stream` closure with a `'static` bound and
+    /// no `&self`, so it cannot borrow the OnceCell. Held behind an `Arc` rather
+    /// than constructed per turn because `TiktokenCounter` carries a blake3-keyed
+    /// LRU — building a second one would throw the cache away and load
+    /// `o200k_base` again.
+    async fn token_counter_handle(&self) -> Arc<dyn PondTokenCounter> {
+        match self.token_counter_cell().await {
+            Some(c) => c.clone(),
+            None => Arc::new(HeuristicTokenCounter),
+        }
+    }
+
+    /// Builds (once) and returns the tiktoken counter, or `None` if it could
+    /// not be built. Shared by both accessors so there is exactly one init.
+    async fn token_counter_cell(&self) -> &Option<Arc<crate::token_counter::TiktokenCounter>> {
+        self.token_counter
             .get_or_init(|| async {
                 match crate::token_counter::TiktokenCounter::new().await {
-                    Ok(c) => Some(c),
+                    Ok(c) => Some(Arc::new(c)),
                     Err(e) => {
                         tracing::warn!("token counter unavailable, falling back to chars/4: {e}");
                         None
                     }
                 }
             })
-            .await;
-        match built {
-            Some(c) => c,
-            None => &HEURISTIC,
-        }
+            .await
     }
 
     /// The RAW resolved window, together with the provider it belongs to.
@@ -1478,12 +1496,44 @@ impl GooseAdapter {
         if !emit {
             return Vec::new();
         }
+        Self::reasoning_blocks(msg)
+    }
+
+    /// The reasoning blocks a message carries, with no display gate.
+    ///
+    /// Split out of `reasoning_frames` so the *count* and the *display* read
+    /// the same content through one extraction, while only the display is gated
+    /// on `show_thinking`.
+    fn reasoning_blocks(msg: &Message) -> Vec<String> {
         msg.content
             .iter()
             .filter_map(|c| c.as_thinking())
             .map(|t| t.thinking.trim().to_string())
             .filter(|t| !t.is_empty())
             .collect()
+    }
+
+    /// PAI-5 P2. Tokens this message spent on reasoning.
+    ///
+    /// **Ungated on purpose.** The model decodes its reasoning whether or not
+    /// `show_thinking` is on, so a count that moved with a display setting would
+    /// report a different cost for the same turn depending on a checkbox — and
+    /// PAI-5 P5 derives an output reserve from exactly this number. The gate
+    /// belongs on the frame, which is a data-out surface; the count is a number
+    /// about a turn and carries none of the text.
+    ///
+    /// **GIAP-derived, and inexact.** No provider GIAP ships reports a reasoning
+    /// count: Goose's `Usage` has input/output/total/cache_read/cache_write and
+    /// nothing else, and the providers that separate reasoning do it in a
+    /// content channel. So this counts the text we received, through the
+    /// `TokenCounter` port, whose every implementation says `is_exact() ==
+    /// false`. It is not subtracted from the provider's completion count — see
+    /// `UsageStats::reasoning_tokens`.
+    fn count_reasoning_tokens(msg: &Message, counter: &dyn PondTokenCounter) -> u32 {
+        Self::reasoning_blocks(msg)
+            .iter()
+            .map(|t| counter.count(t) as u32)
+            .sum()
     }
 
     /// Append the `<vision>` section to a prompt template when the model can see.
@@ -3439,6 +3489,13 @@ impl GooseAdapter {
         // touch `PromptState` and so cannot move the KV prefix.
         let emit_reasoning = Self::reasoning_frames_enabled(settings.show_thinking, is_voice);
 
+        // PAI-5 P2. An owned counter for the 'static stream closure, resolved
+        // here rather than inside it. Deliberately AFTER the trim above, which
+        // already builds this counter on the default configuration, so the
+        // common case pays nothing new. Nothing here reaches `PromptState`, so
+        // the KV prefix cannot move.
+        let reasoning_counter = self.token_counter_handle().await;
+
         // Cancellation token: when the stream is dropped (e.g. voice interrupt),
         // the DropGuard fires and cancels the token.  Goose's agent loop checks
         // `is_token_cancelled()` at each turn boundary and exits early, so
@@ -3520,6 +3577,12 @@ impl GooseAdapter {
                                 // `produced_visible`: reasoning alone leaves the
                                 // user with nothing, and marking the turn visible
                                 // would suppress the empty-turn recovery below.
+                                // PAI-5 P2. Counted before the display gate and
+                                // outside it: the reasoning was decoded either
+                                // way, so the cost is the same whether or not
+                                // anybody is shown it.
+                                *turn_stats.reasoning_tokens.get_or_insert(0) +=
+                                    Self::count_reasoning_tokens(&msg, reasoning_counter.as_ref());
                                 for content in Self::reasoning_frames(&msg, emit_reasoning) {
                                     yield Ok(AgentStreamEvent::Thinking { content });
                                 }
@@ -3781,11 +3844,20 @@ impl GooseAdapter {
                 pond_core::models::ports::provider::UsageStats {
                     prompt_tokens: turn_stats.prompt_tokens,
                     completion_tokens: turn_stats.completion_tokens,
+                    // Reported alongside, never deducted. The provider's output
+                    // count probably already covers the reasoning decode, but it
+                    // is the engine's number and this one is ours; subtracting
+                    // would corrupt the measured one to flatter the derived one.
+                    reasoning_tokens: turn_stats.reasoning_tokens,
                 }
             } else {
                 pond_core::models::ports::provider::UsageStats {
                     prompt_tokens: (user_msg_len / 4).max(1) as u32,
                     completion_tokens: (total_output_chars / 4).max(1) as u32,
+                    // `total_output_chars` never contained the reasoning:
+                    // thinking blocks are not `as_text()`, so they never reached
+                    // the text accumulator. Additive here, with no overlap.
+                    reasoning_tokens: turn_stats.reasoning_tokens,
                 }
             };
             turn_stats.finalize_rates();
@@ -4695,6 +4767,97 @@ mod tests {
         assert!(
             body.contains("Self::reasoning_frames_enabled(settings.show_thinking, is_voice)"),
             "emit_reasoning is no longer bound from show_thinking AND the voice flag"
+        );
+    }
+
+    // ── PAI-5 P2: reasoning tokens ────────────────────────────────────────
+
+    /// The claim P2 exists to make: the COUNT does not move with the display
+    /// setting. `show_thinking` decides whether a person is shown the reasoning;
+    /// it does not decide whether the model spent the tokens. If this ever
+    /// couples, a Jetson running the shipped default (`show_thinking = false`)
+    /// reports every turn as having done no thinking at all, and PAI-5 P5 sizes
+    /// its output reserve from that lie.
+    #[test]
+    fn reasoning_is_counted_even_when_it_is_not_shown() {
+        use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
+        let msg = Message::assistant()
+            .with_thinking(
+                "The user asked about the porch light. I should check the device \
+                 registry before claiming it exists.",
+                "",
+            )
+            .with_text("The porch light is off.");
+
+        // Display gate shut: nothing leaves as a frame.
+        assert!(
+            GooseAdapter::reasoning_frames(&msg, false).is_empty(),
+            "the display gate stopped gating"
+        );
+        // Count is taken anyway.
+        let counted = GooseAdapter::count_reasoning_tokens(&msg, &HeuristicTokenCounter);
+        assert!(
+            counted > 0,
+            "reasoning must be counted even when show_thinking is off; got {counted}"
+        );
+        // And it is the same number the gate-open case would produce.
+        assert_eq!(
+            counted,
+            GooseAdapter::count_reasoning_tokens(&msg, &HeuristicTokenCounter),
+            "the count depends on something other than the message"
+        );
+    }
+
+    /// A message with no thinking channel counts zero, not "some of the answer".
+    /// The failure this rules out is counting `as_concat_text()` by mistake,
+    /// which would double-report every ordinary turn as reasoning.
+    #[test]
+    fn answer_text_is_not_reasoning() {
+        use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
+        let msg = Message::assistant()
+            .with_text("A long and perfectly ordinary answer with no reasoning channel at all.");
+        assert_eq!(
+            GooseAdapter::count_reasoning_tokens(&msg, &HeuristicTokenCounter),
+            0
+        );
+    }
+
+    /// The wiring guard. The two tests above can both pass while the stream
+    /// counts inside the display gate — which is the exact regression that would
+    /// make the number meaningless on the shipped configuration. Asserted
+    /// structurally: the accumulation must appear ABOVE the `reasoning_frames`
+    /// loop, i.e. outside it, and must not mention `emit_reasoning`.
+    #[test]
+    fn the_reasoning_count_is_taken_outside_the_display_gate() {
+        let src = include_str!("goose_agent.rs");
+        let body = src.split("mod tests").next().unwrap_or(src);
+        let lines: Vec<&str> = body.lines().collect();
+
+        let gate_line = lines
+            .iter()
+            .position(|l| l.contains("for content in Self::reasoning_frames(&msg, emit_reasoning)"))
+            .expect("the gated lift is gone; the P1 guard should have caught this first");
+
+        let window = &lines[gate_line.saturating_sub(6)..gate_line];
+        let count_line = window
+            .iter()
+            .position(|l| l.contains("Self::count_reasoning_tokens(&msg,"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the reasoning token count is not taken in the six lines before the \
+                     display gate. If it moved inside `for content in reasoning_frames(..)`, \
+                     the count is now zero whenever show_thinking is off — which is the \
+                     shipped default, so every Jetson turn would report no thinking."
+                )
+            });
+        assert!(
+            !window[count_line].contains("emit_reasoning"),
+            "the reasoning count now reads emit_reasoning; the cost of a turn must not \
+             depend on whether anybody is watching"
+        );
+        assert!(
+            body.contains("turn_stats.reasoning_tokens.get_or_insert(0)"),
+            "the count no longer accumulates into TurnStats, so nothing downstream sees it"
         );
     }
 

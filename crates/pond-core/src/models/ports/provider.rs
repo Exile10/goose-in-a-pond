@@ -21,6 +21,26 @@ pub enum ProviderError {
 pub struct UsageStats {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// Tokens the model spent on reasoning it did not say out loud.
+    ///
+    /// **GIAP-derived, not provider-reported.** No provider GIAP ships reports
+    /// this: Goose's own `Usage` carries input/output/total/cache_read/
+    /// cache_write and nothing else, and the OpenAI-shaped HTTP providers put
+    /// reasoning in a separate *content* channel rather than a separate counter.
+    /// So this is GIAP counting the reasoning text it received, through the
+    /// [`TokenCounter`](crate::models::ports::token_counter::TokenCounter) port
+    /// — which reports `is_exact() == false` for every implementation. Treat it
+    /// as a measurement, never as ground truth.
+    ///
+    /// **Not subtracted from `completion_tokens`.** The provider's output count
+    /// most likely already includes the reasoning decode, but nobody has
+    /// measured which way for the models GIAP pins, and guessing would corrupt
+    /// the one number that *is* provider-reported. This rides alongside.
+    ///
+    /// `None` means nobody counted, which is different from `Some(0)` — "this
+    /// turn produced no reasoning". Anything deriving a budget from this (PAI-5
+    /// P5's `output_reserve_tokens`) must keep the two apart.
+    pub reasoning_tokens: Option<u32>,
 }
 
 /// A single item emitted by [`TokenStream`].

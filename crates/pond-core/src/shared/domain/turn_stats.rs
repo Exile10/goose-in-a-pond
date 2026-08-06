@@ -23,6 +23,20 @@ pub struct TurnStats {
     pub prompt_tokens: u32,
     /// Generated tokens, summed across the turn's inferences.
     pub completion_tokens: u32,
+    /// Tokens spent on reasoning the user never sees, summed across the turn.
+    ///
+    /// GIAP-derived: counted from the structured thinking channel with the
+    /// [`TokenCounter`](crate::models::ports::token_counter::TokenCounter) port,
+    /// because no provider reports it. See `UsageStats::reasoning_tokens` for
+    /// why it is *not* subtracted from `completion_tokens`, and why `None`
+    /// ("nobody counted") is deliberately distinct from `Some(0)` ("no
+    /// reasoning this turn").
+    ///
+    /// Deliberately excluded from `finalize_rates`: `decode_tok_per_sec` is a
+    /// rate over what the provider reported, and mixing a GIAP-derived count
+    /// into a provider-reported rate would make the throughput number a
+    /// different quantity depending on which model answered.
+    pub reasoning_tokens: Option<u32>,
     pub prefill_tok_per_sec: Option<f32>,
     pub decode_tok_per_sec: Option<f32>,
     /// Prompt tokens of the final inference (same basis as `prompt_tokens`),
@@ -104,6 +118,48 @@ mod tests {
         assert_eq!(s.context_pct(), Some(50.0));
         let empty = TurnStats::default();
         assert_eq!(empty.context_pct(), None);
+    }
+
+    /// PAI-5 P2. Reasoning is reported ALONGSIDE the provider's completion
+    /// count, never folded into it — the provider's output count probably
+    /// already includes the reasoning decode and nobody has measured which way,
+    /// so subtracting would corrupt the one number the engine actually
+    /// reported. `finalize_rates` must therefore give the same decode rate
+    /// whether or not reasoning was counted.
+    #[test]
+    fn reasoning_does_not_move_the_completion_count_or_the_decode_rate() {
+        let base = TurnStats {
+            decode_ms: Some(4000),
+            completion_tokens: 88,
+            ..Default::default()
+        };
+        let mut without = base.clone();
+        let mut with = TurnStats {
+            reasoning_tokens: Some(500),
+            ..base
+        };
+        without.finalize_rates();
+        with.finalize_rates();
+        assert_eq!(with.completion_tokens, without.completion_tokens);
+        assert_eq!(with.decode_tok_per_sec, without.decode_tok_per_sec);
+        assert_eq!(with.reasoning_tokens, Some(500));
+    }
+
+    /// "Nobody counted" and "counted, and it was zero" are different facts.
+    /// PAI-5 P5 derives `output_reserve_tokens` from this data and must not
+    /// read an unmeasured turn as a turn that did no thinking.
+    #[test]
+    fn unmeasured_reasoning_is_not_zero_reasoning() {
+        let unmeasured: TurnStats = serde_json::from_str(
+            r#"{"prompt_tokens":1,"completion_tokens":1,"inference_count":1}"#,
+        )
+        .unwrap();
+        assert_eq!(unmeasured.reasoning_tokens, None);
+        let measured: TurnStats = serde_json::from_str(
+            r#"{"prompt_tokens":1,"completion_tokens":1,"inference_count":1,"reasoning_tokens":0}"#,
+        )
+        .unwrap();
+        assert_eq!(measured.reasoning_tokens, Some(0));
     }
 
     #[test]

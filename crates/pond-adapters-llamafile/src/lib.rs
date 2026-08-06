@@ -263,7 +263,7 @@ impl LlmProvider for LlamafileProvider {
                                 let prompt_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0) as u32;
                                 let completion_tokens = usage["completion_tokens"].as_u64().unwrap_or(0) as u32;
                                 if prompt_tokens > 0 || completion_tokens > 0 {
-                                    yield Ok(StreamToken::Usage(UsageStats { prompt_tokens, completion_tokens }));
+                                    yield Ok(StreamToken::Usage(UsageStats { prompt_tokens, completion_tokens, reasoning_tokens: None }));
                                 }
                             }
                         }

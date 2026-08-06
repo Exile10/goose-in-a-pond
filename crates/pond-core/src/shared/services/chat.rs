@@ -1249,6 +1249,13 @@ impl ChatService {
                 rate
             ));
         }
+        // PAI-5 P2. Its own part, next to decode rather than folded into it —
+        // this number is GIAP's count of the thinking channel, not the engine's,
+        // and printing it inside the decode figure would imply the engine
+        // reported it. Absent when nothing counted; "0" when nothing was thought.
+        if let Some(reasoning) = stats.reasoning_tokens {
+            parts.push(format!("reasoning {reasoning} tok"));
+        }
         if let (Some(used), Some(limit)) = (stats.context_used_tokens, stats.context_limit_tokens) {
             parts.push(format!(
                 "ctx {used}/{limit} ({:.0}%)",
@@ -1286,7 +1293,12 @@ impl ChatService {
         .with_token_counts(
             usage.map(|u| u.prompt_tokens),
             usage.map(|u| u.completion_tokens),
-        );
+        )
+        // PAI-5 P2. Carried only where the caller hands over a whole
+        // `UsageStats`. `persist_assistant_turn`'s `(prompt, completion)` tuple
+        // — which is what `/chat/stream` passes — cannot express it, so rows
+        // written by that route keep NULL rather than a wrong zero.
+        .with_reasoning_tokens(usage.and_then(|u| u.reasoning_tokens));
         self.session_storage
             .add_message(self.session_id.clone(), session_msg)
             .await?;
