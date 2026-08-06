@@ -196,7 +196,26 @@ impl ContextGovernor {
         // outrank it, because those are allocations (invariant 3).
         if let Some(catalog) = inputs.catalog_context_length.filter(|c| *c > 0) {
             let mut tokens = catalog as usize;
-            if is_local_provider(inputs.provider) {
+            // `runs_on_this_device`, NOT `is_local_provider`. The question this
+            // rung asks is "can this box afford the number the catalog printed",
+            // and that is about where the weights run, not which provider string
+            // named them. `is_local_provider` covers only local/gguf, which left
+            // ollama and llamafile -- the two providers this rung exists for --
+            // taking a declared maximum unbounded.
+            //
+            // It mattered the moment P3a made the rung reachable: it taught
+            // OllamaCatalogProvider to read the declared window from /api/show,
+            // where a Gemma 4 model reports 131072. The same weights through the
+            // `local` provider were held to 32768, so the history budget was 4x
+            // apart depending only on which string arrived here.
+            //
+            // The other two `is_local_provider` call sites are deliberately left
+            // alone. `heuristic_window` answers a different question (what to
+            // guess when nothing is known) and `prompt_window` a third (how much
+            // preamble a locally-prefilled turn can afford). Widening those is a
+            // behaviour change on every Ollama turn and wants its own phase and
+            // its own TTFT measurement, not a ride along with a clamp fix.
+            if super::model_class::runs_on_this_device(inputs.provider) {
                 tokens = tokens.min(UNPINNED_LOCAL_CEILING);
             }
             let override_tokens = inputs.override_tokens as usize;
@@ -416,11 +435,38 @@ mod tests {
         small.catalog_context_length = Some(8_192);
         assert_eq!(ContextGovernor::resolve(&small).tokens, 8_192);
 
-        // HTTP providers pay no local prefill, so they keep the raw declared
-        // window -- this is the case rung 3 exists for.
-        let mut http = inputs("ollama", "gemma4:e2b");
-        http.catalog_context_length = Some(131_072);
-        let h = ContextGovernor::resolve(&http);
+        // Ollama is NOT the exception, and this assertion used to say it was.
+        //
+        // It read "HTTP providers pay no local prefill, so they keep the raw
+        // declared window", with `ollama` as the fixture. Ollama serves over
+        // HTTP and runs on this box -- `model_class::ON_DEVICE_PROVIDERS` lists
+        // it alongside local, gguf and llamafile -- so it pays the prefill in
+        // full. Believing otherwise let a Gemma 4 model on the Orin take the
+        // 131,072 its /api/show declares, four times the ceiling the same
+        // weights get through the `local` provider, decided by nothing but
+        // which string arrived here. The test asserted the defect, so it passed
+        // throughout.
+        let mut ollama = inputs("ollama", "gemma4:e2b");
+        ollama.catalog_context_length = Some(131_072);
+        let o = ContextGovernor::resolve(&ollama);
+        assert_eq!(
+            o.tokens, UNPINNED_LOCAL_CEILING,
+            "ollama runs on this device, so a declared maximum is still bounded"
+        );
+        assert_eq!(o.source, WindowSource::CatalogRecord);
+
+        let mut llamafile = inputs("llamafile", "gemma4-e2b");
+        llamafile.catalog_context_length = Some(131_072);
+        assert_eq!(
+            ContextGovernor::resolve(&llamafile).tokens,
+            UNPINNED_LOCAL_CEILING
+        );
+
+        // A genuinely hosted provider is the case rung 3 exists for: nothing on
+        // this box prefills it, so the declared window stands.
+        let mut hosted = inputs("openai", "gpt-4o");
+        hosted.catalog_context_length = Some(131_072);
+        let h = ContextGovernor::resolve(&hosted);
         assert_eq!(h.tokens, 131_072);
         assert_eq!(h.source, WindowSource::CatalogRecord);
     }
