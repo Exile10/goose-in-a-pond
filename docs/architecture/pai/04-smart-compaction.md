@@ -42,6 +42,13 @@ HTTP provider's spare capacity is not ours to save".
 > this programme intends to take it: P4's compact-on-resume, and P3's age weighting, which since
 > 2026-08-06 gives the trimmer a tool-result rung keyed on `compaction_verbatim_days`. **Cache age is
 > still entirely unmodelled** — that is P5, and the sentence above remains true of it word for word.
+>
+> **Cache age closed in code 2026-08-06 by P5, and not yet in evidence.** `prefix_cache.rs` supplies
+> the state, the adapter records all six invalidation reasons, and the trimmer's age rung now also
+> fires on a cold prefix. So the heading's claim is retired as a description of the code. It is *not*
+> retired as a description of what is known: section 7's warm-versus-cold TTFT measurement is the
+> phase's acceptance criterion and has not been taken. Read the P5 stamp in section 4 before treating
+> the cache axis as settled.
 
 ### 1.3 `ContextCompactor` is dead code
 
@@ -542,8 +549,99 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   would then have to reconcile with. There is no integration test asserting the refresh completed
   before the first token of the next turn (section 7); that needs a live server and belongs with
   `scripts/live-test.sh`.
-- **P5** `PrefixCacheState` plumbed from the adapter; `invalidated_by` recorded at each of the six
-  known invalidation points; the recompact-when-cold rule.
+- **P5 — CODE LANDED 2026-08-06, MEASUREMENT PENDING. All three clauses shipped; the one thing
+  that decides whether the rule was worth having did not, and this bullet stays open until it
+  does.** Section 7 asks for TTFT on the turn following a compaction, warm-cache versus cold-cache,
+  on the Orin and the Mac, and says plainly that "P5 is only correct if cold-cache recompaction
+  shows no TTFT penalty and warm-cache turns show no new re-prefills". No such run exists. This is
+  the second measurement-pending P5 on the ledger — PAI-3's is the other — and it is recorded as
+  such rather than as LANDED, because a green unit suite proves the rule fires where it was told
+  to, not that firing there was cheap.
+
+  `models/services/context/prefix_cache.rs`: `InvalidationReason` (the six reasons, exactly as
+  designed), `PrefixCacheState { built_at, hash, turns_served, invalidated_by }` with
+  `new`/`invalidate`/`rebuilt`/`serve_turn`/`age_since`/`posture`/`posture_of`, and `CachePosture
+  { Warm | Cold }`. Nine unit tests, pure — no clock read anywhere in the file, the shape P4's
+  resume gate proved. `models/ports/agent.rs` gained `Agent::prefix_cache_state() -> Option<
+  PrefixCacheState>`, defaulting to `None`. `turn_trimmer.rs` takes the posture as an eighth
+  argument. `goose_agent.rs` carries the state and records all six reasons.
+
+  **The rule turned out to be one half of a disjunction, because P3 had already built the other
+  half without being able to name it.** 3.3 reads as two rules — recompact when cold, prefer
+  byte-identical edits when warm — and the warm one was landed on 2026-08-06 by P3, whose
+  age-weighting rung fires only once the conversation is over budget and cites invariant 4 for it.
+  What P3 could not do was tell "the prefix is warm" from "the prefix is already gone", so it used
+  *over budget* as a proxy for both. P5 supplies the real signal and spends it in exactly one
+  direction: the rung now also fires when the cache is provably cold, on a conversation that still
+  fits. Nothing on the warm path was tightened. Stripping stale `<system-context>` and refreshing
+  the rolling summary are front edits too and still run every turn — gating those needs the number
+  section 7 is waiting for, and a threshold invented without it would be indefensible.
+
+  **The six reasons are recorded where they happen and not one line later, and the ordering is the
+  whole difficulty.** `PromptChanged` at the static-prefix comparison (plus unconditionally on the
+  legacy `prefix_cache_prompt = false` path, which rebuilds the prompt every turn);
+  `ModelSwapped`/`ProviderRebuilt` split by `GooseAdapter::provider_change_reason` at the completed
+  swap; `ProviderRebuilt` again at the thinking-flag re-stamp, whose own comment already said "the
+  KV prefix is being rebuilt this turn regardless"; `SessionResumed` on entry to
+  `hydrate_goose_session`; `ToolSetChanged` in `track_user_extension`/`untrack_user_extension`;
+  `MultimodalTurn` where `turn_images` is taken. The last of those sits deliberately between the
+  prefix comparison and the trim, so the trimmer reads *this* turn's posture rather than the
+  previous turn's.
+
+  **The ordering bug I wrote first, and the state machine that exists because of it.** The obvious
+  `serve_turn` clears `invalidated_by` — a turn was served, so the cache held. It is wrong, and
+  wrong precisely on the case 3.2 calls the most valuable cold moment there is. `SessionResumed` is
+  recorded while the engine session is being hydrated, hundreds of lines *before* the static prefix
+  is compared in the same turn; an eager clear had a resumed session clearing its own resume and
+  reading `Warm`. So the clear is deferred by one turn: `serve_turn` only clears when a turn had
+  already been served on this prefix. `rebuilt` clears the reason instead, which is safe because a
+  new prefix has `turns_served == 0` and `posture()` reads that as `Cold` on its own. The residue
+  is that a reason is sticky for one extra turn — most visibly after a multimodal turn — so the
+  state over-reports `Cold` once. That is a bounded over-count of a condition whose only
+  consequence is permission to degrade material already past the verbatim horizon; the opposite
+  error silently forfeits the free recompaction the phase exists to take.
+
+  **A latent defect in P3's rung, which only became routine under P5, and it is a good argument for
+  running the idempotence property on every new trigger.** `truncate_head_tail` is not a fixed
+  point of itself: it keeps `cap` characters and then appends an elision marker, so its output is
+  always longer than the cap and handed its own output it cuts again. P3 never saw it, because its
+  rung only ran when the conversation was over budget and one cut usually brought it under. P5 runs
+  the same rung on cold turns that are comfortably within budget, so without a guard a long cold
+  session would have ground one tool result away by degrees, turn after turn — and section 7's
+  "compaction is idempotent on an unchanged conversation" is exactly the property that forbids it.
+  `AGED_FIXED_POINT_CHARS` (the aged cap plus a 64-character marker allowance) is the guard, and
+  `the_aged_cap_is_a_fixed_point_after_one_cut` fails if the marker ever outgrows the allowance
+  rather than letting the property rot silently. Being generous costs at most 64 uncut characters
+  on an already-degraded result — which is the "marginal token saving" invariant 4 says not to move
+  a prefix for.
+
+  **`turns_served` carries no threshold, deliberately.** Invariant 4 protects "a warm prefix that
+  has served many turns", which invites a rule of the form "served fewer than N turns, perturb it
+  freely". That is the widening direction and it has no more measurement behind it than the warm-path
+  gating above. The only use made of `turns_served` is its zero case, which needs no threshold and
+  cannot be wrong: a prefix that has served nothing has nothing to protect. It is also what makes
+  `rebuilt` safe to write the way it is.
+
+  **What the port method buys, and the honest limit of "plumbed".** `prefix_cache_state()` is read
+  through the trait at the live trim site rather than off the adapter's own field, so a future
+  reader — P7's endpoint, which owes the user "whether the prefix survived" — sees exactly what the
+  trimmer acted on rather than a second reading of the same lock. Its `None` default resolves
+  through `posture_of` to `Warm`, in one place: an agent that cannot see a cache gets pre-P5
+  behaviour, and `an_agent_with_no_prefix_cache_resolves_to_the_warm_posture` pins that direction,
+  because `Cold` is the permission and defaulting to it would widen the rule to every mock and every
+  HTTP path.
+
+  **`CompactionProfile` gained no field**, holding the property P1 and P4 both protected: the
+  trimmer's test module builds it with exhaustive literals, so a new field is an `E0063` there.
+  The posture travels as an argument instead. The thirty existing call sites in that test module
+  were not touched either — a shadowing warm-cache shim named `trim_history` sits at the top of the
+  module, so the tests that predate P5 keep asserting warm behaviour and the P5 tests call
+  `super::trim_history` directly, which is also how a reader tells the two apart.
+
+  **Not done, and named.** No live-server run and, more importantly, no device run: the two
+  measurements section 7 asks for are the phase's own acceptance criteria and neither has been
+  taken. Until they are, the honest claim is that the rule is expressed, reachable in production,
+  and cheap to reverse — not that it pays.
 - **P6 — LANDED 2026-08-06. The predicate now moves the server, and the phrase "and after
   compaction" turned out to be two different calls.** `context_monitor.rs` gained
   `ContextMonitor::claim_compaction`, `ContextMonitor::note_compacted`,

@@ -18,6 +18,7 @@ use pond_core::models::services::context::context_budget::CompactionProfile;
 use pond_core::models::services::context::context_governor::{
     ContextGovernor, ContextInputs, WindowResolution,
 };
+use pond_core::models::services::context::prefix_cache::{InvalidationReason, PrefixCacheState};
 use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
 use pond_core::models::services::prompt_builder::build_prompt_partition;
 use pond_core::prompts::PromptState;
@@ -283,6 +284,15 @@ pub struct GooseAdapter {
     /// prefix has not changed and we skip `override_system_prompt()` — allowing
     /// local inference providers to reuse their KV-cache for the stable portion.
     last_prefix_hash: Mutex<u64>,
+    /// PAI-4 P5's cache-age axis: the same prefix `last_prefix_hash` tracks,
+    /// plus what it has served and what most recently destroyed it.
+    ///
+    /// Deliberately alongside rather than folded into `last_prefix_hash`. That
+    /// field is read to decide whether to call `override_system_prompt`, on the
+    /// hot path, under a lock held for two lines; this one is written from six
+    /// places that have nothing else in common and read by the trimmer. Merging
+    /// them would put the compaction decision inside the prompt-assembly lock.
+    prefix_cache: Mutex<PrefixCacheState>,
     /// GIAP session storage — read-only source of the rolling conversation
     /// summary for the deterministic turn trimmer. Optional: without it the
     /// trimmer still runs, just without a summary splice.
@@ -422,6 +432,7 @@ impl GooseAdapter {
                 pond_core::models::domain::model_capabilities::ModelCapabilities::default(),
             ),
             last_prefix_hash: Mutex::new(0),
+            prefix_cache: Mutex::new(PrefixCacheState::new(0, std::time::Instant::now())),
             giap_session_storage: None,
             last_prompt_tokens_arc: std::sync::OnceLock::new(),
             cached_tools: tokio::sync::RwLock::new(None),
@@ -463,6 +474,69 @@ impl GooseAdapter {
         .await
     }
 
+    // ── PAI-4 P5: prefix-cache bookkeeping ────────────────────────────────
+    //
+    // Six places in this file already destroy the engine's KV prefix, and
+    // until P5 every one of them did so silently. These three helpers are
+    // what turns that into a signal the compaction path can read. All are
+    // synchronous and drop the guard before returning, so they are safe to
+    // call from `async fn`s that later `.await` — the same discipline
+    // `last_prefix_hash` follows two fields up.
+
+    /// Record that the prefix was destroyed, and by what.
+    fn note_prefix_invalidated(&self, reason: InvalidationReason) {
+        let mut state = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let served = state.turns_served;
+        state.invalidate(reason);
+        tracing::debug!(
+            target: "giap::trace",
+            kind = "prefix_cache_invalidated",
+            reason = reason.as_str(),
+            turns_served = served,
+            "KV prefix invalidated"
+        );
+    }
+
+    /// Which of the two provider-side reasons a completed swap was (PAI-4 P5).
+    ///
+    /// `previous_key` is `last_provider_key` as it stood BEFORE the swap, in
+    /// the `"provider:model"` form `ensure_provider_current` builds. Reaching
+    /// the swap means provider or model differs; only the model half decides
+    /// between the two reasons, because only a different model explains a
+    /// change in the answers as well as in the prefill.
+    ///
+    /// A model name may itself contain a colon (`gemma4:e2b`), so the split is
+    /// from the LEFT — the provider is the part before the first colon and the
+    /// model is everything after. Splitting from the right would compare
+    /// `"e2b"` against `"gemma4:e2b"` and call every swap a model swap.
+    fn provider_change_reason(previous_key: &str, new_model: &str) -> InvalidationReason {
+        match previous_key.split_once(':') {
+            Some((_, previous_model)) if previous_model == new_model => {
+                InvalidationReason::ProviderRebuilt
+            }
+            // No previous key at all is first use: nothing was swapped away
+            // from, and calling that a model swap is the honest reading.
+            _ => InvalidationReason::ModelSwapped,
+        }
+    }
+
+    /// Record that a new prefix was installed. Does not make it warm — only a
+    /// served turn does that; see `PrefixCacheState::rebuilt`.
+    fn note_prefix_rebuilt(&self, hash: u64) {
+        self.prefix_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rebuilt(hash, std::time::Instant::now());
+    }
+
+    /// Record that this turn is being served off the existing prefix.
+    fn note_prefix_served(&self) {
+        self.prefix_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .serve_turn();
+    }
+
     /// Returns an `GiapGooseExtensionManager` for managing Goose extensions on a session.
     pub fn extension_manager(&self) -> Arc<GiapGooseExtensionManager> {
         self.extension_manager.clone()
@@ -478,6 +552,11 @@ impl GooseAdapter {
         self.user_extensions.write().await.insert(name.to_string());
         // Invalidate tool cache — new extension means new tools available.
         *self.cached_tools.write().await = None;
+        // ...and new tools mean a different tools block inside the static
+        // prefix. PAI-4 P5: this is 3.3's named example — two sessions
+        // alternating on one model diverge here and re-prefill on every
+        // switch, which used to be an invisible tax.
+        self.note_prefix_invalidated(InvalidationReason::ToolSetChanged);
     }
 
     /// Remove an extension from the user-tracking set.
@@ -485,6 +564,7 @@ impl GooseAdapter {
         self.user_extensions.write().await.remove(name);
         // Invalidate tool cache — removed extension means tools changed.
         *self.cached_tools.write().await = None;
+        self.note_prefix_invalidated(InvalidationReason::ToolSetChanged);
     }
 
     /// The `ExtensionConfig` GIAP registers its builtins under.
@@ -705,6 +785,13 @@ impl GooseAdapter {
     async fn hydrate_goose_session(&self, goose_sid: &str, giap_session_id: &str) {
         use pond_core::models::domain::message::Role as GiapRole;
         use pond_core::models::services::context::turn_trimmer::{plan_replay, TrimRole};
+
+        // PAI-4 P5. Reaching here at all means a FRESH engine session was just
+        // created for a conversation that already has history — the definition
+        // of a resume, and there is no cache to inherit. Recorded before the
+        // storage read so it holds even when the read finds nothing: the engine
+        // session is new either way.
+        self.note_prefix_invalidated(InvalidationReason::SessionResumed);
 
         let Some(storage) = &self.giap_session_storage else {
             return;
@@ -1401,13 +1488,17 @@ impl GooseAdapter {
         enable_thinking: bool,
     ) -> Result<()> {
         let key = format!("{}:{}", settings.chat_provider, settings.chat_model);
-        let key_unchanged = {
+        // Kept as well as compared: PAI-4 P5 needs to know whether the MODEL
+        // changed or only the provider, and by the time the swap block runs
+        // `last_provider_key` has already been overwritten with the new one.
+        let previous_key = {
             let last = self
                 .last_provider_key
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            *last == key
+            last.clone()
         };
+        let key_unchanged = previous_key == key;
         let thinking_unchanged = {
             let last = self
                 .last_thinking_param
@@ -1456,6 +1547,13 @@ impl GooseAdapter {
                     configured.clear();
                     configured.insert(session_id.to_string());
                 }
+                // PAI-4 P5. Same model, reconfigured provider — the comment
+                // above already knew "the KV prefix is being rebuilt this turn
+                // regardless"; this is that fact written where the compaction
+                // path can read it. `ProviderRebuilt` rather than
+                // `ModelSwapped` because the model did not change, and a trace
+                // that cannot tell those apart is worth less than one that can.
+                self.note_prefix_invalidated(InvalidationReason::ProviderRebuilt);
                 tracing::info!(
                     enable_thinking,
                     "Re-stamped engine thinking flag on the current provider"
@@ -1730,6 +1828,17 @@ impl GooseAdapter {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = 0;
 
+            // PAI-4 P5. Two of the six reasons meet here and the difference is
+            // real: `key` is "provider:model", so reaching this block means one
+            // of the two changed. A different model is `ModelSwapped`; the same
+            // model behind a different provider (an Ollama model moved onto the
+            // in-process engine, say) is `ProviderRebuilt`. Both cost the same
+            // prefill; only one of them explains a change in the answers.
+            self.note_prefix_invalidated(Self::provider_change_reason(
+                &previous_key,
+                &settings.chat_model,
+            ));
+
             tracing::debug!("[model-switch] swap complete, key={}", key);
         } else {
             tracing::debug!(
@@ -1861,6 +1970,12 @@ impl GooseAdapter {
             self.token_counter().await,
             CurrentTurn::NotYetAppended,
             self.verbatim_horizon().await,
+            // PAI-4 P5. Read through the port method rather than the field, so
+            // whatever a future caller (P7's compact endpoint) sees is exactly
+            // what the trimmer acted on — one reading, not two.
+            PrefixCacheState::posture_of(
+                pond_core::models::ports::agent::Agent::prefix_cache_state(self).as_ref(),
+            ),
         );
 
         // ── Live-history image cap (phase F2, live half) ──────────────────
@@ -2730,16 +2845,29 @@ impl GooseAdapter {
                 self.agent
                     .override_system_prompt(partition.static_prefix)
                     .await;
-                let mut last_hash = self
-                    .last_prefix_hash
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                *last_hash = partition.prefix_hash;
+                {
+                    let mut last_hash = self
+                        .last_prefix_hash
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    *last_hash = partition.prefix_hash;
+                }
+                // PAI-4 P5. The prefix moved, so this turn pays a full
+                // re-prefill whatever else happens. Note that
+                // `note_prefix_rebuilt` does NOT clear the reason: the new
+                // prefix has served nothing yet, and the trimmer — which runs
+                // later in this same turn — must read Cold, not Warm.
+                self.note_prefix_invalidated(InvalidationReason::PromptChanged);
+                self.note_prefix_rebuilt(partition.prefix_hash);
             } else {
                 tracing::debug!(
                     hash = %partition.prefix_hash,
                     "Static prefix unchanged — skipping override_system_prompt (KV-cache reuse)"
                 );
+                // PAI-4 P5. The one place a prefix earns its warm standing:
+                // the engine is about to serve a turn off a cache it already
+                // holds. Everything else in this file can only take that away.
+                self.note_prefix_served();
             }
 
             // Dynamic suffix (date/time, profile) goes into <system-context> in the
@@ -2755,6 +2883,11 @@ impl GooseAdapter {
             );
             self.shim_controls.set_system_prefix(system_prompt.clone());
             self.agent.override_system_prompt(system_prompt).await;
+            // PAI-4 P5. The legacy path rebuilds the whole system prompt every
+            // turn, so on it the prefix is cold every turn — unconditionally,
+            // with no hash to compare. Saying so is what keeps the trimmer's
+            // posture honest here rather than silently warm.
+            self.note_prefix_invalidated(InvalidationReason::PromptChanged);
         }
 
         // GIAP-owned system-prompt appendix, re-attached by the provider shim
@@ -3221,6 +3354,13 @@ impl GooseAdapter {
         // between attempts or a deterministic model repeats itself.
         let turn_text = user_text.clone();
         let turn_images = request.images.clone();
+        // PAI-4 P5. A turn carrying an image forfeits KV retention outright —
+        // the reason MAX_HISTORY_REPLAY_IMAGES is 1. Recorded here, before the
+        // trim below, so the trimmer sees this turn's posture and not the
+        // previous turn's.
+        if !turn_images.is_empty() {
+            self.note_prefix_invalidated(InvalidationReason::MultimodalTurn);
+        }
         let turn_goose_sid = goose_sid.clone();
 
         let agent_clone = self.agent.clone();
@@ -3790,6 +3930,18 @@ impl AgentPort for GooseAdapter {
             );
         }
     }
+
+    /// PAI-4 P5. This adapter is the only implementor that returns `Some`,
+    /// because it is the only one that tracks a prefix at all — `Agent`'s
+    /// default `None` is correct for every mock and for any agent whose engine
+    /// keeps no KV cache we can see.
+    ///
+    /// A snapshot, not a handle. The state is `Copy` and every caller acts on
+    /// it immediately; handing out a lock would let a compaction decision
+    /// straddle the prompt assembly it is describing.
+    fn prefix_cache_state(&self) -> Option<PrefixCacheState> {
+        Some(*self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner()))
+    }
 }
 
 /// Shrink the text bodies of an oversized structured tool response, or `None`
@@ -4296,6 +4448,50 @@ mod tests {
             "llama-3.2-3b",
             false
         ));
+    }
+
+    // ── PAI-4 P5: which reason a provider swap records ────────────────────
+
+    #[test]
+    fn the_same_model_behind_a_new_provider_is_a_rebuild_not_a_swap() {
+        assert_eq!(
+            GooseAdapter::provider_change_reason("ollama:gemma4:e2b", "gemma4:e2b"),
+            InvalidationReason::ProviderRebuilt
+        );
+        assert_eq!(
+            GooseAdapter::provider_change_reason("local:gemma-4-E2B-it", "gemma-4-E2B-it"),
+            InvalidationReason::ProviderRebuilt
+        );
+    }
+
+    /// The colon-in-the-model-name case, which is not hypothetical: every
+    /// Ollama tag has one. Splitting the key from the right would compare
+    /// "e2b" with "gemma4:e2b" and report a model swap on every provider
+    /// change — a reason nobody could trust in a trace.
+    #[test]
+    fn a_model_name_containing_a_colon_survives_the_key_split() {
+        assert_eq!(
+            GooseAdapter::provider_change_reason("ollama:gemma4:e2b", "gemma4:e4b"),
+            InvalidationReason::ModelSwapped
+        );
+        assert_eq!(
+            GooseAdapter::provider_change_reason("llamafile:gemma4:e2b", "gemma4:e2b"),
+            InvalidationReason::ProviderRebuilt
+        );
+    }
+
+    #[test]
+    fn a_different_model_is_a_swap_and_so_is_the_very_first_provider() {
+        assert_eq!(
+            GooseAdapter::provider_change_reason("local:gemma-4-E2B-it", "gemma-4-E4B-it"),
+            InvalidationReason::ModelSwapped
+        );
+        // Startup: `last_provider_key` is still empty, so there is no previous
+        // model to have kept.
+        assert_eq!(
+            GooseAdapter::provider_change_reason("", "gemma-4-E2B-it"),
+            InvalidationReason::ModelSwapped
+        );
     }
 
     #[test]
