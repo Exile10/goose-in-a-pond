@@ -155,7 +155,7 @@ PAI-3 Context governor ── PAI-4 Compaction ── PAI-5 Thinking │
 | Doc | Workstream | Requirement | Depends on | Status |
 |---|---|---|---|---|
 | [01](./pai/01-identity-and-profile-boundaries.md) | Identity and profile boundaries | Hard profile boundaries | — | **COMPLETE — P1-P8 LANDED** |
-| [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | **P0-P5 LANDED**; P6-P8 designed |
+| [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | **P0-P5, P7 LANDED** (P3, P5 partial); P6, P8 designed |
 | [03](./pai/03-context-governor.md) | Context governor | Large context, used fully | — | **P1, P2 LANDED** |
 | [04](./pai/04-smart-compaction.md) | Smart compaction | Smart compaction | 03 | DESIGNED |
 | [05](./pai/05-reasoning-and-thinking.md) | Reasoning and thinking | Ability to think | 03, 04 | DESIGNED |
