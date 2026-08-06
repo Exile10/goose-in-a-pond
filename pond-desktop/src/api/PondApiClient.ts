@@ -8,6 +8,7 @@ import {
   type ChatEvent,
   type ChatStreamRequest,
   type CleanupResponse,
+  type CompactionReport,
   type Device,
   type DiskUsage,
   type DownloadEntry,
@@ -859,6 +860,20 @@ export class PondApiClient {
 
   deleteSession(sessionId: string): Promise<void> {
     return this.del(`/api/v1/sessions/${encodeURIComponent(sessionId)}`);
+  }
+
+  /**
+   * PAI-4 P7. Ask the server to compact this session now.
+   *
+   * Everything short of a server fault answers 200 with a `status`/`reason`
+   * pair, so a refusal ("cooling_down", "not_under_pressure", …) arrives here
+   * as a normal resolved `CompactionReport` — `request()` only throws on
+   * non-2xx. Callers must render the reason, not treat it as an error: the
+   * endpoint deliberately does not bypass the pressure axis's rate limiter, so
+   * being refused is the common case rather than the exceptional one.
+   */
+  compactSession(sessionId: string): Promise<CompactionReport> {
+    return this.post(`/api/v1/sessions/${encodeURIComponent(sessionId)}/compact`);
   }
 
   // ── Prompts ───────────────────────────────────────────────

@@ -815,6 +815,68 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   catches route registration and auth-middleware problems that no in-process `oneshot` router test
   can see. Section 7's manual check is still manual. And the endpoint has never been exercised against
   a real on-device summariser, only `MockProvider`.
+- **P7b — PARTIALLY LANDED 2026-08-06.** The frame now has a consumer in the hub chat. The classic
+  chat section is blocked, not skipped, and the reason is recorded below.
+
+  **The respec above named the wrong pair of surfaces, in both directions.** There are three
+  `api.chatStream` callers, not two: `sections/Chat.tsx`, `sections/Canvas.tsx` and
+  `hub/views/ChatHub.tsx`. The one the paragraph omits is the hub chat — the newer of the two UIs
+  Jerry keeps deliberately blended — and it is also the one that already implements the
+  `turn_limit_reached` per-turn affordance this phase should copy. `Canvas.tsx` is the surface that
+  should arguably have been excluded: its thread items carry no id, and it implements neither
+  `turn_stats` nor `turn_limit_reached`, so a per-turn control there is a new pattern rather than
+  parity. So Canvas is a **deliberate deferral**, written down here so the next reader does not log it
+  as an oversight.
+
+  **What shipped.** `context_warning` is in the `ChatEventType` union; `ContextWarning` and
+  `CompactionReport` are exported from `api/types.ts`; `PondApiClient.compactSession` posts to
+  `/api/v1/sessions/{id}/compact`; and a new shared `components/ContextPressureNote.tsx` renders the
+  pressure line plus a "Compact now" control, styled in `hub/views/chat.css` next to `.turn-limit`,
+  the file both full chat surfaces already share. `ChatHub.tsx` gained the `context_warning` branch
+  (attaching by message id, same reasoning as `turn_stats`) and renders the note beside the turn-limit
+  one.
+
+  **No Rust changed, and that is the finding.** The paragraph above proves zero consumers by grep,
+  which is true but is a *rendering* fact rather than a transport one: `PondApiClient.streamSse`
+  yields every parsed frame unfiltered and every consumer chain drops unknown types silently, so the
+  frame already reached the client and nothing needed plumbing. It is produced under
+  `context_monitor_enabled`, which defaults to `true`.
+
+  **Two wire details the respec flattened.** It calls the endpoint body and the SSE frame "the same
+  four fields". They differ in exactly the two places a client gets wrong. `turns_remaining` is `null`
+  on the endpoint and a raw `u32` on the frame, where `u32::MAX` (4294967295) means "growth unknown" —
+  the component clamps it and a test asserts the digits never render. And `warning` is only written
+  above 60% utilisation while `should_compact` also fires through the `estimated_turns_remaining < 3`
+  limb, so `warning: null` on a `context_warning` frame is a producible state, not a defensive `?`;
+  the component composes a utilisation line for it and a test asserts that too.
+
+  **`TurnStatsFooter` was considered and rejected as the host.** That footer is gated on
+  `show_turn_stats`, which defaults to `false` in Rust — putting the control there would have shipped
+  it invisible on every default install, which is the same class of mistake as PAI-4 P2 being correct
+  and unreachable.
+
+  **The guard, and the mutation.** `ContextPressureNote.test.tsx` holds the behaviour tests and, more
+  importantly, the wiring assertion that would go red if this phase were reverted: it reads
+  `ChatHub.tsx` from disk and fails with "the frame has no consumer in ChatHub.tsx" when the branch is
+  deleted. That assertion is the whole point of the phase — the component can be perfect and the
+  feature still worth nothing if nothing renders it. Four mutations were run: removing the
+  `warning: null` fallback, removing the `u32::MAX` clamp, turning a refusal into an error
+  (`role="alert"` plus the word Error), and deleting the `ChatHub` branch. Each failed naming the real
+  problem; all were restored and the full suite is 261 passing.
+
+  **Blocked, not deferred: `sections/Chat.tsx`.** That file was held by the concurrently-running PAI-5
+  reasoning group in this batch, so the identical branch and render are NOT in the classic chat
+  section, and neither is `Chat.test.tsx` nor the `context_warning` case in `tests/e2e/chat.spec.ts`
+  (that spec drives the Chat section, so it would have exercised nothing). Applying the same six-line
+  branch at the `turn_limit_reached` site and the same render beside it finishes the phase. The e2e
+  helper already carries a default `**/api/v1/sessions/*/compact` mock returning a
+  `not_under_pressure` refusal, so no spec can reach a real network when it does.
+
+  **What would falsify this.** A live session that crosses 75% and shows no note in the hub chat —
+  which is also the state `POST /sessions/{id}/compact` answers `not_under_pressure` for, so the
+  honest check is a long session, not a fabricated frame. Note that utilisation is only ever learned
+  from a turn taken since this process started, so most real sessions never reach the state at all;
+  the refusal renderings are what a user actually hits, and they are what the tests assert hardest.
 
 ---
 

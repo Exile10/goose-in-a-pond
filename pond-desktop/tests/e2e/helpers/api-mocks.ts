@@ -90,6 +90,28 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
   await page.route("**/api/v1/sessions/*/messages", (route) =>
     route.fulfill({ json: { messages: [] } }),
   );
+  // Manual compaction (PAI-4 P7b). Defaults to the refusal a real install hits
+  // most often — the endpoint does not bypass the pressure axis's rate limiter,
+  // so "not under pressure" is the ordinary answer. Registered before the
+  // `/sessions/*` catch-all below so a spec can still override it (page.route
+  // is last-registered-wins, and that catch-all falls through for this path).
+  await page.route("**/api/v1/sessions/*/compact", (route) =>
+    route.fulfill({
+      json: {
+        session_id: "e2e-session",
+        status: "skipped",
+        reason: "not_under_pressure",
+        outcome: null,
+        context: {
+          utilization_pct: 12.0,
+          turns_remaining: null,
+          avg_growth_rate: 0,
+          should_compact: false,
+          warning: null,
+        },
+      },
+    }),
+  );
   // Rename (PATCH) and delete (DELETE) on an individual session. This pattern
   // also matches `/sessions/:id/messages`, so fall through for those to let the
   // more specific messages route above handle them. Echoes the body for PATCH
@@ -97,7 +119,7 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
   // themselves before calling into the app.
   await page.route("**/api/v1/sessions/*", (route) => {
     const url = route.request().url();
-    if (url.includes("/messages")) return route.fallback();
+    if (url.includes("/messages") || url.includes("/compact")) return route.fallback();
     const method = route.request().method();
     if (method === "PATCH") {
       const body = (route.request().postDataJSON() ?? {}) as Record<string, unknown>;

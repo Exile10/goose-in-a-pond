@@ -4,7 +4,7 @@ import { api } from "../../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../../state/AppContext";
 import { filterThinking } from "../../lib/thinkFilter";
 import { CONTINUE_TURN_MESSAGE } from "../../api/types";
-import type { ChatEvent, ImageAttachment, TurnStats } from "../../api/types";
+import type { ChatEvent, ContextWarning, ImageAttachment, TurnStats } from "../../api/types";
 import { HubIco, micEl } from "../primitives/HubIco";
 import { HP_PATHS } from "../primitives/icons";
 import { GooseAvatar } from "./chat/GooseAvatar";
@@ -12,6 +12,7 @@ import { TypingIndicator } from "./chat/TypingIndicator";
 import { ResultCard } from "./chat/ResultCard";
 import type { CardKind } from "./chat/ResultCard";
 import { TurnStatsFooter } from "../../components/TurnStatsFooter";
+import { ContextPressureNote } from "../../components/ContextPressureNote";
 import { AttachmentTray } from "../../components/AttachmentTray";
 import { prepareImage, validateAttachmentSet } from "../../lib/imageAttach";
 import type { PreparedImage } from "../../lib/imageAttach";
@@ -28,6 +29,9 @@ interface ChatMessage {
   turnStats?: TurnStats;
   /** Set when the agent stopped on its turn budget — renders a Continue action. */
   turnLimit?: number;
+  /** Set when the server said the context window is filling — renders the
+   *  pressure note and the manual compaction control (PAI-4 P7b). */
+  contextWarning?: ContextWarning;
   /** Local preview URLs for images attached to a live-sent message. */
   images?: string[];
 }
@@ -302,6 +306,14 @@ export function ChatHubView() {
             setMsgs((prev) =>
               prev.map((m) => (m.id === agentMsg.id ? { ...m, turnLimit: limit } : m)),
             );
+          } else if (ev.type === "context_warning") {
+            // PAI-4 P7b. The window is filling. Attach by id — same reasoning
+            // as turn_stats — so the note lands on this turn and not on
+            // whatever message a mid-stream history refresh left last.
+            const cw = ev as unknown as ContextWarning;
+            setMsgs((prev) =>
+              prev.map((m) => (m.id === agentMsg.id ? { ...m, contextWarning: cw } : m)),
+            );
           } else if (ev.done && ev.session_id) {
             sessionIdRef.current = ev.session_id;
             dispatch({ type: "SET_SESSION_ID", payload: ev.session_id });
@@ -410,6 +422,12 @@ export function ChatHubView() {
                     <HubIco d={HP_PATHS.play} size={12} color="currentColor" /> Continue
                   </button>
                 </div>
+              )}
+              {m.who === "goose" && !m.streaming && m.contextWarning && (
+                <ContextPressureNote
+                  warning={m.contextWarning}
+                  sessionId={sessionIdRef.current ?? null}
+                />
               )}
               {m.who === "goose" && !m.streaming && showTurnStats && m.turnStats && (
                 <TurnStatsFooter stats={m.turnStats} />
