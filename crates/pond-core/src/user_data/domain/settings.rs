@@ -453,6 +453,18 @@ pub struct Settings {
     #[serde(default = "Settings::default_summary_idle_secs")]
     pub summary_idle_secs: u32,
 
+    /// Gap after which reopening a session counts as a *resume*, and its
+    /// history is reshaped before the first turn back rather than during it.
+    ///
+    /// PAI-4 P4. The gate is
+    /// `models::services::context::resume_compaction::should_run`; this is only
+    /// the threshold it reads. Too small is the dangerous direction — a pause
+    /// inside a live conversation would be read as a resume and recompact
+    /// between every pair of turns — so `resume_compaction::MIN_RESUME_IDLE_SECS`
+    /// floors whatever is stored here.
+    #[serde(default = "Settings::default_resume_compaction_idle_secs")]
+    pub resume_compaction_idle_secs: u32,
+
     // ── Agent behaviour ────────────────────────────────────────────────────────
     /// Agent backend engine: "goose" (default, full-featured) | "pond" (independent, KV-cache reuse).
     /// "goose" uses Block's Goose framework with all MCP extensions, cloud provider support.
@@ -841,6 +853,7 @@ impl Default for Settings {
             show_turn_stats: false,
             hybrid_compaction_enabled: Self::default_hybrid_compaction_enabled(),
             summary_idle_secs: Self::default_summary_idle_secs(),
+            resume_compaction_idle_secs: Self::default_resume_compaction_idle_secs(),
             agent_backend: Self::default_agent_backend(),
             agent_goose_mode: Self::default_agent_goose_mode(),
             agent_max_turns: Self::default_agent_max_turns(),
@@ -1038,6 +1051,13 @@ impl Settings {
     }
     fn default_summary_idle_secs() -> u32 {
         120
+    }
+
+    /// 30 minutes — the single source is the constant the gate itself uses, so
+    /// the setting's default and the code's default cannot drift apart. See
+    /// `resume_compaction::RESUME_IDLE_THRESHOLD_SECS` for why that number.
+    fn default_resume_compaction_idle_secs() -> u32 {
+        crate::models::services::context::resume_compaction::RESUME_IDLE_THRESHOLD_SECS
     }
 
     /// True since the C1-C3 work landed: the engine session is now hydrated
@@ -1862,6 +1882,12 @@ mod tests {
             // settings API during on-device burn-in, no UI control planned.
             "hybrid_compaction_enabled",
             "summary_idle_secs",
+            // PAI-4 P4's threshold. Headless for the same reason its two
+            // neighbours are: it tunes when the pipeline reshapes history, not
+            // what the household can see or decide. A control would also be a
+            // trap — the damaging direction is *shorter*, and a slider inviting
+            // "compact more often" would invite exactly that.
+            "resume_compaction_idle_secs",
             "retention_events_days",
             "retention_events_by_category",
             "retention_sensitive_days",

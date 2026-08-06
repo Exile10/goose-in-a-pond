@@ -160,6 +160,23 @@ session resumed && idle_gap > resume_compaction_idle_secs
 The trigger reuses the pattern already proven in `user_data/services/consolidation_schedule.rs` —
 a pure `should_run` gate with a startup guard — rather than inventing new scheduling.
 
+> **Corrected 2026-08-06 by P4, on what "run full compaction" can mean today.** The pseudo-code
+> reads as though a single compaction pass exists to be invoked. It does not: hybrid compaction is
+> two halves with opposite timing. The deterministic trimmer is a function of the turn being
+> assembled, so there is nothing to pre-run and nothing to save — it is cheap by construction. The
+> half worth moving off the critical path is the rolling summary, and there the gap is real: the
+> idle refresh loop skips any session whose `updated_at` predates process start, so a conversation
+> from before the last restart keeps a summary frozen at the restart and the trimmer splices that
+> stale summary into every turn until four new messages accumulate. Compact-on-resume refreshes it
+> at the reopen. The large tier's re-summarisation is the third thing this trigger will run, once
+> P2 exists.
+>
+> **`resume` is a user action, not an elapsed duration.** The startup guard the design points at has
+> a specific shape here that the one-line rule hides: at boot every stored session satisfies
+> `idle_gap > resume_compaction_idle_secs`, so a gate keyed on the gap alone would compact the whole
+> history store on startup. `ResumeGateInputs::reopened` is the guard, and it can only be set by a
+> request somebody made.
+
 ### 3.3 Cache-age axis — the core insight
 
 Introduce prefix-cache state as an *input* to the compaction decision:
@@ -288,7 +305,60 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   repo has for as long as it existed.
 - **P3** Age-weighted retention priority in the trimmer, with `compaction_verbatim_days` as a
   headless setting.
-- **P4** Compact-on-resume, reusing the `should_run` gate shape from `consolidation_schedule.rs`.
+- **P4 — LANDED 2026-08-06, with a call site, and doing less than "full compaction" for a
+  reason.** `models/services/context/resume_compaction.rs`: `ResumeGateInputs`,
+  `SkipReason { Disabled | NotAReopen | NoPriorHistory | StillWarm | NoSummariser }`,
+  `GateDecision`, `should_run`, `idle_threshold_from_secs`, `idle_gap_since`. Fourteen unit tests.
+  `resume_compaction_idle_secs` is a new headless setting, defaulting to
+  `RESUME_IDLE_THRESHOLD_SECS` so the setting's default and the gate's cannot drift. The caller is
+  `spawn_resume_compaction` in `routes.rs`, fired from `GET /api/v1/sessions/:id/messages`.
+
+  **The reopen is the resume signal, and it had to be a user action rather than a clock.**
+  Consolidation's gate guards "never merely because the process has been up a while". The same
+  hazard wears a different costume here: at boot *every* stored session has a gap of days, so a rule
+  that asked only about `idle_gap` would compact the entire history store on startup and call each
+  one a resume. `ResumeGateInputs::reopened` is that guard, and nothing in `pond-core` can set it
+  from a timer — the one production caller sets it from a request a person made. Removing the check
+  makes `a_huge_gap_alone_is_not_a_resume` and `no_single_precondition_can_be_dropped` fail with
+  *"the gate ran with `reopened` unsatisfied"*.
+
+  **What actually runs on resume today is the rolling-summary refresh, not a "full compaction", and
+  the difference is worth stating plainly rather than papering over.** 3.2 says compaction "happens
+  *during* the first turn back, while the user waits on a token stream". With hybrid compaction on,
+  that is only half true: the in-turn work is the deterministic trimmer, which is cheap and cannot
+  be pre-run anyway, because it is a function of the turn being assembled. The expensive, pre-runnable
+  half is the summary — and there the phase found a real hole rather than a hypothetical one. The
+  idle refresh loop in `pond-server` skips every session whose `updated_at` predates process start
+  (its own "never at startup" guard), so a conversation from before the last restart keeps a summary
+  that stops where it stopped, and the trimmer splices that stale summary into every turn until four
+  new messages accumulate. Refreshing on reopen closes exactly that, and does it while the user is
+  reading history rather than waiting on tokens. The large tier's re-summarisation is P2's, and this
+  gate will call it when it exists.
+
+  **Too short is the failure that costs something, so both fallbacks lengthen.**
+  `RESUME_IDLE_THRESHOLD_SECS` is 30 minutes — 15x the default `summary_idle_secs` and 2x
+  consolidation's `INACTIVITY_THRESHOLD_SECS`, which is the point at which the rest of the system
+  already considers the household asleep. A threshold that is too *large* only means the user pays
+  what they pay today; one that is too small reads a mid-conversation pause as a resume and spends a
+  model call between every pair of turns. So `MIN_RESUME_IDLE_SECS = 300` floors whatever is stored
+  (a `0` from a hand-edited row must not mean "every reopen"), and `idle_gap_since` returns
+  `Duration::ZERO` for a future timestamp rather than an enormous positive gap — clock skew reads as
+  "active", never as "stale".
+
+  **Invariant 1 is held structurally, not by promise.** Every input the gate needs, including its two
+  database reads, is gathered *inside* the spawned task, so `GET /sessions/:id/messages` returns at
+  exactly the speed it did before. The refresh itself races a watcher on `last_user_activity` — the
+  same contract the idle loop uses — so a user turn cancels it and nothing is persisted. A
+  process-local in-flight set keeps two rapid reopens of one session from queueing two model calls
+  ahead of that turn on the serial on-device engine; it is deliberately not a database row, which
+  would outlive a `kill -9` and strand the session as permanently compacting.
+
+  **What is deferred, and named so it is not mistaken for done.** Age-weighted retention is P3's and
+  is untouched. `PrefixCacheState` is P5's: this phase uses the idle gap as the cache-age proxy the
+  design itself offers ("the KV cache is long gone"), and introduces no cache-state type that P5
+  would then have to reconcile with. There is no integration test asserting the refresh completed
+  before the first token of the next turn (section 7); that needs a live server and belongs with
+  `scripts/live-test.sh`.
 - **P5** `PrefixCacheState` plumbed from the adapter; `invalidated_by` recorded at each of the six
   known invalidation points; the recompact-when-cold rule.
 - **P6** Act on `should_compact` between turns; call `reset_session` on clear and after compaction.
