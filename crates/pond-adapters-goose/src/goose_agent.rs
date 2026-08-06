@@ -1429,6 +1429,63 @@ impl GooseAdapter {
         }
     }
 
+    /// Whether THIS turn may emit `AgentStreamEvent::Thinking` frames at all.
+    ///
+    /// Gated at the PRODUCER rather than at the SSE seam, deliberately. Three
+    /// separate consumers read this event — `routes.rs` forwards it on
+    /// `/chat/stream` and again on `/agent/chat/stream`, and `pond-server`'s CLI
+    /// printer writes it dimmed to stderr — and exactly one of them has ever
+    /// consulted `show_thinking`. The CLI printer is also the terminal voice
+    /// loop, where PAI-5 invariant 2 says reasoning is unspeakable text. A gate
+    /// here is the only one all three inherit, and it is the contract
+    /// `AgentStreamEvent::Thinking`'s own doc comment already claims ("only
+    /// emitted when `show_thinking` is enabled").
+    ///
+    /// `voice` is the OR of the instance flag (CLI `--input whisper`) and the
+    /// per-request one (the desktop voice pipeline), unlike
+    /// `vision_section_applies` — this value never reaches `PromptState`, so it
+    /// cannot move the static prefix between turns, and the per-request flag is
+    /// the only thing that catches a voice turn on a text-started process.
+    ///
+    /// On failure the access narrows: a settings load that falls back to
+    /// `Settings::default()` gets `show_thinking: false` and emits nothing.
+    fn reasoning_frames_enabled(show_thinking: bool, voice: bool) -> bool {
+        show_thinking && !voice
+    }
+
+    /// The reasoning text a single agent message contributes to the stream.
+    ///
+    /// The producers already exist and were being dropped one call short of the
+    /// seam. `goose-local-inference` reads llama.cpp's `reasoning_content` delta
+    /// and sends `Message::assistant().with_thinking(..)`; the shared OpenAI
+    /// format does the same for every HTTP provider that separates reasoning
+    /// (Ollama's qwen3 / deepseek-r1 among them). Both arrive here inside
+    /// `AgentEvent::Message`, and `as_concat_text()` filters on `as_text()`,
+    /// which returns `None` for `Thinking` — so the structured channel was
+    /// parsed upstream, thrown away here, and then re-derived downstream by
+    /// `ThoughtFilter` scraping tags out of prose.
+    ///
+    /// `RedactedThinking` is dropped on purpose: its payload is provider
+    /// ciphertext (`data`), meaningful only when replayed back to the same
+    /// provider. Rendering it would put opaque base64 in the user's thinking
+    /// panel, and it is a data-out surface with no readable content to justify
+    /// it.
+    ///
+    /// Nothing is persisted here — PAI-5 P6 owns that, and until it lands
+    /// reasoning stays out of `session_messages` and out of any replayed
+    /// context.
+    fn reasoning_frames(msg: &Message, emit: bool) -> Vec<String> {
+        if !emit {
+            return Vec::new();
+        }
+        msg.content
+            .iter()
+            .filter_map(|c| c.as_thinking())
+            .map(|t| t.thinking.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
     /// Append the `<vision>` section to a prompt template when the model can see.
     ///
     /// Appended to the TEMPLATE, before Tera runs, rather than to the rendered
@@ -3376,6 +3433,12 @@ impl GooseAdapter {
         let user_msg_len = request.message.len();
         let turn_start = std::time::Instant::now();
 
+        // Whether this turn may surface the model's reasoning at all. Resolved
+        // here, from the settings already in hand, so the 'static stream closure
+        // below carries a decision rather than a repository handle. Does not
+        // touch `PromptState` and so cannot move the KV prefix.
+        let emit_reasoning = Self::reasoning_frames_enabled(settings.show_thinking, is_voice);
+
         // Cancellation token: when the stream is dropped (e.g. voice interrupt),
         // the DropGuard fires and cancels the token.  Goose's agent loop checks
         // `is_token_cancelled()` at each turn boundary and exits early, so
@@ -3450,6 +3513,16 @@ impl GooseAdapter {
                     match event_result {
                         Ok(event) => match event {
                             goose::agents::AgentEvent::Message(msg) => {
+                                // Surface the model's reasoning BEFORE the tool
+                                // calls and the answer text of the same message,
+                                // which is the order the provider produced them
+                                // in. Deliberately does NOT set
+                                // `produced_visible`: reasoning alone leaves the
+                                // user with nothing, and marking the turn visible
+                                // would suppress the empty-turn recovery below.
+                                for content in Self::reasoning_frames(&msg, emit_reasoning) {
+                                    yield Ok(AgentStreamEvent::Thinking { content });
+                                }
                                 // Emit tool call and result events
                                 for content in &msg.content {
                                     match content {
@@ -4512,6 +4585,117 @@ mod tests {
                 "voice mode must suppress <thinking> regardless of mode ({mode})"
             );
         }
+    }
+
+    // ── PAI-5 P1: the structured reasoning channel ────────────────────────
+
+    /// PAI-5 invariant 2: voice mode never renders reasoning. It is unspeakable
+    /// text, and the terminal voice loop prints `Thinking` frames to stderr
+    /// unconditionally, so a leak here is a leak all the way to the speaker.
+    ///
+    /// This is the clause that has no second line of defence. `show_thinking`
+    /// is also checked at the SSE seam for the `ThoughtFilter` capture path
+    /// (`routes.rs` builds the filter with `settings.show_thinking &&
+    /// !req.voice_mode`), but the structured frames this phase introduces are
+    /// forwarded there unconditionally — the producer is the only gate.
+    #[test]
+    fn a_voice_turn_never_surfaces_reasoning() {
+        for show_thinking in [true, false] {
+            assert!(
+                !GooseAdapter::reasoning_frames_enabled(show_thinking, true),
+                "voice mode leaked reasoning with show_thinking={show_thinking}"
+            );
+        }
+        assert!(GooseAdapter::reasoning_frames_enabled(true, false));
+        assert!(
+            !GooseAdapter::reasoning_frames_enabled(false, false),
+            "a user who turned thinking off must not receive reasoning frames"
+        );
+    }
+
+    /// A settings read that fails falls back to `Settings::default()`. On that
+    /// path access must NARROW, not widen.
+    #[test]
+    fn the_settings_default_emits_no_reasoning() {
+        let fallback = pond_core::user_data::domain::settings::Settings::default();
+        assert!(!GooseAdapter::reasoning_frames_enabled(
+            fallback.show_thinking,
+            false
+        ));
+    }
+
+    /// What was actually being thrown away. `as_concat_text()` filters on
+    /// `as_text()`, which returns `None` for `Thinking`, so a message carrying
+    /// both reached the stream as answer text only.
+    #[test]
+    fn reasoning_is_lifted_out_of_a_message_that_also_carries_an_answer() {
+        let msg = Message::assistant()
+            .with_thinking("  the user asked about the porch light  ", "")
+            .with_text("The porch light is on.");
+
+        assert_eq!(
+            msg.as_concat_text(),
+            "The porch light is on.",
+            "as_concat_text is still the answer-only view; that is the whole reason \
+             a separate lift is needed"
+        );
+        assert_eq!(
+            GooseAdapter::reasoning_frames(&msg, true),
+            vec!["the user asked about the porch light".to_string()],
+        );
+        assert!(
+            GooseAdapter::reasoning_frames(&msg, false).is_empty(),
+            "the gate is applied inside the lift, not only at the call site"
+        );
+    }
+
+    /// `RedactedThinking` is provider ciphertext, meaningful only when replayed
+    /// to the same provider. Rendering it would put opaque base64 in the user's
+    /// thinking panel — a data-out surface with nothing readable to justify it.
+    /// Empty and whitespace-only blocks are dropped for the same reason a blank
+    /// SSE frame is: it renders as a flicker and says nothing.
+    #[test]
+    fn ciphertext_and_blank_reasoning_never_reach_the_stream() {
+        let msg = Message::assistant()
+            .with_redacted_thinking("ZW5jcnlwdGVkLXJlYXNvbmluZw==")
+            .with_thinking("   ", "")
+            .with_thinking("\n\t", "");
+        assert!(
+            GooseAdapter::reasoning_frames(&msg, true).is_empty(),
+            "redacted or blank reasoning produced a frame"
+        );
+    }
+
+    /// The wiring guard, and the one that matters. The two functions above can
+    /// both be correct while the stream yields `Thinking` from somewhere else
+    /// entirely — which is exactly the shape of this phase's predecessor bug,
+    /// where the producer existed upstream and the consumer existed downstream
+    /// and nothing joined them. Asserted against the source because the stream
+    /// body is an `async_stream` closure over a live Goose agent and cannot be
+    /// driven from a unit test.
+    #[test]
+    fn every_thinking_frame_leaves_through_the_gate() {
+        let src = include_str!("goose_agent.rs");
+        let body = src.split("mod tests").next().unwrap_or(src);
+
+        // Counted on the `yield` prefix, not on the bare type name: two doc
+        // comments above name the variant, and a guard that trips on prose is a
+        // guard nobody will keep.
+        assert_eq!(
+            body.matches("yield Ok(AgentStreamEvent::Thinking").count(),
+            1,
+            "more than one place yields a Thinking frame; every one of them must \
+             go through reasoning_frames_enabled or reasoning can reach a voice \
+             session"
+        );
+        assert!(
+            body.contains("for content in Self::reasoning_frames(&msg, emit_reasoning)"),
+            "the Thinking frame is no longer produced by the gated lift"
+        );
+        assert!(
+            body.contains("Self::reasoning_frames_enabled(settings.show_thinking, is_voice)"),
+            "emit_reasoning is no longer bound from show_thinking AND the voice flag"
+        );
     }
 
     // ── context window precedence ─────────────────────────────────────────
