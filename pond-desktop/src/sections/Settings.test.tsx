@@ -245,6 +245,41 @@ describe("Settings save payload", () => {
     expect(sentPatch()).toEqual({ user_name: "Ochieng" });
   });
 
+  // PAI-5 P4. The Rust side classifies `reasoning_effort` UI_WIRED, and that
+  // classification is checked by a test that only looks at a list of strings --
+  // it cannot tell whether a control exists. This is the part that can.
+  it("the thinking-length control writes reasoning_effort and nothing else", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue(
+      serverSettings({ reasoning_effort: "brief" }) as never,
+    );
+    await renderSettings();
+    enableDevMode();
+    await waitFor(() => {
+      if (!screen.queryByText("Advanced")) throw new Error("dev mode not enabled");
+    });
+    await navigateTo("Models");
+    await waitFor(() => {
+      if (!screen.queryByText("Thinking length")) throw new Error("control not rendered");
+    });
+
+    // Located by its option set, not by its current value: another select on
+    // this panel could easily share a value, and a control found by accident
+    // would assert nothing.
+    const select = (screen.getAllByRole("combobox") as HTMLSelectElement[]).find(
+      (el) =>
+        Array.from(el.options)
+          .map((o) => o.value)
+          .join(",") === "brief,balanced,thorough",
+    );
+    if (!select) throw new Error("no brief/balanced/thorough select on the Models panel");
+    expect(select.value).toBe("brief");
+
+    fireEvent.change(select, { target: { value: "thorough" } });
+    await clickSave();
+
+    expect(sentPatch()).toEqual({ reasoning_effort: "thorough" });
+  });
+
   it("never re-sends the server-owned wake-word transcriptions", async () => {
     // Calibration appends to this field server side. A full-object Save from a
     // panel loaded before calibration would wipe it.
