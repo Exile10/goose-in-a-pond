@@ -23,6 +23,7 @@ use pond_core::models::services::context::context_budget::CompactionProfile;
 use pond_core::models::services::context::context_governor::{
     ContextGovernor, ContextInputs, EngineWindow,
 };
+use pond_core::models::services::context::context_monitor::ContextHealth;
 use pond_core::models::services::context::model_class::ModelClass;
 use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
 use pond_core::prompts::{builtin_template_content, ProfileContext};
@@ -139,6 +140,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             patch(rename_session).delete(delete_session),
         )
         .route("/sessions/{session_id}/messages", get(get_session_messages))
+        // PAI-4 P7 — the manual axis. The time axis (P4) and the pressure axis
+        // (P6) both decide for the user; this is the one a person decides.
+        .route("/sessions/{session_id}/compact", post(compact_session))
         // Phase F2: raw bytes for one persisted image attachment.
         .route(
             "/sessions/{session_id}/attachments/{attachment_id}",
@@ -2428,6 +2432,240 @@ fn spawn_resume_compaction(
         // axis. The gate above is what stays specific to a resume.
         run_compaction_pass(&state, &session_id, &settings, provider, "resume").await;
     });
+}
+
+/// Is a compaction pass already running for this session?
+///
+/// A read-only peek at [`COMPACTIONS_IN_FLIGHT`], for the one caller that has to
+/// *tell a person* why nothing happened. `run_compaction_pass` collapses "a pass
+/// was already running" and "the pass failed" into the same `None`, which is
+/// fine for the two spawned triggers — nobody is reading their return value —
+/// and useless on an endpoint whose entire job is to report. Peeking first makes
+/// the common case ("you pressed this a second after the turn that already
+/// triggered one") say so.
+///
+/// The peek is advisory and the claim inside `run_compaction_pass` is still the
+/// authority: a pass that starts between this read and that claim reports
+/// `failed` instead of `already_running`. That mislabels a benign race and
+/// changes nothing about what happened — no pass ran on this request either way.
+fn compaction_in_flight(session_id: &str) -> bool {
+    match COMPACTIONS_IN_FLIGHT.lock() {
+        Ok(g) => g.contains(session_id),
+        Err(poisoned) => poisoned.into_inner().contains(session_id),
+    }
+}
+
+/// The body every outcome of `POST /sessions/:id/compact` reports.
+///
+/// The context block is deliberately the same four fields the `context_warning`
+/// SSE frame carries, read out of the same [`ContextHealth`], so the number on
+/// the button and the number the stream pushed cannot drift into disagreeing
+/// about the same session. `turns_remaining` is the one departure: the frame
+/// serialises `u32::MAX` when growth is unknown, which reaches a client as
+/// 4294967295 and reads as a number. Here it is `null`.
+fn compaction_report(
+    session_id: &str,
+    status: &str,
+    reason: Option<&str>,
+    outcome: Option<&str>,
+    health: &ContextHealth,
+) -> Json<Value> {
+    Json(json!({
+        "session_id": session_id,
+        "status": status,
+        "reason": reason,
+        "outcome": outcome,
+        "context": {
+            "utilization_pct": health.utilization_pct,
+            "turns_remaining": (health.estimated_turns_remaining != u32::MAX)
+                .then_some(health.estimated_turns_remaining),
+            "avg_growth_rate": health.avg_growth_rate,
+            "should_compact": health.should_compact,
+            "warning": health.warning,
+        },
+    }))
+}
+
+/// POST /api/v1/sessions/:session_id/compact — compact this session now.
+///
+/// PAI-4 P7. The third and last trigger: P4 is the time axis (a session reopened
+/// after a gap), P6 the pressure axis (a session past 75% of its window), and
+/// this one is a person deciding. It runs the same pass as both of them —
+/// `run_compaction_pass` — and it is subject to the same rules, which is the
+/// whole of the design and the only part that is easy to get wrong.
+///
+/// **It does not bypass P6's rate limiter, and that is deliberate.** The
+/// tempting shape for a manual endpoint is "the user asked, so just do it".
+/// `ContextMonitor::claim_compaction` exists because `should_compact` is
+/// monotone: past 75% a session is above 75% on every later turn, so an ungated
+/// rule spends a summarisation model call between every pair of turns on the
+/// device least able to afford one. A button that skipped the claim would hand
+/// exactly that ability to anything holding a bearer token, and on the serial
+/// on-device engine each of those calls is time the user's next turn waits
+/// behind. So the endpoint is strictly a *subset* of what the pressure axis
+/// already does on its own: it can only bring a pass forward within the rules,
+/// never past them. A bypass would be a widening, and this programme's rule on
+/// widening is that it is a bug.
+///
+/// **What that costs, said plainly.** Two presses that a user would expect to
+/// work do not. A session below the compaction threshold answers
+/// `not_under_pressure` rather than compacting, because the claim recomputes
+/// `should_compact` under its own lock and refuses. A session the monitor has
+/// never recorded a turn for — anything from before this process started, and
+/// everything at all when `context_monitor_enabled` is off — is in that same
+/// state, because utilisation is only ever learned from a turn. Both answer with
+/// a reason rather than a silent no-op, which is the least a manual control
+/// owes. Making the button work under no pressure needs a rate limit that does
+/// not exist yet: the cooldown is counted in *recorded turns*, and with no turns
+/// happening it never expires, so a manual axis with its own gate needs a
+/// wall-clock one. That is a phase, not a line.
+///
+/// **This one awaits.** P4 and P6 spawn and return because they run inside a
+/// request a user did not make — a reopen, and an SSE generator with the `done`
+/// frame still unsent — and invariant 1 says compaction never blocks a turn.
+/// Neither applies here: this request *is* the compaction, nobody is watching a
+/// token stream, and awaiting is the only way to report what the pass did. The
+/// turn-preemption watcher inside `run_compaction_pass` still holds, so a user
+/// who presses the button and then starts typing cancels their own pass and
+/// persists nothing.
+///
+/// Everything short of a server fault answers 200 with a `status`/`reason` pair
+/// rather than an error code: "I did not compact, and here is why, and here is
+/// where your window actually is" is a successful answer to this question. 404
+/// is reserved for a session id that does not exist, so a typo is not reported
+/// as a healthy window.
+async fn compact_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    use pond_core::shared::services::session_summary::RefreshOutcome;
+
+    state
+        .session_storage
+        .get_session(&session_id)
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                SessionStorageError::SessionNotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json!({ "error": format!("{e}") })))
+        })?;
+
+    let settings = state.settings_repo.get().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("read settings: {e}") })),
+        )
+    })?;
+
+    let health = state.context_monitor.check_context_health(&session_id);
+
+    // Read before the claim, and in this order, because each answers a
+    // different question the user might be asking and only the first true one
+    // is worth reporting.
+    if !settings.context_monitor_enabled {
+        // Nothing has called `record_turn` for any session, so every utilisation
+        // number below this line is a zero that means "not measured", not "empty".
+        return Ok(compaction_report(
+            &session_id,
+            "skipped",
+            Some("monitor_disabled"),
+            None,
+            &health,
+        ));
+    }
+    if !settings.hybrid_compaction_enabled {
+        // The same switch the other two axes read first. Acting here would
+        // resurrect half of a feature the user turned off.
+        return Ok(compaction_report(
+            &session_id,
+            "skipped",
+            Some("compaction_disabled"),
+            None,
+            &health,
+        ));
+    }
+    if !health.should_compact {
+        return Ok(compaction_report(
+            &session_id,
+            "skipped",
+            Some("not_under_pressure"),
+            None,
+            &health,
+        ));
+    }
+
+    // The provider is read before the claim, which is the opposite order to
+    // `spawn_pressure_compaction`, and the difference matters here. There, the
+    // claim is read first because it is the cheap check and the one that fails
+    // most often. Here, a claim spent on a pass that then cannot run burns a
+    // cooldown counted in recorded turns — and a user pressing a button is very
+    // often not taking any turns, so the button would stay dead until they did.
+    let Some(provider) = state.llm_provider.read().await.clone() else {
+        return Ok(compaction_report(
+            &session_id,
+            "skipped",
+            Some("no_summariser"),
+            None,
+            &health,
+        ));
+    };
+    if compaction_in_flight(&session_id) {
+        return Ok(compaction_report(
+            &session_id,
+            "skipped",
+            Some("already_running"),
+            None,
+            &health,
+        ));
+    }
+    if !state.context_monitor.claim_compaction(&session_id) {
+        // `should_compact` was true a few lines ago and the claim recomputes it,
+        // so the cooldown is what refused — barring a turn that completed in
+        // between and changed the answer, which is a race whose honest label is
+        // still "a pass ran recently".
+        return Ok(compaction_report(
+            &session_id,
+            "skipped",
+            Some("cooling_down"),
+            None,
+            &health,
+        ));
+    }
+
+    let outcome = run_compaction_pass(&state, &session_id, &settings, provider, "manual").await;
+
+    let (status, reason, outcome_label) = match outcome {
+        // Same rule as the pressure axis: only a refresh that actually persisted
+        // a new summary changed the shape of the history, so only that one is
+        // allowed to throw away the growth window.
+        Some(RefreshOutcome::Refreshed { .. }) => {
+            state.context_monitor.note_compacted(&session_id);
+            ("compacted", None, Some("refreshed"))
+        }
+        Some(RefreshOutcome::NothingToDo) => (
+            "skipped",
+            Some("nothing_to_summarise"),
+            Some("nothing_to_do"),
+        ),
+        Some(RefreshOutcome::Cancelled) => {
+            ("skipped", Some("preempted_by_turn"), Some("cancelled"))
+        }
+        None => ("skipped", Some("failed"), None),
+    };
+
+    // Re-read: `note_compacted` drops the growth samples, so a compacted session
+    // reports `turns_remaining: null` here rather than a rate measured against a
+    // history that no longer exists. That is the post-state the caller asked for.
+    let after = state.context_monitor.check_context_health(&session_id);
+    Ok(compaction_report(
+        &session_id,
+        status,
+        reason,
+        outcome_label,
+        &after,
+    ))
 }
 
 /// Percent-encode the few characters that would break a path segment.

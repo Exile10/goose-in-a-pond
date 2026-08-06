@@ -699,7 +699,96 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   **Not done, and named.** No live-server run. This adds a route side effect and a background model
   call, which is what `scripts/live-test.sh` exists to catch; the integration assertion section 7
   asks for — that a pass completes before the next turn's first token — still needs a live server.
-- **P7** `POST /sessions/{id}/compact` plus a desktop control on the existing `ContextCard`.
+- **P7 — SPLIT 2026-08-06. P7a (the API half) LANDED; P7b (the desktop control) RESPECIFIED and
+  outstanding.** The bullet as written was `POST /sessions/{id}/compact` plus a desktop control on
+  the existing `ContextCard`. The second half of that sentence is wrong about the app, and finding
+  out how wrong is what split the phase.
+
+  **What shipped.** `routes.rs` gained `compact_session`, registered at
+  `POST /api/v1/sessions/{session_id}/compact` in the protected router, plus two small helpers:
+  `compaction_in_flight` (a read-only peek at `COMPACTIONS_IN_FLIGHT`) and `compaction_report` (the
+  response body). Five integration tests in `crates/pond-api/tests/manual_compaction_test.rs`.
+  `MockSettingsRepository` gained round-trip support for `hybrid_compaction_enabled` and
+  `context_monitor_enabled`, which it had been silently dropping — both default to `true`, so any
+  test of "does turning compaction off turn it off" would have passed while the feature ran anyway,
+  and the first draft of the switch test did exactly that.
+
+  **The endpoint is a third trigger, not a third mechanism.** P4 is the time axis, P6 the pressure
+  axis, and this is a person deciding; all three run the same `run_compaction_pass`. Everything that
+  makes a pass safe already lives in that function — the in-flight claim, the cancellation watcher,
+  the large tier's gated rebuild — so the manual axis inherits it rather than reimplementing it.
+
+  **It does not bypass P6's rate limiter, and that is the phase.** The tempting shape is "the user
+  asked, so just do it". `claim_compaction` exists because `should_compact` is monotone: past 75% a
+  session is above 75% on every later turn, and an ungated rule spends a summarisation model call
+  between every pair of turns on the device least able to afford one. A button that skipped the claim
+  would hand exactly that ability to anything holding a bearer token, and on the serial on-device
+  engine every one of those calls is time the user's next turn waits behind. So the endpoint is
+  strictly a *subset* of what the pressure axis already does on its own: it can bring a pass forward
+  within the rules, never past them. This programme's rule is that a scope-widening default is a bug,
+  and a bypass here is the widening.
+
+  **What that costs, said plainly, because it is a real cost.** Two presses a user would expect to
+  work do not. A session below the threshold answers `not_under_pressure`. A session the monitor has
+  never recorded a turn for — anything from before this process started, and everything at all when
+  `context_monitor_enabled` is off — is in that same state, because utilisation is only ever learned
+  from a turn. Making the button work under no pressure needs a rate limit that does not exist yet:
+  the cooldown is counted in *recorded turns*, and with no turns happening it never expires, so a
+  manual axis with its own gate needs a wall-clock one. That is a phase, not a line, and it is not
+  this one.
+
+  **This one awaits where the other two spawn.** P4 and P6 `tokio::spawn` and return because they run
+  inside a request the user did not make — a reopen, and an SSE generator with the `done` frame still
+  unsent — and invariant 1 says compaction never blocks a turn. Neither applies here: this request
+  *is* the compaction, nobody is watching a token stream, and awaiting is the only way to report what
+  the pass did. The turn-preemption watcher still holds, so a user who presses the button and then
+  starts typing cancels their own pass and persists nothing.
+
+  **Two orderings differ from `spawn_pressure_compaction` on purpose.** It reads the claim before the
+  provider, because the claim is the cheap check and the one that fails most often. This reads the
+  provider *first*, and peeks at the in-flight set before claiming, because a claim spent on a pass
+  that then cannot run burns a cooldown counted in recorded turns — and a person pressing a button is
+  very often taking no turns at all, so the control would stay dead until they did. Two of the five
+  tests assert exactly that: a refusal for "the feature is off" and a refusal for "not under
+  pressure" both leave the next real claim available.
+
+  **Everything short of a server fault answers 200 with a `status`/`reason` pair.** "I did not
+  compact, here is why, and here is where your window actually is" is a successful answer to this
+  question, and a manual control that silently no-ops is indistinguishable from a broken one. 404 is
+  reserved for a session id that does not exist, so a typo is not reported as a healthy window. The
+  reported context block is deliberately the same four fields the `context_warning` SSE frame carries,
+  read out of the same `ContextHealth`, so the number on the button and the number the stream pushed
+  cannot drift — which is also what section 7's manual check ("verify the reported numbers match a
+  subsequent `turn_stats`") is asking for. One departure: `turns_remaining` is `null` rather than
+  `u32::MAX`, which the frame still serialises as 4294967295 and which reads to a client as a number.
+
+  **The guard, and what breaking it looks like.** `a_second_press_is_refused_by_the_cooldown` is the
+  mutation-tested one. Its first draft asserted `status == "skipped"` and would have passed against a
+  bypassed limiter: a second pass finds the through-pointer already advanced and answers
+  `NothingToDo`, which is *also* reported as skipped. The assertion that actually holds is
+  `outcome is null` — null exactly when no pass ran. Disabling the claim makes it fail with "the
+  second press ran a second pass - the manual endpoint is bypassing P6's rate limiter…" and the whole
+  body, showing `"outcome":"nothing_to_do"`.
+
+  **P7b, respecified.** The design bullet's "a desktop control on the existing `ContextCard`" does not
+  describe this app. `pond-desktop/src/components/ContextCard.tsx` is the MCP-UI tool-result card
+  renderer: it takes a `ContextCard` off `state/reducer.ts` and dispatches to the weather, devices,
+  memory and schedules renderers. "Context" there means tool-call context, not context window, and it
+  has nothing to do with compaction, utilisation or pressure. A grep of all of `pond-desktop/src` for
+  `context_warning`, `contextWarning`, `should_compact`, `context_health` and `percent_used` finds
+  nothing: the `context_warning` frame the server has emitted since before PAI-4 has **zero consumers
+  in the shipped app**, and `context_warning` is not even in the `ChatEventType` union in
+  `api/types.ts`. So P7b is a new surface — a frame the client learns to read, a pressure indicator,
+  and a control that calls this endpoint and renders its `reason` — across both chat surfaces
+  (`Chat.tsx` and `Canvas.tsx`), not a button added to an existing card. It is scoped and estimated as
+  such, and it is deliberately not bundled into the API landing: CLAUDE.md's "know what has no UI
+  before writing a UI test for it" applies exactly here, and a Playwright test written against the
+  assumed `ContextCard` control would have exercised nothing and passed vacuously.
+
+  **Not done, and named.** No live-server run: this adds a route, and `scripts/live-test.sh` is what
+  catches route registration and auth-middleware problems that no in-process `oneshot` router test
+  can see. Section 7's manual check is still manual. And the endpoint has never been exercised against
+  a real on-device summariser, only `MockProvider`.
 
 ---
 

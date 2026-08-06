@@ -21,7 +21,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
 | 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **COMPLETE — P1-P8 LANDED** |
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1-P4, P6 LANDED** (P3 completed by P3b 2026-08-06); **P5 code landed 2026-08-06, awaiting the on-device TTFT measurement that decides it** |
-| 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | **P1, P2, P3, P4, P6 LANDED 2026-08-06** (P1 `ModelClass` + strategy dispatch, domain only; P2 large-tier re-summarisation — the rolling summary rebuilt from the source messages instead of from its own previous output, gated on `ModelClass::Large` and wired into `run_compaction_pass`, so P1 now has its first consumer; P3 age-weighted retention — `compaction_verbatim_days` plus a tool-result rung between "leave it alone" and "drop the whole turn", fed by `Message::created` on the live Goose trim path and firing only when a conversation is already over budget; P4 compact-on-resume gate, wired to the session reopen; P6 `should_compact` now moves the server between turns, rate-limited by `claim_compaction`, and `reset_session` has its first production caller); **P5 code landed 2026-08-06, awaiting the warm-versus-cold TTFT measurement that decides it** (`prefix_cache.rs`: `PrefixCacheState` + the six `InvalidationReason`s recorded in `goose_agent.rs`, `Agent::prefix_cache_state` defaulting to `None`, and the trimmer's age rung now firing on a cold prefix as well as over budget — the warm half was already P3's); P7 designed |
+| 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | **P1, P2, P3, P4, P6 LANDED 2026-08-06** (P1 `ModelClass` + strategy dispatch, domain only; P2 large-tier re-summarisation — the rolling summary rebuilt from the source messages instead of from its own previous output, gated on `ModelClass::Large` and wired into `run_compaction_pass`, so P1 now has its first consumer; P3 age-weighted retention — `compaction_verbatim_days` plus a tool-result rung between "leave it alone" and "drop the whole turn", fed by `Message::created` on the live Goose trim path and firing only when a conversation is already over budget; P4 compact-on-resume gate, wired to the session reopen; P6 `should_compact` now moves the server between turns, rate-limited by `claim_compaction`, and `reset_session` has its first production caller); **P5 code landed 2026-08-06, awaiting the warm-versus-cold TTFT measurement that decides it** (`prefix_cache.rs`: `PrefixCacheState` + the six `InvalidationReason`s recorded in `goose_agent.rs`, `Agent::prefix_cache_state` defaulting to `None`, and the trimmer's age rung now firing on a cold prefix as well as over budget — the warm half was already P3's); **P7a (the API half) LANDED 2026-08-06** (`POST /sessions/{id}/compact` — the manual axis, running the same `run_compaction_pass` behind the same `claim_compaction` rate limiter as P6, and reporting a `status`/`reason` pair with the session's real utilisation when it refuses); **P7b (the desktop control) RESPECIFIED and outstanding** — the bullet said "a control on the existing `ContextCard`", but `ContextCard.tsx` is the MCP-UI tool-result renderer and the shipped app has no context-pressure surface at all (zero consumers for the `context_warning` frame), so P7b is a new surface across both chat views, not a button |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
 | 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0-P5, P7 LANDED** (P3, P5 partial); P6, P8 designed |
 
@@ -1329,3 +1329,64 @@ the touched files (the two the trimmer reports — a `nonminimal_bool` on P3's a
 802 lib passing; `cargo test -p pond-adapters-goose` 98 passing with the two pre-existing failures
 above; `cargo check -p pond-server -p pond-adapters-goose` clean. No live-server run and no device
 run — the second is the phase's own acceptance criterion and is why this is not stamped LANDED.
+
+---
+
+**2026-08-06 — PAI-4 P7a. The manual button is the one place a rate limiter is easiest to argue
+away, and the design bullet was wrong about the UI it named.**
+
+The bullet is `POST /sessions/{id}/compact` plus a desktop control on the existing `ContextCard`.
+The API half landed; the UI half is respecified and outstanding, and finding out why is most of what
+I did before writing any code.
+
+**`ContextCard.tsx` is not what the bullet thinks it is.** It is the MCP-UI tool-result card
+renderer — it takes a `ContextCard` off `state/reducer.ts` and dispatches to the weather, devices,
+memory and schedules renderers. "Context" there is tool-call context, not context window. A grep of
+all of `pond-desktop/src` for `context_warning`, `contextWarning`, `should_compact`, `context_health`
+and `percent_used` returns nothing, and `context_warning` is not even in the `ChatEventType` union:
+the frame the server has emitted since before PAI-4 has zero consumers in the shipped app. So P7b is
+a new surface across both chat views, not a button on an existing card, and it is scoped as such
+rather than smuggled into this landing. CLAUDE.md's "know what has no UI before writing a UI test for
+it" is exactly this case — a Playwright test driving the assumed control would have exercised nothing
+and passed, which is how this programme gets a seventh vacuous test.
+
+**The endpoint does not bypass P6's rate limiter, and refusing to let it is the phase.** "The user
+asked, so just do it" is the natural shape for a manual control and it is a regression here.
+`should_compact` is monotone above 75%, so a press-driven pass is a *rate*: a button that skipped
+`claim_compaction` would let anything holding a bearer token queue summarisation model calls in front
+of the user's next turn on a serial on-device engine. The endpoint is therefore strictly a subset of
+what the pressure axis already does — it can bring a pass forward within the rules, never past them.
+The cost is real and named in the doc rather than hidden: a session below the threshold, and any
+session the monitor has not recorded a turn for, answers `not_under_pressure`. Making the button work
+under no pressure needs a wall-clock cooldown, because the existing one counts *recorded turns* and
+with no turns happening it never expires. That is a phase, not a line.
+
+**Two orderings deliberately differ from `spawn_pressure_compaction`.** It claims before reading the
+provider, because the claim is the cheap check. This reads the provider first and peeks at
+`COMPACTIONS_IN_FLIGHT` before claiming, because a claim spent on a pass that cannot run burns a
+cooldown counted in turns — and a person pressing a button is very often taking no turns, so the
+control would stay dead until they did. Two of the five tests assert that a refusal leaves the next
+real claim available.
+
+**The first draft of the guard would have passed against the bug it guards.** I wrote
+`a_second_press_is_refused_by_the_cooldown` asserting `status == "skipped"`. Mutating the claim away
+still produced "skipped", because a second pass finds the through-pointer already advanced and
+answers `NothingToDo` — which is also a skip. The assertion that actually holds is `outcome is null`,
+null exactly when no pass ran. With the claim disabled it fails with *"the second press ran a second
+pass - the manual endpoint is bypassing P6's rate limiter, and a client hammering it would stack
+summarisation model calls in front of the user's next turn on a serial on-device engine"* and the
+body showing `"outcome":"nothing_to_do"`. Restored by reversing the edit; `grep "if false"` over
+`routes.rs` returns nothing and the five tests are green again.
+
+**A mock that was silently dropping the switch it was being asked about.** The first switch test
+failed with `status: "compacted"` while `hybrid_compaction_enabled` was false:
+`MockSettingsRepository` overlays a hand-picked subset of keys and neither compaction switch was in
+it, so `update` wrote nothing and `get` returned the `true` default. Both switches now round-trip,
+for the reason the mock's own `mic_enabled` comment already gives.
+
+Gates: `cargo fmt --check` clean; `cargo test -p pond-api` all suites green including the 5 new
+(115 lib + integration suites); `cargo test -p pond-core` 802 lib passing; `cargo clippy -p pond-api
+-p pond-core --all-targets` with no new warnings from the touched files; `cargo check -p pond-server
+-p pond-adapters-goose` clean. No live-server run — this adds a route, which is precisely what
+`scripts/live-test.sh` exists to catch and no in-process `oneshot` router test can — and the endpoint
+has never run against a real on-device summariser, only `MockProvider`.
