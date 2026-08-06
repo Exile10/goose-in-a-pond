@@ -35,8 +35,26 @@ const MAIN: &str = include_str!("../../pond-server/src/main.rs");
 /// The wrapper must appear on the binding's own line or in the few lines above
 /// it -- `rustfmt` puts `Arc::new(` and the type on separate lines, so a
 /// single-line check would miss it.
-fn wrapped_within(lines: &[&str], site: usize, wrapper: &str) -> bool {
-    let start = site.saturating_sub(6);
+///
+/// `construction` bounds the search: the window must never reach back over an
+/// EARLIER construction of the same type.
+///
+/// It did, and that made this guard accept the thing it exists to reject. The
+/// window is six lines because rustfmt splits `Arc::new(` from the type, but a
+/// second bare construction three lines below a wrapped one had the wrapped
+/// one's `Redacting...::new(` inside its own window, so it was reported as
+/// wrapped. Demonstrated by inserting a bare `SqliteMemoryRepository::new` next
+/// to the wrapped one in `run_server`: the suite stayed green while that
+/// repository would have written credentials verbatim to `pond_system.db`.
+fn wrapped_within(lines: &[&str], site: usize, wrapper: &str, construction: &str) -> bool {
+    let floor = site.saturating_sub(6);
+    let mut start = floor;
+    for i in (floor..site).rev() {
+        if lines[i].contains(construction) {
+            start = i + 1;
+            break;
+        }
+    }
     lines[start..=site].iter().any(|l| l.contains(wrapper))
 }
 
@@ -53,17 +71,27 @@ fn sites(lines: &[&str], needle: &str) -> Vec<usize> {
 fn every_memory_repository_construction_goes_through_the_redactor() {
     let lines: Vec<&str> = MAIN.lines().collect();
     let found = sites(&lines, "SqliteMemoryRepository::new(");
-    assert!(
-        found.len() >= 4,
+    // Pinned, not a floor. `>= 4` let a FIFTH construction appear unnoticed,
+    // which is the likeliest shape for a new bypass -- a write path added
+    // beside an existing one. Its sibling below already pins its count for the
+    // same reason; this one did not, and the asymmetry was the defect.
+    assert_eq!(
+        found.len(),
+        4,
         "found {} SqliteMemoryRepository::new( sites in main.rs; there were 4 \
-         (run_server, run_chat, run_agent_cmd, run_memories_cmd). Either a \
-         write path was deleted or this guard has stopped matching and is \
-         asserting nothing.",
+         (run_server, run_chat, run_agent_cmd, run_memories_cmd). A new one is \
+         a new write path and needs wrapping; a missing one means this guard \
+         has stopped matching and is asserting nothing.",
         found.len()
     );
     for site in found {
         assert!(
-            wrapped_within(&lines, site, "RedactingMemoryRepository::new("),
+            wrapped_within(
+                &lines,
+                site,
+                "RedactingMemoryRepository::new(",
+                "SqliteMemoryRepository::new("
+            ),
             "main.rs:{} constructs SqliteMemoryRepository outside \
              RedactingMemoryRepository. Chokepoint 1 is bypassed on that path: \
              whatever writes through this repo -- extraction, the giap-memory \
@@ -97,7 +125,12 @@ fn every_event_log_write_sink_goes_through_the_redactor() {
         }
         write_sinks += 1;
         assert!(
-            wrapped_within(&lines, site, "RedactingEventLog::new("),
+            wrapped_within(
+                &lines,
+                site,
+                "RedactingEventLog::new(",
+                "SqliteEventLog::new("
+            ),
             "main.rs:{} builds a write-path SqliteEventLog outside \
              RedactingEventLog. Chokepoint 2 is bypassed: event attributes -- \
              egress URLs with their query strings, policy audit rows carrying \
@@ -124,5 +157,56 @@ fn the_egress_sink_reads_the_redacting_binding() {
         "set_egress_sink no longer takes the wrapped `event_log` binding. If it \
          was rebound to a fresh SqliteEventLog, every recorded outbound call \
          bypasses the redactor -- and it compiles either way."
+    );
+}
+
+/// The bug this guard had, pinned as a fixture rather than by mutating main.rs.
+///
+/// `wrapped_within` scanned a fixed six-line window upward, so a SECOND, bare
+/// construction sitting a few lines below a wrapped one found the wrapped one's
+/// `Redacting...::new(` inside its own window and was reported as wrapped. A
+/// review demonstrated it by adding a bare `SqliteMemoryRepository::new` three
+/// lines below the wrapped one in `run_server`: all three tests stayed green
+/// while that repository would have written credentials verbatim to
+/// `pond_system.db`, which is chokepoint 1's entire purpose.
+///
+/// Pinned here, on synthetic lines, because the alternative is editing
+/// `main.rs` in place and asserting the suite goes red -- which proves it once,
+/// leaves nothing behind, and cannot run in CI.
+#[test]
+fn the_window_never_reaches_back_over_an_earlier_construction() {
+    let lines = vec![
+        "let memory_repo = Arc::new(RedactingMemoryRepository::new(",
+        "    SqliteMemoryRepository::new(db.system.clone()),",
+        "    redactor.clone(),",
+        "));",
+        "let leaky = Arc::new(SqliteMemoryRepository::new(db.system.clone()));",
+    ];
+    let sites: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("SqliteMemoryRepository::new("))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(sites, vec![1, 4], "fixture must contain both constructions");
+
+    assert!(
+        wrapped_within(
+            &lines,
+            1,
+            "RedactingMemoryRepository::new(",
+            "SqliteMemoryRepository::new("
+        ),
+        "the genuinely wrapped construction must still read as wrapped -- \
+         without this the guard could pass by rejecting everything"
+    );
+    assert!(
+        !wrapped_within(
+            &lines,
+            4,
+            "RedactingMemoryRepository::new(",
+            "SqliteMemoryRepository::new("
+        ),
+        "a bare construction below a wrapped one must NOT inherit its wrapper"
     );
 }
