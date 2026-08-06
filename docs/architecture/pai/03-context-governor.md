@@ -126,6 +126,9 @@ One precedence, used by the adapter, the trimmer, telemetry and the monitor alik
 2. **Pinned registry `context_size`** — authoritative for GGUF models because *it is the
    allocation*, which is why it currently outranks the user override and must keep doing so.
 3. **`ModelRecord.context_length`** — for catalog models, once actually populated (3.3).
+   *Corrected 2026-08-06 by P3b:* a declared maximum, not an allocation, so it is bounded by
+   `UNPINNED_LOCAL_CEILING` **and** by a lower `context_window_override`. Ranking it flatly above
+   rung 4 inverted the one case rung 4 exists for; see P3b in section 4.
 4. **`context_window_override`** — the escape hatch for memory-constrained deployments.
 5. **Name heuristic** — last resort, and the only path that may return the conservative 4,096.
 
@@ -167,6 +170,9 @@ column into the answer for HTTP and Ollama models, where no registry entry exist
 with no `tool_calling` column, a `qwq` row claiming 32K when the code gives it 4,096, a vision row
 predating `name_implies_vision`, and `trim_to_budget_for_model` cited as live when nothing outside
 its own tests calls it.
+
+*Landed 2026-08-06 by P3b:* "It surfaces in the Models UI beside the existing capability badges,
+and it feeds precedence rung 3" is now true of both halves.
 
 ### 3.4 Asymmetric budgets — how "to the fullest" is actually achieved
 
@@ -254,15 +260,54 @@ Once occupancy is measured rather than estimated, `ContextHealth.should_compact`
   local provider it is bounded by `UNPINNED_LOCAL_CEILING`. Without that, populating the field would
   have handed the trimmer a 128K history budget on a Mac that allocated 32K.
 
-  **Still not reachable in production.** All three `ContextInputs` construction sites —
-  `goose_agent.rs::resolve_window_with`, `routes.rs`'s `turn_context_limit`, and the quarantined
-  `pond-agent/src/agent.rs` — still pass `catalog_context_length: None`, so `WindowSource::CatalogRecord`
-  remains a rung nothing can produce. The two live ones are in files a concurrent workstream holds.
-  The Models UI half is blocked on the same file: `record_to_dto` and `ModelStatusEntry` would both
-  have to change, and `record_to_dto` lives in `routes.rs`. Deferred to **P3b**, which is exactly:
-  supply the record's `context_length` at the two live call sites, add it to `ModelStatusEntry`, and
-  render it in `Models.tsx` beside `CapabilityBadges` — which today infers the window from the model
-  *name* in the frontend, a third copy of the heuristic this workstream exists to delete.
+  ~~**Still not reachable in production.**~~ Closed by P3b below.
+- **P3b — LANDED 2026-08-06. Rung 3 is reachable, and the override now bounds it.** Both live
+  `ContextInputs` construction sites supply the record's `context_length`: `routes.rs`'s
+  `turn_context_limit` reads it through `state.model_repo`, and `GooseAdapter` reads it through a
+  `model_repo` it did not previously have. `ModelStatusEntry` carries `context_length`,
+  `record_to_dto` fills it, and `CapabilityBadges` in `Models.tsx` prefers it over
+  `inferCapabilities` — the frontend's own copy of the name heuristic, which said 128,000 for a
+  Gemma 4 that declares 131,072.
+
+  **The adapter half was the real cost, and the phase brief understated it.** `GooseAdapter` had no
+  model-repository access at all and `resolve_window` was a static function with no `&self`; the
+  only registry it could reach was Goose's process-global one. What shipped: a `model_repo` field, a
+  `with_model_repo` builder, `resolve_window`/`apply_goose_env_knobs` becoming `&self` and `async`,
+  and a new `model_repo` parameter on `build_goose_backend` that all **five** of its call sites pass
+  — the three CLI ones included, because a `pond-server chat` turn budgets its history the same way
+  a dashboard turn does and giving only the server the real window would put the two back out of
+  agreement, which is the whole defect PAI-3 removes.
+
+  **Designed but corrected: rung 3 no longer beats a LOWER user override.** Section 3.1 ranks
+  `CatalogRecord` above `Override`, and while rung 3 was dead that cost nothing. Live, it inverts
+  the one case the override exists for — named in `goose_agent.rs`'s own doc comment as "a Jetson
+  running Ollama with a hand-tuned KV cache". Populating the catalog would have replaced that user's
+  8,192 with gemma 4's declared 131,072 and the engine would have truncated every prompt. So a
+  catalog value is now bounded by the override as well as by `UNPINNED_LOCAL_CEILING`, and when the
+  override binds, `WindowSource::Override` is what gets reported — a number's provenance has to name
+  the value that actually won (invariant 4). The override still cannot *widen* past the declared
+  maximum, and rungs 1 and 2 still outrank it, because those are allocations (invariant 3).
+
+  **What made this testable rather than vacuous.** P3 shipped the data and every test of rung 3
+  passed the catalog value in by hand, which is exactly why nobody noticed that no production caller
+  supplied one. `resolve_window_from` splits out everything except the process-global registry read,
+  so `the_adapter_reads_the_catalog_it_was_given` drives a stub `ModelRepository` and asserts both
+  the resolved window *and the id that was asked for* — a lookup that derives `"local/gemma-4-E2B-it"`
+  instead of `"gguf/gemma-4-E2B-it"` returns `None` and degrades silently to the heuristic, which is
+  a passing test reporting the opposite of the truth. Verified by mutation twice: severing the
+  catalog read gives `left: 128000, right: 131072`, and deriving the id from the provider string
+  gives `left: ["ollama/gemma4:e2b", "local/gemma-4-E2B-it"]`.
+
+  Two things fell out. `ModelCategory::for_chat_provider` now owns the provider-to-category mapping
+  that the settings role-sync in `routes.rs` had written out separately — two copies of the rule that
+  decides which catalog row a chat model lives in, which would have made the lookup miss silently if
+  they ever diverged. And `chat_stream` resolved the window twice per turn through the old static
+  `effective_context_window`; it now reads the single resolution `apply_goose_env_knobs` caches,
+  which was already duplication and would have become two extra catalog round trips.
+
+  **Not done: the quarantined `pond-agent/src/agent.rs`** still passes `catalog_context_length: None`.
+  It is not activatable at runtime (Q2-05) and has no repository to read; wiring it would be
+  untestable work on a path that cannot execute.
 - **P4 — LANDED 2026-08-06, with six anchors rather than a formula.** `from_context_window` is
   piecewise-linear interpolation over `PROFILE_ANCHORS`, flat below the first anchor and above the
   last. Its signature, its fields and `usable_prompt_tokens()` are unchanged, so all four production
@@ -311,7 +356,11 @@ Once occupancy is measured rather than estimated, `ContextHealth.should_compact`
   whole. Recorded, not fixed: `Models.tsx`'s `inferCapabilities` has drifted from `from_model_name`
   in both directions — no E1B exclusion, no `gemma-3n` spellings, no `vl`/`vision` segment rule — so
   the badges disagree with the backend on precisely the model the E1B exclusion exists for. Both
-  documents describe a mid-programme state and say so; the rung-3 rows are what P3b moves.
+  documents describe a mid-programme state and say so; the rung-3 rows are what P3b moves. **P3b
+  moved them on 2026-08-06** — rung 3 is live at both call sites, and the `Models.tsx` drift it
+  recorded is now bounded: `inferCapabilities` still supplies the thinking/vision/audio badges and
+  still disagrees with `from_model_name` on those, but the context-window badge no longer comes from
+  it whenever the catalog has an answer.
 
 ---
 

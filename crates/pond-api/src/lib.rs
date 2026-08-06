@@ -402,6 +402,15 @@ pub struct ModelStatusEntry {
     pub ram_estimate_mb: Option<u64>,
     /// Suggested role assignment: "chat" | "think" | "task". None = general purpose.
     pub recommended_role: Option<String>,
+    /// Maximum context tokens this model declares. LLM rows only; `None` for
+    /// ASR/TTS/embedding, and for LLM rows whose catalog provider could not
+    /// answer.
+    ///
+    /// This is rung 3 of the context governor
+    /// (`docs/architecture/pai/03-context-governor.md`), surfaced so the Models
+    /// UI stops inferring the window from the model's NAME — a third copy of a
+    /// heuristic the backend already replaced with a real number.
+    pub context_length: Option<u32>,
     /// ASR language ("en", "multilingual"). Whisper models only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub asr_language: Option<String>,

@@ -55,6 +55,26 @@ impl ModelCategory {
         }
     }
 
+    /// The catalog category an LLM `chat_provider` string names.
+    ///
+    /// `Settings.chat_provider` is a provider identifier ("local", "gguf",
+    /// "ollama", "llamafile"); `ModelRecord.id` is keyed by category. Anything
+    /// that wants to find the active chat model's catalog row has to bridge the
+    /// two, and until this existed each caller wrote the mapping again — which
+    /// is how the row lookup and the role-assignment sync could disagree about
+    /// where the same model lives.
+    ///
+    /// `llamafile` is the fallback because it is the only remaining LLM
+    /// category, and an unknown provider string is far more likely to be a
+    /// llamafile spelling than a GGUF one.
+    pub fn for_chat_provider(provider: &str) -> Self {
+        match provider {
+            "local" | "gguf" => Self::Gguf,
+            "ollama" => Self::Ollama,
+            _ => Self::Llamafile,
+        }
+    }
+
     /// True for LLM models that can be assigned to a chat/think/task role.
     pub fn is_llm(&self) -> bool {
         matches!(self, Self::Gguf | Self::Llamafile | Self::Ollama)
@@ -240,6 +260,41 @@ mod tests {
             let s = cat.as_str();
             let back = ModelCategory::from_str(s).expect("roundtrip failed");
             assert_eq!(*cat, back, "roundtrip failed for {s}");
+        }
+    }
+
+    #[test]
+    fn chat_provider_maps_to_a_catalog_category() {
+        // The two spellings the local in-process engine answers to.
+        assert_eq!(
+            ModelCategory::for_chat_provider("local"),
+            ModelCategory::Gguf
+        );
+        assert_eq!(
+            ModelCategory::for_chat_provider("gguf"),
+            ModelCategory::Gguf
+        );
+        assert_eq!(
+            ModelCategory::for_chat_provider("ollama"),
+            ModelCategory::Ollama
+        );
+        assert_eq!(
+            ModelCategory::for_chat_provider("llamafile"),
+            ModelCategory::Llamafile
+        );
+        // Unknown providers fall to llamafile rather than panicking: the caller
+        // is doing a catalog lookup that is allowed to miss.
+        assert_eq!(
+            ModelCategory::for_chat_provider("something-new"),
+            ModelCategory::Llamafile
+        );
+        // Every answer is an LLM category -- a chat provider can never name a
+        // whisper or piper row.
+        for p in ["local", "gguf", "ollama", "llamafile", "mock"] {
+            assert!(
+                ModelCategory::for_chat_provider(p).is_llm(),
+                "chat provider {p} resolved to a non-LLM category"
+            );
         }
     }
 
