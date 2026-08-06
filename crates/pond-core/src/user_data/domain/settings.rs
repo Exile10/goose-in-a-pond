@@ -465,6 +465,20 @@ pub struct Settings {
     #[serde(default = "Settings::default_resume_compaction_idle_secs")]
     pub resume_compaction_idle_secs: u32,
 
+    /// Days of history the in-turn trimmer keeps *verbatim* before age
+    /// weighting is allowed to degrade it harder than the flat caps do.
+    ///
+    /// PAI-4 P3. `0` disables age weighting entirely, and is the only way to;
+    /// there is no separate boolean that could fall out of step with the
+    /// number. The rung it controls
+    /// (`turn_trimmer::AGED_TOOL_RESULT_MAX_CHARS`) fires only when a
+    /// conversation is already over budget, so a *large* value costs nothing
+    /// beyond today's behaviour. Small is the damaging direction — a horizon
+    /// inside the span of a live conversation would hard-truncate tool results
+    /// the model is still reasoning about.
+    #[serde(default = "Settings::default_compaction_verbatim_days")]
+    pub compaction_verbatim_days: u32,
+
     // ── Agent behaviour ────────────────────────────────────────────────────────
     /// Agent backend engine: "goose" (default, full-featured) | "pond" (independent, KV-cache reuse).
     /// "goose" uses Block's Goose framework with all MCP extensions, cloud provider support.
@@ -854,6 +868,7 @@ impl Default for Settings {
             hybrid_compaction_enabled: Self::default_hybrid_compaction_enabled(),
             summary_idle_secs: Self::default_summary_idle_secs(),
             resume_compaction_idle_secs: Self::default_resume_compaction_idle_secs(),
+            compaction_verbatim_days: Self::default_compaction_verbatim_days(),
             agent_backend: Self::default_agent_backend(),
             agent_goose_mode: Self::default_agent_goose_mode(),
             agent_max_turns: Self::default_agent_max_turns(),
@@ -1058,6 +1073,13 @@ impl Settings {
     /// `resume_compaction::RESUME_IDLE_THRESHOLD_SECS` for why that number.
     fn default_resume_compaction_idle_secs() -> u32 {
         crate::models::services::context::resume_compaction::RESUME_IDLE_THRESHOLD_SECS
+    }
+
+    /// Three days — the single source is the constant the trimmer itself uses,
+    /// for the same reason `default_resume_compaction_idle_secs` reads its
+    /// gate's constant: the setting's default and the code's cannot drift.
+    fn default_compaction_verbatim_days() -> u32 {
+        crate::models::services::context::turn_trimmer::DEFAULT_VERBATIM_DAYS
     }
 
     /// True since the C1-C3 work landed: the engine session is now hydrated
@@ -1888,6 +1910,14 @@ mod tests {
             // trap — the damaging direction is *shorter*, and a slider inviting
             // "compact more often" would invite exactly that.
             "resume_compaction_idle_secs",
+            // PAI-4 P3's verbatim horizon. Headless with its neighbours, and
+            // for a sharper version of the same reason: the damaging direction
+            // is *shorter*, and the only honest UI label for it ("how many days
+            // of history stay full-fidelity") describes a rung that fires only
+            // under budget pressure a household cannot see. Exposing a number
+            // whose effect is invisible most of the time invites tuning by
+            // superstition.
+            "compaction_verbatim_days",
             "retention_events_days",
             "retention_events_by_category",
             "retention_sensitive_days",
