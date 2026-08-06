@@ -644,6 +644,7 @@ impl Agent for PondAgent {
                         created_at: chrono::Utc::now(),
                         prompt_tokens: None,
                         completion_tokens: None,
+                        reasoning_tokens: None,
                     };
                     if let Err(e) = storage_ref
                         .add_message(session_id_persist.clone(), sm)
@@ -802,6 +803,7 @@ mod tests {
                 yield Ok(pond_core::models::ports::inference::ChatEvent::Usage(UsageStats {
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    reasoning_tokens: None,
                 }));
             })
         }

@@ -16,6 +16,15 @@ pub struct SessionMessage {
     /// Real completion-token count for this assistant message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_tokens: Option<u32>,
+    /// Tokens the turn spent on reasoning the user never saw (assistant rows).
+    ///
+    /// The COUNT only. The reasoning text is not persisted here and is not
+    /// replayed into context — PAI-5 P6 owns that decision and it has not
+    /// landed. `None` means nobody counted (every row written before this
+    /// column existed, and every row written by a path that does not carry
+    /// reasoning through); it is not the same as `Some(0)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
 }
 
 impl SessionMessage {
@@ -27,6 +36,7 @@ impl SessionMessage {
             created_at: Utc::now(),
             prompt_tokens: None,
             completion_tokens: None,
+            reasoning_tokens: None,
         }
     }
 
@@ -34,6 +44,16 @@ impl SessionMessage {
     pub fn with_token_counts(mut self, prompt: Option<u32>, completion: Option<u32>) -> Self {
         self.prompt_tokens = prompt;
         self.completion_tokens = completion;
+        self
+    }
+
+    /// Attach the turn's GIAP-derived reasoning-token count (assistant rows).
+    ///
+    /// Separate from `with_token_counts` on purpose: those two come from the
+    /// provider and this one does not, and a single setter would invite a
+    /// caller to pass all three from the same source.
+    pub fn with_reasoning_tokens(mut self, reasoning: Option<u32>) -> Self {
+        self.reasoning_tokens = reasoning;
         self
     }
 }

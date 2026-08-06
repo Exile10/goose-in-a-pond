@@ -170,14 +170,23 @@ every token.
 
 ### 3.2 Count reasoning tokens
 
+> **CORRECTED 2026-08-06 by P2.** Two claims below were wrong. The migration number was stale —
+> the sequence ends at `0038_drafts_owner.sql`, so P2 took **0039**. And the section read as though
+> the count arrives from the provider: it does not, for any provider GIAP ships. Goose's `Usage`
+> has input/output/total/cache_read/cache_write and no reasoning field, and the OpenAI-shaped
+> providers separate reasoning into a *content* channel rather than a counter. The number is
+> GIAP's own, counted from the text P1 captured through the PAI-3 `TokenCounter` port. See the P2
+> stamp in section 4.
+
 `UsageStats` gains `reasoning_tokens: Option<u32>`, persisted alongside the existing per-message
-counts (the next free migration number — `0037` at the time of writing — extending `0029`'s
-columns). This closes the loop with PAI-3: the governor
+counts (migration `0039`, extending `0029`'s columns). This closes the loop with PAI-3: the governor
 can then set `output_reserve_tokens` from **measured** reasoning behaviour for the active model
 rather than from a constant chosen to survive the worst case observed once on an Orin.
 
-The cost model also becomes honest — `GET /usage/summary` currently attributes reasoning to
-completion, which overstates answer length and understates why the device felt slow.
+The cost model also becomes honest — though "currently attributes reasoning to completion" was an
+assumption, not a finding. Whether the provider's `output_tokens` already covers the reasoning
+decode is **unmeasured for every model GIAP pins**, which is exactly why P2 reports the two numbers
+side by side and subtracts nothing.
 
 ### 3.3 A thinking budget, derived not typed
 
@@ -288,7 +297,70 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   **Not persisted, on purpose.** P6 owns that. Until it lands, reasoning is streamed and forgotten:
   `chat.rs` matches `Thinking` and ignores it, so nothing enters `session_messages` and nothing is
   replayed into context.
-- **P2** `UsageStats.reasoning_tokens` + migration; surfaced in `turn_stats` and `/usage/summary`.
+- **P2 — LANDED 2026-08-06 as the producer and the store. The two display surfaces it named are
+  NOT done, and the reason is a held file, not a decision.**
+
+  `UsageStats.reasoning_tokens: Option<u32>` (`models/ports/provider.rs`),
+  `TurnStats.reasoning_tokens: Option<u32>` (`shared/domain/turn_stats.rs`),
+  `SessionMessage.reasoning_tokens` (`user_data/domain/session.rs`) with
+  `with_reasoning_tokens`, and migration `0039_reasoning_tokens.sql` —
+  `ALTER TABLE session_messages ADD COLUMN reasoning_tokens INTEGER`, nullable, **no DEFAULT**.
+  `GooseAdapter::count_reasoning_tokens(&Message, &dyn TokenCounter)` accumulates into `turn_stats`
+  in the stream loop and both arms of the `usage` build carry it out.
+
+  **The number is GIAP's, not the engine's, and the plan said otherwise.** Section 3.2 implied
+  `reasoning_tokens` arrives from the provider. It does not and will not: Goose's `Usage`
+  (`goose-provider-types/src/conversation/token_usage.rs`) carries input/output/total/cache_read/
+  cache_write and no reasoning field, and the providers that *do* separate reasoning put it in a
+  content channel, not a counter. So this counts the thinking text P1 captured, through the PAI-3
+  P2 `TokenCounter` port — tiktoken when it is built, chars/4 otherwise, and `is_exact()` is false
+  for both. The doc comments say so at every one of the three declarations, because a number whose
+  provenance is only in a commit message gets read as ground truth within a release.
+
+  **It is not subtracted from `completion_tokens`, and that is a decision, not an oversight.** The
+  provider's output count most likely already includes the reasoning decode — but nobody has
+  measured which way for the models GIAP pins, and subtracting a GIAP estimate from an engine-
+  reported number corrupts the one that was actually measured. `turn_stats.rs ::
+  reasoning_does_not_move_the_completion_count_or_the_decode_rate` holds that line, and
+  `finalize_rates` deliberately ignores the field so `decode_tok_per_sec` stays a rate over what the
+  engine reported.
+
+  **Counted ungated, displayed gated.** `count_reasoning_tokens` does not consult `show_thinking`;
+  only `reasoning_frames` does. The model spends the tokens either way, and the shipped default is
+  `show_thinking = false`, so a count that moved with the checkbox would report every Jetson turn as
+  having done no thinking — and P5 sizes `output_reserve_tokens` from exactly this number.
+  `the_reasoning_count_is_taken_outside_the_display_gate` asserts structurally that the accumulation
+  sits above the frame loop; mutation-tested by moving it inside, which fails naming that
+  consequence.
+
+  **`None` is not `Some(0)`.** "Nobody counted" and "counted, and this turn thought nothing" are
+  different facts and P5 must not read the first as the second. That is why 0039 has no `DEFAULT 0`:
+  a default would retroactively assert of every pre-existing row that its turn did no thinking.
+  `reasoning_tokens_round_trip_beside_the_provider_counts` reaches that case with a raw INSERT that
+  omits the column — the adapter always binds it, so binding NULL through the adapter would pass
+  against `DEFAULT 0` just as happily. Mutation-tested by adding the default.
+
+  **What was deliberately NOT done, and why.** `crates/pond-api/src/routes.rs` was concurrently held
+  by the PAI-2 security work, so the `turn_stats` SSE frame and `GET /usage/summary` do not carry
+  the field. Both are in that file: the frame is a hand-built `json!` (adding a field to `TurnStats`
+  does not flow into it), and `/chat/stream` flattens usage into two `u32` locals and hands
+  `ChatService` a `(prompt, completion)` **tuple**, which cannot express a third number. So on the
+  desktop route the count is produced, reaches `AgentStreamEvent::Done`, and is dropped; the
+  persisted column is NULL for those rows, which is the honest value. It is carried end to end on
+  the `ChatService` path — `pond chat` and the terminal voice loop — where `turn_usage` is a whole
+  `UsageStats`: it is persisted by `persist_assistant_response` and printed as `reasoning N tok` in
+  the stdout turn summary. Widening `persist_assistant_turn`'s tuple was considered and rejected:
+  every caller of it is in routes.rs.
+
+  **Also not done:** `pond-inference`'s `reasoning_content` is still parsed and dropped (quarantined
+  path, same carve-out as P1), and nothing counts reasoning for a non-Goose provider — those
+  `UsageStats` sites pass `None` explicitly rather than a flattering zero.
+
+  **What would falsify this.** A turn on `local`/`gguf` with a thinking model whose stdout summary
+  prints no `reasoning` part, or prints `reasoning 0 tok` while the thinking panel shows text — the
+  first means the count never reached `TurnStats`, the second means it was taken from the gated
+  lift. Equally falsifying: `session_messages.reasoning_tokens` coming back `0` for rows written
+  before 0039, which would mean the column grew a default.
 - **P3 — ALREADY LANDED**, before this programme began. One `thinking_enabled` drives both the
   prompt section and the engine param; see section 1.7. Nothing to do.
 - **P4** `reasoning_effort` tri-state mapped through the compaction profile; `brief` default on
@@ -334,7 +406,9 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   budget and a complete answer arrives.
 - **Integration** — `show_thinking` on `/agent/chat/stream` produces `thinking` events (it produces
   none today).
-- **Regression** — reasoning tokens appear in `turn_stats` and are *not* double-counted in
-  `completion_tokens`.
+- **Regression** — reasoning tokens are reported *alongside* `completion_tokens` and never deducted
+  from it. Landed as `turn_stats.rs ::
+  reasoning_does_not_move_the_completion_count_or_the_decode_rate`. The `turn_stats` **SSE frame**
+  half of this is still outstanding: it is built by hand in the held `routes.rs`. See P2.
 - **Manual** — `persist_thinking` on, reopen the session, confirm reasoning is visible in the UI and
   absent from the model's replayed context.
