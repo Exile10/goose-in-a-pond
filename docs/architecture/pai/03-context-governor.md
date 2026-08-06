@@ -54,8 +54,9 @@ one turn, every time the conversation shape changes.
 
 Real counts *are* available — migration `0029_message_token_counts` stores per-message
 `prompt_tokens`/`completion_tokens`, and `TurnStats.context_limit_tokens` carries the engine's
-actual allocated `n_ctx`. (`docs/architecture/token_tracking.md:28` still says otherwise; that
-document is stale and is corrected as part of this workstream.)
+actual allocated `n_ctx`. (`docs/architecture/token_tracking.md` said otherwise until the
+2026-08-03 documentation-debt pass; P6 then rewrote it around the accounting/budgeting split this
+workstream forced into the open.)
 
 ### 1.4 Per-model metadata exists in three places, none of them usable
 
@@ -64,10 +65,22 @@ document is stale and is corrected as part of this workstream.)
    inside the submodule.
 2. **`ModelCapabilities::from_model_name`** (`model_capabilities.rs:182-196`) — a string heuristic:
    `gemma-4*` → 128,000; `llama-3` → 8,192; `qwen`/`mistral` → 32,768; **everything else → 4,096**.
-3. **`ModelRecord.context_length: Option<u32>`** (`models/domain/model_record.rs:108`) — exists in
-   the schema, written as `None` by every production path (`model_service.rs:383,532`,
-   `routes.rs:3174`), read back only by `sqlite_model_repository.rs:44`. **No budget code consults
-   it.**
+3. **`ModelRecord.context_length: Option<u32>`** (`ModelRecord` in
+   `models/domain/model_record.rs`) — exists in the schema, persisted by
+   `SqliteModelRepository::upsert` and read back by `row_to_record`. **No budget code consults it.**
+
+   *Corrected 2026-08-06.* The original claim, "written as `None` by every production path
+   (`model_service.rs:383,532`, `routes.rs:3174`)", was wrong twice over. Both `model_service.rs`
+   sites are inside the `#[cfg(test)]` module — test fixtures, not production paths — and
+   `gguf_record` in `composite_model_catalog_provider.rs` writes `Some(e.context_length)` for all
+   twenty curated GGUF entries. What is actually true is an **asymmetry**: the GGUF table populates
+   the field, `llamafile_record` and `ollama_entry_to_record` write `None`, and the Whisper / Piper /
+   embedding rows write `None` correctly because the field is meaningless for them.
+
+   The value being unread is what let the data rot unnoticed: every Gemma 4 entry declares `8192`,
+   copy-pasted from the Gemma 2 rows above it, against a real declared window of `131072` (verified
+   2026-08-06 against `model_info["gemma4.context_length"]` from a live `POST
+   localhost:11434/api/show`).
 
 There is no models catalog JSON anywhere in the repository.
 
@@ -149,8 +162,11 @@ Catalog providers populate `ModelRecord.context_length` instead of `None`. It su
 UI beside the existing capability badges, and it feeds precedence rung 3. This turns a dormant
 column into the answer for HTTP and Ollama models, where no registry entry exists.
 
-`docs/architecture/model_capabilities.md` is refreshed at the same time — it documents five fields;
-`ModelCapabilities` has six (`tool_calling` is missing).
+`docs/architecture/model_capabilities.md` is refreshed at the same time. The missing sixth field
+(`tool_calling`) was added on 2026-08-03; P6 fixed what that pass left behind — a detection table
+with no `tool_calling` column, a `qwq` row claiming 32K when the code gives it 4,096, a vision row
+predating `name_implies_vision`, and `trim_to_budget_for_model` cited as live when nothing outside
+its own tests calls it.
 
 ### 3.4 Asymmetric budgets — how "to the fullest" is actually achieved
 
@@ -212,12 +228,41 @@ Once occupancy is measured rather than estimated, `ContextHealth.should_compact`
   into `pond-adapters-goose/src/token_counter.rs`.
 - ~~**P2** `TokenCounter` port; GGUF-backed adapter; chars/4 as the declared fallback.~~ Feedback
   correction retained.
-- **P3** Populate `ModelRecord.context_length` in catalog providers; surface in the Models UI;
-  wire as precedence rung 3.
+- **P3 — PARTIAL. Data landed; the wiring and the UI are BLOCKED.** `ModelRecord.context_length` is
+  now populated by every catalog provider that can answer: the llamafile table gained the field, the
+  Gemma 4 rows were corrected from a copy-pasted `8192` to the declared `131072`, and
+  `OllamaCatalogProvider` reads the real window from `POST /api/show`'s `model_info` map — the
+  provider class rung 3 exists for, and the reason it has never been reachable. Rung 3 itself gained
+  the clamp it was missing: a catalog value is a *declared maximum*, not an allocation, so for a
+  local provider it is bounded by `UNPINNED_LOCAL_CEILING`. Without that, populating the field would
+  have handed the trimmer a 128K history budget on a Mac that allocated 32K.
+
+  **Still not reachable in production.** All three `ContextInputs` construction sites —
+  `goose_agent.rs::resolve_window_with`, `routes.rs`'s `turn_context_limit`, and the quarantined
+  `pond-agent/src/agent.rs` — still pass `catalog_context_length: None`, so `WindowSource::CatalogRecord`
+  remains a rung nothing can produce. The two live ones are in files a concurrent workstream holds.
+  The Models UI half is blocked on the same file: `record_to_dto` and `ModelStatusEntry` would both
+  have to change, and `record_to_dto` lives in `routes.rs`. Deferred to **P3b**, which is exactly:
+  supply the record's `context_length` at the two live call sites, add it to `ModelStatusEntry`, and
+  render it in `Models.tsx` beside `CapabilityBadges` — which today infers the window from the model
+  *name* in the frontend, a third copy of the heuristic this workstream exists to delete.
 - **P4** Continuous profile function with the existing tiers as regression fixtures.
 - **P5** Asymmetric budgeting: preamble capped, working set scaled. Measure TTFT before and after on
   both Mac and Orin — this phase is only correct if TTFT is flat and retained history grows.
-- **P6** Documentation: refresh `token_tracking.md` and `model_capabilities.md`.
+- **P6 — LANDED (2026-08-06).** `token_tracking.md` rewritten around the split this workstream
+  forced into the open: **accounting** (real provider `Usage` aggregated into `TurnStats`,
+  per-session totals, savings) and **budgeting** (`TokenCounter`, `CompactionProfile`, the trimmer),
+  which meet at exactly one place, the overshoot correction. `model_capabilities.md` rewritten
+  around the demotion of `context_window_tokens` to the governor's last rung. Four claims were false
+  rather than merely incomplete, and each is named in the new text so the correction cannot be
+  quietly reversed: the UI does not mark estimates with `~` (it is a rounding marker on counts of
+  1000 or more); `trim_to_budget_for_model` has no production caller; `qwq` resolves to 4,096
+  because the context arm matches `qwen`, which `qwq` does not contain; and
+  `GET /models/capabilities` does return `tool_calling`, because the handler serialises the struct
+  whole. Recorded, not fixed: `Models.tsx`'s `inferCapabilities` has drifted from `from_model_name`
+  in both directions — no E1B exclusion, no `gemma-3n` spellings, no `vl`/`vision` segment rule — so
+  the badges disagree with the backend on precisely the model the E1B exclusion exists for. Both
+  documents describe a mid-programme state and say so; the rung-3 rows are what P3b moves.
 
 ---
 

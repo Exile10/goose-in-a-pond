@@ -20,7 +20,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 2 | Requires the ability of the model to **think** | [PAI-5](./05-reasoning-and-thinking.md) | DESIGNED |
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
 | 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **COMPLETE — P1-P8 LANDED** |
-| 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2 LANDED**; P3-P6 designed |
+| 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1, P2, P6 LANDED; P3 PARTIAL** (data landed, wiring + UI blocked -> P3b); P4-P5 designed |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
 | 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0-P5, P7 LANDED** (P3, P5 partial); P6, P8 designed |
@@ -329,7 +329,8 @@ Other corrections applied: PAI-5's prompt/engine thinking inconsistency is **alr
 is a no-op); `GOOSE_AUTO_COMPACT_THRESHOLD` is not local-gated, only the tool-pair knob is; there is
 **no pairing lockout** and its absence is deliberate (a lockout would be a guest-triggerable DoS);
 `Profile` has six fields not five; `ModelRecord.context_length` *is* written for the curated GGUF
-catalog; PAI-8 undercounted the multipart upload routes (`/voice/calibrate` and
+catalog (and only there — see the 2026-08-06 entry: the correction was right and still incomplete,
+because it stopped at "is written" without asking *by which providers*); PAI-8 undercounted the multipart upload routes (`/voice/calibrate` and
 `/sessions/{id}/identify-user` also take uploads), which matters because PAI-1 and PAI-2 lean on
 that absence argument.
 
@@ -878,3 +879,119 @@ integration targets; clippy clean on the fast set; `cargo check -p pond-server
 asserts the PAIR (`PUT /settings` 200 with no token before `POST /onboard/complete`, 401 after) plus
 the whole reset-then-recover round trip over real HTTP. Asserting only the 401 would pass on a
 server that never started.
+
+**2026-08-06 — PAI-3 P3 PARTIAL: the catalog data landed, the rung is still dead.**
+
+`WindowSource::CatalogRecord` — precedence rung 3 — **has never been producible in production.** All
+three `ContextInputs` construction sites (`goose_agent.rs::resolve_window_with`, `routes.rs`'s
+`turn_context_limit`, and the quarantined `pond-agent/src/agent.rs`) pass
+`catalog_context_length: None`. The only thing that has ever produced that variant is the unit test
+in `context_governor.rs`. This is the `ProfileScope::Owner` defect exactly: a branch with full test
+coverage, reachable from no fixture production can build.
+
+Two things it hid, both found by asking *who writes the field* rather than *is the field written*:
+
+- The checklist's own 2026-08-03 correction — "`ModelRecord.context_length` *is* written for the
+  curated GGUF catalog" — was true and stopped one question short. `gguf_record` writes it;
+  `llamafile_record` and `ollama_entry_to_record` write `None`. **Ollama is the provider class the
+  rung was designed for**, and it was the one with no data.
+- Every Gemma 4 row declared `8192`, copy-pasted from the Gemma 2 rows directly above it in the same
+  table. The real declared window is `131072`, verified against
+  `model_info["gemma4.context_length"]` from a live `POST localhost:11434/api/show`. Nothing caught
+  it in the seven commits since, because nothing read the field.
+
+**A dormant column is not a safe place to put data.** It rots at the rate the catalog is edited and
+nothing pushes back. That is the general lesson, and it is the same shape as the vacuous-test family:
+the absence of a reader is the absence of a check.
+
+Landed (all in files no other workstream holds): the llamafile table gained `context_length`; the
+Gemma 4 rows were corrected; `OllamaCatalogProvider` now reads the window from `/api/show`, matching
+the `model_info` key by `.context_length` suffix rather than an architecture allowlist that would go
+silently dead on the next family; and rung 3 gained the clamp it was missing — a catalog value is a
+DECLARED MAXIMUM, not an allocation, so for a local provider it is bounded by
+`UNPINNED_LOCAL_CEILING`. Without that clamp, populating the field correctly would have been the
+regression: 131,072 tokens of history budget on a Mac that allocated 32,768.
+
+**Blocked, and deliberately not worked around.** Supplying the value at the two live call sites needs
+`goose_agent.rs` and `routes.rs`; surfacing it in the Models UI needs `record_to_dto` (in
+`routes.rs`) plus `ModelStatusEntry` and `types.ts`. All held by a concurrent session. Deferred to
+**P3b** rather than edited carefully — PAI-2 lost an encrypted secret store to two phases writing one
+file, and it compiled with every test green. Note for P3b: `Models.tsx`'s `inferCapabilities` derives
+the context window from the model NAME in the frontend, a third copy of the heuristic this workstream
+exists to delete; replacing it is the point of surfacing the field, not a bonus.
+
+**The mutations, and what they printed.** Removing the local clamp from rung 3 failed
+`a_catalog_length_cannot_widen_an_unpinned_local_window` with `left: 131072, right: 32768` — the
+defect, in the numbers, in the message — with the other sixteen governor tests still green, so the
+guard is doing the work and not a blast radius. Reverting `llamafile_record` to `context_length: None`
+failed `every_chat_capable_entry_declares_a_context_window` with `catalog entry llama-1b declares no
+usable context window (0); rung 3 of the context governor reads this field`, and took
+`the_same_base_model_declares_the_same_window_in_both_tables` down with it. Both restored, both green
+after.
+
+**2026-08-06 — PAI-3 P6. A partial correction is how a document ends up contradicting itself.**
+
+`token_tracking.md` and `model_capabilities.md` had both already been "corrected" in the 2026-08-03
+documentation-debt pass, and both were still wrong in the same shape: the fix landed in one place
+and not in its neighbours. `token_tracking.md`'s prose said real provider usage is the primary path
+while the ASCII flow diagram three lines above it still had `chars / 4 heuristic` on the main arrow.
+`model_capabilities.md` gained `tool_calling` in the struct listing while the detection table below
+it kept five columns and the REST sample below that kept five keys — and since the handler
+serialises the struct whole, the wire has carried six fields the entire time. **When a claim is
+corrected in a document, grep the document for every other place that claim appears.** A partial
+correction reads as authoritative and is harder to spot than the original error.
+
+**Four claims were false, not merely incomplete**, and two were only findable by reading the
+frontend:
+
+- The `~` prefix does not mean "estimated". `formatTokens` in `UsageStatsCard.tsx` applies it to
+  every count of 1000 or more as a rounding marker for the `k` suffix and prints smaller counts
+  bare. It takes a number and nothing else; `UsageStats` carries no provenance to read.
+- `trim_to_budget_for_model` was cited as what `context_window_tokens` drives. Its only call sites
+  are its own unit tests, below the `#[cfg(test)]` line in the same file. A function with tests and
+  no callers looks alive to any grep that stops at the first hit.
+- `qwq` was documented at 32K. The context arm matches the substring `qwen`, which `qwq` does not
+  contain, so it falls through to the 4,096 default. The table row grouped `qwen3 / qwq` together,
+  which is what hid it — **a doc table that merges two patterns into one row cannot express them
+  diverging.**
+- `Models.tsx`'s `inferCapabilities` claims to mirror `from_model_name` and does not: no E1B
+  exclusion, so `gemma-4-E1B-it` gets a Vision badge the backend deliberately refuses; no
+  `gemma-3n` spellings; no `vl`/`vision` segment rule; and it computes neither `structured_output`
+  nor `tool_calling`. Recorded, not fixed — it is badges only, but it is a duplicate of a rule whose
+  entire design is an argument about which way it is allowed to be wrong.
+
+**Line numbers, again.** `03-context-governor.md` cited `token_tracking.md:28`, and the roadmap's
+debt table cited both files by line; the rewrites move every one. All three citations are now
+symbols or section names. That is the second time PAI-3 has rotted a citation by editing the file it
+points at.
+
+**No gates were owed, and that is worth stating rather than leaving implicit**: the phase touches no
+Rust, no `Settings` field, no migration, no route and no startup wiring, so `cargo` and
+`live-test.sh` have nothing to say about it. They were run anyway, to prove that claim rather than
+assert it. `cargo fmt --check` clean; `cargo test -p pond-core` 749 passed, **4 failed** — all four
+in `context_budget.rs`, which is the continuous-curve work of a concurrent phase, mid-edit, in the
+working tree. A documentation phase that reports a red suite it did not cause is more useful than
+one that reports "green" by only running what it likes.
+
+**The mutation, since a doc that asserts a guard owes evidence the guard bites.** Section 3 of
+`token_tracking.md` now claims `GOOSE_CONTEXT_LIMIT` is written and never read, on the strength of
+two `include_str!` source-scanning tests — exactly the class of check that can pass by matching
+nothing. Putting `std::env::var("GOOSE_CONTEXT_LIMIT")` back into `ContextGovernor::prompt_window`
+failed `this_module_does_not_read_the_environment` with `context_governor must not read process
+environment variables`, with the other sixteen governor tests still green, so the guard is doing the
+work and is not a blast radius. Restored; the file's md5 is byte-identical to before the mutation,
+which matters because the file carries another phase's uncommitted work and `git checkout --` would
+have destroyed it. Its twin in `goose_agent.rs` was **not** mutated — that file is held by a
+concurrent session — and `token_tracking.md` says so rather than implying both were proven.
+
+What the phase did owe beyond that was verification:
+every claim was re-checked against `git show HEAD:<path>` rather than the working tree, because a
+concurrent session is mid-edit in `goose_agent.rs`, `turn_trimmer.rs` and `routes.rs`, and
+documenting somebody else's uncommitted work as current state is its own way of shipping a lie.
+
+**What that discipline caught.** The recon for this phase reported the PAI-3 documents as clean;
+they were not. PAI-3 P3 had landed its catalog work into the same three files in the meantime, so
+the status rows this phase had to stamp were already carrying `P3 PARTIAL`. They were merged, not
+overwritten. Both rewrites also had to stop describing rung 3 as "PAI-3 P3" future work: the durable
+statement is that **no production caller supplies `catalog_context_length`**, which is true both
+before and after P3's data work, and is the thing P3b changes.
