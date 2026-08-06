@@ -484,13 +484,50 @@ mod tests {
         );
     }
 
-    /// The whole reason `runs_on_this_device` is not `is_local_provider`:
-    /// PAI-3 P3 made a 131,072-token Ollama resolution real, and rung 3 does not
-    /// clamp it because Ollama is not a "local provider" by the governor's
-    /// preamble-cost definition. It still must not unlock an on-device
-    /// summarisation call.
+    /// The whole reason `runs_on_this_device` is not `is_local_provider`: an
+    /// on-device provider must not unlock a blocking summarisation call however
+    /// big its window is.
+    ///
+    /// **This test used to reach that state through rung 3, and it was reading a
+    /// bug.** It asserted a 131,072-token *catalog* resolution for Ollama and
+    /// noted that "rung 3 does not clamp it because Ollama is not a local
+    /// provider by the governor's preamble-cost definition". That was true and it
+    /// was the defect: the governor's `is_local_provider` covered only
+    /// local/gguf, so the declared maximum Ollama reports from `/api/show` went
+    /// unbounded, while the same weights through `local` were held to the
+    /// ceiling. This phase compensated for it here instead of fixing it there,
+    /// which left the tier right and the *window* four times too big for every
+    /// budget downstream. Rung 3 now clamps anything that runs on this device.
+    ///
+    /// So the fixture moved to rung 1. An engine-reported window IS an
+    /// allocation and is deliberately never clamped — a big box really can give
+    /// Ollama 131,072 — which makes it the honest way to reach a large window on
+    /// an on-device provider, and it keeps this test exercising the provider
+    /// guard rather than the window bracket. Through rung 3 it would now resolve
+    /// to 32,768 and land in Medium on width alone, proving nothing.
     #[test]
-    fn a_131k_ollama_catalog_window_stays_out_of_the_large_tier() {
+    fn a_large_window_on_an_on_device_provider_stays_out_of_the_large_tier() {
+        let inputs = ContextInputs {
+            provider: "ollama",
+            model: "gemma4:e2b",
+            engine_reported: Some(EngineWindow::new("gemma4:e2b", 131_072)),
+            ..Default::default()
+        };
+        let resolution = ContextGovernor::resolve(&inputs);
+        assert_eq!(resolution.tokens, 131_072, "an allocation is not clamped");
+        assert_eq!(resolution.source, WindowSource::EngineReported);
+        assert_eq!(
+            ModelClass::from_resolution(inputs.provider, &resolution),
+            ModelClass::Medium,
+            "an Ollama model on this box was handed the tier that spends a model \
+             call on compaction"
+        );
+    }
+
+    /// And the rung-3 half, now that it is bounded: the catalog's declared
+    /// maximum no longer escapes the ceiling for an on-device provider.
+    #[test]
+    fn an_ollama_catalog_maximum_is_bounded_by_the_governor() {
         let inputs = ContextInputs {
             provider: "ollama",
             model: "gemma4:e2b",
@@ -498,14 +535,11 @@ mod tests {
             ..Default::default()
         };
         let resolution = ContextGovernor::resolve(&inputs);
-        assert_eq!(resolution.tokens, 131_072);
-        assert_eq!(resolution.source, WindowSource::CatalogRecord);
         assert_eq!(
-            ModelClass::from_resolution(inputs.provider, &resolution),
-            ModelClass::Medium,
-            "an Ollama model on this box was handed the tier that spends a model \
-             call on compaction"
+            resolution.tokens, 32_768,
+            "a declared maximum is not an allocation, whoever declared it"
         );
+        assert_eq!(resolution.source, WindowSource::CatalogRecord);
     }
 
     /// And the hosted counterpart, so the test above is not passing because the
