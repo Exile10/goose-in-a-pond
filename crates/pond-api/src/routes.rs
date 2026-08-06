@@ -1699,6 +1699,21 @@ fn chat_stream_inner(
                         "warning": health.warning,
                     }).to_string();
                     yield Ok(Event::default().data(data));
+
+                    // PAI-4 P6: and then actually do something about it. Until
+                    // this phase the frame above was the entire response to a
+                    // filling context window — the server warned the client and
+                    // took no action itself.
+                    //
+                    // This call spawns and returns; it must stay that way. We
+                    // are inside the SSE generator, the `done` frame below is
+                    // still unsent, and invariant 1 is that compaction never
+                    // blocks a turn, ever. Doing the work here — the obvious
+                    // reading of "act on should_compact" — would put a
+                    // summarisation model call between the user's last token and
+                    // the end of their stream, on the tier that can least afford
+                    // it. Everything real happens in the detached task.
+                    spawn_pressure_compaction(&state, &session_id);
                 }
             }
         }
@@ -1954,6 +1969,16 @@ async fn delete_session(
             };
             (status, Json(json!({"error": format!("{}", e)})))
         })?;
+
+    // PAI-4 P6 — the "on clear" half. `reset_session` had no production caller
+    // at all before this phase, so the growth map only ever grew: every session
+    // the process had ever streamed a turn for stayed in it, and a new
+    // conversation created under a recycled id would have inherited the
+    // utilisation, the growth samples and the compaction cooldown of the one it
+    // replaced. Deleting the row is the only place the session genuinely stops
+    // existing, so it is the only place a full reset is the right call.
+    state.context_monitor.reset_session(&session_id);
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2075,16 +2100,165 @@ async fn get_session_messages(
     Ok(Json(json!({ "messages": list })))
 }
 
-/// Sessions with a resume compaction currently in flight.
+/// Sessions with a between-turns compaction pass currently in flight.
 ///
 /// Process-local, because the hazard is process-local: two rapid reopens of the
 /// same session would each spawn a refresh, and on the serial on-device engine
 /// the second queues behind the first while the user's first turn queues behind
 /// both. A row in the database would be worse, not better — it would outlive a
 /// `kill -9` and strand the session as permanently "compacting".
-static RESUME_COMPACTIONS_IN_FLIGHT: std::sync::LazyLock<
+///
+/// PAI-4 P6 widened this from resume-only to *all* compaction passes. There are
+/// now two independent triggers — the time axis (P4, a reopen after a gap) and
+/// the pressure axis (P6, a session past 75% of its window) — and a session that
+/// has just been reopened after a long gap is exactly the session most likely to
+/// saturate on its first turn back. Keeping one set means the two axes exclude
+/// each other rather than stacking two model calls in front of the same turn.
+static COMPACTIONS_IN_FLIGHT: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Run one rolling-summary refresh for a session, off the request path.
+///
+/// The shared body of both compaction triggers. Everything that makes a pass
+/// safe lives here so the two axes cannot drift:
+///
+/// - **It claims the session first**, and returns `None` when a pass is already
+///   running — see [`COMPACTIONS_IN_FLIGHT`].
+/// - **A user turn reclaims the engine immediately.** The refresh races a
+///   watcher on `last_user_activity`, the same contract the idle summary loop in
+///   `pond-server` uses; a cancelled refresh persists nothing.
+///
+/// Returns the outcome when a pass actually ran. Callers are already inside a
+/// spawned task: this awaits a model call and must never be called from a
+/// handler body or an SSE generator.
+async fn run_compaction_pass(
+    state: &Arc<AppState>,
+    session_id: &str,
+    provider: Arc<dyn pond_core::models::ports::provider::LlmProvider>,
+    trigger: &'static str,
+) -> Option<pond_core::shared::services::session_summary::RefreshOutcome> {
+    {
+        let mut in_flight = match COMPACTIONS_IN_FLIGHT.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !in_flight.insert(session_id.to_string()) {
+            return None;
+        }
+    }
+
+    // Abort the moment the user starts typing — the on-device engine is
+    // serial, and this pass must never be what a turn waits behind.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let baseline = state.last_user_activity.read().await.elapsed();
+    let watcher_activity = state.last_user_activity.clone();
+    let watcher_cancel = cancel.clone();
+    let watcher = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if watcher_activity.read().await.elapsed() < baseline {
+                watcher_cancel.cancel();
+                break;
+            }
+        }
+    });
+
+    let svc = pond_core::shared::services::session_summary::SessionSummaryService::new(
+        provider,
+        state.session_storage.clone(),
+    );
+    let result = svc.refresh(session_id, &cancel).await;
+    watcher.abort();
+
+    match COMPACTIONS_IN_FLIGHT.lock() {
+        Ok(mut g) => {
+            g.remove(session_id);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().remove(session_id);
+        }
+    }
+
+    match result {
+        Ok(outcome) => {
+            tracing::info!(
+                target: "giap::trace",
+                kind = "compaction_pass",
+                trigger = trigger,
+                session_id = %session_id,
+                outcome = ?outcome,
+            );
+            Some(outcome)
+        }
+        Err(e) => {
+            tracing::debug!("{trigger} compaction failed for {session_id}: {e}");
+            None
+        }
+    }
+}
+
+/// PAI-4 P6 — act on `should_compact`, between turns rather than during one.
+///
+/// `should_compact` has been computed since long before PAI-4 and, until this
+/// phase, its only consumer in production was the `context_warning` SSE frame:
+/// the server told the client the window was filling and then did nothing about
+/// it. This is the server-side half. The frame is unchanged — the client still
+/// gets it, and it still fires on the same predicate.
+///
+/// **Where this runs is the whole design.** Invariant 1 says compaction never
+/// blocks a turn, ever, and the obvious implementation — doing the work at the
+/// point `should_compact` is read — breaks it, because that point is inside the
+/// SSE generator with the user watching a token stream and the `done` frame
+/// still unsent. So this function does nothing but `tokio::spawn`; every read,
+/// every gate and the model call itself happen in the detached task, after the
+/// stream that spawned it has been dropped.
+///
+/// **The claim is the rate limiter, and it is not optional.** `should_compact`
+/// is monotone in utilisation: past 75% it is true on every subsequent turn.
+/// `ContextMonitor::claim_compaction` is what turns that standing condition into
+/// at most one pass per [`COMPACTION_COOLDOWN_TURNS`](pond_core::models::services::context::context_monitor)
+/// turns, and it recomputes health under its own lock so two turns finishing at
+/// once cannot both be authorised by one snapshot.
+fn spawn_pressure_compaction(state: &Arc<AppState>, session_id: &str) {
+    let state = state.clone();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        // Same switch the time axis reads. Hybrid compaction off means the
+        // trimmer and the summary are both off; acting here would resurrect
+        // half of a feature the user turned off.
+        let Ok(settings) = state.settings_repo.get().await else {
+            return;
+        };
+        if !settings.hybrid_compaction_enabled {
+            return;
+        }
+
+        // Claimed before the provider is read, because the claim is the cheap
+        // check and it is the one that fails most often.
+        if !state.context_monitor.claim_compaction(&session_id) {
+            return;
+        }
+
+        let Some(provider) = state.llm_provider.read().await.clone() else {
+            return;
+        };
+
+        if let Some(outcome) = run_compaction_pass(&state, &session_id, provider, "pressure").await
+        {
+            // Only a refresh that actually persisted a new summary changed the
+            // shape of the history. `NothingToDo` and `Cancelled` left it
+            // exactly as it was, and telling the monitor otherwise would throw
+            // away a growth window for nothing.
+            if matches!(
+                outcome,
+                pond_core::shared::services::session_summary::RefreshOutcome::Refreshed { .. }
+            ) {
+                state.context_monitor.note_compacted(&session_id);
+            }
+        }
+    });
+}
 
 /// PAI-4 P4 — compact a session on resume, before its first turn back.
 ///
@@ -2151,56 +2325,10 @@ fn spawn_resume_compaction(
         }
         let Some(provider) = provider else { return };
 
-        // Claim the session, or leave it to the pass already running.
-        {
-            let mut in_flight = match RESUME_COMPACTIONS_IN_FLIGHT.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if !in_flight.insert(session_id.clone()) {
-                return;
-            }
-        }
-
-        // Abort the moment the user starts typing — the on-device engine is
-        // serial, and this pass must never be what a turn waits behind.
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let baseline = state.last_user_activity.read().await.elapsed();
-        let watcher_activity = state.last_user_activity.clone();
-        let watcher_cancel = cancel.clone();
-        let watcher = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                if watcher_activity.read().await.elapsed() < baseline {
-                    watcher_cancel.cancel();
-                    break;
-                }
-            }
-        });
-
-        let svc = pond_core::shared::services::session_summary::SessionSummaryService::new(
-            provider,
-            state.session_storage.clone(),
-        );
-        match svc.refresh(&session_id, &cancel).await {
-            Ok(outcome) => tracing::info!(
-                target: "giap::trace",
-                kind = "resume_compaction",
-                session_id = %session_id,
-                outcome = ?outcome,
-            ),
-            Err(e) => tracing::debug!("resume compaction failed for {session_id}: {e}"),
-        }
-        watcher.abort();
-
-        match RESUME_COMPACTIONS_IN_FLIGHT.lock() {
-            Ok(mut g) => {
-                g.remove(&session_id);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().remove(&session_id);
-            }
-        }
+        // PAI-4 P6 moved the in-flight claim, the cancellation watcher and the
+        // refresh itself into `run_compaction_pass`, shared with the pressure
+        // axis. The gate above is what stays specific to a resume.
+        run_compaction_pass(&state, &session_id, provider, "resume").await;
     });
 }
 
