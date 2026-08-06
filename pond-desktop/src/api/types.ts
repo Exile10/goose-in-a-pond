@@ -427,7 +427,7 @@ export interface ChatStreamRequest {
   images?: ImageAttachment[];
 }
 
-export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision" | "turn_stats" | "turn_limit_reached";
+export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision" | "turn_stats" | "turn_limit_reached" | "context_warning";
 
 // Sent as a fresh user turn when the agent stopped on its turn budget. The
 // backend has no dedicated resume endpoint — a continuation IS just the next
@@ -449,6 +449,52 @@ export interface TurnStats {
   context_pct: number | null;
   model_load_ms: number | null;
   inference_count: number;
+}
+
+// PAI-4 P7b. The server pushes this mid-stream when `ContextHealth.should_compact`
+// is true for the session that just took a turn (routes.rs, guarded by the
+// default-true `context_monitor_enabled`). It is NOT the same shape as the
+// `POST /sessions/{id}/compact` response body below, and the two differences are
+// the ones a client gets wrong:
+//
+//  - `turns_remaining` is a raw u32 here, and the monitor uses `u32::MAX`
+//    (4294967295) to mean "growth is unknown". The endpoint sends `null` for the
+//    same state. Never print this number without clamping it.
+//  - `warning` is only populated above 60% utilisation, but `should_compact`
+//    also fires through the `estimated_turns_remaining < 3` limb, which can be
+//    true below that. So `warning: null` on a `context_warning` frame is a
+//    producible state, not a defensive `?`.
+export interface ContextWarning {
+  type: "context_warning";
+  utilization_pct: number;
+  turns_remaining: number;
+  avg_growth_rate: number;
+  warning: string | null;
+}
+
+/** Sentinel the monitor uses for "growth rate unknown, so turns remaining is unknown". */
+export const TURNS_REMAINING_UNKNOWN = 4294967295;
+
+/** Response body of POST /api/v1/sessions/{session_id}/compact. */
+export interface CompactionReport {
+  session_id: string;
+  /** "compacted" only when a pass actually persisted a new summary. */
+  status: "compacted" | "skipped";
+  /**
+   * Why it was skipped. The server's vocabulary, verbatim: monitor_disabled,
+   * compaction_disabled, not_under_pressure, no_summariser, already_running,
+   * cooling_down, nothing_to_summarise, preempted_by_turn, failed.
+   */
+  reason: string | null;
+  outcome: string | null;
+  context: {
+    utilization_pct: number;
+    /** `null` here where the SSE frame sends 4294967295. */
+    turns_remaining: number | null;
+    avg_growth_rate: number;
+    should_compact: boolean;
+    warning: string | null;
+  };
 }
 
 export interface ChatEvent {

@@ -537,6 +537,51 @@
   cursor: default;
 }
 
+/* PAI-4 P7b — context-window pressure note + manual compaction control.
+   Deliberately quieter than an alert: a filling window is normal, and the
+   refusal note that usually follows the button is information, not a failure. */
+.ctx-pressure {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+  padding-left: 2px;
+}
+.ctx-pressure__note {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--mut, #94A3B8);
+}
+.ctx-pressure__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--bd, rgba(124, 58, 237, 0.3));
+  background: transparent;
+  color: var(--acc, #7C3AED);
+  cursor: pointer;
+}
+.ctx-pressure__btn:hover:not(:disabled) {
+  background: rgba(124, 58, 237, 0.08);
+}
+.ctx-pressure__btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.ctx-pressure__result {
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--mut, #94A3B8);
+}
+
 /* Per-turn inference stats footer */
 .turn-stats-footer {
   display: flex;

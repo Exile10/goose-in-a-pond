@@ -167,6 +167,29 @@ describe("deleteSession()", () => {
   });
 });
 
+describe("compactSession()", () => {
+  it("POSTs /sessions/:id/compact", async () => {
+    fetchMock.mockResolvedValueOnce(
+      okJson({ session_id: "s1", status: "compacted", reason: null, outcome: "refreshed", context: {} }),
+    );
+    const res = await client().compactSession("s1");
+    expect(fetchMock.mock.calls[0][0]).toContain("/api/v1/sessions/s1/compact");
+    expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe("POST");
+    expect(res.status).toBe("compacted");
+  });
+
+  it("resolves a refusal rather than throwing", async () => {
+    // The endpoint answers 200 with a status/reason pair for everything short
+    // of a server fault, so the client must NOT model a refusal as an error —
+    // being refused is the common path.
+    fetchMock.mockResolvedValueOnce(
+      okJson({ session_id: "s1", status: "skipped", reason: "cooling_down", outcome: null, context: {} }),
+    );
+    const res = await client().compactSession("s1");
+    expect(res.reason).toBe("cooling_down");
+  });
+});
+
 // ── skills ────────────────────────────────────────────────────────────────────
 
 describe("listSkills()", () => {
