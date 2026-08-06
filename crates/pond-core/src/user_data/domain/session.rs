@@ -16,6 +16,11 @@ pub struct SessionMessage {
     /// Real completion-token count for this assistant message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_tokens: Option<u32>,
+    /// Training-feedback signal from the chat UI's like/dislike controls.
+    /// `None` = no vote, `Some(true)` = liked (keep as training data),
+    /// `Some(false)` = disliked (excluded from training data).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liked: Option<bool>,
 }
 
 impl SessionMessage {
@@ -27,6 +32,7 @@ impl SessionMessage {
             created_at: Utc::now(),
             prompt_tokens: None,
             completion_tokens: None,
+            liked: None,
         }
     }
 

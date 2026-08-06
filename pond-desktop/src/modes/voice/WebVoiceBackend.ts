@@ -14,7 +14,7 @@ import type {
 } from "./VoiceBackend";
 import {
   encodeWav, calculateRms, downsampleTo16k, getAudioContext, closeAudioContext,
-  playPingTone, playThinkingTone, splitSentences, stripMarkdown, normalizeForSpeech,
+  playPingTone, splitSentences, stripMarkdown, normalizeForSpeech,
   isWhisperArtifact, checkDismissal, getToolAnnouncement, getQuip,
   filterThinkingFull, createVadState, advanceVad, DEFAULT_VAD_CONFIG,
   registerTtsSource, clearTtsSource, stopTtsPlayback, isTtsInterrupted, resetTtsInterrupt,
@@ -72,7 +72,6 @@ export class WebVoiceBackend implements VoiceBackend {
   private pipelineActive = false;
   private abortController: AbortController | null = null;
   private ttsSource: AudioBufferSourceNode | null = null;
-  private stopThinkingFn: (() => void) | null = null;
   private recording: RecordingContext | null = null;
   private wakeActive = false;
   private wakeDetecting = false;
@@ -153,7 +152,13 @@ export class WebVoiceBackend implements VoiceBackend {
             const responsePromise = fetch(`${this.serverUrl}/api/v1/chat/stream`, {
               method: "POST",
               headers,
-              body: JSON.stringify({ message: transcript, session_id: sessionId, voice_mode: true }),
+              // voice_mode: false — generate the exact same response the chat
+              // tab would produce for identical wording; the existing TTS
+              // pipeline (stripMarkdown/normalizeForSpeech/filterThinkingFull)
+              // already makes any response safe to speak, so a separate
+              // voice-tailored prompt variant isn't needed and was producing
+              // grammatically mangled text on small on-device models.
+              body: JSON.stringify({ message: transcript, session_id: sessionId, voice_mode: false }),
               signal: llmAbort.signal,
             });
             this.speculativeLlm = { transcript, response: responsePromise, abort: llmAbort, firedAt, silenceOnset };
@@ -244,20 +249,16 @@ export class WebVoiceBackend implements VoiceBackend {
       this.onTranscript?.(text);
       this.onStateChange?.("thinking");
 
-      // Concurrent quip + thinking tone
+      // Concurrent quip while the LLM streams
       let quipDone = false;
       void this.playTtsSentence(getQuip(), ac.signal).catch(() => {}).then(() => { quipDone = true; });
-      const stopThink = playThinkingTone();
-      this.stopThinkingFn = stopThink;
 
       // Step 2: SSE chat stream (passes pre-started speculative response if any)
       await this.streamChat(text, opts, ac, () => {
-        stopThink(); this.stopThinkingFn = null;
         // Stop quip if still playing so first real sentence starts immediately
         if (!quipDone) { stopTtsPlayback(); resetTtsInterrupt(); }
       }, preStartedLlm);
 
-      if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
       if (!this.cancelled) this.onStateChange?.("idle");
     } catch (err) {
       if (this.cancelled || (err as Error).name === "AbortError") return;
@@ -268,7 +269,6 @@ export class WebVoiceBackend implements VoiceBackend {
       this.pipelineActive = false;
       this.wakeDetecting = false;
       this.abortController = null;
-      if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
       // Restart the wake listener (it was killed when detection fired).
       if (this._wakeWord && !this.cancelled) {
         this.startWakeListener(this._wakeWord, this._wakeNorm.slice(1));
@@ -284,7 +284,6 @@ export class WebVoiceBackend implements VoiceBackend {
     // which fires onWakeDetected → runPipeline, and finally restarts the listener.
     this.abortController?.abort(); this.abortController = null;
     if (this.speculativeLlm) { this.speculativeLlm.abort.abort(); this.speculativeLlm = null; }
-    if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
     // Stop any in-progress TTS: kills the active source, resolves pending
     // promises, and sets the interrupted flag so queued sentences are skipped.
     stopTtsPlayback();
@@ -437,7 +436,8 @@ export class WebVoiceBackend implements VoiceBackend {
       const firedAt = Date.now();
       const freshRes = await fetch(`${opts.serverUrl}/api/v1/chat/stream`, {
         method: "POST", headers, signal: controller.signal,
-        body: JSON.stringify({ message: text, session_id: opts.sessionId, voice_mode: true }),
+        // See the speculative fetch above for why this is false, not true.
+        body: JSON.stringify({ message: text, session_id: opts.sessionId, voice_mode: false }),
       });
       return [freshRes, firedAt, firedAt, false];
     })();

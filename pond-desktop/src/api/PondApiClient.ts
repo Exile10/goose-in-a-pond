@@ -834,9 +834,12 @@ export class PondApiClient {
     );
   }
 
-  getSessionMessages(sessionId: string): Promise<SessionMessage[]> {
+  /** `limit` with no `offset`: server returns the N most recent messages
+   *  (newest-aware), not an old-first page — see get_session_messages. */
+  getSessionMessages(sessionId: string, limit?: number): Promise<SessionMessage[]> {
+    const qs = limit != null ? `?limit=${encodeURIComponent(String(limit))}` : "";
     return this.get<{ messages: Array<Record<string, unknown>> } | Array<Record<string, unknown>>>(
-      `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages${qs}`,
     ).then((r) => {
       const raw = Array.isArray(r) ? r : (r as { messages: Array<Record<string, unknown>> }).messages ?? [];
       return raw.map((m): SessionMessage => ({
@@ -848,6 +851,7 @@ export class PondApiClient {
         tool_calls: m.tool_calls as SessionMessageToolCall[] | undefined,
         tool_call_id: m.tool_call_id as string | undefined,
         images: m.images as SessionMessage["images"],
+        liked: m.liked as boolean | null | undefined,
       }));
     });
   }
@@ -858,6 +862,23 @@ export class PondApiClient {
 
   deleteSession(sessionId: string): Promise<void> {
     return this.del(`/api/v1/sessions/${encodeURIComponent(sessionId)}`);
+  }
+
+  /** Delete a message and every later message in the same session — the
+   *  primitive behind "edit" and "refresh" on a user message. */
+  deleteMessagesFrom(sessionId: string, messageId: string): Promise<void> {
+    return this.del(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}`,
+    );
+  }
+
+  /** Set (`true`/`false`) or clear (`null`) the like/dislike training-feedback
+   *  flag on one message. */
+  setMessageFeedback(sessionId: string, messageId: string, liked: boolean | null): Promise<void> {
+    return this.put(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/feedback`,
+      { liked },
+    );
   }
 
   // ── Prompts ───────────────────────────────────────────────

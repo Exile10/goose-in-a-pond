@@ -583,6 +583,10 @@ export interface SessionMessage {
   tool_call_id?: string;
   /** Present on messages (typically role="user") that had images attached. */
   images?: SessionMessageImage[];
+  /** Training-feedback vote from the chat UI's like/dislike controls.
+   *  `true` = liked (kept as training data), `false` = disliked (excluded),
+   *  `null`/absent = no vote. */
+  liked?: boolean | null;
 }
 
 // ── HuggingFace / Model Download ──────────────────────────────
