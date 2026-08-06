@@ -322,6 +322,88 @@ pub struct GooseAdapter {
     group_embeddings: tokio::sync::OnceCell<Option<Vec<(String, Vec<f32>)>>>,
 }
 
+/// Hard ceiling on a single buffered reasoning passage, in bytes.
+///
+/// The coalescer holds at most one passage, and every real block ends the
+/// moment the model says anything the user can see. A provider that never
+/// produces visible output — broken, hostile, or simply looping — would
+/// otherwise grow the buffer for the whole turn. 64 KiB is far past any
+/// reasoning block a shipped model emits (a 16k-token context cannot hold one)
+/// and is bounded memory rather than a correctness rule, so crossing it splits
+/// the passage and logs, instead of dropping it.
+const REASONING_BUFFER_LIMIT: usize = 64 * 1024;
+
+/// PAI-5 P1 (granularity). One reasoning passage, assembled from however many
+/// pieces the provider chose to send it in.
+///
+/// The providers disagree about what an `AgentEvent::Message` carrying
+/// `Thinking` *means*, and P1 originally assumed they agreed:
+///
+/// | provider family | shape | source |
+/// |---|---|---|
+/// | local / gguf (the Jetson headline config) | one message **per token piece** | `goose-local-inference/src/llamacpp/inference_native_tools.rs` calls `push_structured_reasoning` from inside the per-token `\|piece\|` callback |
+/// | openai-format HTTP (Ollama, DeepSeek, OpenRouter, vLLM) | one message per streamed delta | `goose-provider-types/src/formats/openai.rs` pushes each chunk's newly-arrived `reasoning_text()` |
+/// | google | one message per part | delta-shaped |
+/// | anthropic | one message per **complete block** | `formats/anthropic.rs` accumulates `ThinkingDelta` internally and emits once at `content_block_stop` |
+/// | any non-streaming response | one message per complete block | `response_to_message` |
+///
+/// Emitting one `AgentStreamEvent::Thinking` per message therefore rendered a
+/// single passage as hundreds of one-fragment `<p>`s in `sections/Chat.tsx`
+/// (which appends thinking frames while it concatenates text deltas), with the
+/// inter-fragment spacing destroyed by a per-fragment `.trim()`. Buffering
+/// fixes that without costing anything on the streaming surface: `Chat.tsx`
+/// gates the whole thinking panel on `!msg.streaming`, so nothing was rendered
+/// mid-turn anyway.
+///
+/// The buffer is written only through [`ReasoningCoalescer::push`], which
+/// carries the display gate. With `emit` false nothing is ever stored, so a
+/// voice turn or a `show_thinking = false` turn holds no reasoning text in
+/// memory at all — the gate narrows both the surface and the residency.
+#[derive(Default)]
+struct ReasoningCoalescer {
+    buf: String,
+}
+
+impl ReasoningCoalescer {
+    /// Append this message's reasoning fragments, **raw**.
+    ///
+    /// No trimming and no blank-dropping happen here: a fragment that is a lone
+    /// `" "` is the space between two words, and dropping it is precisely how
+    /// `"the user asked about the light"` became `"the userasked aboutthe
+    /// light"`. Normalisation happens once, in [`Self::flush`], at the surface
+    /// that actually produces a frame.
+    fn push(&mut self, msg: &Message, emit: bool) {
+        for fragment in GooseAdapter::reasoning_frames(msg, emit) {
+            self.buf.push_str(&fragment);
+        }
+    }
+
+    /// Whether the buffered passage has outgrown [`REASONING_BUFFER_LIMIT`].
+    fn over_cap(&self) -> bool {
+        self.buf.len() >= REASONING_BUFFER_LIMIT
+    }
+
+    /// Bytes currently buffered — for the over-cap log line only.
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Take the passage, trimmed once, or `None` if there is nothing readable.
+    ///
+    /// This is the surface that keeps P1's user-visible claim: no blank frame,
+    /// no ciphertext. `RedactedThinking` never enters the buffer (it is dropped
+    /// in the lift), and a buffer holding only whitespace trims to empty and
+    /// yields nothing rather than a flickering empty paragraph.
+    fn flush(&mut self) -> Option<String> {
+        let passage = std::mem::take(&mut self.buf);
+        let trimmed = passage.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(trimmed.to_string())
+    }
+}
+
 impl GooseAdapter {
     /// Primary factory — all repos are injected by `pond-server/main.rs`.
     pub async fn new(
@@ -1511,6 +1593,12 @@ impl GooseAdapter {
     /// Nothing is persisted here — PAI-5 P6 owns that, and until it lands
     /// reasoning stays out of `session_messages` and out of any replayed
     /// context.
+    ///
+    /// **These are fragments, not frames.** The name is kept because the gate
+    /// living inside this function is the load-bearing P1 decision and must not
+    /// move to the call site, but what comes out is raw and may be a lone
+    /// space. It goes into [`ReasoningCoalescer`], which is the only thing that
+    /// produces an `AgentStreamEvent::Thinking`.
     fn reasoning_frames(msg: &Message, emit: bool) -> Vec<String> {
         if !emit {
             return Vec::new();
@@ -1518,18 +1606,53 @@ impl GooseAdapter {
         Self::reasoning_blocks(msg)
     }
 
-    /// The reasoning blocks a message carries, with no display gate.
+    /// The reasoning fragments a message carries, with no display gate.
     ///
     /// Split out of `reasoning_frames` so the *count* and the *display* read
     /// the same content through one extraction, while only the display is gated
     /// on `show_thinking`.
+    ///
+    /// Deliberately **not** trimmed and **not** filtered for blanks. It used to
+    /// be both, back when one message was assumed to be one whole block; on the
+    /// delta providers that assumption made every inter-word space disappear.
+    /// `ReasoningCoalescer::flush` does the trim, once, on the assembled
+    /// passage.
     fn reasoning_blocks(msg: &Message) -> Vec<String> {
         msg.content
             .iter()
             .filter_map(|c| c.as_thinking())
-            .map(|t| t.thinking.trim().to_string())
-            .filter(|t| !t.is_empty())
+            .map(|t| t.thinking.clone())
             .collect()
+    }
+
+    /// Whether this message ends the reasoning passage in flight.
+    ///
+    /// Defined as "the message carries something **this adapter would yield**":
+    /// a tool request, a tool response, or non-empty answer text. That
+    /// definition is what makes coalescing correct for every provider family
+    /// rather than only the delta ones:
+    ///
+    /// - A whole-block provider (anthropic, or any non-streaming response) is
+    ///   followed by text or a tool call, so its block flushes on its own and
+    ///   is emitted verbatim, unmerged. Two of its blocks can only be adjacent
+    ///   across a tool round-trip, which itself flushes.
+    /// - A delta provider accumulates across the `Usage` and `HistoryReplaced`
+    ///   events that interleave its fragments — those are different
+    ///   `AgentEvent` variants and never reach the buffer — and lands as one
+    ///   passage.
+    ///
+    /// `Thinking` and `RedactedThinking` never end a block, and neither does a
+    /// message carrying only a `SystemNotification`: GIAP yields nothing for
+    /// one, so splitting there would be invisible to the user and would cut a
+    /// passage in half for no reason.
+    fn message_ends_reasoning(msg: &Message) -> bool {
+        use goose::conversation::message::MessageContent;
+        msg.content.iter().any(|c| {
+            matches!(
+                c,
+                MessageContent::ToolRequest(_) | MessageContent::ToolResponse(_)
+            )
+        }) || !msg.as_concat_text().is_empty()
     }
 
     /// PAI-5 P2. Tokens this message spent on reasoning.
@@ -3557,6 +3680,11 @@ impl GooseAdapter {
                 // (GOOSE_MAX_EMPTY_TURN_RETRIES=0); GIAP re-engages with a changed
                 // prompt, and says something actionable once the budget is spent.
                 let mut attempt: usize = 0;
+                // PAI-5 P1 (granularity). One reasoning passage in flight.
+                // Declared outside `'attempts` only so it is obviously a single
+                // buffer; every attempt flushes it before it ends, so no
+                // reasoning ever crosses a re-engagement boundary.
+                let mut reasoning = ReasoningCoalescer::default();
                 'attempts: loop {
                     let attempt_text = if attempt == 0 {
                         turn_text.clone()
@@ -3602,8 +3730,27 @@ impl GooseAdapter {
                                 // anybody is shown it.
                                 *turn_stats.reasoning_tokens.get_or_insert(0) +=
                                     Self::count_reasoning_tokens(&msg, reasoning_counter.as_ref());
-                                for content in Self::reasoning_frames(&msg, emit_reasoning) {
-                                    yield Ok(AgentStreamEvent::Thinking { content });
+                                // PAI-5 P1 (granularity). Buffer the fragment;
+                                // emit only when the passage is finished. On
+                                // the local/gguf path one message is one TOKEN
+                                // PIECE, so yielding per message rendered a
+                                // paragraph per token with the spacing trimmed
+                                // out of it.
+                                reasoning.push(&msg, emit_reasoning);
+                                let ends_block = Self::message_ends_reasoning(&msg);
+                                let overflowed = reasoning.over_cap();
+                                if overflowed {
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        bytes = reasoning.len(),
+                                        "reasoning passage exceeded the coalescer cap; \
+                                         emitting it as a partial block",
+                                    );
+                                }
+                                if ends_block || overflowed {
+                                    if let Some(content) = reasoning.flush() {
+                                        yield Ok(AgentStreamEvent::Thinking { content });
+                                    }
                                 }
                                 // Emit tool call and result events
                                 for content in &msg.content {
@@ -3827,6 +3974,15 @@ impl GooseAdapter {
                     }
                 }
 
+                    // PAI-5 P1 (granularity). The passage the stream ended on.
+                    // A turn CAN end in pure reasoning — gemma-4-E2B closes its
+                    // thinking block and emits end_of_turn with no text — and a
+                    // coalescer that drops that block is strictly worse than
+                    // the confetti it replaced. Inside `'attempts` so it is
+                    // both the per-attempt and the end-of-stream flush.
+                    if let Some(content) = reasoning.flush() {
+                        yield Ok(AgentStreamEvent::Thinking { content });
+                    }
                     if produced_visible {
                         break 'attempts;
                     }
@@ -4764,13 +4920,187 @@ mod tests {
             "as_concat_text is still the answer-only view; that is the whole reason \
              a separate lift is needed"
         );
+        // The lift is RAW — padding and all. Normalisation is the coalescer's
+        // job and happens once per passage, not once per fragment.
         assert_eq!(
             GooseAdapter::reasoning_frames(&msg, true),
-            vec!["the user asked about the porch light".to_string()],
+            vec!["  the user asked about the porch light  ".to_string()],
         );
         assert!(
             GooseAdapter::reasoning_frames(&msg, false).is_empty(),
             "the gate is applied inside the lift, not only at the call site"
+        );
+        // And the frame a user actually sees is the trimmed passage.
+        let mut coalescer = ReasoningCoalescer::default();
+        coalescer.push(&msg, true);
+        assert_eq!(
+            coalescer.flush(),
+            Some("the user asked about the porch light".to_string()),
+        );
+    }
+
+    /// THE guard for PAI-5 P1's granularity clause, and the sequence the design
+    /// doc demands verbatim.
+    ///
+    /// On the shipped headline configuration — a Jetson on `chat_provider =
+    /// local` / gguf with `show_thinking = true` — goose emits one
+    /// `AgentEvent::Message` per token piece
+    /// (`goose-local-inference/src/llamacpp/inference_native_tools.rs` calls
+    /// `push_structured_reasoning` from inside the per-token callback). One
+    /// frame per message therefore meant one `<p>` per token in `Chat.tsx`,
+    /// with every inter-word space eaten by a per-fragment `.trim()`.
+    ///
+    /// The count assertion is not decoration: a coalescer that emitted the
+    /// right text in three pieces would still be the bug.
+    #[test]
+    fn a_reasoning_passage_arrives_as_one_frame_with_its_spacing_intact() {
+        let mut coalescer = ReasoningCoalescer::default();
+        let mut frames: Vec<String> = Vec::new();
+        for fragment in [" the user", " asked about", " the light"] {
+            let msg = Message::assistant().with_thinking(fragment, "");
+            coalescer.push(&msg, true);
+            assert!(
+                !GooseAdapter::message_ends_reasoning(&msg),
+                "a message carrying only reasoning must not end the passage, or \
+                 every delta flushes and nothing was coalesced"
+            );
+        }
+        if let Some(content) = coalescer.flush() {
+            frames.push(content);
+        }
+
+        assert_eq!(
+            frames.len(),
+            1,
+            "a single reasoning passage produced {} frames; the consumer renders \
+             one <p> per frame, so this is the per-token confetti P1 shipped. \
+             Frames: {:?}",
+            frames.len(),
+            frames
+        );
+        assert_eq!(
+            frames[0], "the user asked about the light",
+            "the passage lost its inter-fragment whitespace. A per-fragment trim \
+             joins the deltas as \"the userasked aboutthe light\"; the trim must \
+             happen ONCE, on the assembled passage."
+        );
+    }
+
+    /// Coalescing must not become "merge the whole turn". `anthropic.rs`
+    /// accumulates `ThinkingDelta` internally and emits exactly ONE
+    /// `with_thinking(..)` at `content_block_stop`, as does every non-streaming
+    /// response path — so on those providers a message IS a complete block, and
+    /// fusing two of them would invent a passage the model never wrote.
+    ///
+    /// Two whole blocks can only be adjacent across something the user sees, so
+    /// the flush condition ("this message carries something the adapter would
+    /// yield") separates them without knowing which provider it is talking to.
+    #[test]
+    fn a_whole_block_provider_is_not_merged_into_one_giant_block() {
+        const FIRST: &str = "The user wants the porch light. I should check the registry.";
+        const SECOND: &str = "The registry says it exists and is off. I can turn it on.";
+
+        let mut coalescer = ReasoningCoalescer::default();
+        let mut frames: Vec<String> = Vec::new();
+
+        // Mirrors the stream's own sequence: push, then flush iff this message
+        // carries something the adapter would yield.
+        fn feed(msg: Message, coalescer: &mut ReasoningCoalescer, frames: &mut Vec<String>) {
+            coalescer.push(&msg, true);
+            if GooseAdapter::message_ends_reasoning(&msg) {
+                if let Some(content) = coalescer.flush() {
+                    frames.push(content);
+                }
+            }
+        }
+
+        feed(
+            Message::assistant().with_thinking(FIRST, ""),
+            &mut coalescer,
+            &mut frames,
+        );
+        // Something visible: the answer text that closes the first block.
+        feed(
+            Message::assistant().with_text("Checking the registry."),
+            &mut coalescer,
+            &mut frames,
+        );
+        feed(
+            Message::assistant().with_thinking(SECOND, ""),
+            &mut coalescer,
+            &mut frames,
+        );
+        if let Some(content) = coalescer.flush() {
+            frames.push(content);
+        }
+
+        assert_eq!(
+            frames.len(),
+            2,
+            "two complete provider blocks came out as {} frame(s). Merging them \
+             fuses reasoning the model emitted separately. Frames: {:?}",
+            frames.len(),
+            frames
+        );
+        assert_eq!(frames[0], FIRST);
+        assert_eq!(frames[1], SECOND);
+    }
+
+    /// The worst failure mode a coalescer can have: buffering a passage and
+    /// then never emitting it. That is strictly worse than the confetti it
+    /// replaced, because the user sees nothing at all.
+    ///
+    /// It is a real case, not a hypothetical — a turn can end in pure reasoning
+    /// (gemma-4-E2B closes its thinking block and emits end_of_turn with no
+    /// text), which is exactly why the empty-turn re-engagement loop exists in
+    /// this file.
+    #[test]
+    fn a_block_that_ends_the_turn_is_not_dropped() {
+        let mut coalescer = ReasoningCoalescer::default();
+        for fragment in ["I should", " check the", " device registry."] {
+            let msg = Message::assistant().with_thinking(fragment, "");
+            coalescer.push(&msg, true);
+            assert!(!GooseAdapter::message_ends_reasoning(&msg));
+        }
+        assert_eq!(
+            coalescer.flush(),
+            Some("I should check the device registry.".to_string()),
+            "the turn ended in pure reasoning and the buffered passage was lost. \
+             The stream needs a flush AFTER the goose event loop drains, not only \
+             inside it."
+        );
+    }
+
+    /// The display gate owns the BUFFER, not just the frame. With the gate shut
+    /// nothing is stored, so a voice turn or a `show_thinking = false` turn
+    /// holds no reasoning text in memory at all — and a later flush cannot
+    /// resurrect it. Access narrows on failure: `Settings::default()` must
+    /// produce no frame either.
+    #[test]
+    fn the_display_gate_still_owns_the_buffer() {
+        let mut coalescer = ReasoningCoalescer::default();
+        for fragment in [" the user", " asked about", " the light"] {
+            coalescer.push(&Message::assistant().with_thinking(fragment, ""), false);
+        }
+        assert_eq!(
+            coalescer.flush(),
+            None,
+            "reasoning was buffered with the display gate shut; on a voice turn \
+             that is unspeakable text one flush away from the speaker"
+        );
+
+        let fallback = pond_core::user_data::domain::settings::Settings::default();
+        let emit = GooseAdapter::reasoning_frames_enabled(fallback.show_thinking, false);
+        let mut coalescer = ReasoningCoalescer::default();
+        coalescer.push(
+            &Message::assistant().with_thinking("something private", ""),
+            emit,
+        );
+        assert_eq!(
+            coalescer.flush(),
+            None,
+            "the settings-read fallback emitted reasoning; a scope-widening default \
+             is a bug"
         );
     }
 
@@ -4779,14 +5109,33 @@ mod tests {
     /// thinking panel — a data-out surface with nothing readable to justify it.
     /// Empty and whitespace-only blocks are dropped for the same reason a blank
     /// SSE frame is: it renders as a flicker and says nothing.
+    ///
+    /// Aimed at the FLUSH, not at the lift. The lift is now raw on purpose — a
+    /// lone `" "` fragment is the space between two words and must survive it —
+    /// so asserting "the raw lift returned a non-empty whitespace string" would
+    /// be the guard quietly degrading into a restatement of the change. The
+    /// claim that matters is the one at the surface: no frame reaches the
+    /// stream.
     #[test]
     fn ciphertext_and_blank_reasoning_never_reach_the_stream() {
         let msg = Message::assistant()
             .with_redacted_thinking("ZW5jcnlwdGVkLXJlYXNvbmluZw==")
             .with_thinking("   ", "")
             .with_thinking("\n\t", "");
+
         assert!(
-            GooseAdapter::reasoning_frames(&msg, true).is_empty(),
+            !GooseAdapter::reasoning_frames(&msg, true)
+                .iter()
+                .any(|f| f.contains("ZW5jcnlwdGVk")),
+            "provider ciphertext entered the reasoning channel; RedactedThinking \
+             must be dropped in the lift, not merely trimmed later"
+        );
+
+        let mut coalescer = ReasoningCoalescer::default();
+        coalescer.push(&msg, true);
+        assert_eq!(
+            coalescer.flush(),
+            None,
             "redacted or blank reasoning produced a frame"
         );
     }
@@ -4798,24 +5147,66 @@ mod tests {
     /// and nothing joined them. Asserted against the source because the stream
     /// body is an `async_stream` closure over a live Goose agent and cannot be
     /// driven from a unit test.
+    /// The stream body with every `//` comment removed, one entry per line.
+    ///
+    /// Round 1 shipped a guard that a COMMENT satisfied: the egress guard
+    /// searched for bare symbols, so prose naming the tracker certified two
+    /// files that did not call it. Every structural assertion in this file
+    /// reads code only.
+    fn stream_body_code() -> Vec<String> {
+        let src = include_str!("goose_agent.rs");
+        let body = src.split("mod tests").next().unwrap_or(src);
+        body.lines()
+            .map(|l| match l.find("//") {
+                Some(i) => l[..i].to_string(),
+                None => l.to_string(),
+            })
+            .collect()
+    }
+
     #[test]
     fn every_thinking_frame_leaves_through_the_gate() {
         let src = include_str!("goose_agent.rs");
         let body = src.split("mod tests").next().unwrap_or(src);
+        let code = stream_body_code();
 
-        // Counted on the `yield` prefix, not on the bare type name: two doc
-        // comments above name the variant, and a guard that trips on prose is a
-        // guard nobody will keep.
-        assert_eq!(
-            body.matches("yield Ok(AgentStreamEvent::Thinking").count(),
-            1,
-            "more than one place yields a Thinking frame; every one of them must \
-             go through reasoning_frames_enabled or reasoning can reach a voice \
-             session"
-        );
+        // NOT a count. There are two flush sites now (one per completed block,
+        // one after the event loop drains), and pinning "== 2" is the exact
+        // shape that certified a fourth ungated egress entry point in round 1:
+        // a THIRD raw yield would satisfy a bumped number. Instead every yield
+        // must be able to name the coalescer immediately above it, so the
+        // assertion scales with however many flush sites the stream grows.
+        let yields: Vec<usize> = code
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("yield Ok(AgentStreamEvent::Thinking"))
+            .map(|(i, _)| i)
+            .collect();
         assert!(
-            body.contains("for content in Self::reasoning_frames(&msg, emit_reasoning)"),
-            "the Thinking frame is no longer produced by the gated lift"
+            !yields.is_empty(),
+            "nothing yields a Thinking frame any more; PAI-5 P1's structured \
+             reasoning channel has been removed"
+        );
+        for i in &yields {
+            let window = &code[i.saturating_sub(3)..*i];
+            assert!(
+                window.iter().any(|l| l.contains("reasoning.flush()")),
+                "the Thinking frame yielded at line {} does not come out of \
+                 ReasoningCoalescer::flush. The coalescer is where the once-per-\
+                 passage trim and the buffered display gate live, so a raw yield \
+                 here re-opens both the per-token confetti and the path by which \
+                 ungated reasoning reaches a voice session.",
+                i + 1
+            );
+        }
+        assert_eq!(
+            code.iter()
+                .filter(|l| l.contains("reasoning.push(&msg, emit_reasoning)"))
+                .count(),
+            1,
+            "the gated push into the reasoning coalescer must appear exactly once. \
+             A second, ungated push would fill the buffer on a voice turn and the \
+             next flush would emit it."
         );
         assert!(
             body.contains("Self::reasoning_frames_enabled(settings.show_thinking, is_voice)"),
@@ -4831,6 +5222,57 @@ mod tests {
             "is_voice is no longer composed by voice_turn(instance, request). If the \
              per-request flag was dropped, reasoning leaks to every desktop voice turn: \
              the serve-mode adapter hardcodes the instance flag to false."
+        );
+    }
+
+    /// The flush that is easiest to delete and hardest to notice.
+    ///
+    /// `a_block_that_ends_the_turn_is_not_dropped` proves the coalescer can
+    /// emit a trailing passage; it cannot prove the STREAM asks it to. Removing
+    /// the flush that sits after the goose event loop leaves every unit test
+    /// green and silently drops the last reasoning block of every turn that
+    /// ends in reasoning.
+    ///
+    /// Anchored on the loop's own closing brace rather than on "after the
+    /// `while let` line", because the in-loop flush also sits after that line —
+    /// a guard written that way would pass with the trailing flush deleted,
+    /// which is the whole failure it exists to catch.
+    #[test]
+    fn the_last_reasoning_block_of_a_turn_is_flushed_after_the_event_loop() {
+        let code = stream_body_code();
+
+        let loop_start = code
+            .iter()
+            .position(|l| l.contains("while let Some(event_result) = goose_stream.next().await {"))
+            .expect("the goose event loop is gone");
+        let indent = |l: &String| l.len() - l.trim_start().len();
+        let loop_indent = indent(&code[loop_start]);
+        let loop_end = (loop_start + 1..code.len())
+            .find(|&i| code[i].trim() == "}" && indent(&code[i]) == loop_indent)
+            .expect("could not find the end of the goose event loop");
+        let recovery = code
+            .iter()
+            .position(|l| l.contains("if produced_visible {"))
+            .expect("the empty-turn recovery check is gone");
+        assert!(
+            loop_end < recovery,
+            "the event loop no longer closes before the empty-turn recovery check; \
+             this guard's anchors have rotted and must be re-derived"
+        );
+
+        assert!(
+            code[loop_end + 1..recovery]
+                .iter()
+                .any(|l| l.contains("reasoning.flush()")),
+            "there is no reasoning.flush() between the end of the goose event loop \
+             (line {}) and the empty-turn recovery check (line {}). Without it the \
+             LAST reasoning passage of the turn is buffered and never emitted — and \
+             a turn ending in pure reasoning is real, not hypothetical: it is the \
+             case the re-engagement loop directly below exists to handle. A \
+             coalescer that drops the final block is worse than the per-token \
+             frames it replaced.",
+            loop_end + 1,
+            recovery + 1
         );
     }
 
@@ -4895,12 +5337,16 @@ mod tests {
     fn the_reasoning_count_is_taken_outside_the_display_gate() {
         let src = include_str!("goose_agent.rs");
         let body = src.split("mod tests").next().unwrap_or(src);
-        let lines: Vec<&str> = body.lines().collect();
+        let lines = stream_body_code();
 
+        // Re-anchored on the coalescer push. The old anchor was the
+        // `for content in Self::reasoning_frames(&msg, emit_reasoning)` line,
+        // which this phase deleted — and it was `.expect()`ed, so the guard
+        // would have PANICKED rather than reported anything useful.
         let gate_line = lines
             .iter()
-            .position(|l| l.contains("for content in Self::reasoning_frames(&msg, emit_reasoning)"))
-            .expect("the gated lift is gone; the P1 guard should have caught this first");
+            .position(|l| l.contains("reasoning.push(&msg, emit_reasoning)"))
+            .expect("the gated push is gone; the P1 guard should have caught this first");
 
         let window = &lines[gate_line.saturating_sub(8)..gate_line];
         window

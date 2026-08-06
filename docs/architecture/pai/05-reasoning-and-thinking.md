@@ -265,6 +265,10 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   > `(false, true)` row is asserted first and by name, because it is the shipped-desktop case. The
   > source guard additionally pins the composition, not just the token. Both mutations now go red.
 
+  > **RESOLVED 2026-08-06 by P1-granularity — see the stamp directly below this note.** The
+  > diagnosis under it is correct and is left standing verbatim, because it is the record of what
+  > the defect was and it is the thing that falsifies the fix.
+  >
   > **OPEN 2026-08-06 (synthesis), NOT fixed: the frame granularity is wrong, and the phase's claim
   > that "the consumer already exists, so this is observable end-to-end with no further work" is
   > false in shape rather than in degree.** P1 emits ONE `Thinking` frame per `AgentEvent::Message`.
@@ -293,6 +297,134 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   > message and emit one frame per completed block, or keep per-delta frames and stop trimming.
   > Either way the test must drive a SEQUENCE: `[" the user", " asked about", " the light"]` must
   > round-trip to `"the user asked about the light"`, not `"the userasked aboutthe light"`.
+
+  > **P1-granularity — LANDED 2026-08-06. Reasoning frames are coalesced per block in
+  > `GooseAdapter`, flushed on visible output and at end of stream.** One file:
+  > `crates/pond-adapters-goose/src/goose_agent.rs`. No route, no handler, no migration, no startup
+  > wiring, no `Settings` field — `routes.rs`, `main.rs` and `Chat.tsx` keep working unchanged,
+  > which is the point of fixing this at the producer.
+  >
+  > **What landed.** `ReasoningCoalescer { buf: String }` with `push(&Message, emit)` /
+  > `over_cap()` / `flush() -> Option<String>`. `reasoning_frames(msg, emit)` keeps the display gate
+  > INSIDE it — that is the load-bearing P1 decision and moving it to the call site is how it gets
+  > lost — but it is now the RAW fragment lift: no per-fragment `.trim()`, no dropping of
+  > whitespace-only fragments, because a lone `" "` is the space between two words. Trim-once and
+  > drop-if-blank moved into `flush()`, so P1's user-visible claim (no blank frame, no ciphertext)
+  > is kept at the surface that actually produces a frame. `RedactedThinking` is still dropped in
+  > the lift, so provider ciphertext never enters the buffer at all.
+  >
+  > **Why the flush condition is load-bearing rather than decoration.** The round-1 note reads as
+  > though every provider emits deltas. It does not, and an unconditional turn-wide merge would be
+  > WRONG:
+  >
+  > | provider family | one `AgentEvent::Message` is… | source |
+  > |---|---|---|
+  > | local / gguf (the Jetson headline config) | one **token piece** | `goose-local-inference/src/llamacpp/inference_native_tools.rs` calls `push_structured_reasoning` from inside the per-token `\|piece\|` callback; `thinking_output.rs` returns the raw delta |
+  > | openai-format HTTP (Ollama, DeepSeek, OpenRouter, vLLM) | one streamed **delta** | `goose-provider-types/src/formats/openai.rs` pushes each chunk's newly-arrived `reasoning_text()` |
+  > | google | one **part** | delta-shaped |
+  > | anthropic | one **complete block** | `formats/anthropic.rs` accumulates `ThinkingDelta` in local state and emits once at `content_block_stop` |
+  > | any non-streaming response | one **complete block** | `response_to_message` |
+  >
+  > So the flush condition is `message_ends_reasoning(msg)`: true iff the message carries something
+  > **this adapter would yield** — a `ToolRequest`, a `ToolResponse`, or non-empty
+  > `as_concat_text()`. Defined that way rather than "has text" because a `SystemNotification`-only
+  > message produces nothing in GIAP, so splitting there would cut a passage in half invisibly.
+  > `Thinking` and `RedactedThinking` never end a block. The consequence for a whole-block provider
+  > is that its block is followed by text or a tool call and therefore flushes on its own, emitted
+  > verbatim and unmerged; two of its blocks can only be adjacent across a tool round-trip, which
+  > itself flushes. The consequence for a delta provider is that fragments accumulate across the
+  > `Usage` and `HistoryReplaced` events that interleave them — different `AgentEvent` variants,
+  > which never touch the buffer — and land as one passage.
+  >
+  > **The finding that kills the streaming-responsiveness objection.** `sections/Chat.tsx:633` gates
+  > the entire thinking panel on `!msg.streaming`. Nothing is rendered until the turn ends, so
+  > per-delta frames bought ZERO streaming responsiveness on the shipped desktop; what they bought
+  > was hundreds of React state updates (`[...prev.slice(0,-1)]` per token) and hundreds of
+  > one-fragment `<p>`s. There is no user-visible cost to buffering, and `pond-server/main.rs`
+  > prints thinking with `\r\x1b[K` (overwrite), where per-delta frames were a flicker.
+  >
+  > **A cap, not a promise.** `REASONING_BUFFER_LIMIT = 64 KiB` force-flushes and logs a `WARN`. A
+  > provider that never produces visible output would otherwise grow the buffer for a whole turn.
+  > This is bounded memory, not a correctness rule: crossing it splits the passage rather than
+  > dropping it.
+  >
+  > **What I deliberately did NOT do.** (a) I did not move `count_reasoning_tokens` into the
+  > coalescer — see the new open item below; the coalescer is display-gated and moving the count
+  > into it is exactly the `Some(0)`-for-the-whole-corpus regression synthesis closed one note up.
+  > (b) I did not touch `Chat.tsx`. Its append is correct once the producer emits blocks, and the
+  > file is held by another workstream this round. (c) I did not change persistence: P6 still owns
+  > that, and reasoning still never reaches `session_messages`. (d) I did not add a `Settings`
+  > field; the granularity is not a user choice.
+  >
+  > **Guards, and the three mutations run against them.** New:
+  > `a_reasoning_passage_arrives_as_one_frame_with_its_spacing_intact` (the SEQUENCE the note above
+  > demands, asserting the frame COUNT is 1 as well as the text),
+  > `a_whole_block_provider_is_not_merged_into_one_giant_block`,
+  > `a_block_that_ends_the_turn_is_not_dropped`, `the_display_gate_still_owns_the_buffer`,
+  > `the_last_reasoning_block_of_a_turn_is_flushed_after_the_event_loop`. Re-aimed:
+  > `ciphertext_and_blank_reasoning_never_reach_the_stream` now asserts at the FLUSH (asserting the
+  > raw lift is non-empty would have been the guard degrading into a restatement of the change).
+  > Mutations, each restored byte-identical: **M1** put `.trim()` back on each fragment in the lift —
+  > test 1 failed printing `"the userasked aboutthe light"`, naming destroyed whitespace rather than
+  > a bare assert. **M2** deleted the post-loop flush — exactly ONE guard caught it,
+  > `the_last_reasoning_block_of_a_turn_is_flushed_after_the_event_loop`, printing the two line
+  > numbers it looked between and naming the dropped final passage. Worth recording that
+  > `a_block_that_ends_the_turn_is_not_dropped` stayed GREEN under M2 and recon predicted it would
+  > fail: it is a pure coalescer test and knows nothing about the stream's wiring, which is the
+  > whole reason the positional guard has to exist alongside it. **M3** made
+  > `message_ends_reasoning` return `false` always — test 2 failed showing the two blocks fused into
+  > one frame.
+  >
+  > **Two source guards were rewritten, carefully, because this is where the fix could quietly
+  > weaken what synthesis just repaired.** `every_thinking_frame_leaves_through_the_gate` asserted
+  > `matches("yield Ok(AgentStreamEvent::Thinking").count() == 1`; there are two flush sites now,
+  > and bumping that to `== 2` is precisely the "vacuity control that pins the wrong number" shape —
+  > it would certify a third, ungated yield. It now iterates EVERY such yield and requires
+  > `reasoning.flush()` in the three lines above it, plus exactly one
+  > `reasoning.push(&msg, emit_reasoning)`, and it reads comment-stripped source so prose cannot
+  > satisfy it. The `reasoning_frames_enabled(settings.show_thinking, is_voice)` and
+  > `voice_turn(voice_instance, request.voice_mode)` composition pins are kept verbatim.
+  > `the_reasoning_count_is_taken_outside_the_display_gate` `.expect()`ed the
+  > `for content in Self::reasoning_frames(&msg, emit_reasoning)` line this phase deleted — it would
+  > have PANICKED rather than reported. Re-anchored on `reasoning.push(&msg, emit_reasoning)`, with
+  > the whole-eight-line-window scan kept.
+  >
+  > **The positional guard is anchored on the loop's closing brace, not on "after the `while let`
+  > line".** Recon proposed the latter; it is vacuous, because the in-loop flush also sits after
+  > that line, so deleting the trailing flush would have left it green — the exact failure it exists
+  > to catch. It now locates the `while let Some(event_result) = goose_stream.next().await {` line,
+  > finds the `}` at matching indentation, and requires a `reasoning.flush()` between that brace and
+  > `if produced_visible {`.
+  >
+  > **Reachable in production.** A Jetson on `chat_provider = local` / gguf with
+  > `show_thinking = true` and `thinking_mode` on — the shipped headline configuration — takes this
+  > path on every turn, and the frames reach `Chat.tsx` through `routes.rs` unchanged.
+  >
+  > **What would falsify it.** One turn on that configuration whose thinking panel still renders as
+  > many one-word paragraphs; or a passage that renders with its inter-word spaces missing; or an
+  > anthropic-family turn whose two reasoning blocks render as one; or a turn ending in pure
+  > reasoning (gemma-4-E2B does this) that renders no thinking panel at all.
+  >
+  > `RUSTFLAGS="" SQLX_OFFLINE=true cargo test -p pond-adapters-goose` — 114 pass, 0 fail;
+  > `cargo fmt --check` clean; `cargo clippy -p pond-adapters-goose --all-targets` emits nothing new
+  > in `goose_agent.rs`.
+
+  > **OPEN 2026-08-06 (P1-granularity), NOT fixed and NOT to be fixed inside the coalescer: PAI-5
+  > P2's reasoning count is taken per MESSAGE, which on the delta providers means per token piece.**
+  > `count_reasoning_tokens` is called once per `AgentEvent::Message`, so on local/gguf and on the
+  > openai format it counts a ~4-character fragment at a time. With `HeuristicTokenCounter`
+  > (`token_counting.rs`, `text.len() / CHARS_PER_TOKEN`, integer division, no `max(1)`) that
+  > truncates to **0** for most fragments — a large systematic UNDERCOUNT of the number P5 sizes
+  > `output_reserve_tokens` from. It only bites when tiktoken fails to build and
+  > `token_counter_handle()` falls back; with tiktoken it is roughly right.
+  >
+  > **Do not "fix" this by counting at flush time.** The coalescer is display-gated by design, and
+  > `chat.rs::stream_response_inner` — the only path that persists the number — builds its request
+  > with `voice_mode: true`, so `emit_reasoning` is always false there. Moving the count into the
+  > coalescer would write `Some(0)` for 100% of the corpus, which is the exact regression the
+  > correction two notes above closed. A real fix needs a second, UNGATED accumulator for the raw
+  > fragment text, which is more machinery than that phase warrants; it belongs wherever P5's
+  > reserve is next touched.
 
   **The phase as written targeted a crate that cannot execute.** `ChatEvent::Reasoning` and
   `pond-inference`'s `reasoning_content` both belong to the quarantined PondAgent loop (Q2-05), so
