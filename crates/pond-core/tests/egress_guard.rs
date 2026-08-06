@@ -35,8 +35,10 @@ use std::path::{Path, PathBuf};
 const MIN_FILES_SCANNED: usize = 300;
 /// Below this the send detector has broken, not the code moved. 18 today.
 const MIN_SENDERS: usize = 15;
-/// P5 leaves six real-egress files unreached. This number only ever goes down.
-const MAX_UNGATED: usize = 6;
+/// P6a gated five of P5's six. One remains -- `pond-api/src/routes.rs`, whose
+/// nine egress sites are interleaved with seven loopback ones. This number only
+/// ever goes down.
+const MAX_UNGATED: usize = 1;
 
 /// Any of these in a file's production source means it reaches the tracker.
 const TRACKER_SYMBOLS: &[&str] = &[
@@ -48,11 +50,25 @@ const TRACKER_SYMBOLS: &[&str] = &[
 ];
 
 /// Files whose outbound calls reach the shared egress tracker.
+///
+/// NECESSARY BUT NOT SUFFICIENT, and the phase that filled this list out said so
+/// out loud: [`egress_tracked_files_reach_the_tracker`] looks for ONE tracker
+/// symbol per FILE. `pond-hf-cache/src/lib.rs` has two senders and
+/// `pond-api/src/routes.rs` has nine, so gating one of them would turn this
+/// guard green while the rest still phone out. Each multi-sender file therefore
+/// carries a behavioural test of its own -- for the HF cache, the three
+/// `head_redirect_*` / `get_redirect_*` / `a_permitted_redirect_chain_*` tests
+/// in its own `mod tests`, one per site plus a vacuity control.
 const EGRESS_TRACKED: &[&str] = &[
+    "crates/pond-adapters-goose/src/extension_manager.rs",
+    "crates/pond-adapters-goose/src/vision_encoder.rs",
     "crates/pond-adapters-weather/src/lib.rs",
+    "crates/pond-hf-cache/src/lib.rs",
     "crates/pond-infra/src/fcm_push_relay.rs",
     "crates/pond-infra-scheduler/src/webhook_executor.rs",
     "crates/pond-mcp-server/src/http.rs",
+    "crates/pond-server/src/main.rs",
+    "crates/pond-server/src/model_download.rs",
     "crates/pond-server/src/schedule_executors.rs",
 ];
 
@@ -118,33 +134,12 @@ const LOOPBACK_ONLY: &[Exempt] = &[
 /// This list is the honest scope of `network_mode = "offline"`: these calls
 /// still leave the machine. It exists instead of a silent gap, and the cap
 /// above is what stops it becoming a parking lot.
-const UNGATED_SENDERS: &[(&str, &str)] = &[
-    (
-        "crates/pond-api/src/routes.rs",
-        "HF model search/info, GitHub releases, Spotify, OAuth token exchange -- \
-         9 sites mixed with 7 loopback ones (piper, whisper, ollama). PAI-2 P6.",
-    ),
-    (
-        "crates/pond-server/src/main.rs",
-        "OAuth refresh loop against each provider's token_url. PAI-2 P6.",
-    ),
-    (
-        "crates/pond-server/src/model_download.rs",
-        "model/voice/ONNX downloads from huggingface.co and github.com. PAI-2 P6.",
-    ),
-    (
-        "crates/pond-hf-cache/src/lib.rs",
-        "redirect-following HF blob fetches. PAI-2 P6.",
-    ),
-    (
-        "crates/pond-adapters-goose/src/vision_encoder.rs",
-        "downloads the vision encoder. Not in the fast-crate test set. PAI-2 P6.",
-    ),
-    (
-        "crates/pond-adapters-goose/src/extension_manager.rs",
-        "connectivity-probes a user-supplied MCP server URI. PAI-2 P6.",
-    ),
-];
+const UNGATED_SENDERS: &[(&str, &str)] = &[(
+    "crates/pond-api/src/routes.rs",
+    "HF model search/info, GitHub releases, Spotify, and BOTH OAuth token \
+     exchanges (authorization_code as well as refresh) -- 9 egress sites mixed \
+     with 7 loopback ones (piper, whisper, ollama). PAI-2 P6b.",
+)];
 
 // -- the scan -----------------------------------------------------------------
 
@@ -494,5 +489,96 @@ fn every_reqwest_crate_owns_a_classified_sender() {
          through a form the detector misses (Client::execute, reqwest::blocking, \
          a wrapper) -- teach `sends_http` about it.",
         unaccounted
+    );
+}
+
+/// The gate must be INSTALLED before anything downloads, on every entry point.
+///
+/// PAI-2 P6a found two ways this claim was false while every other test in this
+/// file was green, and neither is visible to a scan that only asks "does the
+/// file mention a tracker symbol".
+///
+/// 1. `set_network_mode` had exactly ONE call site, inside `run_server`. The
+///    mode is a process-global that defaults to `Open`, so `pond chat` -- which
+///    is also the terminal voice loop -- and `pond setup` ran with the setting
+///    unread. Every gate they inherited evaluated against a default nobody had
+///    chosen.
+/// 2. Inside `run_server`, `ensure_onnx_runtime()` -- which downloads ~100 MB
+///    from github.com by shelling out to `curl` -- ran 40-odd lines BEFORE the
+///    mode was installed. Gating it there would have been a mechanism that
+///    cannot fire, which this programme already has two of.
+///
+/// So this asserts ORDER, not presence. Presence is what was already true.
+///
+/// Source-text and not a runtime check because there is nothing to call: the
+/// defect is where a statement sits in a 3,000-line `async fn`. It lives in
+/// `pond-core` rather than beside `main.rs` because CI has no
+/// `cargo test -p pond-server` -- a guard there never fires on a PR. Same
+/// reasoning, and same shape, as
+/// `pond-infra/tests/redaction_chokepoints_are_wired.rs`.
+#[test]
+fn every_entry_point_installs_the_gate_before_it_downloads() {
+    let main_rs = workspace_root().join("crates/pond-server/src/main.rs");
+    let src = std::fs::read_to_string(&main_rs)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", main_rs.display()));
+    let prod = production_source(&src);
+
+    // Top-level items start at column 0, so this splits `main.rs` into function
+    // bodies without brace-counting. The marker is re-prepended so each chunk
+    // still carries the `fn` line it came from.
+    let chunks: Vec<String> = prod
+        .split("\nfn ")
+        .flat_map(|c| c.split("\nasync fn "))
+        .map(|c| c.to_string())
+        .collect();
+
+    let mut callers = 0usize;
+    for chunk in &chunks {
+        // The CALL, not the definition -- the definition's chunk starts with
+        // `ensure_onnx_runtime()` and contains no call.
+        let Some(call_at) = chunk.find("    ensure_onnx_runtime();") else {
+            continue;
+        };
+        callers += 1;
+
+        let name = chunk.lines().next().unwrap_or("<unknown>");
+        // The CALL form, with its path qualifier and opening paren -- not the
+        // bare symbol. Mutation-testing this guard is what forced the
+        // distinction: deleting the install from `run_chat` left the guard
+        // GREEN, because the comment ABOVE the deleted call still said the
+        // words "set_network_mode" and a substring search cannot tell prose
+        // from code. Every real call site in `main.rs` is written
+        // `..::egress::set_network_mode(`; a mention in a comment is not.
+        let install_at = chunk.find("egress::set_network_mode(");
+
+        assert!(
+            install_at.is_some(),
+            "`{name}` calls ensure_onnx_runtime(), which can download ~100 MB \
+             from github.com, but never calls set_network_mode -- so the \
+             process-global is still at its `Open` default and a stored \
+             `network_mode = \"offline\"` does not apply here. Install the mode \
+             from the settings row before the first fetch."
+        );
+        let install_at = install_at.unwrap();
+
+        assert!(
+            install_at < call_at,
+            "`{name}` installs the egress gate at byte {install_at} but calls \
+             ensure_onnx_runtime() at byte {call_at} -- the download happens \
+             BEFORE the setting that governs it is read, so the gate inside it \
+             can never refuse. Move the call below set_network_mode."
+        );
+    }
+
+    // Vacuity control. If `ensure_onnx_runtime` is renamed or the call sites
+    // move, the loop above finds nothing and reports success -- the exact
+    // failure shape this file's header warns about.
+    assert_eq!(
+        callers, 3,
+        "expected the 3 entry points that call ensure_onnx_runtime() \
+         (run_setup, run_server, run_chat); found {callers}. If a call site was \
+         added or removed, update this number after checking the new one \
+         installs the mode first. If it dropped to 0 the detector has broken, \
+         not the code."
     );
 }

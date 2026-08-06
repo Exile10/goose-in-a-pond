@@ -608,6 +608,27 @@ async fn run_setup(model: &str) -> Result<()> {
     let db_setup = Database::init(&data_dir).await?;
     println!("  ✅ Databases ready");
 
+    // PAI-2 P6a: `pond setup` is almost entirely downloads — whisper, piper,
+    // the chat model, the ONNX runtime — and it ran with the egress gate at its
+    // `Open` default because `set_network_mode` was only ever called by
+    // `run_server`. Installed here, before the first fetch in step 3, so a
+    // household that stored `offline` gets refusals it can act on instead of
+    // a setup command that quietly ignores the setting.
+    //
+    // This runs after the DB init because the setting lives in it; on a first
+    // run there are no rows and `Settings::default()` gives `open`, which is
+    // the same answer as before and the right one — nobody has asked for
+    // anything narrower yet.
+    pond_core::shared::services::egress::set_network_mode(
+        pond_core::shared::services::egress::NetworkMode::parse(
+            &SqliteSettingsRepository::new(db_setup.system.clone())
+                .get()
+                .await
+                .unwrap_or_default()
+                .network_mode,
+        ),
+    );
+
     // One-shot HF cache migration — moves pre-existing flat model files into
     // the content-addressed blob layout so subsequent downloads dedupe. Errors
     // are logged but never block startup. Idempotent via filesystem marker.
@@ -988,11 +1009,10 @@ async fn run_server(
     );
     println!("  ╚═══════════════════════════════════════╝");
 
-    // Ensure the ONNX Runtime shared library is available — check system
-    // paths first, then auto-download from GitHub Releases if needed.
-    // Must run before any ONNX-dependent init (face recognition, embeddings).
-    ensure_onnx_runtime();
-
+    // NOTE: `ensure_onnx_runtime()` used to be called here. It moved below the
+    // `set_network_mode` install, because it can DOWNLOAD, and a download
+    // cannot be gated by a setting that has not been read yet. See PAI-2 P6a.
+    //
     // Bake in the face-recognition runtime defaults so the server Just Works
     // on a fresh install without the operator having to remember a four-line
     // env-var incantation.  Every var stays overridable — we only set it
@@ -1038,6 +1058,19 @@ async fn run_server(
     pond_core::shared::services::egress::set_network_mode(
         pond_core::shared::services::egress::NetworkMode::parse(&settings.network_mode),
     );
+
+    // Ensure the ONNX Runtime shared library is available — check system
+    // paths first, then auto-download from GitHub Releases if needed.
+    // Must run before any ONNX-dependent init (face recognition, embeddings);
+    // those all happen further down, so nothing between here and the old site
+    // (`apply_face_recognition_defaults` sets env vars, `Database::init`, the
+    // HF-cache migration, the system-dep warning) touches ONNX.
+    //
+    // It must run AFTER `set_network_mode`, not before: it downloads ~100 MB
+    // from github.com, and at the old site the process-global was still at its
+    // `Open` default, so a stored `network_mode = "offline"` did not apply to
+    // the single largest outbound transfer `serve` makes. PAI-2 P6a.
+    ensure_onnx_runtime();
 
     // Override agent_backend from DB settings (UI can change it without CLI restart).
     // CLI flag takes precedence only when explicitly set to something other than "goose".
@@ -3135,7 +3168,26 @@ async fn run_server(
                         .flatten()
                         .unwrap_or_else(|| provider.bundled_client_id.clone());
 
-                    match refresh_http_client
+                    // PAI-2 P6a: gate before the token leaves the machine. This
+                    // is a background loop, so a refusal skips THIS provider on
+                    // THIS tick and the loop keeps running -- killing the worker
+                    // would mean tightening network_mode once permanently
+                    // disabled refresh, even after the user loosened it again.
+                    let call = match pond_core::shared::services::egress::begin(
+                        &provider.token_url,
+                        "POST",
+                    ) {
+                        Ok(call) => call,
+                        Err(denied) => {
+                            tracing::warn!(
+                                provider = %provider.id,
+                                "OAuth auto-refresh skipped: {denied}"
+                            );
+                            continue;
+                        }
+                    };
+
+                    let refreshed = refresh_http_client
                         .post(&provider.token_url)
                         .form(&[
                             ("grant_type", "refresh_token"),
@@ -3143,8 +3195,10 @@ async fn run_server(
                             ("client_id", client_id.as_str()),
                         ])
                         .send()
-                        .await
-                    {
+                        .await;
+                    call.finish(refreshed.as_ref().ok().map(|r| r.status().as_u16()));
+
+                    match refreshed {
                         Ok(resp) if resp.status().is_success() => {
                             if let Ok(body) = resp.json::<serde_json::Value>().await {
                                 if let Some(at) = body["access_token"].as_str() {
@@ -3449,10 +3503,9 @@ async fn run_chat(
     };
 
     let data_dir = default_data_dir();
-    // Must run before any ONNX-dependent init (Piper TTS). `serve` and `setup`
-    // already call this; without it here ORT_DYLIB_PATH is never set and
-    // Piper::new() hangs indefinitely.
-    ensure_onnx_runtime();
+    // NOTE: `ensure_onnx_runtime()` used to be called here, before the database
+    // even existed. It moved below the settings load for the reason given at
+    // its new site. PAI-2 P6a.
     let db = Database::init(&data_dir).await?;
 
     // Install the audit MCP server's read handle so the giap-audit extension works
@@ -3476,6 +3529,22 @@ async fn run_chat(
     // Falls back to Settings::default() when the DB has no rows yet (first run).
     let settings_repo_chat = SqliteSettingsRepository::new(db.system.clone());
     let settings = settings_repo_chat.get().await.unwrap_or_default();
+
+    // PAI-2 P6a: install the egress gate on THIS path too. `set_network_mode`
+    // had exactly one call site, inside `run_server`, and the mode is a
+    // process-global that defaults to `Open` — so `network_mode = "offline"`
+    // was a silent no-op for the whole of `pond chat`, which is also the
+    // terminal voice loop. Every outbound call this process makes, gated or
+    // not, was evaluated against a setting nobody had read.
+    pond_core::shared::services::egress::set_network_mode(
+        pond_core::shared::services::egress::NetworkMode::parse(&settings.network_mode),
+    );
+
+    // Must run before any ONNX-dependent init (Piper TTS); without it
+    // ORT_DYLIB_PATH is never set and Piper::new() hangs indefinitely. It runs
+    // after the mode install above because it can download ~100 MB from
+    // github.com, and a download cannot be gated by a setting read afterwards.
+    ensure_onnx_runtime();
 
     // CLI args override settings; settings provide the defaults from the chat role.
     let settings_provider = settings.chat_provider.clone();
@@ -4915,6 +4984,22 @@ fn download_and_extract_ort(
     let tgz = tmp_dir.join("ort.tgz");
 
     // ── Download ─────────────────────────────────────────────────────────
+    // PAI-2 P6a. This is a ~100 MB fetch from github.com and it was invisible
+    // to `egress_guard.rs`, which finds senders by looking for `reqwest`. A
+    // subprocess is a sender too. It is the only one in the tree
+    // (`Command::new("curl")` matches here and nowhere else), so the hole was
+    // one call, but it was the largest single outbound transfer the pond makes.
+    //
+    // `check_egress` and not `EgressCall::begin`: this fn is synchronous, and
+    // `EgressCall::finish` -> `record_egress` reaches `tokio::spawn`, which
+    // panics with no runtime on the thread. All three callers happen to be
+    // inside an async fn today, but nothing in the signature says so, and
+    // panicking inside a privacy check is the failure this module's own
+    // `append_event` doc warns about. A refusal is still recorded -- that path
+    // is runtime-safe -- so the audit trail keeps the half that matters.
+    pond_core::shared::services::egress::check_egress(url)
+        .map_err(|denied| anyhow::anyhow!("{denied}"))?;
+
     let status = Command::new("curl")
         .args([
             "-fSL",           // fail on HTTP errors, show errors, follow redirects
