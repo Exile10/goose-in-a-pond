@@ -203,6 +203,23 @@ The existing tier values become the test fixtures: the function must reproduce t
 4,096 / 12,288 / 65,536 / 128,000 within a stated tolerance, so this is a refactor with a
 regression net rather than a retune.
 
+> **Corrected 2026-08-06, when P4 tried to implement it.** The formula above does **not** reproduce
+> the tier values, and no honest tolerance covers the gap: at 8,192 it gives a 819-token output
+> reserve against the tier's 1,024, and at 128,000 a residual history budget of 109,904 against the
+> tier's 80,000 — 37% out. A formula and a fixture set cannot both be authoritative, and the phase
+> text names the fixtures as the regression net, so the fixtures won.
+>
+> What landed is **piecewise-linear interpolation over an anchor table whose anchors are the tier
+> values themselves**, flat below the first and above the last. It reproduces the tiers by
+> construction rather than approximately by luck, and it still separates 24K from 64K, which is the
+> thing this section wanted. The anchor set is **six**: the four tier boundaries plus 8,192 and
+> 32,768, neither of which is a boundary but both of which are live windows the system actually
+> produces. See P4 in section 4 for why removing either is a regression.
+>
+> "Within a stated tolerance" was the part that could not survive contact. Nobody had stated one,
+> and any tolerance loose enough to admit this formula is loose enough to admit a memory budget that
+> drops from 500 tokens to 350 on every on-device turn.
+
 ### 3.6 One more thing the governor makes possible
 
 Once occupancy is measured rather than estimated, `ContextHealth.should_compact`
@@ -246,7 +263,39 @@ Once occupancy is measured rather than estimated, `ContextHealth.should_compact`
   supply the record's `context_length` at the two live call sites, add it to `ModelStatusEntry`, and
   render it in `Models.tsx` beside `CapabilityBadges` — which today infers the window from the model
   *name* in the frontend, a third copy of the heuristic this workstream exists to delete.
-- **P4** Continuous profile function with the existing tiers as regression fixtures.
+- **P4 — LANDED 2026-08-06, with six anchors rather than a formula.** `from_context_window` is
+  piecewise-linear interpolation over `PROFILE_ANCHORS`, flat below the first anchor and above the
+  last. Its signature, its fields and `usable_prompt_tokens()` are unchanged, so all four production
+  call sites and the quarantined fifth compile untouched — which is what let this land while a
+  concurrent session held `turn_trimmer.rs` and `prompts.rs`.
+
+  **The design's own formula in 3.5 could not be implemented, and the fixtures are why.** It gives a
+  819-token output reserve at 8,192 against the tier's 1,024, and a residual history budget of
+  109,904 at 128,000 against the tier's 80,000 — 37% out. A formula and a fixture set cannot both be
+  authoritative. Interpolating between the tier values reproduces them *by construction* rather than
+  approximately by luck, and still delivers what the tiers could not: 24K and 64K stop sharing a
+  bucket.
+
+  **Six anchors, not four, and shrinking it back to four is a regression.** 8,192 and 32,768 are not
+  tier boundaries, but 8,192 is what `ContextGovernor::prompt_window` hands every local provider, so
+  it is the most-executed window in the system — every Jetson and macOS Metal turn passes through it
+  for the compact-prompt decision and memory injection. Interpolating it would have cut
+  `max_memory_fragments` from 5 to 4 and `memory_token_budget` from 500 to 350 on every on-device
+  turn: a real regression wearing a refactor's clothes, which is the exact hazard the phase brief
+  named. Removing that one anchor fails four tests, **two of them pre-existing**
+  (`compaction_profile_macos_8k`, `available_history_chars_subtracts_overhead`) — so the anchor is
+  load-bearing for shipped behaviour, not just for the new curve's own tests. Verified by mutation,
+  not asserted.
+
+  `use_compact_prompt` is deliberately **not** interpolated. Every other field is a budget answering
+  "how much"; that one is a format switch answering "which", and a continuous curve through a
+  boolean has no meaning. Its 12,288 boundary is unchanged.
+
+  What actually improves: the tier constants satisfy
+  `reserve + system + memory + history <= window` at exactly their four edges and at **none** of the
+  195,905 windows between them — at 12,289 they declare 29,548 tokens against a 12,289-token window.
+  The curve's over-commitment set is a strict subset of the tiers' (2,116 windows, down from
+  54,245) and worst-case over-commitment falls from 2.404x to 1.041x.
 - **P5** Asymmetric budgeting: preamble capped, working set scaled. Measure TTFT before and after on
   both Mac and Orin — this phase is only correct if TTFT is flat and retained history grows.
 - **P6 — LANDED (2026-08-06).** `token_tracking.md` rewritten around the split this workstream

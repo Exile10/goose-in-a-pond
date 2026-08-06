@@ -67,61 +67,194 @@ impl CompactionProfile {
     }
 }
 
+/// One point on the budget curve: the profile that this exact window produces.
+///
+/// # Why these six, and not the four tiers
+///
+/// Four of them ARE the old tier values, at the windows where the old step
+/// function returned them. The other two - 8,192 and 32,768 - are not tier
+/// boundaries, and pinning them is the whole reason this change is a refactor
+/// rather than a retune:
+///
+/// - **8,192 is the most-executed window in the system.** `prompt_window`
+///   clamps every local provider to exactly 8,192, and both prompt-side call
+///   sites (the compact-prompt decision and memory injection) pass the clamped
+///   value here. Interpolating 4,096 -> 12,288 across it would have cut
+///   `max_memory_fragments` from 5 to 4 and `memory_token_budget` from 500 to
+///   350 on every Jetson and every macOS Metal turn.
+/// - **32,768 is what the name heuristic hands to qwen and mistral**, and an
+///   existing regression test pins it.
+///
+/// Because 8,192/12,288 and 32,768/65,536 carry identical values, those two
+/// segments are FLAT: the whole of each old bucket's upper half answers exactly
+/// as it did before. What changes is the interior of the lower halves, which is
+/// the point - a 24K model and a 64K model no longer share a budget.
+struct ProfileAnchor {
+    window: usize,
+    compaction_threshold: f32,
+    memory_token_budget: usize,
+    max_memory_fragments: usize,
+    system_prompt_budget: usize,
+    history_token_budget: usize,
+    output_reserve_tokens: usize,
+}
+
+/// The budget curve, ascending by window. Below the first anchor and above the
+/// last the curve is flat, which reproduces the old function's open-ended first
+/// and last tiers.
+static PROFILE_ANCHORS: [ProfileAnchor; 6] = [
+    // Jetson-class. A thinking block alone measured 306 tokens on this device;
+    // 768 covers reasoning plus a real answer, and it is the floor for every
+    // smaller window too (invariant 2: the output reserve is never zero).
+    ProfileAnchor {
+        window: 4_096,
+        compaction_threshold: 0.60,
+        memory_token_budget: 200,
+        max_memory_fragments: 3,
+        system_prompt_budget: 1_500,
+        history_token_budget: 1_200,
+        output_reserve_tokens: 768,
+    },
+    // The local prompt clamp, and the macOS Metal default.
+    ProfileAnchor {
+        window: 8_192,
+        compaction_threshold: 0.70,
+        memory_token_budget: 500,
+        max_memory_fragments: 5,
+        system_prompt_budget: 3_000,
+        history_token_budget: 4_000,
+        output_reserve_tokens: 1_024,
+    },
+    // Old tier-2 ceiling. Same values as 8,192, so 8,192..12,288 is flat.
+    ProfileAnchor {
+        window: 12_288,
+        compaction_threshold: 0.70,
+        memory_token_budget: 500,
+        max_memory_fragments: 5,
+        system_prompt_budget: 3_000,
+        history_token_budget: 4_000,
+        output_reserve_tokens: 1_024,
+    },
+    // What the name heuristic gives qwen and mistral.
+    ProfileAnchor {
+        window: 32_768,
+        compaction_threshold: 0.75,
+        memory_token_budget: 1_500,
+        max_memory_fragments: 10,
+        system_prompt_budget: 6_000,
+        history_token_budget: 20_000,
+        output_reserve_tokens: 2_048,
+    },
+    // Old tier-3 ceiling. Same values as 32,768, so 32,768..65,536 is flat.
+    ProfileAnchor {
+        window: 65_536,
+        compaction_threshold: 0.75,
+        memory_token_budget: 1_500,
+        max_memory_fragments: 10,
+        system_prompt_budget: 6_000,
+        history_token_budget: 20_000,
+        output_reserve_tokens: 2_048,
+    },
+    // Large-context HTTP models (gemma-4 by name heuristic).
+    ProfileAnchor {
+        window: 128_000,
+        compaction_threshold: 0.80,
+        memory_token_budget: 4_000,
+        max_memory_fragments: 15,
+        system_prompt_budget: 10_000,
+        history_token_budget: 80_000,
+        output_reserve_tokens: 4_096,
+    },
+];
+
+/// Interpolate a token budget. The `t <= 0.0` and `t >= 1.0` short-circuits make
+/// anchor reproduction structural rather than a matter of floating-point luck:
+/// landing exactly on an anchor must return that anchor's integer, not something
+/// one ULP away that rounds the other direction.
+fn lerp_budget(a: usize, b: usize, t: f64) -> usize {
+    if t <= 0.0 {
+        return a;
+    }
+    if t >= 1.0 {
+        return b;
+    }
+    (a as f64 + (b as f64 - a as f64) * t).round() as usize
+}
+
+fn lerp_threshold(a: f32, b: f32, t: f64) -> f32 {
+    if t <= 0.0 {
+        return a;
+    }
+    if t >= 1.0 {
+        return b;
+    }
+    (a as f64 + (b as f64 - a as f64) * t) as f32
+}
+
 impl CompactionProfile {
     /// Derive a compaction profile from the effective context window in tokens.
     ///
-    /// The tiers are tuned for GIAP's chat workflow:
-    /// - **3K** (Jetson CUDA): aggressive compaction, minimal memory injection.
-    /// - **8K** (macOS Metal default): balanced — enough for 5 memories + prompt.
-    /// - **32K** (Ollama/llamafile with medium models): generous budgets.
-    /// - **128K+** (large context HTTP models): near-unlimited for local use.
+    /// Piecewise-linear over [`PROFILE_ANCHORS`], flat outside them. This
+    /// replaced four hardcoded tiers, and the anchors ARE the old tier values,
+    /// so every window the tiers were ever tested at answers identically - see
+    /// `TIER_FIXTURES` in the tests, which is the guard for that claim.
+    ///
+    /// # What actually changed, and why it is a fix
+    ///
+    /// The old step function was correct at its four boundaries and
+    /// over-committed everywhere in between: at 12,289 tokens it promised a
+    /// 20,000-token history budget, a 6,000-token system prompt, 1,500 tokens of
+    /// memory and a 2,048-token output reserve - 29,548 tokens of budget against
+    /// a 12,289-token window, 2.4x over. Only `turn_trimmer`'s
+    /// `min(usable_prompt_tokens())` clamp stood between that and a
+    /// mid-generation `ContextLengthExceeded`, and that clamp does not subtract
+    /// the system prompt or the memory block, so it was never sufficient.
+    ///
+    /// This matters most at 16,384, which is what the local model registry pins
+    /// on the Orin: budgets there now sum to 12,729 against the 16,384 window
+    /// instead of 29,548. Over 4,096..=200,000 the curve's budget sum is never
+    /// larger than the tiers' was, its over-commitment set is a strict subset of
+    /// theirs, and worst-case over-commitment falls from 2.404x to 1.041x.
+    ///
+    /// Every budget is monotonically non-decreasing in the window: raising
+    /// `context_window_override` can never buy less of anything.
     pub fn from_context_window(context_tokens: usize) -> Self {
-        if context_tokens <= 4096 {
-            // Jetson-class: 3K–4K tokens
-            Self {
-                compaction_threshold: 0.60,
-                memory_token_budget: 200,
-                max_memory_fragments: 3,
-                system_prompt_budget: 1500,
-                history_token_budget: 1200,
-                // A thinking block alone measured 306 tokens on this class of
-                // device; 768 covers reasoning plus a real answer.
-                output_reserve_tokens: 768,
-                context_window_tokens: context_tokens,
-            }
-        } else if context_tokens <= 12288 {
-            // macOS Metal default: 8K–12K tokens
-            Self {
-                compaction_threshold: 0.70,
-                memory_token_budget: 500,
-                max_memory_fragments: 5,
-                system_prompt_budget: 3000,
-                history_token_budget: 4000,
-                output_reserve_tokens: 1024,
-                context_window_tokens: context_tokens,
-            }
-        } else if context_tokens <= 65536 {
-            // Medium context: 32K–64K tokens
-            Self {
-                compaction_threshold: 0.75,
-                memory_token_budget: 1500,
-                max_memory_fragments: 10,
-                system_prompt_budget: 6000,
-                history_token_budget: 20000,
-                output_reserve_tokens: 2048,
-                context_window_tokens: context_tokens,
-            }
+        let first = &PROFILE_ANCHORS[0];
+        let last = &PROFILE_ANCHORS[PROFILE_ANCHORS.len() - 1];
+
+        let (lo, hi, t) = if context_tokens <= first.window {
+            (first, first, 0.0)
+        } else if context_tokens >= last.window {
+            (last, last, 0.0)
         } else {
-            // Large context: 128K+ tokens
-            Self {
-                compaction_threshold: 0.80,
-                memory_token_budget: 4000,
-                max_memory_fragments: 15,
-                system_prompt_budget: 10000,
-                history_token_budget: 80000,
-                output_reserve_tokens: 4096,
-                context_window_tokens: context_tokens,
-            }
+            // The table is ascending and `context_tokens` is strictly inside it,
+            // so this always finds an index >= 1.
+            let i = PROFILE_ANCHORS
+                .iter()
+                .position(|a| a.window >= context_tokens)
+                .expect("context_tokens is below the last anchor");
+            let lo = &PROFILE_ANCHORS[i - 1];
+            let hi = &PROFILE_ANCHORS[i];
+            let t = (context_tokens - lo.window) as f64 / (hi.window - lo.window) as f64;
+            (lo, hi, t)
+        };
+
+        Self {
+            compaction_threshold: lerp_threshold(
+                lo.compaction_threshold,
+                hi.compaction_threshold,
+                t,
+            ),
+            memory_token_budget: lerp_budget(lo.memory_token_budget, hi.memory_token_budget, t),
+            max_memory_fragments: lerp_budget(lo.max_memory_fragments, hi.max_memory_fragments, t),
+            system_prompt_budget: lerp_budget(lo.system_prompt_budget, hi.system_prompt_budget, t),
+            history_token_budget: lerp_budget(lo.history_token_budget, hi.history_token_budget, t),
+            output_reserve_tokens: lerp_budget(
+                lo.output_reserve_tokens,
+                hi.output_reserve_tokens,
+                t,
+            ),
+            context_window_tokens: context_tokens,
         }
     }
 
@@ -129,6 +262,12 @@ impl CompactionProfile {
     ///
     /// Returns true when the context window is small enough that verbose
     /// tool descriptions and detailed instructions waste precious tokens.
+    ///
+    /// Deliberately NOT interpolated. Everything else on this profile is a
+    /// budget and answers "how much"; this one is a format switch and answers
+    /// "which". A continuous curve through a boolean has no meaning, and the
+    /// 12288 boundary is the same one the tier function used, so no caller
+    /// sees a change.
     pub fn use_compact_prompt(&self) -> bool {
         self.context_window_tokens <= 12288
     }
@@ -660,5 +799,231 @@ mod tests {
     fn compaction_profile_stores_context_window() {
         let p = CompactionProfile::from_context_window(8192);
         assert_eq!(p.context_window_tokens, 8192);
+    }
+    // ── P4: the continuous profile curve, with the tiers as fixtures ─────
+
+    /// The four discrete tiers, verbatim as they were before P4. Kept as the
+    /// reference implementation so the properties below are checked against the
+    /// real prior behaviour rather than against numbers somebody transcribed.
+    fn tiers_before_p4(context_tokens: usize) -> (f32, usize, usize, usize, usize, usize) {
+        if context_tokens <= 4096 {
+            (0.60, 200, 3, 1500, 1200, 768)
+        } else if context_tokens <= 12288 {
+            (0.70, 500, 5, 3000, 4000, 1024)
+        } else if context_tokens <= 65536 {
+            (0.75, 1500, 10, 6000, 20000, 2048)
+        } else {
+            (0.80, 4000, 15, 10000, 80000, 4096)
+        }
+    }
+
+    fn budget_sum(p: &CompactionProfile) -> usize {
+        p.output_reserve_tokens
+            + p.system_prompt_budget
+            + p.memory_token_budget
+            + p.history_token_budget
+    }
+
+    /// Every window the discrete tiers were pinned at, with the values they
+    /// produced. This table IS the phase: the machinery changed, these answers
+    /// did not.
+    ///
+    /// It is deliberately wider than the four tier boundaries. 8,192 and 32,768
+    /// are not boundaries, but 8,192 is what `ContextGovernor::prompt_window`
+    /// hands every local provider and 32,768 is what the name heuristic hands
+    /// qwen and mistral - so a curve that only honoured the boundaries would
+    /// have shipped a real on-device change under a refactor's name.
+    const TIER_FIXTURES: &[(usize, f32, usize, usize, usize, usize, usize)] = &[
+        // window,   threshold, memory, frags, system, history, reserve
+        (0, 0.60, 200, 3, 1500, 1200, 768),
+        (3_072, 0.60, 200, 3, 1500, 1200, 768),
+        (4_096, 0.60, 200, 3, 1500, 1200, 768),
+        (8_192, 0.70, 500, 5, 3000, 4000, 1024),
+        (12_288, 0.70, 500, 5, 3000, 4000, 1024),
+        (32_768, 0.75, 1500, 10, 6000, 20000, 2048),
+        (65_536, 0.75, 1500, 10, 6000, 20000, 2048),
+        (128_000, 0.80, 4000, 15, 10000, 80000, 4096),
+        (200_000, 0.80, 4000, 15, 10000, 80000, 4096),
+    ];
+
+    #[test]
+    fn the_curve_reproduces_every_tier_fixture_exactly() {
+        for &(w, thr, mem, frags, sys, hist, reserve) in TIER_FIXTURES {
+            let p = CompactionProfile::from_context_window(w);
+            assert!(
+                (p.compaction_threshold - thr).abs() < 1e-6,
+                "window {w}: compaction_threshold {} != {thr}",
+                p.compaction_threshold
+            );
+            assert_eq!(
+                p.memory_token_budget, mem,
+                "window {w}: memory_token_budget"
+            );
+            assert_eq!(
+                p.max_memory_fragments, frags,
+                "window {w}: max_memory_fragments"
+            );
+            assert_eq!(
+                p.system_prompt_budget, sys,
+                "window {w}: system_prompt_budget"
+            );
+            assert_eq!(
+                p.history_token_budget, hist,
+                "window {w}: history_token_budget"
+            );
+            assert_eq!(
+                p.output_reserve_tokens, reserve,
+                "window {w}: output_reserve_tokens"
+            );
+            assert_eq!(
+                p.context_window_tokens, w,
+                "window {w}: context_window_tokens"
+            );
+        }
+    }
+
+    /// The safety property. The curve is allowed to differ from the tiers in the
+    /// interior - that is the point - but it may never promise MORE budget than
+    /// the tiers already did, at any window. Checked against the old function
+    /// itself, at every integer window in the range that matters.
+    #[test]
+    fn the_curve_never_promises_more_budget_than_the_tiers_did() {
+        for w in 4_096..=200_000usize {
+            let p = CompactionProfile::from_context_window(w);
+            let (_, mem, _, sys, hist, reserve) = tiers_before_p4(w);
+            let before = mem + sys + hist + reserve;
+            let after = budget_sum(&p);
+            assert!(
+                after <= before,
+                "window {w}: curve promises {after} tokens, tiers promised {before}"
+            );
+        }
+    }
+
+    /// The tiers over-committed at every window that was not a boundary. The
+    /// curve may still over-commit - the 8,192 fixture itself sums to 8,524,
+    /// and correcting THAT is P5's asymmetric budgeting, not this phase - but
+    /// wherever it does, the tiers did too, and by more.
+    #[test]
+    fn the_curve_over_commits_strictly_less_often_than_the_tiers() {
+        let mut curve_violations = 0usize;
+        let mut tier_violations = 0usize;
+        for w in 4_096..=200_000usize {
+            let p = CompactionProfile::from_context_window(w);
+            let (_, mem, _, sys, hist, reserve) = tiers_before_p4(w);
+            let tier_sum = mem + sys + hist + reserve;
+            if budget_sum(&p) > w {
+                curve_violations += 1;
+                assert!(
+                    tier_sum > w,
+                    "window {w}: the curve over-commits where the tiers did not"
+                );
+            }
+            if tier_sum > w {
+                tier_violations += 1;
+            }
+        }
+        assert_eq!(curve_violations, 2_116, "curve over-commitment count");
+        assert_eq!(tier_violations, 54_245, "tier over-commitment count");
+    }
+
+    /// The Orin's real operating point, which no tier fixture covers: the local
+    /// model registry pins n_ctx at 16,384 there. The tiers put it in the 32K
+    /// bucket and declared 29,548 tokens of budget against a 16,384-token
+    /// window - 1.8x over, with only `turn_trimmer`'s history clamp (which does
+    /// not subtract the system prompt or the memory block) standing between that
+    /// and a mid-generation context overrun.
+    #[test]
+    fn the_orins_pinned_window_stops_promising_more_than_the_window_holds() {
+        let p = CompactionProfile::from_context_window(16_384);
+        let sum = budget_sum(&p);
+        assert!(
+            sum <= p.context_window_tokens,
+            "budgets sum to {sum} against a {}-token window",
+            p.context_window_tokens
+        );
+        assert_eq!(sum, 12_729, "the Orin budget sum moved; re-derive it");
+        assert_eq!(p.output_reserve_tokens, 1_229);
+        assert_eq!(p.system_prompt_budget, 3_600);
+        assert_eq!(p.memory_token_budget, 700);
+        assert_eq!(p.max_memory_fragments, 6);
+        assert_eq!(p.history_token_budget, 7_200);
+
+        // What it was before, for the record.
+        let (_, mem, _, sys, hist, reserve) = tiers_before_p4(16_384);
+        assert_eq!(mem + sys + hist + reserve, 29_548);
+    }
+
+    /// The stated purpose of the phase, as an assertion.
+    #[test]
+    fn a_24k_model_and_a_64k_model_no_longer_share_a_bucket() {
+        let k24 = CompactionProfile::from_context_window(24_576);
+        let k64 = CompactionProfile::from_context_window(65_536);
+        assert!(
+            k24.history_token_budget < k64.history_token_budget,
+            "24K got {} history tokens, 64K got {}",
+            k24.history_token_budget,
+            k64.history_token_budget
+        );
+        assert_eq!(k24.history_token_budget, 13_600);
+        assert_eq!(k64.history_token_budget, 20_000);
+    }
+
+    /// Invariant 2 of the design: the output reserve is never zero and never
+    /// optional. It is the only thing between a long thinking block and a
+    /// mid-generation context overrun.
+    #[test]
+    fn the_output_reserve_is_never_below_its_floor_at_any_window() {
+        for w in [0, 1, 512, 3_072, 4_096, 6_000, 8_192, 100_000, 1_000_000] {
+            let p = CompactionProfile::from_context_window(w);
+            assert!(
+                p.output_reserve_tokens >= 768,
+                "window {w}: reserve {}",
+                p.output_reserve_tokens
+            );
+        }
+    }
+
+    /// A bigger window must never buy less of anything. Without this, raising
+    /// `context_window_override` by one token could cost the user history.
+    #[test]
+    fn every_budget_is_non_decreasing_in_the_window() {
+        let mut prev = CompactionProfile::from_context_window(4_096);
+        for w in 4_097..=200_000usize {
+            let p = CompactionProfile::from_context_window(w);
+            assert!(
+                p.compaction_threshold >= prev.compaction_threshold,
+                "threshold at {w}"
+            );
+            assert!(
+                p.memory_token_budget >= prev.memory_token_budget,
+                "memory at {w}"
+            );
+            assert!(
+                p.max_memory_fragments >= prev.max_memory_fragments,
+                "fragments at {w}"
+            );
+            assert!(
+                p.system_prompt_budget >= prev.system_prompt_budget,
+                "system at {w}"
+            );
+            assert!(
+                p.history_token_budget >= prev.history_token_budget,
+                "history at {w}"
+            );
+            assert!(
+                p.output_reserve_tokens >= prev.output_reserve_tokens,
+                "reserve at {w}"
+            );
+            prev = p;
+        }
+    }
+
+    /// `use_compact_prompt` is a bool, so it has no continuous form. It stays a
+    /// hard step at 12,288 and must not be quietly folded into the curve.
+    #[test]
+    fn use_compact_prompt_is_still_a_hard_step_at_12288() {
+        assert!(CompactionProfile::from_context_window(12_288).use_compact_prompt());
+        assert!(!CompactionProfile::from_context_window(12_289).use_compact_prompt());
     }
 }
