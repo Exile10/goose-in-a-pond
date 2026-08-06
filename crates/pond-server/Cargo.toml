@@ -14,12 +14,21 @@ name = "pond_server"
 path = "src/lib.rs"
 
 [features]
-default = ["goose-agent", "local-inference", "pond-agent"]
+default = ["goose-agent", "local-inference"]
 # Enable the Goose agent backend (compiles Block's Goose from the submodule — slow first build).
 # Enabled by default. To build without Goose: cargo build -p pond-server --no-default-features
 goose-agent = ["dep:pond-adapters-goose"]
 # Enable the independent PondAgent backend (no Goose dependency, KV-cache reuse).
-# Use agent_backend="pond" in settings to activate. Requires local-inference feature.
+#
+# OFF BY DEFAULT, because the backend it compiles cannot be activated: Q2-05
+# quarantines it at both layers (`PUT /api/v1/settings` 422s `agent_backend =
+# "pond"`, and `serve()` rewrites it to "goose" before any backend is wired). It
+# was in `default` while `scripts/jetson/deploy.sh` and `build-native.sh` built
+# with defaults, so every device build compiled ~4.8 kLOC and a second llama.cpp
+# cmake unit for a path that cannot run. `build-docker.sh` was already correct.
+#
+# Turning it back on is a decision about the quarantine, not about the build:
+#   cargo build -p pond-server --features pond-agent
 pond-agent = ["dep:pond-agent", "dep:pond-inference"]
 # Enable flat-file MCP memory (memories injected into system prompt every chat turn).
 # cargo run -p pond-server --features mcp-memory -- serve
@@ -91,7 +100,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
-dirs = "5.0"
+dirs = { workspace = true }
 hostname = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
@@ -102,7 +111,7 @@ tokio-util = { workspace = true }
 # Required to query pond_logs.db directly in the debug log-tail task.
 sqlx = { workspace = true }
 webbrowser = { workspace = true }
-zip = "2"
+zip = { workspace = true }
 flate2 = "1"
 tar = "0.4"
 url = { workspace = true }

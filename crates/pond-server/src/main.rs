@@ -429,9 +429,69 @@ fn main() -> Result<()> {
     runtime.block_on(async_main())
 }
 
+/// Keep Goose's own on-disk state inside the pond's data directory.
+///
+/// Goose resolves every directory it owns through `Paths::get_dir`, which honours
+/// an absolute `GOOSE_PATH_ROOT` and otherwise falls back to the platform's app
+/// dir for "Block/goose". Nothing in GIAP was setting it, so the engine's
+/// `sessions.db` lived outside `POND_DATA_DIR` entirely, with three consequences:
+///
+///  1. `scripts/live-test.sh` promises a scratch run "can never touch a real
+///     pond". That was true of both pond databases and false of engine state.
+///  2. Two pond-server instances on one machine shared a single session store
+///     and a single `YYYYMMDD_N` id namespace.
+///  3. On a machine that also runs Goose CLI or Desktop, `GooseAdapter::new`
+///     adopts `list_sessions().first()` — ordered by `sort_timestamp DESC`, i.e.
+///     the user's most recent unrelated conversation — repoints its working_dir
+///     at pond-server's cwd and loads 15 `giap-*` extensions onto it.
+///
+/// Must run before anything touches `SESSION_STORAGE`, which is a `LazyLock` over
+/// `Paths::data_dir()` and therefore latches the first answer it gets. Being the
+/// first statement of `async_main` is what guarantees that.
+///
+/// Upgrading an existing pond does not lose history: `pond_system.db` is
+/// authoritative, `resolve_goose_session` re-validates a stored pairing against
+/// the engine store and finds nothing, and `hydrate_goose_session` replays the
+/// conversation from pond history into a fresh engine session.
+fn pin_goose_state_under(data_dir: &std::path::Path) {
+    // `validated_path_root` silently ignores a relative path, which would put us
+    // back on the platform default without saying so.
+    let root = match std::fs::canonicalize(data_dir) {
+        Ok(abs) => abs,
+        Err(_) => {
+            // The directory may not exist on a first run; absolute is all Goose
+            // requires, so fall back to making the configured path absolute.
+            if data_dir.is_absolute() {
+                data_dir.to_path_buf()
+            } else {
+                match std::env::current_dir() {
+                    Ok(cwd) => cwd.join(data_dir),
+                    Err(e) => {
+                        tracing::warn!(
+                            "could not make {} absolute ({e}); goose state stays in its own app dir",
+                            data_dir.display()
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+    };
+    let engine_root = root.join("engine");
+    if let Err(e) = std::fs::create_dir_all(&engine_root) {
+        tracing::warn!(
+            "could not create {} ({e}); goose state stays in its own app dir",
+            engine_root.display()
+        );
+        return;
+    }
+    std::env::set_var("GOOSE_PATH_ROOT", &engine_root);
+}
+
 async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     let data_dir = default_data_dir();
+    pin_goose_state_under(&data_dir);
 
     match cli.command {
         Some(Commands::Setup { model }) => run_setup(&model).await,

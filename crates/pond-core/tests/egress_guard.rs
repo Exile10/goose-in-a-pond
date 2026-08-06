@@ -101,7 +101,8 @@ const LOOPBACK_ONLY: &[Exempt] = &[
     },
     Exempt {
         file: "crates/pond-server/src/composite_model_catalog_provider.rs",
-        reason: "its only request is GET localhost:11434/api/tags",
+        reason: "its only requests are GET localhost:11434/api/tags and \
+                 POST localhost:11434/api/show",
         // Catalogue rows. The download that fetches them is model_download.rs.
         non_target_urls: &[
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/",

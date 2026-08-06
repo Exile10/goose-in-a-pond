@@ -83,7 +83,6 @@ jobs:
             -p pond-infra \
             -p pond-infra-scheduler \
             -p pond-api \
-            -p pond-inference \
             -p pond-adapters-llamafile \
             -p pond-adapters-ollama \
             -p pond-adapters-whisper \
@@ -104,7 +103,6 @@ jobs:
             -p pond-infra \
             -p pond-infra-scheduler \
             -p pond-api \
-            -p pond-inference \
             -p pond-adapters-llamafile \
             -p pond-adapters-ollama \
             -p pond-adapters-whisper \
@@ -121,6 +119,14 @@ jobs:
       # cache; rust-cache makes subsequent runs fast.
       - name: cargo check (production binary — pond-server + goose adapter)
         run: cargo check -p pond-server -p pond-adapters-goose
+
+      # The quarantined PondAgent stack (Q2-05). It is no longer in pond-server's
+      # default features, so the gate above stops reaching it — and CLAUDE.md's
+      # promise is that the code "compiles and can be enabled when the engine is
+      # production-ready". It moved off the fast lint/test pass because it builds
+      # llama-cpp-2, which is exactly what that list is defined to exclude.
+      - name: cargo check (quarantined PondAgent — pond-agent + pond-inference)
+        run: cargo check -p pond-agent -p pond-inference
 
       # Compile-gate the ONNX vision classifier (ort is too heavy for the fast
       # lint/test pass, mirroring pond-adapters-face-onnx). Its pure decode/

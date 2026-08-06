@@ -5,7 +5,6 @@ use crate::models::ports::speech_energy::SpeechEnergy;
 use crate::models::ports::voice_input::{SpeculativeSignal, VoiceInput};
 use crate::models::ports::voice_output::VoiceOutput;
 use crate::models::ports::wake_word::{StreamingWakeWordDetector, WakeWordActivation};
-use crate::models::services::context_compactor::ContextCompactor;
 use crate::models::services::instant_activation::InstantActivation;
 use crate::prompts::{SYSTEM_PROMPT, TITLE_GENERATION_PROMPT};
 use crate::security::domain::event::{Event, EventCategory, PrivacySensitivity};
@@ -193,9 +192,6 @@ pub struct ChatService {
     /// System prompt sent to the LLM on every completion call.
     /// Defaults to `SYSTEM_PROMPT`; override with `with_system_prompt()`.
     system_prompt: String,
-    /// Optional LLM-based context compactor.  When set, triggers at 80% of
-    /// the context budget instead of falling straight to trim_to_budget.
-    compactor: Option<ContextCompactor>,
     /// Optional Answer Reviewer — adversarial post-inference quality gate.
     answer_reviewer: Option<Arc<dyn crate::models::ports::answer_reviewer::AnswerReviewer>>,
     /// Optional memory extraction pipeline. When all three are set,
@@ -270,7 +266,6 @@ impl ChatService {
             session_id,
             session_storage,
             system_prompt: SYSTEM_PROMPT.to_string(),
-            compactor: None,
             answer_reviewer: None,
             memory_extractor: None,
             memory_extraction_service: None,
@@ -428,16 +423,6 @@ impl ChatService {
     /// prompt from `Settings`.  The default is the static `SYSTEM_PROMPT` constant.
     pub fn with_system_prompt(mut self, prompt: String) -> Self {
         self.system_prompt = prompt;
-        self
-    }
-
-    /// Enable LLM-based context compaction.
-    ///
-    /// When set, `chat_once` will summarise older history while preserving the
-    /// most recent turns whenever the conversation exceeds 80% of the context
-    /// limit, instead of simply dropping old messages via `trim_to_budget`.
-    pub fn with_context_compactor(mut self, compactor: ContextCompactor) -> Self {
-        self.compactor = Some(compactor);
         self
     }
 

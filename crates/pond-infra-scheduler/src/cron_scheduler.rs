@@ -345,12 +345,15 @@ impl CronSchedulerAdapter {
 /// The cron expression is evaluated against UTC; the scheduler job itself
 /// handles timezone-correct firing via `tokio-cron-scheduler`.
 fn compute_next_run(cron_expr: &str, _timezone: &str) -> Option<chrono::DateTime<Utc>> {
-    // tokio-cron-scheduler uses 6-field cron (sec min hour dom month dow).
-    // croner 2.x with_seconds_optional allows both 5- and 6-field expressions.
-    let cron = croner::Cron::new(cron_expr)
-        .with_seconds_optional()
-        .parse()
-        .ok()?;
+    // tokio-cron-scheduler uses 6-field cron (sec min hour dom month dow), and
+    // both 5- and 6-field expressions have to parse. croner 3 makes that the
+    // default — `Seconds::Optional` — so the explicit `.with_seconds_optional()`
+    // builder that 2.x needed is gone rather than merely renamed.
+    //
+    // This must stay on the same croner MAJOR as the one inside
+    // `tokio-cron-scheduler`: that copy decides when the job actually fires,
+    // this one decides the `next_run` the UI promises. They were 2.x and 3.x.
+    let cron: croner::Cron = cron_expr.parse().ok()?;
     let now = Utc::now();
     match cron.find_next_occurrence(&now, false) {
         Ok(dt) => Some(dt),

@@ -138,6 +138,78 @@ git submodule update --init --recursive
 
 ---
 
+## Proposed patch — `Auto` mode must still honour `NeverAllow`
+
+**Status: NOT APPLIED.** Written up here rather than committed to the submodule
+because CI clones the fork branch tip directly (see `ci.yml`), so a submodule
+change that exists only in a working tree makes the local build pass and every
+other build fail. It needs staging on the fork and a pointer bump, exactly as
+"Adding a New GIAP Patch" below describes.
+
+**What it buys.** GIAP narrows the tool surface per session — a Guest turn does
+not get the memory tools, a dormant extension group does not get its schemas.
+Today that narrowing is *schema-only*: `provider_shim.rs :: enforce_tools`
+filters the `&[Tool]` slice handed to the provider, but Goose keeps every
+extension loaded agent-wide, `Agent::reply` collects every `ToolRequest`
+regardless of whether its schema was published, and dispatch happens
+before the adapter ever sees the event. So a model that names a withheld tool
+anyway still runs it. `goose_agent.rs` now tracks those calls in
+`suppressed_tool_ids` and drops both the call event and its result — which
+closes the disclosure (a Guest turn's withheld `recall_memories` used to stream
+the household's memories back as `ToolResult { tool: "" }`) — but the tool has
+still executed by then.
+
+**Why the obvious levers do not work.**
+
+- `ToolInspectionManager` is the seam Goose provides for exactly this, and it is
+  unreachable: `Agent::tool_inspection_manager` is `pub(super)` and inspectors
+  are only added inside the private `Agent::create_tool_inspection_manager`.
+- Writing `PermissionLevel::NeverAllow` through `PermissionManager` — which GIAP
+  already passes into `AgentConfig` — looks like it should work and does not.
+  `permission_inspector.rs` matches on the mode first:
+
+  ```rust
+  let action = match goose_mode {
+      GooseMode::Chat => continue,
+      GooseMode::Auto => InspectionAction::Allow,   // <- returns before the check below
+      GooseMode::Approve | GooseMode::SmartApprove => {
+          if let Some(level) = permission_manager.get_user_permission(tool_name) {
+              match level {
+                  PermissionLevel::NeverAllow => InspectionAction::Deny,
+                  ...
+  ```
+
+  GIAP hardcodes `GooseMode::Auto`, so the `NeverAllow` arm is unreachable, and
+  moving off `Auto` would turn on approval prompts for every tool call — a
+  different product.
+
+**The patch.** Honour an explicit `NeverAllow` in `Auto` mode too. "Auto" means
+*do not ask me*, not *ignore the denies I configured*; a deny the user set and
+the agent ignores is the worse reading of the flag, and this is upstreamable
+rather than GIAP-specific.
+
+```rust
+GooseMode::Auto => match permission_manager.get_user_permission(tool_name) {
+    Some(PermissionLevel::NeverAllow) => InspectionAction::Deny,
+    _ => InspectionAction::Allow,
+},
+```
+
+`crates/goose/src/permission/permission_inspector.rs`. The existing
+`#[test_case(GooseMode::Auto, false, None, InspectionAction::Allow; "auto_allows")]`
+still passes (no stored permission); add a case asserting `Auto` + `NeverAllow`
+denies.
+
+**GIAP side, once it lands.** On each turn, write `NeverAllow` for the tools
+outside the session's allow-set and `AlwaysAllow` (or clear) for those inside,
+before `Agent::reply`. Note `PermissionManager` is process-global and keyed by
+tool name, not by session, so with concurrent sessions of differing scope the
+last writer wins — either serialise the write with the turn or upstream a
+session-scoped variant. Until that is settled, `suppressed_tool_ids` in
+`goose_agent.rs` is the containment, and it is a disclosure gate only.
+
+---
+
 ## Adding a New GIAP Patch
 
 1. Checkout `main` in the submodule: `git -C goose checkout main`

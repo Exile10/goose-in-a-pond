@@ -81,9 +81,12 @@ pub struct RejectDraftParams {
 #[derive(Clone)]
 pub struct DraftMcpServer {
     draft_repo: Arc<dyn DraftRepository + Send + Sync>,
-    /// Resolves the caller and the mode. `None` in the quarantined direct
-    /// dispatcher and in tests: every decision is then unresolvable, which
-    /// refuses under `enforce` and reports `would_deny` under `audit`.
+    /// Resolves the caller and the mode. `None` only in tests: every decision is
+    /// then unresolvable, which refuses under `enforce` and reports `would_deny`
+    /// under `audit` -- meaning it is **let through**, because `would_deny` is
+    /// audit's whole point. Any constructor that serves real callers must pass
+    /// [`draft_authority`]; the direct dispatcher did not, and that was a
+    /// bypass, not a quarantine.
     authority: Option<Arc<dyn DraftAuthority>>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
@@ -487,6 +490,16 @@ static DRAFT_AUTHORITY: OnceLock<Option<Arc<dyn DraftAuthority>>> = OnceLock::ne
 /// `audit`.
 pub fn init_draft_authority(authority: Option<Arc<dyn DraftAuthority>>) {
     let _ = DRAFT_AUTHORITY.set(authority);
+}
+
+/// The installed authority, for the other places that build a `DraftMcpServer`.
+///
+/// [`spawn_draft_server`] is not the only constructor: `McpToolDispatcher` builds
+/// its own copy for the direct-dispatch routes. It used to build it without an
+/// authority, which made every decision unresolvable and therefore *permitted*
+/// under `audit` -- see [`DraftMcpServer::authority`].
+pub(crate) fn draft_authority() -> Option<Arc<dyn DraftAuthority>> {
+    DRAFT_AUTHORITY.get().cloned().flatten()
 }
 
 /// Initialize draft server dependencies. Call once at startup.

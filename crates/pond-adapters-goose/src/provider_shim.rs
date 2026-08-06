@@ -212,15 +212,81 @@ impl ShimControls {
     }
 }
 
+/// The last minification, kept so an unchanged tool set is not re-minified on
+/// every provider call.
+///
+/// `input` is retained deliberately, and not just as a key: identity is compared
+/// by `Arc::ptr_eq` on each tool's `input_schema`, which is only sound while the
+/// pointers we compared against are still alive. Holding the inputs keeps those
+/// allocations from being freed and their addresses reused by a different
+/// schema, which is the one way pointer identity could lie. The clone is cheap —
+/// `Tool::input_schema` is an `Arc`, so this is a refcount bump per tool, not a
+/// copy of the schema.
+struct MinifyCache {
+    input: Vec<Tool>,
+    output: Option<Vec<Tool>>,
+}
+
+impl MinifyCache {
+    /// Whether `tools` is the same set, tool for tool, that produced `output`.
+    ///
+    /// Deliberately conservative: two structurally identical schemas behind
+    /// different allocations miss, and simply re-minify. A false miss costs one
+    /// minification; a false hit would send the model the wrong tool set.
+    fn matches(&self, tools: &[Tool]) -> bool {
+        self.input.len() == tools.len()
+            && self
+                .input
+                .iter()
+                .zip(tools)
+                .all(|(a, b)| a.name == b.name && Arc::ptr_eq(&a.input_schema, &b.input_schema))
+    }
+}
+
 /// Provider decorator enforcing GIAP's veto. See module docs.
 pub struct GiapProviderShim {
     inner: Arc<dyn Provider>,
     controls: Arc<ShimControls>,
+    /// Guarded by a plain `Mutex` rather than an async one: the critical section
+    /// is a pointer comparison and a `Vec` clone, and it never awaits.
+    minify_cache: Mutex<Option<MinifyCache>>,
 }
 
 impl GiapProviderShim {
     pub fn new(inner: Arc<dyn Provider>, controls: Arc<ShimControls>) -> Self {
-        Self { inner, controls }
+        Self {
+            inner,
+            controls,
+            minify_cache: Mutex::new(None),
+        }
+    }
+
+    /// `minify_tools`, memoised on the tool set it was last given.
+    ///
+    /// The uncached call ran on EVERY provider call, and it is not cheap for
+    /// something whose answer almost never changes: a deep
+    /// `(*t.input_schema).clone()` per tool, a recursive walk of `properties`,
+    /// `$defs`, `items`, `anyOf`, `oneOf` and `allOf`, a structural inequality
+    /// compare, and a second `Tool` clone — on the order of a thousand small
+    /// allocations per call, for a tool set that changes only when an extension
+    /// is added or a session's allow-set moves.
+    ///
+    /// Note the allow-set is NOT part of the key, and must not be: this runs on
+    /// the output of `enforce_tools`, so a narrowed set arrives here as a
+    /// different, shorter slice and misses on length alone. Keying on the
+    /// published allow-set instead would be wrong — `set_allowed_tools` carries
+    /// names only, and says nothing about the schemas.
+    fn minify_tools_cached(&self, tools: &[Tool]) -> Option<Vec<Tool>> {
+        let mut cache = self.minify_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.as_ref().filter(|c| c.matches(tools)) {
+            return hit.output.clone();
+        }
+        let output = minify_tools(tools);
+        *cache = Some(MinifyCache {
+            input: tools.to_vec(),
+            output: output.clone(),
+        });
+        output
     }
 }
 
@@ -504,6 +570,29 @@ impl Provider for GiapProviderShim {
         };
 
         let enforced_system = enforce_system(system, &prefix, &[&turn_apx, &ext_apx]);
+
+        // The shim is the only thing that delivers GIAP's appendix now — the
+        // parallel `Agent::extend_system_prompt` calls are gone, because Goose
+        // rebuilt them into a block this function discards. That makes a
+        // pass-through here load-bearing rather than merely permissive: it means
+        // the incoming system did not start with GIAP's prefix, so the appendix
+        // is not being attached to anything.
+        //
+        // A pass-through with NO session appendix is the ordinary auxiliary call
+        // (compaction, model listing) and is silent. A pass-through that drops a
+        // real per-turn appendix is the failure this warns about: the prefix
+        // match is a byte comparison, and anything that perturbs the rendered
+        // prefix — a device or assistant name containing `{{`, which
+        // `sanitize_field` does not strip and the minijinja re-render will
+        // mangle — breaks it for that install and takes the skills with it.
+        if enforced_system.is_none() && turn_apx.is_some() {
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "system_appendix_dropped",
+                "this turn's prompt extras and skills were not delivered: the system prompt \
+                 did not match GIAP's prefix, so the shim passed it through unchanged"
+            );
+        }
         let stripped_messages = strip_turn_context(messages);
         // Phase F3: run AFTER the turn-context strip so the promoted carrier is
         // built from the messages the provider will actually receive.
@@ -521,7 +610,7 @@ impl Provider for GiapProviderShim {
             .unwrap_or(messages);
         let vetoed_tools = enforce_tools(tools, &allowed);
         // Minify AFTER the veto so we never pay for tools about to be dropped.
-        let minified_tools = minify_tools(vetoed_tools.as_deref().unwrap_or(tools));
+        let minified_tools = self.minify_tools_cached(vetoed_tools.as_deref().unwrap_or(tools));
         let final_tools: &[Tool] = minified_tools
             .as_deref()
             .or(vetoed_tools.as_deref())
@@ -880,6 +969,105 @@ mod tests {
     fn minify_tools_returns_none_when_already_clean() {
         let clean = tool("giap-weather__get_current_weather");
         assert!(minify_tools(&[clean]).is_none());
+    }
+
+    // ── minification cache ─────────────────────────────────────────────────
+
+    /// A tool carrying the keys `minify_schema_object` strips, so the cached
+    /// answer is a `Some` rather than the less interesting `None`.
+    fn noisy_tool(name: &str) -> Tool {
+        Tool::new(
+            name.to_string(),
+            "desc".to_string(),
+            rmcp::object!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "title": "Params",
+                "type": "object",
+                "properties": { "q": { "type": "string", "title": "Query" } }
+            }),
+        )
+    }
+
+    fn shim_with(controls: ShimControls) -> GiapProviderShim {
+        // `Provider` requires only `get_name` and `stream`; the cache tests
+        // exercise neither, so both are left unreachable rather than mocked.
+        struct Unused;
+        #[async_trait::async_trait]
+        impl Provider for Unused {
+            fn get_name(&self) -> &str {
+                "unused"
+            }
+            async fn stream(
+                &self,
+                _: &goose_providers::model::ModelConfig,
+                _: &str,
+                _: &[Message],
+                _: &[Tool],
+            ) -> Result<goose::providers::base::MessageStream, ProviderError> {
+                unreachable!("the cache tests never reach the inner provider")
+            }
+        }
+        GiapProviderShim::new(Arc::new(Unused), Arc::new(controls))
+    }
+
+    #[test]
+    fn an_unchanged_tool_set_is_minified_once_and_then_replayed() {
+        let shim = shim_with(ShimControls::default());
+        let tools = vec![noisy_tool("giap-weather__get_current_weather")];
+
+        let first = shim
+            .minify_tools_cached(&tools)
+            .expect("minification fired");
+        let second = shim.minify_tools_cached(&tools).expect("cache hit");
+        assert_eq!(first, second);
+        // The stripped keys really are gone, so the cached value is the
+        // minified one and not a pass-through of the input.
+        assert!(first[0].input_schema.get("$schema").is_none());
+        assert!(first[0].input_schema.get("title").is_none());
+    }
+
+    /// The cache must key on the SCHEMAS, not the names. A narrowed allow-set
+    /// arrives here as a shorter slice, and a re-registered extension arrives as
+    /// the same names behind fresh allocations; both must miss rather than
+    /// replay a stale tool set to the model.
+    #[test]
+    fn a_different_tool_set_is_never_served_from_the_cache() {
+        let shim = shim_with(ShimControls::default());
+        let both = vec![
+            noisy_tool("giap-weather__get_current_weather"),
+            noisy_tool("giap-memory__recall_memories"),
+        ];
+        let narrowed = vec![noisy_tool("giap-weather__get_current_weather")];
+
+        let wide = shim.minify_tools_cached(&both).expect("minification fired");
+        assert_eq!(wide.len(), 2);
+
+        let narrow = shim
+            .minify_tools_cached(&narrowed)
+            .expect("minification fired");
+        assert_eq!(
+            narrow.len(),
+            1,
+            "the narrowed set was served from the cache"
+        );
+
+        // And back again, to prove the cache is replaced rather than appended.
+        let wide_again = shim.minify_tools_cached(&both).expect("minification fired");
+        assert_eq!(wide_again.len(), 2);
+    }
+
+    /// Same names, same schema CONTENT, different allocations. Pointer identity
+    /// makes this a miss, which is the conservative direction: it costs one
+    /// extra minification and can never serve the wrong schemas.
+    #[test]
+    fn structurally_equal_tools_behind_new_allocations_are_recomputed_not_replayed() {
+        let shim = shim_with(ShimControls::default());
+        let first_set = vec![noisy_tool("giap-weather__get_current_weather")];
+        let rebuilt = vec![noisy_tool("giap-weather__get_current_weather")];
+
+        let a = shim.minify_tools_cached(&first_set).expect("fired");
+        let b = shim.minify_tools_cached(&rebuilt).expect("fired");
+        assert_eq!(a, b, "a recompute must agree with the cached answer");
     }
 
     // ── D1: session-keyed controls ─────────────────────────────────────────

@@ -21,19 +21,24 @@ re-check locally.
   preserving `session_id`. Its own module doc (`:22-24`) says it is a "neutral routing primitive"
   and warns against wiring it with hardcoded keyword matchers. It is a **switch, not a spawner** —
   no parallelism, no aggregation, no task lifecycle. Deliberately unwired.
-- **`prompts/subagent_system.md`** — a complete, GIAP-flavoured subagent system prompt with
-  `task_instructions`, `max_turns`, `subagent_id`, `tool_count` and `available_tools` template
-  variables, registered as an override at `giap_prompts.rs:56,97,116`. **GIAP never renders or
-  spawns it.** It exists to override a Goose feature GIAP has disabled.
+- **`prompts/subagent_system.md`** — GONE (2026-08-06). It was a complete, GIAP-flavoured subagent
+  system prompt registered as a Goose override by `giap_prompts.rs`, and GIAP never rendered or
+  spawned it: the live prompt path is pond-core's `build_prompt_partition`. The whole of
+  `giap_prompts.rs` and `src/prompts/` (12 templates) is deleted, so there is no longer a
+  GIAP-authored subagent prompt to point at if orchestration is ever built.
 - **`AgentRecipe`** — `user_data/domain/recipe.rs`, `{ id, name, description, yaml, active }`.
-  `POST /api/v1/recipes/{name}/run` (`routes.rs:9591`) parses the YAML via
-  `goose::recipe::Recipe::from_content`, extracts `prompt` or `instructions`, and runs it through
+  `POST /api/v1/recipes/{name}/run` parses the YAML via `routes.rs :: RecipePrompt` (a two-field
+  serde struct; the `goose::recipe::Recipe` call was the only `goose::` reference in `pond-api` and
+  was removed to keep that crate framework-free), extracts `prompt` or `instructions`, and runs it through
   the **same chat-stream pipeline as an ordinary user message**. A recipe today is a stored prompt.
-- **`ModelRouter`** — `models/services/providers/model_router.rs`, dispatches to `chat` / `think` /
-  `task` providers. Its own doc says "all requests currently route to the `chat` provider… `think`
-  and `task` are retained for future per-role model assignment but are not auto-selected."
-- **`UserSkill`** — named Markdown injected as `extend_system_prompt("skill:<name>", …)` every turn
-  (`goose_agent.rs:2337-2345`), deliberately placed outside the KV-cache prefix hash.
+- **`ModelRouter`** — GONE. `model_router.rs` was never declared by a `mod` statement, so it was
+  never compiled and its six tests never ran; three of them asserted routing behaviour its
+  `complete` contradicted. Per-role dispatch, if wanted, starts from the live provider hot-swap
+  seam in `pond-api`'s `AppState`, not from this file.
+- **`UserSkill`** — named Markdown injected every turn, deliberately placed outside the KV-cache
+  prefix hash. It no longer travels through `Agent::extend_system_prompt`: Goose rebuilt that into
+  an appendix the provider shim discarded, and the entry was never removed when a skill was
+  deactivated. The shim's per-session `turn_appendix` is now the only delivery path.
 
 No `spawn_subagent`, no task queue, no worker pool, no parallel fan-out, no inter-agent messaging,
 no result aggregation exists anywhere in `crates/`.
