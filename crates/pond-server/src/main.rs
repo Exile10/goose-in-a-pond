@@ -21,7 +21,6 @@ mod asset_root;
 mod composite_model_catalog_provider;
 mod filesystem_model_storage;
 mod http_model_downloader;
-mod inference_pool;
 mod llamafile_process;
 mod llm_memory_consolidator;
 mod llm_memory_extractor;
