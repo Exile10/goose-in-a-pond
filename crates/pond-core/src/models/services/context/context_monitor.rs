@@ -196,6 +196,60 @@ impl ContextMonitor {
         true
     }
 
+    /// Claim a compaction pass on behalf of a person who asked for one.
+    ///
+    /// PAI-4 P7b-fix. This exists because the manual axis and the pressure axis
+    /// shared one quota *and the pressure axis always took it first*. In the
+    /// chat-stream generator the `context_warning` frame is yielded and
+    /// `spawn_pressure_compaction` is called inside the same `if
+    /// health.should_compact` block, one statement later; the button that frame
+    /// renders only appears after `done`. So by the time a human could press it
+    /// the claim was already gone, [`claim_compaction`](Self::claim_compaction)
+    /// refused, and the endpoint answered `cooling_down` — measured at six
+    /// consecutive pressured turns, six refusals, never one pass. The success
+    /// path was unreachable rather than uncommon.
+    ///
+    /// **What is different, and it is exactly one thing.** The
+    /// [`COMPACTION_COOLDOWN_TURNS`] check is skipped. Both other conditions
+    /// hold unchanged: the session must exist, and `should_compact` is still
+    /// recomputed here under this lock, so a person cannot compact a session
+    /// that is not under pressure. That limb is not what made the button dead
+    /// and relaxing it would be the scope widening this programme calls a bug.
+    ///
+    /// **It still stamps the cooldown, and that is the design rather than an
+    /// oversight.** A manual press *consumes* the quota without *checking* it.
+    /// The two axes therefore cannot double-spend the summariser: a press
+    /// rations the automatic axis for [`COMPACTION_COOLDOWN_TURNS`] recorded
+    /// turns afterwards, exactly as an automatic pass would have. The manual
+    /// axis gains nothing the pressure axis did not already have — it only
+    /// stops being refused by a claim the pressure axis took on its behalf one
+    /// statement earlier.
+    ///
+    /// **What bounds repeated presses is not this method.** It is the rolling
+    /// summary's through-pointer: `SessionSummaryService::refresh` decides
+    /// `NothingToDo` from that pointer and the message count *before* it calls
+    /// the provider, so a second press with no new turns between costs a
+    /// database read and no model call. The caller additionally refuses while a
+    /// pass is in flight, which is what actually protects a serial on-device
+    /// engine.
+    pub fn claim_manual_compaction(&self, session_id: &str) -> bool {
+        let mut sessions = self
+            .session_contexts
+            .lock()
+            .expect("context monitor lock poisoned");
+
+        let Some(state) = sessions.get_mut(session_id) else {
+            return false;
+        };
+
+        if !health_of(state).should_compact {
+            return false;
+        }
+
+        state.turns_at_last_compaction = Some(state.turns);
+        true
+    }
+
     /// Record that a compaction pass changed the shape of this session's
     /// history, without pretending its context window went back to zero.
     ///
@@ -605,5 +659,67 @@ mod tests {
             monitor.claim_compaction("s1"),
             "a cleared session inherited the cooldown of the conversation it replaced",
         );
+    }
+
+    // ── PAI-4 P7b-fix: the manual claim ────────────────────────────────────
+
+    /// THE UNIT GUARD. Reproduces the production ordering exactly: the pressure
+    /// axis takes the claim one statement after the frame that renders the
+    /// button, so every human press arrives at a spent quota.
+    #[test]
+    fn a_manual_claim_succeeds_after_the_pressure_axis_took_the_quota() {
+        let monitor = ContextMonitor::new();
+        saturate(&monitor, "s1");
+
+        assert!(
+            monitor.claim_compaction("s1"),
+            "the pressure axis could not claim - this test reproduces nothing",
+        );
+        assert!(
+            monitor.claim_manual_compaction("s1"),
+            "the manual claim was refused by a quota the pressure axis had \
+             already spent on this same session's behalf, which is what made \
+             the Compact now button dead on every default install",
+        );
+    }
+
+    /// The non-widening half, and the reason a manual claim is not simply
+    /// "return true". A press consumes the quota without checking it, so the two
+    /// axes cannot between them buy two summarisations for one turn.
+    #[test]
+    fn a_manual_claim_rations_the_automatic_axis_afterwards() {
+        let monitor = ContextMonitor::new();
+        saturate(&monitor, "s1");
+
+        assert!(monitor.claim_manual_compaction("s1"));
+        for turn in 1..COMPACTION_COOLDOWN_TURNS {
+            saturate(&monitor, "s1");
+            assert!(
+                !monitor.claim_compaction("s1"),
+                "the pressure axis claimed only {turn} turn(s) after a manual \
+                 press - a person pressing the button no longer costs the \
+                 automatic axis anything, so the two together summarise more \
+                 often than either alone ever could",
+            );
+        }
+    }
+
+    /// Pressure is still required. This is the limb that was never the problem,
+    /// and relaxing it would be the scope widening.
+    #[test]
+    fn a_manual_claim_is_still_refused_on_a_session_under_no_pressure() {
+        let monitor = ContextMonitor::new();
+        monitor.record_turn("s1", 500, 8192);
+        assert!(
+            !monitor.claim_manual_compaction("s1"),
+            "a person compacted a session at {}% utilisation",
+            monitor.check_context_health("s1").utilization_pct,
+        );
+    }
+
+    #[test]
+    fn a_manual_claim_on_an_unknown_session_is_refused() {
+        let monitor = ContextMonitor::new();
+        assert!(!monitor.claim_manual_compaction("never-seen"));
     }
 }

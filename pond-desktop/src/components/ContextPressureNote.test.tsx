@@ -140,32 +140,37 @@ describe("ContextPressureNote", () => {
 });
 
 /**
- * The assertion that would go red if PAI-4 P7b were reverted.
+ * A CHEAP TRIPWIRE, not coverage — and the distinction is on the record.
  *
- * The component above can be perfect and the phase can still be worth nothing:
- * before this change the server had been pushing `context_warning` for months
- * and every chat surface parsed it and dropped it, because no branch matched.
- * `PondApiClient.streamSse` yields every frame unfiltered, so "zero consumers"
- * was a rendering fact, not a transport one — which means the only thing that
- * can catch the regression is checking that a consumer exists.
+ * Round 1 called this "the assertion that would go red if PAI-4 P7b were
+ * reverted". Synthesis corrected that: it goes red only for a revert done with
+ * a delete key. Two semantic mutations leave both substrings in place and pass
+ * — adding `showTurnStats &&` to the render guard (which ships the note
+ * invisible on every default install, `show_turn_stats` being false in Rust),
+ * and attaching the frame to a message id that does not exist.
  *
- * Read from source rather than by rendering ChatHub: that component needs the
- * whole AppContext/api surface stood up, and a wiring claim does not need a
- * DOM to be true.
+ * The coverage now lives in `sections/Chat.test.tsx`, which mounts the real
+ * component, drives a real `context_warning` frame through it and asserts a
+ * real `.ctx-pressure` node; both mutations above go red there. This stays
+ * because it is free and it does catch a deletion, and because `ChatHub.tsx`
+ * still has no mount harness of its own — for that surface a grep is all there
+ * is, and saying so is better than implying otherwise.
  */
 describe("context_warning has a consumer", () => {
-  it("ChatHub reads the frame and renders the note", () => {
-    const src = readFileSync(join(SRC_DIR, "hub/views/ChatHub.tsx"), "utf8");
-    expect(
-      src.includes('ev.type === "context_warning"'),
-      "the frame has no consumer in ChatHub.tsx - the server emits " +
-        "context_warning under a default-true setting and the hub chat drops it",
-    ).toBe(true);
-    expect(
-      src.includes("<ContextPressureNote"),
-      "ChatHub.tsx reads context_warning but renders nothing for it",
-    ).toBe(true);
-  });
+  for (const surface of ["hub/views/ChatHub.tsx", "sections/Chat.tsx"]) {
+    it(`${surface} reads the frame and renders the note`, () => {
+      const src = readFileSync(join(SRC_DIR, surface), "utf8");
+      expect(
+        src.includes('ev.type === "context_warning"'),
+        `the frame has no consumer in ${surface} - the server emits ` +
+          "context_warning under a default-true setting and this surface drops it",
+      ).toBe(true);
+      expect(
+        src.includes("<ContextPressureNote"),
+        `${surface} reads context_warning but renders nothing for it`,
+      ).toBe(true);
+    });
+  }
 
   it("the frame type is in the ChatEventType union", () => {
     const src = readFileSync(join(SRC_DIR, "api/types.ts"), "utf8");

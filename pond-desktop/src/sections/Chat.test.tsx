@@ -22,6 +22,7 @@ vi.mock("../api/PondApiClient", () => ({
       tool_calling: true,
     }),
     sessionAttachmentUrl: vi.fn((sessionId: string, attachmentId: string) => `/api/v1/sessions/${sessionId}/attachments/${attachmentId}`),
+    compactSession: vi.fn(),
   },
 }));
 
@@ -211,6 +212,95 @@ describe("Chat section", () => {
 
     // At minimum, chatStream was called once
     expect(vi.mocked(api.chatStream)).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── PAI-4 P7b-fix: the context-pressure note has a consumer HERE ──────────────
+//
+// Round 1 landed the note in `hub/views/ChatHub.tsx` and guarded it with a
+// two-substring grep, because that component has no render test. Synthesis
+// corrected that: two semantic mutations left both substrings in place and
+// passed 261/261 — adding `showTurnStats &&` to the render guard (which ships
+// the note invisible on every default install, `show_turn_stats` being false in
+// Rust), and attaching the frame to a message id that does not exist.
+//
+// This is the render test the correction asked for, and it is written here
+// rather than against ChatHub because `sections/Chat.tsx` already has the mount
+// harness. It drives the real component with a real stream and asserts a real
+// DOM node, so both of those mutations go red.
+describe("Chat — context pressure note (PAI-4 P7b)", () => {
+  async function streamAndSend(events: ChatEvent[]) {
+    vi.mocked(api.chatStream).mockReturnValue(makeStream(events));
+    render(<Chat />);
+    await waitFor(() => expect(screen.getByLabelText("Message input")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Message input"), { target: { value: "Hello" } });
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Send message"));
+    });
+  }
+
+  /** The frame verbatim as `routes.rs` serialises it in the chat-stream generator. */
+  const warningFrame: ChatEvent = {
+    type: "context_warning",
+    utilization_pct: 82.4,
+    turns_remaining: 2,
+    avg_growth_rate: 640,
+    warning: "Context window 82% full (6750/8192 tokens). ~2 turns remaining.",
+  } as unknown as ChatEvent;
+
+  it("renders the note after a context_warning frame followed by done", async () => {
+    await streamAndSend([
+      { type: "text", content: "The greenhouse fans are on." },
+      warningFrame,
+      { done: true, session_id: "sess-ctx", type: "done" },
+    ]);
+
+    await waitFor(() => {
+      expect(
+        document.querySelector(".ctx-pressure"),
+        "the chat section received context_warning and rendered nothing - the " +
+          "server has emitted this frame under a default-true setting since " +
+          "before PAI-4, and a frame with no consumer is a feature that does " +
+          "not exist",
+      ).toBeTruthy();
+    });
+    // The sentence the server sent, not a placeholder, and the control itself.
+    expect(screen.getByText(/82% full/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /compact now/i })).toBeTruthy();
+  });
+
+  it("enables the control with the session id that arrived on done", async () => {
+    // The `context_warning` frame carries no session id and on a first turn the
+    // id only arrives with `done`, which is emitted after it. A note whose
+    // button stays disabled is a dead control by another route.
+    //
+    // The text frame is part of the fixture on purpose: an agent bubble with no
+    // text, no cards and no reasoning is suppressed entirely, note and all, and
+    // the generator that emits `context_warning` is the one that emits the
+    // answer — so a warning-only turn is not a state production produces.
+    await streamAndSend([
+      { type: "text", content: "The greenhouse fans are on." },
+      warningFrame,
+      { done: true, session_id: "sess-ctx", type: "done" },
+    ]);
+
+    await waitFor(() => expect(document.querySelector(".ctx-pressure")).toBeTruthy());
+    expect(
+      screen.getByRole("button", { name: /compact now/i }).hasAttribute("disabled"),
+      "the Compact now button rendered disabled, so the note is decoration",
+    ).toBe(false);
+  });
+
+  it("renders no note for a turn that never reported pressure", async () => {
+    // The vacuity control. Without it, a component that rendered the note on
+    // every assistant message would pass the test above.
+    await streamAndSend([
+      { type: "text", content: "The greenhouse fans are on." },
+      { done: true, session_id: "sess-ctx", type: "done" },
+    ]);
+
+    await waitFor(() => expect(screen.getByText("The greenhouse fans are on.")).toBeTruthy());
+    expect(document.querySelector(".ctx-pressure")).toBeNull();
   });
 });
 

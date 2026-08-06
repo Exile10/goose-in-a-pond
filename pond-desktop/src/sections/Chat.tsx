@@ -13,8 +13,9 @@ import { TypingIndicator } from "../hub/views/chat/TypingIndicator";
 import { HubIco, micEl } from "../hub/primitives/HubIco";
 import { HP_PATHS } from "../hub/primitives/icons";
 import { CONTINUE_TURN_MESSAGE } from "../api/types";
-import type { ChatEvent, ImageAttachment, ModelEntry, SessionMessage, SessionSummary, TurnStats } from "../api/types";
+import type { ChatEvent, ContextWarning, ImageAttachment, ModelEntry, SessionMessage, SessionSummary, TurnStats } from "../api/types";
 import { TurnStatsFooter } from "../components/TurnStatsFooter";
+import { ContextPressureNote } from "../components/ContextPressureNote";
 import { filterThinking } from "../lib/thinkFilter";
 import { prepareImage, validateAttachmentSet } from "../lib/imageAttach";
 import type { PreparedImage } from "../lib/imageAttach";
@@ -61,6 +62,9 @@ interface Message {
   historyToolNames?: string[];
   /** Set when the agent stopped on its turn budget — renders a Continue action. */
   turnLimit?: number;
+  /** PAI-4 P7b. Set when the turn's `context_warning` frame said the window is
+   *  filling — renders the pressure line and the "Compact now" control. */
+  contextWarning?: ContextWarning;
   /** Image preview URLs — either a live send's local previewUrl, or a
    *  built `${apiBase}${url}` for images replayed from session history. */
   images?: string[];
@@ -505,6 +509,14 @@ export function Chat() {
           setMessages((prev) =>
             prev.map((m) => (m.id === agentMsg.id ? { ...m, turnLimit: limit } : m)),
           );
+        } else if (ev.type === "context_warning") {
+          // PAI-4 P7b. The window is filling. Attach by id — same reasoning as
+          // turn_stats and turn_limit_reached — so the note lands on this turn
+          // and not on whatever message a mid-stream session switch left last.
+          const cw = ev as unknown as ContextWarning;
+          setMessages((prev) =>
+            prev.map((m) => (m.id === agentMsg.id ? { ...m, contextWarning: cw } : m)),
+          );
         }
       }
     } catch (e) {
@@ -692,6 +704,17 @@ export function Chat() {
                       <PlayCircle size={12} aria-hidden /> Continue
                     </button>
                   </div>
+                )}
+                {/* Context window filling — pressure line + "Compact now".
+                    Deliberately NOT gated on showTurnStats: `show_turn_stats`
+                    defaults to false in Rust, so borrowing that gate would ship
+                    this invisible on every default install, which is exactly
+                    why TurnStatsFooter was rejected as the host. */}
+                {msg.role === "agent" && !msg.streaming && msg.contextWarning && (
+                  <ContextPressureNote
+                    warning={msg.contextWarning}
+                    sessionId={sessionIdRef.current ?? null}
+                  />
                 )}
                 {/* Inference stats footer */}
                 {msg.role === "agent" && !msg.streaming && showTurnStats && msg.turnStats && (
