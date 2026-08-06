@@ -21,7 +21,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
 | 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **COMPLETE — P1-P8 LANDED** |
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1-P4, P6 LANDED** (P3 completed by P3b 2026-08-06); **P5 code landed 2026-08-06, awaiting the on-device TTFT measurement that decides it** |
-| 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | **P1, P2, P3, P4, P6 LANDED 2026-08-06** (P1 `ModelClass` + strategy dispatch, domain only; P2 large-tier re-summarisation — the rolling summary rebuilt from the source messages instead of from its own previous output, gated on `ModelClass::Large` and wired into `run_compaction_pass`, so P1 now has its first consumer; P3 age-weighted retention — `compaction_verbatim_days` plus a tool-result rung between "leave it alone" and "drop the whole turn", fed by `Message::created` on the live Goose trim path and firing only when a conversation is already over budget; P4 compact-on-resume gate, wired to the session reopen; P6 `should_compact` now moves the server between turns, rate-limited by `claim_compaction`, and `reset_session` has its first production caller); P5, P7 designed |
+| 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | **P1, P2, P3, P4, P6 LANDED 2026-08-06** (P1 `ModelClass` + strategy dispatch, domain only; P2 large-tier re-summarisation — the rolling summary rebuilt from the source messages instead of from its own previous output, gated on `ModelClass::Large` and wired into `run_compaction_pass`, so P1 now has its first consumer; P3 age-weighted retention — `compaction_verbatim_days` plus a tool-result rung between "leave it alone" and "drop the whole turn", fed by `Message::created` on the live Goose trim path and firing only when a conversation is already over budget; P4 compact-on-resume gate, wired to the session reopen; P6 `should_compact` now moves the server between turns, rate-limited by `claim_compaction`, and `reset_session` has its first production caller); **P5 code landed 2026-08-06, awaiting the warm-versus-cold TTFT measurement that decides it** (`prefix_cache.rs`: `PrefixCacheState` + the six `InvalidationReason`s recorded in `goose_agent.rs`, `Agent::prefix_cache_state` defaulting to `None`, and the trimmer's age rung now firing on a cold prefix as well as over budget — the warm half was already P3's); P7 designed |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
 | 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0-P5, P7 LANDED** (P3, P5 partial); P6, P8 designed |
 
@@ -1258,3 +1258,74 @@ across 20 binaries; `cargo check -p pond-server -p pond-adapters-goose` clean. N
 and that is a gap rather than a judgement: this adds a route side effect that spawns a background
 model call, which is what `scripts/live-test.sh` exists to catch, and section 7's integration
 assertion — that a pass completes before the next turn's first token — needs a real server.
+
+---
+
+**2026-08-06 — PAI-4 P5. The cold half of the rule; P3 had already built the warm half without
+being able to name it. Code landed, measurement not taken.**
+
+`models/services/context/prefix_cache.rs` — `InvalidationReason` (the six designed reasons),
+`PrefixCacheState { built_at, hash, turns_served, invalidated_by }` with
+`invalidate`/`rebuilt`/`serve_turn`/`age_since`/`posture`/`posture_of`, and `CachePosture
+{ Warm | Cold }`. Nine tests, no clock read in the file. `models/ports/agent.rs` —
+`Agent::prefix_cache_state() -> Option<PrefixCacheState>`, default `None`, one test.
+`turn_trimmer.rs` — an eighth argument and seven tests. `goose_agent.rs` — the state, the six
+recording points, the port impl, and `provider_change_reason` with three tests. `pond-core` 802 lib,
+up from 786; `pond-adapters-goose` 98, up from 95.
+
+**This is stamped CODE LANDED, MEASUREMENT PENDING, not LANDED, and the distinction is the point.**
+Section 7 of the design says P5 "is only correct if cold-cache recompaction shows no TTFT penalty
+and warm-cache turns show no new re-prefills" — an Orin-and-Mac measurement, and its own acceptance
+criterion. It has not been taken. That makes two measurement-pending P5s on the ledger alongside
+PAI-3's, which is worth saying out loud rather than quietly accruing: a green unit suite proves the
+rule fires where it was told to, not that firing there was cheap.
+
+**The design reads as two rules and only one of them was new.** 3.3 says recompact when cold,
+prefer byte-identical edits when warm. The warm half landed on 2026-08-06 as P3, whose age rung
+fires only when the conversation is over budget and cites invariant 4 for it — P3 simply could not
+tell "warm" from "already gone", so it used *over budget* as a proxy for both. P5 supplies the real
+signal and spends it in one direction only: the rung also fires when the cache is provably cold on a
+conversation that still fits. Nothing on the warm path was tightened, because gating the summary
+splice or the `<system-context>` strip needs the number section 7 is waiting for.
+
+**The ordering bug I wrote first.** The obvious `serve_turn` clears `invalidated_by`. It is wrong
+exactly on the case 3.2 calls the most valuable cold moment there is: `SessionResumed` is recorded
+while the engine session is hydrated, hundreds of lines before the static prefix is compared *in the
+same turn*, so an eager clear had a resumed session clearing its own resume and reading `Warm`. The
+clear is deferred by one turn instead. The residue is a reason sticky for one extra turn, which
+over-reports `Cold` once; that is a bounded over-count of a permission to degrade already-aged
+material, where the opposite error silently forfeits the free recompaction the phase exists to take.
+
+**A latent defect in P3's rung that only became routine under P5.** `truncate_head_tail` is not a
+fixed point of itself — it keeps `cap` characters and appends an elision marker, so its output
+always exceeds the cap and handed its own output it cuts again. P3 never saw it because its rung
+only ran when over budget and one cut usually brought it under. Running the same rung on cold turns
+that comfortably fit would have ground one tool result away by degrees over a long cold session.
+`AGED_FIXED_POINT_CHARS` is the guard and `the_aged_cap_is_a_fixed_point_after_one_cut` fails if the
+marker outgrows its allowance, rather than letting the property rot. I found this because I wrote
+the idempotence test before believing the rule worked; it failed on the second pass, which is the
+argument for running the property on every new trigger and not only on the one that introduced it.
+
+**Two mutations, both restored by file copy rather than `git checkout`, per the P6 lesson above.**
+Flipping the step-4 guard to `cache == CachePosture::Warm` failed
+`a_cold_prefix_recompacts_a_conversation_that_still_fits_and_a_warm_one_does_not` with *"a warm
+prefix was perturbed for a token saving nothing had asked for — left: 1, right: 0"*, and also failed
+the pre-existing P3 test `age_weighting_never_touches_a_conversation_that_already_fits`, which is the
+useful part: it proves the warm path really is pre-P5 behaviour and not merely asserted to be.
+Deleting the `AGED_FIXED_POINT_CHARS` line failed `a_cold_recompaction_is_idempotent` with *"left: 1,
+right: 0"* on the second pass. Both restored with no residue; full suite green after each.
+
+**Two pre-existing test failures found and NOT fixed here, because they are not this phase's.**
+`goose_agent::tests::the_adapter_reads_the_catalog_it_was_given` and
+`a_catalog_window_reaches_the_governor_from_the_adapter` both fail at HEAD (`fc78ec03`), asserting
+`131072` where the governor now yields `32768`. That is the same shape f770f4de already corrected
+twice: tests encoding the pre-clamp behaviour for an on-device provider. These two survived because
+`pond-adapters-goose` is outside the fast-crate test set and CI only `cargo check`s it, so nothing
+runs them. I verified they fail with my changes stashed before concluding they were not mine.
+
+Gates: `cargo fmt --check` clean; `cargo clippy -p pond-core --all-targets` with no new warnings in
+the touched files (the two the trimmer reports — a `nonminimal_bool` on P3's age predicate and a
+`duplicate_macro_attributes` on an untouched test — are both pre-existing); `cargo test -p pond-core`
+802 lib passing; `cargo test -p pond-adapters-goose` 98 passing with the two pre-existing failures
+above; `cargo check -p pond-server -p pond-adapters-goose` clean. No live-server run and no device
+run — the second is the phase's own acceptance criterion and is why this is not stamped LANDED.

@@ -27,6 +27,7 @@ pub mod context_governor;
 pub mod context_monitor;
 pub mod image_history;
 pub mod model_class;
+pub mod prefix_cache;
 pub mod resume_compaction;
 pub mod resummarisation;
 pub mod token_counting;

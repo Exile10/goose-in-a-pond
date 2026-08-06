@@ -41,6 +41,7 @@ use std::borrow::Cow;
 use std::time::Duration;
 
 use super::context_budget::{truncate_head_tail, CompactionProfile, TOOL_RESULT_MAX_CHARS};
+use super::prefix_cache::CachePosture;
 use super::token_counting::PER_MESSAGE_TOKEN_OVERHEAD;
 use crate::models::ports::token_counter::TokenCounter;
 
@@ -67,6 +68,30 @@ pub const DEFAULT_VERBATIM_DAYS: u32 = 3;
 /// is not worth the same tokens as one from five minutes ago, but it is still
 /// worth more than nothing, which is what dropping its turn would leave.
 pub const AGED_TOOL_RESULT_MAX_CHARS: usize = TOOL_RESULT_MAX_CHARS / 4;
+
+/// Length at or below which a tool result is treated as already aged, and the
+/// P3 rung leaves it alone.
+///
+/// This exists because `truncate_head_tail` is **not a fixed point of itself**:
+/// it keeps `cap` characters of content and then appends an elision marker, so
+/// its output is always longer than the cap it was given, and handed its own
+/// output it cuts again — a little more content each time, for a saving of a
+/// few dozen characters.
+///
+/// P3 never noticed, because its rung only ran when the conversation was over
+/// budget and one aged cut usually brought it under. PAI-4 P5 runs the same rung
+/// on cold turns that are comfortably within budget, so without this the rung
+/// would fire on every cold turn of a long session and grind one tool result
+/// away by degrees. Section 7's "compaction is idempotent on an unchanged
+/// conversation" is the property that forbids it.
+///
+/// The 64-character allowance is a deliberate over-estimate of the marker
+/// (`"\n[... truncated N chars ...]\n"`, at most ~36 characters even for an
+/// absurd N) and `the_aged_cap_is_a_fixed_point_after_one_cut` fails if the
+/// marker ever outgrows it. Being generous costs at most 64 characters left
+/// uncut on an already-degraded result — which is precisely the "marginal token
+/// saving" invariant 4 says not to move a prefix for.
+const AGED_FIXED_POINT_CHARS: usize = AGED_TOOL_RESULT_MAX_CHARS + 64;
 
 /// Convert a stored `compaction_verbatim_days` into the horizon
 /// [`trim_history`] takes. Zero means age weighting is OFF, and that is the
@@ -119,6 +144,14 @@ pub struct TrimOutcome {
     /// False when the input already fit and nothing was modified — the
     /// adapter can skip rewriting the engine conversation entirely.
     pub changed: bool,
+    /// True when age weighting ran on a conversation that was still WITHIN
+    /// budget, purely because the prefix cache was already cold (PAI-4 P5).
+    ///
+    /// This is the one observable the recompact-when-cold rule produces, and
+    /// it exists so the rule can be asserted rather than inferred from a
+    /// message length. It is false on every warm turn, including warm turns
+    /// that degraded plenty of material because they were over budget.
+    pub cold_recompaction: bool,
 }
 
 /// Whether the current turn's user message is already in the slice handed to
@@ -191,6 +224,21 @@ fn last_turn_start(messages: &[TrimMessage]) -> usize {
 /// be degraded harder than fresh material *once the conversation is already
 /// over budget*. `None` disables it and reproduces the pre-P3 behaviour
 /// exactly.
+///
+/// `cache` is PAI-4 P5's cache-age axis, and it moves exactly one guard in one
+/// direction — see step 4. [`CachePosture::Warm`] reproduces the pre-P5
+/// behaviour exactly, and it is what every caller that cannot see the engine's
+/// prefix must pass (`PrefixCacheState::posture_of(None)` returns it, so there
+/// is one place that decision is made rather than one per call site).
+///
+/// Eight positional arguments is over clippy's threshold and the allow below
+/// is deliberate rather than lazy: every one of them is a distinct axis the
+/// caller genuinely knows and this function genuinely must not guess (budget,
+/// summary, feedback, counter, turn position, age, cache). Bundling them into
+/// an options struct would give each a `Default`, and a default for
+/// `CurrentTurn` or `CachePosture` is exactly the silent-wrong-answer failure
+/// both of those types were introduced to stop.
+#[allow(clippy::too_many_arguments)]
 pub fn trim_history(
     messages: Vec<TrimMessage>,
     profile: &CompactionProfile,
@@ -199,6 +247,7 @@ pub fn trim_history(
     counter: &dyn TokenCounter,
     current_turn: CurrentTurn,
     verbatim_horizon: Option<Duration>,
+    cache: CachePosture,
 ) -> TrimOutcome {
     let mut changed = false;
 
@@ -313,13 +362,25 @@ pub fn trim_history(
     //
     //    THREE GUARDS, and each is the narrowing direction on a different axis.
     //
-    //    a. It fires only when the conversation is ALREADY over budget.
-    //       Invariant 4 forbids perturbing a warm prefix for a marginal token
-    //       saving, and this edit is at the FRONT of the conversation — it
-    //       invalidates the KV prefix exactly as dropping a turn would. Doing
-    //       it unconditionally would spend a full re-prefill to save tokens
-    //       nobody needed. Over budget, the prefix was moving anyway, and the
-    //       only question left is what gets sacrificed.
+    //    a. It fires only when the conversation is ALREADY over budget, OR the
+    //       prefix cache is already cold. Invariant 4 forbids perturbing a
+    //       WARM prefix for a marginal token saving, and this edit is at the
+    //       FRONT of the conversation — it invalidates the KV prefix exactly
+    //       as dropping a turn would. Doing it unconditionally would spend a
+    //       full re-prefill to save tokens nobody needed.
+    //
+    //       PAI-4 P5 is the second half of that disjunction, and it is the
+    //       whole of the recompact-when-cold rule at this seam. P3 wrote the
+    //       guard with only "over budget" available, using it as a proxy for
+    //       "the prefix was moving anyway" — which is sound but strictly
+    //       narrower than the real condition. A turn whose provider was
+    //       rebuilt, whose model was swapped, whose session was just resumed,
+    //       or that carries an image is paying a full re-prefill regardless of
+    //       what this function does, so degrading aged material in the same
+    //       breath costs nothing and buys headroom the following WARM turns
+    //       get to keep. `CachePosture::Warm` is the narrowing value and the
+    //       one every caller that cannot see the engine passes, so this reads
+    //       as pre-P5 behaviour everywhere the signal is absent.
     //    b. The LAST turn is spared. That is the design's "current session,
     //       recent turns: verbatim" row made real, and it matters most in the
     //       case age weighting is aimed at: a session reopened after a week has
@@ -341,13 +402,17 @@ pub fn trim_history(
     //    them instead keeps the head and tail of every aged result and loses
     //    nothing that was not already being lost when the turn was dropped.
     let mut aged_truncations = 0usize;
+    let mut cold_recompaction = false;
     if let Some(horizon) = verbatim_horizon {
-        if estimate_tokens(&msgs, counter) > budget {
+        let over_budget = estimate_tokens(&msgs, counter) > budget;
+        if over_budget || cache == CachePosture::Cold {
+            cold_recompaction = !over_budget;
             let horizon_secs = horizon.as_secs();
             let keep_verbatim_from = last_turn_start(&msgs);
             for (i, m) in msgs.iter_mut().enumerate() {
                 if i >= keep_verbatim_from
                     || m.role != TrimRole::ToolResult
+                    || m.text.len() <= AGED_FIXED_POINT_CHARS
                     || !m.age_secs.is_some_and(|age| age > horizon_secs)
                 {
                     continue;
@@ -399,6 +464,11 @@ pub fn trim_history(
         estimated_tokens,
         aged_truncations,
         changed,
+        // Reported only when the cold branch actually did something. A cold
+        // turn with no aged tool results over the cap recompacted nothing, and
+        // saying otherwise would put a false entry in every trace of a fresh
+        // session — where the prefix is cold by construction on turn one.
+        cold_recompaction: cold_recompaction && aged_truncations > 0,
     }
 }
 
@@ -469,6 +539,12 @@ pub fn plan_replay(
         counter,
         CurrentTurn::NotYetAppended,
         None,
+        // A replay exists precisely because the engine session is brand new,
+        // so there is no prefix to protect. This is the honest value rather
+        // than a load-bearing one: `verbatim_horizon` is `None` on this path
+        // (see the `age_secs` comment above), so the guard the posture moves
+        // cannot fire here either way.
+        CachePosture::Cold,
     )
     .messages
 }
@@ -477,6 +553,36 @@ pub fn plan_replay(
 mod tests {
     use super::*;
     use crate::models::services::context::token_counting::HeuristicTokenCounter;
+
+    /// Every test below this line was written against the pre-P5 trimmer and
+    /// asserts WARM-cache behaviour, which is what `CachePosture::Warm`
+    /// reproduces exactly. Rather than append that argument to thirty call
+    /// sites, this shadows [`super::trim_history`] with the warm-cache
+    /// specialisation. The P5 tests at the bottom of the module call
+    /// `super::trim_history` directly and are the only ones that pass a
+    /// posture — so a reader can tell at a glance which tests the cache-age
+    /// axis is live in.
+    #[allow(clippy::too_many_arguments)]
+    fn trim_history(
+        messages: Vec<TrimMessage>,
+        profile: &CompactionProfile,
+        rolling_summary: Option<&str>,
+        last_real_prompt_tokens: Option<u32>,
+        counter: &dyn TokenCounter,
+        current_turn: CurrentTurn,
+        verbatim_horizon: Option<Duration>,
+    ) -> TrimOutcome {
+        super::trim_history(
+            messages,
+            profile,
+            rolling_summary,
+            last_real_prompt_tokens,
+            counter,
+            current_turn,
+            verbatim_horizon,
+            CachePosture::Warm,
+        )
+    }
 
     fn profile(history_budget: usize) -> CompactionProfile {
         CompactionProfile {
@@ -1404,5 +1510,244 @@ mod tests {
                 .map(|m| m.text.clone())
                 .collect::<Vec<_>>()
         );
+    }
+
+    // ── PAI-4 P5: the recompact-when-cold rule ────────────────────────────
+    //
+    // These are the only tests in this module that pass a `CachePosture`, and
+    // they call `super::trim_history` rather than the warm shim above.
+
+    /// A conversation with room to spare and an aged tool result over the cap.
+    /// Warm, nothing happens — invariant 4, a warm prefix is not perturbed for
+    /// a saving nobody needed. Cold, the same conversation is degraded,
+    /// because the re-prefill is being paid either way.
+    fn roomy_with_one_aged_result() -> Vec<TrimMessage> {
+        vec![
+            user(0, "what did the sensor log say"),
+            aged_tool(1, &"y".repeat(4_000), 9 * DAY),
+            assistant(2, "here is the summary"),
+            user(3, "and today?"),
+        ]
+    }
+
+    #[test]
+    fn a_cold_prefix_recompacts_a_conversation_that_still_fits_and_a_warm_one_does_not() {
+        let warm = super::trim_history(
+            roomy_with_one_aged_result(),
+            &profile(5_000),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            horizon(),
+            CachePosture::Warm,
+        );
+        assert_eq!(
+            warm.aged_truncations, 0,
+            "a warm prefix was perturbed for a token saving nothing had asked for"
+        );
+        assert!(!warm.cold_recompaction);
+
+        let cold = super::trim_history(
+            roomy_with_one_aged_result(),
+            &profile(5_000),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            horizon(),
+            CachePosture::Cold,
+        );
+        assert_eq!(
+            cold.aged_truncations, 1,
+            "a cold prefix declined free headroom"
+        );
+        assert!(cold.cold_recompaction);
+        assert!(cold.changed);
+        assert!(
+            cold.estimated_tokens < warm.estimated_tokens,
+            "the cold pass reclaimed nothing: {} vs {}",
+            cold.estimated_tokens,
+            warm.estimated_tokens
+        );
+        // Neither pass may drop a turn on a conversation that fits.
+        assert_eq!(warm.dropped_turns, 0);
+        assert_eq!(cold.dropped_turns, 0);
+    }
+
+    /// The cache posture relaxes ONE guard. The other two — the verbatim
+    /// horizon itself, and sparing the last turn — are untouched, and a cold
+    /// prefix is not a licence to degrade material the age rule protects.
+    #[test]
+    fn a_cold_prefix_still_respects_the_horizon_and_the_last_turn() {
+        let big = "y".repeat(4_000);
+        let msgs = vec![
+            user(0, "old question"),
+            // Inside the horizon: never aged, at any posture.
+            aged_tool(1, &big, 60),
+            assistant(2, "a1"),
+            // The last turn starts here, so this one is spared for being
+            // current even though it is nine days old.
+            user(3, "current question"),
+            aged_tool(4, &big, 9 * DAY),
+        ];
+        let cold = super::trim_history(
+            msgs,
+            &profile(5_000),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            horizon(),
+            CachePosture::Cold,
+        );
+        assert_eq!(
+            cold.aged_truncations, 0,
+            "the cold rule degraded material the horizon or the last-turn guard protects"
+        );
+        assert!(!cold.cold_recompaction);
+        for m in cold
+            .messages
+            .iter()
+            .filter(|m| m.role == TrimRole::ToolResult)
+        {
+            // Step 2's flat cap applied (the input was 4,000 chars) and
+            // nothing more: both results are still far above the aged cap.
+            assert!(
+                m.text.len() > AGED_FIXED_POINT_CHARS,
+                "a spared tool result was cut to the aged cap: {} chars",
+                m.text.len()
+            );
+        }
+    }
+
+    /// The convergence guard behind [`AGED_FIXED_POINT_CHARS`]. If
+    /// `truncate_head_tail`'s elision marker ever outgrows the 64-character
+    /// allowance, the aged rung stops being a one-shot and starts nibbling a
+    /// cold session's tool results away turn by turn. That would be invisible
+    /// in every other test here, so it is pinned directly.
+    #[test]
+    fn the_aged_cap_is_a_fixed_point_after_one_cut() {
+        let huge = "y".repeat(100_000);
+        let once = truncate_head_tail(&huge, AGED_TOOL_RESULT_MAX_CHARS)
+            .expect("100k chars must exceed the aged cap");
+        assert!(
+            once.len() > AGED_TOOL_RESULT_MAX_CHARS,
+            "truncate_head_tail became a fixed point of itself; the allowance \
+             below can be removed, but do not assume it"
+        );
+        assert!(
+            once.len() <= AGED_FIXED_POINT_CHARS,
+            "the elision marker outgrew the {} char allowance: one cut yields {} \
+             chars against a cap of {}",
+            AGED_FIXED_POINT_CHARS - AGED_TOOL_RESULT_MAX_CHARS,
+            once.len(),
+            AGED_TOOL_RESULT_MAX_CHARS
+        );
+    }
+
+    /// `cold_recompaction` reports the RULE, not the posture. An over-budget
+    /// cold turn degrades exactly as an over-budget warm turn does — P3 owns
+    /// that path — so claiming a cold recompaction there would credit P5 with
+    /// work it did not cause.
+    #[test]
+    fn an_over_budget_cold_turn_is_not_reported_as_a_cold_recompaction() {
+        let over_budget = super::trim_history(
+            roomy_with_one_aged_result(),
+            &profile(300),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            horizon(),
+            CachePosture::Cold,
+        );
+        assert_eq!(over_budget.aged_truncations, 1);
+        assert!(
+            !over_budget.cold_recompaction,
+            "P5 took credit for a degradation the budget already forced"
+        );
+    }
+
+    /// Turn one of every session has a cold prefix by construction. If the
+    /// flag fired on the posture alone, every trace would carry a recompaction
+    /// that never happened.
+    #[test]
+    fn a_cold_turn_with_nothing_to_degrade_reports_no_recompaction() {
+        let out = super::trim_history(
+            vec![user(0, "hello"), assistant(1, "hi"), user(2, "again")],
+            &profile(5_000),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            horizon(),
+            CachePosture::Cold,
+        );
+        assert_eq!(out.aged_truncations, 0);
+        assert!(!out.cold_recompaction);
+        assert!(!out.changed);
+    }
+
+    /// A cold pass repeated is a no-op: the second one finds everything
+    /// already at the aged cap, so a session that stays cold for several turns
+    /// does not grind the same material down further.
+    #[test]
+    fn a_cold_recompaction_is_idempotent() {
+        let first = super::trim_history(
+            roomy_with_one_aged_result(),
+            &profile(5_000),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            horizon(),
+            CachePosture::Cold,
+        );
+        let second = super::trim_history(
+            first.messages.clone(),
+            &profile(5_000),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            horizon(),
+            CachePosture::Cold,
+        );
+        assert_eq!(second.aged_truncations, 0);
+        assert!(!second.cold_recompaction);
+        assert!(!second.changed);
+        assert_eq!(
+            first
+                .messages
+                .iter()
+                .map(|m| m.text.clone())
+                .collect::<Vec<_>>(),
+            second
+                .messages
+                .iter()
+                .map(|m| m.text.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `compaction_verbatim_days = 0` is the ONE off switch for age weighting
+    /// (P3's module docs are explicit that there is no second boolean). P5
+    /// must not become one: a cold prefix with age weighting disabled does
+    /// nothing at all.
+    #[test]
+    fn zero_verbatim_days_disables_the_cold_rule_as_well() {
+        let out = super::trim_history(
+            roomy_with_one_aged_result(),
+            &profile(5_000),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            verbatim_horizon_from_days(0),
+            CachePosture::Cold,
+        );
+        assert_eq!(out.aged_truncations, 0);
+        assert!(!out.cold_recompaction);
     }
 }
