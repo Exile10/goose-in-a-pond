@@ -73,6 +73,63 @@ pub const CLUSTER_PM1: u32 = 1068;
 pub const CLUSTER_PM10: u32 = 1069;
 pub const CLUSTER_TVOC: u32 = 1070;
 pub const CLUSTER_RADON: u32 = 1071;
+/// `MeasurementUnit` — what the device says its concentrations are in. The
+/// substance defaults below are only a guess until this is read.
+pub const ATTR_MEASUREMENT_UNIT: u32 = 8;
+
+/// Is this one of the concentration clusters, which publish their own unit?
+fn is_concentration_cluster(cluster: u32) -> bool {
+    matches!(
+        cluster,
+        CLUSTER_CO
+            | CLUSTER_CO2
+            | CLUSTER_NO2
+            | CLUSTER_OZONE
+            | CLUSTER_PM25
+            | CLUSTER_FORMALDEHYDE
+            | CLUSTER_PM1
+            | CLUSTER_PM10
+            | CLUSTER_TVOC
+            | CLUSTER_RADON
+    )
+}
+
+/// Matter's `MeasurementUnitEnum`, as a unit string.
+fn measurement_unit_name(code: u64) -> Option<&'static str> {
+    Some(match code {
+        0 => "ppm",
+        1 => "ppb",
+        2 => "ppt",
+        3 => "mg/m3",
+        4 => "ug/m3",
+        5 => "ng/m3",
+        6 => "/m3",
+        7 => "Bq/m3",
+        _ => return None,
+    })
+}
+
+/// The unit the device itself declares for the concentration at `path`, if it
+/// declares one.
+///
+/// [`sensor_reading_from_update`] is pure over a single attribute and cannot
+/// see this — the unit lives on a sibling attribute of the same cluster. So the
+/// default it applies is the substance's conventional one, and this corrects it
+/// wherever a node is in hand. A device reporting CO2 in ppb was otherwise
+/// labelled ppm: harmless on screen, wrong the moment a rule compares it.
+pub fn declared_unit_for(node: &MatterNode, path: &str) -> Option<&'static str> {
+    let mut parts = path.split('/');
+    let endpoint: u16 = parts.next()?.parse().ok()?;
+    let cluster: u32 = parts.next()?.parse().ok()?;
+    if !is_concentration_cluster(cluster) {
+        return None;
+    }
+    let code = node
+        .attributes
+        .get(&format!("{endpoint}/{cluster}/{ATTR_MEASUREMENT_UNIT}"))?
+        .as_u64()?;
+    measurement_unit_name(code)
+}
 
 /// Thermostat `OccupiedHeatingSetpoint` attribute id.
 pub const ATTR_OCCUPIED_HEATING_SETPOINT: u32 = 18;
@@ -670,6 +727,54 @@ mod tests {
             assert_eq!(reading.unit, unit);
             assert!((reading.value - 636.0).abs() < f64::EPSILON);
         }
+    }
+
+    /// The substance defaults are a guess; the device publishes the truth on a
+    /// sibling attribute. A CO2 sensor reporting ppb was labelled ppm — fine on
+    /// screen, wrong the moment a rule or a summary compares the number.
+    #[test]
+    fn a_declared_measurement_unit_overrides_the_substance_default() {
+        let node: MatterNode = serde_json::from_value(json!({
+            "node_id": 7,
+            "available": true,
+            "attributes": {
+                // CO2 measured in ppb (unit code 1), not the ppm we assume.
+                format!("1/{CLUSTER_CO2}/0"): 636.0,
+                format!("1/{CLUSTER_CO2}/8"): 1,
+                // PM2.5 with no declared unit at all.
+                format!("1/{CLUSTER_PM25}/0"): 12.0,
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            declared_unit_for(&node, &format!("1/{CLUSTER_CO2}/0")),
+            Some("ppb")
+        );
+        // Nothing declared: the caller keeps the substance default.
+        assert_eq!(
+            declared_unit_for(&node, &format!("1/{CLUSTER_PM25}/0")),
+            None
+        );
+        // Not a concentration cluster, so the question does not apply.
+        assert_eq!(
+            declared_unit_for(&node, &format!("1/{CLUSTER_TEMPERATURE}/0")),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unknown_unit_code_is_not_guessed_at() {
+        let node: MatterNode = serde_json::from_value(json!({
+            "node_id": 8,
+            "available": true,
+            "attributes": { format!("1/{CLUSTER_OZONE}/8"): 99 }
+        }))
+        .unwrap();
+        assert_eq!(
+            declared_unit_for(&node, &format!("1/{CLUSTER_OZONE}/0")),
+            None
+        );
     }
 
     /// Filter monitoring is the one cluster here reporting on two attributes:

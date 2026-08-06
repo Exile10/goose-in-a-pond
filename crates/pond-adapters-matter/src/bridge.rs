@@ -28,7 +28,7 @@ use tokio::sync::mpsc;
 
 use crate::client::{MatterClient, MatterEvent};
 use crate::control::{NodeCache, SharedMatterClient};
-use crate::protocol::{node_to_device, sensor_reading_from_update, MatterNode};
+use crate::protocol::{declared_unit_for, node_to_device, sensor_reading_from_update, MatterNode};
 
 /// Reconnect backoff bounds. Exponential from `RECONNECT_BASE` doubling to
 /// `RECONNECT_MAX`, with equal jitter so several Ponds pointed at one restarted
@@ -68,7 +68,10 @@ async fn sync_node(
     // the device list while every question about its reading is answered "none
     // recorded", which reads as "that device is not here".
     for (path, value) in &node.attributes {
-        if let Some(reading) = sensor_reading_from_update(node.node_id, path, value) {
+        if let Some(mut reading) = sensor_reading_from_update(node.node_id, path, value) {
+            if let Some(unit) = declared_unit_for(&node, path) {
+                reading.unit = unit.to_string();
+            }
             bus.publish(BusEvent::Sensor(reading));
         }
     }
@@ -143,7 +146,15 @@ pub async fn run_matter_bridge(
                 if let Some(node) = nodes.write().await.get_mut(&node_id) {
                     node.attributes.insert(path.to_string(), value.clone());
                 }
-                if let Some(reading) = sensor_reading_from_update(node_id, path, value) {
+                let declared = nodes
+                    .read()
+                    .await
+                    .get(&node_id)
+                    .and_then(|node| declared_unit_for(node, path));
+                if let Some(mut reading) = sensor_reading_from_update(node_id, path, value) {
+                    if let Some(unit) = declared {
+                        reading.unit = unit.to_string();
+                    }
                     tracing::debug!(
                         device = %reading.device_id,
                         sensor = %reading.sensor_type,
