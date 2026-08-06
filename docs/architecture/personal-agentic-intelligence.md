@@ -118,11 +118,15 @@ untouched and remains PAI-2 P2: the fix stops `GET /settings` being *reachable*,
   `TokenCounter` port now carries it, with a tiktoken-backed adapter on the live path and chars/4 as
   the declared fallback. The "corrected one turn late" half stands and is now load-bearing on
   purpose: no reachable counter is *exact* for a GGUF model.
-- `ModelRecord.context_length` exists (`models/domain/model_record.rs`). **Correction:** it is *not*
-  written as `None` by every path — `gguf_record()` in
-  `pond-server/src/composite_model_catalog_provider.rs` writes a real value for the curated GGUF
-  catalog. A reader now exists too (`ContextInputs.catalog_context_length`), but every call site
-  still passes `None`, so nothing feeds it yet. That wiring is PAI-3 P3.
+- ~~`ModelRecord.context_length` exists but nothing feeds it.~~ **PARTLY FIXED 2026-08-06 by PAI-3
+  P3.** The earlier correction — `gguf_record()` writes a real value, so it is not `None`
+  everywhere — was true and one question short: `llamafile_record()` and `ollama_entry_to_record()`
+  wrote `None`, and Ollama is the provider class rung 3 was designed for. Both now populate it
+  (Ollama from `/api/show`'s `model_info`), the Gemma 4 rows were corrected from a copy-pasted 8192
+  to the declared 131072, and rung 3 clamps a catalog value by the local ceiling because a declared
+  maximum is not an allocation. **`WindowSource::CatalogRecord` is still unreachable in production**:
+  all three `ContextInputs` call sites pass `None`, and the two live ones (`goose_agent.rs`,
+  `routes.rs`) plus the Models UI are held by a concurrent workstream. That wiring is PAI-3 **P3b**.
 - `reasoning_content` is parsed by llama.cpp and dropped: the identifier appears exactly once in
   `crates/`, in a comment (`pond-inference/src/provider.rs:422`).
 - `AgentStreamEvent::Thinking` has **four consumers and zero producers**
@@ -156,7 +160,7 @@ PAI-3 Context governor ── PAI-4 Compaction ── PAI-5 Thinking │
 |---|---|---|---|---|
 | [01](./pai/01-identity-and-profile-boundaries.md) | Identity and profile boundaries | Hard profile boundaries | — | **COMPLETE — P1-P8 LANDED** |
 | [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | **P0-P5, P7 LANDED** (P3, P5 partial); P6, P8 designed |
-| [03](./pai/03-context-governor.md) | Context governor | Large context, used fully | — | **P1, P2 LANDED** |
+| [03](./pai/03-context-governor.md) | Context governor | Large context, used fully | — | **P1, P2, P6 LANDED; P3 PARTIAL** (rung-3 data landed; wiring + UI -> P3b); P4-P5 designed |
 | [04](./pai/04-smart-compaction.md) | Smart compaction | Smart compaction | 03 | DESIGNED |
 | [05](./pai/05-reasoning-and-thinking.md) | Reasoning and thinking | Ability to think | 03, 04 | DESIGNED |
 | [06](./pai/06-multi-agent-orchestration.md) | Multi-agent orchestration | Multi-agent orchestration | 01, 02, 03, 04 | DESIGNED |
@@ -229,10 +233,10 @@ All of these are now **done**. Kept as a record of what was corrected and why.
 
 | Document | Claim | Reality | Status |
 |---|---|---|---|
-| `architecture/token_tracking.md:28` | "Real token counts are not available from Goose's `AgentEvent` stream" | Migration `0029_message_token_counts` and `TurnStats` landed; they are | FIXED |
+| `architecture/token_tracking.md` ("Estimation") | "Real token counts are not available from Goose's `AgentEvent` stream" | Migration `0029_message_token_counts` and `TurnStats` landed; they are | FIXED; rewritten again by PAI-3 P6, whose rewrite moves the old line 28 |
 | `architecture/scheduling.md:38` | `TaskKind` has two variants; seven MCP tools | Three variants (`SensorTrigger`); twelve tools | FIXED |
 | `api.md:219` | "Token validation is currently a stub" | `SqliteHandshakeAdapter::validate_token` is real | FIXED |
-| `architecture/model_capabilities.md:14` | `ModelCapabilities` has five fields | Six — `tool_calling` was missing from the doc | FIXED |
+| `architecture/model_capabilities.md` (`ModelCapabilities` struct) | `ModelCapabilities` has five fields | Six — `tool_calling` was missing from the doc | FIXED; the detection table below it still omitted the column until PAI-3 P6 |
 | `security/ports/policy.rs:6-11` | Describes the unconditional loopback bypass "at lines 206-214" | Removed in #94; now gated behind `POND_DEV_ALLOW_LOOPBACK` | FIXED |
 | `CLAUDE.md` | "14 `giap-*` extensions", "57 tools" | **15** and **61**. I twice got this wrong before counting properly: `giap-toolkit` registers via the `TOOLKIT_EXTENSION` const, so a grep for `"giap-*"` string literals misses it. Count `register_builtin_extension(` call sites instead | FIXED 2026-08-04 |
 
