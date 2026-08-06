@@ -14,6 +14,7 @@ use pond_core::models::ports::agent::{
 use pond_core::models::ports::embedding::EmbeddingProvider;
 use pond_core::models::ports::model_repository::ModelRepository;
 use pond_core::models::ports::token_counter::TokenCounter as PondTokenCounter;
+use pond_core::models::services::context::context_budget::CompactionProfile;
 use pond_core::models::services::context::context_governor::{
     ContextGovernor, ContextInputs, WindowResolution,
 };
@@ -245,7 +246,12 @@ pub struct GooseAdapter {
     /// changes. This field is the same number, owned deliberately: written on
     /// the settings path, read by the budget paths, never round-tripped through
     /// the environment. See `docs/architecture/pai/03-context-governor.md`.
-    last_window: Mutex<Option<WindowResolution>>,
+    ///
+    /// Cached WITH the provider it was resolved for, since PAI-3 P5: the
+    /// prompt-side clamp is a function of the provider class, so a budget path
+    /// that has the window but not the provider cannot build the asymmetric
+    /// profile and would silently fall back to the symmetric one.
+    last_window: Mutex<Option<(String, WindowResolution)>>,
     /// Per-turn controls for the [`GiapProviderShim`] wrapped around every
     /// provider handed to Goose — GIAP's last-mile veto over the system
     /// prompt, Goose's `<turn-context>` message injection, and the tools list.
@@ -692,7 +698,6 @@ impl GooseAdapter {
     /// the replay degrades the turn, it must never fail it.
     async fn hydrate_goose_session(&self, goose_sid: &str, giap_session_id: &str) {
         use pond_core::models::domain::message::Role as GiapRole;
-        use pond_core::models::services::context::context_budget::CompactionProfile;
         use pond_core::models::services::context::turn_trimmer::{plan_replay, TrimRole};
 
         let Some(storage) = &self.giap_session_storage else {
@@ -747,8 +752,7 @@ impl GooseAdapter {
             .ok()
             .and_then(|(s, _)| s);
 
-        let window = self.history_window().await;
-        let profile = CompactionProfile::from_context_window(window.tokens);
+        let profile = self.turn_profile().await;
 
         // Trailing-user drop, blank filtering, budget cut and summary splice all
         // live in pond-core's `plan_replay` so they are unit-tested there.
@@ -927,7 +931,8 @@ impl GooseAdapter {
         // Stored BEFORE the signature guard below returns early: the budget
         // paths read this field every turn, while the env knobs are only
         // re-exported when something actually changed.
-        *self.last_window.lock().unwrap_or_else(|e| e.into_inner()) = Some(resolution);
+        *self.last_window.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((settings.chat_provider.clone(), resolution));
         let knobs = goose_env_knobs(
             &settings.chat_provider,
             effective_ctx,
@@ -1152,17 +1157,20 @@ impl GooseAdapter {
         }
     }
 
-    /// The window the HISTORY budgets should be derived from.
+    /// The RAW resolved window, together with the provider it belongs to.
     ///
     /// Prefers the resolution cached by `apply_goose_env_knobs`, which runs on
     /// the settings path before any turn reaches the trimmer. The settings load
     /// is the cold path only — a session hydrated before the first turn has
     /// configured a provider.
     ///
-    /// Note this returns the RAW window, not the prompt-side clamp. History
-    /// budgets get the whole window on purpose; only the preamble is clamped.
-    /// Conflating the two silently grows the KV prefix on local providers.
-    async fn history_window(&self) -> WindowResolution {
+    /// The provider is not decoration: `ContextGovernor::prompt_window` needs it
+    /// to decide whether the preamble is re-prefilled locally, and that decision
+    /// is what makes the budget profile asymmetric. Callers wanting budgets want
+    /// [`GooseAdapter::turn_profile`], not this — history budgets get the whole
+    /// window on purpose and only the preamble is clamped, and conflating the
+    /// two silently grows the KV prefix on local providers.
+    async fn window_and_provider(&self) -> (String, WindowResolution) {
         if let Some(cached) = self
             .last_window
             .lock()
@@ -1172,12 +1180,43 @@ impl GooseAdapter {
             return cached;
         }
         let settings = self.settings_repo.get().await.unwrap_or_default();
-        self.resolve_window(
-            &settings.chat_provider,
-            &settings.chat_model,
-            settings.context_window_override,
+        let resolution = self
+            .resolve_window(
+                &settings.chat_provider,
+                &settings.chat_model,
+                settings.context_window_override,
+            )
+            .await;
+        (settings.chat_provider, resolution)
+    }
+
+    /// The budget profile for this turn: history from the full resolved window,
+    /// preamble from the prompt-side clamp.
+    ///
+    /// Every budget path in this adapter goes through here since PAI-3 P5. It
+    /// used to be the caller's job to remember `ContextGovernor::prompt_window`,
+    /// and only two of the four sites did — so `trim_goose_history` and
+    /// `hydrate_goose_session` budgeted history against a profile whose preamble
+    /// fields had scaled with the whole window, while the preamble they were
+    /// budgeting alongside had been built from the 8,192 clamp. One profile per
+    /// turn, carrying both windows, is what makes those two agree.
+    async fn turn_profile(&self) -> CompactionProfile {
+        let (provider, window) = self.window_and_provider().await;
+        Self::profile_for(&provider, window.tokens)
+    }
+
+    /// The pure half of [`GooseAdapter::turn_profile`], split out so the pairing
+    /// is testable without a live adapter.
+    ///
+    /// Which window goes in which slot is the entire phase, and getting it
+    /// backwards compiles: passing the clamp as the context window would cap
+    /// history at the 8K budget on a 32K box, and passing the raw window as the
+    /// prompt window would grow the KV prefix — the thing invariant 1 forbids.
+    fn profile_for(provider: &str, resolved_window: usize) -> CompactionProfile {
+        CompactionProfile::for_windows(
+            resolved_window,
+            ContextGovernor::prompt_window(provider, resolved_window),
         )
-        .await
     }
 
     /// Whether the ACTIVE model can accept image content.
@@ -1677,7 +1716,6 @@ impl GooseAdapter {
     /// Runs only when `hybrid_compaction_enabled` (the default), which is also
     /// what gates the image cap.
     async fn trim_goose_history(&self, goose_sid: &str, giap_session_id: &str) {
-        use pond_core::models::services::context::context_budget::CompactionProfile;
         use pond_core::models::services::context::turn_trimmer::{
             trim_history, CurrentTurn, TrimMessage, TrimRole,
         };
@@ -1707,8 +1745,7 @@ impl GooseAdapter {
             None => None,
         };
 
-        let window = self.history_window().await;
-        let profile = CompactionProfile::from_context_window(window.tokens);
+        let profile = self.turn_profile().await;
         let last_real = self
             .last_prompt_tokens_handle()
             .lock()
@@ -2482,7 +2519,7 @@ impl GooseAdapter {
         let thinking_enabled =
             Self::thinking_section_applies(&settings.thinking_mode, &settings.chat_model, is_voice);
 
-        // The turn's resolved window, read once from the resolution
+        // The turn's budget profile, built once from the resolution
         // `apply_goose_env_knobs` cached at the top of this function.
         //
         // Both consumers below (the prompt tier and the memory-injection
@@ -2491,7 +2528,13 @@ impl GooseAdapter {
         // became a repository read it would also have been two extra catalog
         // round trips per turn, and the block below is synchronous so it could
         // not have awaited them anyway.
-        let effective_ctx = self.history_window().await.tokens;
+        //
+        // Since PAI-3 P5 it is one profile rather than two: `turn_profile`
+        // carries the full window for history and the clamped prompt window for
+        // the preamble, so the two can no longer be built from different numbers
+        // by accident.
+        let turn_profile = self.turn_profile().await;
+        let effective_ctx = turn_profile.context_window_tokens;
 
         let prompt_state = {
             use chrono::Local;
@@ -2505,14 +2548,12 @@ impl GooseAdapter {
                 .map(|d| d.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            // Derive compact_prompt from the PROMPT-side context budget: for
-            // local inference the profile is clamped so a huge KV cache never
-            // selects the verbose tier (see ContextGovernor::prompt_window).
-            let compact_prompt =
-                pond_core::models::services::context_budget::CompactionProfile::from_context_window(
-                    ContextGovernor::prompt_window(&settings.chat_provider, effective_ctx),
-                )
-                .use_compact_prompt();
+            // The prompt tier follows the PROMPT-side window, which for local
+            // inference is clamped so a huge KV cache never selects the verbose
+            // tier (see `CompactionProfile::for_windows`). The profile itself
+            // now knows that; this is no longer a second construction that has
+            // to remember the clamp.
+            let compact_prompt = turn_profile.use_compact_prompt();
 
             // Prose tool lines, from the registry or not at all.
             //
@@ -2710,15 +2751,12 @@ impl GooseAdapter {
         // prompt) to keep the prefix token-stable for KV cache reuse.
         let mut memory_block_for_user_msg = String::new();
         //
-        // Derive a CompactionProfile for MEMORY INJECTION from the
-        // prompt-side context budget: local inference re-prefills every
-        // injected memory token each turn, so the budget stays bounded even
-        // on a 32K context (see ContextGovernor::prompt_window). History budgets elsewhere
-        // keep the real window. `effective_ctx` is the one resolved above.
-        let compaction_profile =
-            pond_core::models::services::context_budget::CompactionProfile::from_context_window(
-                ContextGovernor::prompt_window(&settings.chat_provider, effective_ctx),
-            );
+        // The memory budget is a PREAMBLE budget: local inference re-prefills
+        // every injected memory token each turn, so it stays bounded even on a
+        // 32K context. `turn_profile`'s preamble fields come from the clamped
+        // prompt window for exactly that reason, while its history budget keeps
+        // the real one (see `CompactionProfile::for_windows`).
+        let compaction_profile = &turn_profile;
 
         if !memory_candidates.is_empty() {
             // Blended relevance (similarity + importance + recency decay) so a
@@ -4480,6 +4518,46 @@ mod tests {
             !body.contains("env::var(\"GOOSE_CONTEXT_LIMIT\")"),
             "context windows must come from ContextGovernor, not the environment"
         );
+    }
+
+    // ── PAI-3 P5: the adapter builds ONE asymmetric profile per turn ─────
+
+    /// The wiring guard. `for_windows` is unit-tested in pond-core; what this
+    /// asserts is that the adapter hands it the two windows the right way round,
+    /// which is the half that cannot be checked from inside pond-core and the
+    /// half that used to be four call sites remembering (or not) to clamp.
+    #[test]
+    fn a_local_turn_budgets_history_from_the_window_and_the_preamble_from_the_clamp() {
+        // A Mac that resolved 32,768: four times the KV cache of the clamp.
+        let big = GooseAdapter::profile_for("local", 32_768);
+        let clamped = GooseAdapter::profile_for("local", 8_192);
+
+        // Preamble: frozen at the clamp's allowance. If this grows, TTFT grows
+        // with it on every single turn, because it is the KV prefix.
+        assert_eq!(big.system_prompt_budget, clamped.system_prompt_budget);
+        assert_eq!(big.memory_token_budget, clamped.memory_token_budget);
+        assert_eq!(big.max_memory_fragments, clamped.max_memory_fragments);
+        assert!(
+            big.use_compact_prompt(),
+            "a 32K KV cache selected the verbose prompt tier on a local provider"
+        );
+
+        // History: scaled with the real window, and it took the tokens the
+        // preamble was not allowed to have.
+        assert_eq!(big.context_window_tokens, 32_768);
+        assert_eq!(big.history_token_budget, 24_000);
+        assert!(big.history_token_budget > clamped.history_token_budget);
+    }
+
+    /// HTTP providers pay no local prefill, so nothing is clamped and nothing is
+    /// redistributed — the symmetric profile, unchanged from before this phase.
+    #[test]
+    fn an_http_turn_is_not_clamped_at_all() {
+        let p = GooseAdapter::profile_for("ollama", 32_768);
+        assert_eq!(p.system_prompt_budget, 6_000);
+        assert_eq!(p.memory_token_budget, 1_500);
+        assert_eq!(p.history_token_budget, 20_000);
+        assert!(!p.use_compact_prompt());
     }
 
     // ── F1: image attachment onto the user message ───────────────────────

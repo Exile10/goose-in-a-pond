@@ -57,13 +57,44 @@ pub struct CompactionProfile {
     pub output_reserve_tokens: usize,
     /// The effective context window this profile was derived from.
     pub context_window_tokens: usize,
+    /// The window the PREAMBLE budgets were derived from.
+    ///
+    /// Equal to `context_window_tokens` except on providers whose preamble is
+    /// re-prefilled locally every turn, where it is the clamped prompt-side
+    /// window (`ContextGovernor::prompt_window`). Carrying both is what makes
+    /// the asymmetry a property of the profile rather than of whichever caller
+    /// remembered to clamp — see [`CompactionProfile::for_windows`].
+    pub prompt_window_tokens: usize,
 }
 
 impl CompactionProfile {
-    /// Tokens the prompt may occupy: the window minus the output reserve.
+    /// Tokens the whole PROMPT may occupy: the window minus the output reserve.
+    ///
+    /// This is the ceiling the engine's own reported `prompt_tokens` is compared
+    /// against, so it covers preamble plus history. For the history budget
+    /// alone, use [`CompactionProfile::usable_history_tokens`].
     pub fn usable_prompt_tokens(&self) -> usize {
         self.context_window_tokens
             .saturating_sub(self.output_reserve_tokens)
+    }
+
+    /// Tokens HISTORY may occupy: the usable prompt space, minus the preamble
+    /// this profile has already promised to the system prompt and the injected
+    /// memory block.
+    ///
+    /// `usable_prompt_tokens()` alone was never sufficient as a history clamp
+    /// and P4's own notes said so: at 8,192 the profile declares 1,024 + 3,000 +
+    /// 500 + 4,000 = 8,524 tokens against an 8,192-token window, and a clamp
+    /// that subtracts only the output reserve lets history claim 7,168 of it on
+    /// top of a preamble that is still going to be sent. The overrun that costs
+    /// is the mid-generation one described on `output_reserve_tokens`.
+    ///
+    /// Saturating rather than floored: a preamble allowance larger than the
+    /// window legitimately leaves no room for history at all, and
+    /// `turn_trimmer` owns the floor that keeps the current turn alive.
+    pub fn usable_history_tokens(&self) -> usize {
+        self.usable_prompt_tokens()
+            .saturating_sub(self.system_prompt_budget + self.memory_token_budget)
     }
 }
 
@@ -255,21 +286,82 @@ impl CompactionProfile {
                 t,
             ),
             context_window_tokens: context_tokens,
+            prompt_window_tokens: context_tokens,
+        }
+    }
+
+    /// The asymmetric profile: history budgeted from the full window, preamble
+    /// budgeted from the clamped prompt-side window.
+    ///
+    /// # Why the two halves are not the same number
+    ///
+    /// A context window has two halves with opposite cost curves. The preamble
+    /// (system prompt, tool schemas, injected memories) is the KV prefix, so on
+    /// a provider that re-prefills locally every turn, every token of it is paid
+    /// again on every turn. The working set (conversation history) is paid too,
+    /// but it is what makes the assistant remember you, and it is what gets
+    /// thrown away first. So growing the window must buy working set, never
+    /// preamble (PAI-3 invariant 1).
+    ///
+    /// Until this existed the asymmetry was enforced by the CALLER: two sites in
+    /// `GooseAdapter` remembered to pass `ContextGovernor::prompt_window(..)`
+    /// into `from_context_window`, and every other consumer got a profile whose
+    /// preamble budgets scaled with the full window. That is the same shape as
+    /// the four-paths-disagree defect PAI-3 exists to remove, one layer down.
+    ///
+    /// # What it does with the tokens the preamble is not allowed to have
+    ///
+    /// It gives them to history. The preamble fields come from the anchor curve
+    /// at `prompt_window`; everything else comes from the curve at
+    /// `context_window`; and the difference between the two preamble
+    /// allowances is ADDED to `history_token_budget`. So the total budget is
+    /// identical to `from_context_window(context_window)` - which is what keeps
+    /// P4's "never promises more than the tiers did" property true - while the
+    /// split between prefix and working set moves.
+    ///
+    /// Concretely, on a local provider whose window resolves to 32,768 the
+    /// preamble stays at the 8,192 allowance (3,000 + 500) instead of growing to
+    /// 6,000 + 1,500, and the 4,000 tokens that frees go to history: 20,000 ->
+    /// 24,000. That is the measurable claim of this phase - flat TTFT, more
+    /// retained history.
+    ///
+    /// When `prompt_window >= context_window` there is nothing to clamp and
+    /// nothing to redistribute, so this is exactly `from_context_window`. HTTP
+    /// providers take that path: their preamble is not paid for in local
+    /// prefill.
+    pub fn for_windows(context_window: usize, prompt_window: usize) -> Self {
+        let full = Self::from_context_window(context_window);
+        if prompt_window >= context_window {
+            return full;
+        }
+        let capped = Self::from_context_window(prompt_window);
+        let freed = (full.system_prompt_budget + full.memory_token_budget)
+            .saturating_sub(capped.system_prompt_budget + capped.memory_token_budget);
+        Self {
+            memory_token_budget: capped.memory_token_budget,
+            max_memory_fragments: capped.max_memory_fragments,
+            system_prompt_budget: capped.system_prompt_budget,
+            history_token_budget: full.history_token_budget + freed,
+            prompt_window_tokens: prompt_window,
+            ..full
         }
     }
 
     /// Whether the system prompt should use a compact format.
     ///
-    /// Returns true when the context window is small enough that verbose
-    /// tool descriptions and detailed instructions waste precious tokens.
+    /// Returns true when the window is small enough that verbose tool
+    /// descriptions and detailed instructions waste precious tokens.
+    ///
+    /// Reads the PROMPT window, not the context window: this is a preamble
+    /// decision, and on a local provider a 32K KV cache must not buy a more
+    /// verbose prefix. Under `from_context_window` the two are the same number,
+    /// so the 12288 boundary is unmoved for every existing caller.
     ///
     /// Deliberately NOT interpolated. Everything else on this profile is a
     /// budget and answers "how much"; this one is a format switch and answers
-    /// "which". A continuous curve through a boolean has no meaning, and the
-    /// 12288 boundary is the same one the tier function used, so no caller
-    /// sees a change.
+    /// "which". A continuous curve through a boolean has no meaning.
     pub fn use_compact_prompt(&self) -> bool {
-        self.context_window_tokens <= 12288
+        self.prompt_window_tokens <= 12288
     }
 }
 
@@ -1025,5 +1117,145 @@ mod tests {
     fn use_compact_prompt_is_still_a_hard_step_at_12288() {
         assert!(CompactionProfile::from_context_window(12_288).use_compact_prompt());
         assert!(!CompactionProfile::from_context_window(12_289).use_compact_prompt());
+    }
+
+    // ── P5: asymmetric budgeting - preamble capped, working set scaled ───
+
+    /// The phase, as one assertion.
+    ///
+    /// A local provider's prompt window is clamped to 8,192 whatever the KV
+    /// cache holds, so quadrupling the window from 8,192 to 32,768 must buy
+    /// HISTORY and nothing else. If the preamble grows too, TTFT grows with it
+    /// permanently - it is the KV prefix, re-prefilled every turn (invariant 1).
+    #[test]
+    fn growing_the_window_buys_history_and_never_preamble() {
+        let small = CompactionProfile::for_windows(8_192, 8_192);
+        let big = CompactionProfile::for_windows(32_768, 8_192);
+
+        assert_eq!(
+            big.system_prompt_budget, small.system_prompt_budget,
+            "a 4x window bought a bigger system prompt: {} vs {}",
+            big.system_prompt_budget, small.system_prompt_budget
+        );
+        assert_eq!(
+            big.memory_token_budget, small.memory_token_budget,
+            "a 4x window bought a bigger memory block: {} vs {}",
+            big.memory_token_budget, small.memory_token_budget
+        );
+        assert_eq!(
+            big.max_memory_fragments, small.max_memory_fragments,
+            "a 4x window bought more memory fragments"
+        );
+        assert_eq!(
+            big.use_compact_prompt(),
+            small.use_compact_prompt(),
+            "a 4x window flipped the prompt to the verbose tier"
+        );
+
+        assert!(
+            big.history_token_budget > small.history_token_budget,
+            "a 4x window bought no extra history: {} vs {}",
+            big.history_token_budget,
+            small.history_token_budget
+        );
+        // The exact numbers, so a silent re-tune is visible in the diff.
+        assert_eq!(small.history_token_budget, 4_000);
+        assert_eq!(big.history_token_budget, 24_000);
+        assert_eq!(big.system_prompt_budget, 3_000);
+        assert_eq!(big.memory_token_budget, 500);
+    }
+
+    /// The redistribution is exactly that - a redistribution. Nothing is
+    /// invented, so P4's "never promises more budget than the tiers did"
+    /// property survives untouched.
+    #[test]
+    fn capping_the_preamble_moves_tokens_to_history_and_creates_none() {
+        for window in [8_193usize, 12_288, 16_384, 32_768, 65_536, 128_000] {
+            let symmetric = CompactionProfile::from_context_window(window);
+            let asymmetric = CompactionProfile::for_windows(window, 8_192);
+            assert_eq!(
+                budget_sum(&asymmetric),
+                budget_sum(&symmetric),
+                "window {window}: the split changed the TOTAL budget"
+            );
+            assert!(
+                asymmetric.history_token_budget >= symmetric.history_token_budget,
+                "window {window}: capping the preamble cost history"
+            );
+        }
+    }
+
+    /// The symmetric case must be bit-identical to the old constructor, or every
+    /// HTTP provider silently re-tunes. `prompt_window >= context_window` is the
+    /// path they take.
+    #[test]
+    fn an_unclamped_prompt_window_reproduces_from_context_window_exactly() {
+        for &(w, ..) in TIER_FIXTURES {
+            let a = CompactionProfile::from_context_window(w);
+            for prompt in [w, w + 1, w * 2 + 1] {
+                let b = CompactionProfile::for_windows(w, prompt);
+                assert_eq!(budget_sum(&a), budget_sum(&b), "window {w} prompt {prompt}");
+                assert_eq!(a.history_token_budget, b.history_token_budget, "window {w}");
+                assert_eq!(a.system_prompt_budget, b.system_prompt_budget, "window {w}");
+                assert_eq!(a.memory_token_budget, b.memory_token_budget, "window {w}");
+                assert_eq!(a.max_memory_fragments, b.max_memory_fragments, "window {w}");
+                assert_eq!(a.prompt_window_tokens, b.prompt_window_tokens, "window {w}");
+                assert_eq!(a.use_compact_prompt(), b.use_compact_prompt(), "window {w}");
+            }
+        }
+    }
+
+    /// Invariant 1 as a range property rather than a spot check: across every
+    /// window a local provider can resolve to, the preamble allowance is frozen
+    /// at the clamp's values.
+    #[test]
+    fn the_preamble_allowance_is_flat_across_every_clamped_window() {
+        let clamp = 8_192usize;
+        let reference = CompactionProfile::from_context_window(clamp);
+        for window in (clamp..=200_000).step_by(97) {
+            let p = CompactionProfile::for_windows(window, clamp.min(window));
+            assert_eq!(
+                p.system_prompt_budget, reference.system_prompt_budget,
+                "window {window}"
+            );
+            assert_eq!(
+                p.memory_token_budget, reference.memory_token_budget,
+                "window {window}"
+            );
+            assert_eq!(
+                p.max_memory_fragments, reference.max_memory_fragments,
+                "window {window}"
+            );
+            assert!(p.use_compact_prompt(), "window {window}");
+        }
+    }
+
+    /// The over-commitment P4 deferred here. At 8,192 the declared budgets sum
+    /// to 8,524 against an 8,192-token window, and the old history clamp
+    /// (`usable_prompt_tokens`, window minus reserve only) let history claim
+    /// 7,168 of that on top of a preamble that was still going to be sent.
+    #[test]
+    fn the_history_ceiling_subtracts_the_preamble_the_prompt_ceiling_does_not() {
+        let p = CompactionProfile::from_context_window(8_192);
+        // Unchanged: this is the ceiling the engine's own prompt_tokens is
+        // measured against, so it must still cover preamble plus history.
+        assert_eq!(p.usable_prompt_tokens(), 8_192 - 1_024);
+        // New: history alone may not claim the preamble's room.
+        assert_eq!(p.usable_history_tokens(), 7_168 - 3_000 - 500);
+        assert!(
+            p.usable_history_tokens() < p.history_token_budget,
+            "the declared 4,000-token history budget was payable after all"
+        );
+    }
+
+    /// A preamble allowance larger than the whole window leaves history nothing,
+    /// and must saturate rather than wrap. `turn_trimmer` owns the floor that
+    /// keeps the current turn alive.
+    #[test]
+    fn a_preamble_bigger_than_the_window_leaves_zero_history_room() {
+        let p = CompactionProfile::from_context_window(1_024);
+        assert_eq!(p.system_prompt_budget, 1_500);
+        assert_eq!(p.usable_prompt_tokens(), 256);
+        assert_eq!(p.usable_history_tokens(), 0);
     }
 }

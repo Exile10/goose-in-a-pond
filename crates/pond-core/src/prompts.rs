@@ -70,10 +70,12 @@ pub struct PromptState {
     /// True when the model supports thinking/reasoning (Gemma 4, Qwen3, etc.)
     /// and thinking_mode is not "off".
     pub thinking_enabled: bool,
-    /// True when the effective context window is small enough that the system
+    /// True when the PROMPT-side context window is small enough that the system
     /// prompt should use a compact format (skip verbose tool descriptions and
     /// detailed instructions to save tokens).  Derived from
-    /// [`CompactionProfile::use_compact_prompt()`].
+    /// [`CompactionProfile::use_compact_prompt()`], which reads the clamped
+    /// prompt window rather than the full context window — growing the KV cache
+    /// must not buy a more verbose prefix.
     pub compact_prompt: bool,
     /// True when the provider injects the full tools JSON via the model's chat
     /// template (local llama.cpp native tool calling) — the template must then
@@ -1913,8 +1915,9 @@ mod tests {
     /// exactly one tool in the whole server did that. Every style, in BOTH
     /// tiers, must now say that an empty result is not an answer and that
     /// another tool should be tried — the compact tier especially, since
-    /// `prompt_budget_ctx` clamps local/gguf to 8192 and the on-device model
-    /// never sees the verbose branch.
+    /// `ContextGovernor::prompt_window` clamps local/gguf to 8192 and the
+    /// on-device model never sees the verbose branch. (Named `prompt_budget_ctx`
+    /// until PAI-3 P1 moved it into `pond-core`.)
     #[test]
     fn every_style_and_tier_says_an_empty_result_is_not_an_answer() {
         let s = Settings::default();

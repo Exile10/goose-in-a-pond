@@ -20,7 +20,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 2 | Requires the ability of the model to **think** | [PAI-5](./05-reasoning-and-thinking.md) | DESIGNED |
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
 | 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **COMPLETE — P1-P8 LANDED** |
-| 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1-P4, P6 LANDED** (P3 completed by P3b 2026-08-06); P5 needs on-device TTFT measurement |
+| 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1-P4, P6 LANDED** (P3 completed by P3b 2026-08-06); **P5 code landed 2026-08-06, awaiting the on-device TTFT measurement that decides it** |
 | 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
 | 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0-P5, P7 LANDED** (P3, P5 partial); P6, P8 designed |
@@ -995,3 +995,52 @@ the status rows this phase had to stamp were already carrying `P3 PARTIAL`. They
 overwritten. Both rewrites also had to stop describing rung 3 as "PAI-3 P3" future work: the durable
 statement is that **no production caller supplies `catalog_context_length`**, which is true both
 before and after P3's data work, and is the thing P3b changes.
+
+---
+
+**2026-08-06 — PAI-3 P5 code landed. The measurement that decides it did not.**
+
+P5 is "asymmetric budgeting: preamble capped, working set scaled", and the first surprise was that
+the cap already existed. P1 had moved it into `ContextGovernor::prompt_window` and two adapter sites
+called it. The defect was that calling it was **optional**: `trim_goose_history` and
+`hydrate_goose_session` built their profile straight from the raw window, so a single Orin turn
+carried two different preamble budgets depending on which function you read — 3,600/700 on the
+history side, 3,000/500 on the side that actually assembled the prompt. That is the four-paths-
+disagree shape PAI-3 exists to remove, reproduced one layer down inside the fix for it.
+
+So the asymmetry moved into the type. `CompactionProfile::for_windows(context, prompt)` takes both
+windows, sources the preamble fields from the clamped one and everything else from the full one, and
+**adds the difference to `history_token_budget`** — the preamble does not merely stay small, the
+tokens it is denied go to history. Total budget is unchanged, which is what keeps P4's
+"never promises more than the tiers did" property intact while the prefix/working-set split moves.
+The profile gained one field, `prompt_window_tokens`, so `use_compact_prompt()` can be a preamble
+decision rather than a context-window decision.
+
+The second half is the clamp P4 deferred here **by name** in its own test comments: `turn_trimmer`
+capped history at window-minus-reserve, which does not subtract the system prompt or the memory
+block, so at 8,192 it let history claim 7,168 tokens on top of a 3,500-token preamble that was going
+to be sent anyway. `usable_history_tokens()` subtracts it. `usable_prompt_tokens()` is deliberately
+untouched, because the overshoot correction compares it against the engine's report of the **whole**
+prompt and a history-only ceiling there would cry overshoot on every turn that merely spent its
+budget. That distinction is the one thing in this phase most likely to be "tidied" wrongly later.
+
+**What it costs, said out loud rather than buried.** At a symmetric 8,192 window effective history
+drops from 4,000 to 3,668. That is less retained history at one operating point, and it is correct:
+the 4,000 was never payable. Above the clamp history grows — 20,000 to 24,000 at 32,768 local, 7,200
+to 8,000 at the Orin's pinned 16,384 — with the preamble frozen.
+
+**Three mutations, because two of the three failure modes compile silently.** Ignoring the prompt
+window: `a 4x window bought a bigger system prompt: 6000 vs 3000`. Reverting the trimmer clamp:
+`history claimed 3810 tokens, past the 3668 the preamble leaves it`. Swapping the two `usize`
+arguments at the adapter's `profile_for` — which the compiler cannot object to — `left: 8192,
+right: 32768`. That third one is why the pure half was split out of `turn_profile`: `for_windows`
+being right inside `pond-core` says nothing at all about the adapter feeding it correctly, and a
+test that only exercised `pond-core` would have been the seventh vacuous test in this programme.
+
+**Why the status cell says "code landed" and not "LANDED".** This document's own success criterion
+for P5 is a measurement: `ttft_ms`, `prefill_ms`, `prompt_tokens` and retained turns, on Mac and on
+Orin, before and after. There is no Jetson attached to the machine this landed on, and neither run
+happened. The arithmetic says the local preamble is byte-for-byte what it was, because the same
+clamp feeds the same two consumers — but "the budget did not change" and "TTFT did not change" are
+different claims, and only the second one is what the phase promised. Stamping LANDED on unit tests
+here would be exactly the substitution the PAI-2 P5 repair earlier in this log exists to warn about.

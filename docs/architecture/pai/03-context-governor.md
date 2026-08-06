@@ -93,6 +93,10 @@ Separately, `prompt_budget_ctx` (`goose_agent.rs:879+`) clamps the *prompt-side*
 tier for local providers even when the KV cache is larger. The doc comment records why: an
 unclamped 32K profile produced a 9.4K-token prompt and roughly 17 s TTFT for a one-line question.
 
+*Corrected 2026-08-06.* `prompt_budget_ctx` no longer exists under that name — P1 moved it into
+`pond-core` as `ContextGovernor::prompt_window`, and P5 made calling it mandatory by folding it into
+`CompactionProfile::for_windows`. Grep for `prompt_window`, not for the old name.
+
 ---
 
 ## 2. The gap
@@ -191,6 +195,10 @@ So: **growing the window buys working set, not preamble.** The preamble budget s
 the 8K tier's numbers regardless of window size; `history_token_budget` scales with the window.
 That is the concrete meaning of "dynamically and to the fullest" on this hardware, and it is
 compatible with everything Phase D landed on tool narrowing.
+
+*Code landed 2026-08-06 by P5*, as `CompactionProfile::for_windows`, which additionally hands the
+tokens the preamble is denied **to** history rather than leaving them unspent — see P5 in section 4.
+The measured half of the claim, section 7's Measured row, has not been run.
 
 ### 3.5 A continuous profile function
 
@@ -341,8 +349,63 @@ Once occupancy is measured rather than estimated, `ContextHealth.should_compact`
   195,905 windows between them — at 12,289 they declare 29,548 tokens against a 12,289-token window.
   The curve's over-commitment set is a strict subset of the tiers' (2,116 windows, down from
   54,245) and worst-case over-commitment falls from 2.404x to 1.041x.
-- **P5** Asymmetric budgeting: preamble capped, working set scaled. Measure TTFT before and after on
-  both Mac and Orin — this phase is only correct if TTFT is flat and retained history grows.
+- **P5 — CODE LANDED 2026-08-06. THE MEASUREMENT THAT DECIDES IT IS OUTSTANDING.** The asymmetry
+  moved from the callers into the profile. `CompactionProfile::for_windows(context, prompt)` takes
+  both windows: the preamble fields (`system_prompt_budget`, `memory_token_budget`,
+  `max_memory_fragments`, and `use_compact_prompt`, which now reads the new `prompt_window_tokens`)
+  come from the anchor curve at the *clamped* prompt window; the reserve, the threshold and the
+  history budget come from the curve at the *full* window; and the difference between the two
+  preamble allowances is **added to `history_token_budget`**. The total budget is therefore
+  identical to `from_context_window(context)` — P4's "never promises more than the tiers did"
+  property is untouched — while the split between KV prefix and working set moves. That is 3.4's
+  "growing the window buys working set, not preamble", expressed as arithmetic rather than as a
+  convention.
+
+  **What was actually wrong, and it was not what the phase text implies.** The clamp itself already
+  existed (P1 moved it into `ContextGovernor::prompt_window`). What did not exist was any obligation
+  to use it: exactly **two** of the four adapter budget sites called it, both on the preamble side.
+  `trim_goose_history` and `hydrate_goose_session` built their profile from the raw window, so on
+  the Orin they budgeted history against a profile declaring a 3,600-token system prompt and a
+  700-token memory block while the preamble actually being assembled alongside them had been
+  budgeted at 3,000 and 500 from the 8,192 clamp. Two numbers for one turn, decided by which call
+  site you happened to be in — the same defect PAI-3 exists to remove, one layer down. There is now
+  one `GooseAdapter::turn_profile()` and all four sites call it; `last_window` caches the provider
+  with the resolution, because the clamp is a function of the provider class and a caller holding
+  only the window would silently fall back to the symmetric profile.
+
+  **The second half is the clamp P4 deferred here by name.** `turn_trimmer` capped history at
+  `usable_prompt_tokens()` — window minus output reserve — which P4's own notes called "never
+  sufficient" because it does not subtract the system prompt or the memory block. New
+  `usable_history_tokens()` does, and the trimmer uses it, floored at `MIN_HISTORY_TOKENS`.
+  `usable_prompt_tokens()` is deliberately unchanged and still what the engine's reported
+  `prompt_tokens` is compared against in the overshoot correction: the engine reports the *whole*
+  prompt, so comparing it against a history-only ceiling would report an overshoot on every turn
+  that merely spent its budget.
+
+  **What this costs, stated rather than buried.** At a symmetric 8,192 window the declared budgets
+  sum to 8,524 against an 8,192-token window, and the new clamp cuts effective history from 4,000
+  to 3,668. That is a reduction in retained history at exactly one operating point, and it is the
+  correct one: the 4,000 was never payable alongside the 3,500-token preamble that was going to be
+  sent anyway. Everywhere the window exceeds the clamp, history grows — 32,768 local goes from
+  20,000 to 24,000 declared, and the Orin's pinned 16,384 from 7,200 to 8,000, with the preamble
+  allowance frozen at the clamp's 3,500 in both cases.
+
+  **Verified by mutation, three ways, not asserted.** Making `for_windows` ignore its prompt window
+  gives `a 4x window bought a bigger system prompt: 6000 vs 3000`; reverting the trimmer's clamp to
+  `usable_prompt_tokens` gives `history claimed 3810 tokens, past the 3668 the preamble leaves it`;
+  and swapping the two arguments at the adapter's `profile_for` — which compiles, both being
+  `usize` — gives `left: 8192, right: 32768` on `context_window_tokens`. That last one is why the
+  pure half was split out of `turn_profile` at all: `for_windows` being right in `pond-core` proves
+  nothing about the adapter feeding it the two windows the right way round.
+
+  **Not done, and this is the part that decides the phase.** The success criterion in this document
+  is *measured*: same question, fresh session, `ttft_ms` / `prefill_ms` / `prompt_tokens` and
+  retained turns on **both Mac and Orin**, before and after. Neither run has happened — there is no
+  Jetson attached to the machine this landed on, and a TTFT claim from unit tests is not a TTFT
+  claim. The arithmetic says the preamble is byte-for-byte unchanged on the local path (the same
+  clamp feeds the same two consumers) and that history grows, but "the budget did not change" and
+  "TTFT did not change" are different statements and only the second one is the criterion. **Do not
+  mark this phase LANDED outright until section 7's Measured row has been run.**
 - **P6 — LANDED (2026-08-06).** `token_tracking.md` rewritten around the split this workstream
   forced into the open: **accounting** (real provider `Usage` aggregated into `TurnStats`,
   per-session totals, savings) and **budgeting** (`TokenCounter`, `CompactionProfile`, the trimmer),
