@@ -117,16 +117,29 @@ jobs:
       # Without this, a path/API break in pond-server or the Goose adapter — the
       # exact failure mode that motivated CI — passes unnoticed. Slow on a cold
       # cache; rust-cache makes subsequent runs fast.
-      - name: cargo check (production binary — pond-server + goose adapter)
-        run: cargo check -p pond-server -p pond-adapters-goose
+      #
+      # `--all-targets` is load-bearing, not tidiness. Without a target selector
+      # cargo builds lib + bins ONLY, so these crates' tests/ and examples/ were
+      # compiled by nothing in this pipeline — they are excluded from the fast
+      # test job by definition. `pond-server/tests/live_feature_test.rs` sat
+      # broken for a whole phase because `MemoryExtractionService::run` grew a
+      # `scope` parameter: production call sites were compiler-forced to update,
+      # the test call sites were not, and CI was green throughout. Prefer
+      # `--all-targets` over `--tests`: `--tests` rebuilds the bins in cfg(test)
+      # mode, so a break inside a `#[cfg(not(test))]` block in main.rs would
+      # still slip past. This covers lib + bins + tests + examples.
+      - name: cargo check (production binary + its test targets — pond-server + goose adapter)
+        run: cargo check -p pond-server -p pond-adapters-goose --all-targets
 
       # The quarantined PondAgent stack (Q2-05). It is no longer in pond-server's
       # default features, so the gate above stops reaching it — and CLAUDE.md's
       # promise is that the code "compiles and can be enabled when the engine is
-      # production-ready". It moved off the fast lint/test pass because it builds
-      # llama-cpp-2, which is exactly what that list is defined to exclude.
-      - name: cargo check (quarantined PondAgent — pond-agent + pond-inference)
-        run: cargo check -p pond-agent -p pond-inference
+      # production-ready". A quarantined crate whose own unit tests no longer
+      # compile has quietly broken that promise, which is why this one is
+      # `--all-targets` too. It moved off the fast lint/test pass because it
+      # builds llama-cpp-2, which is exactly what that list is defined to exclude.
+      - name: cargo check (quarantined PondAgent + its test targets — pond-agent + pond-inference)
+        run: cargo check -p pond-agent -p pond-inference --all-targets
 
       # Compile-gate the ONNX vision classifier (ort is too heavy for the fast
       # lint/test pass, mirroring pond-adapters-face-onnx). Its pure decode/

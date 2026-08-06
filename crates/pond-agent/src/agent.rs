@@ -682,6 +682,7 @@ impl Agent for PondAgent {
 mod tests {
     use super::*;
     use pond_core::models::ports::inference::ChatEventStream;
+    use pond_core::user_data::domain::profile::ProfileScope;
     use pond_core::user_data::domain::session::{Session, SessionMessage};
     use pond_core::user_data::ports::device_registry::{Device, RegisterDeviceRequest};
     use pond_core::user_data::ports::session_storage::SessionStorageError;
@@ -840,6 +841,12 @@ mod tests {
                 images: vec![],
                 voice_mode: false,
                 canvas_mode: false,
+                // States what this fixture is, nothing more. This loop does not
+                // read either field -- it is quarantined (Q2-05) and its scope
+                // handling is unwritten, so Household here is a description of
+                // the fixture, not evidence the loop honours a scope.
+                profile_scope: ProfileScope::Household,
+                profile_context: None,
             })
             .await
             .unwrap();
@@ -858,6 +865,8 @@ mod tests {
                 images: vec![],
                 voice_mode: false,
                 canvas_mode: false,
+                profile_scope: ProfileScope::Household,
+                profile_context: None,
             })
             .await
             .unwrap();
