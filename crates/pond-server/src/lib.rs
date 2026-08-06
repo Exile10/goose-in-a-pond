@@ -4,7 +4,6 @@
 //! them without duplicating code from `main.rs`.
 
 pub mod hf_cache_migration;
-pub mod inference_pool;
 pub mod llm_memory_consolidator;
 pub mod llm_memory_extractor;
 pub mod schedule_executors;
