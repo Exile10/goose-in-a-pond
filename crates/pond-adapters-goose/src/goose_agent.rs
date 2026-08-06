@@ -252,6 +252,11 @@ pub struct GooseAdapter {
     /// that has the window but not the provider cannot build the asymmetric
     /// profile and would silently fall back to the symmetric one.
     last_window: Mutex<Option<(String, WindowResolution)>>,
+    /// `Settings::compaction_verbatim_days`, cached on the settings path for
+    /// the same reason `last_window` is: `trim_goose_history` runs on every
+    /// turn, and a settings load per turn is a cost the budget paths
+    /// deliberately do not pay. PAI-4 P3.
+    last_verbatim_days: Mutex<Option<u32>>,
     /// Per-turn controls for the [`GiapProviderShim`] wrapped around every
     /// provider handed to Goose — GIAP's last-mile veto over the system
     /// prompt, Goose's `<turn-context>` message injection, and the tools list.
@@ -406,6 +411,7 @@ impl GooseAdapter {
             last_env_signature: Mutex::new(String::new()),
             token_counter: tokio::sync::OnceCell::new(),
             last_window: Mutex::new(None),
+            last_verbatim_days: Mutex::new(None),
             shim_controls: Arc::new(crate::provider_shim::ShimControls::default()),
             goose_session_map: Mutex::new(HashMap::new()),
             loaded_sessions: Mutex::new(HashSet::new()),
@@ -933,6 +939,13 @@ impl GooseAdapter {
         // re-exported when something actually changed.
         *self.last_window.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((settings.chat_provider.clone(), resolution));
+        // Same placement, same reason: stored BEFORE the signature guard below
+        // returns early, because the trimmer reads it every turn while the env
+        // knobs are only re-exported when something changed. PAI-4 P3.
+        *self
+            .last_verbatim_days
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(settings.compaction_verbatim_days);
         let knobs = goose_env_knobs(
             &settings.chat_provider,
             effective_ctx,
@@ -1188,6 +1201,39 @@ impl GooseAdapter {
             )
             .await;
         (settings.chat_provider, resolution)
+    }
+
+    /// PAI-4 P3's verbatim horizon for this turn, or `None` when age weighting
+    /// is off.
+    ///
+    /// Prefers the value cached by `apply_goose_env_knobs`, exactly as
+    /// `window_and_provider` does, so the per-turn trim costs no settings read.
+    /// The cold path is a session trimmed before the settings path has ever
+    /// run; falling back to `Settings::default()` there rather than to "off"
+    /// keeps a missing cache from silently disabling the feature.
+    /// The guard is released in its own scope BEFORE the settings await. A
+    /// `MutexGuard` held across an await makes the whole future non-`Send`, and
+    /// `AgentPort`'s boxed futures require `Send` — so the first version of this
+    /// compiled nowhere and failed only under
+    /// `cargo check -p pond-adapters-goose`, which the fast-crate lint pass does
+    /// not run. `window_and_provider` avoids the same trap by cloning out of the
+    /// lock and returning early.
+    async fn verbatim_horizon(&self) -> Option<std::time::Duration> {
+        let cached = *self
+            .last_verbatim_days
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let days = match cached {
+            Some(days) => days,
+            None => {
+                self.settings_repo
+                    .get()
+                    .await
+                    .unwrap_or_default()
+                    .compaction_verbatim_days
+            }
+        };
+        pond_core::models::services::context::turn_trimmer::verbatim_horizon_from_days(days)
     }
 
     /// The budget profile for this turn: history from the full resolved window,
@@ -1753,6 +1799,15 @@ impl GooseAdapter {
             .get(giap_session_id)
             .copied();
 
+        // Wall-clock now, in unix seconds, for PAI-4 P3's age weighting.
+        // `Message::created` is the same epoch. A clock that cannot be read at
+        // all yields `None` ages, which the trimmer treats as recent — the
+        // narrowing direction, and never a failed turn.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+
         let trim_input: Vec<TrimMessage> = source
             .iter()
             .enumerate()
@@ -1773,11 +1828,17 @@ impl GooseAdapter {
                     }
                 };
                 let is_summary = text.trim_start().starts_with("<conversation-summary>");
+                // `saturating_sub` is the clock-skew rule, and it matches the
+                // one `resume_compaction::idle_gap_since` already uses: a
+                // message stamped in the future reads as age 0 (recent), never
+                // as an enormous positive age that would degrade it.
+                let age_secs = now_secs.map(|now| now.saturating_sub(m.created.max(0) as u64));
                 TrimMessage {
                     index,
                     role,
                     text,
                     is_summary,
+                    age_secs,
                 }
             })
             .collect();
@@ -1799,6 +1860,7 @@ impl GooseAdapter {
             last_real,
             self.token_counter().await,
             CurrentTurn::NotYetAppended,
+            self.verbatim_horizon().await,
         );
 
         // ── Live-history image cap (phase F2, live half) ──────────────────
@@ -4757,6 +4819,9 @@ mod tests {
             role: pond_core::models::services::context::turn_trimmer::TrimRole::User,
             text: text.to_string(),
             is_summary: false,
+            // The image cap is age-blind: it runs AFTER `trim_history` over
+            // whatever survived, and its policy lives in `image_history`.
+            age_secs: None,
         }
     }
 

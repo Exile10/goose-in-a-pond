@@ -38,6 +38,7 @@
 //! multiple of it.
 
 use std::borrow::Cow;
+use std::time::Duration;
 
 use super::context_budget::{truncate_head_tail, CompactionProfile, TOOL_RESULT_MAX_CHARS};
 use super::token_counting::PER_MESSAGE_TOKEN_OVERHEAD;
@@ -47,6 +48,36 @@ use crate::models::ports::token_counter::TokenCounter;
 /// this, a turn carries no usable context at all, and dropping to zero would
 /// make the assistant forget the message it is answering.
 const MIN_HISTORY_TOKENS: usize = 64;
+
+/// Days of history the trimmer treats as *verbatim* before age weighting is
+/// allowed to degrade it. The default for `Settings::compaction_verbatim_days`
+/// reads this constant, so the setting's default and the code's cannot drift.
+///
+/// Three days is deliberately generous. The damaging direction is *short*: a
+/// horizon inside the span of a normal conversation would hard-truncate tool
+/// results the model is still reasoning about, and the saving is a few hundred
+/// tokens. A horizon that is too long only means the household pays what it
+/// pays today.
+pub const DEFAULT_VERBATIM_DAYS: u32 = 3;
+
+/// Tool-result cap applied to material older than the verbatim horizon —
+/// a quarter of [`TOOL_RESULT_MAX_CHARS`].
+///
+/// This is the whole of PAI-4 P3's escalation rung: a three-day-old tool result
+/// is not worth the same tokens as one from five minutes ago, but it is still
+/// worth more than nothing, which is what dropping its turn would leave.
+pub const AGED_TOOL_RESULT_MAX_CHARS: usize = TOOL_RESULT_MAX_CHARS / 4;
+
+/// Convert a stored `compaction_verbatim_days` into the horizon
+/// [`trim_history`] takes. Zero means age weighting is OFF, and that is the
+/// only way to disable it — there is no separate boolean to fall out of step
+/// with the number.
+pub fn verbatim_horizon_from_days(days: u32) -> Option<Duration> {
+    if days == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(u64::from(days) * 24 * 60 * 60))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrimRole {
@@ -65,6 +96,15 @@ pub struct TrimMessage {
     pub text: String,
     /// True for the spliced `<conversation-summary>` message.
     pub is_summary: bool,
+    /// How old this message is, in seconds, measured by the CALLER at trim
+    /// time. `None` means the caller could not establish an age.
+    ///
+    /// `None` is treated as *recent* everywhere, which is the narrowing
+    /// direction: an unknown age never earns a message extra degradation. Only
+    /// the live Goose turn path populates this today (from
+    /// `goose::conversation::message::Message::created`); the hydration replay
+    /// does not, and says so.
+    pub age_secs: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -72,6 +112,10 @@ pub struct TrimOutcome {
     pub messages: Vec<TrimMessage>,
     pub dropped_turns: usize,
     pub estimated_tokens: usize,
+    /// Tool results re-truncated at [`AGED_TOOL_RESULT_MAX_CHARS`] because they
+    /// fell outside the verbatim horizon. Zero whenever age weighting is off,
+    /// no message carried an age, or the conversation already fit.
+    pub aged_truncations: usize,
     /// False when the input already fit and nothing was modified — the
     /// adapter can skip rewriting the engine conversation entirely.
     pub changed: bool,
@@ -142,6 +186,11 @@ fn last_turn_start(messages: &[TrimMessage]) -> usize {
 /// budget. `rolling_summary`, when present, is spliced (or refreshed) as a
 /// summary message at the front. `last_real_prompt_tokens` is the previous
 /// turn's engine-reported prompt size, used to tighten `counter`'s estimate.
+///
+/// `verbatim_horizon` is PAI-4 P3's age weighting: material older than it may
+/// be degraded harder than fresh material *once the conversation is already
+/// over budget*. `None` disables it and reproduces the pre-P3 behaviour
+/// exactly.
 pub fn trim_history(
     messages: Vec<TrimMessage>,
     profile: &CompactionProfile,
@@ -149,6 +198,7 @@ pub fn trim_history(
     last_real_prompt_tokens: Option<u32>,
     counter: &dyn TokenCounter,
     current_turn: CurrentTurn,
+    verbatim_horizon: Option<Duration>,
 ) -> TrimOutcome {
     let mut changed = false;
 
@@ -247,6 +297,8 @@ pub fn trim_history(
                         role: TrimRole::User,
                         text: body,
                         is_summary: true,
+                        // The summary is generated now, whatever it summarises.
+                        age_secs: Some(0),
                     },
                 );
                 changed = true;
@@ -254,8 +306,67 @@ pub fn trim_history(
         }
     }
 
-    // 4. Drop oldest complete turns (never the summary, never the last turn)
-    //    until within budget.
+    // 4. Age-weighted degradation (PAI-4 P3). One rung, inserted between "leave
+    //    it alone" and "drop the whole turn": a tool result older than the
+    //    verbatim horizon is re-truncated at AGED_TOOL_RESULT_MAX_CHARS, which
+    //    is a quarter of the flat cap step 2 already applied.
+    //
+    //    THREE GUARDS, and each is the narrowing direction on a different axis.
+    //
+    //    a. It fires only when the conversation is ALREADY over budget.
+    //       Invariant 4 forbids perturbing a warm prefix for a marginal token
+    //       saving, and this edit is at the FRONT of the conversation — it
+    //       invalidates the KV prefix exactly as dropping a turn would. Doing
+    //       it unconditionally would spend a full re-prefill to save tokens
+    //       nobody needed. Over budget, the prefix was moving anyway, and the
+    //       only question left is what gets sacrificed.
+    //    b. The LAST turn is spared. That is the design's "current session,
+    //       recent turns: verbatim" row made real, and it matters most in the
+    //       case age weighting is aimed at: a session reopened after a week has
+    //       every message past the horizon, including the one the model is
+    //       about to answer.
+    //    c. `age_secs: None` is never aged. A caller that cannot establish an
+    //       age gets today's behaviour rather than a guess.
+    //
+    //    What this rung deliberately does NOT do is drop aged turns outright,
+    //    which is what 3.2's table ("older than compaction_verbatim_days:
+    //    represented by the rolling summary only") asks for. The trimmer cannot
+    //    honour that claim: the summary's coverage is a through-pointer into
+    //    `session_messages` (`SessionSummaryService`), the trimmer sees the
+    //    ENGINE conversation with positional indices, and there is no mapping
+    //    between them here. Worse, the summariser always leaves the newest
+    //    KEEP_RECENT_MESSAGES = 6 uncovered by construction, so "the summary
+    //    represents it" is provably false for the tail. Dropping on that
+    //    premise would lose messages nothing had recorded, silently. Degrading
+    //    them instead keeps the head and tail of every aged result and loses
+    //    nothing that was not already being lost when the turn was dropped.
+    let mut aged_truncations = 0usize;
+    if let Some(horizon) = verbatim_horizon {
+        if estimate_tokens(&msgs, counter) > budget {
+            let horizon_secs = horizon.as_secs();
+            let keep_verbatim_from = last_turn_start(&msgs);
+            for (i, m) in msgs.iter_mut().enumerate() {
+                if i >= keep_verbatim_from
+                    || m.role != TrimRole::ToolResult
+                    || !m.age_secs.is_some_and(|age| age > horizon_secs)
+                {
+                    continue;
+                }
+                if let Some(truncated) = truncate_head_tail(&m.text, AGED_TOOL_RESULT_MAX_CHARS) {
+                    m.text = truncated;
+                    aged_truncations += 1;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // 5. Drop oldest complete turns (never the summary, never the last turn)
+    //    until within budget. Age needs no say in the ORDER here and is given
+    //    none: age is monotonic with position in a conversation, so
+    //    "oldest-first" already is "most-aged-first", and re-deriving it from
+    //    timestamps would be a second implementation of the same ordering with
+    //    a clock skew failure mode the current one cannot have.
     let mut dropped_turns = 0usize;
     loop {
         let estimated = estimate_tokens(&msgs, counter);
@@ -286,6 +397,7 @@ pub fn trim_history(
         messages: msgs,
         dropped_turns,
         estimated_tokens,
+        aged_truncations,
         changed,
     }
 }
@@ -337,6 +449,14 @@ pub fn plan_replay(
             role,
             text,
             is_summary: false,
+            // Age weighting is NOT wired on the hydration path, deliberately.
+            // This function's input is `(role, text)` pairs; the durable rows do
+            // carry timestamps, but threading them here widens the tuple through
+            // the adapter's own pre-filtering (which assigns the indices this
+            // function relies on) to buy a rung that only fires when a replay is
+            // over budget — at which point the drop loop already handles it.
+            // PAI-4 P3 leaves this `None` rather than inventing an age.
+            age_secs: None,
         })
         .collect();
     // Trailing user messages were popped above, so nothing here is the current
@@ -348,6 +468,7 @@ pub fn plan_replay(
         None,
         counter,
         CurrentTurn::NotYetAppended,
+        None,
     )
     .messages
 }
@@ -403,6 +524,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         // 1200 <= 3328, so the declared budget still applies here.
         assert!(out.estimated_tokens <= 1200, "got {}", out.estimated_tokens);
@@ -422,6 +544,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         assert!(
             out.estimated_tokens <= 1280,
@@ -456,6 +579,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         assert!(
             out.estimated_tokens <= 3_668,
@@ -495,6 +619,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         assert!(out.estimated_tokens > 0, "must keep the current turn");
         assert_eq!(out.messages.len(), 1, "only the current turn survives");
@@ -515,6 +640,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         )
         .estimated_tokens;
         // Engine said the last prompt was 3,786 tokens — 458 over the ceiling.
@@ -525,6 +651,7 @@ mod tests {
             Some(3786),
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         )
         .estimated_tokens;
         assert!(
@@ -547,6 +674,7 @@ mod tests {
             Some(100_000),
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         assert!(out.estimated_tokens > 0, "must keep the current turn");
     }
@@ -557,6 +685,7 @@ mod tests {
             role: TrimRole::User,
             text: text.to_string(),
             is_summary: false,
+            age_secs: None,
         }
     }
     fn assistant(index: usize, text: &str) -> TrimMessage {
@@ -565,6 +694,7 @@ mod tests {
             role: TrimRole::Assistant,
             text: text.to_string(),
             is_summary: false,
+            age_secs: None,
         }
     }
     fn tool(index: usize, text: &str) -> TrimMessage {
@@ -573,8 +703,25 @@ mod tests {
             role: TrimRole::ToolResult,
             text: text.to_string(),
             is_summary: false,
+            age_secs: None,
         }
     }
+
+    /// Same as [`tool`], but carrying an age — the only builder that can put a
+    /// message outside the verbatim horizon.
+    fn aged_tool(index: usize, text: &str, age_secs: u64) -> TrimMessage {
+        TrimMessage {
+            age_secs: Some(age_secs),
+            ..tool(index, text)
+        }
+    }
+
+    /// Three days, the default horizon.
+    fn horizon() -> Option<Duration> {
+        verbatim_horizon_from_days(DEFAULT_VERBATIM_DAYS)
+    }
+
+    const DAY: u64 = 24 * 60 * 60;
 
     #[test]
     /// The production shape: the adapter trims before the turn is appended, so
@@ -597,6 +744,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         assert!(out.changed);
         for i in [0, 2] {
@@ -624,6 +772,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::AlreadyAppended,
+            None,
         );
         assert!(out.changed);
         assert!(!out.messages[0].text.contains("<system-context>"));
@@ -648,6 +797,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         assert!(
             !out.changed,
@@ -666,6 +816,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         assert!(out.changed);
         assert!(out.messages[1].text.len() < TOOL_RESULT_MAX_CHARS + 64);
@@ -685,6 +836,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         assert!(out.messages[0].is_summary);
         assert!(out.messages[0].text.contains("<conversation-summary>"));
@@ -698,6 +850,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         let summaries: Vec<_> = out2.messages.iter().filter(|m| m.is_summary).collect();
         assert_eq!(summaries.len(), 1);
@@ -724,6 +877,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         assert_eq!(out.dropped_turns, 2);
         // Whole turns went together: no leading tool/assistant orphans.
@@ -747,6 +901,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         assert_eq!(out.messages.len(), 2, "the current turn is never dropped");
     }
@@ -767,6 +922,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         let twice = trim_history(
             once.messages.clone(),
@@ -775,6 +931,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         assert!(!twice.changed, "second pass must be a no-op");
         assert_eq!(once.messages.len(), twice.messages.len());
@@ -790,6 +947,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         assert!(!out.changed);
         assert_eq!(out.dropped_turns, 0);
@@ -813,6 +971,7 @@ mod tests {
             None,
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         assert_eq!(relaxed.dropped_turns, 0);
         let tightened = trim_history(
@@ -822,6 +981,7 @@ mod tests {
             Some(6144),
             &HeuristicTokenCounter,
             CurrentTurn::NotYetAppended,
+            None,
         );
         assert!(tightened.dropped_turns > 0);
     }
@@ -927,6 +1087,322 @@ mod tests {
         assert_eq!(
             first.iter().map(|m| m.text.clone()).collect::<Vec<_>>(),
             second.iter().map(|m| m.text.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── PAI-4 P3: age-weighted retention ────────────────────────────────────
+    //
+    // Budgets here are chosen so the rung is REACHABLE. It only fires when the
+    // conversation is already over budget, so a test written against a generous
+    // budget asserts `aged_truncations == 0` about a mechanism that was never
+    // invited to run -- which is how the first draft of three of these passed
+    // while proving nothing. Each test below either forces an overflow or
+    // states, in the same test, that the aged case does fire at that budget.
+
+    /// A conversation whose old tool results are the reason it overflows now
+    /// survives with its turns intact: the aged results shrink to a quarter of
+    /// the flat cap and the drop loop has less work, or none.
+    ///
+    /// THIS IS THE PHASE'S MAIN GUARD. Without the rung, the same input loses
+    /// whole turns.
+    #[test]
+    fn an_aged_tool_result_is_degraded_before_its_turn_is_dropped() {
+        let big = "y".repeat(4_000);
+        let msgs = vec![
+            user(0, "first question"),
+            aged_tool(1, &big, 9 * DAY),
+            assistant(2, "answer one"),
+            user(3, "second question"),
+            aged_tool(4, &big, 8 * DAY),
+            assistant(5, "answer two"),
+            user(6, "current question"),
+        ];
+
+        let without = trim_history(
+            msgs.clone(),
+            &profile(600),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            None,
+        );
+        let with = trim_history(
+            msgs,
+            &profile(600),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            horizon(),
+        );
+
+        assert!(
+            without.dropped_turns > 0,
+            "fixture is not over budget -- the rung would never be invited to run"
+        );
+        assert_eq!(
+            with.aged_truncations, 2,
+            "both aged tool results should have been re-truncated"
+        );
+        assert!(
+            with.dropped_turns < without.dropped_turns,
+            "age weighting must save turns the flat trimmer dropped: with={} without={}",
+            with.dropped_turns,
+            without.dropped_turns
+        );
+        for m in with
+            .messages
+            .iter()
+            .filter(|m| m.role == TrimRole::ToolResult)
+        {
+            assert!(
+                m.text.len() <= AGED_TOOL_RESULT_MAX_CHARS + 64,
+                "aged result was not re-truncated: {} chars",
+                m.text.len()
+            );
+        }
+    }
+
+    /// Invariant 4. The SAME conversation that gets degraded at a tight budget
+    /// must come through a generous one untouched by the rung, or age weighting
+    /// is spending a full re-prefill to save tokens nobody needed.
+    #[test]
+    fn age_weighting_never_touches_a_conversation_that_already_fits() {
+        let msgs = vec![
+            user(0, "q"),
+            aged_tool(1, &"y".repeat(4_000), 30 * DAY),
+            assistant(2, "a"),
+            user(3, "current"),
+        ];
+        let tight = trim_history(
+            msgs.clone(),
+            &profile(300),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            horizon(),
+        );
+        assert_eq!(
+            tight.aged_truncations, 1,
+            "control: this conversation IS degradable when over budget"
+        );
+
+        let roomy = trim_history(
+            msgs,
+            &profile(100_000),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            horizon(),
+        );
+        assert_eq!(roomy.aged_truncations, 0);
+        assert_eq!(roomy.dropped_turns, 0);
+        // The flat cap from step 2 still applies -- that is pre-P3 behaviour.
+        // What must NOT have happened is the tighter aged cap.
+        let tool_text = &roomy
+            .messages
+            .iter()
+            .find(|m| m.role == TrimRole::ToolResult)
+            .expect("tool result kept")
+            .text;
+        assert!(
+            tool_text.len() > AGED_TOOL_RESULT_MAX_CHARS,
+            "a fitting conversation was degraded anyway: {} chars",
+            tool_text.len()
+        );
+    }
+
+    /// The "current session, recent turns: verbatim" row. A session reopened
+    /// after a week has EVERY message past the horizon, including the one the
+    /// model is about to answer -- that one is still spared.
+    #[test]
+    fn the_last_turn_is_verbatim_even_when_the_whole_session_is_aged() {
+        let big = "y".repeat(4_000);
+        let out = trim_history(
+            vec![
+                user(0, "old question"),
+                aged_tool(1, &big, 9 * DAY),
+                assistant(2, "old answer"),
+                user(3, "the question being answered"),
+                aged_tool(4, &big, 9 * DAY),
+            ],
+            &profile(600),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            horizon(),
+        );
+        assert_eq!(
+            out.aged_truncations, 1,
+            "exactly the tool result OUTSIDE the last turn may be degraded"
+        );
+        let last = out.messages.last().expect("last turn survives");
+        assert_eq!(last.role, TrimRole::ToolResult);
+        assert!(
+            last.text.len() > AGED_TOOL_RESULT_MAX_CHARS,
+            "the last turn's tool result was degraded: {} chars",
+            last.text.len()
+        );
+    }
+
+    /// Both narrowing defaults, at a budget where the rung provably DOES fire
+    /// for an aged message: an unknown age and a fresh age are treated
+    /// identically to each other, and neither earns extra degradation.
+    #[test]
+    fn an_unknown_or_fresh_age_is_never_degraded() {
+        let big = "y".repeat(4_000);
+        let run = |age: Option<u64>| {
+            trim_history(
+                vec![
+                    user(0, "q"),
+                    TrimMessage {
+                        age_secs: age,
+                        ..tool(1, &big)
+                    },
+                    assistant(2, "a"),
+                    user(3, "current"),
+                ],
+                &profile(300),
+                None,
+                None,
+                &HeuristicTokenCounter,
+                CurrentTurn::NotYetAppended,
+                horizon(),
+            )
+        };
+        assert_eq!(
+            run(Some(9 * DAY)).aged_truncations,
+            1,
+            "control: at this budget an AGED message is degraded"
+        );
+        for age in [None, Some(0), Some(DAY), Some(3 * DAY)] {
+            assert_eq!(
+                run(age).aged_truncations,
+                0,
+                "age {age:?} is inside the horizon and must not be degraded"
+            );
+        }
+    }
+
+    /// Zero days is the off switch, and off must mean identical to pre-P3.
+    #[test]
+    fn zero_verbatim_days_disables_age_weighting_entirely() {
+        assert_eq!(verbatim_horizon_from_days(0), None);
+        assert_eq!(
+            verbatim_horizon_from_days(DEFAULT_VERBATIM_DAYS),
+            Some(Duration::from_secs(3 * DAY))
+        );
+
+        let msgs = vec![
+            user(0, "q"),
+            aged_tool(1, &"y".repeat(4_000), 30 * DAY),
+            assistant(2, "a"),
+            user(3, "current"),
+        ];
+        let run = |h: Option<Duration>| {
+            trim_history(
+                msgs.clone(),
+                &profile(300),
+                None,
+                None,
+                &HeuristicTokenCounter,
+                CurrentTurn::NotYetAppended,
+                h,
+            )
+        };
+        let on = run(horizon());
+        let off = run(verbatim_horizon_from_days(0));
+        let pre_p3 = run(None);
+
+        assert_eq!(
+            on.aged_truncations, 1,
+            "control: the horizon is doing something at this budget"
+        );
+        assert_eq!(off.aged_truncations, 0);
+        assert_eq!(off.dropped_turns, pre_p3.dropped_turns);
+        assert_eq!(
+            off.messages
+                .iter()
+                .map(|m| m.text.clone())
+                .collect::<Vec<_>>(),
+            pre_p3
+                .messages
+                .iter()
+                .map(|m| m.text.clone())
+                .collect::<Vec<_>>(),
+            "zero days must reproduce pre-P3 output exactly"
+        );
+        assert_ne!(
+            on.messages
+                .iter()
+                .map(|m| m.text.clone())
+                .collect::<Vec<_>>(),
+            off.messages
+                .iter()
+                .map(|m| m.text.clone())
+                .collect::<Vec<_>>(),
+            "on and off must differ, or the off switch proves nothing"
+        );
+    }
+
+    /// Tool results still travel with their turn (invariant 2) and the result
+    /// is idempotent once the rung has fired: re-running the trimmer on its own
+    /// output degrades nothing further.
+    #[test]
+    fn age_weighting_is_idempotent_and_orphans_nothing() {
+        let big = "y".repeat(4_000);
+        let msgs = vec![
+            user(0, "q1"),
+            aged_tool(1, &big, 9 * DAY),
+            assistant(2, "a1"),
+            user(3, "current"),
+        ];
+        let first = trim_history(
+            msgs,
+            &profile(300),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            horizon(),
+        );
+        assert_eq!(first.aged_truncations, 1);
+        for (i, m) in first.messages.iter().enumerate() {
+            if m.role == TrimRole::ToolResult {
+                assert!(
+                    first.messages[..i]
+                        .iter()
+                        .any(|p| p.role == TrimRole::User && !p.is_summary),
+                    "orphaned tool result at {i}"
+                );
+            }
+        }
+
+        let second = trim_history(
+            first.messages.clone(),
+            &profile(300),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            horizon(),
+        );
+        assert_eq!(second.aged_truncations, 0, "second pass degraded again");
+        assert_eq!(
+            first
+                .messages
+                .iter()
+                .map(|m| m.text.clone())
+                .collect::<Vec<_>>(),
+            second
+                .messages
+                .iter()
+                .map(|m| m.text.clone())
+                .collect::<Vec<_>>()
         );
     }
 }

@@ -38,9 +38,10 @@ HTTP provider's spare capacity is not ours to save".
 
 > **Half-closed 2026-08-06.** The model axis is done: P1 added `ModelClass`, and P2 gave it a
 > mechanism to gate — the large tier's re-summarisation, which the on-device tiers do not run. So
-> strategy now varies by tier, and `run_compaction_pass` is where. The time axis is partly done (P4's
-> compact-on-resume; P3's age weighting is not). **Cache age is still entirely unmodelled** — that is
-> P5, and the sentence above remains true of it word for word.
+> strategy now varies by tier, and `run_compaction_pass` is where. The time axis is done as far as
+> this programme intends to take it: P4's compact-on-resume, and P3's age weighting, which since
+> 2026-08-06 gives the trimmer a tool-result rung keyed on `compaction_verbatim_days`. **Cache age is
+> still entirely unmodelled** — that is P5, and the sentence above remains true of it word for word.
 
 ### 1.3 `ContextCompactor` is dead code
 
@@ -166,6 +167,18 @@ drops strictly oldest-first. Add recency tiers:
 
 This is not a new mechanism — it is a priority order over mechanisms the trimmer already has. It
 matters most for the long-lived "household" sessions PAI-7 will create, which are never closed.
+
+> **Corrected 2026-08-06 by P3, on rows one and three.** Row three ("represented by the rolling
+> summary only") cannot be honoured by the trimmer and was not implemented: the summary's coverage is
+> a through-pointer into `session_messages` while the trimmer addresses the engine conversation by
+> position, and the summariser leaves the newest six messages uncovered by construction — so
+> "the summary represents it" is unverifiable in general and false for the tail. Dropping on that
+> premise would lose messages silently. Aged material is *degraded* instead, at
+> `AGED_TOOL_RESULT_MAX_CHARS`. Row one turned out to be the load-bearing row and is enforced
+> literally: everything from the last turn's start is spared, which is what keeps a session reopened
+> after a week from degrading the very message the model is about to answer. Row two's implied
+> reordering is a no-op and was not built — age is monotonic with position, so the existing
+> oldest-first drop already is most-aged-first.
 
 **Compact-on-resume — the highest-value time behaviour, and it is free.** A session reopened after a
 gap is about to pay a full prefill anyway (the KV cache is long gone). Today compaction happens
@@ -411,8 +424,70 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   pinned instead is that the tier they resolve is reachable and that the mechanism they call behaves.
   `note_compacted` still keys on `RefreshOutcome::Refreshed` only, deliberately: a rebuild changes the
   summary's size, not the message history the growth samples measured.
-- **P3** Age-weighted retention priority in the trimmer, with `compaction_verbatim_days` as a
-  headless setting.
+- **P3 — LANDED 2026-08-06, as one rung rather than three tiers, because the trimmer cannot
+  verify the claim the third tier rests on.** `turn_trimmer.rs` gained `DEFAULT_VERBATIM_DAYS = 3`,
+  `AGED_TOOL_RESULT_MAX_CHARS` (a quarter of `TOOL_RESULT_MAX_CHARS`), `verbatim_horizon_from_days`,
+  `TrimMessage::age_secs`, `TrimOutcome::aged_truncations`, and a seventh parameter on
+  `trim_history`. Six new unit tests (`pond-core` 785 lib, up from 779). `compaction_verbatim_days`
+  is a new headless setting whose default reads the trimmer's constant, so the setting's default and
+  the code's cannot drift — the same construction P4 used. The caller is `trim_goose_history` in
+  `pond-adapters-goose`, which fills `age_secs` from `goose::conversation::message::Message::created`
+  and reads the horizon from a `last_verbatim_days` cache written on the settings path beside
+  `last_window`.
+
+  **The table in 3.2 asks for something the trimmer is not in a position to do, and shipping it
+  would have lost messages silently.** Row three says material older than the horizon is
+  "represented by the rolling summary only" — so it can be dropped. The trimmer cannot establish
+  that premise. The summary's coverage is a through-pointer into `session_messages`
+  (`SessionSummaryService`), the trimmer sees the *engine* conversation addressed by position, and
+  nothing here maps between the two. Worse, the summariser leaves the newest
+  `KEEP_RECENT_MESSAGES = 6` uncovered by construction, so for the tail the premise is not merely
+  unverifiable but false. Dropping on it would have destroyed turns nothing had recorded, and every
+  test would still have passed. What shipped instead degrades that material: an aged tool result is
+  re-truncated head-and-tail at a quarter of the flat cap, which is a rung *between* "leave it
+  alone" and "drop the whole turn" and loses strictly less than the drop it displaces.
+
+  **Age changes what is sacrificed, not when.** The rung fires only when the conversation is already
+  over budget. This is invariant 4, and it is not a detail: the edit lands at the FRONT of the
+  conversation and invalidates the KV prefix exactly as dropping a turn would, so firing it on a
+  conversation that already fits would spend a full re-prefill to save tokens nobody needed.
+  Removing that gate makes `age_weighting_never_touches_a_conversation_that_already_fits` fail with
+  *left: 1, right: 0*, and takes the idempotence test with it.
+
+  **Row one turned out to be the load-bearing one.** "Current session, recent turns: verbatim" is
+  enforced by sparing everything from `last_turn_start` onward, and it matters most in precisely the
+  case age weighting exists for — a session reopened after a week, where *every* message is past the
+  horizon including the one the model is about to answer. Dropping the guard makes
+  `the_last_turn_is_verbatim_even_when_the_whole_session_is_aged` fail with *"exactly the tool result
+  OUTSIDE the last turn may be degraded", left: 2, right: 1*.
+
+  **Age is given no say in the drop ORDER, deliberately.** 3.2 opens by observing the trimmer "drops
+  strictly oldest-first" as though that were the defect. It is not: age is monotonic with position in
+  a conversation, so oldest-first already *is* most-aged-first, and re-deriving that order from
+  timestamps would be a second implementation of the same ordering with a clock-skew failure mode the
+  current one cannot have. Claiming a reordering here would have been a vacuous change.
+
+  **Three narrowing defaults, each on a different axis.** `age_secs: None` (a caller that cannot
+  establish an age) is treated as recent, never degraded. A future timestamp reads as age 0 via
+  `saturating_sub`, matching `resume_compaction::idle_gap_since` — clock skew reads as "active",
+  never as enormous age. And `compaction_verbatim_days = 0` is the only off switch; there is no
+  separate boolean that could fall out of step with the number.
+
+  **What is deferred, and named.** The hydration replay is NOT age-weighted: `plan_replay` takes
+  `(role, text)` pairs, and threading timestamps through the adapter's pre-filtering — which assigns
+  the indices `plan_replay` relies on — would widen that seam to buy a rung that only fires when a
+  replay is over budget, where the drop loop already acts. It passes `None` rather than inventing an
+  age. There is also no live-server run, the same gap P2, P4 and P6 all recorded.
+
+  **Found while gating, not caused by this phase, and left alone deliberately.**
+  `cargo test -p pond-adapters-goose` fails two tests at HEAD *before* this change:
+  `the_adapter_reads_the_catalog_it_was_given` and
+  `a_catalog_window_reaches_the_governor_from_the_adapter`, both asserting an Ollama model resolves
+  to 131,072 — the behaviour f770f4de deliberately ended when rung 3 began clamping a catalog maximum
+  for anything `runs_on_this_device`. They are the same "test asserting the old bug" class f770f4de
+  found twice already, surviving here because `pond-adapters-goose` is outside the fast-crate set and
+  CI only `cargo check`s it. Correcting another phase's assertions was not this phase's to do, but
+  they are latent and named.
 - **P4 — LANDED 2026-08-06, with a call site, and doing less than "full compaction" for a
   reason.** `models/services/context/resume_compaction.rs`: `ResumeGateInputs`,
   `SkipReason { Disabled | NotAReopen | NoPriorHistory | StillWarm | NoSummariser }`,

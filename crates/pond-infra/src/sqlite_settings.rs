@@ -273,6 +273,10 @@ impl SettingsRepository for SqliteSettingsRepository {
             "resume_compaction_idle_secs",
             settings.resume_compaction_idle_secs.to_string()
         );
+        upsert!(
+            "compaction_verbatim_days",
+            settings.compaction_verbatim_days.to_string()
+        );
         // Answer review
         upsert!("review_mode", &settings.review_mode);
         upsert!("review_max_rounds", settings.review_max_rounds.to_string());
@@ -795,6 +799,11 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "resume_compaction_idle_secs" => {
             if let Ok(v) = value.parse() {
                 s.resume_compaction_idle_secs = v;
+            }
+        }
+        "compaction_verbatim_days" => {
+            if let Ok(v) = value.parse() {
+                s.compaction_verbatim_days = v;
             }
         }
         // Answer review
