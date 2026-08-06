@@ -95,9 +95,31 @@ current design pays blindly:
 
 | Model class | Strategy |
 |---|---|
-| Small on-device (`local`/`gguf`, ≤ 12K window) | Deterministic trim only. No LLM in the compaction path — a summarisation stall at 20 tok/s is a user-visible hang, which is precisely why hybrid compaction exists. |
+| Small on-device (`local`/`gguf`, ≤ 12K window) | Deterministic trim, plus the idle rolling summary. No **blocking** LLM in the compaction path — a summarisation stall at 20 tok/s is a user-visible hang, which is precisely why hybrid compaction exists. |
 | Medium (32K, Ollama/llamafile) | Deterministic trim + idle rolling summary (today's behaviour). |
 | Large / HTTP (≥ 64K) | Deterministic trim + idle summary + **LLM re-summarisation of the summary itself** when it grows stale. Here the summarisation call is cheap and off the critical path. |
+
+> **Corrected 2026-08-06 by P1, in two places.**
+>
+> **The small row said "deterministic trim only. No LLM in the compaction path."** The stated reason
+> is a stall at 20 tok/s, and the idle rolling summary cannot produce one: it runs only after
+> `summary_idle_secs`, a new turn cancels it, and turns read `sessions.rolling_summary` without ever
+> awaiting it (1.1; invariant 5). Reading the row literally would have removed the rolling summary
+> from the device whose window runs out first, to prevent a hang that path structurally cannot cause.
+> What the small tier really excludes is a model call the *compaction* has to wait for — which is the
+> large tier's re-summarisation, and nothing else here. The idle summary does carry a real on-device
+> cost, but a different one: it evicts the prefix cache, so the next turn pays a prefill it would not
+> have. That is P5's arithmetic, it applies to the medium tier just as much, and it needs a
+> measurement rather than a flag flipped here.
+>
+> **The three rows each mix a window size with a provider**, and two live configurations fall between
+> them: an 8K *hosted* model, and a 131,072-token *Ollama* model on the Orin, which PAI-3 P3 made
+> reachable by teaching `OllamaCatalogProvider` to read `context_length` from `/api/show`.
+> `model_class.rs` implements the table as the two independent questions it is made of — a window
+> bracket (`SMALL_WINDOW_CEILING` / `LARGE_WINDOW_FLOOR`) and an on-device provider set. Every row
+> above is reproduced; the small hosted model takes the small strategy (at 12K there is no span worth
+> re-summarising), and the 131K Ollama model takes the *medium* strategy with the *large* budgets,
+> because the window is generous and the compute is not.
 
 The large-model tier is where re-summarisation belongs. It is a problem the on-device tier does not
 have, and the answer to why nothing was ever wired: nobody had a tier where it was safe.
@@ -198,8 +220,57 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
 
 ## 4. Phases
 
-- **P1** `ModelClass` derived from the governor; strategy dispatch; today's behaviour preserved for
-  the small and medium tiers.
+- **P1 — LANDED 2026-08-06, as two axes rather than three rows.**
+  `models/services/context/model_class.rs`: `ModelClass { Small | Medium | Large }`,
+  `CompactionStrategy { deterministic_trim, idle_rolling_summary, llm_resummarisation }`,
+  `ModelClass::classify(provider, window)` and `ModelClass::from_resolution(provider,
+  &WindowResolution)`. Domain only — no call site yet, same shape as PAI-3 P1, and **P2 is the first
+  consumer**. 15 unit tests.
+
+  **The table in 3.1 could not be implemented as written, and the reason is a real gap rather than a
+  wording quibble.** Each of its three rows names a window size *and* a provider, so two
+  configurations that exist today fall between them: an 8K hosted model, and a 131,072-token Ollama
+  model on the Orin — which PAI-3 P3 made genuinely reachable when it taught `OllamaCatalogProvider`
+  to read `context_length` from `/api/show`. The implementation splits the rows into the two
+  independent questions they are made of, and both cells then have answers. The window brackets are
+  `SMALL_WINDOW_CEILING = 12_288` and `LARGE_WINDOW_FLOOR = 65_536`, which are not new numbers:
+  12,288 is `use_compact_prompt`'s step and `PROFILE_ANCHORS`' third point, 65,536 is its fifth.
+
+  **`runs_on_this_device` is deliberately NOT `ContextGovernor::is_local_provider`, and conflating
+  them would be the defect this phase exists to avoid.** The governor's predicate answers "is the
+  preamble re-prefilled here every turn?", which is true for the in-process engine and false for
+  Ollama. This one answers "would an extra model call compete with the turn the user is waiting
+  on?", which is true for Ollama and llamafile as well — on the Orin they are HTTP to `127.0.0.1`
+  and the tokens come off the same 102 GB/s. So `ON_DEVICE_PROVIDERS` is
+  `local | gguf | ollama | llamafile`, matched case-insensitively, and it is a **deny-list for the
+  large tier**: it is safe when too wide and unsafe when too narrow, which is why a provider that
+  *could* point at another machine (`OLLAMA_HOST`) is kept inside it. Only `Large` unlocks a
+  mechanism, so every fallback resolves downward.
+
+  **Where this contradicts the document, and the contradiction is deliberate.** 3.1's small-tier row
+  and invariant 3 both say no LLM in the compaction path on-device. `strategy()` nevertheless
+  reports `idle_rolling_summary: true` for `Small`. The stated reason for the prohibition — "a
+  summarisation stall at 20 tok/s is a user-visible hang" — is a hazard the idle rolling summary
+  structurally cannot produce: it runs only after `summary_idle_secs`, it is cancelled by a new
+  turn, and a turn reads `sessions.rolling_summary` without ever awaiting it (1.1, and invariant 5
+  says the same). Setting the flag false would have removed the rolling summary from the one device
+  whose window runs out first, to prevent a stall that path cannot cause — and the phase text is
+  explicit that P1 preserves today's behaviour on the small and medium tiers. There *is* a real
+  on-device cost to an idle summarisation: it evicts the prefix cache, so the next turn pays a
+  prefill it would not have. That is cache-age arithmetic, it applies to the medium tier equally,
+  and it belongs to **P5** with a measurement behind it. Both 3.1 and invariant 3 now carry that
+  correction; `strategy()`'s doc comment carries the argument.
+
+  **Consequence: `Small` and `Medium` select the same strategy today**, and a test asserts it rather
+  than leaving it to be discovered as a bug. The classes are not redundant — they are the gate P3's
+  `compaction_verbatim_days` and P5's cache rules key on — but in P1 the only tier whose strategy
+  differs is `Large`.
+
+  **What the compiler could not have caught.** `CompactionProfile` gained no field. `turn_trimmer.rs`
+  constructs it with exhaustive literals in two test helpers, so a new field would have broken a file
+  a concurrent session was expected to hold — the same structural collision that nearly destroyed the
+  encrypted secret store in the PAI-2 batch. Keeping the profile's signature untouched is what let
+  PAI-3 P4 land under the same conditions, and it is why the class is derived rather than stored.
 - **P2 — RESPECIFIED 2026-08-06. Write a large-tier compaction strategy; do not revive anything.**
   The phase used to read "revive `ContextCompactor`". That file was deleted on 2026-08-06 and the
   deletion is right (see 1.3): it carried its own `CHARS_PER_TOKEN = 4` and `USABLE_HISTORY_CHARS`,
@@ -229,7 +300,12 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
 
 1. Compaction never blocks a turn. Ever.
 2. Tool results never orphan from their turn.
-3. On the small on-device tier, no compaction path calls a model.
+3. On the small on-device tier, no compaction path **waits on** a model. Restated 2026-08-06 by P1:
+   the original wording ("calls a model") would have switched off the idle rolling summary there, and
+   that summary is never awaited by a turn — see the correction under 3.1. What this forbids on the
+   two on-device tiers is the large tier's re-summarisation, which compaction does wait for;
+   `ModelClass::permits_compaction_model_call()` is the gate, and it is false for `Small` and
+   `Medium`.
 4. A warm prefix that has served many turns is not perturbed for a marginal token saving.
 5. The rolling summary is read, never awaited.
 6. Image policy lives in `image_history.rs` and nowhere else.

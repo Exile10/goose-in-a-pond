@@ -9,6 +9,9 @@
 //!   memories, and tool declarations given the active model's context size.
 //! - [`context_monitor`] — tracks live context utilisation across a session so
 //!   compaction can be triggered proactively.
+//! - [`model_class`] — which compaction mechanisms this model can afford, from
+//!   the governor's resolved window and who is serving it. The budget modules
+//!   answer "how much"; this one answers "which".
 //! - [`turn_budget`] — the per-request reasoning-budget note shown to the model.
 //! - [`image_history`] — how many historical image attachments are replayed as
 //!   real pixels rather than a text placeholder.
@@ -16,6 +19,7 @@ pub mod context_budget;
 pub mod context_governor;
 pub mod context_monitor;
 pub mod image_history;
+pub mod model_class;
 pub mod token_counting;
 pub mod turn_budget;
 pub mod turn_trimmer;
