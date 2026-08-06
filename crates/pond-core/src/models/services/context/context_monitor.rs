@@ -23,6 +23,21 @@ const COMPACT_THRESHOLD_PCT: f32 = 75.0;
 /// regardless of utilization percentage.
 const MIN_TURNS_REMAINING: u32 = 3;
 
+/// Recorded turns that must pass between two compaction passes on one session.
+///
+/// PAI-4 P6. Before this phase `should_compact` only decided whether to emit an
+/// SSE frame, so firing it on every turn past 75% cost nothing. The moment it
+/// drives a summarisation it is a *rate*, and the utilisation limb is monotone:
+/// a session that crosses 75% stays above it, so an ungated rule would spend a
+/// model call between every pair of turns on the device least able to afford
+/// one — the same failure PAI-4 P4 guarded against on the time axis with
+/// `MIN_RESUME_IDLE_SECS`. Three is the smallest number that leaves the pass
+/// visibly cheaper than the turns around it, and it is deliberately the same
+/// number as [`MIN_TURNS_REMAINING`]: a session with fewer turns left than the
+/// cooldown gets exactly one pass before the trimmer takes over, which is what
+/// the trimmer is for.
+const COMPACTION_COOLDOWN_TURNS: u32 = 3;
+
 /// Per-session context tracking state.
 #[derive(Debug, Clone)]
 pub struct ContextState {
@@ -35,6 +50,10 @@ pub struct ContextState {
     /// Rolling window of per-turn token growth (tokens added each turn).
     /// Capped at [`MAX_GROWTH_SAMPLES`] entries; oldest are evicted.
     pub growth_rates: Vec<u32>,
+    /// `turns` as it stood when a compaction pass was last claimed for this
+    /// session, or `None` if none ever was. Drives the cooldown in
+    /// [`ContextMonitor::claim_compaction`].
+    pub turns_at_last_compaction: Option<u32>,
 }
 
 /// Snapshot of a session's context health, returned by
@@ -91,6 +110,7 @@ impl ContextMonitor {
                 turns: 0,
                 context_limit,
                 growth_rates: Vec::with_capacity(MAX_GROWTH_SAMPLES),
+                turns_at_last_compaction: None,
             });
 
         // Calculate growth delta (tokens added this turn)
@@ -119,77 +139,157 @@ impl ContextMonitor {
             .lock()
             .expect("context monitor lock poisoned");
 
-        let state = match sessions.get(session_id) {
-            Some(s) => s,
-            None => {
-                return ContextHealth {
-                    utilization_pct: 0.0,
-                    avg_growth_rate: 0,
-                    estimated_turns_remaining: u32::MAX,
-                    should_compact: false,
-                    warning: None,
-                };
+        match sessions.get(session_id) {
+            Some(s) => health_of(s),
+            None => ContextHealth {
+                utilization_pct: 0.0,
+                avg_growth_rate: 0,
+                estimated_turns_remaining: u32::MAX,
+                should_compact: false,
+                warning: None,
+            },
+        }
+    }
+
+    /// Claim the right to run one compaction pass for this session, or decline.
+    ///
+    /// PAI-4 P6 — the *acting* half of `should_compact`, and the reason it is a
+    /// method rather than a caller-side `if`. Three things have to be true at
+    /// once and they have to be true under one lock:
+    ///
+    /// 1. the session is genuinely under pressure (`should_compact`, recomputed
+    ///    here rather than passed in, so a stale snapshot cannot authorise a
+    ///    pass);
+    /// 2. [`COMPACTION_COOLDOWN_TURNS`] recorded turns have passed since the
+    ///    last claim;
+    /// 3. nobody else is claiming concurrently — two turns of one session can
+    ///    finish at once, and both would otherwise queue a summarisation ahead
+    ///    of the user's next turn on a serial on-device engine.
+    ///
+    /// The cooldown is stamped on the **claim**, not on completion. What is
+    /// being rationed is the model call, and that is spent whether or not the
+    /// pass finds anything to summarise.
+    ///
+    /// Returns `false` for a session with no recorded turns — a pass needs
+    /// something to compact.
+    pub fn claim_compaction(&self, session_id: &str) -> bool {
+        let mut sessions = self
+            .session_contexts
+            .lock()
+            .expect("context monitor lock poisoned");
+
+        let Some(state) = sessions.get_mut(session_id) else {
+            return false;
+        };
+
+        if !health_of(state).should_compact {
+            return false;
+        }
+
+        if let Some(last) = state.turns_at_last_compaction {
+            if state.turns.saturating_sub(last) < COMPACTION_COOLDOWN_TURNS {
+                return false;
             }
-        };
+        }
 
-        let utilization_pct = if state.context_limit == 0 {
-            0.0
-        } else {
-            (state.estimated_tokens as f32 / state.context_limit as f32) * 100.0
-        };
+        state.turns_at_last_compaction = Some(state.turns);
+        true
+    }
 
-        let avg_growth_rate = if state.growth_rates.is_empty() {
-            0
-        } else {
-            let sum: u32 = state.growth_rates.iter().sum();
-            sum / state.growth_rates.len() as u32
-        };
-
-        let estimated_turns_remaining = if avg_growth_rate == 0 {
-            u32::MAX
-        } else {
-            let remaining_tokens = state.context_limit.saturating_sub(state.estimated_tokens);
-            remaining_tokens / avg_growth_rate
-        };
-
-        let should_compact = utilization_pct > COMPACT_THRESHOLD_PCT
-            || (avg_growth_rate > 0 && estimated_turns_remaining < MIN_TURNS_REMAINING);
-
-        let warning = if utilization_pct > WARNING_THRESHOLD_PCT {
-            Some(format!(
-                "Context window {:.0}% full ({}/{} tokens). ~{} turns remaining.",
-                utilization_pct,
-                state.estimated_tokens,
-                state.context_limit,
-                if estimated_turns_remaining == u32::MAX {
-                    "unlimited".to_string()
-                } else {
-                    estimated_turns_remaining.to_string()
-                },
-            ))
-        } else {
-            None
-        };
-
-        ContextHealth {
-            utilization_pct,
-            avg_growth_rate,
-            estimated_turns_remaining,
-            should_compact,
-            warning,
+    /// Record that a compaction pass changed the shape of this session's
+    /// history, without pretending its context window went back to zero.
+    ///
+    /// This is deliberately **not** [`reset_session`](Self::reset_session), and
+    /// the difference is the one thing in this phase that could not be taken
+    /// from the design bullet as written. `reset_session` drops the whole entry,
+    /// which is right when the session is gone. After a rolling-summary refresh
+    /// the session is very much still here and its window did not shrink: the
+    /// next turn reports the same utilisation to `record_turn`, so a full reset
+    /// would clear the cooldown stamp and let the pass fire again immediately —
+    /// exactly the between-every-pair-of-turns model call the cooldown exists to
+    /// prevent.
+    ///
+    /// What is genuinely stale is the growth window: those samples measured a
+    /// differently-shaped history. Dropping them takes
+    /// `estimated_turns_remaining` back to "unknown" until fresh samples
+    /// accumulate, which quiets that limb of `should_compact` while leaving the
+    /// utilisation limb — the honest one — untouched.
+    pub fn note_compacted(&self, session_id: &str) {
+        let mut sessions = self
+            .session_contexts
+            .lock()
+            .expect("context monitor lock poisoned");
+        if let Some(state) = sessions.get_mut(session_id) {
+            state.growth_rates.clear();
         }
     }
 
     /// Clear all tracking state for the given session.
     ///
-    /// Call this after compaction resets the context window, so the monitor
-    /// starts fresh with accurate measurements.
+    /// Call this when the session itself goes away. Until PAI-4 P6 this had no
+    /// production caller at all, so every session ever seen stayed in the map
+    /// for the life of the process, and a deleted session that came back under
+    /// the same id inherited the growth history of the conversation it replaced.
     pub fn reset_session(&self, session_id: &str) {
         let mut sessions = self
             .session_contexts
             .lock()
             .expect("context monitor lock poisoned");
         sessions.remove(session_id);
+    }
+}
+
+/// Derive a health snapshot from one session's recorded state.
+///
+/// Shared by [`ContextMonitor::check_context_health`] and
+/// [`ContextMonitor::claim_compaction`] so the predicate that reports pressure
+/// and the predicate that acts on it cannot drift apart.
+fn health_of(state: &ContextState) -> ContextHealth {
+    let utilization_pct = if state.context_limit == 0 {
+        0.0
+    } else {
+        (state.estimated_tokens as f32 / state.context_limit as f32) * 100.0
+    };
+
+    let avg_growth_rate = if state.growth_rates.is_empty() {
+        0
+    } else {
+        let sum: u32 = state.growth_rates.iter().sum();
+        sum / state.growth_rates.len() as u32
+    };
+
+    let estimated_turns_remaining = if avg_growth_rate == 0 {
+        u32::MAX
+    } else {
+        let remaining_tokens = state.context_limit.saturating_sub(state.estimated_tokens);
+        remaining_tokens / avg_growth_rate
+    };
+
+    let should_compact = utilization_pct > COMPACT_THRESHOLD_PCT
+        || (avg_growth_rate > 0 && estimated_turns_remaining < MIN_TURNS_REMAINING);
+
+    let warning = if utilization_pct > WARNING_THRESHOLD_PCT {
+        Some(format!(
+            "Context window {:.0}% full ({}/{} tokens). ~{} turns remaining.",
+            utilization_pct,
+            state.estimated_tokens,
+            state.context_limit,
+            if estimated_turns_remaining == u32::MAX {
+                "unlimited".to_string()
+            } else {
+                estimated_turns_remaining.to_string()
+            },
+        ))
+    } else {
+        None
+    };
+
+    ContextHealth {
+        utilization_pct,
+        avg_growth_rate,
+        estimated_turns_remaining,
+        should_compact,
+        warning,
     }
 }
 
@@ -380,5 +480,130 @@ mod tests {
         monitor.record_turn("s1", 100, 0);
         let h = monitor.check_context_health("s1");
         assert_eq!(h.utilization_pct, 0.0);
+    }
+
+    // ── PAI-4 P6: acting on should_compact ──────────────────────────────
+
+    /// Drive one session above the 75% utilisation threshold.
+    fn saturate(monitor: &ContextMonitor, session: &str) {
+        monitor.record_turn(session, 7000, 8192);
+    }
+
+    #[test]
+    fn a_session_under_no_pressure_cannot_claim_a_compaction() {
+        let monitor = ContextMonitor::new();
+        monitor.record_turn("s1", 500, 8192);
+        assert!(
+            !monitor.claim_compaction("s1"),
+            "claimed a compaction at {}% utilisation",
+            monitor.check_context_health("s1").utilization_pct,
+        );
+    }
+
+    #[test]
+    fn an_unknown_session_cannot_claim_a_compaction() {
+        let monitor = ContextMonitor::new();
+        assert!(!monitor.claim_compaction("never-seen"));
+    }
+
+    /// The guard this phase turns on. `should_compact` is monotone once
+    /// utilisation crosses the threshold, so without the cooldown every turn
+    /// past 75% would queue its own summarisation.
+    #[test]
+    fn a_saturated_session_claims_once_and_then_waits_out_the_cooldown() {
+        let monitor = ContextMonitor::new();
+        saturate(&monitor, "s1");
+
+        assert!(monitor.claim_compaction("s1"), "first claim must succeed");
+
+        for turn in 1..COMPACTION_COOLDOWN_TURNS {
+            saturate(&monitor, "s1");
+            assert!(
+                !monitor.claim_compaction("s1"),
+                "claimed again only {turn} turn(s) into a {COMPACTION_COOLDOWN_TURNS}-turn cooldown \
+                 - a still-saturated session would summarise between every pair of turns",
+            );
+        }
+
+        saturate(&monitor, "s1");
+        assert!(
+            monitor.claim_compaction("s1"),
+            "cooldown never expired after {COMPACTION_COOLDOWN_TURNS} turns",
+        );
+    }
+
+    #[test]
+    fn repeated_claims_within_one_turn_yield_exactly_one_pass() {
+        let monitor = ContextMonitor::new();
+        saturate(&monitor, "s1");
+
+        let granted = (0..5).filter(|_| monitor.claim_compaction("s1")).count();
+        assert_eq!(
+            granted, 1,
+            "{granted} concurrent claims were granted for one turn",
+        );
+    }
+
+    #[test]
+    fn the_cooldown_is_per_session() {
+        let monitor = ContextMonitor::new();
+        saturate(&monitor, "s1");
+        saturate(&monitor, "s2");
+
+        assert!(monitor.claim_compaction("s1"));
+        assert!(
+            monitor.claim_compaction("s2"),
+            "one session's cooldown blocked another's",
+        );
+    }
+
+    /// `note_compacted` must NOT behave like `reset_session`: the window did not
+    /// shrink, so utilisation stays honest and the cooldown stays stamped.
+    #[test]
+    fn note_compacted_clears_growth_history_but_not_the_cooldown() {
+        let monitor = ContextMonitor::new();
+        saturate(&monitor, "s1");
+        assert!(monitor.claim_compaction("s1"));
+
+        monitor.note_compacted("s1");
+
+        let h = monitor.check_context_health("s1");
+        assert_eq!(h.avg_growth_rate, 0, "growth samples survived a compaction");
+        assert_eq!(h.estimated_turns_remaining, u32::MAX);
+        assert!(
+            h.utilization_pct > COMPACT_THRESHOLD_PCT,
+            "note_compacted pretended the context window emptied ({}%)",
+            h.utilization_pct,
+        );
+
+        saturate(&monitor, "s1");
+        assert!(
+            !monitor.claim_compaction("s1"),
+            "note_compacted cleared the cooldown, so the next turn re-fired",
+        );
+    }
+
+    #[test]
+    fn note_compacted_on_an_unknown_session_is_a_no_op() {
+        let monitor = ContextMonitor::new();
+        monitor.note_compacted("never-seen");
+        assert!(!monitor.claim_compaction("never-seen"));
+    }
+
+    /// The "on clear" half of the phase: a deleted session must not hand its
+    /// cooldown or its growth history to whatever reuses the id.
+    #[test]
+    fn reset_session_clears_the_cooldown_too() {
+        let monitor = ContextMonitor::new();
+        saturate(&monitor, "s1");
+        assert!(monitor.claim_compaction("s1"));
+
+        monitor.reset_session("s1");
+
+        saturate(&monitor, "s1");
+        assert!(
+            monitor.claim_compaction("s1"),
+            "a cleared session inherited the cooldown of the conversation it replaced",
+        );
     }
 }

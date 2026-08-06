@@ -56,12 +56,17 @@ read**. No caller of `with_context_compactor` exists anywhere in `crates/`.
 > phases removed, into the one tier where an accurate count is affordable. Dead code that has
 > drifted three phases behind the live path is not an asset waiting to be switched on.
 
-### 1.4 `should_compact` is computed and ignored
+### 1.4 `should_compact` is computed and ignored — CLOSED by P6, 2026-08-06
 
-`ContextMonitor::check_context_health` (`context_monitor.rs:116-186`) returns `should_compact` when
-utilisation exceeds 75% or fewer than three turns remain at the current growth rate. The API emits a
-`context_warning` SSE event (`routes.rs:1748-1757`) and logs. **Nothing acts on it server-side**, and
-`reset_session` (`:187`) is never called from any handler.
+`ContextMonitor::check_context_health` returns `should_compact` when utilisation exceeds 75% or fewer
+than three turns remain at the current growth rate. The API emitted a `context_warning` SSE event and
+logged it, and that was the whole response: **nothing acted on it server-side**, and `reset_session`
+was never called from any handler — so the growth map also only ever grew.
+
+P6 closed both halves. `claim_compaction` is what the server now acts on, `spawn_pressure_compaction`
+in `routes.rs` is where, and `reset_session` is called from `delete_session`. The `context_warning`
+frame is unchanged. See the P6 stamp in section 4 for what "act" turned out to mean and for the one
+place the design bullet could not be followed literally.
 
 ### 1.5 The cost of moving the prefix is known and unmodelled
 
@@ -214,10 +219,30 @@ has served two is not.
 ### 3.4 Act on `should_compact`, between turns
 
 `ContextHealth.should_compact` becomes actionable — but compaction runs **between** turns, never
-during one, consistent with the programme's invariant 2. The existing `context_warning` SSE keeps
+during one, consistent with **invariant 1** (corrected 2026-08-06 by P6: this line said "invariant
+2", which is the tool-result rule; the one meant is "compaction never blocks a turn, ever"). The
+existing `context_warning` SSE keeps
 flowing to the client. `ContextMonitor::reset_session` gets called when a session is cleared or its
 history is compacted, so the growth-rate samples stop describing a conversation that no longer
 exists.
+
+> **Corrected 2026-08-06 by P6, in two places.**
+>
+> *A standing condition is not an event.* This section treats `should_compact` as something that
+> happens; it is something that becomes and stays true. Utilisation is monotone across a
+> conversation, so once a session crosses 75% the predicate is true on every subsequent turn, and
+> "act on it" with no rate limit means a summarisation between every pair of turns. The rate limiter
+> is `COMPACTION_COOLDOWN_TURNS`, and it is not a detail of the implementation — without it this
+> section describes the exact failure P4 spent `MIN_RESUME_IDLE_SECS` avoiding on the time axis.
+>
+> *`reset_session` after compaction would undo the rate limiter.* "Cleared **or** compacted" reads as
+> one action for two situations, but they are not the same situation. A cleared session is gone: drop
+> everything. A compacted session is still here and its window did **not** shrink — the rolling
+> summary refresh changes what the trimmer splices, not what the engine reports next turn — so a full
+> reset would restore 0% utilisation, an empty growth window and, fatally, no cooldown stamp, and the
+> pass would re-fire on the very next turn. `note_compacted` is the post-compaction call: it drops
+> the growth samples, which genuinely described a differently-shaped history, and leaves utilisation
+> and the cooldown alone.
 
 ### 3.5 An explicit compaction endpoint
 
@@ -361,7 +386,62 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   `scripts/live-test.sh`.
 - **P5** `PrefixCacheState` plumbed from the adapter; `invalidated_by` recorded at each of the six
   known invalidation points; the recompact-when-cold rule.
-- **P6** Act on `should_compact` between turns; call `reset_session` on clear and after compaction.
+- **P6 — LANDED 2026-08-06. The predicate now moves the server, and the phrase "and after
+  compaction" turned out to be two different calls.** `context_monitor.rs` gained
+  `ContextMonitor::claim_compaction`, `ContextMonitor::note_compacted`,
+  `ContextState::turns_at_last_compaction` and `COMPACTION_COOLDOWN_TURNS = 3`; the health arithmetic
+  moved to a free `health_of(&ContextState)` so the predicate that *reports* pressure and the one
+  that *acts* on it cannot drift. Eight new unit tests (`pond-core` 755 lib, up from 747).
+  `routes.rs` gained `spawn_pressure_compaction`, called from the `should_compact` branch of
+  `chat_stream`, and `run_compaction_pass`, the shared body P4's `spawn_resume_compaction` now also
+  uses. `reset_session` gained its first production caller, in `delete_session`, with a wiring test
+  (`crates/pond-api/tests/context_monitor_reset_test.rs`).
+
+  **What "between turns" cost, and why it is the whole phase.** The tempting implementation is to do
+  the work where `should_compact` is read. That line is inside the SSE generator: the model has
+  finished, but the `done` frame is unsent and the client is still on the stream, so a summarisation
+  there sits between the user's last token and the end of their turn — on the tier that can least
+  afford it, and in direct violation of invariant 1. `spawn_pressure_compaction` therefore does
+  nothing but `tokio::spawn`; the settings read, the gate, the provider read and the model call all
+  happen in the detached task, exactly as P4 does it. The `context_warning` frame is untouched: it
+  fires on the same predicate, carries the same fields, and reaches the client before the spawn.
+
+  **The rate limiter is the part the design bullet does not contain, and without it the phase is a
+  regression.** `should_compact` was cheap to be wrong about while it only decided whether to emit a
+  frame. The moment it drives a model call it is a *rate*, and utilisation is monotone: a session
+  that crosses 75% is above 75% on every later turn, so an unlimited rule summarises between every
+  pair of turns. `claim_compaction` grants at most one pass per `COMPACTION_COOLDOWN_TURNS` recorded
+  turns, recomputes health under its own lock so two turns finishing at once cannot both be
+  authorised by one snapshot, and stamps the cooldown on the **claim** rather than on completion —
+  the model call is spent whether or not the summariser finds anything to do.
+
+  **`reset_session` after compaction is wrong, and the phase says so rather than shipping it.** The
+  bullet reads "on clear and after compaction" as though one call served both. It does not. A clear
+  means the session stopped existing, and dropping the whole entry is right — that is
+  `delete_session`, which is also the only route where a session stops existing (`DELETE
+  /sessions/:id/user` releases an identity binding and changes nothing about the context, so it is
+  deliberately *not* a call site). After a compaction the session is still here and its window did
+  not shrink: the rolling-summary refresh changes what the trimmer splices, not what the engine
+  reports on the next turn. A full reset there would zero utilisation, empty the growth window and
+  clear the cooldown stamp, and the pass would fire again on the very next turn — the failure the
+  cooldown exists to prevent, reintroduced by the line meant to tidy up after it. `note_compacted`
+  drops only the growth samples, which genuinely measured a differently-shaped history, and it runs
+  only for `RefreshOutcome::Refreshed`: `NothingToDo` and `Cancelled` changed nothing, and paying a
+  growth window for them would be pure loss.
+
+  **What actually runs is the rolling-summary refresh, the same mechanism as P4**, because it is the
+  only compaction mechanism that exists to call — the trimmer is a function of the turn being
+  assembled and cannot be pre-run, and the large tier's re-summarisation is P2's. The two triggers
+  are genuinely independent (P4 is the time axis, P6 the pressure axis) and now share one in-flight
+  set, renamed `COMPACTIONS_IN_FLIGHT`: a session reopened after a long gap is precisely the session
+  most likely to saturate on its first turn back, and two separate sets would have stacked two model
+  calls in front of one turn. No `ModelClass` gate was added, deliberately —
+  `permits_compaction_model_call()` gates the large tier's re-summarisation, and applying it here
+  would switch the rolling summary off on the small tier, which P1 argued against at length.
+
+  **Not done, and named.** No live-server run. This adds a route side effect and a background model
+  call, which is what `scripts/live-test.sh` exists to catch; the integration assertion section 7
+  asks for — that a pass completes before the next turn's first token — still needs a live server.
 - **P7** `POST /sessions/{id}/compact` plus a desktop control on the existing `ContextCard`.
 
 ---

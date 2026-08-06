@@ -21,7 +21,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
 | 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **COMPLETE — P1-P8 LANDED** |
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1-P4, P6 LANDED** (P3 completed by P3b 2026-08-06); **P5 code landed 2026-08-06, awaiting the on-device TTFT measurement that decides it** |
-| 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | **P1, P4 LANDED 2026-08-06** (P1 `ModelClass` + strategy dispatch, domain only — P2 is its first consumer; P4 compact-on-resume gate, wired to the session reopen, refreshing the rolling summary); P2, P3, P5-P7 designed |
+| 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | **P1, P4, P6 LANDED 2026-08-06** (P1 `ModelClass` + strategy dispatch, domain only — P2 is its first consumer; P4 compact-on-resume gate, wired to the session reopen; P6 `should_compact` now moves the server between turns, rate-limited by `claim_compaction`, and `reset_session` has its first production caller); P2, P3, P5, P7 designed |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
 | 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0-P5, P7 LANDED** (P3, P5 partial); P6, P8 designed |
 
@@ -1185,3 +1185,76 @@ ignored, `-p pond-infra` 214 + 3 + 4 + 1 ignored, `-p pond-api` 263 across 19 bi
 judgement: the phase adds a `Settings` field and a route side effect, both of which
 `scripts/live-test.sh` exists to catch, and the integration assertion section 7 asks for — that the
 refresh completes before the first token of the next turn — needs a real server and a real model.
+
+---
+
+**2026-08-06 — PAI-4 P6. A standing condition is not an event, and "reset after compaction" would
+have undone the thing that makes it safe.**
+
+`context_monitor.rs` — `claim_compaction`, `note_compacted`, `ContextState::turns_at_last_compaction`,
+`COMPACTION_COOLDOWN_TURNS = 3`, and the health arithmetic lifted into a free `health_of`. Eight new
+tests; `pond-core` 755 lib, up from 747. `routes.rs` — `spawn_pressure_compaction` fired from the
+`should_compact` branch of `chat_stream`, `run_compaction_pass` shared with P4's
+`spawn_resume_compaction`, and `reset_session` called from `delete_session`. One new wiring test,
+`crates/pond-api/tests/context_monitor_reset_test.rs`.
+
+**Where the code runs is what holds invariant 1, and the obvious placement breaks it.** The line the
+phase is named after sits inside the SSE generator. The model has finished, but the `done` frame is
+unsent and the client is still on the stream, so doing the work there puts a summarisation between
+the user's last token and the end of their turn. `spawn_pressure_compaction` does nothing but
+`tokio::spawn`; every read, the gate, and the model call happen in the detached task. Same shape as
+P4, for the same reason, and it is worth stating as a rule: **"between turns" is a claim about the
+stack you are on, not about the line number.** The `context_warning` frame is untouched.
+
+**The design bullet contains no rate limit, and without one the phase is a regression.**
+`should_compact` was safe to fire freely while it only decided whether to emit a frame. Driving a
+model call makes it a rate, and utilisation is monotone — a session that crosses 75% is above 75% on
+every later turn, so an unlimited rule summarises between every pair of turns on the device least
+able to afford it. That is the identical failure P4 guarded against on the time axis with
+`MIN_RESUME_IDLE_SECS`, arriving through a different door. `claim_compaction` grants one pass per
+three recorded turns, recomputes health under its own lock so two turns finishing at once cannot both
+be authorised by one snapshot, and stamps the cooldown on the **claim**: the model call is spent
+whether or not the summariser finds anything to do.
+
+**"Call `reset_session` on clear and after compaction" is two situations wearing one call, and the
+second one is wrong.** A clear means the session stopped existing — drop everything. That is
+`delete_session`, and it is the *only* such route: `DELETE /sessions/:id/user` releases an identity
+binding and changes nothing about the context, so it is deliberately not a call site, which is the
+narrower reading and therefore the right one. After a compaction the session is still here and its
+window did **not** shrink: the rolling-summary refresh changes what the trimmer splices, not what the
+engine reports next turn. Resetting there would zero utilisation, empty the growth window and clear
+the cooldown stamp — so the pass would re-fire on the very next turn, the exact failure the cooldown
+exists to prevent, reintroduced by the line meant to tidy up after it. `note_compacted` drops only
+the growth samples (which genuinely measured a differently-shaped history) and runs only for
+`RefreshOutcome::Refreshed`; `NothingToDo` and `Cancelled` changed nothing.
+
+**Two things found while checking rather than assumed.** `reset_session` had no production caller at
+all, so the growth map was also an unbounded leak — every session the process ever streamed a turn
+for stayed in it for the life of the process. And section 3.4 cited "invariant 2" for the
+between-turns rule; invariant 2 is the tool-result rule, and the one meant is invariant 1. Both fixed
+in the same change.
+
+**Mutations, both restored, `git status --porcelain` re-read after each.** Deleting the cooldown
+comparison from `claim_compaction` failed three tests:
+`a_saturated_session_claims_once_and_then_waits_out_the_cooldown` with *"claimed again only 1 turn(s)
+into a 3-turn cooldown - a still-saturated session would summarise between every pair of turns"*,
+`repeated_claims_within_one_turn_yield_exactly_one_pass` with *"5 concurrent claims were granted for
+one turn — left: 5, right: 1"*, and `note_compacted_clears_growth_history_but_not_the_cooldown` with
+*"note_compacted cleared the cooldown, so the next turn re-fired"*. Deleting the
+`state.context_monitor.reset_session(&session_id)` line from `delete_session` failed
+`deleting_a_session_clears_its_context_monitor_state` with *"the deleted session's utilisation
+survived the delete — left: 85.44922, right: 0.0"*, which is the point of that test: it is a wiring
+claim no unit test can reach.
+
+**A restore that went wrong, recorded because it nearly cost the phase.** I reverted the first
+mutation with `git checkout -- <file>`, which does not undo a mutation — it reverts the file to
+`HEAD`, and took every edit of the phase with it. Nothing outside my own footprint was touched and
+the work was re-applied, but the correct tool for an experiment on a file with uncommitted work is a
+copy and a copy back. The second mutation was done that way.
+
+Gates: `cargo fmt --check` clean; `cargo clippy -p pond-core -p pond-api --all-targets` with no new
+warnings in the touched files; `cargo test -p pond-core` 755 lib + 5 + 3 ignored, `-p pond-api` 264
+across 20 binaries; `cargo check -p pond-server -p pond-adapters-goose` clean. No live-server run,
+and that is a gap rather than a judgement: this adds a route side effect that spawns a background
+model call, which is what `scripts/live-test.sh` exists to catch, and section 7's integration
+assertion — that a pass completes before the next turn's first token — needs a real server.
