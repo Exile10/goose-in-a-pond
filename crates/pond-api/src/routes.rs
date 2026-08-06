@@ -190,6 +190,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // DELETE clears activity on demand (#117, "clear my activity").
         .route("/activity", get(get_activity).delete(clear_activity))
         .route("/activity/summary", get(activity_summary))
+        // PAI-2 P8a — the would-deny telemetry the enforce flip is waiting on.
+        // Protected by registration here and by its absence from PUBLIC_ROUTES.
+        .route("/security/policy-report", get(policy_report))
         .route(
             "/camera/events",
             get(list_camera_events).post(record_camera_event),
@@ -5628,6 +5631,146 @@ async fn activity_summary(
         "since": since.to_rfc3339(),
         "total": total,
         "by_category": by_category,
+    })))
+}
+
+// ── PAI-2 P8a: the would-deny read surface ────────────────────────────────────
+
+/// Cap on audit events scanned for one policy report. The count is honest about
+/// hitting it (`truncated`) rather than reporting a silently capped total: a
+/// would-deny number that quietly stopped counting is the same lie the
+/// two-source split below exists to avoid.
+const POLICY_REPORT_MAX_EVENTS: usize = 5000;
+
+#[derive(serde::Deserialize)]
+struct PolicyReportParams {
+    /// Time window for the *events* half: "hour" | "day" (default) | "week".
+    window: Option<String>,
+}
+
+/// `GET /api/v1/security/policy-report` — what would flipping
+/// `security_policy_mode` to `enforce` actually break?
+///
+/// **Two sources, labelled, never summed.** `security_policy_mode` ships as
+/// `audit` precisely so this question can be answered from evidence before P8b
+/// flips it, and each source alone gives a wrong answer:
+///
+/// - `events` comes from the unified event log. Durable across restarts, and
+///   the only half that can attribute a would-deny to a principal — but it is
+///   pruned on a retention window and `DELETE /api/v1/activity` is a
+///   user-facing "clear my activity" button, so an operator reading only this
+///   after somebody tidied up would see zero and conclude the flip is safe.
+/// - `process` comes from `POLICY_COUNTERS`, bumped at each decision site.
+///   Survives pruning and the clear button, does not survive a restart.
+///
+/// A single merged number would be wrong in whichever direction the reader did
+/// not check. Adding them would double-count. So both are reported with the
+/// window each covers.
+///
+/// Zeros, never 404, on an empty window: a green test must be distinguishable
+/// from an unwired route.
+///
+/// Registered in `protected_routes` and deliberately absent from
+/// `PUBLIC_ROUTES`, so the compile-time route guards in `middleware/mod.rs`
+/// enforce the token requirement rather than this handler restating it.
+async fn policy_report(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<PolicyReportParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    use pond_core::security::ports::policy as pol;
+
+    let window = params.window.as_deref().unwrap_or("day");
+    let span = match window {
+        "hour" => chrono::Duration::hours(1),
+        "day" => chrono::Duration::days(1),
+        "week" => chrono::Duration::weeks(1),
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("invalid `window` {other:?}; use hour|day|week") })),
+            ))
+        }
+    };
+    let since = chrono::Utc::now() - span;
+
+    // Every verdict gets a bucket up front, so an empty window answers with
+    // explicit zeros rather than an object missing the key the reader wanted.
+    let mut by_verdict: std::collections::BTreeMap<&str, u64> =
+        pol::VERDICTS.iter().map(|v| (*v, 0u64)).collect();
+    let mut scanned = 0usize;
+    let mut unclassified = 0u64;
+    let mut truncated = false;
+    let mut events_available = false;
+
+    if let Some(event_log) = state.event_log.as_ref() {
+        events_available = true;
+        // `EventQuery` has no action filter and no group-by, so both happen in
+        // Rust over the returned rows. That is why the cap and the `truncated`
+        // flag exist: the store cannot narrow to `security.audit` for us.
+        let rows = event_log
+            .query(EventQuery {
+                category: Some(EventCategory::Auth),
+                since: Some(since),
+                max_sensitivity: Some(PrivacySensitivity::Sensitive),
+                limit: Some(POLICY_REPORT_MAX_EVENTS),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "policy report query failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "policy report query failed" })),
+                )
+            })?;
+
+        truncated = rows.len() >= POLICY_REPORT_MAX_EVENTS;
+
+        for event in rows.iter().filter(|e| e.action == pol::AUDIT_ACTION) {
+            scanned += 1;
+            match event
+                .attributes
+                .get(pol::audit_attrs::VERDICT)
+                .and_then(|v| match v {
+                    pond_core::security::domain::event::AttributeValue::Text(s) => Some(s.as_str()),
+                    _ => None,
+                }) {
+                // An audit row written before the verdict became an attribute,
+                // or by something that stopped setting it. Counted separately
+                // rather than folded into `allow` -- a report that quietly
+                // reclassifies what it cannot read is the failure this endpoint
+                // exists to prevent.
+                None => unclassified += 1,
+                Some(v) => match by_verdict.get_mut(v) {
+                    Some(slot) => *slot += 1,
+                    None => unclassified += 1,
+                },
+            }
+        }
+    }
+
+    let process = pol::POLICY_COUNTERS.snapshot();
+
+    Ok(Json(json!({
+        "window": window,
+        "since": since.to_rfc3339(),
+        "events": {
+            "allow":      by_verdict["allow"],
+            "would_deny": by_verdict["would_deny"],
+            "deny":       by_verdict["deny"],
+            "unclassified": unclassified,
+            "scanned": scanned,
+            "truncated": truncated,
+            "available": events_available,
+            "note": "durable across restarts; pruned on retention and erasable by DELETE /api/v1/activity",
+        },
+        "process": {
+            "allow":      process.allow,
+            "would_deny": process.would_deny,
+            "deny":       process.deny,
+            "counting_since": process.counting_since.to_rfc3339(),
+            "note": "survives log pruning and DELETE /api/v1/activity; resets on restart",
+        },
     })))
 }
 
@@ -12220,13 +12363,23 @@ async fn evaluate_identity_assertion(
         pol::PolicyDecision::refuse(mode, pol::REASON_UNPROVEN_IDENTITY)
     };
 
+    // Tallied at the decision site, not inside an `audit` implementation, and
+    // not conditionally on a policy adapter being installed: this counts what
+    // the policy decided. `POLICY_COUNTERS` is the half of the telemetry that
+    // survives log retention and the "clear my activity" button; the event log
+    // is the half that survives a restart. Neither is trustworthy alone, which
+    // is why `GET /security/policy-report` reports them separately.
+    pol::POLICY_COUNTERS.record(&decision);
     if let Some(policy) = &state.security_policy {
         policy
             .audit(
                 &principal,
-                &format!("identify_session:{}", decision.verdict()),
+                // A plain verb. The verdict used to ride this string as a
+                // `:{verdict}` suffix; it is an attribute now, so the report
+                // groups on a field instead of parsing a substring.
+                "identify_session",
                 pol::scopes::SESSION,
-                decision.allowed,
+                &decision,
             )
             .await;
     }

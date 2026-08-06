@@ -10,7 +10,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::security::ports::draft_authority::DraftAuthority;
-use crate::security::ports::policy::{scopes, PolicyMode, Principal, SecurityPolicy};
+use crate::security::ports::policy::{
+    scopes, PolicyDecision, PolicyMode, Principal, SecurityPolicy,
+};
 use crate::user_data::domain::profile::ProfileScope;
 use crate::user_data::domain::session::{IdentificationSource, SessionIdentity};
 use crate::user_data::ports::profile::ProfileRepository;
@@ -110,7 +112,7 @@ impl DraftAuthority for RepoDraftAuthority {
         Some((resolved.scope, resolved.source))
     }
 
-    async fn audit(&self, engine_session_id: &str, action: &str, ok: bool) {
+    async fn audit(&self, engine_session_id: &str, action: &str, decision: &PolicyDecision) {
         let Some(policy) = &self.policy else {
             return;
         };
@@ -124,7 +126,7 @@ impl DraftAuthority for RepoDraftAuthority {
                 &principal,
                 &format!("{action} session={engine_session_id}"),
                 scopes::DRAFT,
-                ok,
+                decision,
             )
             .await;
     }

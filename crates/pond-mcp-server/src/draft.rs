@@ -183,13 +183,17 @@ impl DraftMcpServer {
             Err(reason) => PolicyDecision::refuse(mode, reason),
         };
 
+        // Tallied at the decision site, not inside an `audit` implementation:
+        // this is the count of what the policy decided, and it must not depend
+        // on whether an audit sink happens to be installed. `POLICY_COUNTERS`
+        // survives log pruning and `DELETE /api/v1/activity`, which the event
+        // half does not.
+        pond_core::security::ports::policy::POLICY_COUNTERS.record(&decision);
         if let Some(auth) = &self.authority {
-            auth.audit(
-                &session,
-                &format!("draft_{verb}:{}", decision.verdict()),
-                decision.allowed,
-            )
-            .await;
+            // The verdict rides the decision, not a `:{verdict}` suffix on the
+            // action string. The report groups on the attribute.
+            auth.audit(&session, &format!("draft_{verb}"), &decision)
+                .await;
         }
         if decision.would_deny() {
             tracing::warn!(
@@ -576,10 +580,15 @@ mod tests {
         }
     }
 
+    /// Records `(action, verdict, ok)` per audit call. The verdict is captured
+    /// separately from `ok` on purpose: under `audit` mode every entry has
+    /// `ok == true`, so a stub that stored only the bool could not tell an
+    /// allow from a would-deny and every assertion made against it would be
+    /// satisfied by deleting the rule.
     struct StubAuthority {
         mode: PolicyMode,
         scope: Option<ProfileScope>,
-        audited: Mutex<Vec<(String, bool)>>,
+        audited: Mutex<Vec<(String, String, bool)>>,
     }
 
     #[async_trait]
@@ -595,8 +604,12 @@ mod tests {
                 .clone()
                 .map(|s| (s, IdentificationSource::Explicit))
         }
-        async fn audit(&self, _session: &str, action: &str, ok: bool) {
-            self.audited.lock().unwrap().push((action.to_string(), ok));
+        async fn audit(&self, _session: &str, action: &str, decision: &PolicyDecision) {
+            self.audited.lock().unwrap().push((
+                action.to_string(),
+                decision.verdict().to_string(),
+                decision.allowed,
+            ));
         }
     }
 
@@ -656,18 +669,22 @@ mod tests {
             assert_eq!(after.status, expect_status, "mode {mode:?}");
             let audited = auth.audited.lock().unwrap().clone();
             assert_eq!(audited.len(), 1);
+            // The action string is a plain verb in every mode now: the verdict
+            // moved onto the decision so the policy report can group on an
+            // attribute instead of parsing a substring out of a free-form field.
+            assert_eq!(audited[0].0, "draft_approve", "mode {mode:?}");
             match mode {
                 PolicyMode::Enforce => {
                     assert!(text.contains("not permitted"), "got: {text}");
-                    assert_eq!(audited[0].0, "draft_approve:deny");
-                    assert!(!audited[0].1);
+                    assert_eq!(audited[0].1, "deny");
+                    assert!(!audited[0].2);
                 }
                 PolicyMode::Audit => {
                     assert_eq!(
-                        audited[0].0, "draft_approve:would_deny",
+                        audited[0].1, "would_deny",
                         "audit must not read as 'allow' for the calls enforce would block"
                     );
-                    assert!(audited[0].1, "audit does not block");
+                    assert!(audited[0].2, "audit does not block");
                 }
                 PolicyMode::Off => unreachable!(),
             }
@@ -759,7 +776,9 @@ mod tests {
             repo.get("d1").await.unwrap().unwrap().status,
             DraftStatus::Approved
         );
-        assert_eq!(auth.audited.lock().unwrap()[0].0, "draft_approve:allow");
+        let audited = auth.audited.lock().unwrap().clone();
+        assert_eq!(audited[0].0, "draft_approve");
+        assert_eq!(audited[0].1, "allow");
     }
 
     /// `save_draft` must stamp the owner from the resolved scope. Without this
