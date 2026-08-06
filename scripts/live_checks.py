@@ -681,6 +681,110 @@ def section_redaction():
     )
 
 
+def section_policy_telemetry():
+    """PAI-2 P8a -- is the would-deny telemetry wired by `run_server`?
+
+    The unit tests construct `SqliteSecurityPolicy` themselves and hand it to a
+    router they built. They cannot answer whether `main.rs` bound a policy at
+    all, whether it bound one with an event log behind it, or whether the report
+    route is registered on the running binary. That is the same gap
+    `section_redaction` exists to close, and it is where PAI-2's defects have
+    actually been.
+
+    **What this can and cannot reach, said plainly.** live-test.sh starts this
+    server with POND_DEV_ALLOW_LOOPBACK, so the middleware attaches
+    `Principal::loopback()` -- and `is_identity_assertion_proven` deliberately
+    permits loopback ("whoever is at the console already has the box"). So the
+    decision this section takes is an ALLOW, and a would-deny is not producible
+    from here. That is not a weakness in the rule: a remote caller presenting a
+    real handshake token gets `Principal::token`, which proves nothing, and
+    would-denies. It does mean the number this section moves is `allow`, and
+    claiming otherwise would be the "fixture unreachable in production" mistake
+    in reverse.
+
+    What it therefore proves: the route exists on the real binary, the policy is
+    bound with a live event sink, and the report reads the `verdict` ATTRIBUTE
+    off the stored event rather than a substring of the action string.
+    """
+    print("\n=== P8a: policy telemetry on the running binary ===")
+
+    code, before = call("GET", "/api/v1/security/policy-report?window=day")
+    if not expect(
+        "the policy report is registered and answers",
+        code,
+        200,
+        before,
+        (
+            "has an events block",
+            isinstance(before, dict) and isinstance(before.get("events"), dict),
+        ),
+        (
+            "has a process block",
+            isinstance(before, dict) and isinstance(before.get("process"), dict),
+        ),
+        (
+            "the event log is actually bound",
+            isinstance(before, dict)
+            and before.get("events", {}).get("available") is True,
+        ),
+    ):
+        return
+
+    code, body = call("GET", "/api/v1/security/policy-report?window=forever")
+    expect("an unrecognised window is refused, not widened", code, 400, body)
+
+    seed_session("sess-policy-telemetry")
+    who = new_profile("Telemetry")
+    if not who:
+        return
+
+    code, body = call(
+        "PUT", "/api/v1/sessions/sess-policy-telemetry/user", {"profile_id": who}
+    )
+    if not expect(
+        "an identity assertion from the console is permitted",
+        code,
+        200,
+        body,
+        ("bound", isinstance(body, dict) and body.get("bound") is True),
+    ):
+        return
+
+    code, after = call("GET", "/api/v1/security/policy-report?window=day")
+    if not expect("the report answers after the decision", code, 200, after):
+        return
+
+    def delta(block, key):
+        return after[block][key] - before[block][key]
+
+    check(
+        "the decision reached the durable event half",
+        delta("events", "allow") == 1,
+        "events allow delta %s (before %s, after %s)"
+        % (delta("events", "allow"), before["events"], after["events"]),
+    )
+    check(
+        "the decision reached the process counters",
+        delta("process", "allow") == 1,
+        "process allow delta %s (before %s, after %s)"
+        % (delta("process", "allow"), before["process"], after["process"]),
+    )
+    # If the verdict ever rides the action string again, the attribute the
+    # report groups on goes missing and every row lands here instead. A zero
+    # would_deny alone would not have caught that -- it is zero anyway.
+    check(
+        "no audit row was unreadable to the report",
+        after["events"]["unclassified"] == 0,
+        "unclassified %s -- an audit event carried no verdict attribute: %s"
+        % (after["events"]["unclassified"], after["events"]),
+    )
+    check(
+        "the count is not silently capped",
+        after["events"]["truncated"] is False,
+        str(after["events"]),
+    )
+
+
 def main():
     """Auth is NOT checked here.
 
@@ -706,6 +810,11 @@ def main():
         section_secret_store()
         section_redaction()
         section_network_mode()
+        # First pass only. It creates a profile by name, which would collide
+        # with the row it left behind, and the process counters it reads are
+        # zero on a fresh process by design -- so on the restart pass it would
+        # assert nothing the first pass has not already asserted better.
+        section_policy_telemetry()
 
     failed = [label for label, ok, _ in results if not ok]
     print("\n%d checks run, %d failed" % (len(results), len(failed)))

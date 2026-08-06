@@ -6,7 +6,7 @@
 //! state. Deployments that want a real audit trail (e.g. one persisting to
 //! `pond_logs.db`) swap in a pond-infra adapter without changing any consumer.
 
-use crate::security::ports::policy::{Principal, SecurityPolicy};
+use crate::security::ports::policy::{PolicyDecision, Principal, SecurityPolicy};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -28,12 +28,24 @@ impl SecurityPolicy for AllowAllPolicy {
         Ok(true)
     }
 
-    async fn audit(&self, principal: &Principal, action: &str, scope: &str, ok: bool) {
+    /// Logs the verdict, not just the effect. This implementation keeps no
+    /// state, so the line is all there is — and `ok` alone would read
+    /// "permitted" for the would-denies too.
+    async fn audit(
+        &self,
+        principal: &Principal,
+        action: &str,
+        scope: &str,
+        decision: &PolicyDecision,
+    ) {
         tracing::debug!(
             ?principal,
             action,
             scope,
-            ok,
+            ok = decision.allowed,
+            verdict = decision.verdict(),
+            mode = decision.mode.as_str(),
+            reason = decision.denied_reason.unwrap_or(""),
             "security audit (allow-all policy)"
         );
     }
@@ -42,7 +54,9 @@ impl SecurityPolicy for AllowAllPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::ports::policy::{scopes, PrincipalKind};
+    use crate::security::ports::policy::{
+        scopes, PolicyMode, PrincipalKind, REASON_UNPROVEN_IDENTITY,
+    };
 
     #[tokio::test]
     async fn allow_returns_true_for_every_principal_kind() {
@@ -71,12 +85,30 @@ mod tests {
     async fn audit_does_not_panic() {
         let policy = AllowAllPolicy::new();
         let principal = Principal::token("client-xyz").with_remote_addr("10.0.0.5:55123");
-        // Should complete without panicking for both outcomes.
+        // Should complete without panicking for every verdict.
         policy
-            .audit(&principal, "read", scopes::PROFILE, true)
+            .audit(
+                &principal,
+                "read",
+                scopes::PROFILE,
+                &PolicyDecision::permit(PolicyMode::Audit),
+            )
             .await;
         policy
-            .audit(&Principal::internal(), "write", scopes::SCHEDULE, false)
+            .audit(
+                &Principal::internal(),
+                "write",
+                scopes::SCHEDULE,
+                &PolicyDecision::refuse(PolicyMode::Audit, REASON_UNPROVEN_IDENTITY),
+            )
+            .await;
+        policy
+            .audit(
+                &Principal::internal(),
+                "write",
+                scopes::SCHEDULE,
+                &PolicyDecision::refuse(PolicyMode::Enforce, REASON_UNPROVEN_IDENTITY),
+            )
             .await;
     }
 

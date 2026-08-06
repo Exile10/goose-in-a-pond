@@ -14,7 +14,7 @@
 //! things a decision needs. It lives in `pond-core` because the rule is policy;
 //! the implementation is mechanism and needs three repositories.
 
-use crate::security::ports::policy::PolicyMode;
+use crate::security::ports::policy::{PolicyDecision, PolicyMode};
 use crate::user_data::domain::profile::ProfileScope;
 use crate::user_data::domain::session::IdentificationSource;
 use async_trait::async_trait;
@@ -38,5 +38,15 @@ pub trait DraftAuthority: Send + Sync {
     ) -> Option<(ProfileScope, IdentificationSource)>;
 
     /// Record a decision at the boundary. Must never fail the caller.
-    async fn audit(&self, engine_session_id: &str, action: &str, ok: bool);
+    ///
+    /// Takes the whole [`PolicyDecision`] rather than an `ok: bool` for the same
+    /// reason [`SecurityPolicy::audit`] does: under `audit` the effect of a
+    /// refusal is "permitted", so `ok` cannot answer what `enforce` would have
+    /// blocked. `action` is a plain verb (`draft_approve`) — the verdict used to
+    /// ride the action string as a `:{verdict}` suffix, and a report that has to
+    /// parse a substring out of a free-form field is one rename from reading
+    /// zero forever.
+    ///
+    /// [`SecurityPolicy::audit`]: crate::security::ports::policy::SecurityPolicy::audit
+    async fn audit(&self, engine_session_id: &str, action: &str, decision: &PolicyDecision);
 }

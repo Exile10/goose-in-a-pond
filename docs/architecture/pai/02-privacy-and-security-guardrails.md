@@ -554,6 +554,10 @@ cannot change class quietly.
     `reject` equivalents) through `SecurityPolicy::audit` under a new `scopes::DRAFT`, and a
     `would_deny` also emits `kind = "policy_would_deny"` at WARN.
 
+    *Superseded 2026-08-06 (P8a, landed).* The action string is now a plain `draft_approve` /
+    `draft_reject` and the verdict is an event **attribute**. Read the P8a entry below before
+    trusting any `:verdict`-suffixed string named anywhere in this document.
+
     *Corrected 2026-08-06 (P8a recon).* This sentence used to end "that is the evidence P8 needs
     before the default flips to `enforce`". It is not, yet — it is the raw material for that
     evidence and nothing refines it. Three facts, each checked against code:
@@ -570,6 +574,15 @@ cannot change class quietly.
     `would_deny`. `pruning.rs` caps Sensitive events at `events_sensitive_days: 7`, and
     `DELETE /api/v1/activity` purges with `max_sensitivity: None` *deliberately* — so the user's own
     "clear my activity" button erases the enforcement evidence. See P8a.
+
+    *Status of those three facts after P8a landed, 2026-08-06.* **(a) is fixed** — `POLICY_COUNTERS`
+    counts, and `GET /api/v1/security/policy-report` aggregates. **(b) is fixed** — `verdict` is an
+    attribute on the stored event and the action string is a plain verb. **(c) is fixed as a
+    reachability problem and deliberately NOT fixed as a durability one**: the report exists and an
+    operator can read it, but the events half is still capped at seven days and still erasable by
+    `DELETE /api/v1/activity`. That is why the report carries a second, process-lifetime block
+    instead of one merged number. Making the audit trail itself un-erasable is a retention decision
+    that belongs with `events_sensitive_days`, not with a read surface.
   - **Deviation from the plan:** no `PrincipalKind::AgentTurn`. A tool call has no HTTP principal,
     so the audit line uses `Principal::internal()` and carries the engine session in the action
     string. Inventing a principal kind whose `proven_profile_id` is still `None` would have looked
@@ -1034,65 +1047,106 @@ cannot change class quietly.
   clean; `scripts/live-test.sh --ui` green including the no-bypass auth pass, which now asserts the
   PAIR — `PUT /settings` returns 200 with no token *before* `POST /onboard/complete` and 401 after —
   plus the full reset-then-recover round trip over real HTTP.
-- **P8a** BLOCKED 2026-08-06 — build the would-deny telemetry the flip is waiting on.
-  *Designed, not landed. The blocker is concurrency, not doubt: see below.*
+- **P8a** LANDED 2026-08-06 — the would-deny telemetry the flip is waiting on.
 
-  P8 was one bullet and it read as if only a release stood between `audit` and `enforce`. It
-  does not. The telemetry that bullet presumes is **emitted and never aggregated, never read, and
-  gone in seven days** — the three facts are set out in P1's corrected entry above. So the bullet
-  splits: P8a builds the counters and one operator-reachable read surface; P8b is the flip, and it
-  stays blocked until P8a has run on a real pond for a release.
+  P8 was one bullet and it read as if only a release stood between `audit` and `enforce`. It did
+  not: the telemetry that bullet presumed was emitted and never aggregated, never read, and gone in
+  seven days. This is the half that makes the question answerable. It does not flip anything.
 
-  **The design, so the next run lands it in one pass and not three.**
+  **What landed.**
 
-  1. *Make the verdict a first-class field.* `SecurityPolicy::audit(&self, principal, action,
-     scope, ok: bool)` takes `decision: &PolicyDecision` in place of `ok`. There are exactly two
-     implementors — `AllowAllPolicy` (`security/services/policy.rs`) and `SqliteSecurityPolicy`
-     (`pond-infra/src/sqlite_security_policy.rs`) — so the compiler names both and each decides out
-     loud. **Do not add a defaulted trait method to avoid the churn**; a half-adopted seam is this
-     repo's named bug class, and a second `audit_decision` method alongside the old one would leave
-     the identity path counting nothing while the report looked green. `SqliteSecurityPolicy::audit`
-     then emits `.attr("verdict", …)`, `.attr("mode", …)`, `.attr("reason", …)` beside the existing
-     `ok`, keeping the `Sensitive` classification. `DraftAuthority::audit` takes the decision
-     through too, and the `:{verdict}` suffix comes back out of both `format!` action strings so
-     `action` is a clean `identify_session` / `draft_approve`.
-  2. *The read surface.* `GET /api/v1/security/policy-report?window=hour|day|week`, registered in
-     `protected_routes` and **not** in `PUBLIC_ROUTES`, so P0/P7's four compile-time route guards do
-     the auth work for free. It reports **two** numbers on purpose and labels them: an events query
-     (`EventCategory::Auth`, action `security.audit`, grouped by the new `verdict` attribute), which
-     is durable but truncated at seven days and wipeable by `DELETE /activity`; and process-lifetime
-     `AtomicU64` counters, which survive pruning and a cleared activity log but not a restart. A
-     single number that quietly means "the last seven days unless somebody pressed Clear" is worse
-     than two honest ones.
-  3. *Non-vacuity.* With no decisions in the window the endpoint returns zeros, not 404, so a green
-     test is distinguishable from an unwired one. The behavioural test drives a `Principal::token`
-     asserting a profile it has not proved, under `security_policy_mode = "audit"`, and asserts
-     `would_deny: 1` **and** `allow` unchanged. Two mutations to run against it: flip
-     `PolicyDecision::verdict()`'s `(true, true)` arm to `"allow"` — the report test must fail
-     naming would_deny 0 vs 1, the exact confusion the field exists to prevent; and revert the audit
-     signature so the verdict rides the action string again — the report must show zeros rather than
-     crash, which proves the endpoint reads the attribute and not the string. `scripts/live_checks.py`
-     gets a `section_policy_telemetry` that POSTs an unproved assertion over real HTTP and reads the
-     report back, for the same reason `section_redaction` exists: a unit test constructs the policy
-     itself and can never answer what `run_server` actually bound.
+  1. *The verdict is a first-class field.* `SecurityPolicy::audit` takes `decision: &PolicyDecision`
+     in place of `ok: bool`, and `DraftAuthority::audit` the same. Required, not defaulted, and with
+     no parallel `audit_decision` beside the old one — the compiler named all four implementors
+     (`AllowAllPolicy`, `SqliteSecurityPolicy`, `RepoDraftAuthority`, and the `draft.rs` test stub)
+     and each decided out loud. `SqliteSecurityPolicy` now writes `verdict`, `mode` and `reason`
+     beside the existing `ok`, still classified `Sensitive`. `reason` is **absent** rather than
+     blank on a permit: an empty string reads as a field we failed to record.
+  2. *The `:{verdict}` suffix came out of both action strings.* `routes.rs` writes
+     `identify_session` and `draft.rs` writes `draft_approve` / `draft_reject`. Nothing parses a
+     substring any more.
+  3. *`AUDIT_ACTION` and the attribute keys moved to `pond-core`* (`security/ports/policy.rs`).
+     They were a private const in `pond-infra` while nothing read the events. The moment something
+     read them, one of two copies was going to drift and the reader would answer zero forever
+     without failing. `VERDICTS` is exported for the same reason and has its own test asserting the
+     producer and the buckets are the same set in both directions.
+  4. *`POLICY_COUNTERS`* — process-lifetime `AtomicU64` tallies, recorded **at the two decision
+     sites** rather than inside an `audit` implementation. Deliberate: this counts what the policy
+     decided, and it must not stop counting because an audit sink is unwired. There is no `reset`.
+  5. *`GET /api/v1/security/policy-report?window=hour|day|week`* — registered in `protected_routes`,
+     absent from `PUBLIC_ROUTES`, so the compile-time route guards do the auth work. Two labelled
+     blocks, never summed: `events` (durable, pruned at seven days, erasable by
+     `DELETE /api/v1/activity`) and `process` (survives both, dies on restart). Zeros and 200 on an
+     empty window, never 404.
+  6. *Honest truncation.* `EventQuery` has no action filter and no group-by, so both happen in Rust
+     over at most `POLICY_REPORT_MAX_EVENTS` (5000) rows, and the body carries `truncated`,
+     `scanned` and `unclassified`. Recon caught this drift in the design: the plan said "an events
+     query grouped by the verdict attribute" and the store cannot do either. A silently capped total
+     would be the same lie the two-source split exists to avoid.
 
-  **Explicitly out of scope:** any `pond-desktop` UI, and any new `Settings` field.
-  `security_policy_mode` stays HEADLESS_BY_DESIGN and that classification is unchanged — `curl` or
-  `giap.sh doctor` is the operator path in this phase.
+  **The guard, and the two mutations.** `crates/pond-api/tests/policy_report_test.rs` drives a real
+  router with a live `SqliteEventLog` **and** a live `SqliteSecurityPolicy` — `security_policy: None`
+  is what every other pond-api integration harness passes, and every assertion here would have
+  passed vacuously against it. Four tests: the behavioural one (zeros before, `would_deny == 1` and
+  `allow == 0` after, in both halves), the two-source separation (clearing the activity log zeros
+  the events half and must not touch the process half), the window rejection, and 401 without a
+  token.
 
-  **Why it did not land on 2026-08-06.** Both halves need `crates/pond-api/src/routes.rs`: the
-  signature change in (1) breaks compilation at the `policy.audit(...)` call inside
-  `evaluate_identity_assertion`, and the route in (2) must be registered in `protected_routes`.
-  routes.rs was concurrently held by the PAI-5 reasoning work in that run (it is where `TurnStats` /
-  `UsageStats` reach the `turn_stats` SSE frame and the persisted `SessionStats`), and staging a
-  shared file would have swept another phase's uncommitted work into this commit — a mistake this
-  programme has already made once. **Landing only the draft half was considered and rejected**: the
-  identity-assertion path is the one the flip is most about, so a report that silently omitted it
-  would be a misleading count, which is worse than no count. Nothing partial was left in the tree.
+  - *Mutation (a)* — flip `PolicyDecision::verdict()`'s `(true, true)` arm from `"would_deny"` to
+    `"allow"`. FAILED with `the event half lost the would-deny: {"events":{"allow":1,…,"would_deny":0},
+    "process":{"allow":1,…,"would_deny":0}}  left: 0  right: 1`. Exactly the confusion the field
+    exists to prevent, named in the message.
+  - *Mutation (b)* — put the verdict back on the action string and drop the `verdict` attribute.
+    FAILED with `"would_deny":0,"unclassified":1,"scanned":1` and the process half still reading
+    `"would_deny":1`. It did not crash, it counted the row it could not classify — which is what
+    proves the endpoint reads the attribute and not a substring, and why `unclassified` is a
+    separate bucket rather than folded into `allow`.
+  - Both restored and verified byte-identical with `cmp`.
 
-  **What would falsify this design.** If `GET /api/v1/security/policy-report` ever reports a
-  would-deny total that a `DELETE /api/v1/activity` can take to zero, the two-source split has been
-  collapsed back into one and the endpoint is lying by omission.
+  **One thing the guard nearly got wrong, recorded because it is the shape this programme keeps
+  hitting.** The first run of the file passed and the second failed with `process.would_deny` 2 vs 1:
+  `POLICY_COUNTERS` is a process-global and `cargo test` runs the functions concurrently, so two
+  tests taking a decision made each other's deltas wrong. A test that reports the scheduler is worse
+  than no test. Both decision-taking tests now hold a `DECISION_LOCK` first.
+
+  **Reachable in production.** `main.rs` binds `SqliteSecurityPolicy` over the real event log
+  unconditionally (`security_policy` in `AppState`), `security_policy_mode` defaults to `audit`, and
+  `PUT /api/v1/sessions/{id}/user` is the live route. A remote caller holding a handshake token gets
+  `Principal::token`, which proves no membership, so **every remote "this is Liz" is a would-deny
+  today** and lands in both halves of the report. The draft path counts on every approve/reject.
+
+  **What `scripts/live_checks.py :: section_policy_telemetry` can and cannot reach.** live-test.sh
+  runs the functional pass with `POND_DEV_ALLOW_LOOPBACK`, so the middleware attaches
+  `Principal::loopback()` — and `is_identity_assertion_proven` deliberately permits loopback. So the
+  decision that section takes is an **allow**, and a would-deny is not producible from there. It
+  asserts the allow moved by exactly one in *both* halves, that `events.available` is true (the
+  event log is really bound), that `unclassified` is zero (nothing wrote an audit row the report
+  could not read), and that the count was not capped. Claiming it demonstrates a would-deny would be
+  the unreachable-fixture mistake in reverse. The would-deny is covered by the integration test,
+  where the principal is a `Token`.
+
+  **Deliberately NOT done:** any `pond-desktop` UI, any new `Settings` field
+  (`security_policy_mode` stays HEADLESS_BY_DESIGN, unchanged — `curl` is the operator path), any
+  change to the retention or erasability of the audit trail, and the P8b flip. Also not done:
+  auditing anything beyond the two call sites that already audited. The report counts what is
+  recorded; it does not widen what is recorded, and it must not be read as coverage of the whole
+  cross-boundary surface.
+
+  **A drift corrected in passing.** `sqlite_security_policy.rs`'s module docs claimed nothing called
+  `SecurityPolicy::audit` in production. That stopped being true when P1 landed. Fixed in the same
+  change, with the two real call sites named.
+
+  **What would falsify this.** If `GET /api/v1/security/policy-report` ever reports a would-deny
+  total that `DELETE /api/v1/activity` can take to zero, the two-source split has been collapsed and
+  the endpoint is lying by omission — `clearing_the_activity_log_cannot_zero_the_process_counters`
+  is the test that says so. And if `events.unclassified` is ever non-zero on a live run, something
+  is writing audit rows without a verdict and the report is undercounting silently.
+
+  Gates: `cargo fmt --check` clean; clippy clean (0 errors) on pond-core / pond-infra / pond-api /
+  pond-mcp-server `--all-targets`; pond-core 808 + 6 + 2, pond-infra 217 + 3 + 4, pond-mcp-server 185,
+  pond-api 115 lib + all 21 integration targets including the new 4, all green;
+  `cargo check -p pond-server -p pond-adapters-goose` clean. **No live run** — the coordinator owns
+  it, and this phase adds a route and a handler, so it needs one.
 - **P8b** BLOCKED on P8a — flip the default to `security_policy_mode = "enforce"`, only after a
   release in `audit` whose telemetry shows what would have been denied. Note the standing
   precondition underneath both: `is_identity_assertion_proven` currently refuses *every* remote

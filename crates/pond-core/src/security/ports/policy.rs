@@ -28,9 +28,13 @@
 //! (per-profile memory access, per-extension secret scopes, notification
 //! consent) lands here later without re-architecting the request path.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
 use crate::user_data::domain::profile::ProfileScope;
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 /// Coarse-grained user-data scope identifiers used by [`SecurityPolicy::allow`].
 ///
@@ -162,6 +166,16 @@ impl PolicyMode {
     pub fn denies_bite(&self) -> bool {
         matches!(self, Self::Enforce)
     }
+
+    /// The wire form, so an audit attribute round-trips through
+    /// [`PolicyMode::parse`] unchanged.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Audit => "audit",
+            Self::Enforce => "enforce",
+        }
+    }
 }
 
 /// What the policy decided, kept separate from what the caller was allowed to do.
@@ -217,6 +231,113 @@ impl PolicyDecision {
             (true, false) => "deny",
         }
     }
+}
+
+/// The three values [`PolicyDecision::verdict`] can take, in the order a report
+/// should present them. A reader that groups on the attribute uses this rather
+/// than re-listing the strings, so the writer and the reader cannot drift.
+pub const VERDICTS: [&str; 3] = ["allow", "would_deny", "deny"];
+
+/// The `action` every [`SecurityPolicy::audit`] entry is recorded under.
+///
+/// Shared between the adapter that writes the event and the report handler that
+/// reads it back. It was a private constant in `pond-infra` while nothing read
+/// the events; the moment something did, one of the two copies was going to
+/// drift, and the reader would then answer zero forever without failing.
+pub const AUDIT_ACTION: &str = "security.audit";
+
+/// Attribute keys on an audit event. `VERDICT` is the one that answers "what
+/// would `enforce` have changed" — `OK` cannot, because in `audit` mode it is
+/// `true` for exactly the calls `enforce` would block.
+pub mod audit_attrs {
+    pub const PRINCIPAL: &str = "principal";
+    pub const ACTION: &str = "action";
+    pub const SCOPE: &str = "scope";
+    pub const OK: &str = "ok";
+    pub const VERDICT: &str = "verdict";
+    pub const MODE: &str = "mode";
+    pub const REASON: &str = "reason";
+    pub const REMOTE_ADDR: &str = "remote_addr";
+}
+
+/// Process-lifetime tallies of policy decisions, by verdict.
+///
+/// **Why this exists beside the event log rather than instead of it.** The event
+/// log is durable but it is pruned on a retention window and `DELETE
+/// /api/v1/activity` is a user-facing "clear my activity" button — so a
+/// would-deny total read only from events can be taken to zero by a person
+/// tidying up, and an operator deciding whether it is safe to flip
+/// `security_policy_mode` to `enforce` would read "nothing would break". These
+/// counters survive both, and do not survive a restart. Neither number is
+/// trustworthy alone, which is why the report labels them separately instead of
+/// adding them together.
+///
+/// There is deliberately **no reset**: a counter of refused-but-permitted
+/// accesses that anything in the process can zero is not evidence.
+#[derive(Debug)]
+pub struct PolicyCounters {
+    allow: AtomicU64,
+    would_deny: AtomicU64,
+    deny: AtomicU64,
+    counting_since: OnceLock<DateTime<Utc>>,
+}
+
+/// The one process-wide instance. Decision sites call
+/// [`PolicyCounters::record`]; the report handler calls
+/// [`PolicyCounters::snapshot`].
+pub static POLICY_COUNTERS: PolicyCounters = PolicyCounters::new();
+
+impl PolicyCounters {
+    const fn new() -> Self {
+        Self {
+            allow: AtomicU64::new(0),
+            would_deny: AtomicU64::new(0),
+            deny: AtomicU64::new(0),
+            counting_since: OnceLock::new(),
+        }
+    }
+
+    /// Tally one decision. Call this at the decision site, next to the audit
+    /// write — not inside [`SecurityPolicy::audit`], which two adapters
+    /// implement and one of them could stop calling it without the compiler
+    /// noticing.
+    pub fn record(&self, decision: &PolicyDecision) {
+        self.mark_start();
+        let counter = match decision.verdict() {
+            "allow" => &self.allow,
+            "would_deny" => &self.would_deny,
+            _ => &self.deny,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read the tallies. This also starts the clock if nothing has been
+    /// recorded yet, so `counting_since` is always an honest lower bound on the
+    /// window the numbers cover rather than a guess at when the process booted.
+    pub fn snapshot(&self) -> PolicyCounterSnapshot {
+        let counting_since = self.mark_start();
+        PolicyCounterSnapshot {
+            allow: self.allow.load(Ordering::Relaxed),
+            would_deny: self.would_deny.load(Ordering::Relaxed),
+            deny: self.deny.load(Ordering::Relaxed),
+            counting_since,
+        }
+    }
+
+    fn mark_start(&self) -> DateTime<Utc> {
+        *self.counting_since.get_or_init(Utc::now)
+    }
+}
+
+/// A read of [`POLICY_COUNTERS`] at one instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyCounterSnapshot {
+    pub allow: u64,
+    pub would_deny: u64,
+    pub deny: u64,
+    /// The instant these counters started counting. Everything before it was
+    /// another process.
+    pub counting_since: DateTime<Utc>,
 }
 
 /// The one rule where a deny is meaningful today: may this caller assert that a
@@ -350,11 +471,29 @@ pub trait SecurityPolicy: Send + Sync {
     async fn allow(&self, principal: &Principal, scope: &str) -> Result<bool>;
 
     /// Append an audit entry. Intended to be called at cross-boundary calls,
-    /// recording who did what to which scope and whether it was permitted.
+    /// recording who did what to which scope and **what the policy decided**.
+    ///
+    /// This takes the whole [`PolicyDecision`] and not an `ok: bool` on purpose.
+    /// `ok` is the *effect*, and in `audit` mode the effect of a refusal is
+    /// "permitted" — so an audit trail carrying only `ok` reads as a clean bill
+    /// of health for exactly the calls `enforce` would block, which is the one
+    /// question the mode exists to answer. The decision carries the verdict, the
+    /// mode it was taken under, and the reason.
+    ///
+    /// It is deliberately **not** a defaulted method, and there is deliberately
+    /// no second `audit_decision` alongside the old one: a half-adopted seam is
+    /// this repo's named bug class, and the half still calling the old shape
+    /// would count nothing while the report looked green.
     ///
     /// Auditing must never fail the caller, so this returns nothing — the
     /// implementation swallows or logs its own errors.
-    async fn audit(&self, principal: &Principal, action: &str, scope: &str, ok: bool);
+    async fn audit(
+        &self,
+        principal: &Principal,
+        action: &str,
+        scope: &str,
+        decision: &PolicyDecision,
+    );
 }
 
 #[cfg(test)]
@@ -544,6 +683,73 @@ mod policy_rule_tests {
                 p.proven_profile_id, None,
                 "a constructor handed out a proved identity: {p:?}"
             );
+        }
+    }
+
+    // ── Process-lifetime counters ──────────────────────────────────────────
+
+    /// The counters are a process-global, so this asserts DELTAS. An absolute
+    /// assertion here would pass or fail depending on which other test in this
+    /// binary ran first, which is a test that reports the scheduler.
+    #[test]
+    fn each_verdict_lands_in_its_own_counter() {
+        let before = POLICY_COUNTERS.snapshot();
+        POLICY_COUNTERS.record(&PolicyDecision::permit(PolicyMode::Audit));
+        POLICY_COUNTERS.record(&PolicyDecision::refuse(
+            PolicyMode::Audit,
+            REASON_UNPROVEN_IDENTITY,
+        ));
+        POLICY_COUNTERS.record(&PolicyDecision::refuse(
+            PolicyMode::Enforce,
+            REASON_UNPROVEN_IDENTITY,
+        ));
+        let after = POLICY_COUNTERS.snapshot();
+
+        assert_eq!(after.allow - before.allow, 1);
+        assert_eq!(
+            after.would_deny - before.would_deny,
+            1,
+            "a refusal that was let through must not be counted as an allow"
+        );
+        assert_eq!(after.deny - before.deny, 1);
+    }
+
+    /// A snapshot taken before anything is recorded still names an instant, so
+    /// the report never has to say "since: null" and leave the operator to
+    /// guess whether the window is empty or unknown.
+    #[test]
+    fn snapshot_starts_the_clock_rather_than_reporting_nothing() {
+        let a = POLICY_COUNTERS.snapshot();
+        let b = POLICY_COUNTERS.snapshot();
+        assert_eq!(
+            a.counting_since, b.counting_since,
+            "the start instant must not move under repeated reads"
+        );
+        assert!(a.counting_since <= Utc::now());
+    }
+
+    /// The report groups on these strings; `verdict()` produces them. If either
+    /// side gains a fourth value without the other, the report silently drops a
+    /// whole class of decision into no bucket at all.
+    #[test]
+    fn every_verdict_a_decision_can_produce_is_a_known_bucket() {
+        let produced = [
+            PolicyDecision::permit(PolicyMode::Audit).verdict(),
+            PolicyDecision::refuse(PolicyMode::Audit, REASON_UNPROVEN_IDENTITY).verdict(),
+            PolicyDecision::refuse(PolicyMode::Enforce, REASON_UNPROVEN_IDENTITY).verdict(),
+        ];
+        for v in produced {
+            assert!(VERDICTS.contains(&v), "unbucketed verdict: {v}");
+        }
+        for v in VERDICTS {
+            assert!(produced.contains(&v), "bucket nothing can produce: {v}");
+        }
+    }
+
+    #[test]
+    fn mode_round_trips_through_its_wire_form() {
+        for mode in [PolicyMode::Off, PolicyMode::Audit, PolicyMode::Enforce] {
+            assert_eq!(PolicyMode::parse(mode.as_str()), mode);
         }
     }
 }
