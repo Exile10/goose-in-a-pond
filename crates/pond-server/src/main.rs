@@ -1513,22 +1513,14 @@ async fn run_server(
         chat_provider_arc.clone() as Arc<dyn LlmProvider>
     )));
 
-    // Build InferencePool — concurrent LLM task submission with provider-aware
-    // concurrency limits. HTTP providers (Ollama/llamafile) get 3 concurrent
-    // slots; local GGUF gets 1 (serialized by Goose's model mutex anyway).
-    let inference_pool: Option<Arc<dyn pond_core::models::ports::inference_pool::InferencePool>> = {
-        use pond_core::models::ports::inference_pool::InferencePool as _;
-        let pool = inference_pool::TokioInferencePool::for_provider(
-            llm_provider.clone(),
-            &effective_chat_provider,
-        );
-        println!(
-            "  Inference Pool: concurrency={} (provider={})",
-            pool.concurrency(),
-            effective_chat_provider
-        );
-        Some(Arc::new(pool))
-    };
+    // AppState still carries an `inference_pool` slot (pond-api's InferencePool
+    // port), but the only implementation ever built for it, TokioInferencePool,
+    // had zero callers of `submit` — nothing on the serving path ever queued a
+    // task through it, so it did no work beyond printing a concurrency figure
+    // at startup. Removed with that print; leaving the field `None` costs
+    // nothing until a real consumer needs the port.
+    let inference_pool: Option<Arc<dyn pond_core::models::ports::inference_pool::InferencePool>> =
+        None;
 
     // Build AnswerReviewer for the HTTP path — adversarial post-inference quality gate.
     // Always constructed so the user can toggle it on/off at runtime via settings.
