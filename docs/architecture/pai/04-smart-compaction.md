@@ -44,6 +44,18 @@ error. It is stored on `ChatService` as `compactor: Option<ContextCompactor>` (`
 initialised `None` (`:270`), settable via `with_context_compactor` (`:424-425`) — and **never
 read**. No caller of `with_context_compactor` exists anywhere in `crates/`.
 
+> **Deleted 2026-08-06, and the deletion is correct.** `context_compactor.rs` and
+> `compact_encoding.rs` are gone and no reference to `ContextCompactor` remains anywhere in
+> `crates/`. This section is kept because the *diagnosis* was right and the phase list was built on
+> it; only the disposition changed, from "revive" to "rewrite".
+>
+> The reason is PAI-3, not tidiness. The deleted implementation was built on
+> `USABLE_HISTORY_CHARS` and its own `const CHARS_PER_TOKEN: usize = 4` — precisely the estimator
+> PAI-3 P2 spent a phase replacing with the `TokenCounter` port, and precisely the kind of second
+> copy PAI-3 P1 exists to prevent. Reviving it would have re-imported the heuristic two landed
+> phases removed, into the one tier where an accurate count is affordable. Dead code that has
+> drifted three phases behind the live path is not an asset waiting to be switched on.
+
 ### 1.4 `should_compact` is computed and ignored
 
 `ContextMonitor::check_context_health` (`context_monitor.rs:116-186`) returns `should_compact` when
@@ -87,10 +99,17 @@ current design pays blindly:
 | Medium (32K, Ollama/llamafile) | Deterministic trim + idle rolling summary (today's behaviour). |
 | Large / HTTP (≥ 64K) | Deterministic trim + idle summary + **LLM re-summarisation of the summary itself** when it grows stale. Here the summarisation call is cheap and off the critical path. |
 
-The large-model tier is where the dead `ContextCompactor` is **revived rather than deleted**. It is
-correct code solving a problem the on-device tier does not have. It gets wired behind the governor,
-given an `LlmProvider`, and gated on model class — which is also the answer to why it was never
-wired: nobody had a tier where it was safe.
+The large-model tier is where re-summarisation belongs. It is a problem the on-device tier does not
+have, and the answer to why nothing was ever wired: nobody had a tier where it was safe.
+
+> **Corrected 2026-08-06.** This paragraph said the dead `ContextCompactor` would be "revived rather
+> than deleted". It has since been deleted, correctly — see 1.3. What this tier needs is written
+> fresh against the landed governor: `TokenCounter` for the measurement, `CompactionProfile`'s
+> interpolated curve for the budget, and `ModelClass` for the gate. The salvage from the old file is
+> its *shape*, which was sound and is worth restating so it is not rediscovered: summarise the older
+> span, splice the result back as a single message, keep the most recent turns verbatim, and fall
+> back to a deterministic trim whenever the LLM call fails so a chat turn is never interrupted by
+> compaction.
 
 ### 3.2 Time axis — age-weighted retention and compact-on-resume
 
@@ -181,8 +200,21 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
 
 - **P1** `ModelClass` derived from the governor; strategy dispatch; today's behaviour preserved for
   the small and medium tiers.
-- **P2** Revive `ContextCompactor` for the large tier — wire it, give it a provider, gate it on class,
-  and add the first test that actually executes it.
+- **P2 — RESPECIFIED 2026-08-06. Write a large-tier compaction strategy; do not revive anything.**
+  The phase used to read "revive `ContextCompactor`". That file was deleted on 2026-08-06 and the
+  deletion is right (see 1.3): it carried its own `CHARS_PER_TOKEN = 4` and `USABLE_HISTORY_CHARS`,
+  the estimator PAI-3 P2 replaced with the `TokenCounter` port, so reviving it would have re-imported
+  a heuristic two landed phases removed — into the one tier that can afford an accurate count.
+
+  What P2 builds instead: LLM re-summarisation for the large tier, written against what has landed —
+  `TokenCounter` for measurement, `CompactionProfile`'s interpolated curve for the budget,
+  `ModelClass` for the gate, an `LlmProvider` for the call. Keep the old file's shape, which was
+  sound: summarise the older span, splice it back as one message, keep recent turns verbatim, and
+  fall back to a deterministic trim on any LLM failure so a turn is never interrupted.
+
+  **And add the first test that actually executes it** — that clause survives the respec unchanged,
+  because it is the reason the original was dead. 277 lines with no caller passed every gate this
+  repo has for as long as it existed.
 - **P3** Age-weighted retention priority in the trimmer, with `compaction_verbatim_days` as a
   headless setting.
 - **P4** Compact-on-resume, reusing the `should_run` gate shape from `consolidation_schedule.rs`.
