@@ -883,7 +883,8 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   > it should land together with the `sections/Chat.tsx` half this stamp already lists as blocked.
 
   > **OPEN 2026-08-06 (synthesis), and it is the more serious of the two: the "Compact now" control
-  > can never succeed on any default configuration.** P6's pressure axis and P7b's manual axis share
+  > can never succeed on any default configuration.** — **CLOSED 2026-08-06 by P7b-fix, below; the
+  > diagnosis was exact and the reproduction is now a test.** P6's pressure axis and P7b's manual axis share
   > both the trigger condition and the single `claim_compaction` quota, and the pressure axis takes
   > the claim strictly BEFORE the button is rendered. In the chat-stream generator the
   > `context_warning` frame is yielded and `spawn_pressure_compaction(&state, &session_id)` is called
@@ -926,6 +927,95 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   honest check is a long session, not a fabricated frame. Note that utilisation is only ever learned
   from a turn taken since this process started, so most real sessions never reach the state at all;
   the refusal renderings are what a user actually hits, and they are what the tests assert hardest.
+- **P7b-fix — LANDED 2026-08-06.** Both open items above are closed: the "Compact now" control can
+  now succeed, and the classic chat section renders it. Neither half is a line-count change, because
+  the first is a decision about what the cooldown is *for* and the second is the render test round
+  one could not write.
+
+  **The button, and why the fix is not a bypass.** `ContextMonitor::claim_manual_compaction` sits
+  beside `claim_compaction` and differs from it in exactly one respect: it skips the
+  `COMPACTION_COOLDOWN_TURNS` check. It still requires the session to exist, it still recomputes
+  `should_compact` under the same lock — a person may not compact a session that is not under
+  pressure, and that limb was never what made the button dead — and it **still stamps**
+  `turns_at_last_compaction`. Consuming the quota without checking it is the whole design: a human
+  press rations the automatic axis for three recorded turns afterwards exactly as an automatic pass
+  would, so the two axes cannot between them buy two summarisations for one turn. The manual axis
+  gains nothing the pressure axis did not already have; it only stops being refused by a claim the
+  pressure axis took on its behalf one statement earlier.
+
+  **P7a's argument was read before deciding, as its stamp asked, and it is a threat model rather
+  than a mechanism.** The mechanism in the code cuts the other way. `SessionSummaryService::refresh`
+  decides `NothingToDo` from the rolling summary's through-pointer and the message count *before* it
+  reaches `provider.complete`, so a client hammering the endpoint after one successful pass spends a
+  database read per press and no model call — and every message that would change that answer is a
+  turn a human had to take. What bounds the manual axis's model spend is the through-pointer, not the
+  turn cooldown, which is precisely why removing the cooldown from this axis costs nothing P7a was
+  protecting. `compaction_in_flight` is untouched and is read *before* the claim; that is the guard
+  that actually protects a serial on-device engine, and it survives.
+
+  **One residual, named here rather than discovered later.** `SessionSummaryService::resummarise` is
+  *not* through-pointer-idempotent in the same way and can spend one model call per press. It is
+  gated on `ModelClass::permits_compaction_model_call()` — the large tier only, definitionally not
+  the on-device engine the argument above is about — and it shares this pass's single
+  `COMPACTIONS_IN_FLIGHT` claim, so it serialises. If a wall-clock rate limit is ever built, this is
+  the path that wants it.
+
+  **`cooling_down` is now unreachable from this endpoint, and the refusal was re-labelled rather
+  than left lying.** With the cooldown skipped, the only way the claim can refuse after the
+  `should_compact` read a few lines above is that a turn completed in between and took the session
+  back under the threshold. That is `not_under_pressure`, and reporting it as `cooling_down` would
+  have been a sentence about a rule this axis no longer runs. `ContextPressureNote`'s `REASON_TEXT`
+  keeps its `cooling_down` entry — the component was outside this phase's footprint, and a spare
+  entry is harmless where a missing one would print "Nothing was compacted." for a real refusal.
+
+  **The guard was RE-DERIVED, not weakened, and that is the point of the phase.**
+  `a_second_press_is_refused_by_the_cooldown` asserted the very behaviour that made the button dead
+  and passed while doing so — a test can be green and be certifying the bug. It is replaced by four:
+  `a_press_after_the_pressure_axis_already_claimed_still_compacts` (the guard: it calls
+  `claim_compaction` FIRST, reproducing what `spawn_pressure_compaction` does one statement after the
+  frame, and then presses); `a_press_rations_the_automatic_axis_afterwards` (the non-widening
+  control); `a_press_while_a_pass_is_in_flight_is_refused` (the surviving guard, made deterministic
+  by a provider that blocks inside `complete` until the test releases it, rather than by racing a
+  100 ms sleep); and `a_second_press_spends_no_second_model_call`, which **counts provider calls**
+  because P7a already learned that a status-only assertion passes against both the bug and the fix —
+  `NothingToDo` and a second real pass are both reported as `skipped`.
+
+  Three mutations, each restored byte-identical. Putting `claim_compaction` back in `compact_session`
+  failed the first test naming the pressure axis having taken the shared quota. Deleting the
+  `compaction_in_flight` check failed the third with `"failed"` where `already_running` belonged.
+  Dropping the `turns_at_last_compaction` stamp from `claim_manual_compaction` failed the second in
+  both `pond-core` and `pond-api`, saying a press now costs the automatic axis nothing.
+
+  **The Chat section, and the render test the synthesis correction asked for.** `sections/Chat.tsx`
+  gets the same `context_warning` branch (attaching by `m.id === agentMsg.id`) and the same
+  `<ContextPressureNote>` beside the `.turn-limit` block, gated on `!msg.streaming` and **not** on
+  `showTurnStats` — `show_turn_stats` is false in Rust by default and borrowing that gate would ship
+  the note invisible, which is why `TurnStatsFooter` was rejected as its host in the first place.
+  `Chat.test.tsx` now mounts the real component, drives a real `context_warning` frame through the
+  real stream and asserts a real `.ctx-pressure` node. Both mutations that beat round one's grep were
+  run against it and both went red: adding `showTurnStats &&` to the render guard, and attaching the
+  frame to a message id that does not exist. A vacuity control (`renders no note for a turn that
+  never reported pressure`) sits beside them, and a third test asserts the button is *enabled*, since
+  the frame carries no session id and a permanently-disabled control is a dead button by another
+  route. The two-substring grep in `ContextPressureNote.test.tsx` is kept and now covers both
+  surfaces, re-labelled in the file as a tripwire rather than as coverage — `ChatHub.tsx` still has
+  no mount harness, so for that surface a grep is genuinely all there is.
+
+  **Deliberately NOT done.** `Canvas.tsx` remains the deferral the P7b stamp already argued: its
+  thread items carry no id and it implements neither `turn_stats` nor `turn_limit_reached`, so a
+  per-turn control there is a new pattern rather than parity. No wall-clock rate limit, so a session
+  the monitor has never recorded a turn for still answers `not_under_pressure` — that is unchanged
+  and still a phase, not a line. And an agent bubble with no text, no cards and no reasoning is
+  suppressed entirely, note and all; the generator that emits `context_warning` is the one that emits
+  the answer, so a warning-only turn is not a state production produces, and widening the suppression
+  rule to keep an empty bubble alive for a footer would be the wrong trade.
+
+  **What would falsify this.** A pressured session where the note renders and the press still answers
+  `cooling_down` — that string should now be unreachable from this endpoint. A press that compacts
+  and then leaves the pressure axis free to compact again on the very next turn: the two axes are
+  supposed to share one quota, and if they stop the device pays for it. A press that reaches the
+  summariser twice with no new messages between. Or `.ctx-pressure` appearing in the classic chat on
+  a turn that sent no `context_warning`.
 
 ---
 

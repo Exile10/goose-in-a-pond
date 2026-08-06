@@ -1,24 +1,35 @@
-//! PAI-4 P7 — `POST /api/v1/sessions/:id/compact`, the manual compaction axis.
+//! PAI-4 P7 / P7b-fix — `POST /api/v1/sessions/:id/compact`, the manual axis.
 //!
 //! What these tests are for, in order of how much they matter:
 //!
-//! 1. **The button does not bypass P6's rate limiter.** This is the whole risk of
-//!    the phase. `should_compact` is monotone above 75%, so an endpoint that ran
-//!    a pass on every press would let anything holding a bearer token queue
-//!    unbounded summarisation model calls in front of the user's next turn on a
-//!    serial on-device engine. `a_second_press_is_refused_by_the_cooldown` is the
-//!    guard: break the `claim_compaction` call in `compact_session` and it fails.
-//! 2. **The endpoint reports rather than no-ops.** Every refusal carries a reason
+//! 1. **The button works at all.** P7 refused the press unless P6's shared
+//!    `claim_compaction` granted, and the pressure axis takes that claim one
+//!    statement after the frame that renders the button — so the claim was gone
+//!    before the control existed and every press answered `cooling_down`. The
+//!    original guard here, `a_second_press_is_refused_by_the_cooldown`, asserted
+//!    precisely the behaviour that made it dead, and passed while doing so.
+//!    `a_press_after_the_pressure_axis_already_claimed_still_compacts`
+//!    reproduces that production ordering and is the replacement.
+//! 2. **And it is still not a bypass.** Three separate limbs stand in for the
+//!    cooldown, each with its own test: a press consumes the automatic axis's
+//!    quota (`a_press_rations_the_automatic_axis_afterwards`), a press while a
+//!    pass runs is refused (`a_press_while_a_pass_is_in_flight_is_refused`), and
+//!    a second press spends no second model call, because the rolling summary's
+//!    through-pointer decides `NothingToDo` before it reaches the provider
+//!    (`a_second_press_spends_no_second_model_call`).
+//! 3. **The endpoint reports rather than no-ops.** Every refusal carries a reason
 //!    and the session's real utilisation, so a control that declines is
 //!    diagnosable instead of looking broken.
-//! 3. **A session id that does not exist is a 404**, not a healthy window.
+//! 4. **A session id that does not exist is a 404**, not a healthy window.
 //!
-//! These are wiring tests. The cooldown arithmetic itself is unit-tested in
+//! These are wiring tests. The claim arithmetic itself is unit-tested in
 //! `pond-core`'s `context_monitor`; what no unit test can reach is whether the
-//! route actually goes through it.
+//! route actually goes through it, and the whole of P7b-fix is that it went
+//! through the wrong one.
 //!
 //! Run: cargo test -p pond-api --test manual_compaction_test
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -93,9 +104,62 @@ impl DeviceRegistry for MockDeviceRegistry {
     }
 }
 
+/// A summariser that counts its calls and can be held open on demand.
+///
+/// Two things `MockProvider` cannot do, and both are load-bearing here now that
+/// the turn cooldown no longer rations the manual axis:
+///
+/// - **Counting.** What bounds a person hammering the button is the rolling
+///   summary's through-pointer, and the only honest way to assert that is to
+///   count the model calls rather than to read the status string — a second pass
+///   that answers `NothingToDo` and a second pass that ran are both reported as
+///   `skipped`.
+/// - **Holding.** `already_running` is the guard that survives this phase, and
+///   racing two requests against `MockProvider`'s 100 ms sleep would be a timing
+///   assertion. `entered`/`release` make it deterministic: the second request is
+///   issued only once the first is provably inside the model call.
+struct CountingProvider {
+    calls: Arc<AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    /// `Some` => block inside `complete` until notified.
+    release: Option<Arc<tokio::sync::Notify>>,
+}
+
+#[async_trait::async_trait]
+impl pond_core::models::ports::provider::LlmProvider for CountingProvider {
+    async fn complete(
+        &self,
+        _system_prompt: &str,
+        _messages: Vec<ChatMessage>,
+    ) -> anyhow::Result<ChatMessage> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        // `notify_one`, not `notify_waiters`: it stores a permit when nobody is
+        // waiting yet, so the test cannot lose the signal by polling late. That
+        // race is exactly how a deterministic test degrades into a timed one.
+        self.entered.notify_one();
+        if let Some(release) = &self.release {
+            release.notified().await;
+        }
+        Ok(ChatMessage::assistant(
+            "The household discussed the greenhouse fans and agreed to raise the \
+             evening setpoint.",
+        ))
+    }
+
+    fn model_name(&self) -> String {
+        "counting-v1".to_string()
+    }
+}
+
 // ── Test fixture ───────────────────────────────────────────────────────────────
 
 async fn make_app() -> (axum::Router, Arc<AppState>, tempfile::TempDir) {
+    make_app_with_provider(Arc::new(MockProvider::new())).await
+}
+
+async fn make_app_with_provider(
+    provider: Arc<dyn pond_core::models::ports::provider::LlmProvider>,
+) -> (axum::Router, Arc<AppState>, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = pond_infra::db::Database::init(tmp.path()).await.unwrap();
 
@@ -115,9 +179,7 @@ async fn make_app() -> (axum::Router, Arc<AppState>, tempfile::TempDir) {
         agent: Arc::new(MockAgent::new()),
         // The summariser the pass runs on. Without one the endpoint answers
         // `no_summariser` and every assertion below would be about that branch.
-        llm_provider: Arc::new(tokio::sync::RwLock::new(Some(
-            Arc::new(MockProvider::new()),
-        ))),
+        llm_provider: Arc::new(tokio::sync::RwLock::new(Some(provider))),
         llamafile_url: "http://127.0.0.1:8080".to_string(),
         tts: None,
         settings_repo: Arc::new(MockSettingsRepository::new()),
@@ -250,46 +312,186 @@ fn saturate(state: &Arc<AppState>, session_id: &str) {
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
-/// THE GUARD. Two presses in a row must not buy two model calls.
+/// THE GUARD, and the whole of PAI-4 P7b-fix.
 ///
-/// `claim_compaction` grants at most one pass per `COMPACTION_COOLDOWN_TURNS`
-/// recorded turns, and the manual endpoint is deliberately *inside* that rule
-/// rather than beside it. Nothing records a turn between these two requests, so
-/// the cooldown cannot have expired and the second press must be refused.
+/// This reproduces the production ordering rather than an idealised one. In the
+/// chat-stream generator the `context_warning` frame is yielded and
+/// `spawn_pressure_compaction` is called one statement later inside the SAME
+/// `if health.should_compact` block; that spawn takes `claim_compaction`. The
+/// note the frame renders only appears once the message stops streaming, i.e.
+/// strictly after `done`, i.e. after the spawn. So on every real press the quota
+/// is already spent — not sometimes, not as a race the user could win, always.
+///
+/// The claim below is therefore the fixture, not a contrivance: a test that
+/// pressed the button without it would exercise a state the app cannot be in,
+/// which is the shape that let this ship broken the first time.
 #[tokio::test]
-async fn a_second_press_is_refused_by_the_cooldown() {
+async fn a_press_after_the_pressure_axis_already_claimed_still_compacts() {
     let (app, state, _tmp) = make_app().await;
     let session = state
         .session_storage
-        .create_session("p7-cooldown".to_string())
+        .create_session("p7-after-pressure".to_string())
+        .await
+        .expect("create session");
+    seed_history(&state, &session.id, 12).await;
+    saturate(&state, &session.id);
+
+    assert!(
+        state.context_monitor.claim_compaction(&session.id),
+        "the pressure axis could not claim, so this test is not reproducing the \
+         production ordering and would pass against the dead button",
+    );
+
+    let body = compact(&app, &session.id).await;
+    assert_eq!(
+        body["status"], "compacted",
+        "the press was refused after the pressure axis took the shared quota \
+         one statement after the frame that renders this very button - which is \
+         what every real press looks like, so the advertised success path is \
+         unreachable rather than uncommon: {body}",
+    );
+    assert_eq!(
+        body["outcome"], "refreshed",
+        "the endpoint reported success without a pass having persisted a \
+         summary: {body}",
+    );
+}
+
+/// The non-widening control, and the reason the manual claim is not `true`.
+///
+/// A press CONSUMES the automatic axis's quota without CHECKING it. Without
+/// that, a person pressing the button costs the pressure axis nothing and the
+/// two together summarise more often than either alone ever could — which is the
+/// widening P7's stamp argued against, and it is still not allowed.
+#[tokio::test]
+async fn a_press_rations_the_automatic_axis_afterwards() {
+    let (app, state, _tmp) = make_app().await;
+    let session = state
+        .session_storage
+        .create_session("p7-rations".to_string())
+        .await
+        .expect("create session");
+    seed_history(&state, &session.id, 12).await;
+    saturate(&state, &session.id);
+
+    let body = compact(&app, &session.id).await;
+    assert_eq!(body["status"], "compacted", "{body}");
+
+    // One more pressured turn: nowhere near COMPACTION_COOLDOWN_TURNS, so the
+    // pressure axis must still be held off by the press that just happened.
+    saturate(&state, &session.id);
+    assert!(
+        !state.context_monitor.claim_compaction(&session.id),
+        "the pressure axis claimed one turn after a manual press - a press now \
+         costs the automatic axis nothing, so a user pressing the button and \
+         then taking a turn buys two summarisations where the rules allow one",
+    );
+}
+
+/// The guard that survives the phase. `compaction_in_flight` is what actually
+/// protects a serial on-device engine, and it is read BEFORE the claim so a
+/// refusal here does not spend one.
+///
+/// Deterministic rather than timed: the second request is issued only once the
+/// first is provably inside `provider.complete`.
+#[tokio::test]
+async fn a_press_while_a_pass_is_in_flight_is_refused() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (app, state, _tmp) = make_app_with_provider(Arc::new(CountingProvider {
+        calls: calls.clone(),
+        entered: entered.clone(),
+        release: Some(release.clone()),
+    }))
+    .await;
+
+    let session = state
+        .session_storage
+        .create_session("p7-in-flight".to_string())
+        .await
+        .expect("create session");
+    seed_history(&state, &session.id, 12).await;
+    saturate(&state, &session.id);
+
+    let first = tokio::spawn({
+        let app = app.clone();
+        let id = session.id.clone();
+        async move { compact(&app, &id).await }
+    });
+
+    entered.notified().await;
+
+    let second = compact(&app, &session.id).await;
+    assert_eq!(
+        second["status"], "skipped",
+        "a press landed while a pass was already running: {second}",
+    );
+    assert_eq!(
+        second["reason"], "already_running",
+        "a press during an in-flight pass was refused for the wrong reason - \
+         the in-flight peek is the guard that protects the serial on-device \
+         engine from two summarisations at once: {second}",
+    );
+    assert!(second["outcome"].is_null(), "{second}");
+
+    release.notify_waiters();
+    let first = first.await.expect("first press panicked");
+    assert_eq!(first["status"], "compacted", "{first}");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "two presses reached the summariser",
+    );
+}
+
+/// What bounds a person hammering the button, now that the turn cooldown does
+/// not. `SessionSummaryService::refresh` decides `NothingToDo` from the rolling
+/// summary's through-pointer and the message count BEFORE it reaches
+/// `provider.complete`, so a second press with no new turns in between costs a
+/// database read and nothing else.
+///
+/// Counted, not read off the status string: a second pass that answered
+/// `NothingToDo` and a second pass that actually ran are BOTH reported as
+/// `skipped`, so a status assertion would pass against either.
+#[tokio::test]
+async fn a_second_press_spends_no_second_model_call() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (app, state, _tmp) = make_app_with_provider(Arc::new(CountingProvider {
+        calls: calls.clone(),
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: None,
+    }))
+    .await;
+
+    let session = state
+        .session_storage
+        .create_session("p7-second-press".to_string())
         .await
         .expect("create session");
     seed_history(&state, &session.id, 12).await;
     saturate(&state, &session.id);
 
     let first = compact(&app, &session.id).await;
+    assert_eq!(first["status"], "compacted", "{first}");
     assert_eq!(
-        first["status"], "compacted",
-        "the first press did not run a pass: {first}",
+        calls.load(Ordering::SeqCst),
+        1,
+        "the first press did not reach the summariser",
     );
-    assert_eq!(first["outcome"], "refreshed");
 
     let second = compact(&app, &session.id).await;
-    // `outcome` is null exactly when no pass ran, and that is the claim that
-    // matters. `status` alone is too weak to be the guard: a second pass finds
-    // the through-pointer already advanced and answers `NothingToDo`, which is
-    // also reported as "skipped" — so a bypassed rate limiter would still look
-    // like a refusal here while having spent the model call.
-    assert!(
-        second["outcome"].is_null(),
-        "the second press ran a second pass - the manual endpoint is bypassing \
-         P6's rate limiter, and a client hammering it would stack summarisation \
-         model calls in front of the user's next turn on a serial on-device \
-         engine: {second}",
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the second press spent another summarisation model call with no new \
+         messages to fold - a client hammering this endpoint would stack them \
+         in front of the user's next turn on a serial on-device engine: {second}",
     );
     assert_eq!(
-        second["reason"], "cooling_down",
-        "the second press was refused, but not by the cooldown: {second}",
+        second["outcome"], "nothing_to_do",
+        "the second press did not report the through-pointer refusal it made: \
+         {second}",
     );
 }
 

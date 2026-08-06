@@ -206,6 +206,47 @@ test.describe("Chat section — response rendering", () => {
     await expect(page.getByText("First message")).toBeVisible({ timeout: 10_000 });
     await expect(page.getByText("Second message")).toBeVisible({ timeout: 10_000 });
   });
+
+  // PAI-4 P7b-fix. The Chat section is the surface round 1 could not reach, and
+  // this spec is the one that drives it. `mockAllApiRoutes` already registers a
+  // `**/api/v1/sessions/*/compact` route returning a `not_under_pressure`
+  // refusal, so the click below cannot reach a real network — verified in
+  // `helpers/api-mocks.ts`, not assumed.
+  test("context_warning renders the pressure note and its refusal", async ({ page }) => {
+    await page.route("**/api/v1/chat/stream", (route) =>
+      route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+        body: mockSseStream([
+          { type: "text", content: "The greenhouse fans are on.", token: "The greenhouse fans are on." },
+          {
+            type: "context_warning",
+            utilization_pct: 82.4,
+            turns_remaining: 2,
+            avg_growth_rate: 640,
+            warning: "Context window 82% full (6750/8192 tokens). ~2 turns remaining.",
+          },
+          { done: true, session_id: "e2e-session", model_role: "chat" },
+        ]),
+      }),
+    );
+
+    await goToChat(page);
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("are the fans on?");
+    await textarea.press("Meta+Enter");
+
+    await expect(page.locator(".ctx-pressure")).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByText(/82% full/)).toBeVisible({ timeout: 10_000 });
+
+    // A refusal is the ordinary answer and it must read as information, not as
+    // a failure — this is the path a user actually hits most.
+    await page.getByRole("button", { name: /compact now/i }).click();
+    await expect(page.locator(".ctx-pressure__result")).toHaveText(
+      /still room in this window/i,
+      { timeout: 10_000 },
+    );
+  });
 });
 
 // ── Live E2E tests (require running pond-server) ───────────────────────────────

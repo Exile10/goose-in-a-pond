@@ -2529,31 +2529,49 @@ fn compaction_report(
 /// `run_compaction_pass` — and it is subject to the same rules, which is the
 /// whole of the design and the only part that is easy to get wrong.
 ///
-/// **It does not bypass P6's rate limiter, and that is deliberate.** The
-/// tempting shape for a manual endpoint is "the user asked, so just do it".
-/// `ContextMonitor::claim_compaction` exists because `should_compact` is
-/// monotone: past 75% a session is above 75% on every later turn, so an ungated
-/// rule spends a summarisation model call between every pair of turns on the
-/// device least able to afford one. A button that skipped the claim would hand
-/// exactly that ability to anything holding a bearer token, and on the serial
-/// on-device engine each of those calls is time the user's next turn waits
-/// behind. So the endpoint is strictly a *subset* of what the pressure axis
-/// already does on its own: it can only bring a pass forward within the rules,
-/// never past them. A bypass would be a widening, and this programme's rule on
-/// widening is that it is a bug.
+/// **It took P6's rate limiter, and that was the bug — PAI-4 P7b-fix.** The
+/// original shape refused the press unless `ContextMonitor::claim_compaction`
+/// granted, on the argument that `should_compact` is monotone above 75% and an
+/// ungated endpoint would let anything holding a bearer token queue a
+/// summarisation between every pair of turns. The argument is sound and the
+/// implementation could never work, because the two axes shared one quota and
+/// the pressure axis always took it first: in the chat-stream generator the
+/// `context_warning` frame is yielded and `spawn_pressure_compaction` runs one
+/// statement later inside the same `if health.should_compact` block, while the
+/// button that frame renders only appears after `done`. Six consecutive
+/// pressured turns produced six `cooling_down` refusals and never one pass, so
+/// the advertised success path was unreachable rather than uncommon.
 ///
-/// **What that costs, said plainly.** Two presses that a user would expect to
-/// work do not. A session below the compaction threshold answers
+/// So this now calls `ContextMonitor::claim_manual_compaction`, which differs
+/// from `claim_compaction` in exactly one respect: it skips the turn cooldown.
+/// It still requires pressure, and it still *stamps* the cooldown — a press
+/// consumes the automatic axis's quota without checking it, so the two together
+/// can never buy two summarisations for one turn. That is why this is not a
+/// widening: the manual axis gains nothing the pressure axis did not already
+/// have, it only stops being refused by a claim taken on its behalf.
+///
+/// **What actually bounds repeated presses, since the cooldown no longer does.**
+/// Two things, and neither is new. `compaction_in_flight` below refuses while a
+/// pass is running, which is what protects a serial on-device engine. And
+/// `SessionSummaryService::refresh` decides `NothingToDo` from the rolling
+/// summary's through-pointer and the message count *before* it reaches
+/// `provider.complete`, so a second press with no new turns in between costs a
+/// database read and no model call — and every new message is a turn the person
+/// had to take. The large tier's `resummarise` is the one path that can spend a
+/// call per press; it is gated on `ModelClass::permits_compaction_model_call()`,
+/// i.e. not the on-device engine this argument is about, and it shares this
+/// pass's single in-flight claim.
+///
+/// **What it still costs.** A session below the compaction threshold answers
 /// `not_under_pressure` rather than compacting, because the claim recomputes
 /// `should_compact` under its own lock and refuses. A session the monitor has
 /// never recorded a turn for — anything from before this process started, and
 /// everything at all when `context_monitor_enabled` is off — is in that same
 /// state, because utilisation is only ever learned from a turn. Both answer with
 /// a reason rather than a silent no-op, which is the least a manual control
-/// owes. Making the button work under no pressure needs a rate limit that does
-/// not exist yet: the cooldown is counted in *recorded turns*, and with no turns
-/// happening it never expires, so a manual axis with its own gate needs a
-/// wall-clock one. That is a phase, not a line.
+/// owes. Making the button work under no pressure would need a wall-clock rate
+/// limit that does not exist; that is a phase, not a line, and it is still not
+/// this one.
 ///
 /// **This one awaits.** P4 and P6 spawn and return because they run inside a
 /// request a user did not make — a reopen, and an SSE generator with the `done`
@@ -2655,15 +2673,18 @@ async fn compact_session(
             &health,
         ));
     }
-    if !state.context_monitor.claim_compaction(&session_id) {
-        // `should_compact` was true a few lines ago and the claim recomputes it,
-        // so the cooldown is what refused — barring a turn that completed in
-        // between and changed the answer, which is a race whose honest label is
-        // still "a pass ran recently".
+    if !state.context_monitor.claim_manual_compaction(&session_id) {
+        // The manual claim skips the cooldown, so the ONLY way it refuses after
+        // the `should_compact` read above is that a turn completed in between
+        // and took the session back under the threshold, or that the session
+        // left the monitor's map entirely. `cooling_down` was the label here
+        // before P7b-fix and would now be a lie; `not_under_pressure` is what
+        // the claim actually decided, and it is the same sentence the branch
+        // above reports for the same condition.
         return Ok(compaction_report(
             &session_id,
             "skipped",
-            Some("cooling_down"),
+            Some("not_under_pressure"),
             None,
             &health,
         ));
