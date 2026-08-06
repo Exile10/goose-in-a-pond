@@ -22,7 +22,9 @@
 //!    model registry. Authoritative for GGUF because the engine ranks it above
 //!    its own memory estimate, which makes it the allocation too.
 //! 3. [`WindowSource::CatalogRecord`] — `ModelRecord.context_length`, for
-//!    HTTP and Ollama models where no registry entry exists.
+//!    HTTP and Ollama models where no registry entry exists. A declared
+//!    maximum rather than an allocation, so it is bounded both by the local
+//!    ceiling and by any user override that is LOWER than it.
 //! 4. [`WindowSource::Override`] — the user's `context_window_override`. An
 //!    escape hatch for deployments whose real limit is neither the model's max
 //!    nor the engine's estimate.
@@ -30,7 +32,8 @@
 //!
 //! Rungs 1 and 2 outrank the user override deliberately. An override is a
 //! preference; an allocation is a fact, and budgeting above it only makes the
-//! engine truncate.
+//! engine truncate. Rung 3 does NOT outrank it in the widening direction: the
+//! catalog knows what the model supports, not what this box can afford.
 
 use crate::models::domain::model_capabilities::ModelCapabilities;
 
@@ -186,14 +189,25 @@ impl ContextGovernor {
         // allocated 32K would otherwise budget history for four times the
         // room the engine has, and the engine answers that by truncating the
         // prompt. Rungs 1 and 2 are allocations and are never clamped.
+        //
+        // A user override is the same KIND of bound as the local ceiling, only
+        // stated by hand, so it clamps this rung too -- see
+        // `a_lower_override_bounds_the_catalog_maximum`. Rungs 1 and 2 still
+        // outrank it, because those are allocations (invariant 3).
         if let Some(catalog) = inputs.catalog_context_length.filter(|c| *c > 0) {
-            let tokens = catalog as usize;
+            let mut tokens = catalog as usize;
+            if is_local_provider(inputs.provider) {
+                tokens = tokens.min(UNPINNED_LOCAL_CEILING);
+            }
+            let override_tokens = inputs.override_tokens as usize;
+            if override_tokens > 0 && override_tokens < tokens {
+                return WindowResolution {
+                    tokens: override_tokens,
+                    source: WindowSource::Override,
+                };
+            }
             return WindowResolution {
-                tokens: if is_local_provider(inputs.provider) {
-                    tokens.min(UNPINNED_LOCAL_CEILING)
-                } else {
-                    tokens
-                },
+                tokens,
                 source: WindowSource::CatalogRecord,
             };
         }
@@ -316,11 +330,64 @@ mod tests {
     fn catalog_length_is_used_when_no_registry_entry_exists() {
         let mut i = inputs("ollama", "some-unknown-model");
         i.catalog_context_length = Some(16384);
-        i.override_tokens = 2048;
 
         let r = ContextGovernor::resolve(&i);
         assert_eq!(r.tokens, 16384);
         assert_eq!(r.source, WindowSource::CatalogRecord);
+    }
+
+    #[test]
+    fn a_lower_override_bounds_the_catalog_maximum() {
+        // Corrected when PAI-3 P3b made rung 3 reachable. The documented
+        // precedence put CatalogRecord above Override, and while rung 3 was
+        // dead that cost nothing. Live, it inverts the one case the override
+        // exists for, named in `goose_agent.rs`'s own doc comment: a Jetson
+        // running Ollama with a hand-tuned KV cache. Populating the catalog
+        // would have replaced that user's 8192 with gemma4's declared 131072
+        // and the engine would have truncated every prompt.
+        //
+        // Rungs 1 and 2 still outrank the override -- they are allocations
+        // (invariant 3). A catalog value is not; it says what the MODEL
+        // supports, not what this box allocated.
+        let mut i = inputs("ollama", "gemma4:e2b");
+        i.catalog_context_length = Some(131_072);
+        i.override_tokens = 8_192;
+
+        let r = ContextGovernor::resolve(&i);
+        assert_eq!(r.tokens, 8_192);
+        assert_eq!(
+            r.source,
+            WindowSource::Override,
+            "provenance must name the value that actually won"
+        );
+
+        // The override cannot WIDEN past the declared maximum: asking for more
+        // than the model supports is not an allocation either.
+        let mut wide = inputs("ollama", "gemma4:e2b");
+        wide.catalog_context_length = Some(16_384);
+        wide.override_tokens = 65_536;
+        let w = ContextGovernor::resolve(&wide);
+        assert_eq!(w.tokens, 16_384);
+        assert_eq!(w.source, WindowSource::CatalogRecord);
+
+        // On a local provider the override is compared against the ALREADY
+        // ceiling-clamped value, so an override between the ceiling and the
+        // declared maximum does not resurrect the 128K window.
+        let mut local = inputs("local", "gemma-4-e2b");
+        local.catalog_context_length = Some(131_072);
+        local.override_tokens = 65_536;
+        let l = ContextGovernor::resolve(&local);
+        assert_eq!(l.tokens, UNPINNED_LOCAL_CEILING);
+        assert_eq!(l.source, WindowSource::CatalogRecord);
+
+        // And a registry pin still beats both, unchanged.
+        let mut pinned = inputs("local", "gemma-4-e2b");
+        pinned.catalog_context_length = Some(131_072);
+        pinned.override_tokens = 8_192;
+        pinned.registry_pinned = Some(4_096);
+        let p = ContextGovernor::resolve(&pinned);
+        assert_eq!(p.tokens, 4_096);
+        assert_eq!(p.source, WindowSource::Registry);
     }
 
     #[test]

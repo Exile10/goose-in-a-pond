@@ -771,6 +771,7 @@ export class PondApiClient {
             is_active: (item.active as boolean | undefined) ?? false,
             ram_estimate_mb: item.ram_estimate_mb as number | undefined,
             recommended_role: item.recommended_role as string | undefined,
+            context_length: (item.context_length as number | null | undefined) ?? undefined,
             downloaded: item.downloaded as boolean | undefined,
             description: item.description as string | undefined,
             size_mb: item.size_mb as number | undefined,

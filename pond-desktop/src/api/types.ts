@@ -353,6 +353,13 @@ export interface ModelEntry {
   is_active: boolean;
   ram_estimate_mb?: number;
   recommended_role?: string;
+  /**
+   * Declared maximum context window, straight from the catalog row the backend
+   * persisted. LLM entries only; absent when the catalog provider could not
+   * answer. Prefer this over inferring the window from `name` — the name
+   * heuristic is a copy of a backend rule that has already moved on.
+   */
+  context_length?: number;
   downloaded?: boolean;
   description?: string;
   size_mb?: number;

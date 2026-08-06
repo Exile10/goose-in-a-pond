@@ -124,9 +124,15 @@ untouched and remains PAI-2 P2: the fix stops `GET /settings` being *reachable*,
   wrote `None`, and Ollama is the provider class rung 3 was designed for. Both now populate it
   (Ollama from `/api/show`'s `model_info`), the Gemma 4 rows were corrected from a copy-pasted 8192
   to the declared 131072, and rung 3 clamps a catalog value by the local ceiling because a declared
-  maximum is not an allocation. **`WindowSource::CatalogRecord` is still unreachable in production**:
-  all three `ContextInputs` call sites pass `None`, and the two live ones (`goose_agent.rs`,
-  `routes.rs`) plus the Models UI are held by a concurrent workstream. That wiring is PAI-3 **P3b**.
+  maximum is not an allocation. ~~**`WindowSource::CatalogRecord` is still unreachable in
+  production**~~ — **FIXED 2026-08-06 by PAI-3 P3b.** Both live `ContextInputs` sites now supply it:
+  `routes.rs` through `state.model_repo`, and `GooseAdapter` through a `model_repo` threaded in for
+  this (it had none, and `resolve_window` was static). `ModelStatusEntry.context_length` carries it
+  to the Models UI, whose `CapabilityBadges` now prefers it over the frontend's own name heuristic.
+  P3b also narrowed the rung: a catalog value is bounded by a lower `context_window_override`, and
+  reports `WindowSource::Override` when that binds — otherwise populating the catalog would have
+  overruled the hand-tuned KV cache the override exists for. Only the quarantined
+  `pond-agent/src/agent.rs` still passes `None`.
 - `reasoning_content` is parsed by llama.cpp and dropped: the identifier appears exactly once in
   `crates/`, in a comment (`pond-inference/src/provider.rs:422`).
 - `AgentStreamEvent::Thinking` has **four consumers and zero producers**
@@ -160,7 +166,7 @@ PAI-3 Context governor ── PAI-4 Compaction ── PAI-5 Thinking │
 |---|---|---|---|---|
 | [01](./pai/01-identity-and-profile-boundaries.md) | Identity and profile boundaries | Hard profile boundaries | — | **COMPLETE — P1-P8 LANDED** |
 | [02](./pai/02-privacy-and-security-guardrails.md) | Privacy and security guardrails | Privacy/security guardrails | 01 | **P0-P5, P7 LANDED** (P3, P5 partial); P6, P8 designed |
-| [03](./pai/03-context-governor.md) | Context governor | Large context, used fully | — | **P1, P2, P6 LANDED; P3 PARTIAL** (rung-3 data landed; wiring + UI -> P3b); P4-P5 designed |
+| [03](./pai/03-context-governor.md) | Context governor | Large context, used fully | — | **P1-P4, P6 LANDED** (P3 completed by P3b 2026-08-06); P5 needs on-device TTFT measurement |
 | [04](./pai/04-smart-compaction.md) | Smart compaction | Smart compaction | 03 | DESIGNED |
 | [05](./pai/05-reasoning-and-thinking.md) | Reasoning and thinking | Ability to think | 03, 04 | DESIGNED |
 | [06](./pai/06-multi-agent-orchestration.md) | Multi-agent orchestration | Multi-agent orchestration | 01, 02, 03, 04 | DESIGNED |

@@ -7,10 +7,12 @@ use goose::conversation::message::Message;
 use goose::providers::base::Provider;
 use goose::session::SessionManager;
 use pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort;
+use pond_core::models::domain::model_record::{ModelCategory, ModelRecord};
 use pond_core::models::ports::agent::{
     Agent as AgentPort, AgentRequest, AgentResponse, AgentStreamEvent,
 };
 use pond_core::models::ports::embedding::EmbeddingProvider;
+use pond_core::models::ports::model_repository::ModelRepository;
 use pond_core::models::ports::token_counter::TokenCounter as PondTokenCounter;
 use pond_core::models::services::context::context_governor::{
     ContextGovernor, ContextInputs, WindowResolution,
@@ -192,6 +194,15 @@ pub struct GooseAdapter {
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     /// Device registry — queried per turn to populate PromptState for Jinja2 rendering.
     device_repo: Arc<dyn DeviceRegistry>,
+    /// Model catalog — the ONLY way this adapter can reach
+    /// `ModelRecord.context_length`, which is rung 3 of the context governor.
+    ///
+    /// Optional because the CLI one-shot paths build an adapter without one and
+    /// a missing catalog row must degrade to the heuristic rather than fail a
+    /// turn. But when it is `None` on the serving path, rung 3 is unreachable
+    /// and every Ollama model falls back to a substring match on its name —
+    /// which is the bug PAI-3 exists to remove, so `main.rs` supplies it.
+    model_repo: Option<Arc<dyn ModelRepository>>,
     llamafile_url: String,
     /// GIAP data directory — used to resolve GGUF model paths under
     /// `$data_dir/models/gguf/` for the in-process LocalInferenceProvider.
@@ -378,6 +389,7 @@ impl GooseAdapter {
             memory_repo,
             embedding_provider: None,
             device_repo,
+            model_repo: None,
             llamafile_url,
             data_dir,
             extension_manager,
@@ -898,12 +910,19 @@ impl GooseAdapter {
     /// or `context_window_override` did nothing until a model switch or a
     /// restart. They are settings-derived, not provider-derived, so they belong
     /// on the settings path.
-    fn apply_goose_env_knobs(&self, settings: &pond_core::user_data::domain::settings::Settings) {
-        let resolution = Self::resolve_window(
-            &settings.chat_provider,
-            &settings.chat_model,
-            settings.context_window_override,
-        );
+    /// Async since PAI-3 P3b: resolving the window now consults the model
+    /// catalog, which is a repository read. The one caller already awaits.
+    async fn apply_goose_env_knobs(
+        &self,
+        settings: &pond_core::user_data::domain::settings::Settings,
+    ) {
+        let resolution = self
+            .resolve_window(
+                &settings.chat_provider,
+                &settings.chat_model,
+                settings.context_window_override,
+            )
+            .await;
         let effective_ctx = resolution.tokens;
         // Stored BEFORE the signature guard below returns early: the budget
         // paths read this field every turn, while the env knobs are only
@@ -999,14 +1018,79 @@ impl GooseAdapter {
         entry.settings.context_size.map(|c| c as usize)
     }
 
+    /// `ModelRecord.context_length` for a provider/model pair, when the catalog
+    /// has a row for it.
+    ///
+    /// This is rung 3 of the context governor and the reason this adapter
+    /// carries a `model_repo` at all. It matters most for Ollama, where there
+    /// is no registry pin to read and `OllamaCatalogProvider` has already
+    /// written the real window it got from `POST /api/show`'s `model_info` map.
+    /// Without this lookup that value sits in the database and the adapter
+    /// guesses from the model's name instead.
+    /// Takes the repo as an argument rather than reading `self.model_repo` so
+    /// the lookup — id derivation included — is testable against a stub.
+    async fn catalog_context_length(
+        repo: Option<&Arc<dyn ModelRepository>>,
+        provider: &str,
+        model: &str,
+    ) -> Option<u32> {
+        let repo = repo?;
+        let id = ModelRecord::id_for(&ModelCategory::for_chat_provider(provider), model);
+        match repo.get_by_id(&id).await {
+            Ok(Some(record)) => record.context_length,
+            Ok(None) => None,
+            Err(e) => {
+                // A catalog read failure must not fail a turn: the governor
+                // still has three rungs below this one.
+                tracing::warn!(model_id = %id, error = %e, "catalog context_length lookup failed");
+                None
+            }
+        }
+    }
+
     /// Resolve the window for a provider/model pair, reading the process-global
-    /// model registry for the pinned size.
-    fn resolve_window(provider: &str, model: &str, override_tokens: u32) -> WindowResolution {
+    /// model registry for the pinned size and the catalog for the declared one.
+    async fn resolve_window(
+        &self,
+        provider: &str,
+        model: &str,
+        override_tokens: u32,
+    ) -> WindowResolution {
         let pinned = match provider {
             "local" | "gguf" => Self::registry_context_size(model),
             _ => None,
         };
-        Self::resolve_window_with(provider, model, override_tokens, pinned)
+        Self::resolve_window_from(
+            self.model_repo.as_ref(),
+            provider,
+            model,
+            override_tokens,
+            pinned,
+        )
+        .await
+    }
+
+    /// Everything `resolve_window` does except the process-global registry read
+    /// — which is the one part a test cannot stand up. Split out so the WIRING
+    /// is covered and not just the precedence: this phase exists because every
+    /// caller of `resolve_window_with` passed a hardcoded `None` for the
+    /// catalog, and a test that also passes the value by hand would have gone
+    /// on passing for as long as that was true.
+    ///
+    /// The catalog read is skipped whenever a registry pin exists, because rung
+    /// 2 wins outright — no point paying for a row the governor will discard.
+    async fn resolve_window_from(
+        repo: Option<&Arc<dyn ModelRepository>>,
+        provider: &str,
+        model: &str,
+        override_tokens: u32,
+        pinned: Option<usize>,
+    ) -> WindowResolution {
+        let catalog = match pinned {
+            Some(_) => None,
+            None => Self::catalog_context_length(repo, provider, model).await,
+        };
+        Self::resolve_window_with(provider, model, override_tokens, pinned, catalog)
     }
 
     /// Precedence, extracted so it can be tested without the process-global
@@ -1021,14 +1105,14 @@ impl GooseAdapter {
         model: &str,
         override_tokens: u32,
         pinned: Option<usize>,
+        catalog: Option<u32>,
     ) -> WindowResolution {
         ContextGovernor::resolve(&ContextInputs {
             provider,
             model,
             override_tokens,
             registry_pinned: pinned,
-            // Populated in PAI-3 P3, once catalog providers write it.
-            catalog_context_length: None,
+            catalog_context_length: catalog,
             // Deliberately absent on this path: it is settings-scoped and
             // process-wide, and one session's last turn is not evidence about
             // it. Session-scoped callers pass their own reading.
@@ -1039,10 +1123,6 @@ impl GooseAdapter {
             // supply it themselves.
             capability_window: None,
         })
-    }
-
-    fn effective_context_window(provider: &str, model: &str, override_tokens: u32) -> usize {
-        Self::resolve_window(provider, model, override_tokens).tokens
     }
 
     /// The token counter the budget paths use.
@@ -1092,11 +1172,12 @@ impl GooseAdapter {
             return cached;
         }
         let settings = self.settings_repo.get().await.unwrap_or_default();
-        Self::resolve_window(
+        self.resolve_window(
             &settings.chat_provider,
             &settings.chat_model,
             settings.context_window_override,
         )
+        .await
     }
 
     /// Whether the ACTIVE model can accept image content.
@@ -2076,6 +2157,18 @@ impl GooseAdapter {
         self
     }
 
+    /// Attach the model catalog, so the context governor's rung 3
+    /// (`ModelRecord.context_length`) becomes reachable from this adapter.
+    ///
+    /// A builder rather than a `new()` argument for the same reason as the
+    /// embedding provider: without it every budget path still works, just on a
+    /// worse answer — the model-name heuristic, which returns 4,096 for
+    /// anything it does not recognise.
+    pub fn with_model_repo(mut self, repo: Arc<dyn ModelRepository>) -> Self {
+        self.model_repo = Some(repo);
+        self
+    }
+
     /// Attach GIAP session storage so the deterministic turn trimmer can
     /// splice the rolling `<conversation-summary>` into the model's history.
     pub fn with_giap_session_storage(
@@ -2248,7 +2341,7 @@ impl GooseAdapter {
         // hydration and ModelConfig construction: it exports GOOSE_CONTEXT_LIMIT
         // for Goose's own use, and it populates `last_window`, which is where
         // the GIAP-side budget paths now get the window from.
-        self.apply_goose_env_knobs(&settings);
+        self.apply_goose_env_knobs(&settings).await;
 
         // Goose maintains its own sessions.db with auto-generated IDs.
         let goose_sid = self.resolve_goose_session(&session_id).await;
@@ -2389,6 +2482,17 @@ impl GooseAdapter {
         let thinking_enabled =
             Self::thinking_section_applies(&settings.thinking_mode, &settings.chat_model, is_voice);
 
+        // The turn's resolved window, read once from the resolution
+        // `apply_goose_env_knobs` cached at the top of this function.
+        //
+        // Both consumers below (the prompt tier and the memory-injection
+        // budget) used to re-resolve it independently through the static
+        // `effective_context_window`. That was already duplication; once rung 3
+        // became a repository read it would also have been two extra catalog
+        // round trips per turn, and the block below is synchronous so it could
+        // not have awaited them anyway.
+        let effective_ctx = self.history_window().await.tokens;
+
         let prompt_state = {
             use chrono::Local;
             let now = Local::now();
@@ -2404,11 +2508,6 @@ impl GooseAdapter {
             // Derive compact_prompt from the PROMPT-side context budget: for
             // local inference the profile is clamped so a huge KV cache never
             // selects the verbose tier (see ContextGovernor::prompt_window).
-            let effective_ctx = Self::effective_context_window(
-                &settings.chat_provider,
-                &settings.chat_model,
-                settings.context_window_override,
-            );
             let compact_prompt =
                 pond_core::models::services::context_budget::CompactionProfile::from_context_window(
                     ContextGovernor::prompt_window(&settings.chat_provider, effective_ctx),
@@ -2615,12 +2714,7 @@ impl GooseAdapter {
         // prompt-side context budget: local inference re-prefills every
         // injected memory token each turn, so the budget stays bounded even
         // on a 32K context (see ContextGovernor::prompt_window). History budgets elsewhere
-        // keep the real window.
-        let effective_ctx = Self::effective_context_window(
-            &settings.chat_provider,
-            &settings.chat_model,
-            settings.context_window_override,
-        );
+        // keep the real window. `effective_ctx` is the one resolved above.
         let compaction_profile =
             pond_core::models::services::context_budget::CompactionProfile::from_context_window(
                 ContextGovernor::prompt_window(&settings.chat_provider, effective_ctx),
@@ -4132,7 +4226,8 @@ mod tests {
     /// history the engine cannot hold, and llama.cpp truncates the prompt.
     #[test]
     fn a_pinned_local_context_outranks_a_larger_override() {
-        let r = GooseAdapter::resolve_window_with("local", "gemma-4-E2B-it", 16384, Some(4096));
+        let r =
+            GooseAdapter::resolve_window_with("local", "gemma-4-E2B-it", 16384, Some(4096), None);
         assert_eq!(r.tokens, 4096);
         assert_eq!(
             r.source,
@@ -4146,11 +4241,12 @@ mod tests {
     fn an_unpinned_local_model_falls_back_to_override_then_ceiling() {
         use pond_core::models::services::context::context_governor::WindowSource;
 
-        let overridden = GooseAdapter::resolve_window_with("local", "gemma-4-E2B-it", 16384, None);
+        let overridden =
+            GooseAdapter::resolve_window_with("local", "gemma-4-E2B-it", 16384, None, None);
         assert_eq!(overridden.tokens, 16384);
         assert_eq!(overridden.source, WindowSource::Override);
 
-        let ceiling = GooseAdapter::resolve_window_with("local", "gemma-4-E2B-it", 0, None);
+        let ceiling = GooseAdapter::resolve_window_with("local", "gemma-4-E2B-it", 0, None, None);
         assert_eq!(ceiling.tokens, 32768);
         assert_eq!(ceiling.source, WindowSource::Heuristic);
     }
@@ -4160,10 +4256,215 @@ mod tests {
     #[test]
     fn http_providers_are_unaffected_by_the_registry_rule() {
         assert_eq!(
-            GooseAdapter::resolve_window_with("ollama", "gemma4:e2b", 8192, None).tokens,
+            GooseAdapter::resolve_window_with("ollama", "gemma4:e2b", 8192, None, None).tokens,
             8192
         );
-        assert!(GooseAdapter::resolve_window_with("ollama", "gemma4:e2b", 0, None).tokens > 0);
+        assert!(
+            GooseAdapter::resolve_window_with("ollama", "gemma4:e2b", 0, None, None).tokens > 0
+        );
+    }
+
+    /// PAI-3 P3b: the catalog value the adapter now reads has to actually reach
+    /// the governor. Before this phase every construction site passed `None`,
+    /// so `WindowSource::CatalogRecord` was a rung nothing in production could
+    /// produce, and an Ollama model whose real window `POST /api/show` had
+    /// already reported still got the 4,096 substring-match default.
+    #[test]
+    fn a_catalog_window_reaches_the_governor_from_the_adapter() {
+        use pond_core::models::services::context::context_governor::WindowSource;
+
+        // Without it: the name heuristic, which does not recognise this model.
+        let guessed =
+            GooseAdapter::resolve_window_with("ollama", "some-unknown-model", 0, None, None);
+        assert_eq!(guessed.tokens, 4096);
+        assert_eq!(guessed.source, WindowSource::Heuristic);
+
+        // With it: the catalog's number, tagged as such.
+        let known = GooseAdapter::resolve_window_with(
+            "ollama",
+            "some-unknown-model",
+            0,
+            None,
+            Some(131_072),
+        );
+        assert_eq!(known.tokens, 131_072);
+        assert_eq!(known.source, WindowSource::CatalogRecord);
+
+        // A registry pin still wins -- it is the allocation, the catalog value
+        // is the model's declared maximum.
+        let pinned = GooseAdapter::resolve_window_with(
+            "local",
+            "gemma-4-E2B-it",
+            0,
+            Some(4096),
+            Some(131_072),
+        );
+        assert_eq!(pinned.tokens, 4096);
+        assert_eq!(pinned.source, WindowSource::Registry);
+    }
+
+    /// A model catalog holding exactly one row, for the wiring test below.
+    struct StubCatalog {
+        record: Option<ModelRecord>,
+        /// Every id the adapter asked for, so the test can assert the id was
+        /// DERIVED correctly and not merely that a number came back.
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl StubCatalog {
+        fn holding(id: &str, context_length: Option<u32>) -> Self {
+            Self {
+                record: Some(ModelRecord {
+                    id: id.to_string(),
+                    category: ModelCategory::Ollama,
+                    name: "gemma4:e2b".to_string(),
+                    filename: None,
+                    description: String::new(),
+                    size_mb: 0,
+                    url: None,
+                    hf_id: None,
+                    ram_estimate_mb: None,
+                    recommended_role: None,
+                    context_length,
+                    quantization: None,
+                    asr_language: None,
+                    asr_size: None,
+                    tts_engine: None,
+                    tts_voice_name: None,
+                    config_filename: None,
+                    config_url: None,
+                    tts_url: None,
+                    sample_rate: None,
+                    downloaded: true,
+                    is_custom: false,
+                }),
+                asked: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelRepository for StubCatalog {
+        async fn list_all(&self) -> Result<Vec<ModelRecord>> {
+            Ok(self.record.clone().into_iter().collect())
+        }
+        async fn list_by_category(&self, _c: &ModelCategory) -> Result<Vec<ModelRecord>> {
+            Ok(vec![])
+        }
+        async fn get_by_id(&self, id: &str) -> Result<Option<ModelRecord>> {
+            self.asked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(id.to_string());
+            Ok(self.record.as_ref().filter(|r| r.id == id).cloned())
+        }
+        async fn upsert(&self, _m: &ModelRecord) -> Result<()> {
+            Ok(())
+        }
+        async fn set_downloaded(&self, _id: &str, _d: bool) -> Result<()> {
+            Ok(())
+        }
+        async fn list_assignments(
+            &self,
+        ) -> Result<Vec<pond_core::models::domain::model_record::ModelRoleAssignment>> {
+            Ok(vec![])
+        }
+        async fn get_assignment(
+            &self,
+            _r: &str,
+        ) -> Result<Option<pond_core::models::domain::model_record::ModelRoleAssignment>> {
+            Ok(None)
+        }
+        async fn set_assignment(&self, _r: &str, _m: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn clear_assignment(&self, _r: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The wiring, not the precedence.
+    ///
+    /// PAI-3 P3 landed the data and left every `ContextInputs` construction site
+    /// passing `catalog_context_length: None`, so rung 3 was a rung nothing in
+    /// production could produce and every test of it passed the value in by
+    /// hand. This one goes through the repository the adapter actually holds:
+    /// break the lookup — hardcode `None`, derive the wrong id, drop the
+    /// `with_model_repo` plumbing — and it fails.
+    #[tokio::test]
+    async fn the_adapter_reads_the_catalog_it_was_given() {
+        use pond_core::models::services::context::context_governor::WindowSource;
+
+        // No catalog: the name heuristic answers, and for gemma 4 it answers
+        // 128,000 -- a round number somebody typed, not a number the model
+        // declares.
+        let blind = GooseAdapter::resolve_window_from(None, "ollama", "gemma4:e2b", 0, None).await;
+        assert_eq!(blind.tokens, 128_000);
+        assert_eq!(blind.source, WindowSource::Heuristic);
+
+        // A model the heuristic does not recognise at all gets the
+        // conservative default -- this is the case rung 3 rescues.
+        let unknown =
+            GooseAdapter::resolve_window_from(None, "ollama", "some-unknown-model", 0, None).await;
+        assert_eq!(unknown.tokens, 4096);
+        assert_eq!(unknown.source, WindowSource::Heuristic);
+
+        // With the catalog: the window Ollama's `model_info` actually reported,
+        // 131,072 -- which is NOT the heuristic's 128,000, so this assertion
+        // cannot pass by accident on the fallback path.
+        let catalog: Arc<dyn ModelRepository> =
+            Arc::new(StubCatalog::holding("ollama/gemma4:e2b", Some(131_072)));
+        let seen =
+            GooseAdapter::resolve_window_from(Some(&catalog), "ollama", "gemma4:e2b", 0, None)
+                .await;
+        assert_eq!(
+            seen.tokens, 131_072,
+            "the catalog row's context_length never reached the governor"
+        );
+        assert_eq!(seen.source, WindowSource::CatalogRecord);
+
+        // The id has to be derived the way the catalog stores it -- category,
+        // not provider. A lookup that asks for the wrong key returns None and
+        // degrades SILENTLY to the heuristic, so assert the key, not just the
+        // answer. "local" and "ollama" are different provider strings that must
+        // reach different categories.
+        let stub = Arc::new(StubCatalog::holding("ollama/gemma4:e2b", Some(131_072)));
+        let probe: Arc<dyn ModelRepository> = stub.clone();
+        let _ =
+            GooseAdapter::resolve_window_from(Some(&probe), "ollama", "gemma4:e2b", 0, None).await;
+        let _ = GooseAdapter::resolve_window_from(Some(&probe), "local", "gemma-4-E2B-it", 0, None)
+            .await;
+        assert_eq!(
+            stub.asked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            ["ollama/gemma4:e2b", "gguf/gemma-4-E2B-it"],
+            "the catalog id must be derived from the CATEGORY the row is keyed by"
+        );
+
+        // A registry pin short-circuits the catalog read entirely: rung 2 wins,
+        // so the row is never fetched.
+        let counting = Arc::new(StubCatalog::holding("gguf/gemma-4-E2B-it", Some(131_072)));
+        let counting_port: Arc<dyn ModelRepository> = counting.clone();
+        let pinned = GooseAdapter::resolve_window_from(
+            Some(&counting_port),
+            "local",
+            "gemma-4-E2B-it",
+            0,
+            Some(4096),
+        )
+        .await;
+        assert_eq!(pinned.tokens, 4096);
+        assert_eq!(pinned.source, WindowSource::Registry);
+        assert!(
+            counting
+                .asked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "a pinned registry size must not pay for a catalog read it will discard"
+        );
     }
 
     /// The regression guard for PAI-3 P1: the budget paths must not recover the

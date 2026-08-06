@@ -2374,6 +2374,7 @@ async fn run_server(
             draft_repo.clone(),
             device_control.clone(),
             Some(session_storage.clone()),
+            Some(model_repo.clone()),
             false, // voice_mode — server mode, not voice
         )
         .await
@@ -3768,6 +3769,7 @@ async fn run_chat(
             draft_repo,
             Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
             Some(trim_storage), // powers the trimmer's summary splice
+            Some(chat_model_repo.clone()),
             input == "whisper", // voice_mode
         )
         .await;
@@ -5785,6 +5787,11 @@ async fn build_goose_backend(
         dyn pond_core::user_data::ports::device_control::DeviceControlPort + Send + Sync,
     >,
     session_storage: Option<Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>>,
+    // Model catalog, so `GooseAdapter` can reach `ModelRecord.context_length`
+    // — rung 3 of the context governor. Optional only so a caller with no
+    // catalog to hand still compiles; every caller in this file supplies one,
+    // because without it an Ollama model's window is guessed from its name.
+    model_repo: Option<Arc<dyn ModelRepository>>,
     voice_mode: bool,
 ) -> (
     Arc<dyn Agent>,
@@ -5957,6 +5964,13 @@ async fn build_goose_backend(
             // falls back to the keyword LIKE search.
             let adapter = match embedding_provider {
                 Some(provider) => adapter.with_embedding_provider(provider),
+                None => adapter,
+            };
+            // The model catalog, which is the only rung of the context governor
+            // that can answer for an Ollama model. Without it the adapter falls
+            // back to a substring match on the model's name.
+            let adapter = match model_repo {
+                Some(repo) => adapter.with_model_repo(repo),
                 None => adapter,
             };
             if voice_mode {
@@ -6435,6 +6449,12 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
     let draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync> =
         Arc::new(SqliteDraftRepository::new(db.system.clone()));
+    // The catalog the context governor's rung 3 reads. The CLI paths get one
+    // too: a `pond-server chat` turn budgets its history exactly the way a
+    // dashboard turn does, and giving only the server the real window would put
+    // the two back out of agreement — which is the whole defect PAI-3 removes.
+    let cli_model_repo: Arc<dyn ModelRepository + Send + Sync> =
+        Arc::new(SqliteModelRepository::new(db.system.clone()));
 
     let settings = settings_repo.get().await.unwrap_or_default();
     // Use the configured LLM server URL (llamafile default). GooseAdapter uses this to
@@ -6493,6 +6513,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 draft_repo,
                 Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
+                Some(cli_model_repo.clone()),
                 false,
             )
             .await;
@@ -6534,6 +6555,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 draft_repo,
                 Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
+                Some(cli_model_repo.clone()),
                 false,
             )
             .await;
@@ -6601,6 +6623,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 draft_repo,
                 Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
+                Some(cli_model_repo.clone()),
                 false,
             )
             .await;

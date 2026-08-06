@@ -1572,6 +1572,26 @@ fn chat_stream_inner(
         // roughly an eighth of the truth, so `context_warning` could not fire
         // before the trimmer started dropping turns. Resolving once is the only
         // way the two can be guaranteed to agree.
+        // Rung 3's input: the catalog row for the active chat model. Reached
+        // through `state.model_repo`, which is the same catalog the Models tab
+        // lists — so telemetry, the growth monitor and the UI are all quoting
+        // one number. Absent repo or absent row falls through to the rungs
+        // below, which is what happened for every turn before PAI-3 P3b.
+        let catalog_context_length = match &state.model_repo {
+            Some(repo) => {
+                let id = ModelRecord::id_for(
+                    &ModelCategory::for_chat_provider(&settings.chat_provider),
+                    &settings.chat_model,
+                );
+                repo.get_by_id(&id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|m| m.context_length)
+            }
+            None => None,
+        };
+
         let turn_context_limit = ContextGovernor::resolve(&ContextInputs {
             provider: &settings.chat_provider,
             model: &settings.chat_model,
@@ -1579,7 +1599,7 @@ fn chat_stream_inner(
             // Not reachable from the API layer; the adapter owns the registry
             // lookup and reports the result via TurnStats.
             registry_pinned: None,
-            catalog_context_length: None,
+            catalog_context_length,
             engine_reported: turn_stats
                 .as_ref()
                 .and_then(|s| s.context_limit_tokens)
@@ -2754,13 +2774,18 @@ async fn update_settings(
                         let _ = repo.clear_assignment(role).await;
                         continue;
                     }
-                    // Derive category from provider
-                    let category = match *provider {
-                        "local" | "gguf" => "gguf",
-                        "ollama" => "ollama",
-                        "asr" | "" if *role == "asr" => "whisper",
-                        "tts" | "" if *role == "tts" => "tts_piper",
-                        _ => "llamafile",
+                    // Derive the catalog category. Keyed on the ROLE first,
+                    // because only the LLM roles have a provider to consult —
+                    // ASR and TTS pass an empty provider string. The LLM arm
+                    // delegates to `ModelCategory::for_chat_provider`, which is
+                    // the same mapping the context governor's rung-3 lookup
+                    // uses; the two used to be written out separately and a
+                    // divergence would mean one of them silently addressing a
+                    // row that does not exist.
+                    let category = match *role {
+                        "asr" => "whisper",
+                        "tts" => "tts_piper",
+                        _ => ModelCategory::for_chat_provider(provider).as_str(),
                     };
                     let model_id = format!("{}/{}", category, model_name);
                     let _ = repo.set_assignment(role, &model_id).await;
@@ -3084,6 +3109,7 @@ fn record_to_dto(m: &ModelRecord, assignments: &[ModelRoleAssignment]) -> ModelS
         filename: m.filename.clone(),
         ram_estimate_mb: m.ram_estimate_mb,
         recommended_role: m.recommended_role.clone(),
+        context_length: m.context_length,
         asr_language: m.asr_language.clone(),
         asr_size: m.asr_size.clone(),
         tts_engine: m.tts_engine.clone(),
