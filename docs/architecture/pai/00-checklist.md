@@ -21,7 +21,7 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
 | 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **COMPLETE — P1-P8 LANDED** |
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1-P4, P6 LANDED** (P3 completed by P3b 2026-08-06); **P5 code landed 2026-08-06, awaiting the on-device TTFT measurement that decides it** |
-| 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | DESIGNED |
+| 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | **P1 LANDED 2026-08-06** (`ModelClass` + strategy dispatch, domain only — P2 is its first consumer); P2-P7 designed |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
 | 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0-P5, P7 LANDED** (P3, P5 partial); P6, P8 designed |
 
@@ -1044,3 +1044,72 @@ happened. The arithmetic says the local preamble is byte-for-byte what it was, b
 clamp feeds the same two consumers — but "the budget did not change" and "TTFT did not change" are
 different claims, and only the second one is what the phase promised. Stamping LANDED on unit tests
 here would be exactly the substitution the PAI-2 P5 repair earlier in this log exists to warn about.
+
+---
+
+**2026-08-06 — PAI-4 P1. The design's tier table had two undefined cells and one overstated rule.**
+
+`ModelClass { Small | Medium | Large }` and `CompactionStrategy` live in
+`models/services/context/model_class.rs`, derived from the provider string plus whatever
+`ContextGovernor::resolve` returned. Domain only, no call site — PAI-3 P1's shape, and P2 is the
+first consumer. 15 tests; `pond-core` 733 lib, up from 718.
+
+**The phase was specified as "derive `ModelClass` from the governor" and the work was almost entirely
+deciding what the table in 3.1 actually means.** Each of its three rows names a window size *and* a
+provider, which reads as one axis and is two. Two configurations that exist today fall between the
+rows: an 8K hosted model, and a 131,072-token Ollama model on the Orin — the second of which PAI-3 P3
+made reachable seven days ago by teaching `OllamaCatalogProvider` to read `context_length` from
+`/api/show`, and rung 3 does not clamp it because Ollama is not a "local provider" by the governor's
+definition. Implemented as two brackets plus a provider set, every row is reproduced and both cells
+get an answer.
+
+**The predicate that matters is not the one that was already there.** `ContextGovernor`'s
+`is_local_provider` is `local | gguf`, and reusing it would have been the obvious move and wrong: it
+asks whether the *preamble* is re-prefilled locally every turn. What the compaction tier needs to
+know is whether an *extra* model call competes with the turn the user is waiting on, and on the Orin
+Ollama and llamafile are HTTP to `127.0.0.1` off the same 102 GB/s. `ON_DEVICE_PROVIDERS` is
+therefore four entries, not two, and it is a deny-list for the one permissive tier — safe when too
+wide, unsafe when too narrow, which is why a provider that *could* point at another box is kept
+inside it. Generalisable: **two predicates with the same name in English are not the same predicate,
+and the cheap reuse is where a tier system quietly stops meaning anything.**
+
+**I did not implement invariant 3 as written, and said so in three places rather than one.** The
+small-tier row and the invariant both say no LLM in the on-device compaction path; the reason given
+is a stall at 20 tok/s. The idle rolling summary cannot produce that stall — it runs after
+`summary_idle_secs`, a new turn cancels it, and turns read `sessions.rolling_summary` without
+awaiting it, which invariant 5 says in the same list. Following the wording would have removed the
+rolling summary from the device whose window runs out first, to prevent a hang that path structurally
+cannot cause. There *is* a real cost on-device and it is a different one — an idle summarisation
+evicts the prefix cache, so the next turn pays a prefill it would not have — and it belongs to P5,
+with a measurement, and it applies to the medium tier equally. The correction is written into 3.1,
+into invariant 3, and into `strategy()`'s doc comment, because a claim corrected in one place and
+left standing in its neighbours is how this programme has produced documents that contradict
+themselves twice now.
+
+**The consequence is that `Small` and `Medium` select the same strategy today**, which looks like the
+classes are redundant. A test asserts the equality on purpose, naming the phase's own "today's
+behaviour preserved" requirement, so that if it ever stops being true somebody has to mean it.
+
+**`CompactionProfile` gained no field, and that was the load-bearing decision.** `turn_trimmer.rs`
+builds it with exhaustive literals in two test helpers, so a new field is an `E0063` in a file this
+phase does not own. The class is derived from `(provider, resolved_window)` — both of which every
+budget call site already holds — rather than stored. Same property that let PAI-3 P4 land while
+`turn_trimmer.rs` and `prompts.rs` were held.
+
+**Two mutations, and the second one taught me something about the first.** Adding `ModelClass::Small`
+to the `llm_resummarisation` arm failed `the_on_device_tiers_never_permit_an_llm_in_the_compaction_path`
+with `the small tier selected a strategy that re-summarises with an LLM; on this tier that call
+competes with the next turn's prefill (PAI-4 invariant 3)`, and took the behaviour-preservation test
+with it — 13 of 15 still green, so the guard bites without being a blast radius. Dropping `ollama`
+from `ON_DEVICE_PROVIDERS` failed three, including `ollama at 131072 tokens classified as large,
+expected medium`. But it did **not** fail `an_on_device_provider_can_never_reach_the_large_tier`,
+because that test iterates over the constant it is checking — it is a range property over whatever
+the list happens to say, so shrinking the list makes it vacuously pass. That is the seventh member of
+this programme's vacuous-test family and the first I caught by mutating rather than by review.
+**A property test that quantifies over the data it is protecting protects nothing; the explicit table
+next to it is what actually holds the line.** Both mutations restored, file md5 byte-identical.
+
+Gates: `cargo fmt --check` clean, `cargo clippy -p pond-core --all-targets` with no new warnings,
+`cargo test -p pond-core` 733 lib + 5 + 3 ignored, and `cargo check -p pond-server
+-p pond-adapters-goose` clean. No live-server run: the phase touches no migration, no route, no
+handler and no startup wiring, and adds no `Settings` field.
