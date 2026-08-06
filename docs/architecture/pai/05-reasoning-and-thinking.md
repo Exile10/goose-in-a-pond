@@ -367,7 +367,57 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   local.
 - **P5** `output_reserve_tokens` derived from measured reasoning behaviour rather than a constant
   (needs P2's data).
-- **P6** `persist_thinking` side table; UI disclosure in the existing thinking panel; never replayed.
+- **P6 — NOT LANDED 2026-08-06. Blocked, and the blocker is file ownership, not design.**
+  `persist_thinking` side table; UI disclosure in the existing thinking panel; never replayed.
+
+  P6 needs four seams and **all four are in files another workstream held for this run**:
+
+  | Seam | File | Why it cannot move |
+  |---|---|---|
+  | The gate — `persist_thinking`, default `false` | `pond-core/src/user_data/domain/settings.rs` | held (security) |
+  | The write — accumulate the thinking text and hand it to `ChatService` | `pond-api/src/routes.rs` (`chat_stream` ~1332/1560, `agent_chat_stream` ~7919/8020) | held (security) |
+  | The read — rehydrate on `GET /sessions/{id}/messages` | `pond-api/src/routes.rs` (`get_session_messages`, registered at ~142) | held (security) |
+  | The render — refill `thinkingBlocks` on session load | `pond-desktop/src/sections/Chat.tsx` | held (frontend) |
+
+  **Nothing was landed instead, deliberately.** The unheld half — migration `0040`, a
+  `pond-infra` store, a `pond-core` port — is buildable in an afternoon and would have been a
+  **write-only table with no caller, no gate and no reader**. That is not a partial P6; it is a
+  third "correct but unreachable" mechanism next to PAI-4 P2 and P7a, and this one would be
+  strictly worse than the other two: it would accumulate reasoning text — which restates household
+  context verbatim — on disk, with no setting to refuse it and no surface to view or delete it. A
+  privacy store whose only property is that it exists is a defect, so it was not written.
+
+  **There is no alternative write site, and that was checked rather than assumed.**
+  `AgentStreamEvent::Thinking` has exactly four consumers in the workspace. Two are the held
+  `routes.rs` handlers. The third is `main.rs:6452` (`pond agent`), outside this group's footprint
+  and inside the startup-wiring file. The fourth is `chat.rs:1101` — the **voice** loop, where
+  invariant 2 forbids rendering reasoning and P1's `reasoning_frames_enabled(show_thinking, voice)`
+  gate means the frame never arrives at all. Persisting there would violate the invariant rather
+  than satisfy the phase. Writing from `GooseAdapter` instead was rejected on two counts: it puts
+  policy in an adapter, and `ChatService` is declared the sole owner of turn persistence.
+
+  **Migration number, announced so the next run does not collide:** P2 took `0039`, so **P6 takes
+  `0040`** (`0040_session_thinking.sql`). Nothing was created under that name — it is reserved by
+  this note, not by a file.
+
+  **Corrections to the plan of record, for whoever picks this up.** The recon plan said reasoning
+  "vanishes on reload because nothing is persisted". Accurate, but it understates the work: the
+  blocks never reach `ChatService` in the first place, because `routes.rs` forwards the frame
+  straight to SSE and never accumulates it — so P6 is a write path to build, not a read path to
+  add. The plan also asked for the side table to "inherit the parent row's profile scoping"; note
+  that the parent is `session_messages`, which carries no `profile_id` of its own — the scope has
+  to come through `sessions.profile_id` (added in `0003`, indexed in `0037`), and a fixture that
+  sets it by hand reproduces exactly the `ProfileScope::Owner` no-op that went undetected for a
+  whole phase.
+
+  **One piece of good news, verified rather than hoped.** Invariant 3 is already enforced by the
+  schema, not by convention: `session_messages.role` carries a `CHECK (role IN ('user',
+  'assistant', 'system', 'tool'))` since `0022`. A future refactor cannot quietly turn reasoning
+  into a replayed message role — it would have to rebuild the table to do it. The side-table design
+  is therefore the cheap path as well as the correct one.
+
+  **What would falsify this deferral.** `routes.rs`, `settings.rs` and `Chat.tsx` all being
+  unheld — at which point P6 is ordinary work with no unknowns left in it.
 - **P7** Unify the two stream handlers; `/agent/chat/stream` gains full parity, including memory
   extraction.
 
@@ -411,4 +461,5 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   reasoning_does_not_move_the_completion_count_or_the_decode_rate`. The `turn_stats` **SSE frame**
   half of this is still outstanding: it is built by hand in the held `routes.rs`. See P2.
 - **Manual** — `persist_thinking` on, reopen the session, confirm reasoning is visible in the UI and
-  absent from the model's replayed context.
+  absent from the model's replayed context. **Not runnable as of 2026-08-06:** there is no
+  `persist_thinking` setting and no store behind it. See P6.
