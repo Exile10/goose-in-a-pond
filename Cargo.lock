@@ -8716,6 +8716,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "fs2",
+ "pond-core",
  "reqwest 0.13.3",
  "tempfile",
  "thiserror 1.0.69",

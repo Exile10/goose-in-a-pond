@@ -214,7 +214,7 @@ Applied at exactly three chokepoints:
 `EventLog` `Arc`s, not one: the shared binding, the egress sink that reads it, and the
 `SqliteSecurityPolicy` audit sink, which is constructed independently. **3 has no call site to wire.**
 No connector exists, the live webhook arm sends no body, and the body-carrying executor is never
-constructed. It moves to P6. See the P3 entry in section 5.)*
+constructed. It moves to P6b. See the P3 entry in section 5.)*
 
 **Explicit non-goal, stated so nobody 'fixes' it later: the redactor is not applied to the model's
 own prompt.** Redacting the assistant's view of your life is what makes it useless. The privacy
@@ -326,10 +326,27 @@ mechanical rather than a comment), `UNGATED_SENDERS` (enumerated, capped, shrink
 the crate-level rule in the only form that holds: every `reqwest` crate owns at least one classified
 file, which is what catches a sender using `Client::execute` or `reqwest::blocking`.
 
-**`network_mode = "offline"` is not yet a complete claim.** Six real-egress files are still ungated
-(HF/GitHub model downloads, OAuth token refresh, Spotify, the vision-encoder download, the MCP
-connectivity probe). They are enumerated in `UNGATED_SENDERS`; P5 is not done until that list is
-empty, and the cap is what stops it becoming a parking lot.
+**`network_mode = "offline"` is not yet a complete claim.** ~~Six real-egress files are still
+ungated (HF/GitHub model downloads, OAuth token refresh, Spotify, the vision-encoder download, the
+MCP connectivity probe).~~ *Superseded 2026-08-06 by P6a: five of the six are gated and
+`UNGATED_SENDERS` is down to one entry, `pond-api/src/routes.rs`.* They are enumerated in
+`UNGATED_SENDERS`; this is not done until that list is empty, and the cap is what stops it becoming
+a parking lot.
+
+**A file-level guard is necessary and not sufficient, and P6a is where that stopped being a
+footnote.** `egress_tracked_files_reach_the_tracker` checks for ONE tracker symbol per FILE, so a
+file with several senders goes green on the first one gated. Three files in the list have more than
+one: `pond-hf-cache/src/lib.rs` (two redirect loops), `pond-server/src/model_download.rs` (three),
+and `pond-api/src/routes.rs` (nine, still ungated). Those need a BEHAVIOURAL test per site, and the
+mutation that proves it is not paranoia is in P6a's entry below — gating one of the HF cache's two
+hops leaves the file-level guard green while the other still resolves DNS to a third-party host.
+
+**A sender is not always a `reqwest` call.** The guard finds senders by looking for `reqwest`, and
+P6a found one it cannot see: `download_and_extract_ort` in `pond-server/src/main.rs` shells out to
+`curl` for a ~100 MB ONNX Runtime tarball from github.com. It is the only subprocess sender in the
+tree (`Command::new("curl")` matches there and nowhere else), so the hole was one call — but it was
+the largest single outbound transfer the pond makes, and no amount of `reqwest` scanning would ever
+have reported it. When adding a sender, ask what the guard can SEE, not what it lists.
 
 ### 3.6 The outbound-action gate
 
@@ -659,7 +676,7 @@ cannot change class quietly.
   `pond-infra-scheduler`, is referenced exactly once in the repository — by its own `pub use` — and
   is never constructed. Wiring a redactor into either would have redacted nothing while reading as
   coverage, which is the failure PAI-1 P4 named when it refused to build a matrix of twenty-four
-  allows. It lands with **P6**, alongside PAI-8, and P6 now owns it.
+  allows. It lands with **P6b**, alongside PAI-8, and P6b now owns it.
 
   **Two things found on the way.** Neither webhook path calls `record_egress`, so a webhook fire is
   invisible to the activity API — recorded, not fixed here, because it belongs to P5's
@@ -730,7 +747,9 @@ cannot change class quietly.
   Six remain: HF/GitHub model downloads, the OAuth refresh loop, Spotify, the HF blob cache, the
   vision-encoder download and the MCP connectivity probe. They are enumerated in `UNGATED_SENDERS`
   in `crates/pond-core/tests/egress_guard.rs` under a cap that only moves down, and they belong to
-  P6. The remaining seven senders are loopback-only — ollama on 11434, llamafile on 8080 — and a
+  P6. *(True as written on 2026-08-05. P6a gated five of the six on 2026-08-06; only `routes.rs`
+  remains, and P5's own claim that `record_egress` covers every sender was still incomplete in a
+  way neither phase had noticed — see the `curl` subprocess note in 3.5.)* The remaining seven senders are loopback-only — ollama on 11434, llamafile on 8080 — and a
   guard that reported those as egress would be switched off inside a week.
 
   **The parse deliberately widens and the API deliberately narrows.** `NetworkMode::parse` falls
@@ -778,9 +797,95 @@ cannot change class quietly.
   pond-infra-scheduler, pond-mcp-server, pond-adapters-weather all green;
   `cargo check -p pond-server -p pond-adapters-goose` clean; `scripts/live-test.sh --ui` green,
   11 restart-pass checks, 0 failed.
-- **P6** Draft gate for outbound connector actions (lands with PAI-8), **and P3's third
+- **P6 splits, because half of it was never blocked.** The bullet used to read only "draft gate for
+  outbound connector actions (lands with PAI-8), and P3's third chokepoint", which routed the whole
+  phase as PAI-8-blocked. The egress half was assigned to P6 by 3.5 and by P5's entry and appeared
+  nowhere here, so a reader planning work would have skipped it. It is now **P6a** (landable, and
+  landed) and **P6b** (genuinely blocked).
+
+- **P6a — LANDED 2026-08-06, five of P5's six senders gated, plus one nobody had counted.**
+  `pond-adapters-goose/src/extension_manager.rs` (the MCP connectivity probe, whose URI is typed by
+  whoever adds the extension and is therefore the most attacker-influenced destination in the
+  tree), `pond-adapters-goose/src/vision_encoder.rs`, `pond-server/src/main.rs` (the background
+  OAuth refresh loop), `pond-server/src/model_download.rs` (all three sites, including the
+  `face-onnx`-gated `buffalo_l.zip` one — a `cfg`'d sender is still a sender), and
+  `pond-hf-cache/src/lib.rs` (both redirect loops). `UNGATED_SENDERS` is down from six entries to
+  one and `MAX_UNGATED` from 6 to 1.
+
+  **`pond-hf-cache` had no `pond-core` dependency.** That is the only new plumbing in the phase and
+  it was recorded nowhere. The direction is inward and there is no cycle — `pond-core` pulls
+  `pond-voice` plus serde/tokio/tracing and never reaches back — so the dep is correct rather than
+  merely convenient.
+
+  **Gated per redirect HOP, not once on the entry URL.** Both HF cache loops follow redirects by
+  hand, reassigning `current` in a `for _ in 0..10`, precisely because the host changes mid-chain —
+  that is why `should_send_auth_on_redirect` exists two lines away. A one-shot check on the entry
+  URL would wave through exactly the case that matters: `huggingface.co` redirecting to a CDN.
+
+  **Stated out loud rather than discovered: this is a behaviour change on `allowlist`.** Neither
+  `huggingface.co` nor `github.com` is in `KNOWN_PUBLIC_SUFFIXES`, so both classify `Sensitive`, so
+  `network_mode = "allowlist"` now refuses every model download. That polarity is correct and
+  invariant 4 says public suffixes are added deliberately, not to soften a refusal — so the fix is
+  an actionable message (`EgressDenied` already renders mode, host and what to set), not a wider
+  allowlist. Anyone on `allowlist` who wants models must move to `open` for the download.
+
+  **The largest hole was one the guard could not see.** `ensure_onnx_runtime()` downloads a ~100 MB
+  ONNX Runtime tarball from github.com by shelling out to `curl`, so it never appeared in a scan
+  that finds senders by looking for `reqwest`. It is gated with `check_egress` rather than
+  `EgressCall::begin`, because the function is synchronous and `finish` -> `record_egress` reaches
+  `tokio::spawn`, which panics with no runtime on the thread; refusals are still recorded, since
+  that path is runtime-safe.
+
+  **And gating it exposed that the gate was installed too late to matter.** `set_network_mode` had
+  exactly ONE call site, inside `run_server`, and the mode is a process-global defaulting to `Open`
+  — so `network_mode = "offline"` was a silent no-op for the whole of `pond chat` (which is also
+  the terminal voice loop) and `pond setup` (which is almost entirely downloads). Worse, inside
+  `run_server` itself `ensure_onnx_runtime()` ran ~40 lines BEFORE the install, so gating it there
+  would have produced a mechanism that cannot fire — this programme already has two of those and
+  did not need a third. All three entry points now install the mode from the settings row before
+  their first fetch, and `ensure_onnx_runtime()` moved below the install on all three. Nothing
+  between the old and new sites touches ONNX (`apply_face_recognition_defaults` sets env vars,
+  `Database::init`, the HF-cache migration, the system-dep warning).
+
+  **What this deliberately did NOT do.** `pond-api/src/routes.rs` is untouched: it holds nine egress
+  sites (HF search, HF repo files, GitHub releases, the spawned download task, the TTS voice config,
+  BOTH OAuth token exchanges — `authorization_code` as well as refresh, which the doc named nowhere
+  — and all three Spotify sites including the post-401 retry) interleaved with seven loopback ones,
+  and it was held by a concurrent group. It is P6b, and until it lands `MAX_UNGATED` is 1, not 0.
+  `crates/pond-api/tests/egress_offline_routes.rs` was planned and NOT written, for the same reason.
+  `run_agent_cmd` still never installs the mode, and `init_draft_authority` / `set_egress_sink` are
+  still `run_server`-only — those are startup gaps of the same shape, recorded, not fixed here.
+  `ensure_espeak_ng_data` and `fetch_buffalo_l_zip` are gated in source but have NO behavioural
+  test: the first shells out to `brew` and has half a dozen environment-dependent early returns
+  before it reaches the network, so a test of it would pass on any dev machine without touching the
+  gate; the second only compiles under `--features face-onnx`.
+
+  **Mutation-tested, and the main guard failed one of its own mutations.** `every_entry_point_
+  installs_the_gate_before_it_downloads` is new, lives in `pond-core` because CI has no
+  `cargo test -p pond-server`, and asserts ORDER rather than presence. Deleting the `run_chat`
+  install left it GREEN — because the comment above the deleted call still contained the words
+  "set_network_mode" and a substring search cannot tell prose from code. It now matches the call
+  form `egress::set_network_mode(`, and the same mutation fails with "`run_chat(` calls
+  ensure_onnx_runtime() ... but never calls set_network_mode". Restoring the pre-fix ORDER fails
+  with "installs the egress gate at byte 3911 but calls ensure_onnx_runtime() at byte 2507".
+  Deleting both HF-cache gates fails `egress_tracked_files_reach_the_tracker` naming that file.
+  Adding a seventh `UNGATED_SENDERS` entry fails the cap AND the partition test. The mutation that
+  matters most: gating only ONE of the HF cache's two hops keeps the file-level guard GREEN and
+  fails `get_redirect_to_a_non_loopback_host_is_refused_at_the_hop` with a DNS error for
+  `cdn.invalid` — the proof that per-file symbol presence is not coverage.
+
+  Gates: `cargo fmt --check` clean; pond-core 802 + 6 guard, pond-hf-cache 20 + 5, pond-api,
+  pond-infra 214, pond-adapters-goose 105, pond-server lib/bins 81 all green; `cargo check -p
+  pond-server -p pond-adapters-goose` and `cargo check -p pond-server --features face-onnx` clean;
+  clippy clean on the touched crates. NOT run: `cargo test -p pond-server` in full, which does not
+  compile at this commit for an unrelated pre-existing reason — `tests/live_feature_test.rs` calls
+  `MemoryExtractionService::run` without the `&ProfileScope` argument added by `4a86244a` /
+  `1cc7a8eb`. That file is untouched by this phase and CI never builds it.
+
+- **P6b — BLOCKED.** Draft gate for outbound connector actions (lands with PAI-8), **P3's third
   chokepoint** — redaction before a body leaves the pond, which has no call site to wire until
-  PAI-8 creates one.
+  PAI-8 creates one — **and the nine `routes.rs` egress sites** left by P6a, which are not
+  PAI-8-blocked and only need an uncontended tree.
 - **P7 — LANDED 2026-08-05.** `PUBLIC_ROUTES` entries carry an `Exposure`: `Always`,
   `UntilOnboarded`, or `UntilOnboardedThenHostOnly`. Nine entries are state-dependent — `PUT
   /settings`, `POST /profiles`, `PATCH /profiles/{id}`, `POST /onboard`, `/onboard/complete`,

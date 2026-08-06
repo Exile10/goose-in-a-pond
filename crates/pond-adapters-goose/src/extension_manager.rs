@@ -119,7 +119,15 @@ impl ExtensionManagerPort for GiapGooseExtensionManager {
                     .timeout(std::time::Duration::from_secs(5))
                     .build()
                     .unwrap_or_default();
-                match client.get(uri).send().await {
+                // PAI-2 P6a: the URI here is typed by whoever is adding the
+                // extension, so this is the most attacker-influenced
+                // destination in the tree. The gate runs before the probe --
+                // refusing after the packet has left is not a refusal.
+                let call = pond_core::shared::services::egress::begin(uri, "GET")
+                    .map_err(|e| anyhow!("Cannot reach MCP server at {}: {}", uri, e))?;
+                let probed = client.get(uri).send().await;
+                call.finish(probed.as_ref().ok().map(|r| r.status().as_u16()));
+                match probed {
                     Ok(_) => {} // reachable
                     Err(e) => return Err(anyhow!("Cannot reach MCP server at {}: {}", uri, e)),
                 }
