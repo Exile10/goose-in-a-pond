@@ -469,8 +469,17 @@ cannot change class quietly.
   halves of one document disagreed and the wrong half was the one attached to the reassuring
   conclusion. **P0 put a bearer token in front of this route; the keys are still on the struct and
   still serialized into the body. That is P2, and it is untouched.**
-- **P1** `security_policy_mode` with `audit` default; the scope × principal matrix; first production
-  `allow`/`audit` call sites (shared with PAI-1 P4).
+- **P1 — LANDED 2026-08-05, without the matrix.** `security_policy_mode` with `audit` default, and
+  two production `allow`/`audit` call sites (shared with PAI-1 P4).
+
+  **The scope × principal matrix was deliberately not built**, and the header says so because every
+  other phase's header is scannable and this one's omission looked like an oversight for a day.
+  Eight scopes crossed with three `PrincipalKind`s is twenty-four cells, and every one of them has
+  to be `allow`: each kind legitimately needs each scope for something that exists in the code
+  today, and denying `Internal` anything breaks background work silently rather than returning an
+  error to anybody. Twenty-four allows is not a security control, it is a table shaped like one.
+  The axis that actually discriminates is whether a caller has **proved** the identity it claims —
+  which is what both call sites key on instead.
 
   **Mode and first call site LANDED 2026-08-05** (`PolicyMode`, `PolicyDecision`,
   `is_identity_assertion_proven`, `Principal.proven_profile_id`, and
