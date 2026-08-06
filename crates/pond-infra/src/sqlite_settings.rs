@@ -250,6 +250,14 @@ impl SettingsRepository for SqliteSettingsRepository {
             }
         );
         upsert!(
+            "persist_thinking",
+            if settings.persist_thinking {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
             "context_window_override",
             settings.context_window_override.to_string()
         );
@@ -786,6 +794,9 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "thinking_mode" => s.thinking_mode = value.to_string(),
         "show_thinking" => s.show_thinking = value == "true",
         "reasoning_effort" => s.reasoning_effort = value.to_string(),
+        // Anything other than the literal "true" leaves reasoning text
+        // unpersisted. A privacy control narrows on an unreadable value.
+        "persist_thinking" => s.persist_thinking = value == "true",
         "context_window_override" => {
             if let Ok(v) = value.parse() {
                 s.context_window_override = v;

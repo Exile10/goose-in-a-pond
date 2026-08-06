@@ -1197,7 +1197,11 @@ fn chat_stream_inner(
             session_id.clone(),
             storage.clone(),
         )
-        .with_profile_scope(turn_scope.clone());
+        .with_profile_scope(turn_scope.clone())
+        // PAI-5 P6. The user's own choice, off by default. The `Thinking` arm
+        // below calls `record_thinking` unconditionally; this is what decides
+        // whether anything comes of it.
+        .with_thinking(settings.persist_thinking);
         if let (Some(ext), Some(svc)) =
             (state.memory_extractor.clone(), state.memory_extraction_service.clone())
         {
@@ -1333,6 +1337,13 @@ fn chat_stream_inner(
                                     Some(json!({"type": "status", "content": content}).to_string())
                                 }
                                 AgentStreamEvent::Thinking { content } => {
+                                    // PAI-5 P6. Offer it to the persistence
+                                    // owner; `record_thinking` drops it unless
+                                    // the user turned `persist_thinking` on.
+                                    // The SSE frame is unchanged either way --
+                                    // showing it live and keeping it are
+                                    // different consents.
+                                    chat_service.record_thinking(content.clone());
                                     Some(json!({"type": "thinking", "content": content}).to_string())
                                 }
                                 AgentStreamEvent::ToolCall { tool, id, input } => {
@@ -2049,6 +2060,21 @@ async fn get_session_messages(
             acc
         });
 
+    // PAI-5 P6. One query for the whole page, grouped by message id, exactly
+    // like the attachments fold above. Empty for every session recorded before
+    // `persist_thinking` was turned on, and a storage error must not fail a
+    // history read -- reasoning is a convenience, the transcript is not.
+    //
+    // THIS IS THE ONLY PRODUCTION CALLER of `get_thinking_for_session`, and
+    // `crates/pond-core/tests/thinking_is_never_replayed.rs` fails the build if
+    // a second one appears anywhere that builds a prompt. Nothing here reaches
+    // the model: the value is serialised into the HTTP response and dropped.
+    let thinking_by_message: std::collections::HashMap<String, Vec<String>> = state
+        .session_storage
+        .get_thinking_for_session(&session_id)
+        .await
+        .unwrap_or_default();
+
     let list: Vec<Value> = messages
         .iter()
         .map(|m| {
@@ -2098,6 +2124,12 @@ async fn get_session_messages(
                         ),
                     }))
                     .collect::<Vec<_>>());
+            }
+            // PAI-5 P6: the reasoning that produced this reply, if the user
+            // chose to keep it. Absent (not `[]`) on every message that has
+            // none, so the client can tell "not kept" from "kept nothing".
+            if let Some(blocks) = thinking_by_message.get(&m.id) {
+                obj["thinking"] = json!(blocks);
             }
             obj
         })
@@ -8122,11 +8154,24 @@ async fn agent_chat_stream(
     let stream = async_stream::stream! {
         let _permit = permit;
 
+        // PAI-5 P6. This route reads no settings otherwise, so the one read is
+        // here and it narrows: an unreadable settings row means
+        // `persist_thinking` stays false and the reasoning is not kept. A
+        // privacy control that defaults ON when its store is unavailable is the
+        // scope-widening default this programme treats as a bug.
+        let persist_thinking = state
+            .settings_repo
+            .get()
+            .await
+            .map(|s| s.persist_thinking)
+            .unwrap_or(false);
+
         let mut chat_service = pond_core::shared::services::chat::ChatService::new(
             agent.clone(),
             session_id.clone(),
             storage.clone(),
-        );
+        )
+        .with_thinking(persist_thinking);
         if let Some(event_log) = state.event_log.clone() {
             chat_service = chat_service.with_event_log(event_log);
         }
@@ -8182,6 +8227,9 @@ async fn agent_chat_stream(
                             Some(json!({"type": "status", "content": content}).to_string())
                         }
                         AgentStreamEvent::Thinking { content } => {
+                            // PAI-5 P6, same contract as `chat_stream`: offered
+                            // unconditionally, kept only if the user said so.
+                            chat_service.record_thinking(content.clone());
                             Some(json!({"type": "thinking", "content": content}).to_string())
                         }
                         AgentStreamEvent::ToolCall { tool, id, input } => {

@@ -213,3 +213,112 @@ describe("Chat section", () => {
     expect(vi.mocked(api.chatStream)).toHaveBeenCalledTimes(1);
   });
 });
+
+// ── PAI-5 P6: reasoning survives the reload ───────────────────────────────────
+//
+// The thinking panel and its live accumulator both already existed; what did
+// not was the refill from history, so every reloaded conversation showed its
+// answers with the reasoning behind them silently gone. This drives the real
+// component against a real `getSessionMessages` payload rather than asserting
+// that `sessionMessagesToMessages` mentions `thinking` — a grep would have
+// passed against the version that dropped the field on the floor.
+//
+// `vi.resetModules()` + dynamic import because the module-level AppContext mock
+// pins `sessionId: null`. And the session id is flipped AFTER mount rather than
+// set before it, because that is the only way history actually loads: the effect
+// bails when the incoming id already equals `sessionIdRef.current`, which it
+// does on the very first render. A test that mounted with the id already set
+// would render an empty conversation and prove nothing — quietly, since the
+// assertion it makes is about what is absent.
+describe("Chat history — persisted reasoning (PAI-5 P6)", () => {
+  async function renderWithHistory(messages: unknown[]) {
+    vi.resetModules();
+    const getSessionMessages = vi.fn().mockResolvedValue(messages);
+    const holder = { sessionId: null as string | null };
+    vi.doMock("../api/PondApiClient", () => ({
+      api: {
+        chatStream: vi.fn(),
+        listSessions: vi.fn().mockResolvedValue([]),
+        getSessionMessages,
+        setToken: vi.fn(),
+        getSettings: vi.fn().mockResolvedValue({ show_turn_stats: false }),
+        getModelCapabilities: vi.fn().mockResolvedValue({
+          thinking: true,
+          vision: true,
+          audio_input: false,
+          context_window_tokens: 8192,
+          structured_output: false,
+          tool_calling: true,
+        }),
+        sessionAttachmentUrl: vi.fn(() => "/api/v1/sessions/s/attachments/a"),
+      },
+    }));
+    vi.doMock("../state/AppContext", () => ({
+      useAppState: () => ({
+        serverOnline: true,
+        sessionToken: "tok",
+        sessionId: holder.sessionId,
+      }),
+      useAppDispatch: () => vi.fn(),
+    }));
+    const { Chat: FreshChat } = await import("./Chat");
+    const { rerender } = render(<FreshChat />);
+    // The sidebar-click path: the session id arrives from outside, the effect
+    // sees it differ from what it last saw, and fetches.
+    holder.sessionId = "sess-1";
+    await act(async () => {
+      rerender(<FreshChat />);
+    });
+    return getSessionMessages;
+  }
+
+  const assistantRow = (thinking?: string[]) => ({
+    id: "m2",
+    session_id: "sess-1",
+    role: "assistant",
+    content: "The porch light is on.",
+    created_at: "2026-08-06T10:00:01Z",
+    ...(thinking ? { thinking } : {}),
+  });
+
+  const userRow = {
+    id: "m1",
+    session_id: "sess-1",
+    role: "user",
+    content: "Is it on?",
+    created_at: "2026-08-06T10:00:00Z",
+  };
+
+  it("replays stored reasoning into the thinking panel on reload", async () => {
+    await renderWithHistory([
+      userRow,
+      assistantRow(["They said 'it' — probably the thermostat.", "No: the porch light."]),
+    ]);
+
+    await waitFor(() => expect(screen.getByText("The porch light is on.")).toBeTruthy());
+
+    // The panel itself, and BOTH passages. Asserting only the toggle would pass
+    // against a refill that kept the first block and dropped the rest.
+    expect(screen.getByText("Thinking")).toBeTruthy();
+    expect(screen.getByText("They said 'it' — probably the thermostat.")).toBeTruthy();
+    expect(screen.getByText("No: the porch light.")).toBeTruthy();
+  });
+
+  it("shows no thinking panel for a turn recorded without it", async () => {
+    // The default state of every pond: `persist_thinking` is off, so the server
+    // omits the field entirely. This is the vacuity control for the test above
+    // — without it, a component that rendered a "Thinking" panel on every
+    // assistant message would pass that one.
+    await renderWithHistory([userRow, assistantRow()]);
+
+    await waitFor(() => expect(screen.getByText("The porch light is on.")).toBeTruthy());
+    expect(screen.queryByText("Thinking")).toBeNull();
+  });
+
+  it("shows no thinking panel when the server sends an empty list", async () => {
+    await renderWithHistory([userRow, assistantRow([])]);
+
+    await waitFor(() => expect(screen.getByText("The porch light is on.")).toBeTruthy());
+    expect(screen.queryByText("Thinking")).toBeNull();
+  });
+});

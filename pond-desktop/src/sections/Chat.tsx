@@ -83,7 +83,21 @@ function sessionMessagesToMessages(raw: SessionMessage[]): Message[] {
             return bare;
           })
         : undefined;
-      out.push({ id: ++_msgId, role: "agent", text: m.content, historyToolNames, images });
+      // PAI-5 P6. The panel below already renders `thinkingBlocks` and is
+      // already gated on `!streaming`, which is exactly right for replayed
+      // history. All that was missing was the refill: before this, reasoning
+      // existed only for the lifetime of the SSE connection that produced it,
+      // so reloading a conversation showed every answer with the thinking that
+      // led to it silently gone.
+      const thinkingBlocks = m.thinking?.length ? m.thinking : undefined;
+      out.push({
+        id: ++_msgId,
+        role: "agent",
+        text: m.content,
+        historyToolNames,
+        images,
+        thinkingBlocks,
+      });
     } else {
       out.push({ id: ++_msgId, role: "user", text: m.content, images });
     }
