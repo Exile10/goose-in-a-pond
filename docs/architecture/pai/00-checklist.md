@@ -17,13 +17,13 @@ programme is for; the PAI numbers are only the order I chose to build them in.
 | Req | As asked for | Doc | Status |
 |---|---|---|---|
 | 1 | GIAP needs to be **proactive**, not just reactive | [PAI-7](./07-proactive-intelligence.md) | DESIGNED |
-| 2 | Requires the ability of the model to **think** | [PAI-5](./05-reasoning-and-thinking.md) | DESIGNED |
+| 2 | Requires the ability of the model to **think** | [PAI-5](./05-reasoning-and-thinking.md) | **P1, P2 LANDED 2026-08-06** (P1 the reasoning channel — `GooseAdapter` lifts `MessageContent::Thinking` and yields `AgentStreamEvent::Thinking`, gated once at the PRODUCER on `show_thinking && !voice` so all three consumers inherit it; the producer always existed upstream and was being discarded at `as_concat_text()`. P2 producer + store — `reasoning_tokens` on `UsageStats`/`TurnStats`/`SessionMessage`, migration 0039 nullable with NO `DEFAULT`, counted through PAI-3's `TokenCounter` port and reported ALONGSIDE `completion_tokens`, never deducted). **P1 has an OPEN granularity defect** — one frame per reasoning *delta* on local/gguf, which renders as hundreds of one-fragment paragraphs; see the doc. P2's `turn_stats` SSE frame and `GET /usage/summary` are NOT done (`routes.rs` was held). **P6 (persist + rehydrate thinking) is BLOCKED on nothing any more** — its four seams are free now that the batch has ended |
 | 3 | **Multi-agent orchestration** | [PAI-6](./06-multi-agent-orchestration.md) | DESIGNED |
 | 4 | **Hard profile boundaries** | [PAI-1](./01-identity-and-profile-boundaries.md) | **COMPLETE — P1-P8 LANDED** |
 | 5 | **Large context**, using each model's window dynamically and to the fullest | [PAI-3](./03-context-governor.md) | **P1-P4, P6 LANDED** (P3 completed by P3b 2026-08-06); **P5 code landed 2026-08-06, awaiting the on-device TTFT measurement that decides it** |
-| 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | **P1, P2, P3, P4, P6 LANDED 2026-08-06** (P1 `ModelClass` + strategy dispatch, domain only; P2 large-tier re-summarisation — the rolling summary rebuilt from the source messages instead of from its own previous output, gated on `ModelClass::Large` and wired into `run_compaction_pass`, so P1 now has its first consumer; P3 age-weighted retention — `compaction_verbatim_days` plus a tool-result rung between "leave it alone" and "drop the whole turn", fed by `Message::created` on the live Goose trim path and firing only when a conversation is already over budget; P4 compact-on-resume gate, wired to the session reopen; P6 `should_compact` now moves the server between turns, rate-limited by `claim_compaction`, and `reset_session` has its first production caller); **P5 code landed 2026-08-06, awaiting the warm-versus-cold TTFT measurement that decides it** (`prefix_cache.rs`: `PrefixCacheState` + the six `InvalidationReason`s recorded in `goose_agent.rs`, `Agent::prefix_cache_state` defaulting to `None`, and the trimmer's age rung now firing on a cold prefix as well as over budget — the warm half was already P3's); **P7a (the API half) LANDED 2026-08-06** (`POST /sessions/{id}/compact` — the manual axis, running the same `run_compaction_pass` behind the same `claim_compaction` rate limiter as P6, and reporting a `status`/`reason` pair with the session's real utilisation when it refuses); **P7b (the desktop control) RESPECIFIED and outstanding** — the bullet said "a control on the existing `ContextCard`", but `ContextCard.tsx` is the MCP-UI tool-result renderer and the shipped app has no context-pressure surface at all (zero consumers for the `context_warning` frame), so P7b is a new surface across both chat views, not a button |
+| 6 | **Smart compaction** based on different models, time and cache age | [PAI-4](./04-smart-compaction.md) | **P1, P2, P3, P4, P6 LANDED 2026-08-06** (P1 `ModelClass` + strategy dispatch, domain only; P2 large-tier re-summarisation — the rolling summary rebuilt from the source messages instead of from its own previous output, gated on `ModelClass::Large` and wired into `run_compaction_pass`, so P1 now has its first consumer; P3 age-weighted retention — `compaction_verbatim_days` plus a tool-result rung between "leave it alone" and "drop the whole turn", fed by `Message::created` on the live Goose trim path and firing only when a conversation is already over budget; P4 compact-on-resume gate, wired to the session reopen; P6 `should_compact` now moves the server between turns, rate-limited by `claim_compaction`, and `reset_session` has its first production caller); **P5 code landed 2026-08-06, awaiting the warm-versus-cold TTFT measurement that decides it** (`prefix_cache.rs`: `PrefixCacheState` + the six `InvalidationReason`s recorded in `goose_agent.rs`, `Agent::prefix_cache_state` defaulting to `None`, and the trimmer's age rung now firing on a cold prefix as well as over budget — the warm half was already P3's); **P7a (the API half) LANDED 2026-08-06** (`POST /sessions/{id}/compact` — the manual axis, running the same `run_compaction_pass` behind the same `claim_compaction` rate limiter as P6, and reporting a `status`/`reason` pair with the session's real utilisation when it refuses); **P7b (the desktop control) PARTIALLY LANDED 2026-08-06** — the bullet said "a control on the existing `ContextCard`", but `ContextCard.tsx` is the MCP-UI tool-result renderer and the shipped app had no context-pressure surface at all, so P7b is a new surface across the chat views, not a button. `context_warning` is now in the `ChatEventType` union, `PondApiClient.compactSession()` posts to the P7a endpoint, and a shared `ContextPressureNote` renders the pressure line and a "Compact now" control in `hub/views/ChatHub.tsx`. No Rust changed — the frame already reached the client, so "zero consumers" was a *rendering* fact, not a transport one. `sections/Chat.tsx` is outstanding (it was held by the concurrent PAI-5 group) and `sections/Canvas.tsx` is a deliberate deferral. **TWO OPEN DEFECTS, both recorded in the doc and neither fixed:** the "Compact now" control can never reach `status: "compacted"` on any default configuration, because P6's pressure axis takes the shared `claim_compaction` quota one statement after emitting the frame and strictly before the button is rendered — so the advertised success path is unreachable, not merely uncommon, and it needs a design decision about what the cooldown is for; and the phase's one load-bearing guard is a two-substring grep of `ChatHub.tsx` that catches only a textual revert, with nothing in the suite ever rendering `ChatHubView` |
 | 7 | **Personal context streaming** — on-pond, on-mobile, and internet accounts | [PAI-8](./08-personal-context-streaming.md) | DESIGNED |
-| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0-P5, P7 LANDED** (P3, P5 partial); P6, P8 designed |
+| 8 | **Privacy and security guardrails** to minimise data and secret exposure | [PAI-2](./02-privacy-and-security-guardrails.md) | **P0-P5, P6a, P7 LANDED** (P3, P5 partial); **P6a LANDED 2026-08-06** — five of P5's six ungated senders gated plus a sixth the guard could not see (the ~100 MB ONNX Runtime fetch, which egresses via a `curl` subprocess); `UNGATED_SENDERS` 6 → 1, `MAX_UNGATED` 6 → 1; and `set_network_mode` had ONE call site, so `network_mode = "offline"` was a silent no-op on `pond chat`, `pond setup` and (found by the synthesis pass) `pond models`. **P6b outstanding**: `routes.rs`'s nine egress sites are the sole remaining `UNGATED_SENDERS` entry and the reason the cap is 1 and not 0, plus `run_agent_cmd`'s missing mode install. **P8a outstanding** — blocked only by the same `routes.rs` hold, which has now ended |
 
 They are equally weighted and mutually interdependent. `DESIGNED` means the document exists and its
 current-state claims were verified against code; it does **not** mean any code has changed. `LANDED`
@@ -34,13 +34,24 @@ repair of P5, which was recorded as landed while being inert on every default in
 and PAI-2 P0 are landed, PAI-2 P4 encrypts `secrets.json` at rest, and PAI-2 P1 is complete: the
 mode, the identity-assertion call site, and the draft-decision gate that gives a staged action an
 owner. **PAI-2 P5 landed 2026-08-05**: `network_mode` (`open`/`allowlist`/`offline`) now refuses an
-outbound call before the socket opens, at five of the eighteen HTTP-sending files in the tree.
-Everything else is still design only.
+outbound call before the socket opens, at five of the eighteen HTTP-sending files in the tree;
+**P6a extended that to all but one file on 2026-08-06.**
+
+**PAI-5 stopped being design-only on 2026-08-06** (P1 and P2), so four of the eight workstreams now
+have landed code. PAI-6, PAI-7 and PAI-8 are still design only. Two of the eight are code-landed
+with their own deciding measurement outstanding — see the verification-debt note in section 4 —
+and neither may be promoted to `LANDED` without an Orin.
 
 Read `UNGATED_SENDERS` in `crates/pond-core/tests/egress_guard.rs` before you tell anyone
-`network_mode = "offline"` means offline. Six real-egress files are still ungated — model
-downloads, the OAuth refresh loop, Spotify, the HF blob cache, the vision-encoder download, the MCP
-connectivity probe — and they belong to P6. The list is capped and the cap only moves down. Note
+`network_mode = "offline"` means offline. **As of P6a (2026-08-06) exactly ONE file is still
+ungated**: `pond-api/src/routes.rs`, with nine egress sites — the two OAuth token exchanges, all
+three Spotify sites, HF search and repo files, GitHub releases, and the spawned download task. It
+belongs to P6b. The list is capped and the cap only moves down. Two things the list cannot tell
+you, both found by gating the rest: the guard finds senders by looking for `reqwest`, so it was
+blind to the ~100 MB ONNX Runtime download that shells out to `curl` (now gated; it is the only
+subprocess sender in the tree, so the class is closed but the blindness is not); and a gate is
+worth nothing if `set_network_mode` never ran, which was true of three of the four downloading
+entry points. Ask what the guard can SEE, not what it lists. Note
 also that the guard classifies FILES, not crates: the crate-level rule the design asked for ("every
 `reqwest`-using crate references `record_egress`") would have failed for eight of eleven crates on
 the day it landed, and most of what it flagged was a health probe on 127.0.0.1.
@@ -1408,3 +1419,172 @@ Gates: `cargo fmt --check` clean; `cargo test -p pond-api` all suites green incl
 -p pond-adapters-goose` clean. No live-server run — this adds a route, which is precisely what
 `scripts/live-test.sh` exists to catch and no in-process `oneshot` router test can — and the endpoint
 has never run against a real on-device summariser, only `MockProvider`.
+
+---
+
+**2026-08-06 (batch synthesis) — four phases landed in parallel, and the adversarial review found
+more than the phases did. Read the HIGH dispositions before starting anything.**
+
+Four implementation groups ran concurrently in disjoint footprints: PAI-4 P7b, PAI-2 P6a, PAI-5 P1
+and PAI-5 P2. All four committed. This entry is the reconciliation, written after re-running the
+gates rather than from the self-reports, and section 1's table plus the roadmap's table were both
+updated to match — the three places had drifted before and `4b448ffe` is what repairing that costs.
+
+### What actually landed
+
+| Phase | Commit | Landed as | Not done |
+|---|---|---|---|
+| PAI-4 P7b | `d06341c0` | The `context_warning` frame's first consumer, in the hub chat | `sections/Chat.tsx` (was held); Canvas deferred; **the button cannot succeed — see below** |
+| PAI-2 P6a | `55e68e9e` | 5 of P5's 6 ungated senders + the ORT `curl` subprocess; `MAX_UNGATED` 6 → 1; the mode installed before the first fetch on every entry point | `routes.rs` (P6b); `run_agent_cmd`'s install |
+| PAI-5 P1 | `bbb11172` | The reasoning channel, gated once at the producer | `ChatEvent::Reasoning` + `pond-inference` (quarantined, deliberately); ThoughtFilter demotion |
+| PAI-5 P2 | `ce8158b6` | `reasoning_tokens` producer + store, migration 0039 | The `turn_stats` SSE frame and `/usage/summary` (`routes.rs` was held) |
+
+**Verified, not taken on trust.** `cargo fmt --check` clean; the full CI fast-crate set green (55
+test binaries, 0 failures); `cargo test -p pond-adapters-goose` 109 passing; `cargo test -p
+pond-server --lib --bins` 30 + 81; `cargo check -p pond-server -p pond-adapters-goose` clean;
+`npm test` in `pond-desktop` 261/261. Two self-reported pre-existing build breaks were reproduced
+and are real — see verification debt.
+
+### Respecifications worth keeping
+
+- **P1 gated at the PRODUCER, not the SSE seam, and that was the right call.** Recon called seam
+  gating mandatory. There are THREE consumers of `AgentStreamEvent::Thinking`, not two — `routes.rs`
+  twice and `pond-server/src/main.rs`'s CLI printer, which is the terminal voice loop writing to
+  stderr unconditionally. Exactly one ever consulted `show_thinking`. A seam gate needed edits in
+  two crates and would still have leaked reasoning to the speaker on `pond chat`, which is the
+  precise thing PAI-5 invariant 2 forbids. One producer gate is inherited by all three. As a bonus
+  the held-file collision on `routes.rs` evaporated instead of becoming a blocker. **Generalise
+  this:** when a gate is being placed, count the consumers first; "two" is usually a grep of the
+  crate you are already in.
+- **P1's diagnosis in the doc was wrong, not merely stale.** Sections 1.2/1.3 said the reasoning
+  channel was discarded in `pond-inference/src/provider.rs` — a crate that feeds the QUARANTINED
+  PondAgent loop and has never executed in a shipped configuration. The live discard was
+  `GooseAdapter`'s `as_concat_text()`. Following the doc literally would have produced a third
+  correct-but-unreachable mechanism.
+- **P6a added a startup-wiring component recon did not plan.** Without it the new ORT gate was
+  provably unreachable on all three entry points, because `set_network_mode` had one call site.
+  This is the recurring shape: a correct mechanism whose precondition nobody installed.
+
+### HIGH findings from the adversarial review — what I fixed and what I did not
+
+Fixed in this commit, each mutation-tested:
+
+1. **P6a's file-level guard was satisfied by COMMENT PROSE.** `TRACKER_SYMBOLS` held bare symbols,
+   so every real gate could be deleted from a tracked file with all six tests green, provided one
+   of the phase's own comments mentioned the token. FIVE of ten tracked files were vulnerable; TWO
+   were made vulnerable by comments P6a itself added. This is byte-for-byte the defect P6a found in
+   its own ORDER guard and fixed only there. Now: call forms with the opening paren, plus a
+   string-literal-aware `strip_line_comments` pass. Mutation — de-gating `vision_encoder.rs`
+   keeping the comment — went from green to *"these files are listed EGRESS_TRACKED but CALL none
+   of […] in code (comments do not count)"*.
+2. **There was a FOURTH downloading entry point and the guard's detector locked it out.**
+   `run_models` (`pond models download`) calls `model_download::download_file` twice and installed
+   no mode, so P6a's gate there was inert and `offline` permitted a full model download — a privacy
+   control failing OPEN. The detector asked "which functions call `ensure_onnx_runtime()`" and an
+   `assert_eq!(callers, 3)` pinned that answer, so no other route could ever appear in it. Fixed at
+   both ends: `run_models` installs the mode after `Database::init`, and the detector now asks
+   which functions DOWNLOAD, count 4, with the two helpers in an explicit named exemption.
+   Mutation — deleting the install, keeping the comment — fails naming `run_models`.
+3. **The ORT gate, P6a's headline discovery, had no test at all.** The guard asserted only ORDER
+   while its failure message talked about "the gate inside it". Deleting the `check_egress` line
+   left all six tests green (`egress_tracked_files_reach_the_tracker` is satisfied by an unrelated
+   OAuth `egress::begin(` elsewhere in `main.rs`). It is the only subprocess sender in the tree, so
+   nothing `reqwest`-shaped will ever see it. Now asserted: `check_egress(` before
+   `Command::new("curl")`, byte offsets, comments stripped. Mutation goes red.
+4. **P1's gate was tested; its INPUT was not.** Changing `voice_instance || request.voice_mode` to
+   `voice_instance` left all 108 tests passing. On the shipped desktop the instance flag is
+   hardcoded false, so the request flag is the entire defence and that mutation leaks reasoning to
+   every voice turn, silently. The source guard pinned the identifier `is_voice`, never its
+   meaning. Fixed by extracting `GooseAdapter::voice_turn(instance, request)` and asserting all
+   four rows, `(false, true)` first and by name.
+5. **P2's "count is outside the display gate" guard was vacuous against its own claim.** The
+   phase's mutation moved the statement inside the `for` loop, which the six-line window catches.
+   Wrapping it in `if emit_reasoning { … }` one line up — the natural form — passed all seven
+   reasoning tests. The harm is worse than a missed regression: `chat.rs` builds its `AgentRequest`
+   with `voice_mode: true` unconditionally and is the only path that persists the number, so a
+   gated count writes `Some(0)` for 100% of the corpus P5 reads. Now the whole eight-line window is
+   scanned and the failure quotes the offending line.
+6. **P2's carry-out was dark.** Replacing BOTH `UsageStats` arms with a literal
+   `reasoning_tokens: None` passed all 108 tests — the phase's own named failure mode landing
+   silently. Now asserted at 2 occurrences.
+
+**NOT fixed, deliberately, with reasons:**
+
+- **The "Compact now" button cannot succeed on any default configuration (P7b).** P6's pressure
+  axis takes the shared `claim_compaction` quota one statement after emitting the frame, and the
+  note only renders after `done` — so the claim is gone before the button exists. Six consecutive
+  pressured turns produced six `cooling_down` refusals in a reviewer's probe. I verified the
+  ordering in `routes.rs` myself. **This is a design decision, not a repair:** either the manual
+  axis gets its own authorisation (keeping `COMPACTIONS_IN_FLIGHT`, which is what actually protects
+  the serial engine) or the control stops rendering when the auto pass has claimed. P7a's stamp
+  argues hard for *not* bypassing the limiter, and its guard
+  `a_second_press_is_refused_by_the_cooldown` asserts the very thing that makes the button dead, so
+  it must be re-derived either way. A synthesis pass should not silently pick a side. **This is the
+  single most important item for the next round.**
+- **P7b's guard is a two-substring grep and catches only a textual revert.** Two semantic mutations
+  that leave the strings in place passed 261/261, including adding `showTurnStats` to the render
+  guard — which would ship the note invisible on every default install, the exact mistake the stamp
+  says it avoided by rejecting `TurnStatsFooter`. Fixing it needs a render test mounting
+  `ChatHubView`, which needs the `AppContext`/api surface stood up. That is a frontend phase and it
+  should land with the `sections/Chat.tsx` half, not bolted on here.
+- **P1 emits one reasoning frame per DELTA, not per block.** On local/gguf — its headline reachable
+  config — goose emits one `AgentEvent::Message` per token piece, so one reasoning passage renders
+  as hundreds of one-fragment paragraphs with whitespace destroyed by the per-fragment `.trim()`.
+  Confirmed by reading the submodule. This is a streaming-semantics change on the live path and it
+  is exactly the kind of question one turn on a real Jetson answers better than a unit test, so it
+  waits for the live run. The fix belongs in the adapter and needs a SEQUENCE test.
+- **`ChatService::persist_assistant_response`'s reasoning link is untested.** Replacing it with
+  `None` passes all 804 `pond-core` tests. One test against a fake `SessionStorage` closes it; left
+  for PAI-5 P6, which is already opening that file.
+
+### Deferred, with the reason
+
+- **PAI-2 P8a** — needs `routes.rs` for the `SecurityPolicy::audit` signature change and to register
+  `GET /security/policy-report` in `protected_routes` so it inherits P0/P7's four compile-time auth
+  guards. Held during the batch. **The hold has ended**; the design in the doc applies unchanged.
+- **PAI-5 P6** — a four-seam hold, all four now free: `settings.rs` (`persist_thinking`, all five
+  pieces), `routes.rs` (accumulate `Thinking` into the persist call on both handlers, and rehydrate
+  in `get_session_messages`), and `sections/Chat.tsx` (refill `thinkingBlocks` on session load; the
+  render already exists). No unknowns left in it.
+- **PAI-2 P6b** and **PAI-4 P7b's `sections/Chat.tsx` half** — same story, same unblocking.
+
+Every one of these was blocked by concurrency, not by design. **The lesson for the next batch is
+routing, not engineering:** `crates/pond-api/src/routes.rs` blocked three phases across two
+workstreams in one run. It is the busiest file in the programme and scheduling two groups against
+it costs more than running them serially would have.
+
+### Verification debt — do not let this quietly become LANDED
+
+- **PAI-3 P5 and PAI-4 P5** are code-landed with their deciding measurement outstanding. Both need
+  warm-versus-cold TTFT on an Orin that is not attached to this machine. Their own design sections
+  make the measurement the acceptance criterion. A green unit suite proves the rule fires where it
+  was told to, not that firing there was cheap. Two measurement-pending P5s is now a standing item,
+  not an aside.
+- **`cargo test -p pond-server` does not compile**, and has not since `ProfileScope` landed.
+  `crates/pond-server/tests/live_feature_test.rs` calls `MemoryExtractionService::run` without its
+  `&ProfileScope` argument (E0061, 2 errors). Reproduced. CI has no `cargo test -p pond-server`, so
+  it is invisible there and will stay invisible.
+- **`cargo test -p pond-agent` is impossible** for the same class of reason: `agent.rs`'s `mod
+  tests` builds `AgentRequest` without `profile_scope` / `profile_context` (E0063, 2 errors). CI
+  runs `cargo check -p pond-agent` WITHOUT `--tests`, so it is green and will stay green. Fixing it
+  means choosing a `ProfileScope` in a test fixture, which is a PAI-1 decision with an
+  access-widening failure mode — take the narrowest scope, and do it deliberately.
+
+Both of those are the same defect as the one CLAUDE.md already warns about for
+`pond-adapters-goose`: **a `check` is not a `test`, and for the crates CI only checks, nothing else
+will ever run their assertions.**
+
+### Needs the live run (`scripts/live-test.sh --ui`, coordinator, once, after this)
+
+- **PAI-2 P6a — startup ordering changed on `serve`, `chat` and `setup`, and now `models` too.**
+  This is the highest-value live check in the batch: `set_network_mode` moved, and a mode installed
+  too late is indistinguishable from one installed correctly until something tries to download.
+- **PAI-5 P1** — confirm reasoning frames reach the browser, render once and not twice, and
+  **watch for the delta-granularity defect above**: if the thinking panel shows a wall of
+  one-word paragraphs, that is the open finding reproducing, not a new bug.
+- **PAI-5 P2** — migration 0039 must be applied against an already-populated pond. `live-test.sh`
+  step 4 (restart against the same directory) is the case that matters; a migration that only works
+  on an empty database works exactly once.
+- **PAI-4 P7b** — a session crossing 75% should show the note in the hub chat. Expect the "Compact
+  now" control to answer `cooling_down`; per the finding above that is the current behaviour, so a
+  refusal is a CONFIRMATION of the defect, not a failure of the live run.

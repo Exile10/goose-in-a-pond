@@ -6221,6 +6221,26 @@ fn category_to_provider(category: &str) -> String {
 async fn run_models(action: ModelAction) -> Result<()> {
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
+
+    // PAI-2 P6a follow-up: `pond models download` calls
+    // `model_download::download_file` twice and was the FOURTH downloading
+    // entry point, not the third. P6a gated the download and installed the mode
+    // on serve/chat/setup, but never here — so the gate it added was inert on
+    // this path and a stored `network_mode = "offline"` permitted a full model
+    // download. That is a privacy control failing OPEN, which is the polarity
+    // invariant 3 forbids. The guard's detector now looks for functions that
+    // DOWNLOAD rather than functions that call `ensure_onnx_runtime()`, which
+    // is what let the omission through.
+    pond_core::shared::services::egress::set_network_mode(
+        pond_core::shared::services::egress::NetworkMode::parse(
+            &SqliteSettingsRepository::new(db.system.clone())
+                .get()
+                .await
+                .unwrap_or_default()
+                .network_mode,
+        ),
+    );
+
     let repo = Arc::new(SqliteModelRepository::new(db.system.clone()));
 
     match action {

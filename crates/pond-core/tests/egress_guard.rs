@@ -41,12 +41,25 @@ const MIN_SENDERS: usize = 15;
 const MAX_UNGATED: usize = 1;
 
 /// Any of these in a file's production source means it reaches the tracker.
+///
+/// CALL FORMS, with the opening paren -- not bare symbols. A review after P6a
+/// showed the bare-symbol version was satisfied by COMMENT PROSE: every real
+/// gate could be deleted from `vision_encoder.rs` and from `main.rs` while this
+/// guard stayed green, because one of P6a's own explanatory comments mentioned
+/// `record_egress`. Five of the ten tracked files were vulnerable that way, and
+/// two of the five were made vulnerable by comments P6a itself added.
+///
+/// This is the same defect P6a found in its own ORDER guard, by mutation, and
+/// fixed only there. The lesson generalises and the fix has to: any source-text
+/// guard in this repo that greps a bare symbol name has it. Matching a call
+/// form is half the fix; [`strip_line_comments`] is the other half, because
+/// `// see check_egress(...)` defeats the call form too.
 const TRACKER_SYMBOLS: &[&str] = &[
-    "record_egress",
-    "check_egress",
-    "egress::begin",
-    "traced_send",
-    "traced_get",
+    "record_egress(",
+    "check_egress(",
+    "egress::begin(",
+    "traced_send(",
+    "traced_get(",
 ];
 
 /// Files whose outbound calls reach the shared egress tracker.
@@ -200,6 +213,46 @@ fn production_source(src: &str) -> String {
             j += 1;
         }
         i = j + 1;
+    }
+    out
+}
+
+/// The source with every `//` line comment removed, string literals intact.
+///
+/// Used ONLY by [`egress_tracked_files_reach_the_tracker`]. `urls_in` keeps
+/// running on the uncommented source on purpose: the `LOOPBACK_ONLY` entries'
+/// `non_target_urls` allowances name install instructions and catalogue entries
+/// that live in comments, and stripping them would report every one as stale.
+///
+/// String-aware because `"https://…"` contains `//`. Without the `in_string`
+/// track, stripping would eat the rest of any line holding a URL literal --
+/// including a `check_egress(` sitting after it -- and this guard would start
+/// failing on correctly gated code. Raw strings (`r"…"`, `r#"…"#`) are handled
+/// incidentally: the opening and closing quotes are still quotes. Char literals
+/// are NOT tracked, deliberately -- `'a` lifetimes are indistinguishable from an
+/// unterminated char literal without a real lexer, and the cost of being wrong
+/// here is a false FAILURE, which someone reads, not a false pass.
+fn strip_line_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.lines() {
+        let bytes = line.as_bytes();
+        let mut in_string = false;
+        let mut cut = line.len();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' if in_string => i += 1, // skip the escaped byte
+                b'"' => in_string = !in_string,
+                b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => {
+                    cut = i;
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out.push_str(&line[..cut]);
+        out.push('\n');
     }
     out
 }
@@ -368,13 +421,17 @@ fn egress_tracked_files_reach_the_tracker() {
         let Some(prod) = senders.get(*f) else {
             continue; // the partition test owns this case
         };
-        if !TRACKER_SYMBOLS.iter().any(|s| prod.contains(s)) {
+        // Comments stripped: prose that MENTIONS a gate is not a gate. See
+        // TRACKER_SYMBOLS for the mutation that proved this necessary.
+        let code = strip_line_comments(prod);
+        if !TRACKER_SYMBOLS.iter().any(|s| code.contains(s)) {
             broken.push(*f);
         }
     }
     assert!(
         broken.is_empty(),
-        "these files are listed EGRESS_TRACKED but reference none of {TRACKER_SYMBOLS:?}:\n  {:?}",
+        "these files are listed EGRESS_TRACKED but CALL none of \
+         {TRACKER_SYMBOLS:?} in code (comments do not count):\n  {:?}",
         broken
     );
 }
@@ -510,6 +567,16 @@ fn every_reqwest_crate_owns_a_classified_sender() {
 ///
 /// So this asserts ORDER, not presence. Presence is what was already true.
 ///
+/// A review after P6a found a THIRD way, and it was this guard's own detector
+/// that hid it. The detector asked "which functions call `ensure_onnx_runtime()`"
+/// and its vacuity control pinned that answer at three -- so `run_models`
+/// (`pond models download`), which calls `model_download::download_file` twice
+/// and installs no mode at all, was not merely missed but LOCKED OUT of the
+/// question. The gate P6a added inside `download_file` was inert there, and a
+/// stored `network_mode = "offline"` permitted a full model download: a privacy
+/// control failing OPEN. The detector now asks "which functions DOWNLOAD",
+/// which is the question the test's name always claimed to be asking.
+///
 /// Source-text and not a runtime check because there is nothing to call: the
 /// defect is where a statement sits in a 3,000-line `async fn`. It lives in
 /// `pond-core` rather than beside `main.rs` because CI has no
@@ -521,7 +588,12 @@ fn every_entry_point_installs_the_gate_before_it_downloads() {
     let main_rs = workspace_root().join("crates/pond-server/src/main.rs");
     let src = std::fs::read_to_string(&main_rs)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", main_rs.display()));
-    let prod = production_source(&src);
+    // Comments stripped for the whole test. `download_and_extract_ort`'s own
+    // explanatory comment contains the literal `Command::new("curl")`, ~13
+    // lines ABOVE the `check_egress` call it is explaining, so the ORT
+    // assertion below would read the prose as the download and report the gate
+    // as too late. Same lesson as TRACKER_SYMBOLS, applied before it bites.
+    let prod = strip_line_comments(&production_source(&src));
 
     // Top-level items start at column 0, so this splits `main.rs` into function
     // bodies without brace-counting. The marker is re-prepended so each chunk
@@ -532,16 +604,41 @@ fn every_entry_point_installs_the_gate_before_it_downloads() {
         .map(|c| c.to_string())
         .collect();
 
+    // Every way a `main.rs` function reaches the network with a large transfer.
+    const DOWNLOAD_CALLS: &[&str] = &[
+        "    ensure_onnx_runtime();",
+        "model_download::download_file(",
+        "download_and_extract_ort(",
+    ];
+
+    /// The two download helpers themselves, which are NOT entry points.
+    ///
+    /// They must be named rather than inferred. Widening `DOWNLOAD_CALLS` to
+    /// ask "which functions download" made `ensure_onnx_runtime`'s own body
+    /// match (it calls `download_and_extract_ort`), and `download_and_extract_ort`'s
+    /// chunk matches its own `fn` line at byte 0. Both are helpers: their
+    /// callers own the install, and demanding one here would mean reading the
+    /// settings row from a synchronous fn with no runtime. Keeping the list
+    /// explicit and short is the point -- an entry point silently added here
+    /// is exactly the hole `run_models` sat in, so the exemption is auditable
+    /// rather than a heuristic. `download_and_extract_ort` gets its own,
+    /// stricter assertion after the loop.
+    const DOWNLOAD_HELPERS: &[&str] = &["ensure_onnx_runtime", "download_and_extract_ort"];
+
     let mut callers = 0usize;
     for chunk in &chunks {
-        // The CALL, not the definition -- the definition's chunk starts with
-        // `ensure_onnx_runtime()` and contains no call.
-        let Some(call_at) = chunk.find("    ensure_onnx_runtime();") else {
+        // The EARLIEST download in the function is the one the install has to
+        // precede. Taking the first `ensure_onnx_runtime()` and ignoring an
+        // earlier `download_file` would let a gap open up again.
+        let Some(call_at) = DOWNLOAD_CALLS.iter().filter_map(|c| chunk.find(c)).min() else {
             continue;
         };
-        callers += 1;
 
         let name = chunk.lines().next().unwrap_or("<unknown>");
+        if DOWNLOAD_HELPERS.iter().any(|h| name.starts_with(h)) {
+            continue;
+        }
+        callers += 1;
         // The CALL form, with its path qualifier and opening paren -- not the
         // bare symbol. Mutation-testing this guard is what forced the
         // distinction: deleting the install from `run_chat` left the guard
@@ -553,32 +650,77 @@ fn every_entry_point_installs_the_gate_before_it_downloads() {
 
         assert!(
             install_at.is_some(),
-            "`{name}` calls ensure_onnx_runtime(), which can download ~100 MB \
-             from github.com, but never calls set_network_mode -- so the \
-             process-global is still at its `Open` default and a stored \
-             `network_mode = \"offline\"` does not apply here. Install the mode \
-             from the settings row before the first fetch."
+            "`{name}` downloads (one of {DOWNLOAD_CALLS:?}) but never calls \
+             set_network_mode -- so the process-global is still at its `Open` \
+             default and a stored `network_mode = \"offline\"` does not apply \
+             here. Install the mode from the settings row before the first \
+             fetch."
         );
         let install_at = install_at.unwrap();
 
         assert!(
             install_at < call_at,
-            "`{name}` installs the egress gate at byte {install_at} but calls \
-             ensure_onnx_runtime() at byte {call_at} -- the download happens \
-             BEFORE the setting that governs it is read, so the gate inside it \
-             can never refuse. Move the call below set_network_mode."
+            "`{name}` installs the egress gate at byte {install_at} but \
+             downloads at byte {call_at} -- the transfer happens BEFORE the \
+             setting that governs it is read, so the gate inside it can never \
+             refuse. Move the download below set_network_mode."
         );
     }
 
-    // Vacuity control. If `ensure_onnx_runtime` is renamed or the call sites
+    // Vacuity control. If the download helpers are renamed or the call sites
     // move, the loop above finds nothing and reports success -- the exact
     // failure shape this file's header warns about.
+    //
+    // FOUR, not three. The previous three counted callers of
+    // `ensure_onnx_runtime()`, which is a different question from "which
+    // functions download" and pinned the wrong answer: `run_models`
+    // (`pond models download`) fetches a model and its config sibling through
+    // `model_download::download_file` and installed no mode at all, so P6a's
+    // gate inside that fn was inert there and `offline` permitted the download.
+    // A privacy control failing OPEN. Raise this number only after checking the
+    // new entry point installs the mode first.
     assert_eq!(
-        callers, 3,
-        "expected the 3 entry points that call ensure_onnx_runtime() \
-         (run_setup, run_server, run_chat); found {callers}. If a call site was \
-         added or removed, update this number after checking the new one \
-         installs the mode first. If it dropped to 0 the detector has broken, \
-         not the code."
+        callers, 4,
+        "expected the 4 downloading entry points (run_setup, run_server, \
+         run_chat, run_models); found {callers}. If an entry point was added or \
+         removed, update this number after checking the new one installs the \
+         mode first. If it dropped to 0 the detector has broken, not the code."
+    );
+
+    // The ORT fetch itself, which the ORDER assertions above deliberately do
+    // not cover: they prove the mode is INSTALLED in time, not that the ~100 MB
+    // github.com transfer is gated at all. Deleting the `check_egress` line
+    // from `download_and_extract_ort` left all six tests in this file green --
+    // `egress_tracked_files_reach_the_tracker` is satisfied by the unrelated
+    // OAuth `egress::begin(` elsewhere in `main.rs`, and this test only ever
+    // asked about ordering while its own failure message talked about "the gate
+    // inside it". It is the only subprocess sender in the tree, so no
+    // reqwest-shaped detector will ever see it; this is the whole of its
+    // coverage.
+    let ort = chunks
+        .iter()
+        .find(|c| c.starts_with("download_and_extract_ort("))
+        .expect(
+            "`fn download_and_extract_ort(` is gone from main.rs. It was the \
+             only subprocess sender in the tree and the only thing gating the \
+             ~100 MB ONNX Runtime fetch -- if it moved, move this assertion \
+             with it rather than deleting it.",
+        );
+    let gate_at = ort.find("egress::check_egress(").expect(
+        "`download_and_extract_ort` shells out to curl for a ~100 MB github.com \
+         transfer and no longer calls check_egress. The egress guard finds \
+         senders by looking for `reqwest` and is structurally blind to a \
+         subprocess, so nothing else in this file can catch it: `offline` and \
+         `allowlist` would both silently permit the largest single outbound \
+         transfer the pond makes.",
+    );
+    let curl_at = ort
+        .find("Command::new(\"curl\")")
+        .expect("`download_and_extract_ort` no longer shells out to curl -- re-derive this test");
+    assert!(
+        gate_at < curl_at,
+        "`download_and_extract_ort` calls check_egress at byte {gate_at} but \
+         spawns curl at byte {curl_at}. A refusal after the bytes are on the \
+         wire is not a refusal."
     );
 }

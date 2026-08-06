@@ -863,6 +863,39 @@ cannot change class quietly.
   between the old and new sites touches ONNX (`apply_face_recognition_defaults` sets env vars,
   `Database::init`, the HF-cache migration, the system-dep warning).
 
+  > **CORRECTED 2026-08-06 (synthesis). There were FOUR downloading entry points, not three, and
+  > the guard's own detector is what hid the fourth.** `run_models` (`pond models download`) calls
+  > `model_download::download_file` twice — the model and its config sibling — and installed no
+  > mode at all, so the gate P6a added inside `download_file` was inert there and a stored
+  > `network_mode = "offline"` permitted a full model download. A privacy control failing OPEN,
+  > which is the polarity invariant 3 forbids.
+  >
+  > The reason it was not merely missed but *locked out of the question*: the guard asked "which
+  > functions call `ensure_onnx_runtime()`" and pinned the answer at three with an `assert_eq!`
+  > vacuity control. A function that downloads by another route could not appear in the answer no
+  > matter how the assertion was written. The detector now asks **which functions DOWNLOAD**
+  > (`ensure_onnx_runtime();`, `model_download::download_file(`, `download_and_extract_ort(`), the
+  > count is 4, and `run_models` installs the mode immediately after its `Database::init`. The two
+  > download helpers are named in an explicit `DOWNLOAD_HELPERS` exemption rather than inferred,
+  > so an entry point cannot slip into it by accident.
+  >
+  > The general lesson, which is this file's second instance of it: a vacuity control pins the
+  > answer to whatever question the detector asks. If the question is narrower than the test's
+  > name, the control makes the gap permanent instead of catching it.
+
+  > **ALSO CORRECTED 2026-08-06 (synthesis): the ORT gate — this phase's headline discovery — had
+  > no test of any kind.** The new guard asserted only the ORDER of `set_network_mode` against
+  > `ensure_onnx_runtime()`; nothing asserted the ~100 MB github.com transfer was gated *at all*,
+  > while the guard's own failure message talked about "the gate inside it". Deleting the
+  > `check_egress` line from `download_and_extract_ort` left all six tests in `egress_guard.rs`
+  > green — `egress_tracked_files_reach_the_tracker` is satisfied by the unrelated OAuth
+  > `egress::begin(` elsewhere in `main.rs`. Since it is the only subprocess sender in the tree, no
+  > `reqwest`-shaped detector will ever see it, so that was the whole of its coverage.
+  >
+  > `every_entry_point_installs_the_gate_before_it_downloads` now also locates the
+  > `download_and_extract_ort` chunk and asserts `egress::check_egress(` appears at a byte offset
+  > **before** `Command::new("curl")`. A refusal after the bytes are on the wire is not a refusal.
+
   **What this deliberately did NOT do.** `pond-api/src/routes.rs` is untouched: it holds nine egress
   sites (HF search, HF repo files, GitHub releases, the spawned download task, the TTS voice config,
   BOTH OAuth token exchanges — `authorization_code` as well as refresh, which the doc named nowhere
@@ -889,6 +922,28 @@ cannot change class quietly.
   matters most: gating only ONE of the HF cache's two hops keeps the file-level guard GREEN and
   fails `get_redirect_to_a_non_loopback_host_is_refused_at_the_hop` with a DNS error for
   `cdn.invalid` — the proof that per-file symbol presence is not coverage.
+
+  > **CORRECTED 2026-08-06 (synthesis): the phase found this defect in its own ORDER guard and
+  > never propagated the fix to the FILE-level guard, which is the one the whole classification
+  > scheme rests on.** `TRACKER_SYMBOLS` held bare symbols (`record_egress`, `check_egress`,
+  > `egress::begin`, …), so `egress_tracked_files_reach_the_tracker` was satisfied by COMMENT
+  > PROSE. Every real gate could be deleted from a tracked file and all six tests stayed green,
+  > provided one of the phase's own explanatory comments mentioned the token. FIVE of the ten
+  > `EGRESS_TRACKED` files were vulnerable that way — and two of the five,
+  > `pond-adapters-goose/src/vision_encoder.rs` and `pond-server/src/main.rs`, were made vulnerable
+  > by comments **this phase added**. Demonstrated: removing both `egress::begin`/`finish` lines
+  > from `vision_encoder.rs` while keeping the comment left "6 passed; 0 failed".
+  >
+  > Fixed two ways, because either alone is defeatable. `TRACKER_SYMBOLS` now holds CALL forms with
+  > the opening paren, and a `strip_line_comments` pass (string-literal-aware, so a `"https://…"`
+  > does not eat the rest of its line) runs before the search. `urls_in` deliberately keeps running
+  > on the *uncommented* source: the `LOOPBACK_ONLY` entries' `non_target_urls` allowances name
+  > install instructions that genuinely live in comments, and stripping them would report every one
+  > as stale. The same mutation now fails with "these files are listed EGRESS_TRACKED but CALL none
+  > of […] in code (comments do not count)".
+  >
+  > **The standing lesson, now twice-proven in this one file:** any source-text guard in this repo
+  > that greps a bare symbol name has this defect. Match the call form, and strip comments.
 
   Gates: `cargo fmt --check` clean; pond-core 802 + 6 guard, pond-hf-cache 20 + 5, pond-api,
   pond-infra 214, pond-adapters-goose 105, pond-server lib/bins 81 all green; `cargo check -p

@@ -864,6 +864,55 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   (`role="alert"` plus the word Error), and deleting the `ChatHub` branch. Each failed naming the real
   problem; all were restored and the full suite is 261 passing.
 
+  > **CORRECTED 2026-08-06 (synthesis): that assertion is a two-substring grep, and calling it "the
+  > assertion that would go red if this phase were reverted" is too strong — it goes red only for a
+  > revert done with a delete key.** The test asserts `src.includes('ev.type === "context_warning"')`
+  > and `src.includes("<ContextPressureNote")` against `ChatHub.tsx` read off disk. Two semantic
+  > mutations that leave both strings in place passed 261/261: (a) adding `showTurnStats` to the
+  > render guard — `show_turn_stats` defaults to FALSE in Rust, so the note ships invisible on every
+  > default install, which is *the exact failure mode this stamp says it deliberately avoided by
+  > rejecting `TurnStatsFooter`*; and (b) attaching the frame to `m.id === "no-such-message"`, so it
+  > lands on nothing and can never render. Nothing in the suite ever renders `ChatHubView`, so no
+  > test observes whether the note appears.
+  >
+  > Keep the grep — it is a cheap tripwire and it does catch a deletion — but it is not coverage.
+  > What is needed is one render test that mounts `ChatHubView` (or extracts the reducer mapping a
+  > `ChatEvent` onto a `ChatMessage`) and asserts a `context_warning` followed by `done` produces a
+  > `.ctx-pressure` node. That test dies under both mutations above; the grep dies under neither.
+  > Not written here: it needs the `AppContext`/api surface stood up, which is a frontend phase, and
+  > it should land together with the `sections/Chat.tsx` half this stamp already lists as blocked.
+
+  > **OPEN 2026-08-06 (synthesis), and it is the more serious of the two: the "Compact now" control
+  > can never succeed on any default configuration.** P6's pressure axis and P7b's manual axis share
+  > both the trigger condition and the single `claim_compaction` quota, and the pressure axis takes
+  > the claim strictly BEFORE the button is rendered. In the chat-stream generator the
+  > `context_warning` frame is yielded and `spawn_pressure_compaction(&state, &session_id)` is called
+  > **one statement later**, inside the same `if health.should_compact` block. `claim_compaction`
+  > then stamps `turns_at_last_compaction` for `COMPACTION_COOLDOWN_TURNS` = 3 *recorded turns*, and
+  > `compact_session` answers `cooling_down` when the claim fails. The note only renders once
+  > `m.streaming` is false, i.e. strictly after the `done` frame, which is yielded after the spawn —
+  > so this is not a race a user can lose, the claim is already gone before the button exists.
+  > Measured by a reviewer's temporary probe reproducing the production ordering: six consecutive
+  > pressured turns, six identical `status="skipped" reason="cooling_down"` answers, never one
+  > `compacted`.
+  >
+  > So the advertised success path — `status: "compacted"` and the "Compacted — the window has room
+  > again." string — is unreachable, not merely uncommon. This is the same class as the recorded
+  > "PAI-4 P2 is correct but untriggered", except that here the phase's reachability claim asserts
+  > the opposite, which is why it is corrected rather than filed.
+  >
+  > **Deliberately not fixed by the synthesis pass, because it is a design decision and not a
+  > repair.** Two options, and they differ in what they believe the cooldown is FOR. (a) Give the
+  > manual axis its own authorisation: keep `COMPACTIONS_IN_FLIGHT`, which is what actually protects
+  > the serial on-device engine, and let a human press bypass the *turn* cooldown, on the argument
+  > that the cooldown exists to ration AUTOMATIC model calls. (b) Stop rendering the control when
+  > the pressure axis has already claimed — the server would have to say so, e.g. an
+  > `auto_pass_started` field on the `context_warning` frame — and the note becomes information
+  > only. Either way P7a's guard `a_second_press_is_refused_by_the_cooldown` must be re-derived: it
+  > currently asserts the cooldown, which is exactly the thing that makes the button dead. Note that
+  > P7a's own stamp already argued hard for *not* bypassing the limiter; whoever takes this should
+  > read that argument first and then decide, rather than treating this as an obvious bug fix.
+
   **Blocked, not deferred: `sections/Chat.tsx`.** That file was held by the concurrently-running PAI-5
   reasoning group in this batch, so the identical branch and render are NOT in the classic chat
   section, and neither is `Chat.test.tsx` nor the `context_warning` case in `tests/e2e/chat.spec.ts`
