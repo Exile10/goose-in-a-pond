@@ -264,15 +264,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
-dependencies = [
- "derive_arbitrary",
-]
-
-[[package]]
 name = "arboard"
 version = "3.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1681,7 +1672,7 @@ dependencies = [
  "arrayvec",
  "cc",
  "cfg-if 1.0.4",
- "constant_time_eq 0.4.2",
+ "constant_time_eq",
  "cpufeatures 0.3.0",
 ]
 
@@ -1922,25 +1913,6 @@ checksum = "7dafe3a8757b027e2be6e4e5601ed563c55989fcf1546e933c66c8eb3a058d35"
 dependencies = [
  "bytes",
  "either",
-]
-
-[[package]]
-name = "bzip2"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49ecfb22d906f800d4fe833b6282cf4dc1c298f5057ca0b5445e5c209735ca47"
-dependencies = [
- "bzip2-sys",
-]
-
-[[package]]
-name = "bzip2-sys"
-version = "0.1.13+1.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14"
-dependencies = [
- "cc",
- "pkg-config",
 ]
 
 [[package]]
@@ -2468,12 +2440,6 @@ dependencies = [
 
 [[package]]
 name = "constant_time_eq"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
-
-[[package]]
-name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
@@ -2673,15 +2639,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if 1.0.4",
-]
-
-[[package]]
-name = "croner"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c344b0690c1ad1c7176fe18eb173e0c927008fdaaa256e40dfd43ddd149c0843"
-dependencies = [
- "chrono",
 ]
 
 [[package]]
@@ -3036,12 +2993,6 @@ dependencies = [
  "serde",
  "uuid",
 ]
-
-[[package]]
-name = "deflate64"
-version = "0.1.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac6b926516df9c60bfa16e107b21086399f8285a44ca9711344b9e553c5146e2"
 
 [[package]]
 name = "deno_ast"
@@ -3439,17 +3390,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "derive_arbitrary"
-version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "derive_builder"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3573,32 +3513,11 @@ dependencies = [
 
 [[package]]
 name = "dirs"
-version = "5.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
-dependencies = [
- "dirs-sys 0.4.1",
-]
-
-[[package]]
-name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
 dependencies = [
- "dirs-sys 0.5.0",
-]
-
-[[package]]
-name = "dirs-sys"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
-dependencies = [
- "libc",
- "option-ext",
- "redox_users 0.4.6",
- "windows-sys 0.48.0",
+ "dirs-sys",
 ]
 
 [[package]]
@@ -3609,7 +3528,7 @@ checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users 0.5.2",
+ "redox_users",
  "windows-sys 0.59.0",
 ]
 
@@ -4861,7 +4780,7 @@ dependencies = [
  "chrono",
  "clap",
  "ctor 0.2.9",
- "dirs 6.0.0",
+ "dirs",
  "dotenvy",
  "dtor",
  "env-lock",
@@ -4938,7 +4857,7 @@ dependencies = [
  "tiktoken-rs",
  "tokenizers 0.23.1",
  "tokio",
- "tokio-cron-scheduler 0.15.1",
+ "tokio-cron-scheduler",
  "tokio-stream",
  "tokio-util",
  "tower",
@@ -5317,7 +5236,7 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aef3982638978efa195ff11b305f51f1f22f4f0a6cabee7af79b383ebee6a213"
 dependencies = [
- "dirs 6.0.0",
+ "dirs",
  "http 1.4.0",
  "indicatif",
  "libc",
@@ -6632,31 +6551,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "lzma-rs"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "297e814c836ae64db86b36cf2a557ba54368d03f6afcd7d947c266692f71115e"
-dependencies = [
- "byteorder",
- "crc",
-]
-
-[[package]]
 name = "lzma-rust2"
 version = "0.15.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e20f57f9918e5bd7bc58c22cdd70a6afc7375d4dd9683af5f2b34bd3d2bba619"
-
-[[package]]
-name = "lzma-sys"
-version = "0.1.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fda04ab3764e6cde78b9974eec4f779acaba7c4e84b36eca3cf77c581b85d27"
-dependencies = [
- "cc",
- "libc",
- "pkg-config",
-]
 
 [[package]]
 name = "mac-notification-sys"
@@ -8551,7 +8449,6 @@ dependencies = [
  "futures",
  "goose",
  "goose-providers",
- "minijinja",
  "pond-adapters-weather",
  "pond-core",
  "pond-mcp-server",
@@ -8755,7 +8652,6 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
- "goose",
  "hostname",
  "include_dir",
  "mime_guess",
@@ -8770,13 +8666,14 @@ dependencies = [
  "reqwest 0.13.3",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-stream",
  "tokio-util",
  "tower",
- "tower-http 0.6.10",
+ "tower-http 0.7.0",
  "tracing",
  "urlencoding",
  "uuid",
@@ -8854,7 +8751,7 @@ dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
  "chrono",
- "dirs 6.0.0",
+ "dirs",
  "fastembed",
  "hmac 0.12.1",
  "hostname",
@@ -8884,7 +8781,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
- "croner 2.2.0",
+ "croner",
  "futures",
  "pond-core",
  "reqwest 0.13.3",
@@ -8892,7 +8789,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tokio-cron-scheduler 0.14.0",
+ "tokio-cron-scheduler",
  "tracing",
  "uuid",
 ]
@@ -8915,7 +8812,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
- "sysinfo 0.33.1",
+ "sysinfo",
  "tokio",
  "tracing",
  "urlencoding",
@@ -8933,7 +8830,7 @@ dependencies = [
  "chrono",
  "clap",
  "cpal",
- "dirs 5.0.1",
+ "dirs",
  "flate2",
  "fs2",
  "futures",
@@ -8979,7 +8876,7 @@ dependencies = [
  "uuid",
  "webbrowser",
  "wiremock",
- "zip 2.4.2",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -9565,17 +9462,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4666a1a60d8412eab19d94f6d13dcc9cea0a5ef4fdf6a5db306537413c661b1b"
 dependencies = [
  "bitflags 2.13.1",
-]
-
-[[package]]
-name = "redox_users"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
-dependencies = [
- "getrandom 0.2.17",
- "libredox",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -10657,7 +10543,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
 dependencies = [
  "bstr",
- "dirs 6.0.0",
+ "dirs",
  "os_str_bytes",
 ]
 
@@ -11851,20 +11737,6 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.33.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fc858248ea01b66f19d8e8a6d55f41deaf91e9d495246fd01368d99935c6c01"
-dependencies = [
- "core-foundation-sys",
- "libc",
- "memchr",
- "ntapi",
- "rayon",
- "windows 0.57.0",
-]
-
-[[package]]
-name = "sysinfo"
 version = "0.38.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92ab6a2f8bfe508deb3c6406578252e491d299cbbf3bc0529ecc3313aee4a52f"
@@ -12295,28 +12167,13 @@ dependencies = [
 
 [[package]]
 name = "tokio-cron-scheduler"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c71ce8f810abc9fabebccc30302a952f9e89c6cf246fafaf170fef164063141"
-dependencies = [
- "chrono",
- "croner 2.2.0",
- "num-derive",
- "num-traits",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "tokio-cron-scheduler"
 version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f50e41f200fd8ed426489bd356910ede4f053e30cebfbd59ef0f856f0d7432a"
 dependencies = [
  "chrono",
  "chrono-tz",
- "croner 3.0.1",
+ "croner",
  "num-derive",
  "num-traits",
  "tokio",
@@ -12569,11 +12426,6 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
- "http-range-header",
- "httpdate",
- "mime",
- "mime_guess",
- "percent-encoding",
  "pin-project-lite",
  "tokio",
  "tokio-util",
@@ -12591,9 +12443,19 @@ checksum = "b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233"
 dependencies = [
  "bitflags 2.13.1",
  "bytes",
+ "futures-core",
+ "futures-util",
  "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
+ "http-range-header",
+ "httpdate",
+ "mime",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
 ]
@@ -13719,16 +13581,6 @@ dependencies = [
 
 [[package]]
 name = "windows"
-version = "0.57.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12342cb4d8e3b046f3d80effd474a7a02447231330ef77d71daa6fbc40681143"
-dependencies = [
- "windows-core 0.57.0",
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows"
 version = "0.61.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9babd3a767a4c1aef6900409f85f5d53ce2544ccdfaa86dad48c91782c6d6893"
@@ -14603,7 +14455,7 @@ dependencies = [
  "colored",
  "const-str",
  "ctor 1.0.10",
- "dirs 6.0.0",
+ "dirs",
  "futures",
  "git-version",
  "humantime",
@@ -14617,7 +14469,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shellexpand",
- "sysinfo 0.38.4",
+ "sysinfo",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -14635,15 +14487,6 @@ name = "xmlparser"
 version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66fee0b777b0f5ac1c69bb06d361268faafa61cd4682ae064a171c16c433e9e4"
-
-[[package]]
-name = "xz2"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "388c44dc09d76f1536602ead6d325eb532f5c122f17782bd57fb47baeeb767e2"
-dependencies = [
- "lzma-sys",
-]
 
 [[package]]
 name = "yansi"
@@ -14875,36 +14718,6 @@ dependencies = [
  "crc32fast",
  "crossbeam-utils",
  "flate2",
-]
-
-[[package]]
-name = "zip"
-version = "2.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
-dependencies = [
- "aes 0.8.4",
- "arbitrary",
- "bzip2",
- "constant_time_eq 0.3.1",
- "crc32fast",
- "crossbeam-utils",
- "deflate64",
- "displaydoc",
- "flate2",
- "getrandom 0.3.4",
- "hmac 0.12.1",
- "indexmap 2.14.0",
- "lzma-rs",
- "memchr",
- "pbkdf2",
- "sha1",
- "thiserror 2.0.18",
- "time",
- "xz2",
- "zeroize",
- "zopfli",
- "zstd",
 ]
 
 [[package]]

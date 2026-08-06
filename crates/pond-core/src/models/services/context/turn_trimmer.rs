@@ -77,6 +77,32 @@ pub struct TrimOutcome {
     pub changed: bool,
 }
 
+/// Whether the current turn's user message is already in the slice handed to
+/// [`trim_history`].
+///
+/// This is the only thing that decides which user messages carry a *stale*
+/// `<system-context>`, and it was previously assumed rather than passed — the
+/// trimmer always spared the last user message on the grounds that it was the
+/// current turn's fresh injection. In production it never is: the Goose adapter
+/// calls `trim_goose_history` *before* `Agent::reply` appends anything, so the
+/// last user message present is the PREVIOUS turn's, and sparing it re-prefilled
+/// a stale block — wrong date, the previous message's selected memories, the
+/// previous turn-budget note — on the one turn where it was about to matter, and
+/// handed the model two conflicting `<system-context>` blocks.
+///
+/// It also made `TrimOutcome::changed` true on every turn from the third
+/// onwards, which defeated the adapter's `if !changed { return; }` and forced a
+/// whole-table rewrite of the engine conversation every single turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CurrentTurn {
+    /// The caller trims before appending this turn. Every user message present
+    /// is history, so every one of them is stale. This is the production shape.
+    NotYetAppended,
+    /// The caller trims after appending. The last user message is this turn's
+    /// fresh injection and must survive.
+    AlreadyAppended,
+}
+
 /// Remove a `<system-context>…</system-context>` block from a prior user
 /// message. Those blocks carry per-turn date/time and memory injections that
 /// are stale in history — the current turn re-injects fresh ones.
@@ -122,6 +148,7 @@ pub fn trim_history(
     rolling_summary: Option<&str>,
     last_real_prompt_tokens: Option<u32>,
     counter: &dyn TokenCounter,
+    current_turn: CurrentTurn,
 ) -> TrimOutcome {
     let mut changed = false;
 
@@ -155,15 +182,19 @@ pub fn trim_history(
         }
     }
 
-    // 1. Strip stale <system-context> from all PRIOR user messages (every
-    //    user message except the last one — the current turn's injection is
-    //    added after trimming by the adapter).
+    // 1. Strip stale <system-context> from every PRIOR user message. Which ones
+    //    those are is the caller's to say (see `CurrentTurn`) — the adapter trims
+    //    before the turn is appended, so on that path there is no message to
+    //    spare and `spare_last_user` is None.
     let mut msgs: Vec<TrimMessage> = messages;
-    let last_user = msgs
-        .iter()
-        .rposition(|m| m.role == TrimRole::User && !m.is_summary);
+    let spare_last_user = match current_turn {
+        CurrentTurn::AlreadyAppended => msgs
+            .iter()
+            .rposition(|m| m.role == TrimRole::User && !m.is_summary),
+        CurrentTurn::NotYetAppended => None,
+    };
     for (i, m) in msgs.iter_mut().enumerate() {
-        if m.role == TrimRole::User && !m.is_summary && Some(i) != last_user {
+        if m.role == TrimRole::User && !m.is_summary && Some(i) != spare_last_user {
             if let Cow::Owned(stripped) = strip_system_context(&m.text) {
                 m.text = stripped;
                 changed = true;
@@ -295,7 +326,17 @@ pub fn plan_replay(
             is_summary: false,
         })
         .collect();
-    trim_history(trim_input, profile, rolling_summary, None, counter).messages
+    // Trailing user messages were popped above, so nothing here is the current
+    // turn — every `<system-context>` in this input is stale by construction.
+    trim_history(
+        trim_input,
+        profile,
+        rolling_summary,
+        None,
+        counter,
+        CurrentTurn::NotYetAppended,
+    )
+    .messages
 }
 
 #[cfg(test)]
@@ -340,7 +381,14 @@ mod tests {
         assert_eq!(p.usable_prompt_tokens(), 3328);
 
         let msgs: Vec<TrimMessage> = (0..40).map(|i| user(i, &"x".repeat(400))).collect();
-        let out = trim_history(msgs, &p, None, None, &HeuristicTokenCounter);
+        let out = trim_history(
+            msgs,
+            &p,
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+        );
         // 1200 <= 3328, so the declared budget still applies here.
         assert!(out.estimated_tokens <= 1200, "got {}", out.estimated_tokens);
     }
@@ -352,7 +400,14 @@ mod tests {
     fn the_reserve_wins_when_it_is_tighter_than_the_declared_budget() {
         let p = profile_reserved(4000, 2048, 768); // usable = 1280
         let msgs: Vec<TrimMessage> = (0..40).map(|i| user(i, &"x".repeat(400))).collect();
-        let out = trim_history(msgs, &p, None, None, &HeuristicTokenCounter);
+        let out = trim_history(
+            msgs,
+            &p,
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+        );
         assert!(
             out.estimated_tokens <= 1280,
             "history must fit the usable window, got {}",
@@ -368,11 +423,25 @@ mod tests {
         let p = profile_reserved(1200, 4096, 768); // usable = 3328
         let msgs: Vec<TrimMessage> = (0..40).map(|i| user(i, &"x".repeat(400))).collect();
 
-        let baseline =
-            trim_history(msgs.clone(), &p, None, None, &HeuristicTokenCounter).estimated_tokens;
+        let baseline = trim_history(
+            msgs.clone(),
+            &p,
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+        )
+        .estimated_tokens;
         // Engine said the last prompt was 3,786 tokens — 458 over the ceiling.
-        let corrected =
-            trim_history(msgs, &p, None, Some(3786), &HeuristicTokenCounter).estimated_tokens;
+        let corrected = trim_history(
+            msgs,
+            &p,
+            None,
+            Some(3786),
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+        )
+        .estimated_tokens;
         assert!(
             corrected < baseline,
             "overshoot must tighten the budget: {corrected} vs {baseline}"
@@ -386,7 +455,14 @@ mod tests {
     fn the_budget_never_collapses_below_the_floor() {
         let p = profile_reserved(1200, 4096, 768);
         let msgs: Vec<TrimMessage> = (0..40).map(|i| user(i, &"x".repeat(400))).collect();
-        let out = trim_history(msgs, &p, None, Some(100_000), &HeuristicTokenCounter);
+        let out = trim_history(
+            msgs,
+            &p,
+            None,
+            Some(100_000),
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+        );
         assert!(out.estimated_tokens > 0, "must keep the current turn");
     }
 
@@ -416,25 +492,96 @@ mod tests {
     }
 
     #[test]
-    fn strips_stale_system_context_from_prior_user_messages_only() {
+    /// The production shape: the adapter trims before the turn is appended, so
+    /// EVERY user message present is history and every block in it is stale.
+    ///
+    /// This test used to assert the opposite — that `msgs[2]` kept its block —
+    /// with a fixture whose last message was the current turn's. Nothing in
+    /// production ever built that input: `trim_goose_history` runs before
+    /// `Agent::reply`. It was a green test for a state that could not occur,
+    /// which is the unreachable-fixture trap CLAUDE.md warns about.
+    #[test]
+    fn every_user_message_is_stale_when_the_turn_has_not_been_appended_yet() {
         let wrapped =
             "<system-context>\nToday is X\n</system-context>\n<user-message>hi</user-message>";
         let msgs = vec![user(0, wrapped), assistant(1, "hello"), user(2, wrapped)];
-        let out = trim_history(msgs, &profile(10_000), None, None, &HeuristicTokenCounter);
+        let out = trim_history(
+            msgs,
+            &profile(10_000),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+        );
+        assert!(out.changed);
+        for i in [0, 2] {
+            assert!(
+                !out.messages[i].text.contains("<system-context>"),
+                "message {i} kept a stale system-context block"
+            );
+            assert!(out.messages[i]
+                .text
+                .contains("<user-message>hi</user-message>"));
+        }
+    }
+
+    /// The other half of the contract, so the enum cannot quietly become a
+    /// one-armed switch.
+    #[test]
+    fn the_appended_current_turn_keeps_its_fresh_injection() {
+        let wrapped =
+            "<system-context>\nToday is X\n</system-context>\n<user-message>hi</user-message>";
+        let msgs = vec![user(0, wrapped), assistant(1, "hello"), user(2, wrapped)];
+        let out = trim_history(
+            msgs,
+            &profile(10_000),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::AlreadyAppended,
+        );
         assert!(out.changed);
         assert!(!out.messages[0].text.contains("<system-context>"));
-        assert!(out.messages[0]
-            .text
-            .contains("<user-message>hi</user-message>"));
-        // The LAST user message keeps its block (current-turn injection).
         assert!(out.messages[2].text.contains("<system-context>"));
+    }
+
+    /// The write-amplification guard. A conversation that already fits and has
+    /// no stale blocks must report `changed == false`, or the adapter's early
+    /// return never fires and it rewrites goose's whole message table per turn.
+    #[test]
+    fn a_steady_state_conversation_reports_no_change() {
+        let msgs = vec![
+            user(0, "<user-message>hi</user-message>"),
+            assistant(1, "hello"),
+            user(2, "<user-message>again</user-message>"),
+            assistant(3, "sure"),
+        ];
+        let out = trim_history(
+            msgs,
+            &profile(10_000),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+        );
+        assert!(
+            !out.changed,
+            "nothing was stale or oversized, yet the adapter was told to rewrite"
+        );
     }
 
     #[test]
     fn truncates_oversized_tool_results() {
         let big = format!("START{}END", "x".repeat(TOOL_RESULT_MAX_CHARS + 500));
         let msgs = vec![user(0, "check"), tool(1, &big), assistant(2, "done")];
-        let out = trim_history(msgs, &profile(10_000), None, None, &HeuristicTokenCounter);
+        let out = trim_history(
+            msgs,
+            &profile(10_000),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+        );
         assert!(out.changed);
         assert!(out.messages[1].text.len() < TOOL_RESULT_MAX_CHARS + 64);
         // Head+tail: the conclusion at the end of a tool result survives.
@@ -452,6 +599,7 @@ mod tests {
             Some("we discussed ducks"),
             None,
             &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
         );
         assert!(out.messages[0].is_summary);
         assert!(out.messages[0].text.contains("<conversation-summary>"));
@@ -464,6 +612,7 @@ mod tests {
             Some("now geese"),
             None,
             &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
         );
         let summaries: Vec<_> = out2.messages.iter().filter(|m| m.is_summary).collect();
         assert_eq!(summaries.len(), 1);
@@ -483,7 +632,14 @@ mod tests {
             user(5, "latest question"),
             assistant(6, "latest answer"),
         ];
-        let out = trim_history(msgs, &profile(100), None, None, &HeuristicTokenCounter);
+        let out = trim_history(
+            msgs,
+            &profile(100),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+        );
         assert_eq!(out.dropped_turns, 2);
         // Whole turns went together: no leading tool/assistant orphans.
         assert_eq!(out.messages.first().unwrap().role, TrimRole::User);
@@ -499,7 +655,14 @@ mod tests {
     fn last_turn_survives_even_over_budget() {
         let huge = "y".repeat(4_000);
         let msgs = vec![user(0, &huge), assistant(1, &huge)];
-        let out = trim_history(msgs, &profile(50), None, None, &HeuristicTokenCounter);
+        let out = trim_history(
+            msgs,
+            &profile(50),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+        );
         assert_eq!(out.messages.len(), 2, "the current turn is never dropped");
     }
 
@@ -518,6 +681,7 @@ mod tests {
             Some("sum"),
             None,
             &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
         );
         let twice = trim_history(
             once.messages.clone(),
@@ -525,6 +689,7 @@ mod tests {
             Some("sum"),
             None,
             &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
         );
         assert!(!twice.changed, "second pass must be a no-op");
         assert_eq!(once.messages.len(), twice.messages.len());
@@ -533,7 +698,14 @@ mod tests {
     #[test]
     fn unchanged_input_reports_changed_false() {
         let msgs = vec![user(0, "hi"), assistant(1, "hello")];
-        let out = trim_history(msgs, &profile(10_000), None, None, &HeuristicTokenCounter);
+        let out = trim_history(
+            msgs,
+            &profile(10_000),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+        );
         assert!(!out.changed);
         assert_eq!(out.dropped_turns, 0);
     }
@@ -555,6 +727,7 @@ mod tests {
             None,
             None,
             &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
         );
         assert_eq!(relaxed.dropped_turns, 0);
         let tightened = trim_history(
@@ -563,6 +736,7 @@ mod tests {
             None,
             Some(6144),
             &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
         );
         assert!(tightened.dropped_turns > 0);
     }

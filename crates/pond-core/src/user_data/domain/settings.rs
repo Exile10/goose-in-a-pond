@@ -180,12 +180,6 @@ pub struct Settings {
     #[serde(default = "Settings::default_prompt_addendum")]
     pub prompt_addendum: String,
 
-    // ── Fast path ──────────────────────────────────────────────────────────
-    /// When true, trivial messages (greetings, farewells, thanks, acknowledgments)
-    /// are answered deterministically in <10ms without invoking the LLM.
-    #[serde(default = "Settings::default_fast_path_enabled")]
-    pub fast_path_enabled: bool,
-
     // ── Model roles ────────────────────────────────────────────────────────
     /// Provider for the Chat role (fast, conversational). Default = llm_provider.
     #[serde(default = "Settings::default_llm_provider")]
@@ -675,24 +669,11 @@ pub struct Settings {
     #[serde(default = "Settings::default_cloud_output_price_per_million")]
     pub cloud_output_price_per_million: f64,
 
-    // ── Tool cache ──────────────────────────────────────────────────────────
-    /// When true, deterministic tool results (weather, Wikipedia, devices, schedules)
-    /// are cached in memory with per-tool TTLs to avoid redundant API calls.
-    #[serde(default = "Settings::default_tool_cache_enabled")]
-    pub tool_cache_enabled: bool,
-
     // ── Telemetry ─────────────────────────────────────────────────────────
     /// When true, per-turn telemetry metrics (TTFT, token counts, tool latency,
     /// context utilization) are recorded for each chat turn.
     #[serde(default = "Settings::default_telemetry_enabled")]
     pub telemetry_enabled: bool,
-
-    // ── Compact encoding ────────────────────────────────────────────────────
-    /// When true, structured data injected into LLM prompts (memories, tool
-    /// results) uses a compact TOON-style encoding that reduces token count
-    /// by 30-60%. Default: true.
-    #[serde(default = "Settings::default_compact_encoding")]
-    pub compact_encoding: bool,
 
     // ── Experimental ────────────────────────────────────────────────────────
     /// When true, the ToolAgent detects multiple tool intents per message
@@ -810,7 +791,6 @@ impl Default for Settings {
             prompt_style: Self::default_prompt_style(),
             custom_system_prompt: None,
             prompt_addendum: Self::default_prompt_addendum(),
-            fast_path_enabled: Self::default_fast_path_enabled(),
             chat_provider: Self::default_llm_provider(),
             chat_model: Self::default_active_llm_model(),
             tool_model: None,
@@ -894,9 +874,7 @@ impl Default for Settings {
             context_monitor_enabled: Self::default_context_monitor_enabled(),
             cloud_input_price_per_million: Self::default_cloud_input_price_per_million(),
             cloud_output_price_per_million: Self::default_cloud_output_price_per_million(),
-            tool_cache_enabled: Self::default_tool_cache_enabled(),
             telemetry_enabled: Self::default_telemetry_enabled(),
-            compact_encoding: Self::default_compact_encoding(),
             multi_tool_enabled: false,
             tool_call_validation: Self::default_tool_call_validation(),
             tool_request_detection: Self::default_tool_request_detection(),
@@ -918,9 +896,6 @@ impl Default for Settings {
 }
 
 impl Settings {
-    fn default_fast_path_enabled() -> bool {
-        true
-    }
     fn default_prompt_style() -> String {
         "balanced".to_string()
     }
@@ -1221,13 +1196,7 @@ impl Settings {
     fn default_cloud_output_price_per_million() -> f64 {
         10.00
     }
-    fn default_tool_cache_enabled() -> bool {
-        true
-    }
     fn default_telemetry_enabled() -> bool {
-        true
-    }
-    fn default_compact_encoding() -> bool {
         true
     }
     fn default_tool_call_validation() -> bool {
@@ -1929,7 +1898,6 @@ mod tests {
             "cloud_fallback_enabled",
             "cloud_input_price_per_million",
             "cloud_output_price_per_million",
-            "compact_encoding",
             "context_monitor_enabled",
             "context_window_override",
             "custom_system_prompt",
@@ -1946,7 +1914,6 @@ mod tests {
             "ext_system_enabled",
             "ext_vision_enabled",
             "ext_weather_enabled",
-            "fast_path_enabled",
             "home_name",
             "llm_max_tokens",
             "llm_provider",
@@ -1986,7 +1953,6 @@ mod tests {
             "telemetry_enabled",
             "thinking_mode",
             "timezone",
-            "tool_cache_enabled",
             "tool_call_validation",
             "tool_model",
             "tool_output_compaction",

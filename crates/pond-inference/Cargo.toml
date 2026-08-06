@@ -33,9 +33,16 @@ tracing       = { workspace = true }
 uuid          = { workspace = true, features = ["v4"] }
 encoding_rs   = "0.8"
 
-# The version MUST match goose's pinned version to avoid duplicate llama backends.
+# Take the workspace entry rather than restating it. It carries goose's exact pin
+# AND `default-features = false`, and both matter: a literal `version = "0.1.143"`
+# here unified with goose's `=0.1.146` (a caret range accepts it) while the missing
+# `default-features = false` re-enabled upstream's `default = ["openmp", ...]` for
+# the whole resolution unit. Resolver v2 unions features across normal deps, so
+# this crate — which cannot execute at all under the Q2-05 quarantine — decided how
+# ggml was threaded for the engine that does. It showed up as GGML_OPENMP:BOOL=ON
+# in three of four llama-cpp-sys-2 build dirs.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-llama-cpp-2 = { version = "0.1.143", features = ["sampler"] }
+llama-cpp-2 = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-llama-cpp-2 = { version = "0.1.143", features = ["sampler", "metal"] }
+llama-cpp-2 = { workspace = true, features = ["metal"] }

@@ -208,7 +208,7 @@ cargo run -p pond-server
 |---|---|---|---|
 | `Agent` | `AgentRequest`, `AgentResponse` | `MockAgent` | `GooseAdapter` (pond-adapters-goose) |
 | `LlmProvider` | `ChatMessage`, `Role` | `MockProvider`, `FallbackProvider` | `GooseProviderAdapter`, `LlamafileProvider`, `LocalInferenceProvider` |
-| `SessionStorage` | `ChatSession`, `ChatMessage` | `InMemorySessionStorage` | `SqliteSessionStorage` (pond-infra), `GooseSessionAdapter` (pond-adapters-goose) |
+| `SessionStorage` | `ChatSession`, `ChatMessage` | `InMemorySessionStorage` | `SqliteSessionStorage` (pond-infra) |
 | `VoiceInput` | — | `StdinInput` | `WhisperInput` (pond-adapters-whisper) |
 | `VoiceOutput` | — | `PrintOutput` | `PiperOutput` (pond-adapters-piper) |
 | `WakeWordDetector` | — | `InstantActivation` | `WhisperKeywordDetector` (pond-adapters-whisper) |

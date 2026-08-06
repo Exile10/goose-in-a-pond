@@ -505,7 +505,6 @@ function AgentTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
       </Section>
       {devMode && (
         <Section title="Performance">
-          <Row label="Fast path" hint="Skip redundant processing steps for simple queries"><Switch isSelected={s.fast_path_enabled ?? true} onChange={(v) => patch("fast_path_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
           <Row label="Max turns" hint="Tool-calling steps allowed per request (0 = unlimited; the idle timeout still applies)"><input type="number" role="spinbutton" className="native-input" min={0} max={500} value={s.agent_max_turns ?? 50} onChange={(e) => patch("agent_max_turns", Number(e.target.value))} /></Row>
           <Row label="Idle timeout" hint="Abort a turn only after this many seconds with no output (0 disables)"><div className="settings-inline-row"><input type="number" role="spinbutton" className="native-input native-input--w100" min={0} max={3600} value={s.agent_timeout_secs ?? 300} onChange={(e) => patch("agent_timeout_secs", Number(e.target.value))} /><span className="muted-12">seconds</span></div></Row>
           <Row label="Tool output compaction"><Switch isSelected={s.tool_output_compaction ?? true} onChange={(v) => patch("tool_output_compaction", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
@@ -560,7 +559,6 @@ function DataTab({ s, patch, serverUrl, onServerUrlChange, devMode }: { s: Parti
           <Section title="Telemetry">
             <Row label="Usage telemetry"><Switch isSelected={s.telemetry_enabled ?? true} onChange={(v) => patch("telemetry_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
             <Row label="Context monitoring"><Switch isSelected={s.context_monitor_enabled ?? true} onChange={(v) => patch("context_monitor_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-            <Row label="Compact encoding"><Switch isSelected={s.compact_encoding ?? true} onChange={(v) => patch("compact_encoding", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
           </Section>
           <Section title="Cloud cost comparison">
             <Row label="Input price"><div className="settings-inline-row"><span className="muted-12">$</span><input type="number" role="spinbutton" step={0.1} className="native-input native-input--w100" min={0} value={s.cloud_input_price_per_million ?? 2.5} onChange={(e) => patch("cloud_input_price_per_million", Number(e.target.value))} /><span className="muted-12">/ 1M tokens</span></div></Row>
@@ -717,7 +715,6 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
       {devMode && (
         <>
           <Section title="Tool behaviour">
-            <Row label="Tool result cache"><Switch isSelected={s.tool_cache_enabled ?? true} onChange={(v) => patch("tool_cache_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
             <Row label="Tool call validation"><Switch isSelected={s.tool_call_validation ?? true} onChange={(v) => patch("tool_call_validation", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
             <Row label="Tool request detection"><Switch isSelected={s.tool_request_detection ?? true} onChange={(v) => patch("tool_request_detection", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
             <Row label="Multi-tool"><Switch isSelected={s.multi_tool_enabled ?? false} onChange={(v) => patch("multi_tool_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>

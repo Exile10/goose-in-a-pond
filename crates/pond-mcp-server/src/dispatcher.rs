@@ -53,16 +53,21 @@ const PREFIX_DRAFT: &str = "giap-draft__";
 /// Prefix for the audit / privacy tools (`get_recent_activity`, `summarize_activity`,
 /// privacy report). These ARE callable Goose builtin extension tools.
 ///
-/// `giap-audit` (and, symmetrically, `giap-vision`) are intentionally NOT added to
-/// this dispatcher's `servers` vec. This `McpToolDispatcher` is the **PondAgent**
-/// direct-dispatch path, which is quarantined (Q2-05, not runtime-activatable). The
-/// live chat routes both run through `GooseAdapter`, which dispatches audit/vision
-/// tools via Goose's own extension manager (see `giap_registration.rs`), not here.
-/// Additionally, both servers need their backing stores installed via the global
-/// `init_audit_deps` / `init_vision_deps` (called in pond-server where the logs DB
-/// is in scope) rather than through `McpToolDispatcher::new`, whose constructor does
-/// not receive an `EventLog` / `CameraStorage`. The prefix const is defined for
-/// completeness and to document the routing so future edits don't re-flag the gap.
+/// `giap-audit` (and, symmetrically, `giap-vision`) are NOT in this dispatcher's
+/// `servers` vec, because both need backing stores installed by the global
+/// `init_audit_deps` / `init_vision_deps` (called in pond-server, where the logs
+/// DB is in scope) rather than through `McpToolDispatcher::new`, whose
+/// constructor receives no `EventLog` or `CameraStorage`. The live chat routes
+/// reach them through `GooseAdapter` and Goose's extension manager instead (see
+/// `giap_registration.rs`).
+///
+/// This comment used to call the dispatcher "the PondAgent direct-dispatch path,
+/// which is quarantined". It is not quarantined: `main.rs` binds it into
+/// `AppState` unconditionally and `POST /api/v1/tools/invoke` and
+/// `POST /api/v1/mcp/tools/call` serve it to any paired client. What keeps it
+/// safe is `routes.rs :: DIRECT_DISPATCH_ALLOWLIST`, not the quarantine — these
+/// routes carry no engine session, so no `_meta`, so no caller, and a policy
+/// check against an unknown caller is *permitted* under `PolicyMode::Audit`.
 #[allow(dead_code)] // documented, referenced in tests; not routed via this dispatcher (see above)
 const PREFIX_AUDIT: &str = "giap-audit__";
 
@@ -182,7 +187,12 @@ impl McpToolDispatcher {
         let news_server = NewsMcpServer::new(http_client.clone());
         let finance_server = FinanceMcpServer::new(http_client.clone());
         let discovery_server = DiscoveryMcpServer::new(http_client, settings_repo);
-        let draft_server = DraftMcpServer::new(draft_repo);
+        // Defence in depth. `routes.rs :: DIRECT_DISPATCH_ALLOWLIST` is what keeps
+        // the draft tools off this path at all; the authority is what makes the
+        // ownership check real if they ever come back. Without it every decision
+        // is unresolvable, and unresolvable is *permitted* under `audit`.
+        let draft_server =
+            DraftMcpServer::new(draft_repo).with_authority(crate::draft::draft_authority());
 
         // Create a dummy peer via serve_directly on a DuplexStream.
         // The system server is lightweight (no deps) — we use it as the service

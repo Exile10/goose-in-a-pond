@@ -90,38 +90,22 @@ pub struct PromptState {
     pub prefix_hash: Option<u64>,
 }
 
-/// Tool definitions shared between the system prompt template and the classifier.
-/// Returns a list of `(id, description)` pairs. Content is static.
-pub fn giap_tool_definitions() -> &'static [(&'static str, &'static str)] {
-    &[
-        ("wikipedia", "Look up ANY factual, conceptual, or encyclopedic information. Use for: people, places, events, science, history, geography, technology, definitions, concepts, comparisons (\"compare X and Y\"), \"what is X\", \"how does X work\", \"what is the difference between X and Y\", cultural topics, organizations, species, diseases, inventions, wars, countries, languages — anything where accurate, detailed knowledge matters. ALWAYS prefer this over guessing from memory. When in doubt, look it up."),
-        ("weather", "Get current weather or multi-day forecast for any location. Supports 'location' param (e.g. 'Kisumu', 'London') — omit for the user's default. Use get_current_weather for now, get_weather_forecast for upcoming days. Use when the user asks about weather, temperature, forecast, rain, or whether to bring an umbrella."),
-        ("save_memory", "Save information the user wants remembered for later (preferences, facts about themselves, important dates, notes). Use when the user says 'remember', 'don't forget', 'save this', 'note that', or states a personal preference or fact about themselves."),
-        ("recall_memory", "Search saved memories for previously stored information. Use when the user asks 'do you remember', 'what did I say about', or references something they told you before, or asks about their own preferences/history."),
-        ("devices", "List or check status of registered smart home devices. Use when the user asks about their devices, what's connected, or home automation status."),
-        ("schedules", "List scheduled tasks and automations. Use when the user asks about their schedules, reminders, or timed tasks."),
-        ("create_schedule", "Create a new scheduled automation that runs a prompt at a recurring time. Use when the user wants to schedule something, set up a recurring task, or says 'every morning', 'every day at', 'schedule to', 'remind me every', 'at 10 am do'."),
-        ("time", "Get the current date, time, and timezone. Use when the user asks 'what time is it', 'what's today's date', or needs the current time/date for any reason."),
-        ("system_info", "Get system information including OS, hostname, memory usage, and disk space. Use when the user asks about their system, available RAM, disk usage, hardware info, or system specs."),
-        ("notification", "Send a desktop notification popup to the user. Use when the user asks to be notified, alerted, or wants a popup reminder."),
-        ("shell_command", "Execute a safe, sandboxed shell command. Only allow-listed commands: ls, cat, echo, date, uptime, df, free, whoami, hostname, pwd, wc, head, tail, sort, uniq, grep, find, which, env, printenv. Use when the user asks to run a command or check system state via CLI."),
-        ("read_file", "Read the contents of a local file. Use when the user asks to read, view, show, or inspect a file on their system."),
-        ("write_file", "Write content to a local file. Can overwrite or append. Use when the user asks to write, save, or create a file on their system."),
-    ]
-}
-
-/// Pre-formatted tool description lines for prompt template injection.
-/// Cached to avoid 6 `format!()` allocations per turn.
-pub fn giap_tool_description_lines() -> &'static [String] {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<Vec<String>> = OnceLock::new();
-    CACHED.get_or_init(|| {
-        giap_tool_definitions()
-            .iter()
-            .map(|(name, desc)| format!("{} — {}", name, desc))
-            .collect()
-    })
-}
+// `giap_tool_definitions` / `giap_tool_description_lines` used to live here: 13
+// hardcoded (name, description) pairs rendered into the prompt as an "Available
+// tools:" list. Only four of the names existed. The rest named nothing the
+// dispatcher would answer to -- `weather` for `get_current_weather`,
+// `shell_command` for `run_shell_command` -- while 48 real tools were absent,
+// and the block measured 2,931 chars (~732 tokens) at every prompt style and at
+// BOTH compaction tiers, since the compact tier never shortened it.
+//
+// It was also unreachable: production always passes a registry, so the adapter
+// took the registry branch and this static fallback rendered only in tests. That
+// is the more useful half of the finding -- the prose list production actually
+// renders comes from `InMemoryToolRegistry`, which nothing seeds with the 61
+// builtin `giap-*` tools, so it is empty unless the user has added an external
+// MCP extension. The model is told about builtins through native tool schemas
+// instead, which every live provider supports, so an empty section is correct
+// and a hardcoded one could only ever drift back out of date.
 
 /// Estimate how many tokens the model should generate based on query complexity.
 ///
@@ -1643,12 +1627,26 @@ mod tests {
             .collect()
     }
 
+    /// A stable, non-empty tool list for template renders. Deliberately small:
+    /// the budget assertions below measure the TEMPLATE's cost, and pinning them
+    /// to a live inventory would make an unrelated new tool fail this test.
+    pub(super) fn sample_tool_lines() -> Vec<String> {
+        vec![
+            "get_current_weather \u{2014} Current conditions for a location.".to_string(),
+            "save_memory \u{2014} Remember something the user asked to keep.".to_string(),
+            "run_shell_command \u{2014} Run an allow-listed shell command.".to_string(),
+        ]
+    }
+
     /// PromptState for golden-test renders.
     pub(super) fn v2_state(compact: bool, tools: bool, native: bool) -> PromptState {
         PromptState {
             compact_prompt: compact,
+            // A representative fixture, not a production inventory. These are
+            // real tool names, but the point of the golden renders is the
+            // TEMPLATE, so the list only has to be non-empty and stable.
             available_tools: if tools {
-                giap_tool_description_lines().to_vec()
+                sample_tool_lines()
             } else {
                 Vec::new()
             },
@@ -1743,7 +1741,7 @@ mod tests {
                 "style '{name}': tool listing must render when native_tools_json=false"
             );
             assert!(
-                listed.contains("wikipedia"),
+                listed.contains("get_current_weather"),
                 "style '{name}': tool description lines must render"
             );
 
@@ -1777,7 +1775,7 @@ mod tests {
                 current_time: "14:32".to_string(),
                 compact_prompt: true,
                 native_tools_json: true,
-                available_tools: giap_tool_description_lines().to_vec(),
+                available_tools: sample_tool_lines(),
                 ..Default::default()
             };
             let partition = build_prompt_partition(&s, None, &state, raw);

@@ -19,7 +19,16 @@ pond-adapters-weather = { path = "../pond-adapters-weather" }
 rmcp       = { workspace = true }
 anyhow     = "1.0"
 async-trait = "0.1"
-tokio      = { version = "1.49", features = ["full"] }
+# "full" pulled in every tokio feature (net, signal, io-std, macros, sync…)
+# for a crate that only touches fs, process spawning, one duplex-pipe pair,
+# and a command timeout. Narrowed to what src/*.rs actually calls: fs
+# (system.rs file read/write tools), io-util (AsyncWriteExt + the in-memory
+# DuplexStream/duplex() every module's rmcp handler uses), process
+# (system.rs run_command), rt (tokio::spawn in audit.rs), time (the
+# run_command timeout). "sync" (tokio::sync::RwLock, test-only) and "macros"
+# (#[tokio::test]) live in [dev-dependencies] instead of being pulled into
+# the production feature set.
+tokio      = { version = "1.49", features = ["fs", "io-util", "process", "rt", "time"] }
 serde      = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing    = "0.1"
@@ -30,11 +39,11 @@ chrono-tz  = "0.10"
 schemars   = { version = "1", features = ["derive"] }
 reqwest      = { workspace = true }
 urlencoding  = { workspace = true }
-sysinfo      = "0.33"
+sysinfo      = "0.38"
 # Phase F3/F5: camera snapshots are handed to the model as MCP image content,
 # which the protocol carries base64-encoded.
 base64       = { workspace = true }
 notify-rust  = "4"
 
 [dev-dependencies]
-tokio = { version = "1.49", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "sync"] }

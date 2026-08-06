@@ -108,8 +108,6 @@ export interface Settings {
   weather_latitude?: number;
   weather_longitude?: number;
 
-  // Fast path
-  fast_path_enabled?: boolean;
 
   // Active model selection
   active_embedding_model?: string;
@@ -166,14 +164,10 @@ export interface Settings {
   cloud_input_price_per_million?: number;
   cloud_output_price_per_million?: number;
 
-  // Tool cache
-  tool_cache_enabled?: boolean;
 
   // Telemetry
   telemetry_enabled?: boolean;
 
-  // Compact encoding
-  compact_encoding?: boolean;
 
   // Experimental
   multi_tool_enabled?: boolean;

@@ -245,7 +245,8 @@ pub struct GooseAdapter {
     /// Extensions are loaded once per session on first use.
     loaded_sessions: Mutex<HashSet<String>>,
     /// Dynamic tool registry — provides tool descriptions for the system prompt.
-    /// When `None`, falls back to the static `giap_tool_description_lines()`.
+    /// When `None`, no prose tool list is rendered at all -- builtins reach
+    /// the model as native tool schemas regardless.
     tool_registry: Option<Arc<dyn ToolRegistryPort>>,
     /// Tracks which extensions the user explicitly added via the REST API.
     /// These are preserved across turns (not stripped in the extension cleanup loop).
@@ -433,7 +434,7 @@ impl GooseAdapter {
             Arc::new(MockDeviceRegistry),
             url,
             None,
-            None, // tool_registry — falls back to static giap_tool_description_lines()
+            None, // tool_registry — no prose tool list; native schemas still apply
         )
         .await
     }
@@ -462,16 +463,21 @@ impl GooseAdapter {
         *self.cached_tools.write().await = None;
     }
 
-    /// Add a named builtin extension to a Goose session (idempotent).
-    pub async fn add_builtin_extension(&self, name: &str, session_id: &str) -> Result<()> {
-        let config = ExtensionConfig::Builtin {
+    /// The `ExtensionConfig` GIAP registers its builtins under.
+    fn builtin_extension_config(name: &str) -> ExtensionConfig {
+        ExtensionConfig::Builtin {
             name: name.to_string(),
             description: String::new(),
             display_name: None,
             timeout: Some(600),
             bundled: Some(false),
             available_tools: vec![],
-        };
+        }
+    }
+
+    /// Add a named builtin extension to a Goose session (idempotent).
+    pub async fn add_builtin_extension(&self, name: &str, session_id: &str) -> Result<()> {
+        let config = Self::builtin_extension_config(name);
 
         // Also register it with the extension manager so it can be re-enabled if disabled
         self.extension_manager
@@ -482,6 +488,56 @@ impl GooseAdapter {
             .add_extension(config, session_id)
             .await
             .map_err(|e| anyhow!("Failed to add builtin extension '{}': {}", name, e))
+    }
+
+    /// Add every GIAP builtin to a session in one pass.
+    ///
+    /// `Agent::add_extension` is `add_extension_inner` (a `get_session` read for
+    /// the working dir) plus `persist_extension_state` (another `get_session`
+    /// and a `sessions` UPDATE carrying the whole serialized extension blob) —
+    /// about three SQLite round trips each. Fifteen of those, awaited one after
+    /// another, sat between a new conversation's first message and its first
+    /// token. `add_extensions_bulk` loads them concurrently and persists once.
+    ///
+    /// Returns the number that loaded, and logs each failure: an extension that
+    /// does not load is a real problem, not a degraded mode.
+    async fn add_builtin_extensions(&self, names: &[String], session_id: &str) -> usize {
+        for name in names {
+            self.extension_manager
+                .register_config(name.clone(), Self::builtin_extension_config(name))
+                .await;
+        }
+
+        let configs: Vec<ExtensionConfig> = names
+            .iter()
+            .map(|n| Self::builtin_extension_config(n))
+            .collect();
+
+        match self.agent.add_extensions_bulk(configs, session_id).await {
+            Ok(results) => {
+                // Report against each result's own `name`. Nothing documents
+                // that bulk loading preserves input order, and pairing a failure
+                // with the wrong extension is worse than not reporting it.
+                let mut loaded = 0usize;
+                for result in &results {
+                    if result.success {
+                        loaded += 1;
+                        tracing::debug!("giap extension loaded: {}", result.name);
+                    } else {
+                        tracing::warn!(
+                            "giap extension failed to load: {}: {}",
+                            result.name,
+                            result.error.as_deref().unwrap_or("unknown error")
+                        );
+                    }
+                }
+                loaded
+            }
+            Err(e) => {
+                tracing::warn!("giap extensions failed to load in bulk: {e}");
+                0
+            }
+        }
     }
 
     /// Resolve (and create if needed) the Goose-internal session for a given GIAP session ID.
@@ -510,20 +566,41 @@ impl GooseAdapter {
         }
         // Persisted pairing from a previous run. Re-validated against Goose:
         // its store can be wiped independently of ours, and a dangling id would
-        // fail every agent call for the session.
+        // fail every agent call for the session. The `name` check on top of
+        // `is_ok()` guards against a persisted pairing that resolves to a
+        // REAL but foreign session (a recycled id, or a row corrupted by a
+        // bug elsewhere) — every session this method creates is named after
+        // the GIAP id that owns it (see the create-session branch below), so
+        // a mismatch means the pairing is pointing at someone else's
+        // conversation. Falling through here still resolves correctly for a
+        // pairing that predates this check (the id-as-is branch a few lines
+        // down re-resolves the very same session id, name unchecked); it only
+        // changes behaviour for a pairing that was actually wrong.
         if let Some(storage) = &self.giap_session_storage {
             if let Ok(Some(gid)) = storage.get_engine_session_id(giap_sid).await {
-                if self.session_manager.get_session(&gid, false).await.is_ok() {
-                    self.goose_session_map
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(giap_sid.to_string(), gid.clone());
-                    tracing::debug!("Restored persisted goose session pairing {giap_sid} -> {gid}");
-                    return gid;
+                match self.session_manager.get_session(&gid, false).await {
+                    Ok(session) if session.name == giap_sid => {
+                        self.goose_session_map
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(giap_sid.to_string(), gid.clone());
+                        tracing::debug!(
+                            "Restored persisted goose session pairing {giap_sid} -> {gid}"
+                        );
+                        return gid;
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            "Persisted goose session '{gid}' for '{giap_sid}' is named for a \
+                             different session — treating the pairing as stale and re-resolving"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::info!(
+                            "Persisted goose session '{gid}' for '{giap_sid}' is gone — re-creating"
+                        );
+                    }
                 }
-                tracing::info!(
-                    "Persisted goose session '{gid}' for '{giap_sid}' is gone — re-creating"
-                );
             }
         }
         // Try using the GIAP session_id as-is (e.g. if Goose already stored it).
@@ -1521,7 +1598,7 @@ impl GooseAdapter {
     async fn trim_goose_history(&self, goose_sid: &str, giap_session_id: &str) {
         use pond_core::models::services::context::context_budget::CompactionProfile;
         use pond_core::models::services::context::turn_trimmer::{
-            trim_history, TrimMessage, TrimRole,
+            trim_history, CurrentTurn, TrimMessage, TrimRole,
         };
 
         let conversation = match self.session_manager.get_session(goose_sid, true).await {
@@ -1587,12 +1664,23 @@ impl GooseAdapter {
             })
             .collect();
 
+        // `CurrentTurn::NotYetAppended` is the same fact the image cap below
+        // already relies on: this runs before `Agent::reply`, so the newest user
+        // message in the conversation is the PREVIOUS turn's, not this one's.
+        // The trimmer used to assume the opposite and spare it, which left that
+        // turn's `<system-context>` — its date, its selected memories, its
+        // turn-budget note — to be re-prefilled as though it were current, and
+        // put two conflicting blocks in front of the model. It also meant
+        // `outcome.changed` was true on every turn from the third onwards, so
+        // the early return below never fired and every turn rewrote goose's
+        // whole message table.
         let outcome = trim_history(
             trim_input,
             &profile,
             rolling_summary.as_deref(),
             last_real,
             self.token_counter().await,
+            CurrentTurn::NotYetAppended,
         );
 
         // ── Live-history image cap (phase F2, live half) ──────────────────
@@ -1673,6 +1761,33 @@ impl GooseAdapter {
             } else {
                 rebuilt.push(original.clone());
             }
+        }
+
+        // Second guard, behind `outcome.changed`.
+        //
+        // `replace_conversation` is not an update — it is `BEGIN IMMEDIATE;
+        // DELETE FROM messages WHERE session_id = ?` plus one INSERT per
+        // surviving message, each with a fresh `serde_json::to_string` of its
+        // content. Turn N therefore rewrites roughly 2(N-1) rows, and an
+        // image-bearing message carries its base64 inline, so a long
+        // conversation rewrites hundreds of KB per turn onto the Jetson's eMMC —
+        // into a database the REST API never reads.
+        //
+        // `outcome.changed` is the real fix and is now honest (see the
+        // `CurrentTurn` argument above). This hash catches the rest: any path
+        // that sets `changed` or drops an image but produces a conversation
+        // identical to the one already stored.
+        let rebuilt_fingerprint = conversation_fingerprint(&rebuilt);
+        let previous_fingerprint = conversation_fingerprint(&source);
+        if rebuilt_fingerprint == previous_fingerprint {
+            tracing::debug!(
+                target: "giap::trace",
+                kind = "history_trim_skipped",
+                session_id = %giap_session_id,
+                messages = rebuilt.len(),
+                "trim produced an identical conversation; not rewriting the engine store"
+            );
+            return;
         }
 
         let rebuilt_conversation = goose::conversation::Conversation::new_unvalidated(rebuilt);
@@ -1987,7 +2102,7 @@ impl GooseAdapter {
     /// key. Idempotent: skips registration if the model is already known.
     fn register_gguf_model(model_name: &str, data_dir: &std::path::Path) -> String {
         use goose::providers::local_inference::local_model_registry::{
-            get_registry, LocalModelEntry, LocalModelStorage, ModelSettings, ToolCallingMode,
+            get_registry, LocalModelEntry, LocalModelStorage, ToolCallingMode,
         };
 
         let gguf_dir = data_dir.join("models").join("gguf");
@@ -2148,17 +2263,7 @@ impl GooseAdapter {
             if needs_load {
                 let extensions = registered_extensions();
                 let total = extensions.len();
-                let mut loaded = 0usize;
-                for ext_name in extensions {
-                    match self.add_builtin_extension(ext_name, &goose_sid).await {
-                        Ok(()) => {
-                            loaded += 1;
-                            tracing::debug!("giap extension loaded: {ext_name}");
-                        }
-                        // A failed extension is a real problem — surface it.
-                        Err(e) => tracing::warn!("giap extension failed to load: {ext_name}: {e}"),
-                    }
-                }
+                let loaded = self.add_builtin_extensions(extensions, &goose_sid).await;
                 self.loaded_sessions
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -2310,10 +2415,19 @@ impl GooseAdapter {
                 )
                 .use_compact_prompt();
 
-            // Tool description lines: dynamic from registry, static fallback.
+            // Prose tool lines, from the registry or not at all.
+            //
+            // There is no static fallback any more. It was a hardcoded list of
+            // 13 names of which nine matched no tool the dispatcher would answer
+            // to, and because `InMemoryToolRegistry::new()` seeded itself from
+            // the same list, the registry branch served it too — so the fallback
+            // being "only for the None case" was never the protection it looked
+            // like. Builtins reach the model as native tool schemas generated
+            // from the real handlers; what the registry adds is external MCP
+            // extension tools, which those schemas do not describe in prose.
             let available_tools: Vec<String> = match &self.tool_registry {
                 Some(registry) => registry.prompt_description_lines(compact_prompt).await,
-                None => pond_core::prompts::giap_tool_description_lines().to_vec(),
+                None => Vec::new(),
             };
 
             PromptState {
@@ -2442,8 +2556,20 @@ impl GooseAdapter {
         }
 
         // GIAP-owned system-prompt appendix, re-attached by the provider shim
-        // after it vetoes Goose's own appendages. Everything GIAP delivers via
-        // goose extras below is mirrored here so the veto never loses it.
+        // after it vetoes Goose's own appendages.
+        //
+        // This is the ONLY delivery path. Each body used to be pushed here AND
+        // handed to `Agent::extend_system_prompt`, which meant Goose built its
+        // own `# Additional Instructions:` block that `enforce_system` then threw
+        // away — two String allocations and a `prompt_manager` mutex per extra
+        // per turn, plus a Goose-side prompt build that `sanitize_unicode_tags`
+        // -scans every extra ever registered in the process, all discarded.
+        //
+        // The map was the worse half: `remove_system_prompt_extra` has no callers
+        // anywhere, so a skill the user deactivated stayed in Goose's `IndexMap`
+        // for the lifetime of the process, held out of the model only by the
+        // prefix match in `enforce_system`. Never adding it is what actually
+        // fixes that.
         let mut shim_appendix: Vec<String> = Vec::new();
 
         // Extras and skills are appended AFTER the partitioned prompt and sit
@@ -2457,8 +2583,7 @@ impl GooseAdapter {
                     "<extension-notes name=\"{}\">\n{}\n</extension-notes>",
                     extra.key, extra.instruction
                 );
-                shim_appendix.push(body.clone());
-                self.agent.extend_system_prompt(extra.key, body).await;
+                shim_appendix.push(body);
             }
         }
 
@@ -2469,8 +2594,7 @@ impl GooseAdapter {
                     "<extension-notes name=\"{}\">\n{}\n</extension-notes>",
                     key, skill.content
                 );
-                shim_appendix.push(body.clone());
-                self.agent.extend_system_prompt(key, body).await;
+                shim_appendix.push(body);
             }
         }
 
@@ -2604,9 +2728,23 @@ impl GooseAdapter {
                     "orchestrator",
                     "tom",
                 ];
+                // Only remove what is actually loaded. `remove_extension` drops
+                // the extension agent-globally and then calls
+                // `persist_extension_state`, which is a `get_session` read plus
+                // a `sessions` UPDATE — so a name that was never added still
+                // cost two round trips to not-remove. GIAP registers its own
+                // builtins and none of these ten, so in the normal case this
+                // whole block now issues no writes at all.
+                let present: std::collections::HashSet<String> = self
+                    .agent
+                    .list_extensions()
+                    .await
+                    .into_iter()
+                    .map(|e| e.to_string())
+                    .collect();
                 let user_exts = self.user_extensions.read().await;
                 for ext in strip_list {
-                    if !user_exts.contains(*ext) {
+                    if !user_exts.contains(*ext) && present.contains(*ext) {
                         self.agent.remove_extension(ext, &goose_sid).await.ok();
                     }
                 }
@@ -2703,11 +2841,11 @@ impl GooseAdapter {
                         external_extensions.len(),
                     );
 
+                    // Mirrored to the shim only, for the same reason the
+                    // per-turn extras are: Goose's copy is rebuilt into an
+                    // appendix the veto discards.
                     self.shim_controls
-                        .set_extension_appendix(Some(ext_description.clone()));
-                    self.agent
-                        .extend_system_prompt("extensions".to_string(), ext_description)
-                        .await;
+                        .set_extension_appendix(Some(ext_description));
                 } else {
                     self.shim_controls.set_extension_appendix(None);
                 }
@@ -2920,6 +3058,11 @@ impl GooseAdapter {
             let mut total_output_chars: usize = 0;
             // Track tool call ID → tool name so ToolResult events carry the tool name.
             let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
+            // Tool-call ids the allow-set guard refused to surface. Their results
+            // are dropped when they arrive rather than being emitted with an
+            // empty tool name.
+            let mut suppressed_tool_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             // Wall-clock start per tool call (keyed by Goose tool-call ID) for latency.
             let mut tool_call_starts: HashMap<String, std::time::Instant> = HashMap::new();
 
@@ -2988,9 +3131,29 @@ impl GooseAdapter {
                                                 // and the very next call must be admitted, or the escape
                                                 // hatch would enable a group and then block its use.
                                                 if !guard_controls.is_tool_allowed(&tool_name) {
+                                                    // NOT a block. Goose keeps every extension
+                                                    // loaded agent-wide, collects every
+                                                    // ToolRequest regardless of whether its
+                                                    // schema was published, and yields
+                                                    // AgentEvent::Message BEFORE dispatching. So
+                                                    // by the time this runs the tool either has
+                                                    // run or is about to, and nothing here can
+                                                    // stop it. What this does is refuse to
+                                                    // SURFACE the call — and, via
+                                                    // `suppressed_tool_ids` below, refuse to
+                                                    // surface its result.
+                                                    //
+                                                    // A real execution gate needs an inspector
+                                                    // registered with goose's
+                                                    // ToolInspectionManager, whose `add_inspector`
+                                                    // is private and whose field is pub(super) —
+                                                    // i.e. it needs a fork patch, tracked in
+                                                    // docs/goose-patch-management.md.
+                                                    suppressed_tool_ids.insert(tr.id.clone());
                                                     tracing::warn!(
                                                         tool = %tool_name,
-                                                        "Blocked unauthorized tool call (not in schema or no tools loaded)",
+                                                        tool_id = %tr.id,
+                                                        "tool call outside this session's allow-set; suppressing its call and result events (the tool itself still runs)",
                                                     );
                                                     continue;
                                                 }
@@ -3012,6 +3175,26 @@ impl GooseAdapter {
                                             }
                                         }
                                         goose::conversation::message::MessageContent::ToolResponse(tr) => {
+                                            // A suppressed call's RESULT must never reach the
+                                            // client. This used to rely on absence from
+                                            // `tool_id_to_name`, which the guard's `continue`
+                                            // caused — but absence only blanked the NAME:
+                                            // `unwrap_or_default()` gave "" and the content was
+                                            // streamed anyway. On a Guest turn that meant a
+                                            // withheld `giap-memory__recall_memories` returned
+                                            // the household's memories to the device under an
+                                            // empty tool name. Track suppression explicitly.
+                                            if suppressed_tool_ids.remove(&tr.id) {
+                                                tracing::warn!(
+                                                    target: "giap::trace",
+                                                    kind = "tool_result_suppressed",
+                                                    session_id = %session_id,
+                                                    tool_id = %tr.id,
+                                                    "dropped the result of a tool outside this session's allow-set",
+                                                );
+                                                tool_call_starts.remove(&tr.id);
+                                                continue;
+                                            }
                                             // Surface BOTH arms. A failed dispatch still
                                             // reaches the model — goose puts the error into
                                             // its own conversation — so dropping the Err here
@@ -3349,6 +3532,70 @@ impl AgentPort for GooseAdapter {
             Err(e) => Err(anyhow!("Tool dispatch failed: {}", e.message)),
         }
     }
+
+    /// Release the Goose engine session paired with a deleted GIAP session,
+    /// so its messages and `usage_ledger` rows do not outlive the GIAP row
+    /// that referenced them.
+    ///
+    /// Deliberately does NOT go through `resolve_goose_session`: that method
+    /// CREATES (and hydrates) a fresh engine session for a GIAP id it does
+    /// not recognise, which is exactly wrong on a delete path — a session
+    /// with no prior engine pairing has nothing to forget, and conjuring one
+    /// just to immediately delete it would pay for a full history replay for
+    /// no reason. Instead this looks up an already-resolved pairing (process
+    /// cache, then the persisted one) and does nothing if there isn't one.
+    ///
+    /// The persisted pairing is used as found, without re-validating it
+    /// against Goose first (unlike `resolve_goose_session`): if it is already
+    /// stale, `SessionManager::delete_session` simply fails with "not found",
+    /// which is logged and swallowed below like every other failure here.
+    async fn forget_session(&self, session_id: &str) {
+        let cached = self
+            .goose_session_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned();
+
+        let goose_sid = match cached {
+            Some(gid) => Some(gid),
+            None => match &self.giap_session_storage {
+                Some(storage) => storage
+                    .get_engine_session_id(session_id)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            },
+        };
+
+        // Drop the in-process pairing unconditionally, before attempting the
+        // engine-side delete: whether or not the delete below succeeds, this
+        // GIAP id is being removed and must never resolve to this (or any)
+        // Goose session again on a later turn.
+        self.goose_session_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+
+        let Some(goose_sid) = goose_sid else {
+            // No engine session was ever paired with this GIAP id — e.g. a
+            // session created and deleted before its first turn. Nothing to
+            // release.
+            return;
+        };
+
+        if let Err(e) = self.session_manager.delete_session(&goose_sid).await {
+            // Best-effort: the pond row is about to be deleted regardless.
+            // Leaving this engine session behind is strictly better than
+            // failing the user's delete request over storage this API
+            // doesn't even expose.
+            tracing::warn!(
+                "Failed to delete Goose engine session '{goose_sid}' for GIAP session \
+                 '{session_id}': {e}"
+            );
+        }
+    }
 }
 
 /// Shrink the text bodies of an oversized structured tool response, or `None`
@@ -3368,6 +3615,46 @@ impl AgentPort for GooseAdapter {
 /// `structured_content` is left alone: it is arbitrary tool-defined JSON that
 /// cannot be truncated without risking invalid data, and the text bodies are
 /// what the chat template renders.
+/// A cheap stable digest of a conversation, used to decide whether rewriting the
+/// engine's message table would change anything.
+///
+/// Hashes the JSON form of each message's content rather than the content itself
+/// because `MessageContent` does not implement `Hash` — and the JSON is the
+/// faithful proxy here, since it is exactly the bytes `replace_conversation`
+/// would write. Serializing every message once per turn sounds expensive next to
+/// the alternative until you price the alternative: a transaction, a whole-table
+/// DELETE, and one INSERT per message, each doing this same serialization anyway.
+///
+/// `id` and `created` are included because the rebuild deliberately preserves
+/// them — a message that kept its identity but changed its text must still
+/// register as different.
+fn conversation_fingerprint(messages: &[goose::conversation::message::Message]) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    messages.len().hash(&mut hasher);
+    for m in messages {
+        m.id.hash(&mut hasher);
+        m.created.hash(&mut hasher);
+        match m.role {
+            rmcp::model::Role::User => 0u8,
+            rmcp::model::Role::Assistant => 1u8,
+        }
+        .hash(&mut hasher);
+        match serde_json::to_string(&m.content) {
+            Ok(json) => json.hash(&mut hasher),
+            // Unserializable content cannot be compared, so refuse to claim the
+            // conversation is unchanged: hash something unique to this message
+            // so the fingerprints differ and the write proceeds.
+            Err(_) => {
+                "unserializable".hash(&mut hasher);
+                std::ptr::from_ref(m).addr().hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
 fn truncate_tool_response_text(
     message: &goose::conversation::message::Message,
     max_chars: usize,

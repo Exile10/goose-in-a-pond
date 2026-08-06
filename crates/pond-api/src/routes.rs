@@ -22,10 +22,7 @@ use pond_core::models::ports::provider::LlmProvider;
 use pond_core::models::services::context::context_governor::{
     ContextGovernor, ContextInputs, EngineWindow,
 };
-use pond_core::prompts::{
-    build_system_prompt_with_profile, builtin_template_content, render_template, sanitize_field,
-    ProfileContext,
-};
+use pond_core::prompts::{builtin_template_content, ProfileContext};
 use pond_core::security::domain::event::{EventCategory, EventQuery, PrivacySensitivity};
 use pond_core::security::ports::handshake::{
     ChallengeResponse, HandshakeRequest, HandshakeResponse, InitRequest, RefreshRequest,
@@ -1063,51 +1060,6 @@ async fn tts_synthesise(
         })
 }
 
-fn render_tool_guidance_from_extensions(extensions: &[ExtensionInfo]) -> String {
-    if extensions.is_empty() {
-        return String::new();
-    }
-
-    let mut lines = vec![
-        "## Tool Use Guidance".to_string(),
-        "You may call tools when they are necessary to complete the user request.".to_string(),
-        "- Prefer the smallest number of tool calls that can complete the task.".to_string(),
-        "- If a tool fails, explain what failed and continue with the best possible answer."
-            .to_string(),
-        "".to_string(),
-        "Available tools:".to_string(),
-    ];
-
-    let mut tool_count = 0usize;
-    for ext in extensions {
-        if ext.tools.is_empty() {
-            continue;
-        }
-        tool_count += ext.tools.len();
-
-        if ext.description.trim().is_empty() {
-            lines.push(format!("- {} ({})", ext.name, ext.kind));
-        } else {
-            lines.push(format!(
-                "- {} ({}) - {}",
-                ext.name,
-                ext.kind,
-                ext.description.trim()
-            ));
-        }
-
-        for tool in &ext.tools {
-            lines.push(format!("  - {}", tool));
-        }
-    }
-
-    if tool_count == 0 {
-        return String::new();
-    }
-
-    lines.join("\n")
-}
-
 // ── SSE streaming chat ────────────────────────────────────────────────────────
 
 /// Stream chat tokens via Server-Sent Events.
@@ -1208,85 +1160,19 @@ fn chat_stream_inner(
 
         let settings = state.settings_repo.get().await.unwrap_or_default();
 
-        // Build the system prompt
-        let system_prompt = {
-            // NOTE: everything this block produces lands in `_system_prompt`,
-            // which is unused -- `AgentRequest` has no system-prompt field and
-            // the adapter builds its own. It is left in place because the
-            // file-template branch below is the only reader of
-            // `prompt_template_dir`, and deleting it is a separate change.
-            // The profile context that actually reaches the model rides
-            // `AgentRequest.profile_context`, built by `profile_context_for`.
-            let profile_ctx: Option<ProfileContext> = None;
-
-            let file_template = match state.prompt_template_dir.as_ref() {
-                Some(dir) => tokio::fs::read_to_string(dir.join("system.md")).await.ok(),
-                None => None,
-            };
-
-            match file_template {
-                Some(tmpl) => {
-                    let name     = sanitize_field(&settings.assistant_name, 50);
-                    let user     = sanitize_field(&settings.user_name, 50);
-                    let persona  = sanitize_field(&settings.assistant_personality, 200);
-                    let tz       = sanitize_field(&settings.timezone, 50);
-                    let location = if settings.weather_location_name.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\nLocation: {}.", sanitize_field(&settings.weather_location_name, 100))
-                    };
-                    let addendum = sanitize_field(&settings.prompt_addendum, 500);
-                    render_template(&tmpl, &[
-                        ("assistant_name",  name.as_str()),
-                        ("user_name",       user.as_str()),
-                        ("personality",     persona.as_str()),
-                        ("timezone",        tz.as_str()),
-                        ("location",        location.as_str()),
-                        ("prompt_addendum", addendum.as_str()),
-                    ])
-                }
-                None => build_system_prompt_with_profile(&settings, profile_ctx.as_ref()),
-            }
-        };
-
-        let mut _system_prompt = match &state.mcp_memory {
-            Some(m) => {
-                let mem = m.instructions();
-                if mem.is_empty() { system_prompt } else { format!("{}\n\n---\n{}", system_prompt, mem) }
-            }
-            None => system_prompt,
-        };
-
-        if let Some(mgr) = &state.extension_manager {
-            match mgr.list_extensions().await {
-                Ok(extensions) => {
-                    const MAX_TOOL_GUIDANCE_CHARS: usize = 4_000;
-                    const TOOL_GUIDANCE_TRUNCATION_NOTE: &str =
-                        "\n\n[tool guidance truncated; additional tools omitted]";
-
-                    let guidance = render_tool_guidance_from_extensions(&extensions);
-                    if !guidance.is_empty() {
-                        let bounded_guidance = if guidance.len() > MAX_TOOL_GUIDANCE_CHARS {
-                            let reserved = TOOL_GUIDANCE_TRUNCATION_NOTE.len();
-                            let max_content_len = MAX_TOOL_GUIDANCE_CHARS.saturating_sub(reserved);
-                            let mut cut = max_content_len.min(guidance.len());
-                            while cut > 0 && !guidance.is_char_boundary(cut) {
-                                cut -= 1;
-                            }
-                            format!("{}{}", &guidance[..cut], TOOL_GUIDANCE_TRUNCATION_NOTE)
-                        } else {
-                            guidance
-                        };
-
-                        _system_prompt.push_str("\n\n");
-                        _system_prompt.push_str(&bounded_guidance);
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("Failed to list extensions for tool guidance: {}", e);
-                }
-            }
-        }
+        // No system prompt is built here. It used to be, into a `_system_prompt`
+        // that nothing read: `AgentRequest` has no system-prompt field, and the
+        // adapter builds the real one from `build_prompt_partition`. The block cost
+        // a disk read of `<data_dir>/prompts/system.md`, a Tera render of the 8 KB
+        // balanced template, an `Agent::list_tools` round trip and a tool-guidance
+        // format -- every turn, and on every recipe run -- and then dropped all of
+        // it. Editing that file to change behaviour changed nothing, which is the
+        // worse cost: it read as a working override.
+        //
+        // Two things rode on it and are therefore inert until deliberately rewired:
+        // `AppState::prompt_template_dir` (the file override above, superseded by
+        // the template repo the adapter reads) and `AppState::mcp_memory`, whose
+        // instructions were appended here and nowhere else.
 
         let model_role = "chat";
 
@@ -1673,6 +1559,35 @@ fn chat_stream_inner(
             )
             .await;
 
+        // The turn's context window, resolved ONCE.
+        //
+        // Two consumers follow — per-turn telemetry and the context-growth
+        // monitor — and they used to resolve it independently. Telemetry went
+        // through `ContextGovernor`, whose documented precedence is
+        // EngineReported > Registry > CatalogRecord > Override > Heuristic. The
+        // monitor forty lines below took `context_window_override` when set and
+        // `capabilities().context_window_tokens` otherwise, which inverts that
+        // order and never consults the registry pin at all. On a Jetson pinned to
+        // 4096 with capabilities reporting 32768, the monitor read utilisation at
+        // roughly an eighth of the truth, so `context_warning` could not fire
+        // before the trimmer started dropping turns. Resolving once is the only
+        // way the two can be guaranteed to agree.
+        let turn_context_limit = ContextGovernor::resolve(&ContextInputs {
+            provider: &settings.chat_provider,
+            model: &settings.chat_model,
+            override_tokens: settings.context_window_override,
+            // Not reachable from the API layer; the adapter owns the registry
+            // lookup and reports the result via TurnStats.
+            registry_pinned: None,
+            catalog_context_length: None,
+            engine_reported: turn_stats
+                .as_ref()
+                .and_then(|s| s.context_limit_tokens)
+                .map(|t| EngineWindow::new(settings.chat_model.clone(), t)),
+            capability_window: Some(state.agent.capabilities().context_window_tokens),
+        })
+        .tokens as u32;
+
         // ── Per-turn telemetry ──────────────────────────────────────────
         if settings.telemetry_enabled {
             if let Some(ref telemetry) = state.telemetry {
@@ -1693,26 +1608,7 @@ fn chat_stream_inner(
                     .map(|v| v.len() as u32)
                     .unwrap_or(0);
 
-                // Prefer the engine-reported context window over settings/capability
-                // guesses; the engine knows the real n_ctx it allocated. The
-                // precedence itself lives in pond-core's ContextGovernor so this
-                // telemetry cannot drift from what the trimmer actually budgeted
-                // against (PAI-3).
-                let context_limit = ContextGovernor::resolve(&ContextInputs {
-                    provider: &settings.chat_provider,
-                    model: &settings.chat_model,
-                    override_tokens: settings.context_window_override,
-                    // Not reachable from the API layer; the adapter owns the
-                    // registry lookup and reports the result via TurnStats.
-                    registry_pinned: None,
-                    catalog_context_length: None,
-                    engine_reported: turn_stats
-                        .as_ref()
-                        .and_then(|s| s.context_limit_tokens)
-                        .map(|t| EngineWindow::new(settings.chat_model.clone(), t)),
-                    capability_window: Some(state.agent.capabilities().context_window_tokens),
-                })
-                .tokens as u32;
+                let context_limit = turn_context_limit;
                 let context_used = turn_stats
                     .as_ref()
                     .and_then(|s| s.context_used_tokens)
@@ -1753,12 +1649,7 @@ fn chat_stream_inner(
         // ── Context growth monitoring ─────────────────────────────────
         if settings.context_monitor_enabled {
             let estimated_tokens = usage_prompt_tokens + usage_completion_tokens;
-            let context_limit = if settings.context_window_override > 0 {
-                settings.context_window_override
-            } else {
-                let caps = state.agent.capabilities();
-                caps.context_window_tokens
-            };
+            let context_limit = turn_context_limit;
 
             if estimated_tokens > 0 && context_limit > 0 {
                 state.context_monitor.record_turn(
@@ -2024,6 +1915,14 @@ async fn delete_session(
     Path(session_id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     use pond_core::user_data::ports::session_storage::SessionStorageError;
+
+    // Engine cleanup MUST run before the pond row (and the engine_session_map
+    // pairing it cascades away) is deleted below — once the pairing is gone,
+    // the engine-side session id is unrecoverable and its messages, usage
+    // ledger, and inline image attachments become permanently unreachable
+    // garbage in a store the REST API never reads.
+    state.agent.forget_session(&session_id).await;
+
     state
         .session_storage
         .delete_session(&session_id)
@@ -7144,6 +7043,34 @@ fn qualify_tool_name(server: &str, tool: &str) -> String {
     }
 }
 
+/// The tools reachable without an LLM turn, through `POST /api/v1/tools/invoke`
+/// and `POST /api/v1/mcp/tools/call`. Deny-by-default.
+///
+/// These routes carry no engine session, so the `_meta` the MCP servers read the
+/// caller from is empty: `session_from_meta` returns `None` and every policy
+/// decision behind them resolves to an unknown actor. An unknown actor is not a
+/// denied one — `PolicyDecision::refuse` sets `allowed = !mode.denies_bite()`, so
+/// under `PolicyMode::Audit` it is let through. A tool whose guard asks *who is
+/// calling* therefore has no guard at all on this path, and
+/// `giap-draft__approve_draft` is precisely that tool: it is the human
+/// confirmation step for every staged side effect.
+///
+/// So the surface stays as small as what the shipped UI actually needs. The Hub
+/// actuates devices from `hubStore.ts` and `Rooms.tsx`; MCP Apps proxy through
+/// `callServerTool`, and today there is exactly one app — the weather card —
+/// which makes no tool calls of its own. Everything else goes through a chat
+/// turn, where the engine stamps a session into `_meta` and the ownership check
+/// can actually run.
+///
+/// Adding a name here grants it to any paired client *and* to any sandboxed MCP
+/// App iframe. Read-only or narrowly-actuating tools only; nothing that decides,
+/// approves, executes shell, writes files, or reads household memory.
+const DIRECT_DISPATCH_ALLOWLIST: &[&str] = &[
+    "giap-device-control__set_device_state",
+    "giap-weather__get_current_weather",
+    "giap-weather__get_weather_forecast",
+];
+
 /// Shared direct-dispatch path for the tool-invoke endpoints. Bypasses the LLM:
 /// routes straight to the MCP tool registry and returns the raw result.
 async fn dispatch_tool_direct(
@@ -7151,6 +7078,23 @@ async fn dispatch_tool_direct(
     qualified: &str,
     args: Value,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !DIRECT_DISPATCH_ALLOWLIST.contains(&qualified) {
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "direct_dispatch_refused",
+            tool = qualified,
+            "a tool outside the direct-dispatch allowlist was requested LLM-free"
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": format!(
+                    "`{qualified}` cannot be invoked without a chat turn. Only a small set of \
+                     tools is reachable directly, because this path carries no caller identity."
+                )
+            })),
+        ));
+    }
     let dispatcher = state.tool_dispatcher.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -9761,6 +9705,55 @@ struct RunRecipeRequest {
     canvas_mode: bool,
 }
 
+/// The two fields GIAP reads out of a recipe's YAML.
+///
+/// This used to be `goose::recipe::Recipe::from_content`, which was the only
+/// `goose::` reference in the whole of `pond-api` — a path dependency on the
+/// entire agent framework, in the crate CLAUDE.md defines as framework-free, for
+/// two `Option<String>`s. `pond-api` also sits in CI's "fast crates" list, whose
+/// stated definition is "every crate that does not pull the Goose submodule", so
+/// the split the list encodes did not exist while that dependency was there.
+///
+/// `deny_unknown_fields` is deliberately NOT set: a recipe may legally carry
+/// anything Goose understands, and refusing to run it because we do not read a
+/// field would be worse than ignoring it. What we do instead is say so — see
+/// [`RecipePrompt::warn_about_dropped_fields`].
+#[derive(Debug, Default, Deserialize)]
+struct RecipePrompt {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    instructions: Option<String>,
+    /// Present only so the warning below can notice them.
+    #[serde(default)]
+    parameters: Option<Value>,
+    #[serde(default)]
+    sub_recipes: Option<Value>,
+}
+
+impl RecipePrompt {
+    fn parse(yaml: &str) -> Result<Self, serde_yaml::Error> {
+        serde_yaml::from_str(yaml)
+    }
+
+    /// Recipes carrying `parameters` or `sub_recipes` parse cleanly and then run
+    /// as a bare prompt with those fields silently dropped — GIAP delegates to
+    /// the ordinary chat-stream pipeline, which has no parameter substitution and
+    /// no sub-recipe execution. Silence here reads as support.
+    fn warn_about_dropped_fields(&self, name: &str) {
+        if self.parameters.is_some() || self.sub_recipes.is_some() {
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "recipe_fields_dropped",
+                recipe = name,
+                parameters = self.parameters.is_some(),
+                sub_recipes = self.sub_recipes.is_some(),
+                "this recipe declares fields GIAP does not execute; it will run as a bare prompt"
+            );
+        }
+    }
+}
+
 /// Execute a recipe by name. Looks up the AgentRecipe, parses its YAML to
 /// extract the prompt, and delegates to the shared chat-stream pipeline so
 /// the response matches `POST /api/v1/chat/stream` event-for-event.
@@ -9797,11 +9790,14 @@ async fn run_recipe(
         tracing::warn!(name = %name, "running inactive recipe");
     }
 
-    let prompt = match goose::recipe::Recipe::from_content(&recipe.yaml) {
-        Ok(parsed) => parsed
-            .prompt
-            .or(parsed.instructions)
-            .unwrap_or_else(|| format!("Run routine: {}", name)),
+    let prompt = match RecipePrompt::parse(&recipe.yaml) {
+        Ok(parsed) => {
+            parsed.warn_about_dropped_fields(&name);
+            parsed
+                .prompt
+                .or(parsed.instructions)
+                .unwrap_or_else(|| format!("Run routine: {}", name))
+        }
         Err(e) => {
             tracing::warn!(name = %name, error = %e, "failed to parse recipe YAML; using fallback prompt");
             format!("Run routine: {}", name)
@@ -11773,6 +11769,55 @@ async fn clear_session_user_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── direct tool dispatch allowlist ───────────────────────────
+
+    /// The tools this path must never expose. Each one either decides something
+    /// on the caller's behalf, executes, or reads household data — and the
+    /// direct-dispatch routes carry no caller identity to check any of it
+    /// against. `approve_draft` is the sharpest: it is the confirmation step
+    /// that `save_draft` exists to force.
+    const MUST_NEVER_BE_DIRECTLY_DISPATCHABLE: &[&str] = &[
+        "giap-draft__approve_draft",
+        "giap-draft__reject_draft",
+        "giap-system__run_shell_command",
+        "giap-system__read_file",
+        "giap-system__write_file",
+        "giap-memory__recall_memories",
+        "giap-memory__save_memory",
+        "giap-schedule__create_schedule",
+    ];
+
+    #[test]
+    fn the_direct_dispatch_allowlist_holds_nothing_that_decides_executes_or_reads_memory() {
+        for tool in MUST_NEVER_BE_DIRECTLY_DISPATCHABLE {
+            assert!(
+                !DIRECT_DISPATCH_ALLOWLIST.contains(tool),
+                "{tool} is reachable without a chat turn, so without a caller"
+            );
+        }
+    }
+
+    #[test]
+    fn the_allowlist_is_fully_qualified_so_a_bare_name_can_never_match() {
+        // `qualify_tool_name` only prepends a server when one was supplied, so a
+        // bare `tool` with an empty `server` reaches the gate unqualified. If an
+        // entry here were bare, that request would match it.
+        for tool in DIRECT_DISPATCH_ALLOWLIST {
+            assert!(
+                tool.contains("__"),
+                "{tool} is not server-qualified, so an unqualified request matches it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hub_can_still_actuate_a_device() {
+        // hubStore.ts and Rooms.tsx both post {server, tool} rather than a
+        // qualified name — the gate sees whatever `qualify_tool_name` produced.
+        let qualified = qualify_tool_name("giap-device-control", "set_device_state");
+        assert!(DIRECT_DISPATCH_ALLOWLIST.contains(&qualified.as_str()));
+    }
 
     // ── image attachment limits (phase F1) ───────────────────────
 

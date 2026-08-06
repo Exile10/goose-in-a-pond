@@ -309,15 +309,6 @@ impl SettingsRepository for SqliteSettingsRepository {
         // Embedding
         upsert!("active_embedding_model", &settings.active_embedding_model);
         upsert!("embedding_provider", &settings.embedding_provider);
-        // Fast path
-        upsert!(
-            "fast_path_enabled",
-            if settings.fast_path_enabled {
-                "true"
-            } else {
-                "false"
-            }
-        );
         // Agent tuning
         upsert!(
             "agent_timeout_secs",
@@ -424,14 +415,6 @@ impl SettingsRepository for SqliteSettingsRepository {
         );
         // Tool behaviour
         upsert!(
-            "tool_cache_enabled",
-            if settings.tool_cache_enabled {
-                "true"
-            } else {
-                "false"
-            }
-        );
-        upsert!(
             "multi_tool_enabled",
             if settings.multi_tool_enabled {
                 "true"
@@ -459,14 +442,6 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!(
             "telemetry_enabled",
             if settings.telemetry_enabled {
-                "true"
-            } else {
-                "false"
-            }
-        );
-        upsert!(
-            "compact_encoding",
-            if settings.compact_encoding {
                 "true"
             } else {
                 "false"
@@ -829,7 +804,6 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "active_embedding_model" => s.active_embedding_model = value.to_string(),
         "embedding_provider" => s.embedding_provider = value.to_string(),
         // Fast path
-        "fast_path_enabled" => s.fast_path_enabled = value == "true",
         // Agent tuning
         "agent_timeout_secs" => {
             if let Ok(v) = value.parse() {
@@ -918,13 +892,11 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
             }
         }
         // Tool behaviour
-        "tool_cache_enabled" => s.tool_cache_enabled = value == "true",
         "multi_tool_enabled" => s.multi_tool_enabled = value == "true",
         "tool_call_validation" => s.tool_call_validation = value == "true",
         "tool_request_detection" => s.tool_request_detection = value == "true",
         // Data
         "telemetry_enabled" => s.telemetry_enabled = value == "true",
-        "compact_encoding" => s.compact_encoding = value == "true",
         // `api_key_*` has no arm: PAI-2 P2 moved that material to
         // `SecretRepository`. A legacy row left behind by a failed migration
         // falls through to the `_ => {}` arm below and is ignored rather than
