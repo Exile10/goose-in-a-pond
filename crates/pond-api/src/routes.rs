@@ -19,9 +19,12 @@ use axum::{
 use pond_core::mcp::ports::extension_manager::ExtensionInfo;
 use pond_core::models::domain::message::ChatMessage;
 use pond_core::models::ports::provider::LlmProvider;
+use pond_core::models::services::context::context_budget::CompactionProfile;
 use pond_core::models::services::context::context_governor::{
     ContextGovernor, ContextInputs, EngineWindow,
 };
+use pond_core::models::services::context::model_class::ModelClass;
+use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
 use pond_core::prompts::{builtin_template_content, ProfileContext};
 use pond_core::security::domain::event::{EventCategory, EventQuery, PrivacySensitivity};
 use pond_core::security::ports::handshake::{
@@ -2129,12 +2132,22 @@ static COMPACTIONS_IN_FLIGHT: std::sync::LazyLock<
 ///   watcher on `last_user_activity`, the same contract the idle summary loop in
 ///   `pond-server` uses; a cancelled refresh persists nothing.
 ///
-/// Returns the outcome when a pass actually ran. Callers are already inside a
-/// spawned task: this awaits a model call and must never be called from a
-/// handler body or an SSE generator.
+/// - **The large tier rebuilds as well as refreshes** (PAI-4 P2). After the
+///   incremental refresh, `SessionSummaryService::resummarise` re-reads the
+///   covered messages and rebuilds the summary from source with a budget the
+///   window can afford. That second model call is gated on
+///   [`ModelClass::permits_compaction_model_call`], and **only** that call is:
+///   extending the gate to the refresh above would switch the rolling summary
+///   off on the small tier, which PAI-4 P1 argued against at length and P6
+///   deliberately did not do.
+///
+/// Returns the outcome of the refresh when a pass actually ran. Callers are
+/// already inside a spawned task: this awaits a model call — two, on the large
+/// tier — and must never be called from a handler body or an SSE generator.
 async fn run_compaction_pass(
     state: &Arc<AppState>,
     session_id: &str,
+    settings: &Settings,
     provider: Arc<dyn pond_core::models::ports::provider::LlmProvider>,
     trigger: &'static str,
 ) -> Option<pond_core::shared::services::session_summary::RefreshOutcome> {
@@ -2169,6 +2182,35 @@ async fn run_compaction_pass(
         state.session_storage.clone(),
     );
     let result = svc.refresh(session_id, &cancel).await;
+
+    // PAI-4 P2 — the large tier's extra mechanism, and the first thing in this
+    // programme that `ModelClass` gates rather than merely describes.
+    //
+    // It runs AFTER the refresh, not instead of it and not before it. The
+    // refresh advances the through-pointer; rebuilding first would rebuild a
+    // summary the refresh then folds over. Both share this pass's single
+    // in-flight claim and its single cancellation token, so the large tier's two
+    // model calls are still one cancellable pass rather than two things a turn
+    // could queue behind.
+    let resummarised = {
+        let (class, profile) = compaction_model_class(state, settings).await;
+        // `resummarise` checks the tier before it makes even a database read, so
+        // on the small and medium tiers this whole block is the governor
+        // resolution above and nothing else.
+        match svc
+            .resummarise(session_id, class, &profile, &HeuristicTokenCounter, &cancel)
+            .await
+        {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                // Every failure here means "leave the stored summary exactly as
+                // it was", which is the behaviour every tier had before P2.
+                tracing::debug!("{trigger} re-summarisation failed for {session_id}: {e}");
+                None
+            }
+        }
+    };
+
     watcher.abort();
 
     match COMPACTIONS_IN_FLIGHT.lock() {
@@ -2188,6 +2230,7 @@ async fn run_compaction_pass(
                 trigger = trigger,
                 session_id = %session_id,
                 outcome = ?outcome,
+                resummarisation = ?resummarised,
             );
             Some(outcome)
         }
@@ -2196,6 +2239,60 @@ async fn run_compaction_pass(
             None
         }
     }
+}
+
+/// The active model's compaction tier and budget curve, for an off-turn pass.
+///
+/// PAI-4 P2. The rungs are the ones `chat_stream` feeds the governor, minus the
+/// two that only a turn can supply: `engine_reported` arrives on `TurnStats` and
+/// `registry_pinned` belongs to the adapter. Both absent means this resolves no
+/// *higher* than the live path would, and lower is the safe direction here —
+/// [`ModelClass::Large`] is the only tier that unlocks a model call, and a
+/// smaller window can only move a model out of it.
+///
+/// The class is derived from `settings.chat_provider`, and that is the provider
+/// that will make the call: `rebuild_llm_provider` builds `state.llm_provider`
+/// from `chat_provider`/`chat_model`, so the box the gate is reasoning about is
+/// the box the summariser runs on. If those two ever diverge, this gate starts
+/// answering a question about a different machine.
+///
+/// `from_context_window` rather than `for_windows`: the prompt-side clamp only
+/// bites on providers whose preamble is re-prefilled here every turn, and the
+/// only class that reaches the re-summarisation is definitionally not one of
+/// them.
+async fn compaction_model_class(
+    state: &Arc<AppState>,
+    settings: &Settings,
+) -> (ModelClass, CompactionProfile) {
+    let catalog_context_length = match &state.model_repo {
+        Some(repo) => {
+            let id = ModelRecord::id_for(
+                &ModelCategory::for_chat_provider(&settings.chat_provider),
+                &settings.chat_model,
+            );
+            repo.get_by_id(&id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|m| m.context_length)
+        }
+        None => None,
+    };
+
+    let resolution = ContextGovernor::resolve(&ContextInputs {
+        provider: &settings.chat_provider,
+        model: &settings.chat_model,
+        override_tokens: settings.context_window_override,
+        registry_pinned: None,
+        catalog_context_length,
+        engine_reported: None,
+        capability_window: Some(state.agent.capabilities().context_window_tokens),
+    });
+
+    (
+        ModelClass::from_resolution(&settings.chat_provider, &resolution),
+        CompactionProfile::from_context_window(resolution.tokens),
+    )
 }
 
 /// PAI-4 P6 — act on `should_compact`, between turns rather than during one.
@@ -2244,7 +2341,8 @@ fn spawn_pressure_compaction(state: &Arc<AppState>, session_id: &str) {
             return;
         };
 
-        if let Some(outcome) = run_compaction_pass(&state, &session_id, provider, "pressure").await
+        if let Some(outcome) =
+            run_compaction_pass(&state, &session_id, &settings, provider, "pressure").await
         {
             // Only a refresh that actually persisted a new summary changed the
             // shape of the history. `NothingToDo` and `Cancelled` left it
@@ -2328,7 +2426,7 @@ fn spawn_resume_compaction(
         // PAI-4 P6 moved the in-flight claim, the cancellation watcher and the
         // refresh itself into `run_compaction_pass`, shared with the pressure
         // axis. The gate above is what stays specific to a resume.
-        run_compaction_pass(&state, &session_id, provider, "resume").await;
+        run_compaction_pass(&state, &session_id, &settings, provider, "resume").await;
     });
 }
 

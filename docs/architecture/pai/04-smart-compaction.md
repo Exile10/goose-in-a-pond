@@ -36,6 +36,12 @@ HTTP provider's spare capacity is not ours to save".
 `CompactionProfile::from_context_window` varies *budgets* by window size. It does not vary
 *strategy*, and nothing anywhere considers how old a turn is or what state the KV cache is in.
 
+> **Half-closed 2026-08-06.** The model axis is done: P1 added `ModelClass`, and P2 gave it a
+> mechanism to gate — the large tier's re-summarisation, which the on-device tiers do not run. So
+> strategy now varies by tier, and `run_compaction_pass` is where. The time axis is partly done (P4's
+> compact-on-resume; P3's age weighting is not). **Cache age is still entirely unmodelled** — that is
+> P5, and the sentence above remains true of it word for word.
+
 ### 1.3 `ContextCompactor` is dead code
 
 277 lines of LLM summarisation (`context/context_compactor.rs`): `needs_compaction`, `compact`,
@@ -137,6 +143,15 @@ have, and the answer to why nothing was ever wired: nobody had a tier where it w
 > span, splice the result back as a single message, keep the most recent turns verbatim, and fall
 > back to a deterministic trim whenever the LLM call fails so a chat turn is never interrupted by
 > compaction.
+>
+> **LANDED 2026-08-06 by P2**, as `context/resummarisation.rs` (the gate) plus
+> `SessionSummaryService::resummarise` (the mechanism), called from `run_compaction_pass`. Read the
+> P2 stamp in section 4 before changing anything here. Two clauses above did not survive contact
+> with the code: "re-summarisation of the summary itself" is implemented as rebuilding from the
+> **source messages** rather than from the summary chain — re-summarising the chain is what `refresh`
+> already does, and doing it again buys nothing — and "fall back to a deterministic trim" is
+> structural rather than a branch, because this pass is not on a turn's path and the trimmer runs
+> either way.
 
 ### 3.2 Time axis — age-weighted retention and compact-on-resume
 
@@ -173,8 +188,8 @@ a pure `should_run` gate with a startup guard — rather than inventing new sche
 > idle refresh loop skips any session whose `updated_at` predates process start, so a conversation
 > from before the last restart keeps a summary frozen at the restart and the trimmer splices that
 > stale summary into every turn until four new messages accumulate. Compact-on-resume refreshes it
-> at the reopen. The large tier's re-summarisation is the third thing this trigger will run, once
-> P2 exists.
+> at the reopen. The large tier's re-summarisation is the third thing this trigger runs, and P2
+> landed it on 2026-08-06.
 >
 > **`resume` is a user action, not an elapsed duration.** The startup guard the design points at has
 > a specific shape here that the one-line rule hides: at boot every stored session satisfies
@@ -313,21 +328,89 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   a concurrent session was expected to hold — the same structural collision that nearly destroyed the
   encrypted secret store in the PAI-2 batch. Keeping the profile's signature untouched is what let
   PAI-3 P4 land under the same conditions, and it is why the class is derived rather than stored.
-- **P2 — RESPECIFIED 2026-08-06. Write a large-tier compaction strategy; do not revive anything.**
-  The phase used to read "revive `ContextCompactor`". That file was deleted on 2026-08-06 and the
-  deletion is right (see 1.3): it carried its own `CHARS_PER_TOKEN = 4` and `USABLE_HISTORY_CHARS`,
-  the estimator PAI-3 P2 replaced with the `TokenCounter` port, so reviving it would have re-imported
-  a heuristic two landed phases removed — into the one tier that can afford an accurate count.
+- **P2 — LANDED 2026-08-06, respecified first, and nothing was revived.** The phase used to read
+  "revive `ContextCompactor`". That file was deleted on 2026-08-06 and the deletion is right (see
+  1.3): it carried its own `CHARS_PER_TOKEN = 4` and `USABLE_HISTORY_CHARS`, the estimator PAI-3 P2
+  replaced with the `TokenCounter` port, so reviving it would have re-imported a heuristic two landed
+  phases removed — into the one tier that can afford an accurate count. What shipped was written
+  fresh against `TokenCounter`, `CompactionProfile` and `ModelClass`, and no line of the deleted file
+  came back.
 
-  What P2 builds instead: LLM re-summarisation for the large tier, written against what has landed —
-  `TokenCounter` for measurement, `CompactionProfile`'s interpolated curve for the budget,
-  `ModelClass` for the gate, an `LlmProvider` for the call. Keep the old file's shape, which was
-  sound: summarise the older span, splice it back as one message, keep recent turns verbatim, and
-  fall back to a deterministic trim on any LLM failure so a turn is never interrupted.
+  `models/services/context/resummarisation.rs`: `ResummariseGateInputs`,
+  `SkipReason { TierForbidsModelCall | NoSummaryYet | SpanStillFitsHistory | NoRoomToImprove |
+  NothingCovered | SourceTooLargeToRead }`, `GateDecision`, `should_resummarise`,
+  `resummary_budget_tokens`, `source_budget_tokens`, `newest_affordable_start`, `budget_as_words`.
+  Fifteen unit tests, pure — no clock, no database, no model, the shape P4's `resume_compaction`
+  proved. The mechanism is `SessionSummaryService::resummarise` in
+  `shared/services/session_summary.rs`, with eight tests that drive it against a real storage adapter
+  and a stub provider. The caller is `run_compaction_pass` in `routes.rs`, which is the shared body
+  of both existing triggers — so P2 needed no third trigger of its own, and the hole P4 and P6 each
+  left for it by name ("the large tier's re-summarisation is P2's, and this gate will call it when it
+  exists") is the hole it fills.
 
-  **And add the first test that actually executes it** — that clause survives the respec unchanged,
-  because it is the reason the original was dead. 277 lines with no caller passed every gate this
-  repo has for as long as it existed.
+  **What "re-summarisation of the summary itself" turned out to mean, which is not what it sounds
+  like.** `refresh` is a *chain*: every pass feeds the model its own previous 3-5 sentences plus
+  whatever is new. Detail lost on pass *n* cannot return on pass *n+1*, and the loss compounds
+  silently. On the small and medium tiers that is the right trade, because the alternative costs a
+  call on the box the next turn's prefill needs. On the large tier the source messages are still
+  sitting in `session_messages` and the call is somebody else's hardware — so the mechanism is to
+  **rebuild from the source span instead of from the chain**, with a budget the window can afford
+  (`history_token_budget / 16`, clamped to 256..2,048; 1,250 tokens at the large tier's floor against
+  the ~100 the chain produces). It is persisted under the **same through-pointer**: a rebuild changes
+  how faithfully the covered span is represented, never which messages are claimed to be covered.
+
+  **The gate is two conditions and neither is a magic number.** The covered span must have outgrown
+  `history_token_budget` — below that the trimmer could still carry it verbatim, so the summary is a
+  convenience rather than the only record of it, and the number is the trimmer's own. And the budget
+  must allow more than a doubling of what the summary already spends, or the call would rewrite the
+  same-sized artefact for nothing.
+
+  **What I claimed and then had to withdraw, caught by my own test.** The first draft called the
+  second condition "self-clearing" and asserted that a summary at *half* the budget closes the gate.
+  It does not — at exactly half, a doubling is still available, which is the rule as written — and
+  the test failed on the boundary. Worse, checking why exposed a real interaction the phase brief
+  does not mention: `refresh` runs on every tier and asks for "3-5 sentences maximum", so as soon as
+  four new messages accumulate past the pointer it folds the rebuilt summary back down and the gate
+  opens again. The two mechanisms genuinely oscillate. That is not hidden damage — each firing
+  restores fidelity the collapse destroyed — but the honest rate is "at most one rebuild per
+  compaction pass", not "once per session", and the module says so instead of the thing I wanted to
+  be true. **No new rate limiter was added**, deliberately: a pass only happens when
+  `claim_compaction` grants one (P6, one per three turns) or a session is reopened past
+  `resume_compaction_idle_secs` (P4), and a third limiter here would be a second copy of a rule those
+  phases own. Reconciling the two budgets properly — teaching `refresh` that a large window can
+  afford more than three sentences — touches the summary on a path P1 and P6 both argued about at
+  length and needs P5's cache-age measurement. It is named, not done.
+
+  **"Fall back to a deterministic trim on any LLM failure" could not be implemented as written, and
+  saying so is better than a call nothing waits on.** At this seam the fallback is structural: the
+  trimmer runs on every turn regardless of what happened here, and this pass is not on a turn's path
+  at all. Every failure — a tier that forbids the call, no summary yet, a dangling through-pointer, a
+  cancelled token, a provider error, a response no longer than what is stored — resolves to "leave
+  the stored summary exactly as it was", which is the behaviour every tier had before this phase.
+
+  **The gate applies to the re-summarisation and to nothing else.** `run_compaction_pass` still calls
+  `refresh` unconditionally, on every tier, exactly as P6 left it. Extending
+  `permits_compaction_model_call()` upward to cover the refresh would switch the rolling summary off
+  on the small tier — which P1 argued against at length in 3.1 and invariant 3, and which P6
+  explicitly declined to do.
+
+  **And the first test that actually executes it** — the clause that survived the respec, because 277
+  lines with no caller passed every gate this repo has for as long as they existed. Beyond driving
+  the mechanism end to end, one test exists purely against that failure mode:
+  `the_large_tier_is_reachable_through_the_rungs_an_off_turn_pass_can_supply`. An off-turn pass has
+  no `engine_reported` (that arrives on `TurnStats`, during a turn) and no `registry_pinned` (that is
+  the adapter's), so `Large` could have been unreachable in production while every other test passed
+  — the `ProfileScope::Owner` shape, a fixture production cannot produce. It pins both live routes
+  into the tier, a catalog row and the name-derived capability window, and pins that an Ollama model
+  declaring 131,072 still is not cleared.
+
+  **Not done, and named.** No live-server run, the same gap P4 and P6 both recorded: this changes a
+  route side effect and adds a second background model call, which is what `scripts/live-test.sh`
+  exists to catch. There is no test asserting that the `pond-api` wiring fires — `compaction_model_class`
+  and `run_compaction_pass` are private to `routes.rs` and reaching them needs an `AppState`; what is
+  pinned instead is that the tier they resolve is reachable and that the mechanism they call behaves.
+  `note_compacted` still keys on `RefreshOutcome::Refreshed` only, deliberately: a rebuild changes the
+  summary's size, not the message history the growth samples measured.
 - **P3** Age-weighted retention priority in the trimmer, with `compaction_verbatim_days` as a
   headless setting.
 - **P4 — LANDED 2026-08-06, with a call site, and doing less than "full compaction" for a
@@ -357,8 +440,8 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   (its own "never at startup" guard), so a conversation from before the last restart keeps a summary
   that stops where it stopped, and the trimmer splices that stale summary into every turn until four
   new messages accumulate. Refreshing on reopen closes exactly that, and does it while the user is
-  reading history rather than waiting on tokens. The large tier's re-summarisation is P2's, and this
-  gate will call it when it exists.
+  reading history rather than waiting on tokens. The large tier's re-summarisation is P2's, and since
+  2026-08-06 this gate calls it: both triggers share `run_compaction_pass`, which P2 extended.
 
   **Too short is the failure that costs something, so both fallbacks lengthen.**
   `RESUME_IDLE_THRESHOLD_SECS` is 30 minutes — 15x the default `summary_idle_secs` and 2x
@@ -431,7 +514,8 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
 
   **What actually runs is the rolling-summary refresh, the same mechanism as P4**, because it is the
   only compaction mechanism that exists to call — the trimmer is a function of the turn being
-  assembled and cannot be pre-run, and the large tier's re-summarisation is P2's. The two triggers
+  assembled and cannot be pre-run. P2 landed the large tier's re-summarisation on 2026-08-06, in
+  `run_compaction_pass`, so on that tier a pass is now a refresh followed by a rebuild. The two triggers
   are genuinely independent (P4 is the time axis, P6 the pressure axis) and now share one in-flight
   set, renamed `COMPACTIONS_IN_FLIGHT`: a session reopened after a long gap is precisely the session
   most likely to saturate on its first turn back, and two separate sets would have stacked two model
@@ -455,7 +539,10 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
    that summary is never awaited by a turn — see the correction under 3.1. What this forbids on the
    two on-device tiers is the large tier's re-summarisation, which compaction does wait for;
    `ModelClass::permits_compaction_model_call()` is the gate, and it is false for `Small` and
-   `Medium`.
+   `Medium`. **Wired 2026-08-06 by P2**, in two layers: `should_resummarise` checks it first, and
+   `SessionSummaryService::resummarise` checks it again before making even a database read. Removing
+   only one of the two leaves the invariant held — which is deliberate, and which the P2 mutation
+   test confirms in both directions.
 4. A warm prefix that has served many turns is not perturbed for a marginal token saving.
 5. The rolling summary is read, never awaited.
 6. Image policy lives in `image_history.rs` and nowhere else.
