@@ -4087,6 +4087,19 @@ async fn download_model(
         )
     })?;
 
+    // PAI-2 P6b: refuse BEFORE spawning. The transfer itself is gated too (see
+    // `spawn_tracked_download`), but a refusal that only lands in a detached
+    // task shows up as a failed row in the progress tracker, which is not an
+    // answer to "why did nothing download". 502 is the right shape here because
+    // this handler already returns `(StatusCode, Json)` and the dashboard reads
+    // `error` off a non-2xx.
+    pond_core::shared::services::egress::check_egress(&url).map_err(|denied| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": denied.to_string()})),
+        )
+    })?;
+
     // Determine destination path based on category
     let dest = match cat {
         ModelCategory::Whisper => data_dir.join("models").join(&filename),
@@ -4127,13 +4140,26 @@ async fn download_model(
                     if let Some(parent) = cfg_dest.parent() {
                         let _ = tokio::fs::create_dir_all(parent).await;
                     }
-                    match cfg_client.get(&cu).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            if let Ok(bytes) = resp.bytes().await {
-                                let _ = tokio::fs::write(&cfg_dest, &bytes).await;
+                    // PAI-2 P6b: the config sibling is its OWN hop to its OWN
+                    // host and needs its OWN gate. Gating only the weights and
+                    // letting the `.onnx.json` through is exactly the shape
+                    // that kept the file-level guard green in the HF cache.
+                    match pond_core::shared::services::egress::begin(&cu, "GET") {
+                        Err(denied) => {
+                            tracing::warn!("TTS config file {cf} not fetched: {denied}")
+                        }
+                        Ok(call) => {
+                            let sent = cfg_client.get(&cu).send().await;
+                            call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+                            match sent {
+                                Ok(resp) if resp.status().is_success() => {
+                                    if let Ok(bytes) = resp.bytes().await {
+                                        let _ = tokio::fs::write(&cfg_dest, &bytes).await;
+                                    }
+                                }
+                                _ => tracing::warn!("Failed to download TTS config file {}", cf),
                             }
                         }
-                        _ => tracing::warn!("Failed to download TTS config file {}", cf),
                     }
                 }
                 let _ = model_repo.set_downloaded(&model_id, true).await;
@@ -4595,7 +4621,17 @@ async fn search_gguf_models(
         urlencoding::encode(q)
     );
     let client = &state.http_client;
-    match client
+    // PAI-2 P6b. The refusal rides the handler's EXISTING error contract
+    // (HTTP 200 with an `error` string) rather than a new status code: the
+    // dashboard renders that field and throws on a non-2xx, so returning 502
+    // here would turn a privacy refusal into an unhandled rejection. The text
+    // is the whole `EgressDenied` Display, which names the mode, the host and
+    // what to change.
+    let call = match pond_core::shared::services::egress::begin(&url, "GET") {
+        Ok(c) => c,
+        Err(denied) => return Json(json!({"models": [], "error": denied.to_string()})),
+    };
+    let sent = client
         .get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .header(
@@ -4603,8 +4639,9 @@ async fn search_gguf_models(
             concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")),
         )
         .send()
-        .await
-    {
+        .await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    match sent {
         Ok(resp) if resp.status().is_success() => {
             let models: Vec<Value> = resp.json().await.unwrap_or_default();
             // Return a simplified shape: id, downloads, likes, tags
@@ -4635,7 +4672,12 @@ async fn search_llamafile_models(
         .unwrap_or_default();
     let url = "https://api.github.com/repos/Mozilla-Ocho/llamafile/releases?per_page=5";
     let client = &state.http_client;
-    match client
+    // PAI-2 P6b — see search_gguf_models for why the refusal rides the body.
+    let call = match pond_core::shared::services::egress::begin(url, "GET") {
+        Ok(c) => c,
+        Err(denied) => return Json(json!({"models": [], "error": denied.to_string()})),
+    };
+    let sent = client
         .get(url)
         .timeout(std::time::Duration::from_secs(10))
         .header(
@@ -4643,8 +4685,9 @@ async fn search_llamafile_models(
             concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")),
         )
         .send()
-        .await
-    {
+        .await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    match sent {
         Ok(resp) if resp.status().is_success() => {
             let releases: Vec<Value> = resp.json().await.unwrap_or_default();
             let mut assets: Vec<Value> = Vec::new();
@@ -4691,7 +4734,12 @@ async fn list_hf_model_files(
     // (urlencoding::encode would turn '/' into '%2F' which returns 400)
     let url = format!("https://huggingface.co/api/models/{}", repo);
     let client = &state.http_client;
-    match client
+    // PAI-2 P6b — see search_gguf_models for why the refusal rides the body.
+    let call = match pond_core::shared::services::egress::begin(&url, "GET") {
+        Ok(c) => c,
+        Err(denied) => return Json(json!({"files": [], "error": denied.to_string()})),
+    };
+    let sent = client
         .get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .header(
@@ -4699,8 +4747,9 @@ async fn list_hf_model_files(
             concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")),
         )
         .send()
-        .await
-    {
+        .await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    match sent {
         Ok(resp) if resp.status().is_success() => {
             let meta: Value = resp.json().await.unwrap_or_default();
             let files: Vec<Value> = meta["siblings"]
@@ -4762,6 +4811,16 @@ async fn download_model_from_url(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "only https URLs are accepted"})),
+        );
+    }
+
+    // PAI-2 P6b: refuse here, synchronously, rather than only inside the
+    // detached task. This route takes an arbitrary caller-supplied URL, so it
+    // is the one place in the file where "which host" is not decided by us.
+    if let Err(denied) = pond_core::shared::services::egress::check_egress(&url) {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": denied.to_string()})),
         );
     }
 
@@ -4857,7 +4916,16 @@ async fn spawn_tracked_download<F>(
             .await
         } else {
             async {
-                let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+                // PAI-2 P6b. Both download handlers gate before they spawn, but
+                // this is the chokepoint every non-HF transfer actually passes
+                // through, and the HF branch above is gated inside
+                // `pond_hf_cache`. A gate only at the caller is one refactor
+                // away from being no gate at all.
+                let call = pond_core::shared::services::egress::begin(&url, "GET")
+                    .map_err(|denied| denied.to_string())?;
+                let sent = client.get(&url).send().await;
+                call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+                let resp = sent.map_err(|e| e.to_string())?;
                 if !resp.status().is_success() {
                     return Err(format!("HTTP {}", resp.status()));
                 }
@@ -5944,6 +6012,19 @@ async fn transcribe(
 
     // Forward to external whisper.cpp /inference
     let whisper_url = format!("{}/inference", state.whisper_url);
+    // PAI-2 P6b. This host is NOT a loopback literal -- it is
+    // `settings.voice_whisper_url`, which defaults to 127.0.0.1:9000 but is a
+    // free-text setting, so a pond configured with a remote whisper box posts
+    // raw household audio to a third party. `check_egress` and not `begin`:
+    // under the shipped default this fires on every transcription and would
+    // otherwise write an `Internal` event per utterance, which is how a privacy
+    // feed becomes something nobody reads. Loopback passes every mode.
+    pond_core::shared::services::egress::check_egress(&whisper_url).map_err(|denied| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": denied.to_string()})),
+        )
+    })?;
     let part = reqwest::multipart::Part::bytes(bytes)
         .file_name(filename)
         .mime_str(&content_type)
@@ -6074,6 +6155,13 @@ async fn calibrate_wake_word(
             .to_string()
     } else {
         let whisper_url = format!("{}/inference", state.whisper_url);
+        // PAI-2 P6b -- same configurable-host reasoning as `transcribe_audio`.
+        pond_core::shared::services::egress::check_egress(&whisper_url).map_err(|denied| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": denied.to_string()})),
+            )
+        })?;
         let part = reqwest::multipart::Part::bytes(bytes)
             .file_name(filename)
             .mime_str(&content_type)
@@ -7244,8 +7332,21 @@ async fn test_speak(
 }
 
 /// Hit `url` with a GET, return a status/latency object.
+///
+/// Gated (PAI-2 P6b) even though two of its three call sites are 127.0.0.1
+/// literals: the third is `state.whisper_url`, which the user can point
+/// anywhere. `check_egress` permits loopback under every mode, so the
+/// diagnostics page is unchanged on a default install and reports a refusal --
+/// with the setting to change -- only for a destination the mode really refuses.
 async fn probe(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Value {
     let t0 = std::time::Instant::now();
+    if let Err(denied) = pond_core::shared::services::egress::check_egress(url) {
+        return json!({
+            "status": "refused",
+            "url": url,
+            "error": denied.to_string(),
+        });
+    }
     match client
         .get(url)
         .timeout(std::time::Duration::from_secs(timeout_secs))
@@ -9082,6 +9183,22 @@ async fn oauth_callback_handler(
     // Exchange authorization code for tokens.
     // The redirect_uri MUST exactly match the one sent in the authorize request.
     let redirect_uri = format!("http://127.0.0.1:{}/api/v1/oauth/callback", state.api_port);
+    // PAI-2 P6b. The code exchange is a POST of a live credential to a third
+    // party, and it was ungated -- `authorization_code` as well as the refresh
+    // below. The refusal goes through `fail` so the UI polling
+    // `/oauth/status/{state}` gets the reason instead of a hang.
+    let call = match pond_core::shared::services::egress::begin(&provider.token_url, "POST") {
+        Ok(c) => c,
+        Err(denied) => {
+            let reason = denied.to_string();
+            fail(&reason).await;
+            return Html(format!(
+                "<h1>Authorization failed</h1><p>{}</p>",
+                html_escape(&reason)
+            ))
+            .into_response();
+        }
+    };
     let token_response = state
         .http_client
         .post(&provider.token_url)
@@ -9094,6 +9211,7 @@ async fn oauth_callback_handler(
         ])
         .send()
         .await;
+    call.finish(token_response.as_ref().ok().map(|r| r.status().as_u16()));
 
     match token_response {
         Ok(resp) if resp.status().is_success() => {
@@ -9332,7 +9450,18 @@ async fn oauth_refresh_handler(
             .unwrap_or_else(|| provider.bundled_client_id.clone())
     };
 
-    match state
+    // PAI-2 P6b: the refresh hop, gated separately from the code exchange.
+    let call = match pond_core::shared::services::egress::begin(&provider.token_url, "POST") {
+        Ok(c) => c,
+        Err(denied) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": denied.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let sent = state
         .http_client
         .post(&provider.token_url)
         .form(&[
@@ -9341,8 +9470,9 @@ async fn oauth_refresh_handler(
             ("client_id", client_id.as_str()),
         ])
         .send()
-        .await
-    {
+        .await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    match sent {
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             if let Some(access_token) = body["access_token"].as_str() {
@@ -9476,7 +9606,12 @@ async fn refresh_spotify_access_token(state: &AppState) -> Option<String> {
         .flatten()
         .unwrap_or_else(|| provider.bundled_client_id.clone());
 
-    let resp = state
+    // PAI-2 P6b: hop 1 of 3 on this path. The other two are in
+    // `spotify_api_call`, and each one is gated where it is made -- a single
+    // gate at the top of the flow is the shape that lets a copy-pasted retry
+    // out through a hole nobody can see.
+    let call = pond_core::shared::services::egress::begin(&provider.token_url, "POST").ok()?;
+    let sent = state
         .http_client
         .post(&provider.token_url)
         .form(&[
@@ -9485,8 +9620,9 @@ async fn refresh_spotify_access_token(state: &AppState) -> Option<String> {
             ("client_id", client_id.as_str()),
         ])
         .send()
-        .await
-        .ok()?;
+        .await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    let resp = sent.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -9499,40 +9635,94 @@ async fn refresh_spotify_access_token(state: &AppState) -> Option<String> {
     Some(access_token)
 }
 
+/// The egress tracker records the method as a `&'static str`, deliberately: an
+/// attacker-influenced method string must never become an unbounded attribute
+/// key in the event store. `reqwest::Method` is not `'static`, so map it.
+fn static_method_label(method: &reqwest::Method) -> &'static str {
+    if method == reqwest::Method::GET {
+        "GET"
+    } else if method == reqwest::Method::PUT {
+        "PUT"
+    } else if method == reqwest::Method::POST {
+        "POST"
+    } else if method == reqwest::Method::DELETE {
+        "DELETE"
+    } else {
+        "OTHER"
+    }
+}
+
+/// Why a Spotify call produced no response.
+///
+/// PAI-2 P6b replaced a bare `Option` here. Folding a network-mode refusal into
+/// the same `None` that means "Spotify was never connected" makes the dashboard
+/// tell the user to sign in again, which cannot work and does not name the
+/// setting that is actually stopping the call. A refusal nobody can act on is
+/// the failure PAI-2 invariant 1 exists to prevent.
+enum SpotifyUnavailable {
+    /// No secret storage, or no stored token: Spotify was never connected.
+    NotConnected,
+    /// The network mode refused a hop. Carries the whole `EgressDenied` text.
+    Refused(String),
+}
+
 /// Calls the Spotify Web API with the stored access token, transparently
-/// refreshing and retrying once on a 401. Returns `None` when there's no
-/// token to try at all (Spotify not connected) or refresh fails.
+/// refreshing and retrying once on a 401.
 async fn spotify_api_call(
     state: &AppState,
     method: reqwest::Method,
     path: &str,
-) -> Option<reqwest::Response> {
-    let repo = state.secret_repo.as_ref()?;
+) -> Result<reqwest::Response, SpotifyUnavailable> {
+    use SpotifyUnavailable::{NotConnected, Refused};
+
+    let repo = state.secret_repo.as_ref().ok_or(NotConnected)?;
     let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
-    let provider = providers.iter().find(|p| p.id == "spotify")?;
-    let token = repo.get(&provider.token_key).await.ok().flatten()?;
+    let provider = providers
+        .iter()
+        .find(|p| p.id == "spotify")
+        .ok_or(NotConnected)?;
+    let token = repo
+        .get(&provider.token_key)
+        .await
+        .ok()
+        .flatten()
+        .ok_or(NotConnected)?;
     let url = format!("https://api.spotify.com/v1{path}");
 
-    let resp = state
+    // PAI-2 P6b, hop 2 of 3.
+    let method_label = static_method_label(&method);
+    let call = pond_core::shared::services::egress::begin(&url, method_label)
+        .map_err(|denied| Refused(denied.to_string()))?;
+    let sent = state
         .http_client
         .request(method.clone(), &url)
         .bearer_auth(&token)
         .send()
-        .await
-        .ok()?;
+        .await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    let resp = sent.map_err(|_| NotConnected)?;
 
     if resp.status() != StatusCode::UNAUTHORIZED {
-        return Some(resp);
+        return Ok(resp);
     }
 
-    let refreshed = refresh_spotify_access_token(state).await?;
-    state
+    let refreshed = refresh_spotify_access_token(state)
+        .await
+        .ok_or(NotConnected)?;
+    // PAI-2 P6b, hop 3 of 3. The retry is its own request to its own host and
+    // carries a freshly minted credential; it gets its own gate. Reusing the
+    // gate above would be the copy-paste regression this file's guard is built
+    // to catch.
+    let retry = pond_core::shared::services::egress::begin(&url, method_label)
+        .map_err(|denied| Refused(denied.to_string()))?;
+    let sent = state
         .http_client
         .request(method, &url)
         .bearer_auth(&refreshed)
         .send()
-        .await
-        .ok()
+        .await;
+    retry.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    sent.map_err(|_| NotConnected)
 }
 
 /// Maps a failing Spotify Web API status onto a stable machine-readable code
@@ -9570,10 +9760,24 @@ fn spotify_error_hint(status: StatusCode) -> (&'static str, &'static str) {
 async fn music_now_playing_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let Some(resp) =
-        spotify_api_call(&state, reqwest::Method::GET, "/me/player/currently-playing").await
-    else {
-        return Json(json!({"connected": false})).into_response();
+    let resp = match spotify_api_call(&state, reqwest::Method::GET, "/me/player/currently-playing")
+        .await
+    {
+        Ok(r) => r,
+        Err(SpotifyUnavailable::NotConnected) => {
+            return Json(json!({"connected": false})).into_response()
+        }
+        // PAI-2 P6b: not the same thing as "not connected". The widget can say
+        // which setting to change instead of offering a sign-in that will not
+        // help.
+        Err(SpotifyUnavailable::Refused(message)) => {
+            return Json(json!({
+                "connected": false,
+                "error": "network_refused",
+                "message": message,
+            }))
+            .into_response()
+        }
     };
 
     let status = resp.status();
@@ -9634,12 +9838,23 @@ async fn music_control_handler(
         }
     };
 
-    let Some(resp) = spotify_api_call(&state, method, path).await else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "Spotify not connected"})),
-        )
-            .into_response();
+    let resp = match spotify_api_call(&state, method, path).await {
+        Ok(r) => r,
+        Err(SpotifyUnavailable::NotConnected) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Spotify not connected"})),
+            )
+                .into_response()
+        }
+        // PAI-2 P6b.
+        Err(SpotifyUnavailable::Refused(message)) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": message, "code": "network_refused"})),
+            )
+                .into_response()
+        }
     };
 
     match resp.status() {

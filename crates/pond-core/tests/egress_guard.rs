@@ -35,10 +35,11 @@ use std::path::{Path, PathBuf};
 const MIN_FILES_SCANNED: usize = 300;
 /// Below this the send detector has broken, not the code moved. 18 today.
 const MIN_SENDERS: usize = 15;
-/// P6a gated five of P5's six. One remains -- `pond-api/src/routes.rs`, whose
-/// nine egress sites are interleaved with seven loopback ones. This number only
-/// ever goes down.
-const MAX_UNGATED: usize = 1;
+/// P6a gated five of P5's six; P6b gated the last one, `pond-api/src/routes.rs`.
+/// This number only ever goes down, and it is now at the floor: every file in
+/// the workspace that this guard sees sending HTTP either reaches the tracker
+/// or is loopback-only with a checked reason.
+const MAX_UNGATED: usize = 0;
 
 /// Any of these in a file's production source means it reaches the tracker.
 ///
@@ -67,13 +68,17 @@ const TRACKER_SYMBOLS: &[&str] = &[
 /// NECESSARY BUT NOT SUFFICIENT, and the phase that filled this list out said so
 /// out loud: [`egress_tracked_files_reach_the_tracker`] looks for ONE tracker
 /// symbol per FILE. `pond-hf-cache/src/lib.rs` has two senders and
-/// `pond-api/src/routes.rs` has nine, so gating one of them would turn this
+/// `pond-api/src/routes.rs` has sixteen, so gating one of them would turn this
 /// guard green while the rest still phone out. Each multi-sender file therefore
 /// carries a behavioural test of its own -- for the HF cache, the three
 /// `head_redirect_*` / `get_redirect_*` / `a_permitted_redirect_chain_*` tests
-/// in its own `mod tests`, one per site plus a vacuity control.
+/// in its own `mod tests`, one per site plus a vacuity control; for `routes.rs`,
+/// which is by far the worst case, `crates/pond-api/tests/egress_offline_routes.rs`,
+/// which pairs every `.send()` in the file with a gate of its own and drives
+/// five of them over real HTTP with `Offline` installed.
 const EGRESS_TRACKED: &[&str] = &[
     "crates/pond-adapters-goose/src/extension_manager.rs",
+    "crates/pond-api/src/routes.rs",
     "crates/pond-adapters-goose/src/vision_encoder.rs",
     "crates/pond-adapters-weather/src/lib.rs",
     "crates/pond-hf-cache/src/lib.rs",
@@ -147,12 +152,13 @@ const LOOPBACK_ONLY: &[Exempt] = &[
 /// This list is the honest scope of `network_mode = "offline"`: these calls
 /// still leave the machine. It exists instead of a silent gap, and the cap
 /// above is what stops it becoming a parking lot.
-const UNGATED_SENDERS: &[(&str, &str)] = &[(
-    "crates/pond-api/src/routes.rs",
-    "HF model search/info, GitHub releases, Spotify, and BOTH OAuth token \
-     exchanges (authorization_code as well as refresh) -- 9 egress sites mixed \
-     with 7 loopback ones (piper, whisper, ollama). PAI-2 P6b.",
-)];
+///
+/// EMPTY since PAI-2 P6b, and `MAX_UNGATED` is 0. Keep the list -- an empty one
+/// with a zero cap is the statement "there is no known ungated sender", which is
+/// a claim the partition test re-proves on every run. Deleting it would let the
+/// next unclassified sender be classified by adding an entry rather than by
+/// gating the call.
+const UNGATED_SENDERS: &[(&str, &str)] = &[];
 
 // -- the scan -----------------------------------------------------------------
 
@@ -583,26 +589,32 @@ fn every_reqwest_crate_owns_a_classified_sender() {
 /// `cargo test -p pond-server` -- a guard there never fires on a PR. Same
 /// reasoning, and same shape, as
 /// `pond-infra/tests/redaction_chokepoints_are_wired.rs`.
-#[test]
-fn every_entry_point_installs_the_gate_before_it_downloads() {
+/// `main.rs` split into one chunk per top-level `fn` / `async fn`, comments
+/// stripped, `#[cfg(test)]` items removed.
+///
+/// Comments have to go for the whole scan. `download_and_extract_ort`'s own
+/// explanatory comment contains the literal `Command::new("curl")`, ~13 lines
+/// ABOVE the `check_egress` call it is explaining, so an ORDER assertion would
+/// read the prose as the download and report the gate as too late. Same lesson
+/// as TRACKER_SYMBOLS, applied before it bites.
+///
+/// Top-level items start at column 0, so this splits without brace-counting.
+/// The marker is re-prepended so each chunk still carries the `fn` line it came
+/// from -- which is what lets the assertions name the offending function.
+fn main_rs_fn_chunks() -> Vec<String> {
     let main_rs = workspace_root().join("crates/pond-server/src/main.rs");
     let src = std::fs::read_to_string(&main_rs)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", main_rs.display()));
-    // Comments stripped for the whole test. `download_and_extract_ort`'s own
-    // explanatory comment contains the literal `Command::new("curl")`, ~13
-    // lines ABOVE the `check_egress` call it is explaining, so the ORT
-    // assertion below would read the prose as the download and report the gate
-    // as too late. Same lesson as TRACKER_SYMBOLS, applied before it bites.
     let prod = strip_line_comments(&production_source(&src));
-
-    // Top-level items start at column 0, so this splits `main.rs` into function
-    // bodies without brace-counting. The marker is re-prepended so each chunk
-    // still carries the `fn` line it came from.
-    let chunks: Vec<String> = prod
-        .split("\nfn ")
+    prod.split("\nfn ")
         .flat_map(|c| c.split("\nasync fn "))
         .map(|c| c.to_string())
-        .collect();
+        .collect()
+}
+
+#[test]
+fn every_entry_point_installs_the_gate_before_it_downloads() {
+    let chunks = main_rs_fn_chunks();
 
     // Every way a `main.rs` function reaches the network with a large transfer.
     const DOWNLOAD_CALLS: &[&str] = &[
@@ -722,5 +734,77 @@ fn every_entry_point_installs_the_gate_before_it_downloads() {
         "`download_and_extract_ort` calls check_egress at byte {gate_at} but \
          spawns curl at byte {curl_at}. A refusal after the bytes are on the \
          wire is not a refusal."
+    );
+}
+
+/// The gate must also be installed before anything BUILDS AN AGENT.
+///
+/// PAI-2 P6b's companion to the download guard above, and it exists because
+/// that one could not see the hole. Its detector asks "which functions
+/// DOWNLOAD", and `run_agent_cmd` (`pond agent chat` / `agent tools` /
+/// `agent extras`) downloads nothing -- it reads the settings row, ignores
+/// `network_mode`, and hands three arms to `build_goose_backend`, which wires
+/// the LLM provider, the weather adapter and the whole MCP tool surface. Every
+/// gate those paths inherit then evaluated against the `Open` default nobody
+/// chose, so a stored `network_mode = "offline"` did nothing on that entry
+/// point. Downloading is one way to phone home; running a turn is the other,
+/// and it is the common one.
+///
+/// Asserting ORDER rather than presence, for the same reason as the download
+/// guard: `build_goose_backend` reaches the network as soon as it is built, so
+/// an install below it is a mechanism that cannot fire.
+#[test]
+fn every_entry_point_installs_the_gate_before_it_builds_an_agent() {
+    let chunks = main_rs_fn_chunks();
+
+    // The helper itself is not an entry point: it takes the settings it needs
+    // as arguments and its callers own the install. Named, not inferred --
+    // `DOWNLOAD_HELPERS` above records what inferring costs.
+    const BACKEND_HELPERS: &[&str] = &["build_goose_backend"];
+
+    let mut callers = 0usize;
+    for chunk in &chunks {
+        let Some(build_at) = chunk.find("build_goose_backend(") else {
+            continue;
+        };
+        let name = chunk.lines().next().unwrap_or("<unknown>");
+        if BACKEND_HELPERS.iter().any(|h| name.starts_with(h)) {
+            continue;
+        }
+        callers += 1;
+
+        // The CALL form with its path qualifier, and comments already stripped:
+        // a comment saying the words "set_network_mode" is not an install. That
+        // exact mutation passed against the bare-symbol version of the download
+        // guard.
+        let install_at = chunk.find("egress::set_network_mode(");
+        assert!(
+            install_at.is_some(),
+            "`{name}` builds a Goose agent -- LLM provider, weather adapter, the \
+             whole MCP tool surface -- but never calls set_network_mode, so the \
+             process-global is still at its `Open` default and a stored \
+             `network_mode = \"offline\"` does not apply on this entry point. \
+             Install the mode from the settings row before building the backend."
+        );
+        let install_at = install_at.unwrap();
+        assert!(
+            install_at < build_at,
+            "`{name}` installs the egress gate at byte {install_at} but builds \
+             the agent at byte {build_at}. The backend starts talking as soon as \
+             it exists; an install below it can never refuse anything."
+        );
+    }
+
+    // Vacuity control. If `build_goose_backend` is renamed and this loop finds
+    // nothing, the test reports success -- the failure shape this file's header
+    // warns about, and the one that let `run_models` sit in a hole for a phase.
+    // THREE: run_server, run_chat, run_agent_cmd. Raise it only after checking
+    // the new entry point installs the mode first.
+    assert_eq!(
+        callers, 3,
+        "expected the 3 agent-building entry points (run_server, run_chat, \
+         run_agent_cmd); found {callers}. If one was added or removed, update \
+         this number after checking the new one installs the mode first. If it \
+         dropped to 0 the detector has broken, not the code."
     );
 }

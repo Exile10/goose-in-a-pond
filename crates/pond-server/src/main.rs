@@ -6562,6 +6562,18 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
         Arc::new(SqliteModelRepository::new(db.system.clone()));
 
     let settings = settings_repo.get().await.unwrap_or_default();
+    // PAI-2 P6b: install the egress gate on THIS entry point too. `pond agent`
+    // has read the settings row since it was written, and ignored the one field
+    // on it that says whether the pond is allowed to talk to anybody. All three
+    // arms below reach `build_goose_backend`, which wires the LLM provider, the
+    // weather adapter and the whole MCP tool surface -- everything that phones
+    // out on a turn. Without this the process-global stays at its `Open`
+    // default and every gate those paths inherit evaluates against a mode
+    // nobody chose. P6a fixed the same defect for `run_chat` and `run_setup`
+    // and did not reach here.
+    pond_core::shared::services::egress::set_network_mode(
+        pond_core::shared::services::egress::NetworkMode::parse(&settings.network_mode),
+    );
     // Use the configured LLM server URL (llamafile default). GooseAdapter uses this to
     // route requests when chat_provider = "llamafile"; for ollama/local it uses its own logic.
     let llamafile_url = format!("http://127.0.0.1:{}", ports::llamafile_port());
