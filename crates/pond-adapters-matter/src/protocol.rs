@@ -46,6 +46,34 @@ pub const CLUSTER_TEMPERATURE: u32 = 1026;
 pub const CLUSTER_HUMIDITY: u32 = 1029;
 pub const CLUSTER_OCCUPANCY: u32 = 1030;
 
+// Resource monitoring — the air purifier's two filters. Same cluster shape,
+// one instance per filter.
+pub const CLUSTER_HEPA_FILTER: u32 = 113;
+pub const CLUSTER_ACTIVATED_CARBON_FILTER: u32 = 114;
+/// Remaining life as a percentage.
+pub const ATTR_FILTER_CONDITION: u32 = 0;
+/// 0 = OK, 1 = Warning, 2 = Critical.
+pub const ATTR_FILTER_CHANGE_INDICATION: u32 = 2;
+
+// Concentration measurement — one cluster per substance, all reporting
+// `MeasuredValue` on attribute 0.
+//
+// Units are the defaults for each substance. The device also publishes a
+// `MeasurementUnit` attribute (8) which is authoritative and which GIAP does
+// not read yet: a device reporting CO2 in ppb rather than ppm would be
+// labelled wrongly. Worth reading before this is trusted for anything but
+// display.
+pub const CLUSTER_CO: u32 = 1036;
+pub const CLUSTER_CO2: u32 = 1037;
+pub const CLUSTER_NO2: u32 = 1043;
+pub const CLUSTER_OZONE: u32 = 1045;
+pub const CLUSTER_PM25: u32 = 1066;
+pub const CLUSTER_FORMALDEHYDE: u32 = 1067;
+pub const CLUSTER_PM1: u32 = 1068;
+pub const CLUSTER_PM10: u32 = 1069;
+pub const CLUSTER_TVOC: u32 = 1070;
+pub const CLUSTER_RADON: u32 = 1071;
+
 /// Thermostat `OccupiedHeatingSetpoint` attribute id.
 pub const ATTR_OCCUPIED_HEATING_SETPOINT: u32 = 18;
 /// FanControl `PercentSetting` attribute id — a 0–100 write, no command.
@@ -58,6 +86,22 @@ pub const ATTR_FAN_MODE: u32 = 0;
 /// keeps the two in step, so there is no need to pick a discrete step here.
 pub const FAN_MODE_OFF: u8 = 0;
 pub const FAN_MODE_ON: u8 = 4;
+
+/// `FanMode` by the name a user says it. Auto and Smart are not points on the
+/// percentage scale — they hand the choice back to the device — which is why a
+/// fan needs modes as well as a speed.
+pub fn fan_mode_from_name(name: &str) -> Option<u8> {
+    match name.trim().to_lowercase().as_str() {
+        "off" => Some(FAN_MODE_OFF),
+        "low" => Some(1),
+        "medium" | "med" => Some(2),
+        "high" => Some(3),
+        "on" => Some(FAN_MODE_ON),
+        "auto" => Some(5),
+        "smart" => Some(6),
+        _ => None,
+    }
+}
 
 /// Matter device type ids (Descriptor DeviceTypeList), grouped onto the GIAP
 /// types the UI has icons for. Ids are from the Matter Device Library; the
@@ -338,8 +382,36 @@ pub fn sensor_reading_from_update(
     let _endpoint: u16 = parts.next()?.parse().ok()?;
     let cluster: u32 = parts.next()?.parse().ok()?;
     let attribute: u32 = parts.next()?.parse().ok()?;
+
+    // Filter monitoring is the one thing here that reports on two attributes:
+    // how worn the filter is, and whether the device is asking for it to be
+    // changed. Both are worth knowing and they answer different questions.
+    if let Some((sensor_type, reading, unit)) = match (cluster, attribute) {
+        (CLUSTER_HEPA_FILTER, ATTR_FILTER_CONDITION) => {
+            Some(("hepa_filter_condition", value.as_f64()?, "%"))
+        }
+        (CLUSTER_HEPA_FILTER, ATTR_FILTER_CHANGE_INDICATION) => {
+            Some(("hepa_filter_change", value.as_u64()? as f64, "state"))
+        }
+        (CLUSTER_ACTIVATED_CARBON_FILTER, ATTR_FILTER_CONDITION) => {
+            Some(("carbon_filter_condition", value.as_f64()?, "%"))
+        }
+        (CLUSTER_ACTIVATED_CARBON_FILTER, ATTR_FILTER_CHANGE_INDICATION) => {
+            Some(("carbon_filter_change", value.as_u64()? as f64, "state"))
+        }
+        _ => None,
+    } {
+        return Some(SensorReading {
+            device_id: device_id_for_node(node_id),
+            sensor_type: sensor_type.to_string(),
+            value: reading,
+            unit: unit.to_string(),
+            recorded_at: Utc::now(),
+        });
+    }
+
     if attribute != 0 {
-        return None; // measurement clusters report on attribute 0
+        return None; // every other measurement cluster reports on attribute 0
     }
 
     let (sensor_type, reading, unit) = match cluster {
@@ -364,6 +436,19 @@ pub fn sensor_reading_from_update(
         CLUSTER_AIR_QUALITY => ("air_quality", value.as_u64()? as f64, "level"),
         // Alarm state: 0 normal, non-zero means it is sounding.
         CLUSTER_SMOKE_CO_ALARM => ("smoke_alarm", value.as_u64()? as f64, "state"),
+        // Concentrations are floats in the substance's own unit, passed
+        // through unscaled — the number the device shows is the number a rule
+        // threshold should compare against.
+        CLUSTER_CO => ("carbon_monoxide", value.as_f64()?, "ppm"),
+        CLUSTER_CO2 => ("carbon_dioxide", value.as_f64()?, "ppm"),
+        CLUSTER_NO2 => ("nitrogen_dioxide", value.as_f64()?, "ppb"),
+        CLUSTER_OZONE => ("ozone", value.as_f64()?, "ppb"),
+        CLUSTER_FORMALDEHYDE => ("formaldehyde", value.as_f64()?, "mg/m3"),
+        CLUSTER_PM1 => ("pm1", value.as_f64()?, "ug/m3"),
+        CLUSTER_PM25 => ("pm2_5", value.as_f64()?, "ug/m3"),
+        CLUSTER_PM10 => ("pm10", value.as_f64()?, "ug/m3"),
+        CLUSTER_RADON => ("radon", value.as_f64()?, "ppm"),
+        CLUSTER_TVOC => ("total_volatile_organic_compounds", value.as_f64()?, "ppb"),
         _ => return None,
     };
 
@@ -536,6 +621,87 @@ mod tests {
         // An unknown device type id falls through to the clusters too.
         let unknown = described_node(43, 0xBEEF, &[("1/6/0", json!(false))]);
         assert_eq!(node_to_device(&unknown).device_type, "light");
+    }
+
+    /// Every mode the Virtual Air Purifier offers, by the name a user says.
+    #[test]
+    fn fan_modes_map_from_the_names_a_user_uses() {
+        for (name, code) in [
+            ("off", 0u8),
+            ("low", 1),
+            ("medium", 2),
+            ("high", 3),
+            ("on", 4),
+            ("auto", 5),
+            ("smart", 6),
+        ] {
+            assert_eq!(fan_mode_from_name(name), Some(code), "{name}");
+        }
+
+        // Spoken input is not tidy.
+        assert_eq!(fan_mode_from_name("  HIGH "), Some(3));
+        assert_eq!(fan_mode_from_name("Med"), Some(2));
+        // And an invented mode is refused rather than guessed at.
+        assert_eq!(fan_mode_from_name("turbo"), None);
+        assert_eq!(fan_mode_from_name(""), None);
+    }
+
+    /// The Air Quality Sensor's substances. Each is its own cluster reporting
+    /// MeasuredValue on attribute 0, and each needs its own name or they
+    /// collapse into one unreadable "air quality" number.
+    #[test]
+    fn each_measured_substance_reports_under_its_own_name() {
+        let cases = [
+            (CLUSTER_CO, "carbon_monoxide", "ppm"),
+            (CLUSTER_CO2, "carbon_dioxide", "ppm"),
+            (CLUSTER_NO2, "nitrogen_dioxide", "ppb"),
+            (CLUSTER_OZONE, "ozone", "ppb"),
+            (CLUSTER_FORMALDEHYDE, "formaldehyde", "mg/m3"),
+            (CLUSTER_PM1, "pm1", "ug/m3"),
+            (CLUSTER_PM25, "pm2_5", "ug/m3"),
+            (CLUSTER_PM10, "pm10", "ug/m3"),
+            (CLUSTER_RADON, "radon", "ppm"),
+            (CLUSTER_TVOC, "total_volatile_organic_compounds", "ppb"),
+        ];
+        for (cluster, name, unit) in cases {
+            let reading = sensor_reading_from_update(5, &format!("1/{cluster}/0"), &json!(636.0))
+                .unwrap_or_else(|| panic!("cluster {cluster} should report"));
+            assert_eq!(reading.sensor_type, name);
+            assert_eq!(reading.unit, unit);
+            assert!((reading.value - 636.0).abs() < f64::EPSILON);
+        }
+    }
+
+    /// Filter monitoring is the one cluster here reporting on two attributes:
+    /// how worn the filter is, and whether the device is asking for a change.
+    /// They answer different questions and must not be collapsed.
+    #[test]
+    fn both_filters_report_condition_and_change_indication() {
+        let hepa_condition =
+            sensor_reading_from_update(6, &format!("1/{CLUSTER_HEPA_FILTER}/0"), &json!(100.0))
+                .unwrap();
+        assert_eq!(hepa_condition.sensor_type, "hepa_filter_condition");
+        assert_eq!(hepa_condition.unit, "%");
+        assert!((hepa_condition.value - 100.0).abs() < f64::EPSILON);
+
+        // ChangeIndication lives on attribute 2, which the attribute-0 rule
+        // for every other measurement cluster would otherwise discard.
+        let hepa_change =
+            sensor_reading_from_update(6, &format!("1/{CLUSTER_HEPA_FILTER}/2"), &json!(2))
+                .unwrap();
+        assert_eq!(hepa_change.sensor_type, "hepa_filter_change");
+        assert_eq!(hepa_change.value, 2.0, "2 = Critical");
+
+        let carbon = sensor_reading_from_update(
+            6,
+            &format!("1/{CLUSTER_ACTIVATED_CARBON_FILTER}/0"),
+            &json!(45.0),
+        )
+        .unwrap();
+        assert_eq!(carbon.sensor_type, "carbon_filter_condition");
+
+        // The two filters stay distinguishable — one device has both.
+        assert_ne!(hepa_condition.sensor_type, carbon.sensor_type);
     }
 
     #[test]
