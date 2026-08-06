@@ -431,6 +431,32 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   pinned instead is that the tier they resolve is reachable and that the mechanism they call behaves.
   `note_compacted` still keys on `RefreshOutcome::Refreshed` only, deliberately: a rebuild changes the
   summary's size, not the message history the growth samples measured.
+
+  > **Added 2026-08-06 by review: this mechanism does not fire on any configuration GIAP ships, and
+  > the stamp above did not say so.** `ModelClass::Large` requires
+  > `!runs_on_this_device(provider)`. Every provider `pond-desktop/src` offers is on-device —
+  > `gguf`, `ollama`, `llamafile`, `local` — and `crates/pond-api/src/routes.rs` contains no hosted
+  > provider anywhere. So `permits_compaction_model_call()` is false on every pond a user can
+  > assemble through the product.
+  >
+  > It is not dead code, and the distinction matters. `Settings.chat_provider` is an unvalidated
+  > `String`, and `provider_shim.rs` handles `openai`, `anthropic`, `google` and `databricks`
+  > explicitly — so a hand-edited setting reaches the tier and the mechanism runs. What is true is
+  > that **no shipped path reaches it**, which for a privacy-first local assistant is arguably
+  > correct rather than a defect: the large tier exists for the hosted case 3.1 names, and GIAP does
+  > not currently ship one.
+  >
+  > It is recorded because it is the same shape as the failure this phase was respecified to avoid,
+  > arriving one level up. The original `ContextCompactor` was code with no caller. This is a caller
+  > with no configuration — and `the_large_tier_is_reachable_through_the_rungs_an_off_turn_pass_can_supply`
+  > guards precisely half of that question. It proves an off-turn pass can resolve a *window* into
+  > `Large`, which was the sharp risk and is genuinely pinned; it says nothing about whether any
+  > *provider* on a real pond clears the on-device test, and that is the half that turns out to
+  > decide it. A reachability guard is only as good as the narrowest input it varies.
+  >
+  > What would make it fire: shipping a hosted-provider option, or a user setting `chat_provider`
+  > by hand. Neither should be inferred from this stamp without checking, and the honest reading of
+  > the phase today is "the mechanism is correct and untriggered".
 - **P3 — LANDED 2026-08-06, as one rung rather than three tiers, because the trimmer cannot
   verify the claim the third tier rests on.** `turn_trimmer.rs` gained `DEFAULT_VERBATIM_DAYS = 3`,
   `AGED_TOOL_RESULT_MAX_CHARS` (a quarter of `TOOL_RESULT_MAX_CHARS`), `verbatim_horizon_from_days`,

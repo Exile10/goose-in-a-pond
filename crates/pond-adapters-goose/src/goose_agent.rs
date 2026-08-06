@@ -4575,7 +4575,12 @@ mod tests {
         assert_eq!(guessed.tokens, 4096);
         assert_eq!(guessed.source, WindowSource::Heuristic);
 
-        // With it: the catalog's number, tagged as such.
+        // With it: the catalog's number, tagged as such -- but BOUNDED, because
+        // ollama runs on this box. This asserted 131_072 when it was written,
+        // which was the same wrong belief three other tests held: that ollama is
+        // a hosted provider paying no local prefill. It serves over HTTP and
+        // runs here. f770f4de made rung 3 clamp anything `runs_on_this_device`,
+        // so the declared maximum is now held to UNPINNED_LOCAL_CEILING.
         let known = GooseAdapter::resolve_window_with(
             "ollama",
             "some-unknown-model",
@@ -4583,8 +4588,18 @@ mod tests {
             None,
             Some(131_072),
         );
-        assert_eq!(known.tokens, 131_072);
+        assert_eq!(
+            known.tokens, 32_768,
+            "a declared maximum is not an allocation, and ollama prefills locally"
+        );
         assert_eq!(known.source, WindowSource::CatalogRecord);
+
+        // A hosted provider keeps the raw declared window: nothing on this box
+        // prefills it. This is the case rung 3 exists for, and it is what makes
+        // the assertion above a boundary rather than a blanket clamp.
+        let hosted = GooseAdapter::resolve_window_with("openai", "gpt-4o", 0, None, Some(131_072));
+        assert_eq!(hosted.tokens, 131_072);
+        assert_eq!(hosted.source, WindowSource::CatalogRecord);
 
         // A registry pin still wins -- it is the allocation, the catalog value
         // is the model's declared maximum.
@@ -4705,16 +4720,22 @@ mod tests {
         assert_eq!(unknown.tokens, 4096);
         assert_eq!(unknown.source, WindowSource::Heuristic);
 
-        // With the catalog: the window Ollama's `model_info` actually reported,
-        // 131,072 -- which is NOT the heuristic's 128,000, so this assertion
-        // cannot pass by accident on the fallback path.
+        // With the catalog: the row IS read, and then bounded. Ollama's
+        // `model_info` reports 131,072 and the governor holds an on-device
+        // provider to UNPINNED_LOCAL_CEILING, because a declared maximum is not
+        // an allocation (f770f4de).
+        //
+        // 32,768 still cannot be reached by the fallback path -- the heuristic
+        // for this model is 128,000 -- so this assertion keeps the anti-vacuity
+        // property it was written for, and `source` pins it besides. That
+        // mattered: the value changed and the reason the test exists did not.
         let catalog: Arc<dyn ModelRepository> =
             Arc::new(StubCatalog::holding("ollama/gemma4:e2b", Some(131_072)));
         let seen =
             GooseAdapter::resolve_window_from(Some(&catalog), "ollama", "gemma4:e2b", 0, None)
                 .await;
         assert_eq!(
-            seen.tokens, 131_072,
+            seen.tokens, 32_768,
             "the catalog row's context_length never reached the governor"
         );
         assert_eq!(seen.source, WindowSource::CatalogRecord);

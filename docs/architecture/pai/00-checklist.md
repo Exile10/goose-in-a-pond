@@ -1315,13 +1315,31 @@ useful part: it proves the warm path really is pre-P5 behaviour and not merely a
 Deleting the `AGED_FIXED_POINT_CHARS` line failed `a_cold_recompaction_is_idempotent` with *"left: 1,
 right: 0"* on the second pass. Both restored with no residue; full suite green after each.
 
-**Two pre-existing test failures found and NOT fixed here, because they are not this phase's.**
+**Two test failures found and NOT fixed here, because they are not this phase's.**
 `goose_agent::tests::the_adapter_reads_the_catalog_it_was_given` and
 `a_catalog_window_reaches_the_governor_from_the_adapter` both fail at HEAD (`fc78ec03`), asserting
 `131072` where the governor now yields `32768`. That is the same shape f770f4de already corrected
 twice: tests encoding the pre-clamp behaviour for an on-device provider. These two survived because
 `pond-adapters-goose` is outside the fast-crate test set and CI only `cargo check`s it, so nothing
 runs them. I verified they fail with my changes stashed before concluding they were not mine.
+
+> **Corrected 2026-08-06, and "pre-existing" was the wrong word.** The diagnosis above is right in
+> every particular and the stash check was the correct way to reach it — but the label reads as
+> "somebody else's, from before this work", and these were **broken by `f770f4de` earlier the same
+> session**, which is the clamp fix two commits upstream. Not the phase's fault; still this
+> session's, and worth attributing rather than filing under inherited debt.
+>
+> The reason they were not caught at the source is mine and is the general lesson: `f770f4de` ran
+> `cargo check -p pond-adapters-goose` and not `cargo test`. **A `check` proves a crate compiles and
+> says nothing about whether its assertions still hold**, and for the one crate CI never tests, that
+> gap is the whole safety net. Anything touching `context_governor` precedence must run
+> `cargo test -p pond-adapters-goose`, because the adapter keeps its own copies of those
+> expectations.
+>
+> Both are fixed now: the on-device case asserts the ceiling, and a hosted `openai` fixture was added
+> beside it so the clamp reads as a boundary rather than a blanket. That is the **fourth** test found
+> encoding the pre-clamp belief — two in `f770f4de`, two here — which is what a value duplicated
+> across a domain crate and its adapter costs when it changes.
 
 Gates: `cargo fmt --check` clean; `cargo clippy -p pond-core --all-targets` with no new warnings in
 the touched files (the two the trimmer reports — a `nonminimal_bool` on P3's age predicate and a
