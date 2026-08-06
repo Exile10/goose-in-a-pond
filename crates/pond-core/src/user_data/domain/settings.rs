@@ -434,6 +434,30 @@ pub struct Settings {
     #[serde(default = "Settings::default_reasoning_effort")]
     pub reasoning_effort: String,
 
+    /// Whether the reasoning TEXT a turn produced is written to
+    /// `session_thinking` and replayed into the thinking panel on reload.
+    /// **False by default.**
+    ///
+    /// Orthogonal to both neighbours above: `thinking_mode` says whether the
+    /// model thinks, `show_thinking` says whether the live stream shows it, and
+    /// this says whether it SURVIVES the stream. Showing something once and
+    /// keeping it forever are different consents, and a pond that conflates
+    /// them has decided on the user's behalf.
+    ///
+    /// Off by default because this is the least reviewed text the model
+    /// produces -- the passage where it tries the wrong answer, names a
+    /// household member it then decides not to mention, or reasons about
+    /// something the user only implied. It is also the passage nothing else
+    /// prunes: `retention_session_messages_keep` bounds the transcript, and
+    /// these rows ride the transcript's CASCADE rather than a policy of their
+    /// own. Opt-in is the only defensible polarity for it.
+    ///
+    /// Turning it OFF stops new writes; it does not erase what is already
+    /// there. `DELETE /api/v1/sessions/{id}` still cascades, which is the
+    /// erasure path that exists today.
+    #[serde(default)]
+    pub persist_thinking: bool,
+
     // ── Answer Review ──────────────────────────────────────────────────────
     /// Review mode: "off" (default) | "on" | "auto"
     /// "off": no review — answers stream directly to the user
@@ -888,6 +912,7 @@ impl Default for Settings {
             thinking_mode: Self::default_thinking_mode(),
             show_thinking: false,
             reasoning_effort: Self::default_reasoning_effort(),
+            persist_thinking: false,
             review_mode: Self::default_review_mode(),
             review_max_rounds: Self::default_review_max_rounds(),
             review_pass_threshold: Self::default_review_pass_threshold(),
@@ -2039,6 +2064,7 @@ mod tests {
             "memory_prune_threshold",
             "mic_enabled",
             "multi_tool_enabled",
+            "persist_thinking",
             "prefix_cache_prompt",
             "primary_profile_id",
             "prompt_addendum",

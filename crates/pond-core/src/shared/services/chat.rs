@@ -223,6 +223,21 @@ pub struct ChatService {
     model_name: Option<String>,
     /// Whose turns these are. See [`with_profile_scope`](Self::with_profile_scope).
     profile_scope: ProfileScope,
+    /// PAI-5 P6. Whether reasoning text may be written to storage at all.
+    /// FALSE unless [`with_thinking`](Self::with_thinking) says otherwise, so a
+    /// handler that never heard of this feature persists nothing.
+    persist_thinking: bool,
+    /// Reasoning passages accumulated during the turn in flight, drained by
+    /// `persist_assistant_turn`.
+    ///
+    /// Interior mutability, and the reason is the whole reason this seam works:
+    /// the assistant message's id is minted INSIDE `persist_assistant_turn`
+    /// (`Uuid::new_v4()`), so a handler cannot key these rows to it. The
+    /// handler therefore hands over the TEXT as it streams and this service
+    /// does the keying. Widening `persist_assistant_turn`'s signature was the
+    /// alternative; it would have moved every caller for a value only one of
+    /// them has.
+    thinking_blocks: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 /// Result of one non-persisting agent stream: the streamed/spoken text plus
@@ -276,6 +291,44 @@ impl ChatService {
             telemetry: None,
             model_name: None,
             profile_scope: ProfileScope::Household,
+            persist_thinking: false,
+            thinking_blocks: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// PAI-5 P6. Allow this turn's reasoning text to be persisted.
+    ///
+    /// Takes the setting rather than being an opt-in marker method so the call
+    /// site reads as "whatever the user chose", and so turning the setting off
+    /// does not depend on a handler remembering to stop calling something.
+    pub fn with_thinking(mut self, enabled: bool) -> Self {
+        self.persist_thinking = enabled;
+        self
+    }
+
+    /// Offer one reasoning passage from the turn in flight.
+    ///
+    /// **The gate is here, not at the call site.** Handlers call this
+    /// unconditionally from their `AgentStreamEvent::Thinking` arm; if
+    /// `persist_thinking` is false the text is dropped on the floor and never
+    /// enters this process's heap for longer than the call. Putting the `if` in
+    /// the handler would have meant two copies of a privacy decision in two
+    /// stream loops, and PAI-5's own recorded failure was a gate whose second
+    /// input nobody tested.
+    ///
+    /// `&self` on purpose: the SSE handlers hold the service inside an
+    /// `async_stream!` block where a `&mut` borrow across an await point is
+    /// exactly what does not compile.
+    pub fn record_thinking(&self, block: impl Into<String>) {
+        if !self.persist_thinking {
+            return;
+        }
+        let block = block.into();
+        if block.trim().is_empty() {
+            return;
+        }
+        if let Ok(mut buf) = self.thinking_blocks.lock() {
+            buf.push(block);
         }
     }
 
@@ -647,8 +700,9 @@ impl ChatService {
                 .add_message(self.session_id.clone(), sm)
                 .await?;
         }
+        let assistant_id = Uuid::new_v4().to_string();
         let sm = SessionMessage::new(
-            Uuid::new_v4().to_string(),
+            assistant_id.clone(),
             self.session_id.clone(),
             ChatMessage::assistant(assistant_text),
         )
@@ -656,6 +710,18 @@ impl ChatService {
         self.session_storage
             .add_message(self.session_id.clone(), sm)
             .await?;
+
+        // PAI-5 P6. AFTER the assistant row commits, never before: the
+        // `session_thinking` rows carry a foreign key onto it, and writing them
+        // first would either fail or -- on a connection without
+        // `PRAGMA foreign_keys` -- leave reasoning pointing at a message that
+        // does not exist.
+        //
+        // Best-effort, deliberately. This is a UI convenience; a storage error
+        // here must not cost the user the assistant turn that is already
+        // committed above.
+        self.persist_thinking_blocks(&assistant_id).await;
+
         if let Some((prompt, completion)) = usage {
             if prompt > 0 || completion > 0 {
                 let _ = self
@@ -678,6 +744,41 @@ impl ChatService {
             .await;
 
         Ok(())
+    }
+
+    /// Drain the turn's reasoning passages into storage, keyed to the assistant
+    /// row they produced.
+    ///
+    /// The buffer is drained whether or not the write succeeds, and drained
+    /// even when the gate is off (where it is always empty, because
+    /// `record_thinking` refuses to fill it). Both matter for the same reason:
+    /// a `ChatService` that outlived one turn -- the terminal voice loop keeps
+    /// one for the life of the process -- must not attach turn 1's reasoning to
+    /// turn 2's answer.
+    async fn persist_thinking_blocks(&self, assistant_message_id: &str) {
+        let blocks: Vec<String> = match self.thinking_blocks.lock() {
+            Ok(mut buf) => std::mem::take(&mut *buf),
+            Err(poisoned) => {
+                // A poisoned lock means a panic happened while holding it. Take
+                // what is there and clear it; leaving stale text behind is the
+                // worse failure of the two.
+                let mut buf = poisoned.into_inner();
+                std::mem::take(&mut *buf)
+            }
+        };
+        if blocks.is_empty() || !self.persist_thinking {
+            return;
+        }
+        if let Err(e) = self
+            .session_storage
+            .add_thinking(&self.session_id, assistant_message_id, &blocks)
+            .await
+        {
+            tracing::warn!(
+                session_id = %self.session_id,
+                "failed to persist reasoning text (turn itself is saved): {e}"
+            );
+        }
     }
 
     /// Append the Agent / Inference / Tool events for one completed turn.
@@ -1285,23 +1386,26 @@ impl ChatService {
         usage: Option<&crate::models::ports::provider::UsageStats>,
     ) -> Result<()> {
         let assistant_msg = ChatMessage::assistant(full_text.to_string());
-        let session_msg = SessionMessage::new(
-            Uuid::new_v4().to_string(),
-            self.session_id.clone(),
-            assistant_msg,
-        )
-        .with_token_counts(
-            usage.map(|u| u.prompt_tokens),
-            usage.map(|u| u.completion_tokens),
-        )
-        // PAI-5 P2. Carried only where the caller hands over a whole
-        // `UsageStats`. `persist_assistant_turn`'s `(prompt, completion)` tuple
-        // — which is what `/chat/stream` passes — cannot express it, so rows
-        // written by that route keep NULL rather than a wrong zero.
-        .with_reasoning_tokens(usage.and_then(|u| u.reasoning_tokens));
+        let assistant_id = Uuid::new_v4().to_string();
+        let session_msg =
+            SessionMessage::new(assistant_id.clone(), self.session_id.clone(), assistant_msg)
+                .with_token_counts(
+                    usage.map(|u| u.prompt_tokens),
+                    usage.map(|u| u.completion_tokens),
+                )
+                // PAI-5 P2. Carried only where the caller hands over a whole
+                // `UsageStats`. `persist_assistant_turn`'s `(prompt, completion)` tuple
+                // — which is what `/chat/stream` passes — cannot express it, so rows
+                // written by that route keep NULL rather than a wrong zero.
+                .with_reasoning_tokens(usage.and_then(|u| u.reasoning_tokens));
         self.session_storage
             .add_message(self.session_id.clone(), session_msg)
             .await?;
+        // PAI-5 P6. The terminal voice loop keeps ONE `ChatService` for the life
+        // of the process, so this drain is not optional even though no caller on
+        // this path currently records anything: an undrained buffer would carry
+        // turn 1's reasoning onto turn 2's row the moment one did.
+        self.persist_thinking_blocks(&assistant_id).await;
         Ok(())
     }
 

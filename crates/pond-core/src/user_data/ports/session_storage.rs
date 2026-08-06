@@ -318,4 +318,52 @@ pub trait SessionStorage: Send + Sync {
     ) -> Result<Option<(String, Vec<u8>)>, SessionStorageError> {
         Ok(None) // default no-op for backward compat
     }
+
+    // ── Reasoning text (PAI-5 P6) ───────────────────────────────────────────
+    //
+    // The two methods below are the ONLY way the `<thinking>` text a turn
+    // produced enters or leaves the pond. They live here rather than on a
+    // dedicated port for one blunt reason: the store has to be reachable from
+    // `ChatService` (which mints the assistant message id these rows are keyed
+    // to) and from the history-read handler, and both of those already hold a
+    // `SessionStorage`. A separate port would have meant a new `AppState`
+    // field, and "the adapter exists but production never wired it" is a
+    // failure this programme has recorded three times.
+    //
+    // Defaulted, like every method above, so the four non-SQLite implementors
+    // (two mocks, a `pond-agent` test double, a capturing fake) need no change.
+    // The cost of a default is that deleting the real override leaves the tree
+    // green -- so `SqliteSessionStorage` carries its own behavioural test
+    // (`thinking_blocks_round_trip_keyed_to_their_message`), not a grep.
+
+    /// Persist the reasoning passages a turn produced, in order, keyed to the
+    /// assistant message they produced.
+    ///
+    /// Called only when `settings.persist_thinking` is true; the gate lives in
+    /// `ChatService`, which owns turn persistence, so no handler can hold the
+    /// text and forget to ask.
+    async fn add_thinking(
+        &self,
+        _session_id: &str,
+        _message_id: &str,
+        _blocks: &[String],
+    ) -> Result<(), SessionStorageError> {
+        Ok(()) // default no-op for backward compat
+    }
+
+    /// Every stored reasoning passage in a session, grouped by message id, each
+    /// message's passages in emission order.
+    ///
+    /// **This is a UI read and nothing else.** It must never be called from
+    /// anything that builds a prompt -- the trimmer, the rolling summariser,
+    /// the prompt builder, the compactor. Replaying a model's own discarded
+    /// scratch work back at it is the failure PAI-5's third invariant names, and
+    /// `crates/pond-core/tests/thinking_is_never_replayed.rs` enumerates the
+    /// permitted callers of this method by name.
+    async fn get_thinking_for_session(
+        &self,
+        _session_id: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, SessionStorageError> {
+        Ok(std::collections::HashMap::new()) // default no-op for backward compat
+    }
 }

@@ -90,6 +90,10 @@ export interface Settings {
   thinking_mode?: string;
   reasoning_effort?: string;
   show_thinking?: boolean;
+  /** PAI-5 P6. Whether reasoning text survives the stream that produced it.
+   *  Orthogonal to `show_thinking`, which only decides whether it is shown
+   *  live — showing something once and keeping it are different consents. */
+  persist_thinking?: boolean;
   review_mode?: string;
   review_max_rounds?: number;
   review_pass_threshold?: number;
@@ -629,6 +633,12 @@ export interface SessionMessage {
   tool_call_id?: string;
   /** Present on messages (typically role="user") that had images attached. */
   images?: SessionMessageImage[];
+  /** PAI-5 P6. The reasoning passages this reply was produced by, in emission
+   *  order — present only on role="assistant" messages recorded while
+   *  `persist_thinking` was on. Absent (not `[]`) when nothing was kept, so a
+   *  turn that was never recorded is distinguishable from one that thought
+   *  nothing. */
+  thinking?: string[];
 }
 
 // ── HuggingFace / Model Download ──────────────────────────────

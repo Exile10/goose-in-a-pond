@@ -942,6 +942,61 @@ impl SessionStorage for SqliteSessionStorage {
             .await
             .map(|bytes| (mime_type, bytes)))
     }
+
+    // ── Reasoning text (PAI-5 P6) ───────────────────────────────────────────
+
+    async fn add_thinking(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        blocks: &[String],
+    ) -> Result<(), SessionStorageError> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        for (idx, content) in blocks.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO session_thinking \
+                     (id, message_id, session_id, block_index, content, created_at) \
+                 VALUES (?, ?, ?, ?, ?, datetime('now'))",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(message_id)
+            .bind(session_id)
+            .bind(idx as i64)
+            .bind(content)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn get_thinking_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<HashMap<String, Vec<String>>, SessionStorageError> {
+        // `block_index` and not `created_at`: every block of one turn is
+        // written inside the same `datetime('now')` second, so ordering by time
+        // would shuffle the passages of a fast turn into an arbitrary order.
+        let rows = sqlx::query(
+            "SELECT message_id, content FROM session_thinking \
+             WHERE session_id = ? \
+             ORDER BY message_id, block_index ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            let message_id: String = row.get("message_id");
+            let content: String = row.get("content");
+            out.entry(message_id).or_default().push(content);
+        }
+        Ok(out)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2033,5 +2088,138 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SessionStorageError::SessionNotFound(id) if id == "no-such-session"));
+    }
+
+    // ── Reasoning text (PAI-5 P6) ───────────────────────────────────────────
+    //
+    // `add_thinking` / `get_thinking_for_session` are DEFAULTED on the port so
+    // the four non-SQLite implementors need no change. The cost of a default is
+    // that deleting the override below leaves the whole workspace green while
+    // the feature silently stops working -- the exact vacuity shape this
+    // programme keeps recording. These tests are the counterweight: they run
+    // against the real adapter, and `pond-infra` is in ci.yml's test list.
+
+    async fn seed_assistant_row(s: &SqliteSessionStorage, session: &str, msg: &str) {
+        s.add_message(
+            session.to_string(),
+            SessionMessage::new(
+                msg.to_string(),
+                session.to_string(),
+                ChatMessage::assistant("the answer"),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn thinking_blocks_round_trip_keyed_to_their_message() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-think".to_string()).await.unwrap();
+        seed_assistant_row(&s, "sess-think", "assistant-1").await;
+        seed_assistant_row(&s, "sess-think", "assistant-2").await;
+
+        s.add_thinking(
+            "sess-think",
+            "assistant-1",
+            &["first".to_string(), "second".to_string()],
+        )
+        .await
+        .unwrap();
+        s.add_thinking("sess-think", "assistant-2", &["only".to_string()])
+            .await
+            .unwrap();
+
+        let out = s.get_thinking_for_session("sess-think").await.unwrap();
+
+        // Order within a turn is the whole readability of the panel, and both
+        // blocks of turn one are written inside the same `datetime('now')`
+        // second -- so an adapter that ordered by created_at would shuffle them
+        // and this assertion is what notices.
+        assert_eq!(
+            out.get("assistant-1").map(Vec::as_slice),
+            Some(["first".to_string(), "second".to_string()].as_slice()),
+            "turn one's passages must come back in emission order; got {:?}",
+            out.get("assistant-1")
+        );
+        assert_eq!(
+            out.get("assistant-2").map(Vec::as_slice),
+            Some(["only".to_string()].as_slice()),
+            "turn two's passage must be keyed to turn two, not merged into the \
+             session; got {:?}",
+            out.get("assistant-2")
+        );
+        assert_eq!(out.len(), 2, "one entry per message that has reasoning");
+    }
+
+    #[tokio::test]
+    async fn thinking_is_scoped_to_its_own_session() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-a".to_string()).await.unwrap();
+        s.create_session("sess-b".to_string()).await.unwrap();
+        seed_assistant_row(&s, "sess-a", "a-1").await;
+        seed_assistant_row(&s, "sess-b", "b-1").await;
+        s.add_thinking("sess-a", "a-1", &["private to A".to_string()])
+            .await
+            .unwrap();
+        s.add_thinking("sess-b", "b-1", &["private to B".to_string()])
+            .await
+            .unwrap();
+
+        // Invariant 6. A session's scope is `sessions.profile_id`, and the read
+        // is per-session; a Guest session must not be able to reach a household
+        // member's reasoning simply because both rows live in one table.
+        let a = s.get_thinking_for_session("sess-a").await.unwrap();
+        assert_eq!(a.len(), 1, "session A sees only its own reasoning: {a:?}");
+        assert!(
+            !a.contains_key("b-1"),
+            "session A can read session B's reasoning -- the session filter is \
+             missing from the query: {a:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_with_no_reasoning_reads_back_empty_not_missing() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-quiet".to_string()).await.unwrap();
+        seed_assistant_row(&s, "sess-quiet", "q-1").await;
+
+        // Every session recorded before `persist_thinking` was turned on is in
+        // this state, which is the overwhelming majority of them. Reading one
+        // must be an empty map, never an error -- `get_session_messages`
+        // swallows the error, so an adapter that failed here would turn every
+        // historical page load into a page with no thinking AND no signal.
+        let out = s.get_thinking_for_session("sess-quiet").await.unwrap();
+        assert!(out.is_empty(), "expected no reasoning rows, got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_session_takes_its_reasoning_with_it() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-gone-think".to_string())
+            .await
+            .unwrap();
+        seed_assistant_row(&s, "sess-gone-think", "g-1").await;
+        s.add_thinking("sess-gone-think", "g-1", &["candid".to_string()])
+            .await
+            .unwrap();
+
+        s.delete_session("sess-gone-think").await.unwrap();
+
+        // The erasure path that exists today. Reasoning text is the least
+        // reviewed thing the model produces; it must not be the one artefact
+        // that outlives the conversation a user asked to forget.
+        let left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_thinking WHERE session_id = ?")
+                .bind("sess-gone-think")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            left, 0,
+            "{left} reasoning row(s) survived the deletion of their session -- \
+             the ON DELETE CASCADE in migration 0040 is not being enforced \
+             (check `PRAGMA foreign_keys` is on for this pool)"
+        );
     }
 }
