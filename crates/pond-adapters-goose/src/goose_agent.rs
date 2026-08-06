@@ -1471,6 +1471,25 @@ impl GooseAdapter {
         show_thinking && !voice
     }
 
+    /// Is this a voice turn? The OR of the instance flag and the request flag.
+    ///
+    /// Extracted from `chat_stream` because a review proved the composition was
+    /// the unguarded half of P1's gate. `reasoning_frames_enabled` had a test
+    /// for all four of ITS rows, and the source guard pinned the token
+    /// `is_voice` — but nothing pinned what `is_voice` MEANT, so dropping
+    /// `|| request.voice_mode` left all 108 tests green while reasoning leaked
+    /// to every desktop voice turn with `show_thinking` on.
+    ///
+    /// That mutation is not hypothetical on the shipped product. `main.rs`
+    /// constructs the serve-mode adapter with `voice_mode: false` hardcoded, so
+    /// `instance` is ALWAYS false in the desktop/server process and `request` is
+    /// the only signal that ever goes true — `voice_turn(false, true)` is the
+    /// entire defence for the surface most users are on. It is a truth table, so
+    /// it gets tested as one.
+    fn voice_turn(instance: bool, request: bool) -> bool {
+        instance || request
+    }
+
     /// The reasoning text a single agent message contributes to the stream.
     ///
     /// The producers already exist and were being dropped one call short of the
@@ -2789,7 +2808,7 @@ impl GooseAdapter {
         // instance-level flag (CLI --input whisper) and the per-request flag
         // (desktop voice pipeline sends voice_mode: true).
         let voice_instance = self.voice_mode.load(std::sync::atomic::Ordering::Relaxed);
-        let is_voice = voice_instance || request.voice_mode;
+        let is_voice = Self::voice_turn(voice_instance, request.voice_mode);
 
         // Resolve thinking mode from settings + capabilities.
         // Voice mode always disables thinking — reasoning tokens waste TTS time
@@ -4685,6 +4704,40 @@ mod tests {
         );
     }
 
+    /// The OTHER half of the gate, which was unguarded until a review broke it.
+    ///
+    /// `reasoning_frames_enabled` had all four of its rows tested and the source
+    /// guard pinned the identifier `is_voice`, but nothing pinned the
+    /// COMPOSITION. Deleting `|| request.voice_mode` from `chat_stream` left
+    /// every one of the 108 tests in this crate green, and on the shipped
+    /// desktop that mutation makes reasoning leak to every voice turn, silently:
+    /// `main.rs` builds the serve-mode adapter with `voice_mode: false`
+    /// hardcoded, so the instance flag is never true there and the request flag
+    /// is the whole defence.
+    ///
+    /// The row that matters is therefore `(false, true)`. It is asserted first
+    /// and by name so the failure names the surface it breaks, rather than
+    /// reporting a bare `assert!(false)` from the middle of a loop.
+    #[test]
+    fn a_request_flagged_voice_is_a_voice_turn_even_on_a_text_started_process() {
+        assert!(
+            GooseAdapter::voice_turn(false, true),
+            "the shipped desktop hardcodes the instance flag to false, so the per-request \
+             flag is the ONLY signal that a turn is spoken. Dropping it re-opens the leak \
+             P1 closed, and every gate downstream keeps looking correct."
+        );
+        assert!(
+            GooseAdapter::voice_turn(true, false),
+            "the CLI `--input whisper` instance flag must still count on its own"
+        );
+        assert!(GooseAdapter::voice_turn(true, true));
+        assert!(
+            !GooseAdapter::voice_turn(false, false),
+            "a text turn on a text process must not be treated as voice, or reasoning \
+             is suppressed for everyone"
+        );
+    }
+
     /// A settings read that fails falls back to `Settings::default()`. On that
     /// path access must NARROW, not widen.
     #[test]
@@ -4768,6 +4821,17 @@ mod tests {
             body.contains("Self::reasoning_frames_enabled(settings.show_thinking, is_voice)"),
             "emit_reasoning is no longer bound from show_thinking AND the voice flag"
         );
+        // Pinning the identifier `is_voice` says nothing about what it holds.
+        // A review deleted `|| request.voice_mode` from its binding and this
+        // guard stayed green, along with the other 107 tests. Pin the
+        // composition too, and keep it in the testable unit so the truth table
+        // above is the real assertion and this is only the wiring.
+        assert!(
+            body.contains("let is_voice = Self::voice_turn(voice_instance, request.voice_mode);"),
+            "is_voice is no longer composed by voice_turn(instance, request). If the \
+             per-request flag was dropped, reasoning leaks to every desktop voice turn: \
+             the serve-mode adapter hardcodes the instance flag to false."
+        );
     }
 
     // ── PAI-5 P2: reasoning tokens ────────────────────────────────────────
@@ -4838,26 +4902,61 @@ mod tests {
             .position(|l| l.contains("for content in Self::reasoning_frames(&msg, emit_reasoning)"))
             .expect("the gated lift is gone; the P1 guard should have caught this first");
 
-        let window = &lines[gate_line.saturating_sub(6)..gate_line];
-        let count_line = window
+        let window = &lines[gate_line.saturating_sub(8)..gate_line];
+        window
             .iter()
             .position(|l| l.contains("Self::count_reasoning_tokens(&msg,"))
             .unwrap_or_else(|| {
                 panic!(
-                    "the reasoning token count is not taken in the six lines before the \
+                    "the reasoning token count is not taken in the eight lines before the \
                      display gate. If it moved inside `for content in reasoning_frames(..)`, \
                      the count is now zero whenever show_thinking is off — which is the \
                      shipped default, so every Jetson turn would report no thinking."
                 )
             });
-        assert!(
-            !window[count_line].contains("emit_reasoning"),
-            "the reasoning count now reads emit_reasoning; the cost of a turn must not \
-             depend on whether anybody is watching"
-        );
+        // The WHOLE window, not just the line the call sits on. The original
+        // guard checked only `window[count_line]`, so the most natural form of
+        // this regression — wrapping the accumulation in `if emit_reasoning {`
+        // on the PRECEDING line — passed green, as did a `let gated = ...`
+        // computed above it. Both were demonstrated by a reviewer against this
+        // exact test.
+        //
+        // Worth stating plainly, because it is what makes the regression
+        // invisible rather than merely wrong: `chat.rs::stream_response_inner`
+        // builds its `AgentRequest` with `voice_mode: true` unconditionally, and
+        // that is the ONLY path that persists the count. So on `run_chat`,
+        // `emit_reasoning` is always false — a gated count would write
+        // `Some(0)` for 100% of the corpus PAI-5 P5 reads, and every test that
+        // checks the pure counter would still pass.
+        for line in window {
+            assert!(
+                !line.contains("emit_reasoning"),
+                "the reasoning accumulation is now conditioned on emit_reasoning \
+                 (`{}`); the cost of a turn must not depend on whether anybody is \
+                 watching. On the only path that persists this number the flag is \
+                 always false, so this reports every turn as having done no thinking.",
+                line.trim()
+            );
+        }
         assert!(
             body.contains("turn_stats.reasoning_tokens.get_or_insert(0)"),
             "the count no longer accumulates into TurnStats, so nothing downstream sees it"
+        );
+        // The carry-out. Accumulating into `TurnStats` and then building
+        // `UsageStats` with a literal `None` is this phase's own named failure
+        // mode ("produced, reaches Done, and is dropped") and it was unguarded:
+        // a reviewer replaced BOTH arms with `None` and all 108 tests passed.
+        // There are two arms because the usage build has a reported-usage path
+        // and a fallback path; a regression that fixes only one is worse than
+        // one that fixes neither, because it depends on the provider.
+        assert_eq!(
+            body.matches("reasoning_tokens: turn_stats.reasoning_tokens,")
+                .count(),
+            2,
+            "both UsageStats arms must carry the counted reasoning out of the stream. \
+             A literal `None` in either one drops the number on the providers that take \
+             that path, and every unit test here still passes because they all call the \
+             pure counter."
         );
     }
 

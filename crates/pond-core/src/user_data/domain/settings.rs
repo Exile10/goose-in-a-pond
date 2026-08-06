@@ -1894,10 +1894,16 @@ mod tests {
             // it one now would invite flipping a half-validated matrix on.
             "security_policy_mode",
             // The egress gate's rollout lever (PAI-2 P5). Headless for the same
-            // reason security_policy_mode is: while six real-egress call sites
-            // are still ungated (see crates/pond-core/tests/egress_guard.rs),
+            // reason security_policy_mode is: while any real-egress call site
+            // is still ungated (see crates/pond-core/tests/egress_guard.rs),
             // a UI switch labelled "offline" would promise more than the code
             // delivers. It gets a control when that list is empty.
+            //
+            // P6a took the count from six files to ONE. The remainder is
+            // `pond-api/src/routes.rs`, which holds nine egress sites, and it
+            // is P6b. Read UNGATED_SENDERS rather than this comment -- a count
+            // written in prose is the thing that goes stale, which is why the
+            // number was removed from this sentence rather than decremented.
             "network_mode",
             // Hybrid-compaction rollout flags: operator knobs for the
             // deterministic-trim + idle-summary pipeline; flipped via the

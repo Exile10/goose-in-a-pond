@@ -245,6 +245,55 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   `GooseAdapter::reasoning_frames_enabled(show_thinking, voice)` is the gate. Five unit tests;
   105 pass in the crate.
 
+  > **CORRECTED 2026-08-06 (synthesis): the gate was tested; its INPUT was not, and the input is
+  > the whole defence on the shipped desktop.** `reasoning_frames_enabled` had all four rows of its
+  > truth table asserted, and the source guard pinned the literal
+  > `Self::reasoning_frames_enabled(settings.show_thinking, is_voice)` — but that pins the
+  > *identifier* `is_voice`, never its meaning. A review changed the binding from
+  > `voice_instance || request.voice_mode` to `voice_instance` and **all 108 tests passed**. That
+  > mutation makes reasoning leak to every voice turn with `show_thinking = true`, silently, and it
+  > is not theoretical: `main.rs` builds the serve-mode adapter with `voice_mode: false` hardcoded,
+  > so the instance flag is never true in the desktop/server process and `request.voice_mode` —
+  > sent by `WebVoiceBackend.ts` — is the only signal that ever goes true. `routes.rs` forwards
+  > `AgentStreamEvent::Thinking` unconditionally on both handlers, so the producer gate really is
+  > the only defence, exactly as this phase argued, and its input was unguarded.
+  >
+  > This is the `ProfileScope::Owner` shape one level up: the fixture is reachable in production,
+  > but no test held it reachable. Fixed by extracting the policy into a testable unit —
+  > `GooseAdapter::voice_turn(instance, request)` — called at the binding site, with all four rows
+  > asserted by `a_request_flagged_voice_is_a_voice_turn_even_on_a_text_started_process`. The
+  > `(false, true)` row is asserted first and by name, because it is the shipped-desktop case. The
+  > source guard additionally pins the composition, not just the token. Both mutations now go red.
+
+  > **OPEN 2026-08-06 (synthesis), NOT fixed: the frame granularity is wrong, and the phase's claim
+  > that "the consumer already exists, so this is observable end-to-end with no further work" is
+  > false in shape rather than in degree.** P1 emits ONE `Thinking` frame per `AgentEvent::Message`.
+  > On its own headline reachable configuration — local/gguf on the Jetson — goose emits one
+  > `AgentEvent::Message` **per reasoning delta**, i.e. per token piece:
+  > `goose-local-inference/src/llamacpp/inference_native_tools.rs` calls
+  > `push_structured_reasoning` from inside the per-token `|piece|` callback and it returns the raw
+  > unbuffered delta; `goose-provider-types/src/formats/openai.rs` yields only the newly-accumulated
+  > slice. Nothing upstream coalesces them — `reply_parts.rs`'s
+  > `should_suppress_replayed_thinking` requires `has_tool_requests`, so a pure-reasoning chunk is
+  > never suppressed.
+  >
+  > The consumer treats every frame as a complete, discrete reasoning block:
+  > `sections/Chat.tsx` does `thinkingBlocks: [...(last.thinkingBlocks ?? []), ev.content]` and
+  > renders each as its own `<p>`. So one reasoning passage renders as hundreds of one-fragment
+  > paragraphs, with the inter-fragment whitespace destroyed by `reasoning_frames`' per-fragment
+  > `.trim()`. Note the asymmetry P1 stepped into: `Chat.tsx` CONCATENATES text deltas
+  > (`last.text + visible`) and APPENDS thinking frames. The contrast that establishes the intended
+  > contract is `thought_filter.rs`, which captures the COMPLETE body between paired tags.
+  >
+  > Not fixed here because it is a streaming-semantics change on the live path and the coordinator's
+  > live run has not happened yet — this is precisely a "does it render twice / does it render as
+  > confetti" question that a unit test answers less well than one turn on a real Jetson. Every P1
+  > test is single-message, which is why the suite is green. **The fix belongs in the adapter**
+  > (`Chat.tsx` renders it and the consumer's append is reasonable): accumulate reasoning per
+  > message and emit one frame per completed block, or keep per-delta frames and stop trimming.
+  > Either way the test must drive a SEQUENCE: `[" the user", " asked about", " the light"]` must
+  > round-trip to `"the user asked about the light"`, not `"the userasked aboutthe light"`.
+
   **The phase as written targeted a crate that cannot execute.** `ChatEvent::Reasoning` and
   `pond-inference`'s `reasoning_content` both belong to the quarantined PondAgent loop (Q2-05), so
   implementing them literally would have changed nothing a user can observe — a third "correct but
@@ -332,6 +381,37 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   `the_reasoning_count_is_taken_outside_the_display_gate` asserts structurally that the accumulation
   sits above the frame loop; mutation-tested by moving it inside, which fails naming that
   consequence.
+
+  > **CORRECTED 2026-08-06 (synthesis): that guard was vacuous against the regression it names, and
+  > the phase's mutation happened to pick the one syntactic form it catches.** Moving the statement
+  > INSIDE the `for` loop fails, as reported. Wrapping it in `if emit_reasoning { … }` on the
+  > preceding line — the way anyone would actually couple the count to the display gate — left all
+  > seven reasoning tests green, `the_reasoning_count_is_taken_outside_the_display_gate` included.
+  > The guard located the single line holding `Self::count_reasoning_tokens(&msg,` and checked only
+  > THAT line for `emit_reasoning`; a conditional one line up is invisible to it. A `let gated = …`
+  > computed above it also passed.
+  >
+  > The consequence is worse than a missed regression. `chat.rs::stream_response_inner` builds its
+  > `AgentRequest` with `voice_mode: true` unconditionally, and that is the **only** path that
+  > persists this number — so on `run_chat`, `emit_reasoning` is always false. A gated count would
+  > have written `Some(0)` for 100% of the corpus P5 reads, while every test that exercises the
+  > pure counter kept passing. Fixed: the guard now scans the whole eight-line window and fails on
+  > any `emit_reasoning` in it, quoting the offending line.
+  >
+  > **A second dark link, same shape.** Both `UsageStats` construction arms were replaced with a
+  > literal `reasoning_tokens: None` and all 108 tests passed — this phase's own named failure mode
+  > ("produced, reaches `Done`, and is dropped") landing silently on the path where it is supposed
+  > to survive. The guard now asserts both arms read `turn_stats.reasoning_tokens`. There are two
+  > because the usage build has a reported-usage path and a fallback path, and a regression fixing
+  > only one is worse than one fixing neither, because it then depends on the provider.
+  >
+  > **Still dark, and NOT fixed here** — `ChatService::persist_assistant_response`'s
+  > `.with_reasoning_tokens(usage.and_then(|u| u.reasoning_tokens))` can be replaced with `None`
+  > and all 804 `pond-core` tests pass. The adjacent link IS guarded (mutating
+  > `SessionMessage::with_reasoning_tokens` to a no-op fails the `pond-infra` round-trip), so the
+  > store is proven to round-trip a hand-built row; nothing connects the counted number to the
+  > column. It needs one test against a fake `SessionStorage` asserting the captured
+  > `SessionMessage.reasoning_tokens == Some(N)`. Left for P6, which is already opening this file.
 
   **`None` is not `Some(0)`.** "Nobody counted" and "counted, and this turn thought nothing" are
   different facts and P5 must not read the first as the second. That is why 0039 has no `DEFAULT 0`:
