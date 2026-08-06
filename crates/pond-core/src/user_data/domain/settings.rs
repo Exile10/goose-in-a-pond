@@ -1893,17 +1893,27 @@ mod tests {
             // gets a UI only if it survives to `enforce` (PAI-2 P8), and giving
             // it one now would invite flipping a half-validated matrix on.
             "security_policy_mode",
-            // The egress gate's rollout lever (PAI-2 P5). Headless for the same
-            // reason security_policy_mode is: while any real-egress call site
-            // is still ungated (see crates/pond-core/tests/egress_guard.rs),
-            // a UI switch labelled "offline" would promise more than the code
-            // delivers. It gets a control when that list is empty.
+            // The egress gate's rollout lever (PAI-2 P5). Headless because
+            // while any real-egress call site was still ungated (see
+            // crates/pond-core/tests/egress_guard.rs), a UI switch labelled
+            // "offline" would have promised more than the code delivered. The
+            // condition for giving it a control was "when UNGATED_SENDERS is
+            // empty".
             //
-            // P6a took the count from six files to ONE. The remainder is
-            // `pond-api/src/routes.rs`, which holds nine egress sites, and it
-            // is P6b. Read UNGATED_SENDERS rather than this comment -- a count
-            // written in prose is the thing that goes stale, which is why the
-            // number was removed from this sentence rather than decremented.
+            // THAT CONDITION IS NOW MET. PAI-2 P6b gated the last file,
+            // `pond-api/src/routes.rs`; `UNGATED_SENDERS` is empty and
+            // `MAX_UNGATED` is 0. This stays HEADLESS_BY_DESIGN only because
+            // shipping the control is a `Settings.tsx` + `types.ts` change that
+            // belongs to whoever owns those files, not because the reason still
+            // holds. Reclassifying it here without that UI would be worse than
+            // leaving it: the completeness test checks the CLASSIFICATION, not
+            // whether a control exists, so a premature UI_WIRED would assert
+            // something untrue and silence the only guard on it. The follow-up
+            // is a three-value control (open / allowlist / offline) on the
+            // Privacy section, and it is the last thing PAI-2 P6 owes.
+            //
+            // Read UNGATED_SENDERS rather than this comment for the current
+            // count -- a number written in prose is the thing that goes stale.
             "network_mode",
             // Hybrid-compaction rollout flags: operator knobs for the
             // deterministic-trim + idle-summary pipeline; flipped via the

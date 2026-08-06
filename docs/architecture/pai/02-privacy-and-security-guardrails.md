@@ -966,10 +966,124 @@ cannot change class quietly.
   `MemoryExtractionService::run` without the `&ProfileScope` argument added by `4a86244a` /
   `1cc7a8eb`. That file is untouched by this phase and CI never builds it.
 
-- **P6b — BLOCKED.** Draft gate for outbound connector actions (lands with PAI-8), **P3's third
-  chokepoint** — redaction before a body leaves the pond, which has no call site to wire until
-  PAI-8 creates one — **and the nine `routes.rs` egress sites** left by P6a, which are not
-  PAI-8-blocked and only need an uncontended tree.
+- **P6b — PARTIALLY LANDED 2026-08-06. One of its three parts is done; the other two are still
+  PAI-8-blocked, and the ledger must say so or this reads as finished when two thirds of it is not.**
+
+  P6b was always three things bundled behind one word. Split them:
+
+  | part | state |
+  |---|---|
+  | the `routes.rs` egress sites left by P6a | **LANDED.** Not PAI-8-blocked; it only ever needed an uncontended tree. |
+  | draft gate for outbound connector actions | **BLOCKED**, lands with PAI-8. |
+  | P3's third chokepoint — redaction before a body leaves the pond | **BLOCKED**, and for the sharper reason: there is no call site to wire. PAI-8 creates the first one. |
+
+  **`UNGATED_SENDERS` is empty and `MAX_UNGATED` is 0.** Every file in the workspace that
+  `egress_guard.rs` sees sending HTTP now either reaches the tracker or is loopback-only with a
+  checked reason. That is invariant 4 discharged to zero for the code this guard can see — not for
+  the code it cannot, which is still `download_and_extract_ort`'s `curl` and anything Goose's own
+  provider layer does inside the submodule.
+
+  **Thirteen sites, not the nine the doc claimed, and the extra four are the interesting ones.**
+  P6a's stamp counted nine egress sites and seven loopback; the real split at this HEAD is sixteen
+  senders, thirteen now gated and three genuinely loopback. The four the count missed:
+
+  - **`spawn_tracked_download`'s non-HF branch**, the chokepoint every non-HuggingFace model
+    transfer actually passes through. Both download handlers also refuse synchronously *before*
+    they spawn, because a refusal that only lands in a detached task shows up as a failed row in
+    the progress tracker and is not an answer to "why is nothing downloading".
+  - **`transcribe` and `calibrate_wake_word`'s whisper forwards**, and
+  - **the `probe` helper**, which the plan for this phase explicitly said to leave alone on the
+    grounds that its call sites are `127.0.0.1` literals. Two of the three are. The third is
+    `state.whisper_url`, i.e. `settings.voice_whisper_url` — a free-text setting that merely
+    *defaults* to loopback. A pond pointed at a remote ASR box was POSTing raw household audio to a
+    third party through an ungated `.send()`, and `network_mode = "offline"` did nothing about it.
+    Gating it costs nothing on a default install: `check_egress` classifies loopback `Internal`,
+    which every mode permits. `check_egress` and not `begin` on those three deliberately — under
+    the shipped default they fire on every utterance, and recording an `Internal` egress event per
+    utterance is how a privacy feed becomes something nobody reads.
+
+  **The Spotify `Option` was hiding a refusal inside "not connected".** `spotify_api_call` returned
+  `Option<Response>`, so a network-mode refusal came back as a bare `{"connected": false}` — which
+  sends the user to re-run an OAuth flow that cannot possibly succeed while the mode is what it is.
+  It now returns `Result<_, SpotifyUnavailable>` with `NotConnected` and `Refused` as separate
+  arms; `/music/now-playing` answers `error: "network_refused"` with the whole `EgressDenied` text
+  and `/music/control` answers 502. An unactionable refusal is the failure PAI-2 invariant 1 exists
+  to prevent, and folding it into an unrelated state is the worst version of it.
+
+  **The three model-search handlers deliberately do NOT return 502.** Their contract is already
+  HTTP 200 with an `error` string, `PondApiClient.request` throws `ApiError` on any non-2xx, and
+  the callers of `searchGgufModels` are outside this phase's footprint. Returning 502 would have
+  converted a privacy refusal into an unhandled rejection in the dashboard. The refusal text is
+  carried in full either way; only the envelope differs, and it differs to match what the shipped
+  UI already handles.
+
+  **`run_agent_cmd` installs the mode, and needed a new guard because the existing one could not
+  see it.** `pond agent chat` / `agent tools` / `agent extras` has read the settings row since it
+  was written and ignored the one field on it that says whether the pond may talk to anybody. It is
+  invisible to `every_entry_point_installs_the_gate_before_it_downloads` because that detector asks
+  "which functions DOWNLOAD" and `run_agent_cmd` downloads nothing — it hands three arms to
+  `build_goose_backend`, which wires the LLM provider, the weather adapter and the whole MCP tool
+  surface. Downloading is one way to phone home; running a turn is the other, and it is the common
+  one. `every_entry_point_installs_the_gate_before_it_builds_an_agent` asserts ORDER, not presence,
+  over the three callers of `build_goose_backend` (`run_server`, `run_chat`, `run_agent_cmd`), with
+  the count pinned.
+
+  **The main guard is NOT the file-level one, and it could not be.**
+  `egress_tracked_files_reach_the_tracker` looks for one tracker symbol per FILE; `routes.rs` has
+  sixteen senders, so gating one of them turns that test green while fifteen still phone out. That
+  guard says exactly this in its own doc comment. So `crates/pond-api/tests/egress_offline_routes.rs`
+  carries two halves: a source-level test that pairs each `.send()` with a **distinct** preceding
+  gate inside the same function, and behavioural tests that install `Offline` and drive six routes
+  over real HTTP asserting a *refusal* rather than a failure. The source half is not redundant —
+  four gated sites are unreachable from a router test at all (two inside a `tokio::spawn`ed
+  download, both OAuth exchanges needing a live provider redirect or the internal-extension token).
+
+  **Mutation-tested, and the main guard failed its first mutation — for a reason worth recording.**
+  The planned regression was deleting the gate from the Spotify **post-401 retry only**, leaving
+  the first attempt and the refresh gated: a `.send()` copy-pasted below an existing gated one,
+  which is exactly how that retry was written in the first place. All eight tests stayed GREEN.
+  The cause was in the guard, not the code: `GATE_CALLS` held both `egress::begin(` and
+  `shared::services::egress::begin(`, and the second is a **superstring of the first**, so one real
+  call produced two distinct byte offsets and every function counted twice as many gates as it had.
+  A source-text guard whose patterns overlap each other double-counts, and double-counting is
+  indistinguishable from correctness until something is missing. With the list de-overlapped the
+  same mutation fails naming the site: *"`spotify_api_call(`: send #2 (byte 1428) has only 1
+  gate(s) before it, and 1 earlier send(s) already consumed them."*
+
+  Two more mutations. Deleting the `run_agent_cmd` install fails the new entry-point guard with
+  *"`run_agent_cmd(action: AgentAction) -> Result<()> {` builds a Goose agent … but never calls
+  set_network_mode"*. Deleting the `search_gguf_models` gate fails
+  `hugging_face_model_search_is_refused_offline` — and it failed by **returning twenty real
+  HuggingFace model records**, which is the behavioural half proving it is not vacuous: the request
+  genuinely left the machine. All three restored byte-identical (`shasum -a 256` compared).
+
+  **The lesson to carry, in the same family as P6a's:** a guard that greps bare symbols is
+  defeatable by comments; a guard whose patterns overlap is defeatable by arithmetic. Both fail
+  *open*, both look correct in review, and only mutation finds either.
+
+  **What this deliberately did NOT do.** No UI. `network_mode` stays `HEADLESS_BY_DESIGN`, and the
+  comment on it now records that its stated condition ("it gets a control when that list is empty")
+  is **met** while the control is not built — reclassifying it `UI_WIRED` without the control would
+  make the completeness test assert something untrue and silence the only guard on it. Building it
+  needs `Settings.tsx` and `types.ts`, which belong to another phase. The three loopback senders
+  (`tts_synthesise`, `sync_ollama_models`, `list_ollama_models`) are ungated on purpose and named
+  individually in `UNGATED_LOOPBACK_SENDS`, each pinned to the loopback literal that has to stay in
+  the function. No `/transcribe` behavioural test: it needs a multipart fixture, and the same
+  configurable-host question is covered by the diagnostics probe.
+
+  **What would falsify this.** A `network_mode = "offline"` pond that still completes an outbound
+  request from any `routes.rs` handler. Or a `pond agent chat` run that reaches a third-party host
+  with the setting stored as `offline`. Or — the quieter one — an `allowlist` pond whose HuggingFace
+  model search silently returns an empty list with no `error` field, which would mean a gate that
+  refuses without saying so.
+
+  Gates: `cargo fmt --check` clean; `cargo test -p pond-core` and `-p pond-api` green (including
+  `egress_guard` 7/7 and `egress_offline_routes` 8/8); `cargo clippy -p pond-api -p pond-core` adds
+  no new warning (the three in `routes.rs` are pre-existing and untouched by this diff);
+  `cargo check -p pond-server` clean. NOT run: `cargo test -p pond-server`, which still does not
+  compile at this commit for the pre-existing `live_feature_test.rs` reason P6a recorded — a
+  different phase in this round owns that. `scripts/live-test.sh` NOT run by this phase; the
+  coordinator owns the live run and this change touches routes and startup wiring, so it needs one.
 - **P7 — LANDED 2026-08-05.** `PUBLIC_ROUTES` entries carry an `Exposure`: `Always`,
   `UntilOnboarded`, or `UntilOnboardedThenHostOnly`. Nine entries are state-dependent — `PUT
   /settings`, `POST /profiles`, `PATCH /profiles/{id}`, `POST /onboard`, `/onboard/complete`,
