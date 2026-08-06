@@ -240,6 +240,7 @@ impl SettingsRepository for SqliteSettingsRepository {
         );
         // Thinking / reasoning
         upsert!("thinking_mode", &settings.thinking_mode);
+        upsert!("reasoning_effort", &settings.reasoning_effort);
         upsert!(
             "show_thinking",
             if settings.show_thinking {
@@ -784,6 +785,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         // Thinking / reasoning
         "thinking_mode" => s.thinking_mode = value.to_string(),
         "show_thinking" => s.show_thinking = value == "true",
+        "reasoning_effort" => s.reasoning_effort = value.to_string(),
         "context_window_override" => {
             if let Ok(v) = value.parse() {
                 s.context_window_override = v;

@@ -365,6 +365,156 @@ impl CompactionProfile {
     }
 }
 
+// ── Reasoning effort (PAI-5 P4) ─────────────────────────────────────────────
+
+/// How much room the model is told it may spend thinking before it answers.
+///
+/// This is a preference with three settings, NOT a token count the user types.
+/// The right number is a function of the window and the device — see
+/// [`reasoning_budget_tokens`] — so the preference only chooses a share of a
+/// budget the profile already owns.
+///
+/// The string forms are pinned by
+/// `crate::user_data::domain::settings::REASONING_EFFORTS`, and
+/// `reasoning_effort_strings_agree_with_settings` fails if either side grows a
+/// value alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    /// Least thinking. The on-device default: reasoning tokens are decode
+    /// tokens, and decode on the Orin is memory-bandwidth-bound at roughly
+    /// `102 / model_GB` tok/s, so every thinking token is silence before the
+    /// answer starts.
+    Brief,
+    /// The middle setting.
+    Balanced,
+    /// Most thinking. The right choice on an HTTP provider, where the tokens
+    /// are both cheap and fast.
+    Thorough,
+}
+
+impl ReasoningEffort {
+    /// Every variant, in increasing order of spend. Used by the agreement test
+    /// and by anything that needs to enumerate the setting.
+    pub const ALL: &'static [ReasoningEffort] = &[
+        ReasoningEffort::Brief,
+        ReasoningEffort::Balanced,
+        ReasoningEffort::Thorough,
+    ];
+
+    /// Parse the stored setting string.
+    ///
+    /// An unrecognised value falls back to [`ReasoningEffort::Brief`] — the
+    /// SMALLEST budget. This is the same bargain `NetworkMode::parse` strikes
+    /// and the direction matters: a typo that reached the store must not buy
+    /// the model a bigger think than anybody chose. The narrowing half is at
+    /// the edge, where `PUT /api/v1/settings` returns 422 for a value that is
+    /// not in `REASONING_EFFORTS` rather than absorbing it — because the
+    /// fallback here is a silent log line and nobody would ever see it.
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "balanced" => ReasoningEffort::Balanced,
+            "thorough" => ReasoningEffort::Thorough,
+            "brief" => ReasoningEffort::Brief,
+            other => {
+                if !other.is_empty() {
+                    tracing::warn!(
+                        "unrecognised reasoning_effort {other:?} — falling back to \"brief\""
+                    );
+                }
+                ReasoningEffort::Brief
+            }
+        }
+    }
+
+    /// The stored string form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReasoningEffort::Brief => "brief",
+            ReasoningEffort::Balanced => "balanced",
+            ReasoningEffort::Thorough => "thorough",
+        }
+    }
+}
+
+/// The floor under any thinking budget.
+///
+/// Never zero. Zero is `thinking_mode = "off"`'s job, and it says so by
+/// removing the whole `<thinking>` section — a budget of zero words inside a
+/// section that still tells the model to reason is a contradiction, and a small
+/// model resolves contradictions by ignoring one half at random.
+const MIN_REASONING_BUDGET_TOKENS: usize = 32;
+
+/// Tokens a `<thinking>` block may run to, on this profile, at this effort.
+///
+/// Derived from [`CompactionProfile::output_reserve_tokens`] rather than from
+/// the window, because reasoning tokens ARE output tokens: they are decoded
+/// into the same reserve the answer is decoded into, and the overrun that
+/// section 3.3 of PAI-5 is about is precisely a thinking block eating the
+/// reserve mid-generation. Budgeting a share of the raw window instead would
+/// be budgeting against a pool this one does not draw from.
+///
+/// The shares are eighths of the reserve — 1/8, 1/4, 1/2 — which leaves the
+/// answer at least half the reserve at every effort. At the two windows that
+/// actually run (8,192 on every local provider, 32,768 for the name-heuristic
+/// HTTP models) that is 128/256/512 and 256/512/1,024 tokens.
+pub fn reasoning_budget_tokens(profile: &CompactionProfile, effort: ReasoningEffort) -> usize {
+    let reserve = profile.output_reserve_tokens;
+    let share = match effort {
+        ReasoningEffort::Brief => reserve / 8,
+        ReasoningEffort::Balanced => reserve / 4,
+        ReasoningEffort::Thorough => reserve / 2,
+    };
+    share.max(MIN_REASONING_BUDGET_TOKENS)
+}
+
+/// The window the compact tier is sampled at when only `compact_prompt` is known.
+///
+/// 8,192 is not an arbitrary pick: `ContextGovernor::prompt_window` clamps every
+/// local provider to exactly 8,192, so this is the most-executed window in the
+/// system and the profile curve is pinned at it by an existing regression test.
+const COMPACT_TIER_SAMPLE_WINDOW: usize = 8_192;
+
+/// The window the roomy tier is sampled at when only `compact_prompt` is known.
+///
+/// 32,768 is what the model-name heuristic hands to qwen and mistral, and the
+/// profile curve is flat from there to 65,536.
+const ROOMY_TIER_SAMPLE_WINDOW: usize = 32_768;
+
+/// Words a `<thinking>` block may run to — the prompt-side form of
+/// [`reasoning_budget_tokens`].
+///
+/// Words, not tokens, because the model cannot count its own tokens and a token
+/// figure in a prompt is read as decoration. `budget_as_words` is the existing
+/// precedent (`resummarisation.rs`) and rounds DOWN, keeping the ask inside the
+/// budget rather than at it.
+///
+/// # Why this takes a bool and not a `&CompactionProfile`
+///
+/// The prompt renderer never receives the profile. It receives `PromptState`,
+/// whose `compact_prompt` flag IS profile-derived
+/// ([`CompactionProfile::use_compact_prompt`]) and is the only profile signal
+/// that reaches it. So the curve is sampled at the two windows above rather
+/// than evaluated at the turn's own window.
+///
+/// That is a real loss of resolution and it is recorded rather than hidden: the
+/// file that could carry the whole profile into `PromptState` is
+/// `crates/pond-adapters-goose/src/goose_agent.rs`, which was held by another
+/// workstream when this landed. Widening `PromptState` with a
+/// `reasoning_budget_words` field and setting it from `turn_profile` beside
+/// `compact_prompt` (the same block, before `ensure_provider_current`, so the
+/// KV prefix still resolves once per session) is the follow-up. Until then the
+/// two-point sample is honest and, at the two windows that actually run,
+/// exactly equal to the full evaluation.
+pub fn reasoning_budget_words(effort: ReasoningEffort, compact_prompt: bool) -> usize {
+    let window = if compact_prompt {
+        COMPACT_TIER_SAMPLE_WINDOW
+    } else {
+        ROOMY_TIER_SAMPLE_WINDOW
+    };
+    let profile = CompactionProfile::from_context_window(window);
+    super::resummarisation::budget_as_words(reasoning_budget_tokens(&profile, effort))
+}
+
 /// Calculate available history budget in characters after system prompt and tool schema overhead.
 ///
 /// The returned value is the upper bound for the total length of message
@@ -1257,5 +1407,127 @@ mod tests {
         assert_eq!(p.system_prompt_budget, 1_500);
         assert_eq!(p.usable_prompt_tokens(), 256);
         assert_eq!(p.usable_history_tokens(), 0);
+    }
+
+    // ── Reasoning effort (PAI-5 P4) ─────────────────────────────────────────
+
+    /// Bidirectional, in the shape `VERDICTS` uses: a fourth effort added to
+    /// either the enum or the settings constant alone fails here.
+    #[test]
+    fn reasoning_effort_strings_agree_with_settings() {
+        use crate::user_data::domain::settings::REASONING_EFFORTS;
+
+        let from_enum: Vec<&str> = ReasoningEffort::ALL.iter().map(|e| e.as_str()).collect();
+        assert_eq!(
+            from_enum, REASONING_EFFORTS,
+            "ReasoningEffort::ALL and settings::REASONING_EFFORTS have diverged"
+        );
+        for s in REASONING_EFFORTS {
+            assert_eq!(
+                ReasoningEffort::parse(s).as_str(),
+                *s,
+                "round trip failed for {s:?}"
+            );
+        }
+    }
+
+    /// The fallback direction is the whole safety argument: an unrecognised
+    /// value must buy the SMALLEST think, never the largest.
+    #[test]
+    fn an_unrecognised_reasoning_effort_narrows_to_brief() {
+        for bad in ["", "Thorough", "maximum", "high", "off", "true"] {
+            assert_eq!(
+                ReasoningEffort::parse(bad),
+                ReasoningEffort::Brief,
+                "{bad:?} must fall back to the smallest budget"
+            );
+        }
+        // And the fallback really is the smallest, not merely a named variant.
+        let p = CompactionProfile::from_context_window(8_192);
+        let brief = reasoning_budget_tokens(&p, ReasoningEffort::Brief);
+        for e in ReasoningEffort::ALL {
+            assert!(
+                brief <= reasoning_budget_tokens(&p, *e),
+                "Brief is not the smallest budget — the parse fallback widens scope"
+            );
+        }
+    }
+
+    /// The budget is a share of the OUTPUT RESERVE, so it tracks the window and
+    /// the device rather than a number somebody typed. Monotonic in effort,
+    /// monotonic in window, and it always leaves the answer at least half the
+    /// reserve.
+    #[test]
+    fn the_reasoning_budget_is_a_share_of_the_output_reserve() {
+        for w in [3_072usize, 4_096, 8_192, 12_288, 32_768, 65_536, 128_000] {
+            let p = CompactionProfile::from_context_window(w);
+            let b = reasoning_budget_tokens(&p, ReasoningEffort::Brief);
+            let m = reasoning_budget_tokens(&p, ReasoningEffort::Balanced);
+            let t = reasoning_budget_tokens(&p, ReasoningEffort::Thorough);
+            assert!(b <= m && m <= t, "window {w}: not monotonic in effort");
+            assert!(
+                b >= MIN_REASONING_BUDGET_TOKENS,
+                "window {w}: budget fell to zero — that is thinking_mode's job"
+            );
+            assert!(
+                t * 2 <= p.output_reserve_tokens,
+                "window {w}: thinking may claim more than half the answer's room"
+            );
+        }
+        // Bigger window, bigger think — the property section 3.3 asks for.
+        let small = CompactionProfile::from_context_window(8_192);
+        let big = CompactionProfile::from_context_window(65_536);
+        assert!(
+            reasoning_budget_tokens(&small, ReasoningEffort::Brief)
+                < reasoning_budget_tokens(&big, ReasoningEffort::Brief)
+        );
+    }
+
+    /// The prompt-side sample must equal the full evaluation at the two windows
+    /// it claims to stand for. If the sample constants ever drift off the
+    /// profile curve this is what says so.
+    #[test]
+    fn the_two_point_sample_matches_the_profile_it_stands_for() {
+        for (compact, window) in [(true, 8_192usize), (false, 32_768)] {
+            let p = CompactionProfile::from_context_window(window);
+            assert_eq!(p.use_compact_prompt(), compact, "window {window}");
+            for e in ReasoningEffort::ALL {
+                assert_eq!(
+                    reasoning_budget_words(*e, compact),
+                    super::super::resummarisation::budget_as_words(reasoning_budget_tokens(&p, *e)),
+                    "window {window}, effort {}",
+                    e.as_str()
+                );
+            }
+        }
+    }
+
+    /// Three efforts, three DIFFERENT word counts, on both tiers — and never
+    /// zero. A budget that collapsed to one number would render an identical
+    /// prompt at every effort and the setting would do nothing.
+    #[test]
+    fn every_effort_renders_a_distinct_non_zero_word_budget() {
+        for compact in [true, false] {
+            let words: Vec<usize> = ReasoningEffort::ALL
+                .iter()
+                .map(|e| reasoning_budget_words(*e, compact))
+                .collect();
+            assert!(
+                words.iter().all(|w| *w > 0),
+                "compact={compact}: a zero word budget reached the prompt"
+            );
+            assert!(
+                words[0] < words[1] && words[1] < words[2],
+                "compact={compact}: efforts do not produce distinct budgets: {words:?}"
+            );
+        }
+        // The tight tier must ask for less than the roomy one at equal effort.
+        for e in ReasoningEffort::ALL {
+            assert!(
+                reasoning_budget_words(*e, true) < reasoning_budget_words(*e, false),
+                "effort {}: the on-device tier is not cheaper",
+                e.as_str()
+            );
+        }
     }
 }

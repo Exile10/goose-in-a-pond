@@ -531,3 +531,99 @@ async fn put_settings_refuses_an_unrecognised_network_mode() {
     let restore = put(&app, serde_json::json!({ "network_mode": "open" })).await;
     assert_eq!(restore.status(), StatusCode::OK);
 }
+
+/// PAI-5 P4. `ReasoningEffort::parse` narrows on an unrecognised value -- the
+/// opposite direction to `network_mode`, and for the same reason: on failure,
+/// access narrows. That makes the fallback SAFE but SILENT, which is exactly
+/// why the 422 exists: without it, a typo saved from a client leaves the user
+/// with the smallest think and no way to tell why.
+///
+/// WHAT THIS DELIBERATELY DOES NOT PROVE, because it cannot: that the value
+/// reaches disk. `make_app()` wires `MockSettingsRepository`, whose
+/// `build_settings`/`update` carry a HAND-MAINTAINED SUBSET of the fields —
+/// `reasoning_effort` is not among them, so a `GET` after a `PUT` here returns
+/// the default no matter what the SQLite adapter does. A round-trip assertion
+/// against this harness would be measuring the mock. The real persistence guard
+/// is `roundtrip_persists_every_field` in `pond-infra/src/sqlite_settings.rs`,
+/// which perturbs every serialized field and fails on any that does not come
+/// back — that is what covers the `upsert!` line and the `apply_key` arm.
+///
+/// So this asserts the two things the API layer owns: the refusal, and that a
+/// recognised value survives the merge into the returned `Settings`.
+#[tokio::test]
+async fn put_settings_refuses_an_unrecognised_reasoning_effort() {
+    let (app, _tmp) = make_app().await;
+
+    async fn put(app: &axum::Router, body: serde_json::Value) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/v1/settings")
+                    .header("content-type", "application/json")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn stored_effort(app: &axum::Router) -> String {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/settings")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json.get("reasoning_effort")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("GET /settings carried no reasoning_effort: {json}"))
+            .to_string()
+    }
+
+    // Positive control: the field exists and defaults to the on-device value.
+    // Without it the assertions below would pass against a Settings struct that
+    // never grew the field, because every lookup on a missing key is None.
+    assert_eq!(stored_effort(&app).await, "brief");
+
+    let bad = put(&app, serde_json::json!({ "reasoning_effort": "thourough" })).await;
+    assert_eq!(
+        bad.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an unrecognised reasoning_effort must be refused, not absorbed into \"brief\""
+    );
+    assert_eq!(
+        stored_effort(&app).await,
+        "brief",
+        "the refused value must not have reached the store"
+    );
+
+    // ...and every recognised value is accepted and comes back in the merged
+    // object the handler returns, or the guard has locked the setting out
+    // entirely — a different bug wearing the same green.
+    for good in ["balanced", "thorough", "brief"] {
+        let resp = put(&app, serde_json::json!({ "reasoning_effort": good })).await;
+        assert_eq!(resp.status(), StatusCode::OK, "PUT {good} was refused");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some(good),
+            "PUT returned 200 but the merged settings do not carry {good:?}: {json}"
+        );
+    }
+}

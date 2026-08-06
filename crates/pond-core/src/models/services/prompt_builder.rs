@@ -221,6 +221,10 @@ pub fn compute_prefix_hash_fast(
     settings.weather_location_name.hash(&mut hasher);
     settings.prompt_style.hash(&mut hasher);
     settings.custom_system_prompt.hash(&mut hasher);
+    // Renders the word cap inside <thinking>. Omitting it would let this fast
+    // path report "prefix unchanged" for a prefix that changed, which is the
+    // one way a cache check can be worse than no cache check at all.
+    settings.reasoning_effort.hash(&mut hasher);
     // Template content
     template_content.hash(&mut hasher);
     // State fields that are baked into the static prefix
@@ -230,6 +234,11 @@ pub fn compute_prefix_hash_fast(
     state.voice_mode.hash(&mut hasher);
     state.canvas_mode.hash(&mut hasher);
     state.thinking_enabled.hash(&mut hasher);
+    // Selects the compact variant of four sections, AND the tier the thinking
+    // word cap is drawn from. It was already baked into the static prefix and
+    // already missing from this hash before PAI-5 P4; the second consumer is
+    // what makes the omission worth closing rather than noting.
+    state.compact_prompt.hash(&mut hasher);
     // Gates the "Available tools:" listing inside <tool-usage>
     state.native_tools_json.hash(&mut hasher);
     // Tool descriptions are static, but hash their count as a sanity check
@@ -546,6 +555,55 @@ mod tests {
         settings2.assistant_name = "Changed".to_string();
         let fast3 = compute_prefix_hash_fast(&settings2, &state, PROMPT_BALANCED);
         assert_ne!(fast, fast3, "Fast hash must change when settings change");
+    }
+
+    /// Both inputs to the `<thinking>` word cap really do change the prefix,
+    /// and both are therefore in the fast hash. The failure this catches is the
+    /// silent one: a fast hash that says "unchanged" for a prefix that changed
+    /// means the provider reuses a KV cache for a prompt it never saw.
+    #[test]
+    fn both_inputs_to_the_thinking_budget_move_the_prefix_and_the_fast_hash() {
+        let state = PromptState {
+            thinking_enabled: true,
+            compact_prompt: false,
+            ..default_state()
+        };
+
+        // 1. reasoning_effort.
+        let brief = Settings {
+            reasoning_effort: "brief".to_string(),
+            ..Default::default()
+        };
+        let thorough = Settings {
+            reasoning_effort: "thorough".to_string(),
+            ..Default::default()
+        };
+        let p_brief = build_prompt_partition(&brief, None, &state, PROMPT_BALANCED);
+        let p_thorough = build_prompt_partition(&thorough, None, &state, PROMPT_BALANCED);
+        assert_ne!(
+            p_brief.static_prefix, p_thorough.static_prefix,
+            "reasoning_effort does not reach the static prefix at all"
+        );
+        assert_ne!(
+            p_brief.prefix_hash, p_thorough.prefix_hash,
+            "reasoning_effort changed the prefix without changing its hash"
+        );
+        assert_ne!(
+            compute_prefix_hash_fast(&brief, &state, PROMPT_BALANCED),
+            compute_prefix_hash_fast(&thorough, &state, PROMPT_BALANCED),
+            "the fast hash misses reasoning_effort — it would report a changed prefix unchanged"
+        );
+
+        // 2. compact_prompt, which picks the tier the budget is drawn from.
+        let compact_state = PromptState {
+            compact_prompt: true,
+            ..state.clone()
+        };
+        assert_ne!(
+            compute_prefix_hash_fast(&brief, &state, PROMPT_BALANCED),
+            compute_prefix_hash_fast(&brief, &compact_state, PROMPT_BALANCED),
+            "the fast hash misses compact_prompt"
+        );
     }
 
     #[test]

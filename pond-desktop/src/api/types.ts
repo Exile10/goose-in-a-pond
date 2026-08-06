@@ -88,6 +88,7 @@ export interface Settings {
   chat_model?: string;
   tool_model?: string | null;
   thinking_mode?: string;
+  reasoning_effort?: string;
   show_thinking?: boolean;
   review_mode?: string;
   review_max_rounds?: number;

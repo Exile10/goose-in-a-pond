@@ -226,7 +226,7 @@ Return ONLY the title text — no quotes, no punctuation, no explanation.";
 // Variables substituted:
 //   String: {{assistant_name}}, {{user_name}}, {{personality}}, {{timezone}},
 //           {{location}}, {{current_date}}, {{current_time}}, {{online_device_names}}
-//   usize:  {{device_count}}
+//   usize:  {{device_count}}, {{reasoning_budget_words}}
 //   bool:   {{has_home_devices}}, {{atypical_speech}}, {{has_tools}},
 //           {{voice_mode}}, {{canvas_mode}}, {{thinking_enabled}},
 //           {{compact_prompt}}, {{native_tools_json}}
@@ -388,6 +388,7 @@ If a request requires leaving the local network, say so clearly and wait for con
 For complex questions, reason through the problem step by step before answering. \
 For planning tasks, consider multiple approaches before recommending one. \
 Quality matters more than speed — take time to think when the question deserves it.
+Keep the thinking itself under {{reasoning_budget_words}} words, then answer.
 </thinking>
 {%- endif %}
 {% if voice_mode %}
@@ -487,6 +488,7 @@ Door/alarm: require explicit confirmation. Unknown device: say not set up yet.
 {%- if thinking_enabled %}
 <thinking>
 Hard problems: reason step by step first, then answer.
+Thinking: under {{reasoning_budget_words}} words.
 </thinking>
 {%- endif %}
 {% if voice_mode %}
@@ -612,6 +614,7 @@ Unrecognised device: offer to add it. External egress: disclose destination and 
 <thinking>
 Deep analysis mode — show reasoning chain, evaluate trade-offs, surface uncertainty.
 Prefer precision over brevity.
+Reasoning budget: at most {{reasoning_budget_words}} words before the answer begins.
 </thinking>
 {%- endif %}
 {% if voice_mode %}
@@ -730,6 +733,7 @@ I'll always ask before doing anything outside your home network.
 <thinking>
 For tricky questions I take a moment to think it through step by step before \
 answering — a good answer beats a fast one.
+I keep that to under {{reasoning_budget_words}} words so nobody is left waiting.
 </thinking>
 {%- endif %}
 {% if voice_mode %}
@@ -890,7 +894,7 @@ pub fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
 /// ## Context variables provided
 /// - `String`:  `assistant_name`, `user_name`, `personality`, `timezone`, `location`,
 ///              `current_date`, `current_time`, `online_device_names`
-/// - `usize`:   `device_count`
+/// - `usize`:   `device_count`, `reasoning_budget_words`
 /// - `bool`:    `has_home_devices`, `atypical_speech`, `has_tools`, `voice_mode`,
 ///              `canvas_mode`, `thinking_enabled`, `compact_prompt`,
 ///              `native_tools_json`
@@ -968,6 +972,28 @@ pub fn render_jinja_template(
         &state.map(|s| s.thinking_enabled).unwrap_or(false),
     );
 
+    // How LONG the thinking may run, in words. `thinking_enabled` above says
+    // WHETHER; this says how much, and it is only ever rendered inside the
+    // `{% if thinking_enabled %}` block, so `off` stays off.
+    //
+    // Words rather than tokens because the model cannot count its own tokens.
+    // Derived here, from the two inputs that already reach this function --
+    // `settings.reasoning_effort` (the preference) and `state.compact_prompt`
+    // (the profile signal) -- rather than carried on `PromptState`, so that
+    // nothing new has to resolve inside the adapter. That matters for the KV
+    // prefix: this value is a pure function of the same `settings` that already
+    // chooses `prompt_style` and `custom_system_prompt`, so it resolves in the
+    // same place they do and cannot differ between turn one and turn two the
+    // way a lazily-warmed capability cache did (see PAI-5 invariant 1).
+    let reasoning_budget_words =
+        crate::models::services::context::context_budget::reasoning_budget_words(
+            crate::models::services::context::context_budget::ReasoningEffort::parse(
+                &settings.reasoning_effort,
+            ),
+            state.map(|s| s.compact_prompt).unwrap_or(false),
+        );
+    ctx.insert("reasoning_budget_words", &reasoning_budget_words);
+
     // Compact prompt — when true, templates should skip verbose sections to
     // save tokens on small-context platforms (Jetson 3K, macOS Metal 8K).
     ctx.insert(
@@ -993,12 +1019,16 @@ pub fn render_jinja_template(
         Ok(rendered) => rendered,
         Err(e) => {
             tracing::warn!("Tera render failed — falling back to render_template(): {e}");
+            let budget_words = reasoning_budget_words.to_string();
             let vars: &[(&str, &str)] = &[
                 ("assistant_name", name.as_str()),
                 ("user_name", user.as_str()),
                 ("personality", persona.as_str()),
                 ("timezone", tz.as_str()),
                 ("location", location.as_str()),
+                // Substituted here too so a Tera failure cannot leave a raw
+                // `{{reasoning_budget_words}}` sitting in the system prompt.
+                ("reasoning_budget_words", budget_words.as_str()),
             ];
             render_template(template, vars)
         }
@@ -1838,6 +1868,226 @@ mod tests {
             assert!(
                 !off.contains("<thinking>"),
                 "style '{name}': <thinking> must be hidden when thinking_enabled=false"
+            );
+        }
+    }
+
+    // ── Reasoning effort (PAI-5 P4) ───────────────────────────────────────
+
+    /// Everything between `<thinking>` and `</thinking>`, or `None` when the
+    /// section did not render at all.
+    fn thinking_body(rendered: &str) -> Option<String> {
+        let start = rendered.find("<thinking>")?;
+        let end = rendered.find("</thinking>")?;
+        Some(rendered[start..end].to_string())
+    }
+
+    /// The whole prompt with the `<thinking>` section cut out.
+    fn without_thinking(rendered: &str) -> String {
+        match (rendered.find("<thinking>"), rendered.find("</thinking>")) {
+            (Some(a), Some(b)) => {
+                let mut s = rendered[..a].to_string();
+                s.push_str(&rendered[b..]);
+                s
+            }
+            _ => rendered.to_string(),
+        }
+    }
+
+    fn settings_with_effort(effort: &str) -> Settings {
+        Settings {
+            reasoning_effort: effort.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// THE guard. Two claims, and the second is the one that is easy to lose:
+    ///
+    /// 1. The setting BITES — the three efforts render three DIFFERENT thinking
+    ///    sections, in every style and on both compaction tiers. Asserting that
+    ///    the identifier `reasoning_effort` appears somewhere would pass while
+    ///    the rendered cap was a constant; this compares the rendered text.
+    /// 2. The setting bites NOWHERE ELSE — the rest of the static prefix is
+    ///    byte-identical across all three. A reasoning preference that moved
+    ///    any other part of the prefix would re-prefill the KV cache for a
+    ///    reason unrelated to reasoning.
+    #[test]
+    fn reasoning_effort_changes_the_thinking_section_and_nothing_else() {
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                let state = PromptState {
+                    thinking_enabled: true,
+                    compact_prompt: compact,
+                    ..Default::default()
+                };
+
+                let mut bodies: Vec<String> = Vec::new();
+                let mut remainders: Vec<String> = Vec::new();
+                for effort in ["brief", "balanced", "thorough"] {
+                    let out = render_jinja_template(
+                        raw,
+                        &settings_with_effort(effort),
+                        Some(&state),
+                        None,
+                    );
+                    let body = thinking_body(&out).unwrap_or_else(|| {
+                        panic!(
+                            "style '{name}' (compact={compact}, {effort}): no <thinking> section"
+                        )
+                    });
+                    bodies.push(body);
+                    remainders.push(without_thinking(&out));
+                }
+
+                assert_ne!(
+                    bodies[0], bodies[1],
+                    "style '{name}' (compact={compact}): brief and balanced render the SAME \
+                     <thinking> section — reasoning_effort is not reaching the prompt"
+                );
+                assert_ne!(
+                    bodies[1], bodies[2],
+                    "style '{name}' (compact={compact}): balanced and thorough render the SAME \
+                     <thinking> section — reasoning_effort is not reaching the prompt"
+                );
+
+                assert_eq!(
+                    remainders[0], remainders[1],
+                    "style '{name}' (compact={compact}): reasoning_effort moved the prefix \
+                     OUTSIDE <thinking> (brief vs balanced) — that is an unrelated KV re-prefill"
+                );
+                assert_eq!(
+                    remainders[1], remainders[2],
+                    "style '{name}' (compact={compact}): reasoning_effort moved the prefix \
+                     OUTSIDE <thinking> (balanced vs thorough) — that is an unrelated KV re-prefill"
+                );
+            }
+        }
+    }
+
+    /// The rendered cap must be the number `context_budget` computed, not a
+    /// number that merely differs between efforts. A mutation that rendered the
+    /// effort NAME instead of the budget would satisfy the difference test
+    /// above and fail here.
+    #[test]
+    fn the_rendered_word_cap_is_the_computed_budget() {
+        use crate::models::services::context::context_budget::{
+            reasoning_budget_words, ReasoningEffort,
+        };
+
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                for effort in ["brief", "balanced", "thorough"] {
+                    let expected = reasoning_budget_words(ReasoningEffort::parse(effort), compact);
+                    let out = render_jinja_template(
+                        raw,
+                        &settings_with_effort(effort),
+                        Some(&PromptState {
+                            thinking_enabled: true,
+                            compact_prompt: compact,
+                            ..Default::default()
+                        }),
+                        None,
+                    );
+                    let body = thinking_body(&out).expect("thinking section");
+                    assert!(
+                        body.contains(&expected.to_string()),
+                        "style '{name}' (compact={compact}, {effort}): <thinking> does not carry \
+                         the computed budget {expected}. Section was:\n{body}"
+                    );
+                    // And no raw template variable survived into the prompt.
+                    assert!(
+                        !out.contains("reasoning_budget_words"),
+                        "style '{name}': an unsubstituted {{{{reasoning_budget_words}}}} reached \
+                         the system prompt"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Section 3.6: `off` means off. No effort may resurrect the section, and
+    /// with it hidden the three efforts must render byte-identical prompts —
+    /// otherwise the preference is costing a KV re-prefill for a section that
+    /// is not there.
+    #[test]
+    fn thinking_off_renders_no_section_and_no_delta_at_any_effort() {
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                let state = PromptState {
+                    thinking_enabled: false,
+                    compact_prompt: compact,
+                    ..Default::default()
+                };
+                let mut rendered: Vec<String> = Vec::new();
+                for effort in ["brief", "balanced", "thorough", "not-a-real-effort"] {
+                    let out = render_jinja_template(
+                        raw,
+                        &settings_with_effort(effort),
+                        Some(&state),
+                        None,
+                    );
+                    assert!(
+                        !out.contains("<thinking>"),
+                        "style '{name}' (compact={compact}, {effort}): thinking_mode off must \
+                         remove the section, budget and all"
+                    );
+                    rendered.push(out);
+                }
+                for other in &rendered[1..] {
+                    assert_eq!(
+                        &rendered[0], other,
+                        "style '{name}' (compact={compact}): reasoning_effort changed the prompt \
+                         while thinking was OFF"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The prefix must not depend on WHEN it was rendered. This is PAI-5
+    /// invariant 1 in the form this file can prove: the budget is a pure
+    /// function of `settings` and `compact_prompt`, so rendering the same
+    /// inputs twice — as turn one and turn two do — is byte-identical.
+    #[test]
+    fn the_thinking_budget_is_stable_across_repeated_renders() {
+        let s = settings_with_effort("thorough");
+        let state = PromptState {
+            thinking_enabled: true,
+            compact_prompt: true,
+            ..Default::default()
+        };
+        let first = render_jinja_template(PROMPT_BALANCED, &s, Some(&state), None);
+        let second = render_jinja_template(PROMPT_BALANCED, &s, Some(&state), None);
+        assert_eq!(
+            first, second,
+            "the same settings rendered a different prefix twice — turn two would re-prefill"
+        );
+    }
+
+    /// A stored typo must not widen the budget. `brief` is the smallest, so an
+    /// unrecognised value has to render exactly what `brief` renders.
+    #[test]
+    fn an_unrecognised_stored_effort_renders_the_smallest_budget() {
+        let state = PromptState {
+            thinking_enabled: true,
+            ..Default::default()
+        };
+        let brief = render_jinja_template(
+            PROMPT_BALANCED,
+            &settings_with_effort("brief"),
+            Some(&state),
+            None,
+        );
+        for bad in ["", "maximum", "Thorough", "high"] {
+            let out = render_jinja_template(
+                PROMPT_BALANCED,
+                &settings_with_effort(bad),
+                Some(&state),
+                None,
+            );
+            assert_eq!(
+                brief, out,
+                "stored effort {bad:?} did not narrow to brief — a typo bought a bigger think"
             );
         }
     }

@@ -3238,6 +3238,27 @@ async fn update_settings(
         }
     }
 
+    // Reject an unrecognised reasoning_effort, for the same reason and in the
+    // same direction as network_mode above. `ReasoningEffort::parse` falls back
+    // to "brief" -- the SMALLEST thinking budget -- so a typo that reached the
+    // store would quietly shrink the model's think rather than widen it. That
+    // is the safe failure, which is exactly why it must not be the silent one:
+    // refusing here is the only place the user ever finds out.
+    if let Some(effort) = patch.get("reasoning_effort").and_then(|v| v.as_str()) {
+        if !pond_core::user_data::domain::settings::REASONING_EFFORTS.contains(&effort) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": format!(
+                        "reasoning_effort {:?} is not one of {:?}",
+                        effort,
+                        pond_core::user_data::domain::settings::REASONING_EFFORTS
+                    )
+                })),
+            ));
+        }
+    }
+
     // Reject agent_backend="pond" — backend is quarantined (Q2-05, not production-ready).
     if patch.get("agent_backend").and_then(|v| v.as_str()) == Some("pond") {
         return Err((

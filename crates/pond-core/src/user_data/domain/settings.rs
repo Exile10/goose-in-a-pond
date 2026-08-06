@@ -53,6 +53,15 @@ pub const NETWORK_MODES: &[&str] = &[
     NETWORK_MODE_OFFLINE,
 ];
 
+/// The accepted values of `reasoning_effort`, for validation and for the error
+/// message a rejected write gets back.
+///
+/// The behaviour behind each value lives in
+/// `models::services::context::context_budget::ReasoningEffort`, and a test
+/// there (`reasoning_effort_strings_agree_with_settings`) fails if either side
+/// grows a value alone.
+pub const REASONING_EFFORTS: &[&str] = &["brief", "balanced", "thorough"];
+
 /// One factory default that CHANGED after installs already existed.
 ///
 /// Settings are a flat key-value table and a default only applies when the key
@@ -406,6 +415,24 @@ pub struct Settings {
     /// instead of being silently stripped. Off by default.
     #[serde(default)]
     pub show_thinking: bool,
+
+    /// How much room the model is told it may spend thinking: "brief" |
+    /// "balanced" | "thorough" (default "brief").
+    ///
+    /// A preference, not a token count. The number it becomes is derived from
+    /// the active compaction profile's output reserve — see
+    /// `context_budget::reasoning_budget_tokens` — because the right value is a
+    /// function of the window and the device, not of what somebody typed.
+    ///
+    /// `brief` by default because the shipped target is a Jetson Orin Nano,
+    /// where reasoning tokens are decode tokens and decode is
+    /// memory-bandwidth-bound: every thinking token is silence before the
+    /// answer starts. `thorough` is the right choice on an HTTP provider.
+    ///
+    /// Orthogonal to `thinking_mode`: this says how LONG, that says WHETHER.
+    /// `thinking_mode = "off"` removes the whole section, budget and all.
+    #[serde(default = "Settings::default_reasoning_effort")]
+    pub reasoning_effort: String,
 
     // ── Answer Review ──────────────────────────────────────────────────────
     /// Review mode: "off" (default) | "on" | "auto"
@@ -860,6 +887,7 @@ impl Default for Settings {
             retention_sensitive_days: Self::default_sensitive_days(),
             thinking_mode: Self::default_thinking_mode(),
             show_thinking: false,
+            reasoning_effort: Self::default_reasoning_effort(),
             review_mode: Self::default_review_mode(),
             review_max_rounds: Self::default_review_max_rounds(),
             review_pass_threshold: Self::default_review_pass_threshold(),
@@ -1054,6 +1082,11 @@ impl Settings {
     }
     fn default_thinking_mode() -> String {
         "auto".to_string()
+    }
+    fn default_reasoning_effort() -> String {
+        // Brief: the shipped target is an Orin Nano and thinking tokens are
+        // decode tokens. See the field docs.
+        "brief".to_string()
     }
     fn default_review_mode() -> String {
         "off".to_string()
@@ -2019,6 +2052,7 @@ mod tests {
             "schedule_max_concurrent",
             "schedule_max_runs_per_task",
             "schedule_result_notify",
+            "reasoning_effort",
             "searxng_url",
             "show_thinking",
             "show_turn_stats",

@@ -414,6 +414,7 @@ function ModelsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k:
         <>
           <Section title="Response quality">
             <Row label="Thinking mode"><select className="native-select" value={s.thinking_mode ?? "auto"} onChange={(e) => patch("thinking_mode", e.target.value)}><option value="auto">Auto</option><option value="on">Always on</option><option value="off">Off</option></select></Row>
+            <Row label="Thinking length" hint="How long the model may think before answering. Brief keeps on-device replies fast."><select className="native-select" value={s.reasoning_effort ?? "brief"} onChange={(e) => patch("reasoning_effort", e.target.value)}><option value="brief">Brief</option><option value="balanced">Balanced</option><option value="thorough">Thorough</option></select></Row>
             <Row label="Show thinking steps"><Switch isSelected={s.show_thinking ?? false} onChange={(v) => patch("show_thinking", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
             <Row label="Show turn stats" hint="Display inference timing and context usage below each response"><Switch isSelected={s.show_turn_stats ?? false} onChange={(v) => patch("show_turn_stats", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
             <Row label="Answer review"><select className="native-select" value={s.review_mode ?? "off"} onChange={(e) => patch("review_mode", e.target.value)}><option value="off">Off</option><option value="auto">Auto</option><option value="on">Always on</option></select></Row>
