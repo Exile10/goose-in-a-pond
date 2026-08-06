@@ -29,35 +29,57 @@ session a full re-prefill on its second turn — 3.7 s on the Orin. That reasoni
 `ModelConfig.request_params`, only for `local`/`gguf`, tracked by `last_thinking_param`
 (`:208-211`) so a mode change re-stamps without a provider rebuild.
 
-### 1.2 `AgentStreamEvent::Thinking` has zero producers
+### 1.2 `AgentStreamEvent::Thinking` had zero producers
+
+> **CORRECTED 2026-08-06 by P1.** The observation ("no adapter ever emits it") was right; the
+> diagnosis under it was wrong, and the wrong diagnosis is what sent P1 at the wrong crate. See the
+> P1 stamp in section 4. The line numbers below are re-verified as of 2026-08-06 — every one of the
+> four originally recorded here had rotted.
 
 Four references exist in `crates/`, all consumers:
 
 | Site | What it does |
 |---|---|
-| `shared/services/chat.rs:1084` | matches it and **ignores** it |
-| `pond-api/src/routes.rs:1415` | forwards as a `thinking` SSE event |
-| `pond-api/src/routes.rs:7180` | same, on `/agent/chat/stream` |
-| `pond-server/src/main.rs:6178` | CLI, prints dimmed to stderr |
+| `shared/services/chat.rs:1101` | matches it and **ignores** it |
+| `pond-api/src/routes.rs:1332` | forwards as a `thinking` SSE event |
+| `pond-api/src/routes.rs:7919` | same, on `/agent/chat/stream` |
+| `pond-server/src/main.rs:6388` | CLI, prints dimmed to stderr |
 
-No adapter ever emits it. Thinking reaches the UI **only** through `ThoughtFilter`, a streaming state
-machine (`pond-api/src/thought_filter.rs`, 511 lines) that scrapes tag-delimited blocks out of the
-text stream: `<|channel>thought…<channel|>`, `<think>…</think>`, `<thought>…</thought>`
-(`:23-28`), plus standalone sentinels (`:33-40`). It is constructed with capture only when
-`show_thinking && !voice_mode` (`routes.rs:1374-1378`).
+No adapter emitted it **until P1**. The reason was not that nothing produced reasoning — Goose's own
+`goose-local-inference` has always read llama.cpp's `reasoning_content` and returned
+`Message::assistant().with_thinking(..)`, and `goose-provider-types`' shared OpenAI format does the
+same for every HTTP provider that separates the channel. `GooseAdapter` received those messages and
+dropped the reasoning one call short of the seam, because `as_concat_text()` filters on `as_text()`,
+which returns `None` for `Thinking`.
 
-So the entire feature rests on regex-matching whatever envelope the model happens to emit.
+Before P1, thinking reached the UI **only** through `ThoughtFilter`, a streaming state machine
+(`pond-api/src/thought_filter.rs`) that scrapes tag-delimited blocks out of the text stream:
+`<|channel>thought…<channel|>`, `<think>…</think>`, `<thought>…</thought>`, plus standalone
+sentinels. It is constructed with capture only when `show_thinking && !voice_mode` (grep
+`with_thinking_capture` in `routes.rs`).
+
+The claim that "the entire feature rests on regex-matching whatever envelope the model happens to
+emit" was true in general and **false for the local/gguf path with thinking ON**, which is the
+Jetson's shipped configuration: Goose strips `<think>` from the text before GIAP sees it, so
+`ThoughtFilter`'s capture path received nothing there and `show_thinking` was already non-functional.
+P1 is what makes that path work at all.
 
 ### 1.3 The structured reasoning channel is parsed and thrown away
 
-`pond-inference/src/provider.rs:420-422` documents that `ChatParseStateOaicompat` "extracts
-structured deltas (content, reasoning_content, tool_calls)". The delta-consumption loop
-(`:493-511`) reads `delta["content"]` and `delta["tool_calls"]`. **`reasoning_content` appears
-exactly once in all of `crates/` — in that comment.** llama.cpp has already separated the reasoning
-for us and we discard it, then re-derive it downstream with string matching.
+> **CORRECTED 2026-08-06 by P1.** This section pointed at the wrong crate. `pond-inference` feeds
+> the **quarantined** PondAgent loop (Q2-05: `agent_backend = "pond"` is rejected by the API with
+> 422 and overridden to `"goose"` at startup), so nothing described below has ever executed in a
+> shipped configuration. The live throw-away was in `GooseAdapter`, and P1 fixed that one.
 
-`ChatEvent` (`models/ports/inference.rs:17-28`) is `Text | ToolCall | Usage`. There is no reasoning
-variant at the port level, so even a willing adapter has nowhere to put it.
+`pond-inference/src/provider.rs` documents that `ChatParseStateOaicompat` "extracts structured
+deltas (content, reasoning_content, tool_calls)", and its delta-consumption loop reads
+`delta["content"]` and `delta["tool_calls"]` only. That is still true and still unfixed — it is
+simply not on the serving path, so it is carved out of P1 and left for whichever milestone
+un-quarantines PondAgent.
+
+`ChatEvent` (`models/ports/inference.rs`) is `Text | ToolCall | Usage`. There is no reasoning variant
+at the port level. This is **irrelevant to the live path**, which streams `AgentStreamEvent` — a type
+that has carried a `Thinking` variant all along.
 
 ### 1.4 There is no reasoning budget and no reasoning accounting
 
@@ -116,6 +138,12 @@ the single documented cause of mid-generation context overrun on the target hard
 ## 3. Design
 
 ### 3.1 A first-class reasoning channel
+
+> **SUPERSEDED IN PART 2026-08-06 by P1.** The `ChatEvent` half below applies only to the quarantined
+> PondAgent loop and was not implemented. The live path needed no new port type: `AgentStreamEvent`
+> already had `Thinking`, and the work was to stop discarding the messages that carry it. The
+> `ThoughtFilter` demotion in the last paragraph was also not implemented — see the P1 stamp for why
+> the double-reporting it guards against has no observed path.
 
 Add to `models/ports/inference.rs`:
 
@@ -200,8 +228,66 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
 
 ## 4. Phases
 
-- **P1** `ChatEvent::Reasoning`; read `reasoning_content` in `pond-inference`; `GooseAdapter` emits
-  `AgentStreamEvent::Thinking`. `ThoughtFilter` demoted to fallback.
+- **P1 — LANDED 2026-08-06, respecified onto the live path, and two of its three clauses were
+  deliberately not done.** `crates/pond-adapters-goose/src/goose_agent.rs`:
+  `GooseAdapter::reasoning_frames(&Message, emit) -> Vec<String>` lifts `MessageContent::Thinking`
+  out of every `AgentEvent::Message` and the stream yields it as `AgentStreamEvent::Thinking`,
+  before that message's tool calls and answer text — the order the provider produced them in.
+  `GooseAdapter::reasoning_frames_enabled(show_thinking, voice)` is the gate. Five unit tests;
+  105 pass in the crate.
+
+  **The phase as written targeted a crate that cannot execute.** `ChatEvent::Reasoning` and
+  `pond-inference`'s `reasoning_content` both belong to the quarantined PondAgent loop (Q2-05), so
+  implementing them literally would have changed nothing a user can observe — a third "correct but
+  unreachable" mechanism in a programme that already has two. Sections 1.2 and 1.3 carry the
+  correction. **Neither was implemented and neither should be until PondAgent is un-quarantined**;
+  if that milestone ever arrives, the port-level variant is a five-line change and this is the note
+  that says so.
+
+  **The producer already existed; the drop was ours.** `goose-local-inference` reads llama.cpp's
+  `reasoning_content` and returns `Message::assistant().with_thinking(..)` from three call sites in
+  `llamacpp/inference_native_tools.rs` (and `mlx.rs`, and the emulated-tools path);
+  `goose-provider-types`' shared OpenAI format does the same for DeepSeek/OpenRouter/vLLM-shaped
+  responses, which is the Ollama path. All of it arrived in `AgentEvent::Message` and died on
+  `as_concat_text()`, which filters on `as_text()` — `None` for `Thinking`. A test asserts that
+  `as_concat_text` is still the answer-only view, because that is the whole reason a separate lift
+  has to exist.
+
+  **The gate is at the PRODUCER, and that is the load-bearing decision.** Recon's plan was to gate
+  the two SSE forwards in `routes.rs`. That file was held by a concurrent group, but it was also the
+  wrong place: there are **three** consumers of this event, not two — `routes.rs` twice and
+  `pond-server`'s CLI printer, which is the terminal voice loop, writing dimmed to stderr
+  unconditionally. Exactly one of the three had ever consulted `show_thinking`. Gating at the seam
+  would have required editing all three and left the fourth consumer to be discovered later. One
+  gate at the producer is inherited by every consumer, present and future, and it is the contract
+  `AgentStreamEvent::Thinking`'s own doc comment already claimed. **Consequence: `routes.rs` needed
+  no change at all**, which is also why this landed without touching a held file.
+
+  `voice` is `voice_instance || request.voice_mode` — the CLI `--input whisper` flag OR the
+  per-request desktop flag, unlike `vision_section_applies` which reads only the instance flag. It
+  can be the OR here precisely because this value never reaches `PromptState`: it is resolved after
+  the prompt is built, so it cannot move the static prefix between turn 1 and turn 2. No prompt text
+  changed; the KV prefix is untouched.
+
+  **`ThoughtFilter` was NOT demoted, and the demotion should not be added blind.** The plan asked
+  for its capture path to be suppressed once a structured frame is seen, to prevent double-reporting.
+  No path was found that produces both: on local/gguf, Goose strips `<think>` from the text before
+  GIAP sees it, so the scraper receives nothing to double; where the scraper does fire (a model
+  inlining tags with `enable_thinking` off) there is no structured block. Building a cross-crate
+  suppression signal for a collision nobody has observed would have meant editing a held file to
+  guard against a hypothesis. `ThoughtFilter` therefore still runs unconditionally for text hygiene,
+  which it is needed for regardless — GIAP's `<|channel>thought` and `<thought>` envelopes are not in
+  Goose's own `ThinkFilter` at all.
+
+  **What would falsify this.** A turn on `chat_provider = local`/`gguf` with `show_thinking = true`
+  and `thinking_mode` on that renders no thinking panel in `Chat.tsx` — the frontend already handles
+  `ev.type === "thinking"` and the `ChatEventType` union already lists it, so no UI change was
+  needed and no UI change can be the excuse. Equally falsifying: the same panel appearing twice for
+  one block, which would mean the `ThoughtFilter` collision above is real after all.
+
+  **Not persisted, on purpose.** P6 owns that. Until it lands, reasoning is streamed and forgotten:
+  `chat.rs` matches `Thinking` and ignores it, so nothing enters `session_messages` and nothing is
+  replayed into context.
 - **P2** `UsageStats.reasoning_tokens` + migration; surfaced in `turn_stats` and `/usage/summary`.
 - **P3 — ALREADY LANDED**, before this programme began. One `thinking_enabled` drives both the
   prompt section and the engine param; see section 1.7. Nothing to do.
