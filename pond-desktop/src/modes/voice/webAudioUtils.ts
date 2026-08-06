@@ -530,44 +530,6 @@ export function getToolAnnouncement(toolName: string): string {
   return TOOL_ANNOUNCEMENTS[toolName] ?? `Working on that.`;
 }
 
-// ── Thinking Tone ────────────────────────────────────────────────
-
-/**
- * Play a subtle ambient thinking tone (440Hz pulse at low volume).
- * Returns a stop function. Matches Tauri's thinking tone behavior.
- */
-export function playThinkingTone(): () => void {
-  const ctx = getAudioContext();
-  let stopped = false;
-  let osc: OscillatorNode | null = null;
-  let gain: GainNode | null = null;
-
-  function pulse() {
-    if (stopped) return;
-    osc = ctx.createOscillator();
-    gain = ctx.createGain();
-    osc.type = "sine";
-    osc.frequency.value = 440;
-    gain.gain.setValueAtTime(0, ctx.currentTime);
-    gain.gain.linearRampToValueAtTime(0.06, ctx.currentTime + 0.15);
-    gain.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.85);
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start(ctx.currentTime);
-    osc.stop(ctx.currentTime + 1);
-    osc.onended = () => {
-      if (!stopped) setTimeout(pulse, 150);
-    };
-  }
-  pulse();
-
-  return () => {
-    stopped = true;
-    try { osc?.stop(); } catch { /* ignore */ }
-    try { gain?.disconnect(); } catch { /* ignore */ }
-  };
-}
-
 // ── Quip Generator ───────────────────────────────────────────────
 
 const QUIPS = [

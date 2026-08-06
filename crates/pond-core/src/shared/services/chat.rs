@@ -99,7 +99,11 @@ struct WorkingTone {
 
 impl WorkingTone {
     fn start(output: Arc<dyn VoiceOutput>) -> Self {
-        output.start_thinking_tone();
+        // The ambient tone was removed — it read as an annoying background
+        // beep rather than a helpful cue. The guard itself stays: `stop()`/
+        // `Drop` on a never-started tone is a safe no-op, and keeping the
+        // RAII shape means a future replacement signal (if any) gets the
+        // same "always stopped, never outlives the turn" guarantee for free.
         Self {
             output,
             stopped: false,

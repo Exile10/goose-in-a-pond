@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import { Brain, Check, ChevronDown, Cpu, History, Loader2, Paperclip, PenSquare, PlayCircle, Wrench } from "lucide-react";
+import { Brain, Check, ChevronDown, Copy, Cpu, History, Loader2, Paperclip, Pencil, PenSquare, PlayCircle, RefreshCw, ThumbsDown, ThumbsUp, Wrench, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { nextCardId } from "../state/reducer";
@@ -64,6 +64,14 @@ interface Message {
   /** Image preview URLs — either a live send's local previewUrl, or a
    *  built `${apiBase}${url}` for images replayed from session history. */
   images?: string[];
+  /** The persisted session_messages.id this bubble corresponds to. Absent
+   *  for a just-sent live turn until the "done" event backfills it (see
+   *  sendMessage) — copy/edit/refresh/like/dislike are disabled until then,
+   *  since they all act against this id. */
+  backendId?: string;
+  /** Agent messages only: current like/dislike vote, mirrors the backend's
+   *  `liked` column. `null`/absent = no vote. */
+  liked?: boolean | null;
 }
 
 function sessionMessagesToMessages(raw: SessionMessage[]): Message[] {
@@ -83,9 +91,9 @@ function sessionMessagesToMessages(raw: SessionMessage[]): Message[] {
             return bare;
           })
         : undefined;
-      out.push({ id: ++_msgId, role: "agent", text: m.content, historyToolNames, images });
+      out.push({ id: ++_msgId, role: "agent", text: m.content, historyToolNames, images, backendId: m.id, liked: m.liked ?? null });
     } else {
-      out.push({ id: ++_msgId, role: "user", text: m.content, images });
+      out.push({ id: ++_msgId, role: "user", text: m.content, images, backendId: m.id });
     }
   }
   return out;
@@ -107,6 +115,9 @@ export function Chat() {
   const [showTurnStats, setShowTurnStats]         = useState(false);
   const [attachments, setAttachments]             = useState<PreparedImage[]>([]);
   const [attachError, setAttachError]             = useState<string | null>(null);
+  // Which user message (by local id) is being edited inline, if any.
+  const [editingId, setEditingId]                 = useState<number | null>(null);
+  const [editText, setEditText]                   = useState("");
   // Fail-open: an unknown/failed capabilities fetch never disables attaching —
   // it only disables once we've SUCCESSFULLY confirmed the model lacks vision.
   const [visionCapable, setVisionCapable]         = useState(true);
@@ -474,6 +485,30 @@ export function Chat() {
           if (ev.model_name && ev.model_role) {
             dispatch({ type: "SET_LAST_RESPONSE_META", payload: { modelName: ev.model_name, modelRole: ev.model_role, completionTokens: ev.usage?.completion_tokens ?? 0 } });
           }
+          // The stream never carries the persisted message ids, so copy/edit/
+          // refresh/like/dislike (which all act on a real backend id) have
+          // nothing to target yet. Fetch the small tail of the session and
+          // match by id, not array position — same reasoning as turn_stats
+          // below, a session switch mid-fetch must not misattribute this.
+          const doneSessionId = ev.session_id;
+          const forUser = userMsg.id;
+          const forAgent = agentMsg.id;
+          void (async () => {
+            try {
+              const recent = await api.getSessionMessages(doneSessionId, 10);
+              const nonTool = recent.filter((m) => m.role !== "tool");
+              const lastUser = [...nonTool].reverse().find((m) => m.role === "user");
+              const lastAgent = [...nonTool].reverse().find((m) => m.role === "assistant");
+              setMessages((prev) => prev.map((m) => {
+                if (m.id === forAgent && lastAgent) return { ...m, backendId: lastAgent.id, liked: lastAgent.liked ?? null };
+                if (m.id === forUser && lastUser) return { ...m, backendId: lastUser.id };
+                return m;
+              }));
+            } catch {
+              // Non-fatal: the turn already rendered; only the action icons
+              // stay disabled until the next successful history load.
+            }
+          })();
         } else if (ev.type === "turn_stats") {
           // Attach by id, not array position — a mid-stream session switch
           // replaces `messages` with another conversation's history, and the
@@ -510,6 +545,72 @@ export function Chat() {
       refreshSessions();
     }
   }, [input, attachments, busy, state.serverOnline, state.sessionToken, dispatch, refreshSessions]);
+
+  const copyMessageText = useCallback((text: string) => {
+    void navigator.clipboard.writeText(text).catch(() => {});
+  }, []);
+
+  // Drop everything from `msgId` onward in the LOCAL list — used by both edit
+  // and refresh right before resending, so the stale pair never briefly shows
+  // next to the fresh one.
+  const truncateLocalFrom = useCallback((msgId: number) => {
+    setMessages((prev) => {
+      const idx = prev.findIndex((m) => m.id === msgId);
+      return idx === -1 ? prev : prev.slice(0, idx);
+    });
+  }, []);
+
+  // Shared by refresh (same text) and edit-submit (new text): truncate the
+  // persisted history from this user message onward, then resend through the
+  // normal send path — no separate regenerate endpoint, `/chat/stream`
+  // already knows how to append a fresh turn.
+  const truncateAndResend = useCallback(async (msg: Message, text: string) => {
+    if (!msg.backendId || !sessionIdRef.current || busy) return;
+    try {
+      await api.deleteMessagesFrom(sessionIdRef.current, msg.backendId);
+    } catch (e) {
+      console.error("Failed to truncate session before resend:", e);
+      return;
+    }
+    truncateLocalFrom(msg.id);
+    void sendMessage(text);
+  }, [busy, sendMessage, truncateLocalFrom]);
+
+  const startEditing = useCallback((msg: Message) => {
+    setEditingId(msg.id);
+    setEditText(msg.text);
+  }, []);
+
+  const cancelEditing = useCallback(() => {
+    setEditingId(null);
+    setEditText("");
+  }, []);
+
+  const submitEdit = useCallback((msg: Message) => {
+    const trimmed = editText.trim();
+    if (!trimmed) return;
+    setEditingId(null);
+    void truncateAndResend(msg, trimmed);
+  }, [editText, truncateAndResend]);
+
+  const refreshResponse = useCallback((msg: Message) => {
+    void truncateAndResend(msg, msg.text);
+  }, [truncateAndResend]);
+
+  // `null` clears a vote — clicking the already-active thumb toggles it off.
+  // Optimistic: flips locally first, reverts only if the PUT fails.
+  const setFeedback = useCallback((msg: Message, liked: boolean) => {
+    if (!msg.backendId || !sessionIdRef.current) return;
+    const sessionId = sessionIdRef.current;
+    const backendId = msg.backendId;
+    const prevLiked = msg.liked ?? null;
+    const next = prevLiked === liked ? null : liked;
+    setMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, liked: next } : m)));
+    api.setMessageFeedback(sessionId, backendId, next).catch((e) => {
+      console.error("Failed to save feedback:", e);
+      setMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, liked: prevLiked } : m)));
+    });
+  }, []);
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
@@ -649,12 +750,93 @@ export function Chat() {
                       ))}
                     </div>
                   )}
-                  {msg.text || (msg.streaming
-                    ? msg.status
-                      ? <ThinkingPlaceholder status={msg.status} />
-                      : <span className="stream-dots"><span /><span /><span /></span>
-                    : "")}
+                  {msg.role === "user" && editingId === msg.id ? (
+                    <div className="ch-bubble__edit">
+                      <textarea
+                        className="ch-bubble__edit-input"
+                        value={editText}
+                        onChange={(e) => setEditText(e.target.value)}
+                        onKeyDown={(e) => {
+                          if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); submitEdit(msg); }
+                          if (e.key === "Escape") { e.preventDefault(); cancelEditing(); }
+                        }}
+                        autoFocus
+                        rows={Math.min(8, Math.max(2, editText.split("\n").length))}
+                      />
+                      <div className="ch-bubble__edit-actions">
+                        <button type="button" className="ch-bubble__edit-btn ch-bubble__edit-btn--cancel" onClick={cancelEditing}>
+                          <X size={12} aria-hidden /> Cancel
+                        </button>
+                        <button
+                          type="button"
+                          className="ch-bubble__edit-btn ch-bubble__edit-btn--save"
+                          onClick={() => submitEdit(msg)}
+                          disabled={!editText.trim()}
+                        >
+                          <Check size={12} aria-hidden /> Save &amp; resend
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    msg.text || (msg.streaming
+                      ? msg.status
+                        ? <ThinkingPlaceholder status={msg.status} />
+                        : <span className="stream-dots"><span /><span /><span /></span>
+                      : "")
+                  )}
                 </div>
+                {/* Copy / edit / refresh — user messages only */}
+                {msg.role === "user" && editingId !== msg.id && (
+                  <div className="ch-bubble__actions" role="group" aria-label="Message actions">
+                    <button type="button" className="ch-bubble__action" title="Copy" onClick={() => copyMessageText(msg.text)}>
+                      <Copy size={13} aria-hidden />
+                    </button>
+                    <button
+                      type="button"
+                      className="ch-bubble__action"
+                      title="Edit and resend"
+                      disabled={!msg.backendId || busy}
+                      onClick={() => startEditing(msg)}
+                    >
+                      <Pencil size={13} aria-hidden />
+                    </button>
+                    <button
+                      type="button"
+                      className="ch-bubble__action"
+                      title="Regenerate response"
+                      disabled={!msg.backendId || busy}
+                      onClick={() => refreshResponse(msg)}
+                    >
+                      <RefreshCw size={13} aria-hidden />
+                    </button>
+                  </div>
+                )}
+                {/* Copy / like / dislike — agent messages only; like/dislike feeds (or excludes from) training data */}
+                {msg.role === "agent" && !msg.streaming && (
+                  <div className="ch-bubble__actions" role="group" aria-label="Message actions">
+                    <button type="button" className="ch-bubble__action" title="Copy" onClick={() => copyMessageText(msg.text)}>
+                      <Copy size={13} aria-hidden />
+                    </button>
+                    <button
+                      type="button"
+                      className={`ch-bubble__action${msg.liked === true ? " ch-bubble__action--liked" : ""}`}
+                      title="Good response — use for training"
+                      disabled={!msg.backendId}
+                      onClick={() => setFeedback(msg, true)}
+                    >
+                      <ThumbsUp size={13} aria-hidden />
+                    </button>
+                    <button
+                      type="button"
+                      className={`ch-bubble__action${msg.liked === false ? " ch-bubble__action--disliked" : ""}`}
+                      title="Bad response — exclude from training"
+                      disabled={!msg.backendId}
+                      onClick={() => setFeedback(msg, false)}
+                    >
+                      <ThumbsDown size={13} aria-hidden />
+                    </button>
+                  </div>
+                )}
                 {/* Model role + token meta */}
                 {msg.role === "agent" && msg.modelRole && !msg.streaming && (
                   <span className="bubble__meta">

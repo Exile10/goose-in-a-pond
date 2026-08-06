@@ -632,6 +632,7 @@ impl Agent for PondAgent {
                         created_at: chrono::Utc::now(),
                         prompt_tokens: None,
                         completion_tokens: None,
+                        liked: None,
                     };
                     if let Err(e) = storage_ref
                         .add_message(session_id_persist.clone(), sm)

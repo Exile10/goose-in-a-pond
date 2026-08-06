@@ -37,6 +37,7 @@ struct MessageRow {
     created_at: String,
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
+    liked: Option<i64>,
 }
 
 // ── Conversion helpers ────────────────────────────────────────────────────────
@@ -110,6 +111,7 @@ impl TryFrom<MessageRow> for SessionMessage {
             created_at: parse_dt(&r.created_at),
             prompt_tokens: r.prompt_tokens.map(|v| v as u32),
             completion_tokens: r.completion_tokens.map(|v| v as u32),
+            liked: r.liked.map(|v| v != 0),
         })
     }
 }
@@ -538,7 +540,7 @@ impl SessionStorage for SqliteSessionStorage {
 
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
-             prompt_tokens, completion_tokens \
+             prompt_tokens, completion_tokens, liked \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at ASC, rowid ASC",
@@ -602,7 +604,7 @@ impl SessionStorage for SqliteSessionStorage {
 
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
-             prompt_tokens, completion_tokens \
+             prompt_tokens, completion_tokens, liked \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at ASC, rowid ASC \
@@ -628,7 +630,7 @@ impl SessionStorage for SqliteSessionStorage {
         // Fetch newest-first, then reverse to return chronological order.
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
-             prompt_tokens, completion_tokens \
+             prompt_tokens, completion_tokens, liked \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at DESC, rowid DESC \
@@ -797,6 +799,61 @@ impl SessionStorage for SqliteSessionStorage {
             .await
             .map(|bytes| (mime_type, bytes)))
     }
+
+    async fn set_message_feedback(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        liked: Option<bool>,
+    ) -> Result<(), SessionStorageError> {
+        let result =
+            sqlx::query("UPDATE session_messages SET liked = ? WHERE id = ? AND session_id = ?")
+                .bind(liked.map(|v| v as i64))
+                .bind(message_id)
+                .bind(session_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(SessionStorageError::MessageNotFound(message_id.to_string()));
+        }
+        Ok(())
+    }
+
+    async fn delete_messages_from(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<(), SessionStorageError> {
+        // rowid, not created_at: two messages in the same turn can share a
+        // second-resolution timestamp, and `>=` on created_at alone could
+        // sweep up an earlier sibling row. rowid is SQLite's own insertion
+        // order, so it is a stable tiebreaker — the same one get_messages()
+        // and friends already use as `ORDER BY created_at ASC, rowid ASC`.
+        let result = sqlx::query(
+            "DELETE FROM session_messages \
+             WHERE session_id = ?1 \
+               AND rowid >= (SELECT rowid FROM session_messages WHERE id = ?2 AND session_id = ?1)",
+        )
+        .bind(session_id)
+        .bind(message_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(SessionStorageError::MessageNotFound(message_id.to_string()));
+        }
+
+        sqlx::query("UPDATE sessions SET updated_at = datetime('now') WHERE id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        Ok(())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -940,6 +997,137 @@ mod tests {
         assert!(matches!(
             s.get_session("sess-1").await,
             Err(SessionStorageError::SessionNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn new_messages_default_to_no_feedback() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new(
+                "m1".to_string(),
+                "sess-1".to_string(),
+                ChatMessage::assistant("Hi"),
+            ),
+        )
+        .await
+        .unwrap();
+        let msgs = s.get_messages("sess-1").await.unwrap();
+        assert_eq!(msgs[0].liked, None);
+    }
+
+    #[tokio::test]
+    async fn feedback_round_trips_like_dislike_and_clear() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new(
+                "m1".to_string(),
+                "sess-1".to_string(),
+                ChatMessage::assistant("Hi"),
+            ),
+        )
+        .await
+        .unwrap();
+
+        s.set_message_feedback("sess-1", "m1", Some(true))
+            .await
+            .unwrap();
+        assert_eq!(s.get_messages("sess-1").await.unwrap()[0].liked, Some(true));
+
+        s.set_message_feedback("sess-1", "m1", Some(false))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_messages("sess-1").await.unwrap()[0].liked,
+            Some(false)
+        );
+
+        s.set_message_feedback("sess-1", "m1", None).await.unwrap();
+        assert_eq!(s.get_messages("sess-1").await.unwrap()[0].liked, None);
+    }
+
+    #[tokio::test]
+    async fn feedback_on_missing_message_errors() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        assert!(matches!(
+            s.set_message_feedback("sess-1", "missing", Some(true))
+                .await,
+            Err(SessionStorageError::MessageNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_messages_from_removes_the_target_and_everything_after() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        for (id, text) in [("m1", "First"), ("m2", "Second"), ("m3", "Third")] {
+            s.add_message(
+                "sess-1".to_string(),
+                SessionMessage::new(
+                    id.to_string(),
+                    "sess-1".to_string(),
+                    ChatMessage::user(text),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        s.delete_messages_from("sess-1", "m2").await.unwrap();
+
+        let msgs = s.get_messages("sess-1").await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "m1");
+    }
+
+    /// "Refresh" keeps the user's message and only drops the reply after it —
+    /// this is what makes that possible: truncating from the assistant
+    /// message's id leaves every earlier message, including its own user
+    /// prompt, untouched.
+    #[tokio::test]
+    async fn delete_messages_from_the_assistant_reply_keeps_the_user_prompt() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new(
+                "m1".to_string(),
+                "sess-1".to_string(),
+                ChatMessage::user("Question"),
+            ),
+        )
+        .await
+        .unwrap();
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new(
+                "m2".to_string(),
+                "sess-1".to_string(),
+                ChatMessage::assistant("Answer"),
+            ),
+        )
+        .await
+        .unwrap();
+
+        s.delete_messages_from("sess-1", "m2").await.unwrap();
+
+        let msgs = s.get_messages("sess-1").await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "m1");
+    }
+
+    #[tokio::test]
+    async fn delete_messages_from_missing_message_errors() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        assert!(matches!(
+            s.delete_messages_from("sess-1", "missing").await,
+            Err(SessionStorageError::MessageNotFound(_))
         ));
     }
 

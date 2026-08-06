@@ -15,4 +15,4 @@ pub use context::{
     turn_budget,
 };
 pub use providers::{fallback_provider, fast_responder};
-pub use voice::{fallback_voice_output, instant_activation};
+pub use voice::{fallback_voice_output, instant_activation, spoken_time};
