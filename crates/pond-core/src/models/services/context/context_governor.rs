@@ -178,9 +178,22 @@ impl ContextGovernor {
         }
 
         // 3. Catalog metadata, for models with no registry entry.
+        //
+        // A catalog `context_length` is the model's DECLARED maximum, not an
+        // allocation, so for a local provider it is clamped by the same
+        // ceiling the heuristic rung applies. Gemma 4 declares 131,072
+        // (verified against Ollama's `model_info`); an unpinned Mac that
+        // allocated 32K would otherwise budget history for four times the
+        // room the engine has, and the engine answers that by truncating the
+        // prompt. Rungs 1 and 2 are allocations and are never clamped.
         if let Some(catalog) = inputs.catalog_context_length.filter(|c| *c > 0) {
+            let tokens = catalog as usize;
             return WindowResolution {
-                tokens: catalog as usize,
+                tokens: if is_local_provider(inputs.provider) {
+                    tokens.min(UNPINNED_LOCAL_CEILING)
+                } else {
+                    tokens
+                },
                 source: WindowSource::CatalogRecord,
             };
         }
@@ -308,6 +321,41 @@ mod tests {
         let r = ContextGovernor::resolve(&i);
         assert_eq!(r.tokens, 16384);
         assert_eq!(r.source, WindowSource::CatalogRecord);
+    }
+
+    #[test]
+    fn a_catalog_length_cannot_widen_an_unpinned_local_window() {
+        // The catalog carries the model's DECLARED maximum. Gemma 4 declares
+        // 131,072; the engine on an unpinned local install allocates from its
+        // own memory estimate, and the heuristic rung caps that expectation at
+        // UNPINNED_LOCAL_CEILING. Rung 3 must not be the one rung that escapes
+        // it, or populating the catalog silently hands the trimmer a 128K
+        // history budget on a machine with 32K.
+        let mut i = inputs("local", "gemma-4-e2b");
+        i.catalog_context_length = Some(131_072);
+
+        let r = ContextGovernor::resolve(&i);
+        assert_eq!(r.tokens, UNPINNED_LOCAL_CEILING);
+        assert_eq!(r.source, WindowSource::CatalogRecord);
+
+        // gguf is the same class of provider.
+        let mut g = inputs("gguf", "gemma-4-e2b");
+        g.catalog_context_length = Some(131_072);
+        assert_eq!(ContextGovernor::resolve(&g).tokens, UNPINNED_LOCAL_CEILING);
+
+        // Below the ceiling it passes through untouched, so a genuinely small
+        // model is not inflated to the ceiling.
+        let mut small = inputs("local", "gemma-2-2b-it");
+        small.catalog_context_length = Some(8_192);
+        assert_eq!(ContextGovernor::resolve(&small).tokens, 8_192);
+
+        // HTTP providers pay no local prefill, so they keep the raw declared
+        // window -- this is the case rung 3 exists for.
+        let mut http = inputs("ollama", "gemma4:e2b");
+        http.catalog_context_length = Some(131_072);
+        let h = ContextGovernor::resolve(&http);
+        assert_eq!(h.tokens, 131_072);
+        assert_eq!(h.source, WindowSource::CatalogRecord);
     }
 
     #[test]

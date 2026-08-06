@@ -3,7 +3,8 @@
 //! Three types are defined here:
 //! - [`CompositeModelCatalogProvider`] — aggregates all sub-providers
 //! - [`StaticModelCatalogProvider`]   — curated static lists for Whisper, Piper TTS, Llamafile, GGUF, Embedding
-//! - [`OllamaCatalogProvider`]        — queries the local Ollama instance (`/api/tags`)
+//! - [`OllamaCatalogProvider`]        — queries the local Ollama instance (`/api/tags` for the
+//!   list, then `/api/show` per model for its declared context window)
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -249,6 +250,9 @@ struct LlamafileEntry {
     mozilla_repo: &'static str,
     size_mb: u64,
     ram_estimate_mb: u64,
+    /// The base model's declared maximum, matching the GGUF row for the same
+    /// weights. See `every_chat_capable_entry_declares_a_context_window`.
+    context_length: u32,
     recommended_role: &'static str,
     description: &'static str,
 }
@@ -269,7 +273,7 @@ fn llamafile_record(e: &LlamafileEntry) -> ModelRecord {
         hf_id: None,
         ram_estimate_mb: Some(e.ram_estimate_mb),
         recommended_role: Some(e.recommended_role.to_string()),
-        context_length: None,
+        context_length: Some(e.context_length),
         quantization: None,
         asr_language: None,
         asr_size: None,
@@ -292,6 +296,7 @@ fn llamafile_models() -> Vec<ModelRecord> {
             mozilla_repo: "Llama-3.2-1B-Instruct-llamafile",
             size_mb: 1120,
             ram_estimate_mb: 950,
+            context_length: 131072,
             recommended_role: "chat",
             description: "Llama 3.2 1B Instruct Q4_K_M (~1.1 GB, fastest)",
         },
@@ -301,6 +306,7 @@ fn llamafile_models() -> Vec<ModelRecord> {
             mozilla_repo: "gemma-2-2b-it-llamafile",
             size_mb: 1950,
             ram_estimate_mb: 1800,
+            context_length: 8192,
             recommended_role: "chat",
             description: "Gemma 2 2B IT Q4_K_M (~2.0 GB, smarter) — default",
         },
@@ -310,6 +316,7 @@ fn llamafile_models() -> Vec<ModelRecord> {
             mozilla_repo: "Llama-3.2-3B-Instruct-llamafile",
             size_mb: 2020,
             ram_estimate_mb: 2500,
+            context_length: 131072,
             recommended_role: "chat",
             description: "Llama 3.2 3B Instruct Q4_K_M (~2.0 GB, balanced)",
         },
@@ -319,6 +326,7 @@ fn llamafile_models() -> Vec<ModelRecord> {
             mozilla_repo: "Phi-3.5-mini-instruct-llamafile",
             size_mb: 2390,
             ram_estimate_mb: 2600,
+            context_length: 131072,
             recommended_role: "think",
             description: "Phi-3.5 Mini Instruct Q4_K_M (~2.4 GB, efficient reasoning)",
         },
@@ -328,6 +336,7 @@ fn llamafile_models() -> Vec<ModelRecord> {
             mozilla_repo: "Mistral-7B-Instruct-v0.2-llamafile",
             size_mb: 4370,
             ram_estimate_mb: 5200,
+            context_length: 32768,
             recommended_role: "think",
             description: "Mistral 7B Instruct v0.2 Q4_K_M (~4.4 GB, most capable)",
         },
@@ -534,7 +543,7 @@ fn gguf_models() -> Vec<ModelRecord> {
             hf_repo: "unsloth/gemma-4-E1B-it-GGUF",
             size_mb: 700,
             ram_estimate_mb: 1200,
-            context_length: 8192,
+            context_length: 131072,
             quantization: "Q4_K_M",
             recommended_role: "tool",
             description: "Gemma 4 E1B Instruct Q4_K_M (~700 MB, ultra-fast tool-call specialist)",
@@ -545,7 +554,7 @@ fn gguf_models() -> Vec<ModelRecord> {
             hf_repo: "unsloth/gemma-4-E2B-it-GGUF",
             size_mb: 3100,
             ram_estimate_mb: 4500,
-            context_length: 8192,
+            context_length: 131072,
             quantization: "Q4_K_M",
             recommended_role: "chat",
             description: "Gemma 4 E2B Instruct Q4_K_M (~3.1 GB, vision + tool calling + thinking)",
@@ -556,7 +565,7 @@ fn gguf_models() -> Vec<ModelRecord> {
             hf_repo: "google/gemma-4-E4B-it-GGUF",
             size_mb: 2500,
             ram_estimate_mb: 3500,
-            context_length: 8192,
+            context_length: 131072,
             quantization: "Q4_K_S",
             recommended_role: "chat",
             description: "Gemma 4 E4B Instruct Q4_K_S (~2.5 GB)",
@@ -567,7 +576,7 @@ fn gguf_models() -> Vec<ModelRecord> {
             hf_repo: "unsloth/gemma-4-E4B-it-GGUF",
             size_mb: 3000,
             ram_estimate_mb: 4200,
-            context_length: 8192,
+            context_length: 131072,
             quantization: "Q4_K_M",
             recommended_role: "chat",
             description:
@@ -579,7 +588,7 @@ fn gguf_models() -> Vec<ModelRecord> {
             hf_repo: "unsloth/gemma-4-12B-A4B-it-GGUF",
             size_mb: 7500,
             ram_estimate_mb: 10000,
-            context_length: 8192,
+            context_length: 131072,
             quantization: "Q4_K_M",
             recommended_role: "think",
             description: "Gemma 4 12B MoE (4B active) Q4_K_M (~7.5 GB, strong reasoning + vision)",
@@ -590,7 +599,7 @@ fn gguf_models() -> Vec<ModelRecord> {
             hf_repo: "unsloth/gemma-4-26B-A4B-it-GGUF",
             size_mb: 16000,
             ram_estimate_mb: 20000,
-            context_length: 8192,
+            context_length: 131072,
             quantization: "Q4_K_M",
             recommended_role: "think",
             description: "Gemma 4 26B MoE (4B active) Q4_K_M (~16 GB, best MoE quality + vision)",
@@ -601,7 +610,7 @@ fn gguf_models() -> Vec<ModelRecord> {
             hf_repo: "unsloth/gemma-4-27B-it-GGUF",
             size_mb: 16500,
             ram_estimate_mb: 21000,
-            context_length: 8192,
+            context_length: 131072,
             quantization: "Q4_K_M",
             recommended_role: "think",
             description: "Gemma 4 27B Dense Instruct Q4_K_M (~16.5 GB, highest quality + vision)",
@@ -693,9 +702,10 @@ fn embedding_models() -> Vec<ModelRecord> {
 
 /// Lists models installed in the local Ollama instance.
 ///
-/// Queries `http://localhost:11434/api/tags`. Returns an empty vec (not an error)
-/// if Ollama is not running or the request fails — the composite provider
-/// continues with the static list.
+/// Queries `http://localhost:11434/api/tags` for the list, then `/api/show`
+/// per model for its declared context window. Returns an empty vec (not an
+/// error) if Ollama is not running or the request fails — the composite
+/// provider continues with the static list.
 pub struct OllamaCatalogProvider {
     client: reqwest::Client,
 }
@@ -703,6 +713,44 @@ pub struct OllamaCatalogProvider {
 impl OllamaCatalogProvider {
     pub fn new(client: reqwest::Client) -> Self {
         Self { client }
+    }
+
+    /// The model's declared context window, from `POST /api/show`.
+    ///
+    /// `/api/tags` does not carry one. That is why every Ollama row has held
+    /// `context_length: None` since the column was added, and why
+    /// `WindowSource::CatalogRecord` — precedence rung 3 of the context
+    /// governor — has never been reachable in production: Ollama is the
+    /// provider class that rung exists for.
+    ///
+    /// `/api/show` answers with a `model_info` map keyed by architecture
+    /// (`gemma4.context_length`, `llama.context_length`, `qwen3.context_length`
+    /// …), so the key is matched by suffix. An architecture allowlist would
+    /// return `None` for every model family added after this was written, and
+    /// silently — the rung would go dead again with nothing to notice it.
+    ///
+    /// Every failure is `None`, not an error: a missing context length must
+    /// cost the catalog row, not the whole refresh.
+    async fn declared_context_length(&self, model: &str) -> Option<u32> {
+        let resp = self
+            .client
+            .post("http://localhost:11434/api/show")
+            .timeout(std::time::Duration::from_secs(3))
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .ok()?
+            .json::<serde_json::Value>()
+            .await
+            .ok()?;
+
+        resp["model_info"]
+            .as_object()?
+            .iter()
+            .find(|(k, _)| k.ends_with(".context_length"))
+            .and_then(|(_, v)| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| *v > 0)
     }
 }
 
@@ -718,12 +766,21 @@ impl ModelCatalogProvider for OllamaCatalogProvider {
             .json::<serde_json::Value>()
             .await?;
 
-        let models = resp["models"]
+        let mut models: Vec<ModelRecord> = resp["models"]
             .as_array()
             .unwrap_or(&vec![])
             .iter()
             .filter_map(ollama_entry_to_record)
             .collect();
+
+        // One extra loopback call per installed model, on the catalog-refresh
+        // path only — never on a turn. Sequential rather than joined: the
+        // daemon is local, the timeout is 3 s, and a refresh that hammers
+        // Ollama with N concurrent requests is a worse neighbour than one that
+        // takes a second longer.
+        for m in &mut models {
+            m.context_length = self.declared_context_length(&m.name).await;
+        }
 
         Ok((models, vec![]))
     }
@@ -767,4 +824,79 @@ fn ollama_entry_to_record(m: &serde_json::Value) -> Option<ModelRecord> {
         downloaded: true, // Ollama models are always locally present
         is_custom: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ModelRecord.context_length` is precedence rung 3 of the context
+    /// governor (`WindowSource::CatalogRecord`). It sat unread for so long
+    /// that two whole categories were shipping `None` and the entire Gemma 4
+    /// family was carrying 8192 — copy-pasted from the Gemma 2 rows above it —
+    /// against a declared 131,072. Nothing noticed, because nothing read the
+    /// field.
+    ///
+    /// This asserts the field is populated for every category a chat model can
+    /// come from. It is the check that would have caught both defects.
+    #[test]
+    fn every_chat_capable_entry_declares_a_context_window() {
+        let chat_capable: Vec<ModelRecord> = static_models()
+            .into_iter()
+            .filter(|m| matches!(m.category, ModelCategory::Gguf | ModelCategory::Llamafile))
+            .collect();
+
+        // A floor, so a broken filter cannot pass by matching nothing.
+        assert!(
+            chat_capable.len() >= 20,
+            "only {} chat-capable catalog entries — the filter has broken, \
+             not the catalog shrunk",
+            chat_capable.len()
+        );
+
+        for m in &chat_capable {
+            let declared = m.context_length.unwrap_or(0);
+            assert!(
+                declared >= 2048,
+                "catalog entry {} declares no usable context window ({declared}); \
+                 rung 3 of the context governor reads this field",
+                m.name
+            );
+        }
+    }
+
+    /// The same weights must not declare two different windows.
+    ///
+    /// The llamafile and GGUF tables list several of the same base models, and
+    /// the llamafile numbers were transcribed from the GGUF rows. If a future
+    /// edit corrects one table and not the other, the governor's answer starts
+    /// depending on which category the user happened to install from.
+    #[test]
+    fn the_same_base_model_declares_the_same_window_in_both_tables() {
+        let by_base = |needle: &str| -> Vec<(String, u32)> {
+            static_models()
+                .iter()
+                .filter(|m| {
+                    matches!(m.category, ModelCategory::Gguf | ModelCategory::Llamafile)
+                        && m.filename
+                            .as_deref()
+                            .is_some_and(|f| f.to_ascii_lowercase().contains(needle))
+                })
+                .map(|m| (m.name.clone(), m.context_length.unwrap_or(0)))
+                .collect()
+        };
+
+        for needle in ["llama-3.2-1b", "llama-3.2-3b", "gemma-2-2b"] {
+            let found = by_base(needle);
+            assert!(
+                found.len() >= 2,
+                "expected {needle} in both the GGUF and llamafile tables, found {found:?}"
+            );
+            let first = found[0].1;
+            assert!(
+                found.iter().all(|(_, c)| *c == first),
+                "{needle} declares different windows across tables: {found:?}"
+            );
+        }
+    }
 }
