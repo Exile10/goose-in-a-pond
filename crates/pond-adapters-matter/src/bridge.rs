@@ -76,9 +76,32 @@ async fn sync_node(
     nodes.write().await.insert(node.node_id, node);
 
     match registry.get_device(&device.id).await {
-        Ok(Some(_)) => {
+        Ok(Some(existing)) => {
             if let Err(e) = registry.heartbeat(&device.id).await {
                 tracing::warn!(device = %device.id, error = %e, "matter: heartbeat failed");
+            }
+            // A device registered before GIAP learned to read its Descriptor
+            // kept whatever cluster inference guessed — a dishwasher stayed a
+            // light for the rest of its life, and the only cure was to delete
+            // and re-commission it. Correct it in place instead, and only when
+            // it actually differs, so a resync is otherwise a no-op.
+            if existing.device_type != device.device_type
+                || existing.capabilities != device.capabilities
+            {
+                match registry
+                    .reclassify(&device.id, &device.device_type, &device.capabilities)
+                    .await
+                {
+                    Ok(()) => tracing::info!(
+                        device = %device.id,
+                        was = %existing.device_type,
+                        now = %device.device_type,
+                        "matter: device reclassified"
+                    ),
+                    Err(e) => tracing::warn!(
+                        device = %device.id, error = %e, "matter: reclassify failed"
+                    ),
+                }
             }
         }
         Ok(None) => {

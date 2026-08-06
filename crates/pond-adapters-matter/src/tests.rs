@@ -207,6 +207,13 @@ impl DeviceRegistry for InMemoryRegistry {
     async fn get_device(&self, id: &str) -> Result<Option<Device>> {
         Ok(self.devices.lock().unwrap().get(id).cloned())
     }
+    async fn reclassify(&self, id: &str, device_type: &str, capabilities: &[String]) -> Result<()> {
+        if let Some(device) = self.devices.lock().unwrap().get_mut(id) {
+            device.device_type = device_type.to_string();
+            device.capabilities = capabilities.to_vec();
+        }
+        Ok(())
+    }
     async fn unregister(&self, id: &str) -> Result<()> {
         self.devices.lock().unwrap().remove(id);
         Ok(())
@@ -364,6 +371,60 @@ async fn a_light_still_goes_through_on_off() {
     let frames = received.lock().unwrap().clone();
     assert_eq!(frames[0]["command"], "device_command");
     assert_eq!(frames[0]["args"]["command_name"], "On");
+}
+
+/// A device registered before GIAP could read its Descriptor kept whatever
+/// cluster inference guessed: a dishwasher stayed a light forever, and the only
+/// cure was to delete and re-commission it. A resync now corrects it in place —
+/// and leaves the name alone, because that one is the user's.
+#[tokio::test]
+async fn a_resync_corrects_a_type_that_was_guessed_wrong() {
+    let registry = Arc::new(InMemoryRegistry::default());
+    registry
+        .register(RegisterDeviceRequest {
+            id: Some("matter-18".into()),
+            // What cluster inference gave it, and the name the user chose.
+            name: "Kitchen Dishwasher".into(),
+            device_type: "light".into(),
+            hostname: None,
+            capabilities: vec!["power".into()],
+            room: None,
+        })
+        .await
+        .unwrap();
+
+    let (url, _received) = mock_matter_server(
+        json!([{
+            "node_id": 18,
+            "available": true,
+            "attributes": {
+                "0/29/0": [{ "0": 22, "1": 1 }],
+                "1/29/0": [{ "0": 0x0075, "1": 1 }],   // Dishwasher
+                "1/6/0": false
+            }
+        }]),
+        vec![],
+    )
+    .await;
+    let (client, events) = MatterClient::connect(&url).await.unwrap();
+    tokio::spawn(run_matter_bridge(
+        client,
+        events,
+        Arc::new(RwLock::new(HashMap::new())),
+        registry.clone() as Arc<dyn DeviceRegistry + Send + Sync>,
+        Arc::new(InProcessEventBus::new()) as Arc<dyn EventBus>,
+    ));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let device = registry.get_device("matter-18").await.unwrap().unwrap();
+    assert_eq!(
+        device.device_type, "appliance",
+        "corrected from its own word"
+    );
+    assert_eq!(
+        device.name, "Kitchen Dishwasher",
+        "the name is the user's and must survive a resync"
+    );
 }
 
 /// A sensor is knowable the moment it joins, not whenever it next changes.

@@ -95,6 +95,24 @@ pub trait DeviceRegistry: Send + Sync {
     /// Update editable fields (name, hostname, room) and return the updated
     /// device. Default errors so the many test doubles need no body; real
     /// registries override it.
+    /// Correct what a device *is*, leaving what it is *called* alone.
+    ///
+    /// A device's type and capabilities are derived from what it reports, so
+    /// they can be wrong until it reports better — an adapter that learns to
+    /// read a device more accurately has to be able to say so. Its name cannot:
+    /// that is the user's, and a resync must never overwrite it.
+    ///
+    /// Deliberately narrower than [`Self::update`], which speaks for the user
+    /// (name, hostname, room). This one speaks for the device.
+    async fn reclassify(
+        &self,
+        device_id: &str,
+        _device_type: &str,
+        _capabilities: &[String],
+    ) -> Result<()> {
+        anyhow::bail!("this registry cannot reclassify '{device_id}'")
+    }
+
     async fn update(&self, device_id: &str, _request: UpdateDeviceRequest) -> Result<Device> {
         anyhow::bail!("this registry does not support updating device '{device_id}'")
     }

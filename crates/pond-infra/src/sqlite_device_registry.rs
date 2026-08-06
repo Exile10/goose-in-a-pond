@@ -183,6 +183,28 @@ impl DeviceRegistry for SqliteDeviceRegistry {
         Ok(())
     }
 
+    async fn reclassify(
+        &self,
+        device_id: &str,
+        device_type: &str,
+        capabilities: &[String],
+    ) -> Result<()> {
+        let caps_json = serde_json::to_string(capabilities)?;
+        let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        // Name, hostname and room are untouched on purpose: this speaks for the
+        // device, not for the user.
+        sqlx::query(
+            "UPDATE devices SET device_type = ?, capabilities = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(device_type)
+        .bind(&caps_json)
+        .bind(&now_str)
+        .bind(device_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn update(&self, device_id: &str, request: UpdateDeviceRequest) -> Result<Device> {
         let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         sqlx::query(
@@ -326,6 +348,35 @@ mod tests {
 
         reg.heartbeat(&dev.id).await.unwrap();
         assert!(reg.get_device(&dev.id).await.unwrap().unwrap().is_online);
+    }
+
+    #[tokio::test]
+    async fn reclassify_corrects_the_device_not_the_user_s_name() {
+        let (reg, _tmp) = make_registry().await;
+        let dev = reg.register(req("Kitchen Dishwasher")).await.unwrap();
+        reg.update(
+            &dev.id,
+            UpdateDeviceRequest {
+                name: "Kitchen Dishwasher".to_string(),
+                hostname: Some("dish.local".to_string()),
+                room: Some("Kitchen".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        reg.reclassify(&dev.id, "appliance", &["power".to_string()])
+            .await
+            .unwrap();
+
+        let got = reg.get_device(&dev.id).await.unwrap().unwrap();
+        assert_eq!(got.device_type, "appliance");
+        assert_eq!(got.capabilities, vec!["power".to_string()]);
+        // The three fields that belong to the user, untouched. A resync that
+        // renamed someone's device would be worse than the wrong type.
+        assert_eq!(got.name, "Kitchen Dishwasher");
+        assert_eq!(got.hostname.as_deref(), Some("dish.local"));
+        assert_eq!(got.room.as_deref(), Some("Kitchen"));
     }
 
     #[tokio::test]
