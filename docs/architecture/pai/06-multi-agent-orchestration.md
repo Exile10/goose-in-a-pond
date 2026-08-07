@@ -120,6 +120,12 @@ which is callable directly." It is not. P2 must choose, **before writing code**,
    `pond-adapters-goose` that duplicate `get_agent_messages` — and which is the only route that
    lets GIAP set the child's system prompt (see section 3.2).
 
+**P2 took route 2 (2026-08-07).** `GooseAdapter::run_child_agent` is that loop. The patch set
+stays at five and the child's system prompt is GIAP's own. Two things fell out of owning it that
+the fork route would not have given: an extension that fails to load is a hard error rather than
+Goose's `debug!`-and-swallow, and the drain keeps `as_concat_text()` only, so a child's
+`MessageContent::Thinking` cannot reach the parent as its answer.
+
 So the expensive, fiddly part — spawning a child agent with its own conversation, capping its
 turns, cancelling it — exists, is switched off, **and is behind a visibility wall**. What is
 genuinely free is the structure: `Agent::with_config` builds an `ExtensionManager` with **no**
@@ -243,18 +249,26 @@ Four differences from the sketch above it, each for a reason:
   Passing it twice lets the two disagree, and the one nearer the engine wins — which is how a scope
   gets widened by accident.
 
-`pond-adapters-goose` will implement `Orchestrator` (P2), translating an `AgentRole` into a
-`Recipe` plus a `TaskConfig`. **It cannot render a GIAP subagent system prompt.** GIAP's
+`pond-adapters-goose` implements `Orchestrator` — **AS LANDED (P2, 2026-08-07)** it translates a
+`TaskSpec` into a `ChildPlan` (system prompt, user message, `Vec<ExtensionConfig>`, `max_turns`)
+and drives it over the public `Agent` API. There is no `Recipe` and no `TaskConfig` on the landed
+path: both exist only to be consumed by `run_subagent_task`, which is not callable, and
+`recipe.extensions` was never read by it anyway. The paragraph below is why.
+
+**Goose's own child loop cannot render a GIAP subagent system prompt.** GIAP's
 `prompts/subagent_system.md` was deleted on 2026-08-06 with the whole of `giap_prompts.rs`, and
 Goose's own copy — `goose/crates/goose/src/prompts/subagent_system.md`, opening "You are a
 specialized subagent within the goose AI framework, created by AAIF" — is rendered
 **unconditionally** by `build_subagent_prompt`, which then calls `override_system_prompt` on a
 child `Agent` it constructs internally and never returns. There is no seam. The only
 caller-controlled input is `Recipe.instructions`, which lands inside that template as
-`{{task_instructions}}`. So P2's real options are: accept a hybrid, goose-branded child prompt
-(the shim will **not** correct it — its `GOOSE_DEFAULT_MARKER` does not appear in that template);
-patch the submodule; or take route 2 from section 1.2 and own the loop. Feed pond-core's
-`build_prompt_partition` output into `Recipe.instructions` either way.
+`{{task_instructions}}`. The three options were: accept a hybrid, goose-branded child prompt (the
+shim will **not** correct it — its `GOOSE_DEFAULT_MARKER` does not appear in that template); patch
+the submodule; or take route 2 from section 1.2 and own the loop. **P2 took the third.** The
+child's prompt is `build_prompt_partition(...).static_prefix` — the same call the parent's turn
+makes — plus a GIAP-authored delegation envelope naming the role, the turn budget, the depth cap
+and the child's exact tool names. A guard asserts the prompt starts with that prefix and carries
+none of `goose AI framework` / `AAIF` / `Agentic AI Foundation`.
 
 ### 3.3 What is reused rather than rebuilt
 
@@ -265,9 +279,9 @@ patch the submodule; or take route 2 from section 1.2 and own the loop. Feed pon
 | Per-role tool narrowing | `mcp/domain/tool_group.rs` + `services/tool_selection.rs` — but use `filter_tools_by_groups` (a pure intersection), **never** `select_groups`, whose every failure path widens by design |
 | Per-role model | **Nothing.** `ModelRouter` does not exist and never compiled; there is no `ModelRole` type. See P7 |
 | Cheap in-process routing | Nothing. `DelegatingAgent` is a dead end — see section 1.1 |
-| Child agent execution | Goose's child loop, subject to the visibility wall in section 1.2 |
-| Subagent system prompt | **Nothing.** GIAP's is deleted; Goose's is not substitutable. See section 3.2 |
-| Concurrency limiting | The `Semaphore` pattern from `schedule_executors.rs` |
+| Child agent execution | **Nothing reusable.** `run_subagent_task` is `pub(crate)`; P2 owns the loop over `Agent::with_config` / `update_provider` / `add_extension` / `override_system_prompt` / `reply`, all of which ARE re-exported |
+| Subagent system prompt | **Nothing.** GIAP's is deleted; Goose's is not substitutable. P2 builds it through `build_prompt_partition` — see section 3.2 |
+| Concurrency limiting | The `Semaphore` pattern from `schedule_executors.rs` *(landed in P2 as one process-wide semaphore; `subagent_permits(provider)` expresses each provider's limit as a permit count)* |
 
 The genuinely new code is the domain types, the port, the adapter translation layer, and one MCP
 extension.
@@ -426,14 +440,71 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
   Routines list, because `hubDataStore.ts` maps every recipe to a routine card — a deliberate
   consequence of "no new persistence", not an oversight, and P5 should decide whether to filter it.
   `max_concurrent_subagents` has no caller until P8.
-- **P2** `GooseOrchestrator`. **Decide the visibility question in section 1.2 first** — a sixth fork
-  patch or an owned child loop — because "call `run_subagent_task`" does not compile. Translate
-  role → `Recipe` + `TaskConfig`, always with `Some(max_turns)`, always with `GooseMode::Auto` (any
-  approval-requiring mode deadlocks on the child's `confirmation_rx`), always with
-  `return_last_only: true`, and always with an extension list built from GIAP's own
-  `registered_extensions()`. Build the child's instruction text through `build_prompt_partition`
-  and pass it as `Recipe.instructions`; note that `recipe.extensions` is **never read** by the
-  child loop, so tool narrowing expressed there applies to nothing. Concurrency 1 per section 3.4.
+- **P2 — LANDED 2026-08-07.** `GooseOrchestrator` in `pond-adapters-goose`, implementing P1's
+  `Orchestrator` port. `crates/pond-adapters-goose/src/orchestrator.rs` plus a
+  `driving a child agent` block in `goose_agent.rs`.
+
+  **The visibility question, answered: I own the child loop; there is no sixth fork patch.**
+  `run_subagent_task` is `pub(crate)` and unreachable, which the phase text did not know. I could
+  have made it reachable with two words on the fork, and I did not, because it would have bought a
+  function whose child cannot be given a GIAP prompt: `build_subagent_prompt` renders Goose's own
+  `subagent_system.md` unconditionally and calls `override_system_prompt` on an `Agent` it
+  constructs internally and never returns. A patched-visibility P2 would ship a subagent that
+  introduces itself as "a specialized subagent within the goose AI framework, created by AAIF",
+  and the provider shim would not catch it — `GOOSE_DEFAULT_MARKER` is not in that template. The
+  owned loop is about 120 lines and cost less than the patch would have, once the CI fork-branch
+  bump and the rebase burden are counted. **The patch set stays at five**; `CLAUDE.md` said "two"
+  and now says five, because I counted the rows while deciding this.
+
+  **Respecified against the phase text, and why.** The bullet said "render `subagent_system.md`".
+  That file was deleted on 2026-08-06 with the whole of `giap_prompts.rs`. The child's system
+  prompt is now built through the LIVE path — `build_prompt_partition`, the same call the parent's
+  turn makes — and a GIAP-authored delegation envelope is appended to it: the role, the turn
+  budget, "you cannot delegate", and the exact tool names the child holds. Nothing is translated
+  into a `Recipe` at all: `Recipe` exists only to be consumed by `run_subagent_task`, which I do
+  not call, and `recipe.extensions` is never read by that loop anyway. `TaskConfig` likewise —
+  five of its six fields are inert on the path that would have used it. What survives from the
+  bullet is every one of its imperatives: `Some(max_turns)` always, `GooseMode::Auto` always
+  (any approval-requiring mode deadlocks on the child's `confirmation_rx`), the last assistant
+  message only, and an extension list built explicitly rather than inherited.
+
+  **What I rejected.** Reusing `GooseAdapter::builtin_extension_config` to build the child's
+  extension list — it passes `available_tools: vec![]`, which Goose reads as *all tools of that
+  extension*, so the one-line reuse is a scope-widening default. `child_extensions` populates the
+  allowlist with real unprefixed names (which is what `dispatch_tool_call` matches) and **drops**
+  an extension whose granted list comes out empty rather than emitting one. I also rejected — and
+  then deleted after writing them — two redundant checks: an extension-level
+  `spec.tool_groups().contains` and a second `GOOSE_STRIPPED_BUILTINS` skip inside the parent
+  loop. Both were unreachable behind `TaskSpec::grants_tool`, and I only found out because
+  deleting them left every test green. An unreachable guard with a test that claims to cover it is
+  worse than no guard.
+
+  **Invariant 2 now has one list instead of three.** `goose_agent.rs` carried two hardcoded copies
+  of the ten stripped builtins — `strip_list`, which enforces, and the `is_builtin` prompt filter,
+  which does not — and this phase would have added a third. All three read
+  `orchestrator.rs :: GOOSE_STRIPPED_BUILTINS`, and a canary fails if `goose_agent.rs` ever spells
+  one of those names again. Calling the child loop directly does not bypass the strip, because
+  `Agent::with_config` builds an `ExtensionManager` with no extensions and nothing auto-loads
+  defaults into it — so the child is audited *after* the run as well, and a child that somehow
+  ended up holding `summon` has its result discarded rather than returned.
+
+  **Invariant 3 is a permit, not a convention.** One process-wide `Semaphore`; `spawn` acquires
+  `subagent_permits(provider)` of it before touching the engine, so there is no start path that
+  does not queue. The predicate is `max_concurrent_subagents`, which is written against
+  `runs_on_this_device` — `local`, `gguf`, `ollama`, `llamafile` — and the test iterates
+  `ON_DEVICE_PROVIDERS` rather than naming two of them.
+
+  **Still not done, and owed by later phases.** Nothing calls `spawn`: the first caller is P5's
+  `delegate` tool, and P3 owes the `DelegationAuthority::root(...)` at the edge and the
+  `engine_session_map` row that lets the draft gate resolve a child at all. **The semaphore does
+  not cover the parent's turns**, which section 3.4 says it must: a subagent turn still overwrites
+  the single retained KV prefix that `LoadedModel.session` holds, so the parent pays a re-prefill
+  on its next turn. Closing that means the parent's turn path taking the same permit, which
+  belongs with P4's reservation work. `context_fraction` is carried on the spec and read by
+  nobody — also P4. And `run_child_agent` itself has no test: it needs a real provider and a real
+  Goose session store, so everything that DECIDES was split out into pure functions and the
+  registry, and those are driven through the real `spawn` against a fake engine. The engine drive
+  is owed a live run.
 - **P3** Scope inheritance: `DelegationAuthority::root` constructed at the edge from the turn's
   resolved scope and its **post-selection, post-guest-subtraction** tool set; tool groups narrowed
   per role; draft gate enforced inside subagents. Two traps. First, publish the child's allow-set
@@ -487,21 +558,34 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
    mean un-stripping them.** The hazard is not that a direct child-loop call bypasses the strip —
    a fresh `Agent` has no extensions to strip — it is
    `EnabledExtensionsState::extensions_or_default`, whose fallback re-arms every `default_enabled`
-   platform extension, `summon` included. Build the child's list explicitly.
+   platform extension, `summon` included. Build the child's list explicitly. *(P2: the ten names
+   live once, in `orchestrator.rs :: GOOSE_STRIPPED_BUILTINS`, read by `goose_agent.rs`'s strip
+   guard, its `is_builtin` prompt filter and the plan builder's refusal. A source canary fails if
+   `goose_agent.rs` spells one of them again. The child's list is built from what the PARENT has
+   loaded, never from session or config state, and a child that ends up holding one anyway has its
+   result discarded.)*
 3. Concurrency is 1 for every provider that **runs on this device** until measurement says
    otherwise — `local`, `gguf`, `ollama`, `llamafile`. This used to say "`local`/`gguf`", which is
-   the narrow reading PAI-4 P2 already had to fix once. See section 3.4; and note the semaphore has
-   to cover the parent's turns too, not only other subagents.
+   the narrow reading PAI-4 P2 already had to fix once. See section 3.4. *(P2: one process-wide
+   `Semaphore`, acquired on the only path that starts a child. **The semaphore does NOT yet cover
+   the parent's turns**, which this invariant also requires — owed by P4.)*
 4. Subagent conversations never enter the parent's `session_messages`; only results do. Satisfied
    by construction — `ChatService` is the sole writer of that table and the child loop never
    touches it — with one caveat worth stating: the child's turns *are* persisted, into Goose's own
    `sessions.db` under the child's id. "Not in the parent's history" is true; "not written down" is
-   not. Deleting a parent session must release its children's engine sessions, or every delegation
-   leaks a row.
+   not. *(P2 closes the caveat: `ChildRunner::release` deletes the child's engine session as soon
+   as the run ends, so a delegation leaves no row behind for a parent-delete to have to find. The
+   parent takes back exactly one string — `as_concat_text()` of the last assistant message, which
+   drops `MessageContent::Thinking`, so a child's reasoning is not an eligible result either.)*
 5. Every spawn is cancellable, and cancelling a parent cancels its children. **This is entirely new
    work.** Goose's own background path mints an unrelated root token, `child_token()` is unused
    anywhere in Goose, and GIAP's parent-turn token is a stack local inside a stream closure with no
-   registry and no accessor. Hence `Orchestrator::cancel_children_of`.
+   registry and no accessor. Hence `Orchestrator::cancel_children_of`. *(P2: one
+   `CancellationToken` per run in the orchestrator's registry, checked while queued and re-checked
+   after the await — Goose returns `Ok(partial_text)` on cancel, so the `Result` cannot say. What
+   is still missing is the OTHER end: nothing calls `cancel_children_of` yet, because the parent
+   turn's token is still a stack local. Whatever ends a parent — a cancelled turn, a deleted
+   session, a shutdown — has to call it, and that is P3/P5 wiring.)*
 6. Depth is capped. A recursive delegation loop on a home server is a fire. *(P1: `DelegationDepth`
    cannot be constructed from a number, deserialized, or defaulted; the only public path to a
    deeper one refuses at `MAX_DELEGATION_DEPTH`.)*
@@ -549,10 +633,15 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
   `TurnBudgetExhausted` variants for this reason, and on `TaskRun::result_for_parent()` being
   `None`.
 - **Canary** — a test reading the fork's builtin list so that a Goose sync adding a new
-  orchestration builtin fails loudly rather than silently re-enabling it, in the spirit of
-  `goose_cap_message_is_still_verbatim`. Pin **both** copies of the ten names in `goose_agent.rs`
-  (`strip_list` and the `is_builtin` closure); a test that reads one proves nothing about the
-  other.
+  orchestration builtin fails loudly rather than silently re-enabling it. The old wording said to
+  pin **both** copies of the ten names in `goose_agent.rs`; *(P2 removed the duplication instead —
+  there is one `GOOSE_STRIPPED_BUILTINS` and
+  `goose_agent_reads_the_one_stripped_builtin_list_rather_than_its_own` fails, with comments
+  stripped so prose cannot satisfy it, if `goose_agent.rs` ever spells one of those names again.
+  `the_goose_turn_cap_message_is_still_verbatim` is the submodule-reading half: it re-derives
+  goose's private `MAX_TURNS_MESSAGE` from source, because an exhausted turn budget comes back as
+  `Ok` with that sentence as the "answer".)* A canary over the fork's `PLATFORM_EXTENSIONS` — so a
+  sync that adds an eleventh orchestration builtin fails rather than passing — is **still owed**.
 - **Registration/catalog cross-check** — nothing today asserts that
   `giap_registration.rs`'s registered extensions and `tool_group.rs`'s `TOOL_GROUPS` describe the
   same set. They happen to agree at 15. P5 owes that test, because the failure mode is silent and

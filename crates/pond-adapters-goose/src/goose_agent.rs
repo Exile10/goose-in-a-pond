@@ -3292,18 +3292,14 @@ impl GooseAdapter {
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(&goose_sid);
             if !already_stripped {
-                let strip_list: &[&str] = &[
-                    "developer",
-                    "computercontroller",
-                    "extensionmanager",
-                    "todo",
-                    "apps",
-                    "analyze",
-                    "summon",
-                    "summarize",
-                    "orchestrator",
-                    "tom",
-                ];
+                // PAI-6 P2: one copy of these ten names, in
+                // `orchestrator.rs :: GOOSE_STRIPPED_BUILTINS`. This block is
+                // the guard; the `is_builtin` closure below is a prompt filter;
+                // the orchestrator's plan builder refuses on the same list. All
+                // three used to be able to drift, and only one of them enforced
+                // anything, so a canary pinning one proved nothing about the
+                // others.
+                let strip_list: &[&str] = &crate::orchestrator::GOOSE_STRIPPED_BUILTINS;
                 // Only remove what is actually loaded. `remove_extension` drops
                 // the extension agent-globally and then calls
                 // `persist_extension_state`, which is a `get_session` read plus
@@ -3370,23 +3366,14 @@ impl GooseAdapter {
 
                 // Filter out built-in GIAP extensions (already covered by the
                 // available_tools section in the prompt) and Goose defaults.
+                // `default` and `suggestions` are Goose plumbing that carries no
+                // tools — they are filtered out of the prompt but never
+                // stripped, which is why they are named here and not in
+                // `GOOSE_STRIPPED_BUILTINS`.
                 let is_builtin = |name: &str| {
                     registered_extensions().iter().any(|e| e == name)
-                        || matches!(
-                            name,
-                            "default"
-                                | "developer"
-                                | "computercontroller"
-                                | "extensionmanager"
-                                | "todo"
-                                | "apps"
-                                | "analyze"
-                                | "summon"
-                                | "summarize"
-                                | "orchestrator"
-                                | "tom"
-                                | "suggestions"
-                        )
+                        || crate::orchestrator::GOOSE_STRIPPED_BUILTINS.contains(&name)
+                        || matches!(name, "default" | "suggestions")
                 };
 
                 let external_extensions: Vec<(String, Vec<(String, String)>)> = ext_map
@@ -4261,6 +4248,272 @@ impl AgentPort for GooseAdapter {
     /// straddle the prompt assembly it is describing.
     fn prefix_cache_state(&self) -> Option<PrefixCacheState> {
         Some(*self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+// ── PAI-6 P2: driving a child agent ─────────────────────────────────────────
+//
+// The mechanism half of orchestration. Every policy decision was already made
+// in `pond-core` (the `TaskSpec`) or in `orchestrator.rs` (the `ChildPlan`);
+// nothing below chooses a scope, a tool or a turn budget. It lives in this file
+// rather than in `orchestrator.rs` because it needs `agent`, `session_manager`,
+// `current_provider`, `settings_repo` and `template_repo`, all of which are
+// private fields — and adding public accessors for them would put the parent's
+// live provider and session manager on this crate's API surface for the sake of
+// one caller in the same crate.
+impl GooseAdapter {
+    /// The parent's live engine surface, for [`crate::orchestrator::build_child_plan`].
+    ///
+    /// The tool inventory comes from the PARENT's own Goose session, which is
+    /// what makes "a child's tools are a subset of the parent's" structural: a
+    /// tool the parent does not have loaded cannot appear here, so no plan can
+    /// name it. Passing the catalog instead would make every downstream
+    /// intersection a no-op — the shape PAI-1 P5 shipped and had to repair.
+    pub(crate) async fn child_environment(
+        &self,
+        parent_session_id: &str,
+    ) -> Result<crate::orchestrator::ChildEnvironment> {
+        let settings = self.settings_repo.get().await?;
+        let template_content = self
+            .template_repo
+            .get(&settings.prompt_style)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.content)
+            .unwrap_or_else(|| FALLBACK_PROMPT.to_string());
+
+        // A deliberately lean `PromptState`. A subagent gets a fraction of the
+        // window by construction (`context_fraction`), so it always gets the
+        // compact prompt; it has no devices to talk about and no prose tool
+        // list, because the envelope names its tools exactly; and
+        // `thinking_enabled` is false because nothing consumes a child's
+        // reasoning — the drain loop keeps `as_concat_text()`, which drops
+        // `MessageContent::Thinking` — so paying for it would be pure cost.
+        let prompt_state = PromptState {
+            current_date: String::new(),
+            current_time: String::new(),
+            device_count: 0,
+            has_home_devices: false,
+            online_device_names: String::new(),
+            voice_mode: false,
+            canvas_mode: false,
+            available_tools: Vec::new(),
+            thinking_enabled: false,
+            compact_prompt: true,
+            native_tools_json: matches!(settings.chat_provider.as_str(), "local" | "gguf"),
+            prefix_hash: None,
+        };
+
+        // THE respecification of this phase. The bullet said "render
+        // subagent_system.md"; that file was deleted on 2026-08-06 with the
+        // whole of `giap_prompts.rs`, and Goose's own copy is not substitutable
+        // (`build_subagent_prompt` renders it unconditionally and overrides the
+        // child's system prompt from inside a function GIAP cannot reach). This
+        // is the live path — the same `build_prompt_partition` the parent's turn
+        // uses — so a child introduces itself as this assistant rather than as
+        // "a specialized subagent within the goose AI framework, created by
+        // AAIF". Only the static prefix is taken: the dynamic suffix is date,
+        // time and profile lines, and a child is given its task in words.
+        let partition = build_prompt_partition(&settings, None, &prompt_state, &template_content);
+
+        let goose_sid = self.resolve_goose_session(parent_session_id).await;
+        let mut parent_tools: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
+        for tool in self.agent.list_tools(&goose_sid, None).await {
+            let name = tool.name.to_string();
+            // Unprefixed names, because that is what Goose matches
+            // `available_tools` against: `dispatch_tool_call` checks
+            // `is_tool_available(&resolved.actual_tool_name)`, not the
+            // `extension__tool` name the model sees. An unprefixed tool is
+            // Goose plumbing (the final-output tool, platform tools) and
+            // belongs to no extension, so it is skipped rather than guessed at.
+            let Some(sep) = name.find(pond_core::mcp::domain::tool_group::TOOL_NAME_SEPARATOR)
+            else {
+                continue;
+            };
+            let (extension, rest) = name.split_at(sep);
+            let bare = &rest[pond_core::mcp::domain::tool_group::TOOL_NAME_SEPARATOR.len()..];
+            parent_tools
+                .entry(extension.to_string())
+                .or_default()
+                .insert(bare.to_string());
+        }
+
+        Ok(crate::orchestrator::ChildEnvironment {
+            provider_name: settings.chat_provider.clone(),
+            base_system_prefix: partition.static_prefix,
+            parent_tools,
+        })
+    }
+
+    /// Create the child's engine session.
+    ///
+    /// `SessionType::SubAgent` so Goose's own bookkeeping knows what it is, and
+    /// so anything that later enumerates sessions can tell a delegation apart
+    /// from a conversation. The row has to exist before the plan runs:
+    /// `Agent::update_provider` ends in `session_manager.update(id).apply()`,
+    /// which errors on a missing row and surfaces as "Failed to set provider on
+    /// sub agent" — the same failure class as the recorded `resolve_goose_session`
+    /// foreign-key incident, wearing a provider's clothes.
+    pub(crate) async fn open_child_session(&self, role: &str) -> Result<String> {
+        let session = self
+            .session_manager
+            .create_session(
+                std::env::current_dir().unwrap_or_default(),
+                format!("giap-subagent:{role}"),
+                goose::session::session_manager::SessionType::SubAgent,
+                GooseMode::Auto,
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to create subagent session for role '{role}': {e}"))?;
+        Ok(session.id)
+    }
+
+    /// Delete a child's engine session once its run is over.
+    pub(crate) async fn release_child_session(&self, child_session_id: &str) {
+        if let Err(e) = self.session_manager.delete_session(child_session_id).await {
+            tracing::warn!("Failed to release subagent engine session '{child_session_id}': {e}");
+        }
+    }
+
+    /// Run one child agent to completion, or until `cancel` trips.
+    ///
+    /// This is the ~120 lines that would otherwise have been Goose's
+    /// `get_agent_messages`. See `orchestrator.rs`'s module doc for why they are
+    /// here instead of behind a sixth fork patch.
+    pub(crate) async fn run_child_agent(
+        &self,
+        plan: crate::orchestrator::ChildPlan,
+        cancel: CancellationToken,
+    ) -> Result<crate::orchestrator::ChildOutcome> {
+        let (provider, model_config) = self
+            .current_provider
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                anyhow!(
+                    "no provider is configured on this pond yet - a subagent cannot be given one"
+                )
+            })?;
+
+        // A FRESH agent, deliberately. `Agent::with_config` builds an
+        // `ExtensionManager` with no extensions and nothing auto-loads defaults
+        // into it, so the child starts with an empty tool surface and gets
+        // exactly what the plan puts in. That is what makes invariants 1, 2 and
+        // 6 structural rather than checked.
+        //
+        // `scheduler_service: None` keeps `manage_schedule_tool` off the child's
+        // list. `GooseMode::Auto` is MANDATORY, not a preference: any
+        // approval-requiring mode hangs forever on the child's
+        // `confirmation_rx`, because nothing forwards an ActionRequired message
+        // to a parent. The consequence is that the child's TOOL SET is its only
+        // safety boundary, which is why `available_tools` is populated
+        // explicitly and why nothing that actuates a device belongs in a role.
+        let config = AgentConfig::new(
+            self.session_manager.clone(),
+            goose::config::permission::PermissionManager::instance(),
+            None,
+            GooseMode::Auto,
+            true,
+            GoosePlatform::GooseCli,
+        );
+        let child = GooseAgent::with_config(config);
+
+        child
+            .update_provider(provider, model_config, &plan.child_session_id)
+            .await
+            .map_err(|e| anyhow!("Failed to set the provider on the subagent: {e}"))?;
+
+        // Goose's own child loop `debug!`s and SWALLOWS an extension that fails
+        // to load, so a subagent whose only useful extension never started runs
+        // anyway and returns a plausible-looking wrong answer. Owning the loop
+        // means this can fail loudly instead.
+        for extension in &plan.extensions {
+            child
+                .add_extension(extension.clone(), &plan.child_session_id)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to load extension '{}' for subagent role '{}': {e}",
+                        extension.name(),
+                        plan.role
+                    )
+                })?;
+        }
+
+        child
+            .override_system_prompt(plan.system_prompt.clone())
+            .await;
+
+        let loaded_extensions: std::collections::BTreeSet<String> = child
+            .list_extensions()
+            .await
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+
+        let session_config = goose::agents::SessionConfig {
+            id: plan.child_session_id.clone(),
+            schedule_id: None,
+            // Always `Some`. Goose's `build_subagent_prompt` does
+            // `.expect("TaskConfig always sets max_turns")`, and while that
+            // particular panic is not on this path, an unbounded child on a
+            // 2-4B on-device model is minutes of wall clock with the parent's
+            // turn blocked behind it.
+            max_turns: Some(plan.max_turns),
+            retry_config: None,
+        };
+        let user_message = Message::user().with_text(&plan.user_message);
+
+        let mut stream =
+            goose::session_context::with_session_id(Some(plan.child_session_id.clone()), async {
+                child
+                    .reply(user_message.clone(), session_config, Some(cancel.clone()))
+                    .await
+            })
+            .await
+            .map_err(|e| anyhow!("Failed to start the subagent reply: {e}"))?;
+
+        let mut last_text: Option<String> = None;
+        let mut assistant_turns: u32 = 0;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(goose::agents::AgentEvent::Message(msg)) => {
+                    if msg.role == rmcp::model::Role::Assistant {
+                        assistant_turns = assistant_turns.saturating_add(1);
+                        // `as_concat_text()` filters on `as_text()`, which
+                        // returns `None` for `MessageContent::Thinking`. That is
+                        // load-bearing, not incidental: PAI-5's reasoning gate
+                        // lives at this adapter's own producer, a path a child
+                        // does not go through, so a child's reasoning would
+                        // otherwise reach the parent as its answer.
+                        let text = msg.as_concat_text();
+                        if !text.trim().is_empty() {
+                            last_text = Some(text);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        role = %plan.role,
+                        "subagent stream error, ending the run: {e}"
+                    );
+                    break;
+                }
+            }
+        }
+        drop(stream);
+
+        Ok(crate::orchestrator::ChildOutcome {
+            last_text,
+            assistant_turns,
+            loaded_extensions,
+        })
     }
 }
 

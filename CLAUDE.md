@@ -272,9 +272,12 @@ Do not remove either guard without a dedicated stabilisation milestone. The code
 See `docs/goose-patch-management.md` for the patch set carried on top of upstream (`aaif-goose/goose`) and the upstream-rebase procedure.
 
 The submodule is pinned to `jarida-io/Goose:main` (upstream main synced
-2026-07-25 + the GIAP patch set: ollama tool-less retry, extra featured Gemma 4
-models; the old native_tool_calling/use_jinja patches are subsumed by upstream's
-`ToolCallingMode`/`ChatTemplate`). Upstream declares `rmcp = "^1.4"`; the
+2026-07-25 + the GIAP patch set, which is **five** patches as of 2026-08-07:
+ollama tool-less retry, extra featured Gemma 4 models, llama.cpp `ProviderStats`
+parity, thinking-only turns count as empty, llama.cpp prompt-session KV cache —
+`docs/goose-patch-management.md` is the authoritative table, and this line said
+"two" until PAI-6 P2 counted the rows. The old native_tool_calling/use_jinja
+patches are subsumed by upstream's `ToolCallingMode`/`ChatTemplate`). Upstream declares `rmcp = "^1.4"`; the
 workspace still forces `rmcp = "=1.5.0"`. CI clones the fork branch tip
 directly, bypassing the stored submodule SHA — a BREAKING sync must be staged on
 a side branch and fast-forwarded into fork `main` together with the parent-side
