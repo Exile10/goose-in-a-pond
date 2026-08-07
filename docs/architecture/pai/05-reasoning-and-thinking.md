@@ -537,13 +537,44 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   > because the usage build has a reported-usage path and a fallback path, and a regression fixing
   > only one is worse than one fixing neither, because it then depends on the provider.
   >
-  > **Still dark, and NOT fixed here** — `ChatService::persist_assistant_response`'s
-  > `.with_reasoning_tokens(usage.and_then(|u| u.reasoning_tokens))` can be replaced with `None`
-  > and all 804 `pond-core` tests pass. The adjacent link IS guarded (mutating
-  > `SessionMessage::with_reasoning_tokens` to a no-op fails the `pond-infra` round-trip), so the
-  > store is proven to round-trip a hand-built row; nothing connects the counted number to the
-  > column. It needs one test against a fake `SessionStorage` asserting the captured
-  > `SessionMessage.reasoning_tokens == Some(N)`. Left for P6, which is already opening this file.
+  > **CLOSED 2026-08-06 — the last dark link, `crates/pond-core/tests/reasoning_persistence_guard.rs`.**
+  > It was true that `ChatService::persist_assistant_response`'s
+  > `.with_reasoning_tokens(usage.and_then(|u| u.reasoning_tokens))` could be replaced with `None`
+  > with the whole workspace staying green. The two ends were each proven and the seam between them
+  > was not: `turn_stats.rs` shows a `TurnStats` can *hold* the count, `pond-infra`'s
+  > `reasoning_tokens_round_trip_beside_the_provider_counts` shows a `SessionMessage` carrying one
+  > survives SQLite, and both build their subject by hand. The field worked and the column worked,
+  > on rows nobody populated.
+  >
+  > The guard now drives the join rather than the setter. A local fake `Agent` emits an
+  > `AgentStreamEvent::Done` shaped exactly like `GooseAdapter`'s — both of its `UsageStats` build
+  > arms carry the count — `chat_stream_once` runs for real, and the assertion is on the
+  > `SessionMessage` that `ChatService` handed to a fake `SessionStorage` which keeps it verbatim.
+  > The claim under test is what `ChatService` constructed, not what a store chose to keep.
+  > `MockAgent` could not be used: it hardcodes `usage: None`, which is precisely the input in
+  > question. It lives in `tests/` rather than `chat.rs`'s own `mod tests` so it needs no
+  > `test-mocks` feature — CI runs `cargo test -p pond-core` with no features, so a guard behind
+  > that feature would never execute, vacuous by construction.
+  >
+  > **Mutation-tested three ways, leading with the one that actually happens.** Deleting the builder
+  > call outright — the tidy-up a refactor does — fails test 1 naming the drop; replacing it with
+  > `None` fails identically. `usage.map(|u| u.reasoning_tokens.unwrap_or(0))` is the interesting
+  > one: test 1 still *passes*, because 37 survives a flattening that only corrupts the absent case,
+  > and test 2 is what catches it. Had test 2 stayed green there it would have been decorative.
+  >
+  > **Re-verified 2026-08-07 by accident, which is the best evidence it has.** Another agent left
+  > exactly the `None` mutation in the working tree; 823 lib tests and the other 7 integration tests
+  > passed and this guard was the only thing in the workspace that failed, printing "the turn
+  > counted 37 reasoning tokens and the persisted assistant row carries None; the count reached
+  > `AgentStreamEvent::Done` and was dropped on the way into `session_messages`". That is the
+  > regression happening for real, caught by the one test written for it.
+  >
+  > **Still NULL on the desktop route, by design and not by omission.** The guard is scoped to the
+  > `ChatService` path — `pond chat` and the terminal voice loop — where `turn_usage` is a whole
+  > `UsageStats`. `/chat/stream` flattens usage into a `(prompt, completion)` tuple for
+  > `persist_assistant_turn`, which cannot express a third number, so its rows keep NULL. The
+  > guard's header says so explicitly, because a guard read wider than it tests is how the next
+  > person concludes the desktop route is covered.
 
   **`None` is not `Some(0)`.** "Nobody counted" and "counted, and this turn thought nothing" are
   different facts and P5 must not read the first as the second. That is why 0039 has no `DEFAULT 0`:
