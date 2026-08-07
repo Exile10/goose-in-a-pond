@@ -606,8 +606,71 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   before 0039, which would mean the column grew a default.
 - **P3 — ALREADY LANDED**, before this programme began. One `thinking_enabled` drives both the
   prompt section and the engine param; see section 1.7. Nothing to do.
-- **P4** `reasoning_effort` tri-state mapped through the compaction profile; `brief` default on
-  local.
+- **P4 — LANDED 2026-08-06 (`8689ba47`), respecified in two places, and the resolution it settles
+  for is written down rather than implied.** `ReasoningEffort` (`Brief` | `Balanced` | `Thorough`)
+  and `reasoning_budget_tokens(&CompactionProfile, ReasoningEffort)` in
+  `models/services/context/context_budget.rs`; `Settings::reasoning_effort` defaulting to `"brief"`
+  with all five persistence pieces; `REASONING_EFFORTS` and a 422 arm in `update_settings` cloned
+  from the `network_mode` block; a "Thinking length" select in `Settings.tsx` (classified
+  UI_WIRED). All four `<thinking>` prompt styles now carry a word cap.
+
+  **Not a field on `CompactionProfile`, and the plan's argument for making it one is false.** The
+  plan held that adding a field would raise an E0063 at every construction site and so force each
+  to be considered. There are exactly two literal constructions of `CompactionProfile` in the tree
+  and both are test helpers in `turn_trimmer.rs`; every production site goes through
+  `from_context_window` or `for_windows`, which take a window and nothing else. The E0063 would
+  have bought two test-helper edits while roughly fifteen `from_context_window` callers each minted
+  a profile carrying an effort nobody chose — this repo's half-adopted-seam bug class. It is a free
+  function that READS the profile, which is what "mapped through the compaction profile" asks for:
+  the profile is the input, not the carrier.
+
+  **The budget renders or it does not ship.** Goose's only reasoning knob is the boolean
+  `enable_thinking` request param, and `output_reserve_tokens` is P5's job and needs P2's measured
+  data. So the one seam where a budget can bite today is the `<thinking>` prompt section, with
+  `budget_as_words` doing the token-to-word conversion `session_summary` already established — a
+  model cannot count its own tokens. The share is an eighth, a quarter and a half of
+  `output_reserve_tokens`, not of the raw window, because reasoning tokens ARE output tokens and
+  are decoded into the same reserve the answer is. A number with no consumer would have been this
+  programme's fourth correct-but-unreachable mechanism.
+
+  **Invariant 1 was the whole risk, and the shape chosen removes it rather than managing it.**
+  `reasoning_budget_words` is a pure function of `settings.reasoning_effort` and
+  `state.compact_prompt`, so it resolves inside `render_jinja_template` beside `prompt_style`, in a
+  block that already runs before `ensure_provider_current`. There is nothing new to order. The
+  78-character delta that cost every session a 3.7 s re-prefill on its second turn happened because
+  a value resolved differently on turn one than on turn two; this one cannot. `reasoning_effort` is
+  also hashed into the fast prefix hash in `prompt_builder.rs` — omitting it would let that path
+  report "prefix unchanged" for a prefix that changed, which is the one way a cache check is worse
+  than none.
+
+  **Also not done, deliberately.** `reasoning_budget_words` takes `compact_prompt`, not a whole
+  `CompactionProfile`, so the curve is SAMPLED at two windows (8,192, the clamp every local
+  provider gets, and 32,768, what the name heuristic hands qwen and mistral) instead of evaluated
+  at the turn's own window. Carrying the profile that far means widening `PromptState` and setting
+  it in `crates/pond-adapters-goose/src/goose_agent.rs`, held by another workstream this run. A
+  test pins both samples to the full evaluation so the constants cannot drift off the curve in
+  silence. Nothing was wired to Goose's `enable_thinking` beyond what P3 already does, and no
+  engine-level token cap exists, because no such seam exists to wire to.
+
+  **What would falsify this.** A `<thinking>` section whose word cap does not change between
+  `brief` and `thorough` on the same turn — that means the effort is not reaching the prompt.
+  A cap that renders at all when `thinking_mode = "off"`; off means off, and the cap only ever
+  renders inside `{% if thinking_enabled %}`. An unsubstituted literal `{{reasoning_budget_words}}`
+  reaching a model. Or a second turn re-prefilling after nothing but a settings read, which would
+  mean the value stopped resolving before the provider swap.
+
+  Guards: `reasoning_effort_changes_the_thinking_section_and_nothing_else` (prompts.rs) renders all
+  three efforts across all four styles on both tiers and asserts the `<thinking>` bodies differ
+  while the rest of the prefix is byte-identical;
+  `both_inputs_to_the_thinking_budget_move_the_prefix_and_the_fast_hash` (prompt_builder.rs);
+  `every_effort_renders_a_distinct_non_zero_word_budget` and
+  `the_reasoning_budget_is_a_share_of_the_output_reserve` (context_budget.rs);
+  `put_settings_refuses_an_unrecognised_reasoning_effort` (pond-api). Re-verified 2026-08-06 by
+  mutation: making `Brief` share a quarter with `Balanced` fails two guards, loudest "brief and
+  balanced render the SAME `<thinking>` section — reasoning_effort is not reaching the prompt";
+  deleting the `settings.reasoning_effort.hash()` line fails with "the fast hash misses
+  reasoning_effort — it would report a changed prefix unchanged". Both restored byte-identical.
+  Asserting that the identifier `reasoning_effort` appears in `prompts.rs` would have survived both.
 - **P5** `output_reserve_tokens` derived from measured reasoning behaviour rather than a constant
   (needs P2's data).
 - **P6 — NOT LANDED 2026-08-06. Blocked, and the blocker is file ownership, not design.**
