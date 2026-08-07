@@ -673,57 +673,75 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   Asserting that the identifier `reasoning_effort` appears in `prompts.rs` would have survived both.
 - **P5** `output_reserve_tokens` derived from measured reasoning behaviour rather than a constant
   (needs P2's data).
-- **P6 — NOT LANDED 2026-08-06. Blocked, and the blocker is file ownership, not design.**
-  `persist_thinking` side table; UI disclosure in the existing thinking panel; never replayed.
+- **P6 — LANDED 2026-08-07 (`bc3aa9df`).** `persist_thinking` side table; UI disclosure in the
+  existing thinking panel; never replayed. The deferral note below it predicted the shape of the
+  work correctly and was wrong about exactly one thing, which is recorded at the end.
 
-  P6 needs four seams and **all four are in files another workstream held for this run**:
+  The four seams the deferral named were all held by another group at the time; they were free the
+  next run, and all four moved:
 
-  | Seam | File | Why it cannot move |
-  |---|---|---|
-  | The gate — `persist_thinking`, default `false` | `pond-core/src/user_data/domain/settings.rs` | held (security) |
-  | The write — accumulate the thinking text and hand it to `ChatService` | `pond-api/src/routes.rs` (`chat_stream` ~1332/1560, `agent_chat_stream` ~7919/8020) | held (security) |
-  | The read — rehydrate on `GET /sessions/{id}/messages` | `pond-api/src/routes.rs` (`get_session_messages`, registered at ~142) | held (security) |
-  | The render — refill `thinkingBlocks` on session load | `pond-desktop/src/sections/Chat.tsx` | held (frontend) |
+  | Seam | Where it landed |
+  |---|---|
+  | The gate — `persist_thinking`, default `false` | `settings.rs:459` + `:915`, `sqlite_settings.rs:253` (upsert) and `:799` (`apply_key`) |
+  | The write — accumulate and hand to `ChatService` | `routes.rs:1346` (`chat_stream`) and `:8253` (`agent_chat_stream`), both via `record_thinking` |
+  | The read — rehydrate on session load | `get_thinking_for_session` on `SessionStorage`, folded into the history read |
+  | The render — refill `thinkingBlocks` | `sections/Chat.tsx:96` on load, `:423` while streaming, `:659` in the panel |
 
-  **Nothing was landed instead, deliberately.** The unheld half — migration `0040`, a
-  `pond-infra` store, a `pond-core` port — is buildable in an afternoon and would have been a
-  **write-only table with no caller, no gate and no reader**. That is not a partial P6; it is a
-  third "correct but unreachable" mechanism next to PAI-4 P2 and P7a, and this one would be
-  strictly worse than the other two: it would accumulate reasoning text — which restates household
-  context verbatim — on disk, with no setting to refuse it and no surface to view or delete it. A
-  privacy store whose only property is that it exists is a defect, so it was not written.
+  **Migration `0040_session_thinking.sql`** took the number this note reserved. It is a side table,
+  not a column on `session_messages`, and that is the load-bearing decision: everything that builds
+  a prompt already selects from `session_messages`, so a column there would ride along in queries
+  the trimmer and the summariser already run, and the first `SELECT *` would hand a model its own
+  discarded scratch work. Invariant 3 is enforced by the schema rather than by care.
 
-  **There is no alternative write site, and that was checked rather than assumed.**
-  `AgentStreamEvent::Thinking` has exactly four consumers in the workspace. Two are the held
-  `routes.rs` handlers. The third is `main.rs:6452` (`pond agent`), outside this group's footprint
-  and inside the startup-wiring file. The fourth is `chat.rs:1101` — the **voice** loop, where
-  invariant 2 forbids rendering reasoning and P1's `reasoning_frames_enabled(show_thinking, voice)`
-  gate means the frame never arrives at all. Persisting there would violate the invariant rather
-  than satisfy the phase. Writing from `GooseAdapter` instead was rejected on two counts: it puts
-  policy in an adapter, and `ChatService` is declared the sole owner of turn persistence.
+  **The port went on `SessionStorage`, not a new `ThinkingStore`, and the reason generalises.** A
+  dedicated port meant a new required field on `AppState`, which has 29 literal construction sites —
+  28 of them test files — so it is an `E0063` across all of them, and it would have been the fourth
+  time in this programme an adapter was built and then had to *prove* `main.rs` wired it.
+  `SessionStorage` already carries fourteen defaulted no-op methods (`list_session_attachments` is
+  the precedent for the history-read fold), so production wiring stopped being a claim:
+  `state.session_storage` **is** `SqliteSessionStorage`, and `ChatService` already holds it. Neither
+  `main.rs` nor `lib.rs` was touched.
 
-  **Migration number, announced so the next run does not collide:** P2 took `0039`, so **P6 takes
-  `0040`** (`0040_session_thinking.sql`). Nothing was created under that name — it is reserved by
-  this note, not by a file.
+  That trade has a cost and it is the vacuity shape this programme keeps paying for: **deleting the
+  real override leaves the tree green while the feature stops working.** It is paid for with four
+  behavioural tests against the real adapter rather than a grep — deleting the override fails two of
+  them by name.
 
-  **Corrections to the plan of record, for whoever picks this up.** The recon plan said reasoning
-  "vanishes on reload because nothing is persisted". Accurate, but it understates the work: the
-  blocks never reach `ChatService` in the first place, because `routes.rs` forwards the frame
-  straight to SSE and never accumulates it — so P6 is a write path to build, not a read path to
-  add. The plan also asked for the side table to "inherit the parent row's profile scoping"; note
-  that the parent is `session_messages`, which carries no `profile_id` of its own — the scope has
-  to come through `sessions.profile_id` (added in `0003`, indexed in `0037`), and a fixture that
-  sets it by hand reproduces exactly the `ProfileScope::Owner` no-op that went undetected for a
-  whole phase.
+  **The gate lives in `record_thinking`, in one place, not at the two call sites.** Two stream loops
+  each holding their own copy of a privacy `if` is precisely how `is_voice` shipped in P1: the
+  identifier was present, 108 tests passed, and it leaked on every desktop voice turn because the
+  other input was hardcoded. `/agent/chat/stream` reads no other setting, so its one settings read
+  narrows — unreadable means off.
 
-  **One piece of good news, verified rather than hoped.** Invariant 3 is already enforced by the
-  schema, not by convention: `session_messages.role` carries a `CHECK (role IN ('user',
-  'assistant', 'system', 'tool'))` since `0022`. A future refactor cannot quietly turn reasoning
-  into a replayed message role — it would have to rebuild the table to do it. The side-table design
-  is therefore the cheap path as well as the correct one.
+  The write is inside `ChatService` because the assistant row's id is minted there; a handler
+  physically cannot key a side-table row to it. The buffer is drained on **both** persistence paths,
+  because the terminal voice loop keeps one `ChatService` for the life of the process and an
+  undrained buffer would staple turn one's reasoning to every answer after it.
 
-  **What would falsify this deferral.** `routes.rs`, `settings.rs` and `Chat.tsx` all being
-  unheld — at which point P6 is ordinary work with no unknowns left in it.
+  Guards, mutation-tested and each restored byte-identical: wiring `get_thinking_for_session` into
+  the summariser's transcript loop "for continuity" fails naming `session_summary.rs` and saying
+  why (`crates/pond-core/tests/thinking_is_never_replayed.rs`); making `with_thinking` ignore its
+  argument fails the default-off test; deleting the SQLite override fails the round-trip and the
+  scoping test (`thinking_blocks_round_trip_keyed_to_their_message`); dropping the field from the
+  frontend object literal fails the render test.
+
+  **Not done, and worth knowing:** these rows have no retention policy of their own. They ride the
+  `CASCADE` off `session_messages` and the session, so a future pruner that bypasses the foreign key
+  will orphan them. Turning the setting off stops new writes; it does not erase what is already
+  there.
+
+  **Where the deferral note was wrong.** It listed `main.rs:6452` (`pond agent`) as a fourth
+  consumer of `AgentStreamEvent::Thinking` that was out of footprint. It is — but it is also the one
+  consumer that still does not persist, because it builds no `ChatService`. That is a gap in `pond
+  agent`, not in P6, and it is recorded here so the next reader does not conclude from the two wired
+  handlers that every consumer is covered.
+
+  **What the deferral got right, and why it was the correct call.** Landing the unheld half alone
+  would have produced a write-only table with no caller, no gate and no reader — a third "correct
+  but unreachable" mechanism next to PAI-4 P2 and P7a, and strictly the worst of the three, because
+  it would have accumulated reasoning text (which restates household context verbatim) on disk with
+  no setting to refuse it and no surface to view or delete it. Waiting one run cost nothing and
+  avoided shipping a privacy store whose only property was that it existed.
 - **P7** Unify the two stream handlers; `/agent/chat/stream` gains full parity, including memory
   extraction.
 
