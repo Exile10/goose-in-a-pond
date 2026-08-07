@@ -8701,6 +8701,7 @@ dependencies = [
  "pond-voice",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tera",
  "thiserror 1.0.69",

@@ -87,6 +87,38 @@ impl ProfileScope {
     pub fn allows_personal_data(&self) -> bool {
         !self.excludes_everything()
     }
+
+    /// True when `self` can reach no row that `wider` cannot.
+    ///
+    /// The lattice, which is a PARTIAL order and is easy to get wrong:
+    ///
+    /// - [`Guest`](Self::Guest) is within everything -- it reaches nothing.
+    /// - [`Owner(x)`](Self::Owner) is within `Owner(x)` and within
+    ///   [`Household`](Self::Household).
+    /// - `Owner(x)` and `Owner(y)` are INCOMPARABLE for `x != y`. Neither is
+    ///   within the other, because each reaches rows the other cannot.
+    /// - `Household` is within only `Household`.
+    ///
+    /// Written for PAI-6 invariant 1 -- "a subagent's scope is a subset of its
+    /// parent's, never wider" -- but it belongs on the type rather than in the
+    /// orchestration module, because it is a property of the scope lattice and
+    /// PAI-6 P3 is not the only thing that will need to ask.
+    ///
+    /// Note that `Owner(x).is_within(&Owner(x))` and
+    /// `Household.is_within(&Household)` are both true: "never wider" permits
+    /// equal, which is what inheriting a scope unchanged means.
+    pub fn is_within(&self, wider: &ProfileScope) -> bool {
+        match (self, wider) {
+            // Reaches nothing, so it is within anything.
+            (ProfileScope::Guest, _) => true,
+            // Reaches everything, so only Household contains it.
+            (ProfileScope::Household, ProfileScope::Household) => true,
+            (ProfileScope::Household, _) => false,
+            (ProfileScope::Owner(_), ProfileScope::Household) => true,
+            (ProfileScope::Owner(a), ProfileScope::Owner(b)) => a == b,
+            (ProfileScope::Owner(_), ProfileScope::Guest) => false,
+        }
+    }
 }
 
 /// Request body for creating a new profile.
@@ -136,6 +168,91 @@ mod profile_scope_tests {
         let owner = ProfileScope::Owner("jerry".into());
         assert!(!owner.excludes_everything());
         assert!(owner.allows_personal_data());
+    }
+}
+
+#[cfg(test)]
+mod scope_lattice_tests {
+    use super::*;
+
+    fn every_scope() -> Vec<ProfileScope> {
+        vec![
+            ProfileScope::Guest,
+            ProfileScope::Owner("jerry".into()),
+            ProfileScope::Owner("liz".into()),
+            ProfileScope::Household,
+        ]
+    }
+
+    /// Reflexive: inheriting a scope unchanged is "never wider".
+    #[test]
+    fn every_scope_is_within_itself() {
+        for s in every_scope() {
+            assert!(s.is_within(&s), "{s:?} is not within itself");
+        }
+    }
+
+    /// The whole point. `Household` reaches every row, so nothing narrower
+    /// contains it -- if this ever returns true, a Guest turn could delegate to
+    /// a subagent that reads the household's memory.
+    #[test]
+    fn household_is_within_nothing_narrower() {
+        assert!(!ProfileScope::Household.is_within(&ProfileScope::Guest));
+        assert!(!ProfileScope::Household.is_within(&ProfileScope::Owner("jerry".into())));
+    }
+
+    /// Two members are incomparable. This is the case a total order gets wrong:
+    /// Liz's scope is not "smaller" than Jerry's, it is elsewhere.
+    #[test]
+    fn two_owners_are_incomparable() {
+        let jerry = ProfileScope::Owner("jerry".into());
+        let liz = ProfileScope::Owner("liz".into());
+        assert!(!jerry.is_within(&liz));
+        assert!(!liz.is_within(&jerry));
+    }
+
+    #[test]
+    fn guest_is_within_everything_and_only_guest_is_within_guest() {
+        for wider in every_scope() {
+            assert!(
+                ProfileScope::Guest.is_within(&wider),
+                "Guest should be within {wider:?}"
+            );
+        }
+        for narrower in every_scope() {
+            let expected = matches!(narrower, ProfileScope::Guest);
+            assert_eq!(
+                narrower.is_within(&ProfileScope::Guest),
+                expected,
+                "{narrower:?} within Guest should be {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_owner_is_within_the_household() {
+        assert!(ProfileScope::Owner("jerry".into()).is_within(&ProfileScope::Household));
+    }
+
+    /// Vacuity control: the predicate must not be a constant. If it ever
+    /// returned `true` unconditionally -- the widening direction, and the one a
+    /// careless simplification lands on -- every other test here would still
+    /// pass except the negative ones, so pin the count of false answers too.
+    #[test]
+    fn the_predicate_refuses_a_specific_number_of_pairs() {
+        let scopes = every_scope();
+        let refused = scopes
+            .iter()
+            .flat_map(|a| scopes.iter().map(move |b| (a, b)))
+            .filter(|(a, b)| !a.is_within(b))
+            .count();
+        // 16 ordered pairs. Permitted: 4 reflexive, Guest within the other 3,
+        // and 2 owners within Household = 4 + 3 + 2 = 9. So 7 are refused.
+        assert_eq!(
+            refused, 7,
+            "the scope lattice changed shape; if that was deliberate, say which \
+             pair moved and why it is not a widening"
+        );
     }
 }
 
