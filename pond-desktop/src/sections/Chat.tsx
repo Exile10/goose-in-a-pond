@@ -593,9 +593,19 @@ export function Chat() {
     void truncateAndResend(msg, trimmed);
   }, [editText, truncateAndResend]);
 
-  const refreshResponse = useCallback((msg: Message) => {
-    void truncateAndResend(msg, msg.text);
-  }, [truncateAndResend]);
+  // Called from the AGENT bubble, but truncateAndResend needs a USER message
+  // to delete-from-and-resend — regenerating means "redo the answer to the
+  // prompt right before this one," so walk back to find it. Truncating from
+  // there removes both the old prompt row and its stale answer; resending
+  // the same text creates a fresh pair, keeping exactly one user/answer per
+  // turn (there's no lighter "keep the prompt, only replace the answer"
+  // primitive — see truncateAndResend's own comment).
+  const refreshResponse = useCallback((agentMsg: Message) => {
+    const idx = messages.findIndex((m) => m.id === agentMsg.id);
+    const precedingUser = idx === -1 ? undefined : [...messages.slice(0, idx)].reverse().find((m) => m.role === "user");
+    if (!precedingUser) return;
+    void truncateAndResend(precedingUser, precedingUser.text);
+  }, [messages, truncateAndResend]);
 
   // `null` clears a vote — clicking the already-active thumb toggles it off.
   // Optimistic: flips locally first, reverts only if the PUT fails.
@@ -785,7 +795,7 @@ export function Chat() {
                       : "")
                   )}
                 </div>
-                {/* Copy / edit / refresh — user messages only */}
+                {/* Copy / edit — user messages only */}
                 {msg.role === "user" && editingId !== msg.id && (
                   <div className="ch-bubble__actions" role="group" aria-label="Message actions">
                     <button type="button" className="ch-bubble__action" title="Copy" onClick={() => copyMessageText(msg.text)}>
@@ -800,6 +810,14 @@ export function Chat() {
                     >
                       <Pencil size={13} aria-hidden />
                     </button>
+                  </div>
+                )}
+                {/* Copy / regenerate / like / dislike — agent messages only; like/dislike feeds (or excludes from) training data */}
+                {msg.role === "agent" && !msg.streaming && (
+                  <div className="ch-bubble__actions" role="group" aria-label="Message actions">
+                    <button type="button" className="ch-bubble__action" title="Copy" onClick={() => copyMessageText(msg.text)}>
+                      <Copy size={13} aria-hidden />
+                    </button>
                     <button
                       type="button"
                       className="ch-bubble__action"
@@ -808,14 +826,6 @@ export function Chat() {
                       onClick={() => refreshResponse(msg)}
                     >
                       <RefreshCw size={13} aria-hidden />
-                    </button>
-                  </div>
-                )}
-                {/* Copy / like / dislike — agent messages only; like/dislike feeds (or excludes from) training data */}
-                {msg.role === "agent" && !msg.streaming && (
-                  <div className="ch-bubble__actions" role="group" aria-label="Message actions">
-                    <button type="button" className="ch-bubble__action" title="Copy" onClick={() => copyMessageText(msg.text)}>
-                      <Copy size={13} aria-hidden />
                     </button>
                     <button
                       type="button"
