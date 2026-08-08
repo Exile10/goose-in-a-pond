@@ -16,7 +16,7 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { Button } from "@heroui/react";
-import { ChevronLeft, Mic, Square, Trash2, Radio, Volume2, RotateCcw } from "lucide-react";
+import { ChevronLeft, ChevronUp, ChevronDown, Mic, Square, Trash2, Radio, Volume2, RotateCcw } from "lucide-react";
 import { VoiceOrb } from "../../components/VoiceOrb";
 import { TranscriptFeed } from "../../components/TranscriptFeed";
 import { VoiceSwitcher } from "../../components/VoiceSwitcher";
@@ -84,6 +84,7 @@ function VoiceModeChildProcess() {
   const isError     = voiceState === "error";
   const serverDown  = !state.serverOnline;
   const [isSwitcherOpen, setSwitcherOpen] = useState(false);
+  const [transcriptOpen, setTranscriptOpen] = useState(false);
 
   // Fire a one-shot flash on the orb the moment the child confirms it heard
   // the wake word (wait -> recording), so wake-word detection has a visible
@@ -179,8 +180,10 @@ function VoiceModeChildProcess() {
         </Button>
       </div>
 
-      {/* Stage: orb + state label + live caption. Transcript panel removed
-          for now (was pushing the orb out of view) — being rebuilt. */}
+      {/* Stage: orb + state label + live caption. Full scrollback lives in
+          the drawer below, collapsed by default — it pushes this stage's
+          available height when open (the orb recenters) rather than
+          overlaying or resizing the orb itself. */}
       <div className="vm-stage">
         <VoiceOrb
           state={isConnecting ? "idle" : voiceState}
@@ -203,6 +206,32 @@ function VoiceModeChildProcess() {
             {lastMsg!.text || "…"}
           </p>
         )}
+      </div>
+
+      {/* Transcript drawer: tap to reveal scrollback, capped height so it
+          can never crowd the orb out. */}
+      {state.transcript.length > 0 && (
+        <button
+          type="button"
+          className="vm-transcript-tab"
+          onClick={() => setTranscriptOpen((o) => !o)}
+          aria-expanded={transcriptOpen}
+          aria-controls="vm-transcript-panel"
+        >
+          {transcriptOpen ? <ChevronDown size={13} /> : <ChevronUp size={13} />}
+          Transcript
+        </button>
+      )}
+      <div
+        id="vm-transcript-panel"
+        className={`vm-transcript-drawer${transcriptOpen ? " is-open" : ""}`}
+      >
+        <TranscriptFeed
+          messages={state.transcript}
+          contextCards={state.contextCards}
+          fillHeight
+          compact
+        />
       </div>
 
       {/* Action bar */}

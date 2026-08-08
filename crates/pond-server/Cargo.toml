@@ -75,6 +75,7 @@ pond-adapters-llamafile = { path = "../../crates/pond-adapters-llamafile" }
 pond-adapters-ollama = { path = "../../crates/pond-adapters-ollama" }
 pond-adapters-whisper = { path = "../../crates/pond-adapters-whisper" }
 pond-adapters-piper = { path = "../../crates/pond-adapters-piper" }
+pond-audio = { path = "../pond-audio" }
 cpal = "0.15"
 pond-mcp-server    = { path = "../pond-mcp-server" }
 # Both depend on the goose submodule which creates a diamond rmcp conflict when

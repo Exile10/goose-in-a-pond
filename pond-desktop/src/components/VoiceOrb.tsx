@@ -130,8 +130,14 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0, pulseKey = 0 }: P
   const lastSpikeAtRef = useRef(0);
   const SPIKE_THRESHOLD = 0.32;
   const MIN_SPIKE_INTERVAL_MS = 200;
-  const PARTICLE_LIFETIME_MS = 900;
-  const MAX_PARTICLES = 10;
+  const PARTICLE_LIFETIME_MS = 1400;
+  const PARTICLES_PER_SPIKE = 20;
+  // Pool cap sized for overlapping bursts: at the 200ms minimum spike
+  // interval, several bursts' worth of particles can be alive at once during
+  // their 1400ms lifetime. Too small a cap truncates an older burst
+  // mid-animation (a particle vanishing instead of fading) rather than
+  // letting it finish naturally.
+  const MAX_PARTICLES = 160;
 
   useEffect(() => {
     if (!isSpeaking || level < SPIKE_THRESHOLD) return;
@@ -139,12 +145,21 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0, pulseKey = 0 }: P
     if (now - lastSpikeAtRef.current < MIN_SPIKE_INTERVAL_MS) return;
     lastSpikeAtRef.current = now;
 
-    const id = particleIdRef.current++;
-    const angle = Math.random() * 360;
-    setParticles((ps) => [...ps.slice(-(MAX_PARTICLES - 1)), { id, angle }]);
-    setTimeout(() => {
-      setParticles((ps) => ps.filter((p) => p.id !== id));
-    }, PARTICLE_LIFETIME_MS);
+    // Particles spaced evenly around the circle (with a little jitter) read
+    // as a burst — a single dot at a random angle was too easy to miss,
+    // especially when it happened to land behind the face.
+    const baseAngle = Math.random() * 360;
+    const step = 360 / PARTICLES_PER_SPIKE;
+    const spawned = Array.from({ length: PARTICLES_PER_SPIKE }, (_, i) => ({
+      id: particleIdRef.current++,
+      angle: baseAngle + i * step + (Math.random() * 20 - 10),
+    }));
+    setParticles((ps) => [...ps.slice(-(MAX_PARTICLES - spawned.length)), ...spawned]);
+    spawned.forEach(({ id }) => {
+      setTimeout(() => {
+        setParticles((ps) => ps.filter((p) => p.id !== id));
+      }, PARTICLE_LIFETIME_MS);
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [level, isSpeaking]);
 
@@ -177,7 +192,10 @@ export function VoiceOrb({ state, size = "md", audioLevel = 0, pulseKey = 0 }: P
           className="orb-glass__particle"
           style={{
             "--particle-angle": `${p.angle}deg`,
-            "--particle-radius": `${px * 0.34}px`,
+            // 0.42 clears the halo's outer edge (core at 31% + halo's 8%
+            // inset ≈ 39%), so the burst starts just outside the orb rather
+            // than inside it and drifting out through the halo.
+            "--particle-radius": `${px * 0.42}px`,
           } as React.CSSProperties}
         />
       ))}
