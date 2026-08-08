@@ -85,14 +85,19 @@ pub struct WhisperRsInput {
     wake_words: std::sync::RwLock<Vec<String>>,
     /// Optional live mic-level reporter, fed from the VAD recording loop.
     audio_level_sink: Option<Arc<ThrottledAudioLevelSink>>,
+    /// The single shared microphone owner (see `pond_audio`). Every capture
+    /// call goes through it, so this adapter's follow-up VAD listen can never
+    /// race the wake-word detector for the device.
+    mic: pond_audio::MicHandle,
 }
 
 impl WhisperRsInput {
     /// Load the ggml model at `model_path` and prepare the in-process context.
+    /// `mic` is the process's single shared microphone owner.
     ///
     /// Returns `Err` if the file does not exist or whisper-rs fails to load
     /// it. A whisper-rs panic during load is caught and converted to `Err`.
-    pub fn new(model_path: PathBuf) -> Result<Self> {
+    pub fn new(model_path: PathBuf, mic: pond_audio::MicHandle) -> Result<Self> {
         if !model_path.exists() {
             return Err(anyhow!(
                 "Whisper model file not found: {}",
@@ -112,6 +117,7 @@ impl WhisperRsInput {
             captured: Mutex::new(None),
             wake_words: std::sync::RwLock::new(Vec::new()),
             audio_level_sink: None,
+            mic,
         })
     }
 
@@ -498,11 +504,12 @@ impl WhisperRsInput {
         // instead of paying for it serially afterward (Q2-26).
         let ctx_for_speculative = ctx_arc.clone();
         let spec_wake_words = self.wake_words_snapshot();
+        let mic = self.mic.clone();
         let capture_result = tokio::task::spawn_blocking(move || -> Result<SpeechCapture> {
             if let Some(wav) = captured {
                 let (captured_samples, _captured_rate) = decode_wav_mono_f32(&wav)?;
                 let (fresh_samples, fresh_rate) =
-                    record_mono_f32_until_silence(max_record, silence_ms)?;
+                    record_mono_f32_until_silence(&mic, max_record, silence_ms)?;
                 let fresh_16k = resample_to_16k(&fresh_samples, fresh_rate);
                 let mut combined = captured_samples;
                 // Skip the leading ~200 ms of the fresh recording — the mic
@@ -532,6 +539,7 @@ impl WhisperRsInput {
                     })
                 });
                 let (samples, sample_rate, speculative_transcript) = record_mono_f32_vad(
+                    &mic,
                     DEFAULT_ONSET_WAIT_SECS,
                     max_record,
                     silence_ms,
@@ -672,10 +680,22 @@ mod tests {
         assert_eq!(strip_wake_words(heard.clone(), &[]), heard);
     }
 
+    /// A `MicHandle` backed by a scripted (no-hardware) device, for tests
+    /// that only need a valid handle to construct — not to actually capture.
+    fn test_mic() -> pond_audio::MicHandle {
+        let (mic, _join) = pond_audio::spawn(
+            Box::new(pond_audio::testing::ScriptedCapture::silence(0, 20)),
+            pond_audio::CAPTURE_RATE_HZ,
+            5_000,
+            true,
+        );
+        mic
+    }
+
     #[test]
     fn new_returns_err_on_missing_model() {
         let path = PathBuf::from("/tmp/definitely-not-a-real-whisper-model-12345.bin");
-        let result = WhisperRsInput::new(path);
+        let result = WhisperRsInput::new(path, test_mic());
         assert!(result.is_err(), "expected Err on missing model file");
         let msg = result.err().unwrap().to_string();
         assert!(
@@ -700,7 +720,7 @@ mod tests {
             return;
         };
         let model_path = PathBuf::from(model_env);
-        let input = WhisperRsInput::new(model_path).expect("model should load");
+        let input = WhisperRsInput::new(model_path, test_mic()).expect("model should load");
 
         // 1 second of silence at 16 kHz.
         let silence = vec![0.0f32; 16_000];
@@ -731,7 +751,7 @@ mod tests {
             return;
         };
         let model_path = PathBuf::from(model_env);
-        let input = WhisperRsInput::new(model_path).expect("model should load");
+        let input = WhisperRsInput::new(model_path, test_mic()).expect("model should load");
 
         let wav_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/blobs/jfk.wav");
         let wav_bytes = std::fs::read(&wav_path).expect("jfk.wav fixture missing");
@@ -833,7 +853,7 @@ mod tests {
             eprintln!("set WHISPER_TEST_MODEL");
             return;
         };
-        let input = WhisperRsInput::new(PathBuf::from(model_env)).expect("model loads");
+        let input = WhisperRsInput::new(PathBuf::from(model_env), test_mic()).expect("model loads");
         let ctx = input.context.blocking_read().clone();
 
         let wav_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/blobs/jfk.wav");

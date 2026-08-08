@@ -1010,6 +1010,18 @@ async fn run_server(
     // Apply the microphone privacy setting before anything can open a device.
     pond_core::models::domain::mic_gate::set_mic_enabled(settings.mic_enabled);
 
+    // Single shared microphone owner (see `pond_audio`). This process only
+    // ever transcribes already-recorded audio via the HTTP `/transcribe`
+    // route below — it never opens the device — but `WhisperRsInput::new`
+    // still requires a handle so there is exactly one code path for every
+    // caller, live capture or not.
+    let (mic_handle, _mic_owner_join) = pond_audio::spawn(
+        Box::new(pond_audio::CpalCapture::new()),
+        pond_audio::CAPTURE_RATE_HZ,
+        15_000,
+        settings.mic_enabled,
+    );
+
     // One resolution for both voice models, shared with the `chat` path.
     let voice_models = voice_models::resolve_voice_models(
         &settings,
@@ -1065,7 +1077,7 @@ async fn run_server(
     // depending on pond-adapters-whisper.
     let transcribe_audio: Option<Arc<dyn Fn(Vec<u8>) -> anyhow::Result<String> + Send + Sync>> =
         whisper_model_path.as_ref().and_then(|p| {
-            match WhisperRsInput::new(p.clone()) {
+            match WhisperRsInput::new(p.clone(), mic_handle.clone()) {
                 Ok(w) => {
                     let w = Arc::new(w);
                     Some(Arc::new(move |wav_bytes: Vec<u8>| {
@@ -3320,6 +3332,25 @@ async fn run_chat(
     // Apply the microphone privacy setting before anything can open a device.
     pond_core::models::domain::mic_gate::set_mic_enabled(settings.mic_enabled);
 
+    // Single shared microphone owner (see `pond_audio`). Before this, the
+    // wake-word detector, the VAD follow-up capture, and the "record until
+    // silence" one-breath capture each opened their own `cpal` stream — live
+    // simultaneously by design (the wake listener races the reply for
+    // barge-in), which could race the very next turn's capture for the same
+    // device. Every capture path in this session goes through this one
+    // handle instead, so opens/closes are serialized on one owner thread.
+    //
+    // Sized to the wake-word detector's own history requirement —
+    // `window_ms.max(lookback_ms) + post_trigger_ms` from
+    // `KeywordDetectorConfig::default()` (~13.4s) — with headroom; see the
+    // sizing rule on `pond_audio::spawn`.
+    let (mic_handle, _mic_owner_join) = pond_audio::spawn(
+        Box::new(pond_audio::CpalCapture::new()),
+        pond_audio::CAPTURE_RATE_HZ,
+        15_000,
+        settings.mic_enabled,
+    );
+
     // One resolution for both voice models, accepting every on-disk shape the
     // settings fields have carried. See `voice_models` for why there are three.
     let voice_models = voice_models::resolve_voice_models(
@@ -3688,13 +3719,13 @@ async fn run_chat(
     // only consumer of this NDJSON contract.
     let audio_level_sink: Option<Arc<pond_adapters_whisper::ThrottledAudioLevelSink>> =
         if json_events {
-            Some(Arc::new(pond_adapters_whisper::ThrottledAudioLevelSink::new(
-                Box::new(|rms: f32| {
-                    write_ndjson_line(&pond_core::shared::domain::agent::WorkflowEvent::AudioLevel {
-                        rms,
-                    });
-                }),
-            )))
+            Some(Arc::new(
+                pond_adapters_whisper::ThrottledAudioLevelSink::new(Box::new(|rms: f32| {
+                    write_ndjson_line(
+                        &pond_core::shared::domain::agent::WorkflowEvent::AudioLevel { rms },
+                    );
+                })),
+            ))
         } else {
             None
         };
@@ -3782,7 +3813,7 @@ async fn run_chat(
     // KWS subprocess needed any more.
     let whisper_backend: Option<Arc<WhisperRsInput>> = if input == "whisper" {
         match &whisper_model_path {
-            Some(p) => match WhisperRsInput::new(p.clone()) {
+            Some(p) => match WhisperRsInput::new(p.clone(), mic_handle.clone()) {
                 Ok(w) => {
                     let w = match &audio_level_sink {
                         Some(sink) => w.with_audio_level_sink(sink.clone()),
@@ -3877,10 +3908,13 @@ async fn run_chat(
             ..KeywordDetectorConfig::default()
         };
 
-        let mut detector_builder =
-            WhisperKeywordDetector::new(backend.clone() as Arc<dyn WhisperBackend>, trigger)
-                .with_transcriptions(transcriptions)
-                .with_config(kws_config);
+        let mut detector_builder = WhisperKeywordDetector::new(
+            backend.clone() as Arc<dyn WhisperBackend>,
+            trigger,
+            mic_handle.clone(),
+        )
+        .with_transcriptions(transcriptions)
+        .with_config(kws_config);
         if let Some(sink) = &audio_level_sink {
             detector_builder = detector_builder.with_audio_level_sink(sink.clone());
         }
@@ -3891,6 +3925,14 @@ async fn run_chat(
         backend.set_wake_words(detector.triggers());
         chat_service = chat_service.with_wake_word_detector(detector);
     };
+
+    // ── Wire barge-in energy ──
+    // `MicEnergy` reads live RMS off the same shared mic owner every other
+    // capture path here uses. Without this, `ChatService::new`'s default
+    // `NoEnergy` is inert and barge-in-by-speaking silently never fires — the
+    // wake word was the only way to interrupt a reply.
+    chat_service =
+        chat_service.with_speech_energy(Arc::new(pond_audio::MicEnergy::new(&mic_handle)));
 
     // ── Wire TTS output ──
     // The text/print fallback (no piper): in --json-events mode this MUST NOT
@@ -4087,12 +4129,14 @@ async fn run_chat(
             write_ndjson_line(&WorkflowEvent::Exit {
                 reason: "error".to_string(),
             });
+            mic_handle.shutdown();
             return Err(e);
         }
     } else {
         chat_service.run_loop().await?;
     }
 
+    mic_handle.shutdown();
     Ok(())
 }
 
@@ -4946,7 +4990,16 @@ async fn run_calibrate(
         settings.voice_wake_word = phrase.clone();
     }
 
-    let whisper = WhisperRsInput::new(whisper_model_path.clone())
+    // A self-contained mic owner for this one-shot calibration run — it never
+    // runs concurrently with the wake-word detector, so it does not share a
+    // handle with `run_chat`/`run_server`.
+    let (mic_handle, _mic_owner_join) = pond_audio::spawn(
+        Box::new(pond_audio::CpalCapture::new()),
+        pond_audio::CAPTURE_RATE_HZ,
+        15_000,
+        true,
+    );
+    let whisper = WhisperRsInput::new(whisper_model_path.clone(), mic_handle.clone())
         .with_context(|| format!("loading whisper model: {}", whisper_model_path.display()))?;
     let mut collected = 0usize;
     let mut attempt = 0usize;
@@ -5036,6 +5089,7 @@ async fn run_calibrate(
     println!("  Run `pond-server chat --input whisper` to test it.");
     println!();
 
+    mic_handle.shutdown();
     Ok(())
 }
 

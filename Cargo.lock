@@ -8714,7 +8714,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "cpal",
+ "pond-audio",
  "pond-core",
  "pond-voice",
  "rodio",
@@ -8953,6 +8953,7 @@ dependencies = [
  "pond-adapters-whisper",
  "pond-agent",
  "pond-api",
+ "pond-audio",
  "pond-core",
  "pond-hf-cache",
  "pond-inference",
