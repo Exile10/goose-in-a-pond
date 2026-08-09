@@ -56,7 +56,44 @@ pub enum ProfileScope {
     Guest,
 }
 
+/// The owner id [`ProfileScope::every_shape`] puts inside its `Owner`.
+///
+/// Arbitrary — `Owner` needs a payload and a guard quantifying over shapes does
+/// not care which member. A guard that needs TWO owners has to supply the
+/// second itself, because two members are incomparable rather than ordered
+/// (see [`ProfileScope::is_within`]).
+pub const EXEMPLAR_OWNER_ID: &str = "exemplar-owner";
+
 impl ProfileScope {
+    /// One value of every shape this enum has.
+    ///
+    /// A guard that quantifies over scopes builds its fixture from here rather
+    /// than writing out today's three variants. That is not tidiness: an array
+    /// literal of today's shapes cannot see a shape added tomorrow, and PAI-6's
+    /// four scope-inheritance guards each carried their own copy of one —
+    /// twenty lines after the commit that had removed exactly that defect from
+    /// `RolePersonalData`.
+    ///
+    /// `Owner` carries a `String`, so this is a function and not a `const ALL`
+    /// like [`RedactionKind::ALL`] or [`OnboardingStep::ALL`].
+    ///
+    /// **What this list is and is not.** It is coverage: it decides which
+    /// inputs the guards see. It is NOT the enforcement of PAI-6 invariant 1 —
+    /// a list cannot be, because a variant can be added without touching it.
+    /// The enforcement is `orchestration::child_scope`, which clamps any
+    /// candidate the parent does not contain down to [`Guest`](Self::Guest),
+    /// whatever shape the candidate turned out to be.
+    ///
+    /// [`RedactionKind::ALL`]: crate::security::domain::redaction::RedactionKind::ALL
+    /// [`OnboardingStep::ALL`]: crate::user_data::domain::onboarding::OnboardingStep::ALL
+    pub fn every_shape() -> Vec<ProfileScope> {
+        vec![
+            ProfileScope::Owner(EXEMPLAR_OWNER_ID.to_string()),
+            ProfileScope::Household,
+            ProfileScope::Guest,
+        ]
+    }
+
     /// Named constructor for `serde(default)` attributes.
     ///
     /// Only for deserializing a payload written before a scope field existed.
@@ -175,13 +212,87 @@ mod profile_scope_tests {
 mod scope_lattice_tests {
     use super::*;
 
+    /// Every shape, plus a SECOND owner.
+    ///
+    /// The second one is not decoration: `is_within` is a partial order and the
+    /// pair it is most likely to get wrong is two different members, which a
+    /// fixture holding one `Owner` cannot produce.
+    /// [`ProfileScope::every_shape`] deliberately supplies only one, so this is
+    /// where the second is added — and
+    /// `the_second_owner_really_is_a_different_member` below fails if the two
+    /// ids ever converge, which would silently delete the incomparable case
+    /// from three tests at once.
     fn every_scope() -> Vec<ProfileScope> {
-        vec![
-            ProfileScope::Guest,
-            ProfileScope::Owner("jerry".into()),
-            ProfileScope::Owner("liz".into()),
-            ProfileScope::Household,
-        ]
+        let mut scopes = ProfileScope::every_shape();
+        scopes.push(ProfileScope::Owner(SECOND_OWNER_ID.to_string()));
+        scopes
+    }
+
+    const SECOND_OWNER_ID: &str = "a-different-member";
+
+    #[test]
+    fn the_second_owner_really_is_a_different_member() {
+        assert_ne!(
+            SECOND_OWNER_ID, EXEMPLAR_OWNER_ID,
+            "the fixture's two owners are the same member, so every 'two members are \
+             incomparable' assertion below is comparing a scope with itself"
+        );
+        let owners = every_scope()
+            .iter()
+            .filter(|s| matches!(s, ProfileScope::Owner(_)))
+            .count();
+        assert_eq!(
+            owners, 2,
+            "the lattice fixture holds {owners} owners; with fewer than two, \
+             `two_owners_are_incomparable` and the refused-pair count below stop \
+             exercising the partial order at all"
+        );
+    }
+
+    /// `every_shape()` decides which inputs every scope guard in this crate
+    /// sees, so a variant missing from it is a variant nothing is quantified
+    /// over. Derive the truth from the enum rather than from a second
+    /// hand-written list: serde's `unknown variant` error names every variant
+    /// the generated `Deserialize` impl knows about.
+    ///
+    /// This net has a known hole — a variant carrying `#[serde(skip)]` is
+    /// invisible to it — and that hole is why the profile axis is not defended
+    /// by this list at all. It is defended by `orchestration::child_scope`,
+    /// which clamps rather than enumerates. Read this as coverage breadth, not
+    /// as the boundary.
+    #[test]
+    fn every_shape_lists_every_variant_the_enum_has() {
+        let message = serde_json::from_str::<ProfileScope>("\"definitely_not_a_variant\"")
+            .expect_err("that is not a variant")
+            .to_string();
+        let from_the_enum: Vec<&str> = message.split('`').skip(1).step_by(2).skip(1).collect();
+        assert!(
+            !from_the_enum.is_empty(),
+            "no variant names could be read out of serde's message {message:?}, so this test \
+             can no longer see a new variant at all"
+        );
+        let listed: Vec<String> = ProfileScope::every_shape()
+            .iter()
+            .map(|s| match s {
+                ProfileScope::Owner(_) => "owner".to_string(),
+                ProfileScope::Household => "household".to_string(),
+                ProfileScope::Guest => "guest".to_string(),
+            })
+            .collect();
+        for variant in &from_the_enum {
+            assert!(
+                listed.iter().any(|l| l == variant),
+                "ProfileScope has a variant `{variant}` that every_shape() does not produce. \
+                 Every scope guard in this crate quantifies over that list, so an unlisted \
+                 shape is one nothing is tested against"
+            );
+        }
+        assert_eq!(
+            from_the_enum.len(),
+            listed.len(),
+            "every_shape() and the enum disagree on how many shapes exist: {from_the_enum:?} \
+             against {listed:?}"
+        );
     }
 
     /// Reflexive: inheriting a scope unchanged is "never wider".
