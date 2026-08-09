@@ -1468,9 +1468,41 @@ impl GooseAdapter {
     /// three call sites would be the same defect again.
     async fn turn_profile(&self, giap_session_id: &str) -> CompactionProfile {
         let (provider, window) = self.window_and_provider().await;
-        let reserved =
-            crate::orchestrator::process_device_ledger().reserved_fraction(giap_session_id);
-        Self::profile_for(&provider, window.tokens, reserved)
+        Self::profile_for_session(
+            &crate::orchestrator::process_device_ledger(),
+            &provider,
+            window.tokens,
+            giap_session_id,
+        )
+    }
+
+    /// The ledger read and the profile build, with no live adapter around them.
+    ///
+    /// Split out because the KEY is the part that can be wrong. Reading the
+    /// ledger under an id production never writes — a Goose session id where a
+    /// GIAP one belongs, which is a mix-up this codebase has already made once
+    /// (`resolve_goose_session`) — leaves every reservation reading 0.0 in
+    /// production, so a live child shrinks nothing and the parent's next turn
+    /// budgets as though it owned the whole window. That mutation was applied
+    /// to the line above and the whole suite stayed green: `turn_profile` needs
+    /// a settings repo and a provider, so nothing could run it, and the guard
+    /// that stood for it only grepped for `reserved_fraction(`.
+    ///
+    /// Taking the ledger as an argument rather than reaching for the
+    /// process-wide one is what makes it runnable — and the ledger stays
+    /// process-wide at the one call site, for the reason recorded on
+    /// [`process_device_ledger`](crate::orchestrator::process_device_ledger).
+    fn profile_for_session(
+        ledger: &crate::orchestrator::DeviceLedger,
+        provider: &str,
+        resolved_window: usize,
+        giap_session_id: &str,
+    ) -> CompactionProfile {
+        Self::profile_for(
+            provider,
+            resolved_window,
+            ledger.reserved_fraction(giap_session_id),
+        )
     }
 
     /// The pure half of [`GooseAdapter::turn_profile`], split out so the pairing
@@ -4656,20 +4688,21 @@ impl GooseAdapter {
         while let Some(event) = stream.next().await {
             match event {
                 Ok(goose::agents::AgentEvent::Message(msg)) => {
-                    if msg.role == rmcp::model::Role::Assistant {
-                        // `as_concat_text()` filters on `as_text()`, which
-                        // returns `None` for `MessageContent::Thinking`. That is
-                        // load-bearing, not incidental: PAI-5's reasoning gate
-                        // lives at this adapter's own producer, a path a child
-                        // does not go through, so a child's reasoning would
-                        // otherwise reach the parent as its answer.
-                        turns.assistant_message(&msg.as_concat_text());
-                    } else {
-                        // Goose returns a tool response as a `User` message.
-                        // That is the boundary between one provider call and
-                        // the next, which is what a turn actually is.
-                        turns.other_role_message();
-                    }
+                    // The reduction itself is `child_stream_step`, next to
+                    // `ChildTurns` and tested from a `Vec` of fragments. What
+                    // is left here — the two arguments — is the only part that
+                    // needs a live engine, and it is what the tripwire reads:
+                    // `as_concat_text()` filters on `as_text()`, which returns
+                    // `None` for `MessageContent::Thinking`, and that is
+                    // load-bearing rather than incidental. PAI-5's reasoning
+                    // gate lives at this adapter's own producer, a path a child
+                    // does not go through, so a child's reasoning would
+                    // otherwise reach the parent as its answer.
+                    crate::orchestrator::child_stream_step(
+                        &mut turns,
+                        msg.role == rmcp::model::Role::Assistant,
+                        &msg.as_concat_text(),
+                    );
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -6209,6 +6242,41 @@ mod tests {
             sharing.use_compact_prompt(),
             alone.use_compact_prompt(),
             "the prompt tier flipped under a reservation"
+        );
+    }
+
+    /// The SEAM between the ledger and the profile, which had no behavioural
+    /// guard at all — only a grep for `reserved_fraction(`, which any key
+    /// expression satisfies.
+    ///
+    /// A reservation is filed under the GIAP session id. Reading it back under
+    /// a derived one — `goose-{id}`, or the output of `resolve_goose_session`,
+    /// which is the mix-up this codebase has already made once — returns 0.0
+    /// for every session on the pond, so a live child shrinks nothing and both
+    /// agents budget as though they owned the whole window. That is invisible
+    /// in production: the number is right, it is just always the number for a
+    /// session that does not exist.
+    #[test]
+    fn a_parents_budget_shrinks_for_its_own_sessions_children_and_for_nobody_elses() {
+        let ledger = Arc::new(crate::orchestrator::DeviceLedger::default());
+        let _child = ledger.reserve("sess-A", 0.5);
+
+        let delegating = GooseAdapter::profile_for_session(&ledger, "local", 32_768, "sess-A");
+        let bystander = GooseAdapter::profile_for_session(&ledger, "local", 32_768, "sess-B");
+
+        assert!(
+            delegating.history_token_budget < bystander.history_token_budget,
+            "a session with a live child budgeted {} history tokens and a session with none \
+             budgeted {}; the reservation is being looked up under a key nothing writes, so \
+             every parent on this pond reads 0.0 whatever its children are holding",
+            delegating.history_token_budget,
+            bystander.history_token_budget
+        );
+        assert_eq!(
+            bystander.history_token_budget,
+            GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD).history_token_budget,
+            "a session with no live child of its own was charged for somebody else's, so the \
+             lookup is not keyed by session at all"
         );
     }
 

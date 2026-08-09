@@ -638,6 +638,22 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
   `a_child_of_another_session_waits_for_the_turn_that_holds_the_device` is its vacuity control —
   inheritance is keyed on the child's own parent, not granted to everybody.
 
+  **And the first version of that pass BROKE invariant 3 for siblings — repaired 2026-08-09.**
+  Inheriting was written as `needed = 0`, and `acquire_many_owned(0)` never blocks. A device hold
+  belongs to the SESSION, not to one child, so every child of the delegating turn inherited it:
+  three delegations issued in one parent turn ran three abreast on the one GPU, which is precisely
+  what the invariant forbids and precisely what one retained KV prefix cannot survive. Nothing saw
+  it, because `only_one_on_device_child_runs_at_a_time` does not hold a parent claim — the state P4
+  made normal — and because the phase's own mutation of `inherited = true` produced `left: 3` in
+  that test and was read as a test-only artefact. The repair is that a parent's hold carries its own
+  `Semaphore` of ONE for its children to share: a child never queues behind its own parent, and
+  siblings serialise exactly as any two on-device children do.
+  `siblings_of_one_delegating_turn_still_run_one_at_a_time` is the permanent test and reports
+  `left: 3` against the version that shipped. The generalisable lesson is that **a fix for a
+  deadlock is a concurrency change and needs its own concurrency test**, and the specific one is
+  that a `bool` was the wrong answer to "may this child skip the queue" — the question is *which*
+  queue, so the ledger returns the queue.
+
   **The `sse_semaphore` consequence is real and is NOT closed here.** Even with inheritance, a
   delegating turn holds one of four interactive permits for as long as its child runs, so four
   concurrent delegations still leave nothing for a fifth stream. `Semaphore::new(4)` lives in
@@ -664,12 +680,56 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
   is bounded by `max_turns`, and inventing a second trim path for it is P8's problem if it is
   anyone's.
 
+  **Five of P4's and P2's guards could not fail, and were repaired in the same change 2026-08-09.**
+  Each was found by applying a production-shaped mutation and running the suite, and each was green:
+
+  - `spec.context_fraction()` replaced by the literal `0.3`. Every role fixture in the adapter test
+    file stated 0.3 and the only observing assertion said 0.3, so the guard could not tell reading
+    the role's fraction from restating the fixture's constant — a role authored at 0.8 would have
+    reserved 0.3 forever. `role_with_fraction` now spawns at 0.75 and 0.4, and no single literal
+    satisfies both.
+  - `claim_device_for_turn` deleted from `chat_stream`. The one production call site of invariant
+    3's parent half — the only part of P4 that changes behaviour on every install today — had no
+    guard at all, because every device test either calls `parent_turn_permits` as a pure function or
+    takes the claim from its own body. That is vacuity shape 2, a gate tested while its input is
+    unguarded. `the_live_turn_claims_the_device_before_it_streams_anything` reads `chat_stream`'s
+    body, and it checks the BINDING too: `let _ = claim_device_for_turn(..)` drops the permit on the
+    same line and reads as correct.
+  - `turn_profile` reading the ledger under `goose-{id}`. A GIAP-versus-Goose session id mix-up is a
+    mistake this codebase has already made once, and it leaves every reservation reading 0.0 in
+    production with the number looking right. `profile_for_session` now takes the ledger as an
+    argument, so a test can run it — `a_parents_budget_shrinks_for_its_own_sessions_children_and_for_nobody_elses`
+    — and the residue the tripwire owns is one line: which key the live turn passes.
+  - The drain loop's per-event reduction. See invariant 4 above: the P2 semantics could be restored
+    in full, and every child made to answer nothing, without moving one of the five strings the
+    tripwire looked for. `child_stream_step` is the lifted reduction; what the tripwire asserts now
+    is the two ARGUMENTS the loop passes and that nothing else in it touches the assembler.
+  - The post-run half of the invariant-2 audit. The guard asserted the POSITION of a
+    `list_extensions()` call, not that its result reached `loaded_extensions`, so a read whose result
+    was discarded passed. The window is now the text between the reply and the returned
+    `ChildOutcome`, and the assertion is that the statement extending the audited set is the one
+    that reads the child.
+
+  A sixth, latent: the single-producer count read `goose_agent.rs` while its message spoke about
+  "this adapter", so a second `CompactionProfile::for_windows` in `orchestrator.rs` escaped it —
+  vacuity shape 4, a window too narrow for the natural regression. Both that guard and the
+  delegation-depth canary now walk the crate's `src/` directory, so a file added tomorrow is covered
+  on the day it is added rather than on the day somebody remembers to list it.
+
   **Still not done.** A synchronous delegation cannot shrink its OWN turn's trim: `trim_goose_history`
   runs before `Agent::reply`, so by the time a child exists the parent has already budgeted. The
   reservation binds a *concurrent* turn of the same conversation and, when P8 lands, a background
   child that outlives the turn that spawned it. That is worth saying plainly because the phase text
   reads as though it binds the delegating turn itself, and it does not. Section 3.4's measurement —
   parent context growth with delegation versus inline — is still owed and still needs the Orin.
+
+  One guard is still asymmetric and is `pond-core`'s, so it is not repaired here:
+  `a_parents_budget_and_its_childs_reservation_fit_the_window_or_hit_the_floor` asserts
+  `floored > 0` but never that any case reached the NON-floored branch, so a change that floored
+  every case would leave the real inequality unevaluated with the sweep green. Instrumenting it says
+  the branch IS reached today — 28 floored of 112 checked, 84 asserted — so the test is sound as it
+  stands; what is missing is the control that pins it. The one line is
+  `assert!(checked - floored > 50, ...)` in `turn_trimmer.rs`.
 - **P5** `giap-orchestrator` MCP extension + `ext_orchestrator_enabled`. The toggle needs its **own**
   `default_*` fn returning `false` and a `false` in the `impl Default for Settings` body — reusing
   `Settings::default_ext_enabled()` (which returns `true`) ships orchestration on for every install.
@@ -734,24 +794,40 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
    otherwise — `local`, `gguf`, `ollama`, `llamafile`. This used to say "`local`/`gguf`", which is
    the narrow reading PAI-4 P2 already had to fix once. See section 3.4. *(P2: one process-wide
    `Semaphore`, acquired on the only path that starts a child. **The semaphore does NOT yet cover
-   the parent's turns**, which this invariant also requires — owed by P4.)* *(P4 closes it: every
-   on-device parent turn takes `parent_turn_permits` of the same semaphore, held for the whole turn
-   by a guard the stream drops, so a child cannot reply between two of the parent's provider calls
-   and overwrite the one retained KV prefix. The predicate is `max_concurrent_subagents` again, so
-   a hosted provider's turns take nothing and four hosted conversations still run four abreast. A
-   SYNCHRONOUS child inherits its own parent's claim rather than acquiring — the parent is blocked
-   in a tool call, not talking to the provider, and acquiring would deadlock it against its own
-   child while stranding an `sse_semaphore` permit. What this does NOT bound is that pool: a
-   delegating turn still holds one of `main.rs`'s four interactive permits for the whole of its
-   child's run, and P5 owns that decision.)*
+   the parent's turns**, which this invariant also requires — owed by P4.)* *(P4 closes the parent
+   half: every on-device parent turn takes `parent_turn_permits` of the same semaphore, held for the
+   whole turn by a guard the stream drops, so a child cannot reply between two of the parent's
+   provider calls and overwrite the one retained KV prefix. The predicate is
+   `max_concurrent_subagents` again, so a hosted provider's turns take nothing and four hosted
+   conversations still run four abreast. A SYNCHRONOUS child inherits its own parent's claim rather
+   than acquiring — the parent is blocked in a tool call, not talking to the provider, and acquiring
+   would deadlock it against its own child while stranding an `sse_semaphore` permit.)*
+   *(**P4 as first written also BROKE the child half, and this row claimed the invariant was closed
+   while it was open.** Inheriting was `needed = 0`, and `acquire_many_owned(0)` never blocks; a
+   device hold belongs to the SESSION, so every child of the delegating turn inherited it and N
+   delegations issued in one parent turn ran N abreast on the one GPU. Repaired by giving the hold
+   its own semaphore of ONE for its children to share: a child still never queues behind its own
+   parent, and siblings serialise.
+   `siblings_of_one_delegating_turn_still_run_one_at_a_time` reports `left: 3` against the version
+   that shipped. Two lessons worth keeping: a fix for a deadlock is a concurrency change and needs
+   its own concurrency test, and a status row that overclaims is worse than one that admits a gap,
+   because the next phase builds on the row.)*
+   *(What none of this bounds is the SSE pool: a delegating turn still holds one of `main.rs`'s
+   four interactive permits for the whole of its child's run, and P5 owns that decision.)*
 4. Subagent conversations never enter the parent's `session_messages`; only results do. Satisfied
    by construction — `ChatService` is the sole writer of that table and the child loop never
    touches it — with one caveat worth stating: the child's turns *are* persisted, into Goose's own
    `sessions.db` under the child's id. "Not in the parent's history" is true; "not written down" is
    not. *(P2 closes the caveat: `ChildRunner::release` deletes the child's engine session as soon
    as the run ends, so a delegation leaves no row behind for a parent-delete to have to find. The
-   parent takes back exactly one string — `as_concat_text()` of the last assistant message, which
-   drops `MessageContent::Thinking`, so a child's reasoning is not an eligible result either.)*
+   parent takes back exactly one string — the text of the child's last completed assistant TURN,
+   assembled by `ChildTurns` from `as_concat_text()`, which drops `MessageContent::Thinking`, so a
+   child's reasoning is not an eligible result either.)* *(This row said "the last assistant
+   message" until 2026-08-09, which was the shipped defect rather than the design: goose yields one
+   message per provider chunk, so the last message is the last streamed word. The rule now lives in
+   `child_stream_step`, a pure function beside `ChildTurns`, because the drain loop it was lifted
+   out of needs a live provider — both the turn count and the text argument could be broken with
+   the whole suite green, and were, by mutations that restored the original defect exactly.)*
 5. Every spawn is cancellable, and cancelling a parent cancels its children. **This is entirely new
    work.** Goose's own background path mints an unrelated root token, `child_token()` is unused
    anywhere in Goose, and GIAP's parent-turn token is a stack local inside a stream closure with no

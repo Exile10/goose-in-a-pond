@@ -39,13 +39,25 @@ static ONE_RUN_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
 fn role(name: &str, groups: &[&str]) -> AgentRole {
+    role_with_fraction(name, groups, 0.3)
+}
+
+/// A role that states a `context_fraction` of its own.
+///
+/// Every fixture in this file used to state 0.3, and the one assertion that
+/// observed the reserved value also said 0.3 — so replacing
+/// `spec.context_fraction()` with the literal `0.3` in `spawn` left the whole
+/// suite green. A guard that cannot tell "reads the role's fraction" from
+/// "restates the fixture's constant" is this programme's recorded shapes 3 and
+/// 6 together, and a role authored at 0.8 would have reserved 0.3 forever.
+fn role_with_fraction(name: &str, groups: &[&str], context_fraction: f32) -> AgentRole {
     AgentRole::new(
         name,
         "Answer the question from the tools you have, then stop.",
         groups.iter().map(|g| g.to_string()).collect(),
         RolePersonalData::Inherit,
         4,
-        0.3,
+        context_fraction,
     )
     .expect("fixture role is valid")
 }
@@ -296,13 +308,23 @@ enum Frag<'a> {
     ToolResponse,
 }
 
+/// Drive the reduction the way the drain loop drives it: ROLE-TAGGED, through
+/// `child_stream_step`.
+///
+/// It used to call `assistant_message` and `other_role_message` itself, which
+/// meant the tests below asserted on `ChildTurns` while the mapping from a
+/// message's role to one of those two methods — the mapping that shipped
+/// broken, and the only part of it a defect can live in — was reachable
+/// nowhere but inside `run_child_agent`. Two mutations restoring the original
+/// defect kept all 165 tests green.
 fn assemble(stream: &[Frag<'_>]) -> (Option<String>, u32) {
     let mut turns = ChildTurns::default();
     for fragment in stream {
-        match fragment {
-            Frag::Assistant(text) => turns.assistant_message(text),
-            Frag::ToolResponse => turns.other_role_message(),
-        }
+        let (is_assistant, text) = match fragment {
+            Frag::Assistant(text) => (true, *text),
+            Frag::ToolResponse => (false, ""),
+        };
+        child_stream_step(&mut turns, is_assistant, text);
     }
     turns.finish()
 }
@@ -442,6 +464,27 @@ fn the_turn_assembler_reports_nothing_for_an_empty_stream() {
         Frag::Assistant("three"),
     ]);
     assert_eq!(turns, 3);
+}
+
+/// The role-to-method mapping itself, stated once rather than only implied by
+/// the streams above. This is the half of the reduction that used to live
+/// inside `run_child_agent`, where no test could reach it: an Assistant
+/// fragment accumulates into the open run, and any other role closes it.
+#[test]
+fn an_assistant_fragment_accumulates_and_any_other_role_closes_the_run() {
+    let mut turns = ChildTurns::default();
+    child_stream_step(&mut turns, true, "half ");
+    child_stream_step(&mut turns, true, "an answer");
+    child_stream_step(&mut turns, false, "");
+    child_stream_step(&mut turns, true, "the answer");
+
+    assert_eq!(
+        turns.finish(),
+        (Some("the answer".to_string()), 2),
+        "a fragment's role decides whether it extends the open turn or ends it; getting that \
+         backwards, or dropping the text, is exactly what made every delegation report \
+         TurnBudgetExhausted with a word for an answer"
+    );
 }
 
 /// The goose-side claim the whole rule rests on, read from the submodule rather
@@ -1627,43 +1670,58 @@ fn the_child_agent_publishes_its_boundary_before_it_replies() {
 //
 // These read source text, and that is a weak shape this programme has recorded:
 // a grep catches a textual revert and nothing subtler. They are here because
-// `run_child_agent` needs a provider and a Goose session store, so the ordering
-// facts below cannot be observed any other way, and each of them was WRONG in
-// the version that shipped. Read them as tripwires, not as coverage — the
-// behaviour they are about is covered by the `ChildTurns` tests above, which do
-// not read source at all.
+// `run_child_agent` needs a provider and a Goose session store, so the facts
+// below cannot be observed any other way, and each of them was WRONG in the
+// version that shipped.
+//
+// **They used to claim more than that, and the claim was false.** "The
+// behaviour they stand for is covered by the ChildTurns tests" was written when
+// those tests built a `Vec<Frag>` and called `ChildTurns` directly, so the
+// role-to-method mapping in the loop was covered by nothing: two mutations
+// restoring the original defect — closing the run after every message, and
+// accumulating the empty string — kept the whole suite green while satisfying
+// every string this file looked for. The mapping now lives in
+// `child_stream_step` and IS driven by those tests. What is left here is the
+// residue that cannot be lifted, and it is asserted as arguments to a call
+// rather than as the presence of a token.
 
-/// Everything about turns must go through [`ChildTurns`], which is where the
-/// rule lives and where it is tested. A counter incremented per message inside
-/// the drain loop is exactly the defect: one `AgentEvent::Message` is a provider
-/// chunk.
+/// Every event must be reduced by [`child_stream_step`], with the two
+/// expressions only a live engine can produce.
+///
+/// The argument check is the point. `child_stream_step(&mut turns, true, "")`
+/// type-checks, reads plausibly, and makes every child answer nothing;
+/// `msg.as_concat_text()` is also what drops `MessageContent::Thinking`, so
+/// replacing it can hand the parent a child's reasoning as its result.
 #[test]
-fn the_child_drain_loop_counts_turns_rather_than_fragments() {
-    let child_loop = child_loop_source();
+fn the_child_drain_loop_reduces_every_event_through_the_tested_step() {
+    let drain = child_drain_loop();
 
+    assert_eq!(
+        drain.matches("child_stream_step(").count(),
+        1,
+        "the child drain loop no longer reduces its stream through exactly one \
+         child_stream_step call, so whatever it does instead is untested: nothing without a \
+         provider can reach that loop:\n{drain}"
+    );
+    let args = call_args(&drain, "child_stream_step(");
     assert!(
-        child_loop.contains("ChildTurns::default()"),
-        "the child drain loop no longer assembles turns through ChildTurns, so whatever it does \
-         instead is untested: nothing without a provider can reach that loop"
+        args.contains("msg.role == rmcp::model::Role::Assistant"),
+        "the drain loop no longer decides assistant-or-not from the message's own role, so a \
+         tool response may no longer close a turn - and a run that never closes reads as one \
+         turn with the wrong answer:\n{args}"
     );
     assert!(
-        child_loop.contains("turns.assistant_message("),
-        "assistant messages are no longer accumulated into a turn"
+        args.contains("msg.as_concat_text()"),
+        "the drain loop passes something other than the message's concatenated TEXT. An empty \
+         or constant argument makes every delegation report `subagent produced no answer`, and \
+         anything that is not as_concat_text() may carry MessageContent::Thinking, which is how \
+         a child's reasoning reaches the parent as its result:\n{args}"
     );
     assert!(
-        child_loop.contains("turns.other_role_message()"),
-        "nothing closes a turn, so a tool response no longer separates two provider calls and \
-         the whole run reads as one turn"
-    );
-    assert!(
-        !child_loop.contains("assistant_turns = assistant_turns"),
-        "the drain loop increments a per-message turn counter again; goose yields one message \
-         per provider chunk, so this reports every streamed answer as TurnBudgetExhausted"
-    );
-    assert!(
-        !child_loop.contains("last_text = Some("),
-        "the drain loop assigns last_text per message again; on any streaming provider that is \
-         the last fragment, not the last message"
+        !drain.contains("turns."),
+        "something in the drain loop touches the turn assembler directly again. Every reduction \
+         has to go through child_stream_step, or the part that decides is back inside a \
+         function no test can run:\n{drain}"
     );
 }
 
@@ -1671,28 +1729,68 @@ fn the_child_drain_loop_counts_turns_rather_than_fragments() {
 /// `reply`, it can only report what `add_extension` was handed one line
 /// earlier — which `child_extensions` had already refused — so it was an audit
 /// structurally incapable of failing.
+///
+/// The window is narrowed to the text between the reply and the returned
+/// `ChildOutcome`, and the assertion is that the post-run READ is what feeds
+/// the audited set. Asserting the call's position instead is satisfied by a
+/// read whose result is discarded — applied, and the suite stayed green with
+/// `loaded_extensions` back to being the pre-run snapshot.
 #[test]
 fn the_invariant_two_audit_reads_the_child_after_it_has_run() {
     let child_loop = child_loop_source();
     let reply = child_loop
         .find(".reply(user_message.clone()")
         .expect("the child loop no longer replies");
-    let audits: Vec<usize> = child_loop
-        .match_indices("list_extensions()")
-        .map(|(at, _)| at)
-        .collect();
+    let returned = child_loop
+        .find("Ok(crate::orchestrator::ChildOutcome {")
+        .expect("the child loop no longer returns a ChildOutcome");
+    assert!(
+        reply < returned,
+        "the child loop returns its outcome before it replies, so this window is not the run"
+    );
+    let after_run = &child_loop[reply..returned];
 
-    assert!(
-        !audits.is_empty(),
-        "the child's loaded extensions are never read, so invariant 2 has no post-run audit at \
-         all"
+    let extend_at = after_run.find("loaded_extensions.extend(").expect(
+        "nothing adds to the audited extension set after the child has replied, so \
+         ChildOutcome::loaded_extensions is the pre-run snapshot again - an audit that can only \
+         report what add_extension was handed one line earlier, which child_extensions had \
+         already refused",
     );
+    let statement = &after_run[extend_at..];
+    let statement = &statement[..statement.find(';').unwrap_or(statement.len())];
     assert!(
-        audits.iter().any(|at| *at > reply),
-        "every read of the child's extension list happens BEFORE it replies, so the audit only \
-         ever sees what add_extension was just given - which the plan builder had already \
-         refused"
+        statement.contains("list_extensions()"),
+        "the audited set is extended by something that is not a post-run read of the child's \
+         extensions. A read whose result is dropped leaves the audit blind to an extension that \
+         arrived after add_extension - which is the whole reason it is read twice:\n{statement}"
     );
+}
+
+/// The argument text of the one call to `callee` in `source`, by paren depth.
+///
+/// `callee` includes its opening paren. Used instead of "the source contains
+/// this token somewhere" so a tripwire says which expression is passed WHERE,
+/// which is the difference between catching a textual revert and catching a
+/// changed argument.
+fn call_args(source: &str, callee: &str) -> String {
+    let at = source
+        .find(callee)
+        .unwrap_or_else(|| panic!("`{callee}` is not called here:\n{source}"));
+    let after = &source[at + callee.len()..];
+    let mut depth = 1usize;
+    for (i, c) in after.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return after[..i].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated call to `{callee}`:\n{after}");
 }
 
 /// PAI-4 P5. A child replies through the same engine and overwrites the one
@@ -1736,6 +1834,103 @@ fn child_loop_source() -> String {
     // indented, so this cannot end early.
     let end = body.find("\n}\n").map(|at| at + 3).unwrap_or(body.len());
     body[..end].to_string()
+}
+
+/// Just the `while let Some(event)` loop, so "nothing else touches `turns`" is
+/// a statement about the drain and not about the whole method — which legitimately
+/// calls `turns.finish()` once, after the stream is done.
+fn child_drain_loop() -> String {
+    let body = child_loop_source();
+    let at = body
+        .find("while let Some(event) = stream.next().await")
+        .expect("the child loop no longer drains the reply stream");
+    let rest = &body[at..];
+    let end = rest
+        .find("drop(stream);")
+        .expect("the drain loop no longer ends by dropping the stream");
+    rest[..end].to_string()
+}
+
+/// `GooseAdapter::chat_stream`'s body — the live turn, and the only production
+/// caller of `claim_device_for_turn`.
+fn chat_stream_source() -> String {
+    let source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/goose_agent.rs"))
+            .expect("goose_agent.rs is next door");
+    let code = strip_line_comments(&source);
+    let at = code
+        .find("pub async fn chat_stream(")
+        .expect("GooseAdapter no longer owns the live chat stream");
+    let body = &code[at..];
+    // A method of `impl GooseAdapter` ends at the first closing brace indented
+    // by exactly four spaces; everything nested inside it is deeper.
+    let end = body.find("\n    }").map(|at| at + 6).unwrap_or(body.len());
+    let body = body[..end].to_string();
+    assert!(
+        body.contains("async_stream::stream!") && !body.contains("fn run_child_agent"),
+        "the chat_stream slice is not chat_stream: it either lost its stream block or ran past \
+         the end of the method, and every assertion over it is then about the wrong text"
+    );
+    body
+}
+
+/// The one production call site of invariant 3's PARENT half — vacuity shape 2,
+/// a gate whose input is unguarded.
+///
+/// Every P4 device test either calls `parent_turn_permits` as a pure function
+/// or calls `claim_device_for_turn` from its own body, so none of them observes
+/// whether the LIVE turn takes a claim at all. Deleting this call left 177
+/// tests green while every on-device turn stopped holding the device — which is
+/// the only part of P4 that changes behaviour on every install today.
+///
+/// A source tripwire is the right weight here for the same reason it is for
+/// `turn_profile`: `chat_stream` needs a provider, a session store and a
+/// settings repo, and the claim's whole effect is a permit held for the
+/// lifetime of a stream nothing here can drive.
+#[test]
+fn the_live_turn_claims_the_device_before_it_streams_anything() {
+    let body = chat_stream_source();
+
+    assert_eq!(
+        body.matches("claim_device_for_turn(").count(),
+        1,
+        "the live turn does not take PAI-6 P4's device claim exactly once. With no claim, a \
+         subagent replies between two of this turn's provider calls and overwrites the one \
+         retained KV prefix, and the parent pays a full re-prefill it never sees the cause of"
+    );
+    let claim_at = body
+        .find("claim_device_for_turn(")
+        .expect("counted one just now");
+    let stream_at = body
+        .find("async_stream::stream!")
+        .expect("chat_stream no longer builds an async stream");
+    let first_yield = body.find("yield ").expect("chat_stream no longer yields");
+    assert!(
+        stream_at < claim_at,
+        "the device claim is taken before the stream is returned, so the client waits on a \
+         request that looks hung rather than on a stream that is waiting"
+    );
+    assert!(
+        claim_at < first_yield,
+        "the turn yields before it holds the device, so a child can be replying on this GPU \
+         while this turn prefills"
+    );
+
+    // The claim's whole effect is its lifetime. `let _ = claim_device_for_turn(..)`
+    // compiles, reads as correct, and drops the permit on the same line.
+    let binding: String = body[..claim_at]
+        .rsplit("let ")
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    assert!(
+        !binding.is_empty() && binding != "_",
+        "the device claim is bound to `{binding}`; a wildcard binding drops the permit at the \
+         end of the statement, so the turn holds the device for no time at all and every other \
+         assertion in this test still passes"
+    );
 }
 
 // ── PAI-6 P4: the budget, and the other half of invariant 3 ─────────────────
@@ -1848,48 +2043,61 @@ fn a_reservation_belongs_to_the_conversation_that_made_it() {
     );
 }
 
-/// The claim exists while the child is RUNNING, and is gone afterwards.
+/// The claim exists while the child is RUNNING, is the ROLE's own fraction,
+/// and is gone afterwards.
 ///
 /// Asserted from inside the fake engine, because after `spawn` returns the
 /// answer is zero either way — which is how a reservation that was never taken
 /// would look identical to one that was taken and released.
+///
+/// **Two fractions, neither of them the fixture default.** Every role in this
+/// file used to state 0.3 and this assertion used to say 0.3, so replacing
+/// `spec.context_fraction()` with the literal `0.3` in `spawn` left the suite
+/// green: the guard could not tell reading the role's fraction from restating
+/// the fixture's constant, and a role authored at 0.8 would have reserved 0.3
+/// forever. No single literal satisfies both cases below.
 #[tokio::test]
 async fn while_a_child_runs_its_parents_history_budget_is_reserved() {
     let _serial = ONE_RUN_AT_A_TIME.lock().await;
-    let parent = "p4-live-child-parent";
-    let role = role("researcher", &["giap-weather"]);
-    let env = env_with(
-        "ollama",
-        parent_tools(&[("giap-weather", &["get_weather"])]),
-    );
-    let runner = Arc::new(FakeRunner::new(env));
-    let state = runner.state.clone();
-    let (orchestrator, _turn, _token) = live_turn_for(parent, runner);
+    for (fraction, parent) in [
+        (0.75_f32, "p4-live-child-parent-three-quarters"),
+        (0.4_f32, "p4-live-child-parent-two-fifths"),
+    ] {
+        let role = role_with_fraction("researcher", &["giap-weather"], fraction);
+        let env = env_with(
+            "ollama",
+            parent_tools(&[("giap-weather", &["get_weather"])]),
+        );
+        let runner = Arc::new(FakeRunner::new(env));
+        let state = runner.state.clone();
+        let (orchestrator, _turn, _token) = live_turn_for(parent, runner);
 
-    let run = orchestrator
-        .spawn(spec_for_parent(&role, &["giap-weather"], parent))
-        .await
-        .expect("the delegation runs");
-    assert_eq!(run.status, TaskStatus::Completed);
+        let run = orchestrator
+            .spawn(spec_for_parent(&role, &["giap-weather"], parent))
+            .await
+            .expect("the delegation runs");
+        assert_eq!(run.status, TaskStatus::Completed);
 
-    let observed = state
-        .reserved_during_run
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    assert_eq!(observed.len(), 1, "the fake engine did not run");
-    assert!(
-        (observed[0] - 0.3).abs() < 1e-6,
-        "while the child was replying its parent had {} of its history budget reserved; the \
-         role states context_fraction 0.3, and 0.0 means the parent's next turn budgets as \
-         though it still owned the whole window",
-        observed[0]
-    );
-    assert_eq!(
-        process_device_ledger().reserved_fraction(parent),
-        0.0,
-        "the child finished and its claim on the parent's window outlived it"
-    );
+        let observed = state
+            .reserved_during_run
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(observed.len(), 1, "the fake engine did not run");
+        assert!(
+            (observed[0] - fraction).abs() < 1e-6,
+            "while the child was replying its parent had {} of its history budget reserved and \
+             the role states context_fraction {fraction}. 0.0 means the parent's next turn \
+             budgets as though it still owned the whole window; any other constant means the \
+             fraction a role states is read by nobody",
+            observed[0]
+        );
+        assert_eq!(
+            process_device_ledger().reserved_fraction(parent),
+            0.0,
+            "the child finished and its claim on the parent's window outlived it"
+        );
+    }
 }
 
 /// Every exit gives the budget back, including the ones that never reach the
@@ -1965,6 +2173,80 @@ async fn a_child_runs_under_its_parents_device_claim_rather_than_deadlocking_beh
         !process_device_ledger().session_holds_device(parent),
         "the turn's device claim outlived it"
     );
+}
+
+/// **The regression the inheritance pass introduced**, and the reason an
+/// inherited claim is a semaphore of one rather than a free pass.
+///
+/// `session_holds_device` is a property of the SESSION, so P4's
+/// `needed = if inherited { 0 }` gave EVERY child of the delegating turn a free
+/// pass, and `acquire_many_owned(0)` never blocks. Three delegations issued in
+/// one parent turn therefore ran three abreast on the one GPU — invariant 3
+/// with its on-device half deleted, by the pass written to avoid the deadlock.
+/// Run against that code this test reports `left: 3`, the same number P4's own
+/// mutation produced in `only_one_on_device_child_runs_at_a_time` and read as a
+/// test-only artefact.
+///
+/// Not a hypothetical state: `DeviceLedger` holds a `Vec` of live children per
+/// session, and `children_cannot_reserve_more_of_a_window_than_it_has` reserves
+/// three children of one session. The meter this asserts on is the same one
+/// `the_overlap_detector_can_actually_see_overlap` proves can see three.
+#[tokio::test]
+async fn siblings_of_one_delegating_turn_still_run_one_at_a_time() {
+    let _serial = ONE_RUN_AT_A_TIME.lock().await;
+    let parent = "p4-sibling-parent";
+    let role = role("researcher", &["giap-weather"]);
+    let env = env_with(
+        "ollama",
+        parent_tools(&[("giap-weather", &["get_weather"])]),
+    );
+    let runner = Arc::new(FakeRunner::new(env).holding_for(60));
+    let state = runner.state.clone();
+    let (orchestrator, _turn, token) = live_turn_for(parent, runner);
+
+    // Exactly what `chat_stream` holds for the whole of an on-device turn, and
+    // what a synchronous delegation of it inherits.
+    let claim = claim_device_for_turn(parent, "ollama", &token).await;
+    assert!(
+        claim.is_some(),
+        "an on-device turn took no device claim, so this test is not about inheritance at all"
+    );
+
+    let mut handles = Vec::new();
+    for _ in 0..3 {
+        let orchestrator = orchestrator.clone();
+        let spec = spec_for_parent(&role, &["giap-weather"], parent);
+        handles.push(tokio::spawn(async move { orchestrator.spawn(spec).await }));
+    }
+    for handle in handles {
+        let run = tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect(
+                "a sibling never finished: inheriting has become queueing behind the parent's \
+                 own claim, which is the deadlock that also strands an sse_semaphore permit",
+            )
+            .unwrap()
+            .expect("the delegation runs");
+        assert_eq!(run.status, TaskStatus::Completed);
+    }
+
+    assert_eq!(
+        state.max_in_flight.load(Ordering::SeqCst),
+        1,
+        "three children of ONE parent turn ran concurrently on an on-device provider. Each of \
+         them inherited the parent's device hold, which belongs to the session rather than to \
+         one child, so nothing serialised them against each other: they interleave on one GPU \
+         and overwrite each other's retained KV prefix"
+    );
+    // Vacuity control: all three really ran, so the count above is a
+    // measurement and not two of them having been refused before the engine.
+    assert_eq!(
+        state.plans.lock().unwrap_or_else(|e| e.into_inner()).len(),
+        3,
+        "fewer than three children reached the engine, so max_in_flight is about a delegation \
+         that never happened"
+    );
+    drop(claim);
 }
 
 /// Vacuity control for the test above, and the assertion that inheritance is
@@ -2045,31 +2327,105 @@ fn the_turn_profile_reads_the_live_child_ledger() {
     let end = body.find("\n    }").expect("unterminated turn_profile");
     let body = &body[..end];
 
+    // What the ledger read DOES is covered behaviourally next door, by
+    // `a_parents_budget_shrinks_for_its_own_sessions_children_and_for_nobody_elses`
+    // in goose_agent.rs's own test module, which can run `profile_for_session`.
+    // What is left here is the one line that needs a live adapter: which key
+    // this turn hands it.
+    let args = call_args(body, "Self::profile_for_session(");
     assert!(
-        body.contains("reserved_fraction("),
-        "turn_profile no longer asks the ledger what this session's live children have \
-         reserved, so PAI-6 P4's budget is carried on the spec and read by nobody - exactly \
-         the state P2 and P3 left it in:\n{body}"
+        args.contains("process_device_ledger()"),
+        "turn_profile no longer asks the process ledger what this session's live children have \
+         reserved, so PAI-6 P4's budget is carried on the spec and read by nobody - exactly the \
+         state P2 and P3 left it in:\n{args}"
     );
     assert!(
-        body.contains("profile_for("),
-        "turn_profile stopped going through profile_for, so the reservation and the \
-         prompt-side clamp are no longer applied in one place:\n{body}"
+        args.contains("giap_session_id"),
+        "turn_profile no longer passes the session it was asked about, so every turn on the \
+         pond reads one session's reservations:\n{args}"
+    );
+    assert!(
+        !args.contains("format!") && !args.contains("resolve_goose_session"),
+        "turn_profile DERIVES a lookup key instead of passing the GIAP session id it was given. \
+         Reservations are filed under that id, so a Goose-side id reads 0.0 for every session \
+         and no live child ever shrinks anything - and this codebase has made exactly that \
+         mix-up before, see resolve_goose_session:\n{args}"
     );
 
+    let producers: usize = adapter_sources()
+        .iter()
+        .map(|(_, code)| code.matches("CompactionProfile::for_windows(").count())
+        .sum();
     assert_eq!(
-        source.matches("CompactionProfile::for_windows(").count(),
-        1,
+        producers, 1,
         "there is more than one place in this adapter that builds a CompactionProfile from \
          windows; only the one inside profile_for applies the subagent reservation, so the \
          others budget as though no child were live"
     );
+    let appliers: usize = adapter_sources()
+        .iter()
+        .map(|(_, code)| code.matches("with_history_reserved(").count())
+        .sum();
     assert_eq!(
-        source.matches("with_history_reserved(").count(),
-        1,
+        appliers, 1,
         "the reservation is applied in more than one place, so two paths can disagree about \
          how much of this parent's window is already claimed"
     );
+}
+
+/// Every non-test source file in this crate, comments and inline test modules
+/// stripped.
+///
+/// A hardcoded pair of file names is this programme's recorded vacuity shape 4:
+/// an assertion window too narrow for the natural regression, which for a
+/// single-producer count is a THIRD adapter file. The count guard above read
+/// `goose_agent.rs` alone while its failure message spoke about "this adapter",
+/// and a second `CompactionProfile::for_windows` producer added to
+/// `orchestrator.rs` passed it. The directory is walked instead, so a file
+/// added tomorrow is covered on the day it is added.
+fn adapter_sources() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("this crate's src directory must be readable: {e}"));
+        for entry in entries {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            // Test files are excluded on purpose: this one names the very
+            // constructs the canaries forbid, in the assertions that forbid
+            // them, and test code cannot widen anything a caller reaches.
+            if path.file_name().and_then(|n| n.to_str()) == Some("tests.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("a readable source file");
+            let production = source
+                .split("\nmod tests {")
+                .next()
+                .unwrap_or("")
+                .to_string();
+            out.push((path.display().to_string(), strip_line_comments(&production)));
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+        &mut out,
+    );
+    // Vacuity control for every assertion built on this: a walk that found
+    // nothing, or found one file, satisfies any count-based guard trivially.
+    assert!(
+        out.len() >= 8,
+        "the crate source walk found {} files; whatever it is scanning is not this adapter, and \
+         every count asserted over it is meaningless",
+        out.len()
+    );
+    out
 }
 
 /// Depth is P1's, not P4's — this phase verifies it rather than reimplementing
@@ -2083,18 +2439,15 @@ fn the_turn_profile_reads_the_live_child_ledger() {
 /// adapter-side plan is whatever `TaskSpec::child_authority` handed it.
 #[test]
 fn nothing_in_this_adapter_can_construct_a_delegation_depth() {
-    // This file is deliberately not in the list: it names the type in this very
-    // assertion, so including it would fail on its own text. Test code cannot
-    // widen anything a caller reaches anyway — the two files below are the
-    // whole of this crate's delegation surface.
-    for file in [
-        include_str!("../orchestrator.rs"),
-        include_str!("../goose_agent.rs"),
-    ] {
-        let source = strip_line_comments(file);
+    // Every production file in the crate, not the two that happen to be its
+    // delegation surface today: a third one would be exactly where somebody
+    // would put a constructor this canary is meant to forbid. Test files are
+    // excluded by the walk, because this one names the type in the very
+    // assertion that forbids it.
+    for (path, source) in adapter_sources() {
         assert!(
             !source.contains("DelegationDepth("),
-            "this crate constructs a DelegationDepth. P1 made the cap structural by leaving no \
+            "{path} constructs a DelegationDepth. P1 made the cap structural by leaving no \
              public constructor from a number; an adapter-side one puts the depth back in the \
              hands of whichever caller writes the literal"
         );
