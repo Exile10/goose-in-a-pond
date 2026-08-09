@@ -347,6 +347,72 @@ impl CompactionProfile {
         }
     }
 
+    /// The same profile with part of the history budget held back for a second
+    /// agent that is claiming the same window — PAI-6 P4.
+    ///
+    /// # Why this touches ONE field
+    ///
+    /// A subagent is a second claim on one context window, and the obvious
+    /// implementation — scale the resolved window and re-derive the profile —
+    /// is wrong here. Every preamble field would shrink with it, the system
+    /// prompt would be rebuilt at a smaller allowance, and the KV prefix would
+    /// MOVE: a full re-prefill, measured at 3.7 s on the Orin, paid on the
+    /// parent's very next turn to save tokens on a working set that was going
+    /// to be trimmed anyway. PAI-3's asymmetry rule says growth buys working
+    /// set and never preamble; the same rule read backwards says a reservation
+    /// takes working set and never preamble.
+    ///
+    /// So `system_prompt_budget`, `memory_token_budget`, `max_memory_fragments`,
+    /// `output_reserve_tokens`, `compaction_threshold` and both window fields
+    /// come out untouched, and `use_compact_prompt()` therefore cannot flip
+    /// either. `memory_token_budget` is safe to leave alone for the reason
+    /// PAI-6 section 3.5 records: it feeds `memory_block_for_user_msg`, which
+    /// rides the USER message rather than the prefix.
+    ///
+    /// # Why the reservation is taken from the CLAMPED budget
+    ///
+    /// `history_token_budget` is a declared allowance, not a promise the window
+    /// can keep: at an 8,192 window it declares 4,000 tokens while only 3,668
+    /// survive `usable_history_tokens`. Subtracting the fraction from the
+    /// declared number would leave the parent holding more than the clamp
+    /// allows, the clamp would then discard the difference, and the two claims
+    /// would sum to more than the window — which is the whole failure this
+    /// method exists to prevent. Reserving out of `min(declared, usable)` is
+    /// what makes PAI-6 section 7's assertion true: the parent's effective
+    /// budget plus the reservation plus the preamble fits inside
+    /// `usable_prompt_tokens`, unless the remainder fell under
+    /// `turn_trimmer`'s floor, in which case the floor is the answer and the
+    /// sum legitimately overshoots by exactly that floor.
+    ///
+    /// # The fraction
+    ///
+    /// `0.0` returns an identical profile, which is the answer whenever nothing
+    /// is delegating — so this is a no-op on every turn of a pond that never
+    /// spawns a child. Anything that is not a finite number in `0.0..=1.0`
+    /// reserves the WHOLE claimable budget rather than being ignored:
+    /// `AgentRole::new` already refuses a `context_fraction` outside `(0, 1]`,
+    /// so a bad value here means a ledger defect, and this programme's standing
+    /// rule is that a failure narrows. Over-reserving costs the parent recall;
+    /// under-reserving costs a mid-generation `ContextLengthExceeded` and a
+    /// conversation goose compacts out from under the user.
+    pub fn with_history_reserved(&self, fraction: f32) -> Self {
+        let fraction = if fraction.is_finite() && (0.0..=1.0).contains(&fraction) {
+            fraction
+        } else {
+            1.0
+        };
+        if fraction <= 0.0 {
+            return self.clone();
+        }
+        let claimable = self.history_token_budget.min(self.usable_history_tokens());
+        // `ceil`, so an awkward ratio errs toward reserving MORE.
+        let reserved = (claimable as f64 * fraction as f64).ceil() as usize;
+        Self {
+            history_token_budget: claimable.saturating_sub(reserved),
+            ..self.clone()
+        }
+    }
+
     /// Whether the system prompt should use a compact format.
     ///
     /// Returns true when the window is small enough that verbose tool
@@ -1529,5 +1595,184 @@ mod tests {
                 e.as_str()
             );
         }
+    }
+
+    // ── PAI-6 P4: reserving history for a live subagent ─────────────────────
+
+    /// Everything a reservation must NOT move.
+    ///
+    /// The tempting implementation is `from_context_window(window * (1 -
+    /// fraction))`, which compiles, reads well, and shrinks the system-prompt
+    /// and memory allowances with it — so the preamble is rebuilt at a smaller
+    /// size and the KV prefix MOVES. That is a full re-prefill (3.7 s measured
+    /// on the Orin) charged to the parent's next turn, in exchange for tokens
+    /// on a working set the trimmer was about to cut anyway.
+    ///
+    /// Asserted field by field rather than with a window-derived expectation,
+    /// so a future field added to `CompactionProfile` and forgotten here is
+    /// caught by `the_reservation_covers_every_field_of_the_profile` below.
+    #[test]
+    fn a_reservation_takes_working_set_and_never_preamble() {
+        let base = CompactionProfile::for_windows(32_768, 8_192);
+        let reserved = base.with_history_reserved(0.3);
+
+        assert!(
+            reserved.history_token_budget < base.history_token_budget,
+            "the history budget did not shrink: {} vs {}",
+            reserved.history_token_budget,
+            base.history_token_budget
+        );
+        assert_eq!(
+            reserved.system_prompt_budget, base.system_prompt_budget,
+            "the system prompt allowance moved, so the preamble is rebuilt and the KV prefix \
+             moves with it"
+        );
+        assert_eq!(
+            reserved.memory_token_budget, base.memory_token_budget,
+            "the memory allowance moved"
+        );
+        assert_eq!(
+            reserved.max_memory_fragments, base.max_memory_fragments,
+            "the fragment count moved"
+        );
+        assert_eq!(
+            reserved.output_reserve_tokens, base.output_reserve_tokens,
+            "the output reserve moved - the model would have less room to answer because a \
+             SUBAGENT is running"
+        );
+        assert_eq!(
+            reserved.context_window_tokens, base.context_window_tokens,
+            "the window itself moved"
+        );
+        assert_eq!(
+            reserved.prompt_window_tokens, base.prompt_window_tokens,
+            "the prompt-side window moved, which is the clamp the preamble is built from"
+        );
+        assert!(
+            (reserved.compaction_threshold - base.compaction_threshold).abs() < f32::EPSILON,
+            "the compaction threshold moved"
+        );
+        assert_eq!(
+            reserved.use_compact_prompt(),
+            base.use_compact_prompt(),
+            "the prompt TIER flipped under a reservation, which rewrites the system prompt \
+             wholesale"
+        );
+    }
+
+    /// The tier switch at its most fragile point: a profile sitting just above
+    /// the 12,288 boundary, with the whole budget reserved.
+    #[test]
+    fn the_prompt_tier_cannot_flip_however_much_is_reserved() {
+        let roomy = CompactionProfile::from_context_window(32_768);
+        assert!(!roomy.use_compact_prompt(), "fixture is not the roomy tier");
+        assert!(
+            !roomy.with_history_reserved(1.0).use_compact_prompt(),
+            "reserving the whole history budget moved the profile into the compact prompt tier"
+        );
+    }
+
+    /// No child, no change. This is the state of every turn on a pond that
+    /// never delegates, so it has to be byte-identical rather than merely
+    /// close.
+    #[test]
+    fn no_reservation_is_the_same_profile() {
+        for window in [4_096, 8_192, 16_384, 128_000] {
+            let base = CompactionProfile::for_windows(window, window.min(8_192));
+            let same = base.with_history_reserved(0.0);
+            assert_eq!(
+                same.history_token_budget, base.history_token_budget,
+                "window {window}: a zero reservation changed the history budget"
+            );
+            assert_eq!(same.system_prompt_budget, base.system_prompt_budget);
+            assert_eq!(same.memory_token_budget, base.memory_token_budget);
+            assert_eq!(same.usable_history_tokens(), base.usable_history_tokens());
+        }
+    }
+
+    /// A fraction that is not a fraction reserves EVERYTHING.
+    ///
+    /// `AgentRole::new` refuses a `context_fraction` outside `(0, 1]`, so any
+    /// of these means the ledger that summed them is broken. This programme's
+    /// rule is that a failure narrows: the parent losing recall is recoverable,
+    /// the parent over-committing the window is a mid-generation
+    /// `ContextLengthExceeded` and a conversation goose compacts out from under
+    /// the user.
+    #[test]
+    fn a_fraction_that_is_not_a_fraction_reserves_the_whole_budget() {
+        let base = CompactionProfile::from_context_window(8_192);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.5, -0.5, 47.0] {
+            let reserved = base.with_history_reserved(bad);
+            assert_eq!(
+                reserved.history_token_budget, 0,
+                "fraction {bad} left the parent {} tokens instead of reserving everything",
+                reserved.history_token_budget
+            );
+        }
+        // Vacuity control: a GOOD fraction must not be treated the same way, or
+        // the assertion above is satisfied by a method that always returns 0.
+        assert!(
+            base.with_history_reserved(0.5).history_token_budget > 0,
+            "an ordinary fraction also left the parent nothing, so the bad-input assertion above \
+             proves nothing"
+        );
+    }
+
+    /// The reservation comes out of what the window can actually give history,
+    /// not out of what the profile declares. At 8,192 those differ by 332
+    /// tokens and the difference is what makes two claims sum past the window.
+    #[test]
+    fn the_reservation_is_taken_from_the_clamped_budget_not_the_declared_one() {
+        let base = CompactionProfile::from_context_window(8_192);
+        assert_eq!(base.history_token_budget, 4_000, "declared");
+        assert_eq!(
+            base.usable_history_tokens(),
+            3_668,
+            "what the window allows"
+        );
+
+        let half = base.with_history_reserved(0.5);
+        assert_eq!(
+            half.history_token_budget, 1_834,
+            "half of the CLAMPED 3,668 is what the parent keeps; half of the declared 4,000 \
+             would leave it 2,000, and 2,000 + 2,000 + the preamble overruns the window"
+        );
+    }
+
+    /// A structural tripwire for the field-by-field assertion above: if
+    /// `CompactionProfile` grows a field, this fails until somebody decides
+    /// whether a reservation may move it.
+    ///
+    /// Reads the struct definition rather than counting at runtime, because
+    /// there is no reflection here and a hand-maintained count is the vacuity
+    /// shape this programme has recorded (a control pinned to a number that
+    /// follows the constant wherever it moves).
+    #[test]
+    fn the_reservation_covers_every_field_of_the_profile() {
+        let source = include_str!("context_budget.rs");
+        const DECL: &str = "pub struct CompactionProfile {";
+        let start = source
+            .find(DECL)
+            .expect("the profile struct is no longer declared here");
+        let body = &source[start + DECL.len()..];
+        let end = body.find("\n}").expect("unterminated struct");
+        let fields: Vec<&str> = body[..end]
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let rest = line.strip_prefix("pub ")?;
+                let name = rest.split(':').next()?.trim();
+                (!name.is_empty()).then_some(name)
+            })
+            .collect();
+
+        assert_eq!(
+            fields.len(),
+            8,
+            "CompactionProfile now has {} fields ({fields:?}); \
+             a_reservation_takes_working_set_and_never_preamble asserts on each of them by hand, \
+             so decide whether a subagent reservation may move the new one and add it there",
+            fields.len()
+        );
     }
 }

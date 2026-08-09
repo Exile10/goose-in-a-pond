@@ -48,7 +48,14 @@ use crate::models::ports::token_counter::TokenCounter;
 /// Floor for the history budget after the overshoot correction. Below roughly
 /// this, a turn carries no usable context at all, and dropping to zero would
 /// make the assistant forget the message it is answering.
-const MIN_HISTORY_TOKENS: usize = 64;
+///
+/// Public since PAI-6 P4, because it is what makes that phase's budget
+/// assertion conditional: with a subagent reservation live the declared budgets
+/// legitimately sum to more than the window, by exactly this many tokens, and a
+/// test written without the floor either fails against correct code or is
+/// tuned until it never reaches the floor and then stays green through the
+/// regression it was meant to catch.
+pub const MIN_HISTORY_TOKENS: usize = 64;
 
 /// Days of history the trimmer treats as *verbatim* before age weighting is
 /// allowed to degrade it. The default for `Settings::compaction_verbatim_days`
@@ -215,6 +222,60 @@ fn last_turn_start(messages: &[TrimMessage]) -> usize {
         .unwrap_or(0)
 }
 
+/// The history budget [`trim_history`] actually trims to, and whether the
+/// engine's own last measurement moved it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryBudget {
+    /// Tokens history may occupy on this turn, floored at
+    /// [`MIN_HISTORY_TOKENS`].
+    pub tokens: usize,
+    /// True when the previous turn's REAL prompt count overshot the usable
+    /// ceiling and this budget is smaller because of it. [`trim_history`] uses
+    /// it to report `changed`.
+    pub overshoot_corrected: bool,
+}
+
+/// What history may spend this turn, after both corrections to the profile's
+/// declared allowance.
+///
+/// Extracted from [`trim_history`] rather than inlined so PAI-6 P4's budget
+/// assertion has something to assert on. It had nowhere: the number lived as a
+/// local inside a 200-line function and the only observable downstream of it is
+/// how many turns got dropped, which is a function of the messages as much as
+/// of the budget. A phase whose whole claim is "the parent's budget shrinks by
+/// the reservation" cannot be verified through a proxy that also moves for four
+/// other reasons.
+///
+/// **This is the only place the effective budget is computed.** `trim_history`
+/// calls it; nothing else recomputes the clamp. A second copy would be the
+/// four-paths-disagree shape PAI-3 exists to remove.
+pub fn effective_history_budget(
+    profile: &CompactionProfile,
+    last_real_prompt_tokens: Option<u32>,
+) -> HistoryBudget {
+    let usable = profile.usable_prompt_tokens();
+    let mut tokens = if usable > 0 {
+        profile
+            .history_token_budget
+            .min(profile.usable_history_tokens())
+            .max(MIN_HISTORY_TOKENS)
+    } else {
+        profile.history_token_budget
+    };
+    let mut overshoot_corrected = false;
+    if let Some(real) = last_real_prompt_tokens {
+        let real = real as usize;
+        if usable > 0 && real > usable {
+            tokens = tokens.saturating_sub(real - usable).max(MIN_HISTORY_TOKENS);
+            overshoot_corrected = true;
+        }
+    }
+    HistoryBudget {
+        tokens,
+        overshoot_corrected,
+    }
+}
+
 /// Deterministically trim `messages` to fit within the profile's history
 /// budget. `rolling_summary`, when present, is spliced (or refreshed) as a
 /// summary message at the front. `last_real_prompt_tokens` is the previous
@@ -277,21 +338,12 @@ pub fn trim_history(
     //    against `usable_prompt_tokens` — the engine reports the WHOLE prompt,
     //    preamble included, so the history-only ceiling would report an
     //    overshoot on every turn that merely used its budget.
-    let usable = profile.usable_prompt_tokens();
-    let mut budget = if usable > 0 {
-        profile
-            .history_token_budget
-            .min(profile.usable_history_tokens())
-            .max(MIN_HISTORY_TOKENS)
-    } else {
-        profile.history_token_budget
-    };
-    if let Some(real) = last_real_prompt_tokens {
-        let real = real as usize;
-        if usable > 0 && real > usable {
-            budget = budget.saturating_sub(real - usable).max(MIN_HISTORY_TOKENS);
-            changed = true;
-        }
+    let HistoryBudget {
+        tokens: budget,
+        overshoot_corrected,
+    } = effective_history_budget(profile, last_real_prompt_tokens);
+    if overshoot_corrected {
+        changed = true;
     }
 
     // 1. Strip stale <system-context> from every PRIOR user message. Which ones
@@ -783,6 +835,175 @@ mod tests {
             None,
         );
         assert!(out.estimated_tokens > 0, "must keep the current turn");
+    }
+
+    // ── PAI-6 P4: a subagent is a second claim on one window ────────────────
+
+    /// PAI-6 section 7's budget assertion, in the conditional form that section
+    /// says is the only correct one.
+    ///
+    /// With a child live the parent's effective budget, the child's
+    /// reservation and the preamble must fit inside `usable_prompt_tokens` —
+    /// **or** the parent's budget must be exactly `MIN_HISTORY_TOKENS`, because
+    /// `effective_history_budget` floors there on purpose and at that point the
+    /// declared sum legitimately overshoots by exactly the floor.
+    ///
+    /// Swept over every window the profile curve has an opinion about and every
+    /// fraction a role may state, because the failure this guards is a
+    /// particular *arithmetic* one: reserving out of the DECLARED
+    /// `history_token_budget` instead of out of `min(declared, usable)` passes
+    /// at small fractions and breaks at large ones on exactly the windows where
+    /// the declared budget exceeds the clamp — which includes 8,192, the most
+    /// executed window in the system.
+    #[test]
+    fn a_parents_budget_and_its_childs_reservation_fit_the_window_or_hit_the_floor() {
+        let mut floored = 0usize;
+        let mut checked = 0usize;
+        for window in [2_048, 4_096, 8_192, 12_288, 16_384, 32_768, 65_536, 128_000] {
+            for prompt_window in [window.min(8_192), window] {
+                let parent = CompactionProfile::for_windows(window, prompt_window);
+                for fraction in [0.1_f32, 0.25, 0.3, 0.5, 0.75, 0.9, 1.0] {
+                    checked += 1;
+                    let claimable = parent
+                        .history_token_budget
+                        .min(parent.usable_history_tokens());
+                    let reserved = (claimable as f64 * fraction as f64).ceil() as usize;
+                    let child_live = parent.with_history_reserved(fraction);
+                    let effective = effective_history_budget(&child_live, None).tokens;
+
+                    let sum = effective
+                        + reserved
+                        + child_live.system_prompt_budget
+                        + child_live.memory_token_budget;
+                    if effective == MIN_HISTORY_TOKENS {
+                        floored += 1;
+                        continue;
+                    }
+                    assert!(
+                        sum <= child_live.usable_prompt_tokens(),
+                        "window {window}/{prompt_window} at fraction {fraction}: the parent \
+                         ({effective}) and its child ({reserved}) together with the preamble \
+                         claim {sum} tokens of a {} usable prompt - two agents each believing \
+                         they own the window is the overrun this reservation exists to prevent",
+                        child_live.usable_prompt_tokens()
+                    );
+                }
+            }
+        }
+        assert!(checked > 50, "the sweep degenerated to {checked} cases");
+        // Vacuity control, and the reason the assertion above is a disjunction:
+        // the floor branch must actually be reached by this sweep. Without a
+        // case that hits it, the unconditional form of the assertion would pass
+        // here and then fail against correct code on the first small window.
+        assert!(
+            floored > 0,
+            "no case in the sweep reached MIN_HISTORY_TOKENS, so the conditional form of this \
+             assertion was never exercised and an unconditional one would have looked correct"
+        );
+    }
+
+    /// The floor case, named and pinned, with the proof that the unconditional
+    /// form of the assertion above is WRONG rather than merely unnecessary.
+    ///
+    /// 8,192 is `ContextGovernor::prompt_window`'s clamp and the most executed
+    /// window in the system. A role that reserves all of it leaves the parent
+    /// on the floor, and the declared sum then exceeds the usable prompt by
+    /// exactly `MIN_HISTORY_TOKENS`.
+    #[test]
+    fn a_child_that_takes_the_whole_budget_leaves_the_parent_exactly_on_the_floor() {
+        let parent = CompactionProfile::from_context_window(8_192);
+        let claimable = parent
+            .history_token_budget
+            .min(parent.usable_history_tokens());
+        assert_eq!(claimable, 3_668, "the clamp, not the declared 4,000");
+
+        let child_live = parent.with_history_reserved(1.0);
+        assert_eq!(
+            child_live.history_token_budget, 0,
+            "a fraction of 1.0 must leave the parent nothing to declare"
+        );
+        let effective = effective_history_budget(&child_live, None).tokens;
+        assert_eq!(
+            effective, MIN_HISTORY_TOKENS,
+            "the trimmer's floor is what keeps the turn's own message alive; the parent must \
+             land on it rather than at zero"
+        );
+
+        let sum = effective + claimable + parent.system_prompt_budget + parent.memory_token_budget;
+        assert!(
+            sum > parent.usable_prompt_tokens(),
+            "this case no longer overshoots, so the unconditional form of the budget assertion \
+             would pass here and the conditional form is untested"
+        );
+        assert_eq!(
+            sum - parent.usable_prompt_tokens(),
+            MIN_HISTORY_TOKENS,
+            "the overshoot must be exactly the floor - anything else means the reservation is \
+             being taken from the wrong number"
+        );
+    }
+
+    /// The seam, end to end: a live child does not merely change a struct
+    /// field, it makes the trimmer keep less.
+    ///
+    /// Without this, every assertion above is about arithmetic that
+    /// `trim_history` might not be using. The vacuity control is inline — the
+    /// unreserved run must NOT drop everything, or "reserved drops more" would
+    /// hold against a trimmer that ignores the budget entirely.
+    #[test]
+    fn a_live_child_makes_the_trimmer_keep_less_of_the_parents_history() {
+        let parent = CompactionProfile::from_context_window(8_192);
+        let msgs = || -> Vec<TrimMessage> {
+            (0..40)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        user(i, &"x".repeat(1_000))
+                    } else {
+                        assistant(i, &"y".repeat(1_000))
+                    }
+                })
+                .collect()
+        };
+
+        let unreserved = trim_history(
+            msgs(),
+            &parent,
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            None,
+        );
+        let reserved = trim_history(
+            msgs(),
+            &parent.with_history_reserved(0.5),
+            None,
+            None,
+            &HeuristicTokenCounter,
+            CurrentTurn::NotYetAppended,
+            None,
+        );
+
+        assert!(
+            reserved.estimated_tokens < unreserved.estimated_tokens,
+            "the parent kept {} tokens with a child live and {} without, so the reservation \
+             never reached the trimmer",
+            reserved.estimated_tokens,
+            unreserved.estimated_tokens
+        );
+        assert!(
+            reserved.dropped_turns > unreserved.dropped_turns,
+            "the same conversation dropped {} turns with a child live and {} without",
+            reserved.dropped_turns,
+            unreserved.dropped_turns
+        );
+        assert!(
+            unreserved.estimated_tokens > 0 && unreserved.dropped_turns < 20,
+            "the unreserved run kept {} tokens over {} dropped turns; if it keeps nothing then \
+             'reserved keeps less' is satisfied by a trimmer that ignores the budget",
+            unreserved.estimated_tokens,
+            unreserved.dropped_turns
+        );
     }
 
     fn user(index: usize, text: &str) -> TrimMessage {

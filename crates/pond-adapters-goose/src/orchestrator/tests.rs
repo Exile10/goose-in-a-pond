@@ -55,8 +55,15 @@ fn role(name: &str, groups: &[&str]) -> AgentRole {
 /// constructor and no `Deserialize` precisely so that a fixture cannot invent
 /// an authority the parent never had.
 fn spec_for(role: &AgentRole, parent_groups: &[&str]) -> TaskSpec {
+    spec_for_parent(role, parent_groups, PARENT_SESSION)
+}
+
+/// The same, for a named parent session. PAI-6 P4's ledger is process-wide and
+/// keyed by the GIAP session id, so a test that asserts on a reservation needs a
+/// session no other test in this file is spawning into.
+fn spec_for_parent(role: &AgentRole, parent_groups: &[&str], parent: &str) -> TaskSpec {
     DelegationAuthority::root(
-        "parent-session",
+        parent,
         ProfileScope::Household,
         parent_groups.iter().map(|g| g.to_string()).collect(),
     )
@@ -94,12 +101,23 @@ fn live_turn_with_token(
     TurnAuthorityLease,
     CancellationToken,
 ) {
+    live_turn_for(PARENT_SESSION, runner)
+}
+
+fn live_turn_for(
+    parent: &str,
+    runner: Arc<dyn ChildRunner>,
+) -> (
+    Arc<GooseOrchestrator>,
+    TurnAuthorityLease,
+    CancellationToken,
+) {
     let authorities = Arc::new(TurnAuthorityRegistry::new());
     let token = CancellationToken::new();
     let lease = authorities.publish(
-        "parent-goose-session",
+        &format!("{parent}-goose-session"),
         DelegationAuthority::root(
-            PARENT_SESSION,
+            parent,
             ProfileScope::Household,
             ["giap-weather".to_string()].into_iter().collect(),
         ),
@@ -158,6 +176,11 @@ struct FakeRunnerState {
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
     session_seq: AtomicUsize,
+    /// PAI-6 P4. What the process ledger said the child's PARENT had reserved,
+    /// read from inside the run — which is the only moment the claim is
+    /// supposed to exist. Asserting it after `spawn` returns would only ever
+    /// see zero, whether the reservation was taken or not.
+    reserved_during_run: Mutex<Vec<f32>>,
 }
 
 struct FakeRunner {
@@ -225,6 +248,11 @@ impl ChildRunner for FakeRunner {
     async fn run(&self, plan: ChildPlan, cancel: CancellationToken) -> Result<ChildOutcome> {
         let now = self.state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.state.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        self.state
+            .reserved_during_run
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(process_device_ledger().reserved_fraction(&plan.parent_session_id));
         self.state
             .plans
             .lock()
@@ -1708,4 +1736,375 @@ fn child_loop_source() -> String {
     // indented, so this cannot end early.
     let end = body.find("\n}\n").map(|at| at + 3).unwrap_or(body.len());
     body[..end].to_string()
+}
+
+// ── PAI-6 P4: the budget, and the other half of invariant 3 ─────────────────
+
+/// The parent's turn asks for exactly what an on-device child asks for: all of
+/// it. Pinned against `ON_DEVICE_PROVIDERS` rather than against two names, for
+/// the reason the sibling test next to `subagent_permits` records — a test
+/// naming `local` and `gguf` stays green while ollama, which is the same GPU
+/// over `127.0.0.1`, quietly runs a child alongside a parent turn.
+#[test]
+fn a_parent_turn_on_this_device_takes_the_whole_semaphore() {
+    for provider in ON_DEVICE_PROVIDERS {
+        assert_eq!(
+            parent_turn_permits(provider),
+            SUBAGENT_PERMITS as u32,
+            "provider `{provider}` runs on this device, so a parent turn must hold every permit \
+             - anything less lets a subagent reply between two of the parent's provider calls \
+             and overwrite the one retained KV prefix, which costs the parent a full re-prefill"
+        );
+        assert_eq!(
+            parent_turn_permits(provider),
+            subagent_permits(provider),
+            "a parent turn and a child of `{provider}` ask for different numbers of permits, so \
+             one of them can start while the other holds the device"
+        );
+    }
+}
+
+/// The other half, so the assertion above is not satisfied by a function that
+/// returns the whole semaphore for everything — which would serialise every
+/// hosted conversation on this pond against every other one for no reason.
+#[test]
+fn a_parent_turn_on_a_hosted_provider_claims_nothing() {
+    assert_eq!(
+        parent_turn_permits("anthropic"),
+        0,
+        "a hosted provider has no shared KV prefix on this box, so a turn of it must not take \
+         the device semaphore at all"
+    );
+    assert!(
+        parent_turn_permits("local") > parent_turn_permits("anthropic"),
+        "on-device and hosted parent turns claim the same thing, so the assertion next door is \
+         about nothing"
+    );
+}
+
+/// Releasing must subtract exactly what was added, and return to zero.
+///
+/// A running `f32` sum does not: add 0.3 three times and subtract it three
+/// times and the total is not 0.0, so a parent's budget would come back a
+/// little short and stay short for the rest of the conversation, silently, with
+/// nothing to blame.
+#[test]
+fn a_reservation_is_released_exactly_and_the_budget_comes_back_whole() {
+    let ledger = process_device_ledger();
+    let session = "p4-ledger-arithmetic";
+    assert_eq!(ledger.reserved_fraction(session), 0.0);
+
+    let first = ledger.reserve(session, 0.3);
+    let second = ledger.reserve(session, 0.3);
+    assert!(
+        (ledger.reserved_fraction(session) - 0.6).abs() < 1e-6,
+        "two children of one parent must claim both their shares, got {}",
+        ledger.reserved_fraction(session)
+    );
+
+    drop(first);
+    assert!(
+        (ledger.reserved_fraction(session) - 0.3).abs() < 1e-6,
+        "releasing one child released more than its own share, got {}",
+        ledger.reserved_fraction(session)
+    );
+
+    drop(second);
+    assert_eq!(
+        ledger.reserved_fraction(session),
+        0.0,
+        "the parent's budget did not come back to whole after every child ended"
+    );
+    assert_eq!(ledger.live_children(session), 0, "an entry was left behind");
+}
+
+/// Children cannot between them claim more window than there is. The honest
+/// answer at that point is "all of it", which `with_history_reserved` floors at
+/// `MIN_HISTORY_TOKENS` rather than at zero.
+#[test]
+fn children_cannot_reserve_more_of_a_window_than_it_has() {
+    let ledger = process_device_ledger();
+    let session = "p4-ledger-oversubscribed";
+    let _a = ledger.reserve(session, 0.5);
+    let _b = ledger.reserve(session, 0.5);
+    let _c = ledger.reserve(session, 0.5);
+    assert_eq!(
+        ledger.reserved_fraction(session),
+        1.0,
+        "an oversubscribed parent reported a fraction above 1.0, which is not a share of \
+         anything"
+    );
+}
+
+/// One session's children never shrink another session's window.
+#[test]
+fn a_reservation_belongs_to_the_conversation_that_made_it() {
+    let ledger = process_device_ledger();
+    let _held = ledger.reserve("p4-mine", 0.5);
+    assert_eq!(
+        ledger.reserved_fraction("p4-someone-elses"),
+        0.0,
+        "a delegation in one conversation shrank another conversation's history budget"
+    );
+}
+
+/// The claim exists while the child is RUNNING, and is gone afterwards.
+///
+/// Asserted from inside the fake engine, because after `spawn` returns the
+/// answer is zero either way — which is how a reservation that was never taken
+/// would look identical to one that was taken and released.
+#[tokio::test]
+async fn while_a_child_runs_its_parents_history_budget_is_reserved() {
+    let _serial = ONE_RUN_AT_A_TIME.lock().await;
+    let parent = "p4-live-child-parent";
+    let role = role("researcher", &["giap-weather"]);
+    let env = env_with(
+        "ollama",
+        parent_tools(&[("giap-weather", &["get_weather"])]),
+    );
+    let runner = Arc::new(FakeRunner::new(env));
+    let state = runner.state.clone();
+    let (orchestrator, _turn, _token) = live_turn_for(parent, runner);
+
+    let run = orchestrator
+        .spawn(spec_for_parent(&role, &["giap-weather"], parent))
+        .await
+        .expect("the delegation runs");
+    assert_eq!(run.status, TaskStatus::Completed);
+
+    let observed = state
+        .reserved_during_run
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(observed.len(), 1, "the fake engine did not run");
+    assert!(
+        (observed[0] - 0.3).abs() < 1e-6,
+        "while the child was replying its parent had {} of its history budget reserved; the \
+         role states context_fraction 0.3, and 0.0 means the parent's next turn budgets as \
+         though it still owned the whole window",
+        observed[0]
+    );
+    assert_eq!(
+        process_device_ledger().reserved_fraction(parent),
+        0.0,
+        "the child finished and its claim on the parent's window outlived it"
+    );
+}
+
+/// Every exit gives the budget back, including the ones that never reach the
+/// engine. A refused plan returns `Err` from the middle of `spawn`; if the
+/// reservation were released by a statement at the end rather than by `Drop`,
+/// this parent would lose part of its window for the rest of the process.
+#[tokio::test]
+async fn a_delegation_that_is_refused_still_gives_the_budget_back() {
+    let _serial = ONE_RUN_AT_A_TIME.lock().await;
+    let parent = "p4-refused-parent";
+    // `summon` is one of the ten stripped builtins, so the plan builder refuses
+    // before anything runs.
+    let role = role("saboteur", &["summon"]);
+    let env = env_with("ollama", parent_tools(&[("summon", &["delegate"])]));
+    let runner = Arc::new(FakeRunner::new(env));
+    let (orchestrator, _turn, _token) = live_turn_for(parent, runner);
+
+    let refused = orchestrator
+        .spawn(spec_for_parent(&role, &["summon"], parent))
+        .await;
+    assert!(refused.is_err(), "a spec naming a stripped builtin ran");
+    assert_eq!(
+        process_device_ledger().reserved_fraction(parent),
+        0.0,
+        "a refused delegation left its claim on the parent's history budget behind, so the \
+         parent's every later turn trims against a window it is told it does not have"
+    );
+}
+
+/// **The deadlock this phase could have shipped.**
+///
+/// A synchronous delegation runs inside its parent's turn, and that turn now
+/// holds every permit on this device. A child that queued for them would wait
+/// for a parent that is waiting for the child — forever — while holding one of
+/// `main.rs`'s four `sse_semaphore` permits, so four delegating turns would
+/// take the interactive chat pool down until the process restarted. Nothing
+/// calls `spawn` until P5, so this would not have surfaced in this phase at
+/// all.
+#[tokio::test]
+async fn a_child_runs_under_its_parents_device_claim_rather_than_deadlocking_behind_it() {
+    let _serial = ONE_RUN_AT_A_TIME.lock().await;
+    let parent = "p4-inheriting-parent";
+    let role = role("researcher", &["giap-weather"]);
+    let env = env_with(
+        "ollama",
+        parent_tools(&[("giap-weather", &["get_weather"])]),
+    );
+    let runner = Arc::new(FakeRunner::new(env));
+    let (orchestrator, _turn, token) = live_turn_for(parent, runner);
+
+    // Exactly what `chat_stream` holds for the whole of an on-device turn.
+    let claim = claim_device_for_turn(parent, "ollama", &token).await;
+    assert!(
+        claim.is_some(),
+        "an on-device turn took no device claim, so this test is not about inheritance"
+    );
+    assert!(process_device_ledger().session_holds_device(parent));
+
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        orchestrator.spawn(spec_for_parent(&role, &["giap-weather"], parent)),
+    )
+    .await
+    .expect(
+        "the child never started: it queued for the device permits its own parent's turn is \
+         holding, which is a deadlock that also strands an sse_semaphore permit",
+    )
+    .expect("the delegation runs");
+    assert_eq!(run.status, TaskStatus::Completed);
+
+    drop(claim);
+    assert!(
+        !process_device_ledger().session_holds_device(parent),
+        "the turn's device claim outlived it"
+    );
+}
+
+/// Vacuity control for the test above, and the assertion that inheritance is
+/// keyed on the SESSION rather than granted to everyone: a child whose parent
+/// is not the turn holding the device really does wait for it.
+///
+/// Without this, `a_child_runs_under_its_parents_device_claim...` passes
+/// against a `spawn` that acquires nothing at all, which is invariant 3
+/// deleted.
+#[tokio::test]
+async fn a_child_of_another_session_waits_for_the_turn_that_holds_the_device() {
+    let _serial = ONE_RUN_AT_A_TIME.lock().await;
+    let parent = "p4-waiting-parent";
+    let role = role("researcher", &["giap-weather"]);
+    let env = env_with(
+        "ollama",
+        parent_tools(&[("giap-weather", &["get_weather"])]),
+    );
+    let runner = Arc::new(FakeRunner::new(env));
+    let (orchestrator, _turn, _token) = live_turn_for(parent, runner);
+
+    let other = CancellationToken::new();
+    let claim = claim_device_for_turn("p4-unrelated-conversation", "ollama", &other)
+        .await
+        .expect("an on-device turn claims the device");
+
+    let spec = spec_for_parent(&role, &["giap-weather"], parent);
+    let task_id = spec.id().to_string();
+    let spawned = {
+        let orchestrator = orchestrator.clone();
+        tokio::spawn(async move { orchestrator.spawn(spec).await })
+    };
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        orchestrator
+            .poll(&task_id)
+            .await
+            .unwrap()
+            .expect("the run is registered")
+            .status,
+        TaskStatus::Queued,
+        "a child ran while an UNRELATED conversation's turn held the device - inheritance is \
+         being granted to every session rather than to the child's own parent, which is \
+         invariant 3 with the parent half removed"
+    );
+
+    drop(claim);
+    let run = tokio::time::timeout(std::time::Duration::from_secs(5), spawned)
+        .await
+        .expect("the child never ran after the device was released")
+        .unwrap()
+        .expect("the delegation runs");
+    assert_eq!(run.status, TaskStatus::Completed);
+    assert_eq!(
+        process_device_ledger().reserved_fraction(parent),
+        0.0,
+        "the queued-then-run child left its reservation behind"
+    );
+}
+
+/// The INPUT guard, which is the half PAI-1 P5 lacked when it shipped a
+/// correct gate nothing could reach.
+///
+/// Everything above is about a reservation the trimmer would honour. This is
+/// about whether the live path ever asks for one. `turn_profile` is the single
+/// producer of every budget in the adapter (PAI-3 P5 made it so), so this reads
+/// its body and fails if it stops consulting the ledger, or if a second profile
+/// is minted somewhere that would bypass it.
+#[test]
+fn the_turn_profile_reads_the_live_child_ledger() {
+    let source = strip_line_comments(include_str!("../goose_agent.rs"));
+
+    let start = source
+        .find("async fn turn_profile(")
+        .expect("turn_profile is gone; the adapter's single budget producer has moved");
+    let body = &source[start..start + 600];
+    let end = body.find("\n    }").expect("unterminated turn_profile");
+    let body = &body[..end];
+
+    assert!(
+        body.contains("reserved_fraction("),
+        "turn_profile no longer asks the ledger what this session's live children have \
+         reserved, so PAI-6 P4's budget is carried on the spec and read by nobody - exactly \
+         the state P2 and P3 left it in:\n{body}"
+    );
+    assert!(
+        body.contains("profile_for("),
+        "turn_profile stopped going through profile_for, so the reservation and the \
+         prompt-side clamp are no longer applied in one place:\n{body}"
+    );
+
+    assert_eq!(
+        source.matches("CompactionProfile::for_windows(").count(),
+        1,
+        "there is more than one place in this adapter that builds a CompactionProfile from \
+         windows; only the one inside profile_for applies the subagent reservation, so the \
+         others budget as though no child were live"
+    );
+    assert_eq!(
+        source.matches("with_history_reserved(").count(),
+        1,
+        "the reservation is applied in more than one place, so two paths can disagree about \
+         how much of this parent's window is already claimed"
+    );
+}
+
+/// Depth is P1's, not P4's — this phase verifies it rather than reimplementing
+/// it, and the verification worth having is that the cap is still STRUCTURAL.
+///
+/// The bullet says "depth capped at 1", and the way that stops being true is
+/// not the constant changing (pond-core pins that) but a second way to
+/// construct a depth appearing on this side of the boundary. There is none:
+/// `DelegationDepth` has no public constructor from a number, no `Default` and
+/// no `Deserialize`, so this crate cannot make one, and the only depth in an
+/// adapter-side plan is whatever `TaskSpec::child_authority` handed it.
+#[test]
+fn nothing_in_this_adapter_can_construct_a_delegation_depth() {
+    // This file is deliberately not in the list: it names the type in this very
+    // assertion, so including it would fail on its own text. Test code cannot
+    // widen anything a caller reaches anyway — the two files below are the
+    // whole of this crate's delegation surface.
+    for file in [
+        include_str!("../orchestrator.rs"),
+        include_str!("../goose_agent.rs"),
+    ] {
+        let source = strip_line_comments(file);
+        assert!(
+            !source.contains("DelegationDepth("),
+            "this crate constructs a DelegationDepth. P1 made the cap structural by leaving no \
+             public constructor from a number; an adapter-side one puts the depth back in the \
+             hands of whichever caller writes the literal"
+        );
+    }
+    // The cap itself, read from the domain rather than restated here: a copy of
+    // the number in this crate is a second source of truth for it.
+    assert_eq!(
+        pond_core::shared::domain::orchestration::MAX_DELEGATION_DEPTH,
+        1,
+        "the delegation depth cap moved; a subagent that can spawn is a recursive loop on a \
+         home server"
+    );
 }

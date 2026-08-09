@@ -950,7 +950,7 @@ impl GooseAdapter {
             .ok()
             .and_then(|(s, _)| s);
 
-        let profile = self.turn_profile().await;
+        let profile = self.turn_profile(giap_session_id).await;
 
         // Trailing-user drop, blank filtering, budget cut and summary splice all
         // live in pond-core's `plan_replay` so they are unit-tested there.
@@ -1456,9 +1456,21 @@ impl GooseAdapter {
     /// fields had scaled with the whole window, while the preamble they were
     /// budgeting alongside had been built from the 8,192 clamp. One profile per
     /// turn, carrying both windows, is what makes those two agree.
-    async fn turn_profile(&self) -> CompactionProfile {
+    /// PAI-6 P4. Takes the session id because the reservation is per
+    /// CONVERSATION: a subagent is a second claim on the window of the
+    /// conversation that spawned it, and another session's turn is entitled to
+    /// its whole budget.
+    ///
+    /// Read here rather than at each consumer so there is exactly one place
+    /// that can forget. `turn_profile` is already the single producer of every
+    /// budget in this adapter (PAI-3 P5 made it so, after two of four call
+    /// sites forgot the prompt-side clamp), and a reservation applied at one of
+    /// three call sites would be the same defect again.
+    async fn turn_profile(&self, giap_session_id: &str) -> CompactionProfile {
         let (provider, window) = self.window_and_provider().await;
-        Self::profile_for(&provider, window.tokens)
+        let reserved =
+            crate::orchestrator::process_device_ledger().reserved_fraction(giap_session_id);
+        Self::profile_for(&provider, window.tokens, reserved)
     }
 
     /// The pure half of [`GooseAdapter::turn_profile`], split out so the pairing
@@ -1468,11 +1480,24 @@ impl GooseAdapter {
     /// backwards compiles: passing the clamp as the context window would cap
     /// history at the 8K budget on a 32K box, and passing the raw window as the
     /// prompt window would grow the KV prefix — the thing invariant 1 forbids.
-    fn profile_for(provider: &str, resolved_window: usize) -> CompactionProfile {
+    ///
+    /// `reserved_fraction` is PAI-6 P4's live-child claim, and it is applied
+    /// AFTER `for_windows` for the same reason: scaling `resolved_window` by it
+    /// instead would shrink the preamble allowances and move the prefix, which
+    /// costs a full re-prefill to save tokens on a working set the trimmer was
+    /// about to cut. `0.0` — the answer on every turn of a pond that never
+    /// delegates — returns exactly the profile this function returned before
+    /// P4 existed.
+    fn profile_for(
+        provider: &str,
+        resolved_window: usize,
+        reserved_fraction: f32,
+    ) -> CompactionProfile {
         CompactionProfile::for_windows(
             resolved_window,
             ContextGovernor::prompt_window(provider, resolved_window),
         )
+        .with_history_reserved(reserved_fraction)
     }
 
     /// Whether the ACTIVE model can accept image content.
@@ -2172,7 +2197,7 @@ impl GooseAdapter {
             None => None,
         };
 
-        let profile = self.turn_profile().await;
+        let profile = self.turn_profile(giap_session_id).await;
         let last_real = self
             .last_prompt_tokens_handle()
             .lock()
@@ -2982,7 +3007,7 @@ impl GooseAdapter {
         // carries the full window for history and the clamped prompt window for
         // the preamble, so the two can no longer be built from different numbers
         // by accident.
-        let turn_profile = self.turn_profile().await;
+        let turn_profile = self.turn_profile(&session_id).await;
         let effective_ctx = turn_profile.context_window_tokens;
 
         let prompt_state = {
@@ -3685,12 +3710,45 @@ impl GooseAdapter {
             cancel_token.clone(),
         );
 
+        // The provider this turn will actually reply through, for PAI-6 P4's
+        // device claim below. Taken from the same settings load the rest of the
+        // turn used, so it cannot disagree with what `turn_profile` budgeted
+        // against.
+        let turn_provider = settings.chat_provider.clone();
+        let device_session_id = session_id.clone();
+
         let stream = async_stream::stream! {
             // Hold the guard — dropped when the stream is dropped → cancels token.
             let _guard = cancel_guard;
             // Same lifetime, same reason: dropped with the stream, which revokes
             // this turn's authority to delegate.
             let _authority_lease = authority_lease;
+
+            // ── PAI-6 P4 / invariant 3: this turn's claim on the device ───────
+            //
+            // The half of invariant 3 P2 left open. The subagent semaphore
+            // serialised children against each other; it did not serialise them
+            // against the PARENT, and `goose-local-inference` keeps exactly one
+            // retained KV prefix per model slot for the whole process — so a
+            // child replying between two of this turn's provider calls does not
+            // queue, it overwrites, and this turn pays a 3.7 s re-prefill on its
+            // next call.
+            //
+            // Taken INSIDE the stream rather than before it is returned, so the
+            // HTTP response has already started and the client sees a stream
+            // that is waiting rather than a request that is hanging. Held for
+            // the whole turn, and released by `Drop` on every ending there is,
+            // including the client hanging up.
+            //
+            // `None` on a provider that runs somewhere else: there is no shared
+            // prefix to protect and hosted conversations still run four abreast.
+            // A synchronous delegation does NOT queue behind this claim — it
+            // inherits it, see `claim_device_for_turn`.
+            let _device = crate::orchestrator::claim_device_for_turn(
+                &device_session_id,
+                &turn_provider,
+                &cancel_token,
+            ).await;
 
             yield Ok(AgentStreamEvent::Status { content: "Agent working...".to_string() });
             let mut total_output_chars: usize = 0;
@@ -6076,6 +6134,12 @@ mod tests {
 
     // ── PAI-3 P5: the adapter builds ONE asymmetric profile per turn ─────
 
+    /// What `turn_profile` reads out of the ledger on a pond with nothing
+    /// delegating, which is every pond today. Named so these tests keep saying
+    /// what they are about — the two windows — rather than carrying a bare
+    /// `0.0` that reads like a tolerance.
+    const NO_LIVE_CHILD: f32 = 0.0;
+
     /// The wiring guard. `for_windows` is unit-tested in pond-core; what this
     /// asserts is that the adapter hands it the two windows the right way round,
     /// which is the half that cannot be checked from inside pond-core and the
@@ -6083,8 +6147,8 @@ mod tests {
     #[test]
     fn a_local_turn_budgets_history_from_the_window_and_the_preamble_from_the_clamp() {
         // A Mac that resolved 32,768: four times the KV cache of the clamp.
-        let big = GooseAdapter::profile_for("local", 32_768);
-        let clamped = GooseAdapter::profile_for("local", 8_192);
+        let big = GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD);
+        let clamped = GooseAdapter::profile_for("local", 8_192, NO_LIVE_CHILD);
 
         // Preamble: frozen at the clamp's allowance. If this grows, TTFT grows
         // with it on every single turn, because it is the KV prefix.
@@ -6103,11 +6167,56 @@ mod tests {
         assert!(big.history_token_budget > clamped.history_token_budget);
     }
 
+    /// PAI-6 P4's half of the same wiring question.
+    ///
+    /// pond-core proves that `CompactionProfile::with_history_reserved` moves
+    /// history and nothing else; this proves the ADAPTER applies it that way
+    /// rather than by scaling the window it resolves — which is the
+    /// implementation that compiles, reads well, re-derives every preamble
+    /// allowance, and moves the KV prefix. Delegating would then cost the
+    /// parent a full re-prefill on its next turn, which is the opposite of the
+    /// context isolation the whole workstream is justified by.
+    #[test]
+    fn a_live_child_shrinks_the_parents_history_and_leaves_its_prefix_alone() {
+        let alone = GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD);
+        let sharing = GooseAdapter::profile_for("local", 32_768, 0.5);
+
+        assert!(
+            sharing.history_token_budget < alone.history_token_budget,
+            "a live child did not shrink the parent's history budget: {} vs {}",
+            sharing.history_token_budget,
+            alone.history_token_budget
+        );
+        assert_eq!(
+            sharing.context_window_tokens, alone.context_window_tokens,
+            "the resolved window moved, so the reservation was applied by scaling the window - \
+             which re-derives every preamble allowance and moves the KV prefix"
+        );
+        assert_eq!(
+            sharing.prompt_window_tokens, alone.prompt_window_tokens,
+            "the prompt-side clamp moved under a reservation"
+        );
+        assert_eq!(
+            sharing.system_prompt_budget, alone.system_prompt_budget,
+            "the system prompt allowance moved under a reservation, so the preamble is rebuilt \
+             at a different size and the parent pays a re-prefill for having delegated"
+        );
+        assert_eq!(
+            sharing.memory_token_budget, alone.memory_token_budget,
+            "the memory allowance moved under a reservation"
+        );
+        assert_eq!(
+            sharing.use_compact_prompt(),
+            alone.use_compact_prompt(),
+            "the prompt tier flipped under a reservation"
+        );
+    }
+
     /// HTTP providers pay no local prefill, so nothing is clamped and nothing is
     /// redistributed — the symmetric profile, unchanged from before this phase.
     #[test]
     fn an_http_turn_is_not_clamped_at_all() {
-        let p = GooseAdapter::profile_for("ollama", 32_768);
+        let p = GooseAdapter::profile_for("ollama", 32_768, NO_LIVE_CHILD);
         assert_eq!(p.system_prompt_budget, 6_000);
         assert_eq!(p.memory_token_budget, 1_500);
         assert_eq!(p.history_token_budget, 20_000);
