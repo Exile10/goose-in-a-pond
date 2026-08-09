@@ -178,6 +178,24 @@ pub fn register_giap_extensions(
         registered.push("giap-sensors".into());
     }
 
+    // Orchestration / delegation (PAI-6 P5). OFF by default -- and it is the
+    // only `ext_*` toggle that is, because turning it on means an autonomous
+    // multi-turn agent running under `GooseMode::Auto`, which is not something
+    // an install should acquire by upgrading. `Settings::default_ext_orchestrator_enabled`
+    // returns false; reusing `default_ext_enabled` here would flip that.
+    //
+    // Like giap-audit and giap-vision, the handles it needs are installed
+    // separately -- `init_orchestrator_deps` in pond-server. Unlike them, the
+    // reason is ordering rather than scope: the orchestrator wraps the very
+    // adapter this registration runs before.
+    if settings.ext_orchestrator_enabled {
+        register_builtin_extension(
+            pond_core::mcp::domain::tool_group::ORCHESTRATOR_EXTENSION,
+            pond_mcp_server::spawn_orchestrator_server,
+        );
+        registered.push(pond_core::mcp::domain::tool_group::ORCHESTRATOR_EXTENSION.into());
+    }
+
     // Store for GooseAdapter to read
     let _ = REGISTERED_EXTENSIONS.set(registered.clone());
 

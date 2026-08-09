@@ -54,6 +54,21 @@ pub const CORE_RATIONALE: &str = "draft=safety, memory=cross-cutting, system=tim
 /// The extension providing the discovery / enable escape hatch.
 pub const TOOLKIT_EXTENSION: &str = "giap-toolkit";
 
+/// The extension carrying the `delegate` tool — PAI-6 P5.
+///
+/// A const rather than a bare literal for the same reason [`TOOLKIT_EXTENSION`]
+/// is one: three crates spell this name (the catalog here, the registration in
+/// `pond-adapters-goose`, the server's own `get_info` in `pond-mcp-server`) and a
+/// typo in any of them is silent — an extension name that matches no catalog
+/// entry is treated as a user-added MCP server, which selection never narrows.
+///
+/// Note that consts are also what made this programme's extension count wrong
+/// twice: `grep -c '"giap-[a-z-]*"'` cannot see one. The cross-check in
+/// `crates/pond-core/tests/registration_matches_the_catalog.rs` resolves the
+/// known consts by name and FAILS on any argument it cannot resolve, rather than
+/// skipping it.
+pub const ORCHESTRATOR_EXTENSION: &str = "giap-orchestrator";
+
 /// Separator between the extension name and the tool name in a prefixed tool
 /// name (`giap-weather__get_forecast`). Goose's own convention.
 pub const TOOL_NAME_SEPARATOR: &str = "__";
@@ -165,6 +180,14 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
                       history.",
         core: false,
     },
+    ToolGroup {
+        extension: ORCHESTRATOR_EXTENSION,
+        description: "Handing a piece of work to a named specialist agent that runs on its own \
+                      and reports back: research a question in depth, work through a longer task \
+                      under a saved role, or have a second agent do something while this \
+                      conversation carries on.",
+        core: false,
+    },
 ];
 
 /// Look up a group by extension name.
@@ -203,6 +226,16 @@ pub fn groups_denied_to_guests() -> &'static [&'static str] {
         "giap-vision",
         // Sensor history: when the house was empty, when somebody came home.
         "giap-sensors",
+        // PAI-6 P5, and the one entry on this list that is not about reading
+        // personal data. `delegate` starts an autonomous multi-turn agent under
+        // `GooseMode::Auto` on the household's own hardware, and on a Jetson
+        // that is the single GPU the household's next turn needs. An
+        // unidentified speaker asking a question is one turn; an unidentified
+        // speaker delegating is minutes of unattended work nobody in the house
+        // asked for. The child inherits the guest's scope, so no personal data
+        // leaks -- what is being withheld here is the household's device, not
+        // its memory.
+        ORCHESTRATOR_EXTENSION,
     ]
 }
 
@@ -254,6 +287,15 @@ pub fn groups_denied_to_subagents() -> &'static [&'static str] {
         // Schedules future work that will run with the household's authority,
         // long after the delegation that created it has ended.
         "giap-schedule",
+        // PAI-6 P5. `DelegationAuthority::may_delegate()` already answers no at
+        // depth 1 and `delegate()` refuses with `DepthExceeded`, so this entry
+        // is not what stops a subagent spawning a subagent. It is what stops the
+        // tool being OFFERED to one: a role that names `giap-orchestrator` under
+        // a parent that holds it would otherwise put a tool in a child's prompt
+        // whose every call is refused. On a 2-4B model that is not a harmless
+        // schema -- it is an invitation to spend the turn budget discovering
+        // that it does not work.
+        ORCHESTRATOR_EXTENSION,
     ]
 }
 
@@ -419,6 +461,31 @@ mod guest_denylist_tests {
                  mechanism each one breaks"
             );
         }
+    }
+
+    /// PAI-6 P5. The delegation surface itself is withheld from both a guest
+    /// and a subagent, for two different mechanisms, and neither list is the
+    /// other's backstop -- so both are named here.
+    ///
+    /// Removing either entry is legal code that this test turns into a failure
+    /// with the reason attached. Neither removal would break any other test:
+    /// a subagent's `delegate` call is refused by `DelegationDepth` anyway, and
+    /// a guest's is refused by nothing at all today except the handler's own
+    /// scope check, which is deliberately a SECOND enforcement rather than the
+    /// only one.
+    #[test]
+    fn neither_a_guest_nor_a_subagent_is_offered_the_delegation_tool() {
+        assert!(
+            groups_denied_to_subagents().contains(&ORCHESTRATOR_EXTENSION),
+            "{ORCHESTRATOR_EXTENSION} must be withheld from subagents: depth already refuses the \
+             call, so offering the tool only spends a small model's turn budget discovering that"
+        );
+        assert!(
+            groups_denied_to_guests().contains(&ORCHESTRATOR_EXTENSION),
+            "{ORCHESTRATOR_EXTENSION} must be withheld from guests: delegating starts minutes of \
+             unattended agent work on the household's own GPU, which an unidentified speaker has \
+             no business commanding"
+        );
     }
 
     /// Vacuity control. If the list grew to cover every group, a subagent would

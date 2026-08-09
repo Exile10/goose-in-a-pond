@@ -12867,6 +12867,15 @@ mod tests {
         "giap-memory__recall_memories",
         "giap-memory__save_memory",
         "giap-schedule__create_schedule",
+        // PAI-6 P5. Direct dispatch runs a tool with no chat turn, so there is
+        // no engine session in `_meta` and therefore no `DelegationAuthority` to
+        // resolve. `delegate` would refuse every such call today -- but the
+        // reason it must never be ALLOWLISTED is stronger than that: an entry
+        // here is reachable by any paired client and by any sandboxed MCP App
+        // iframe, and a delegation is a multi-turn autonomous agent run on the
+        // household's own hardware. The thing that decides what it may do is the
+        // caller's authority, and this path has no caller.
+        "giap-orchestrator__delegate",
     ];
 
     #[test]

@@ -854,6 +854,22 @@ pub struct Settings {
     /// Enable the sensor tools module (query stored IoT sensor readings).
     #[serde(default = "Settings::default_ext_enabled")]
     pub ext_sensor_enabled: bool,
+
+    /// Enable the orchestration tools module — the `delegate` tool, which runs a
+    /// saved role as a child agent (PAI-6 P5).
+    ///
+    /// **Its own default fn, and the only extension toggle that is OFF.** Every
+    /// other `ext_*` field reuses [`Settings::default_ext_enabled`], which
+    /// returns `true`; reusing it here would ship autonomous multi-turn agents,
+    /// running under `GooseMode::Auto` with no approval path, switched on for
+    /// every existing install on the next upgrade. Nobody asked for that by
+    /// upgrading.
+    ///
+    /// The direction is also the safe one for a read failure: a settings load
+    /// that fails falls back to [`Settings::default`], and a `settings` row that
+    /// is absent leaves this field at its default, so both mean OFF.
+    #[serde(default = "Settings::default_ext_orchestrator_enabled")]
+    pub ext_orchestrator_enabled: bool,
 }
 
 impl Default for Settings {
@@ -972,6 +988,9 @@ impl Default for Settings {
             ext_finance_enabled: true,
             ext_discovery_enabled: true,
             ext_sensor_enabled: true,
+            // The one `false` in this block, and it must stay a literal `false`
+            // rather than `Self::default_ext_enabled()`. See the field.
+            ext_orchestrator_enabled: false,
         }
     }
 }
@@ -1307,6 +1326,17 @@ impl Settings {
     }
     fn default_ext_enabled() -> bool {
         true
+    }
+
+    /// PAI-6 P5. Deliberately NOT [`Self::default_ext_enabled`].
+    ///
+    /// A separate function rather than a `#[serde(default)]` (which would also
+    /// give `false`) so that the divergence is a named thing a reader trips over
+    /// while adding the next toggle, and so that
+    /// `the_orchestrator_toggle_defaults_off_by_its_own_route` has a symbol to
+    /// assert on rather than only a value.
+    fn default_ext_orchestrator_enabled() -> bool {
+        false
     }
 }
 
@@ -2039,6 +2069,7 @@ mod tests {
             "ext_knowledge_enabled",
             "ext_memory_enabled",
             "ext_news_enabled",
+            "ext_orchestrator_enabled",
             "ext_schedule_enabled",
             "ext_sensor_enabled",
             "ext_system_enabled",
@@ -2147,6 +2178,68 @@ mod tests {
             "settings field count mismatch: {} serialized vs {} classified",
             keys.len(),
             UI_WIRED.len() + HEADLESS_BY_DESIGN.len()
+        );
+    }
+
+    /// PAI-6 P5. `ext_orchestrator_enabled` is the one extension toggle that
+    /// defaults OFF, and there are three separate places it could silently
+    /// become `true`, so all three are asserted.
+    ///
+    /// The third is the one that matters: every other `ext_*` field reuses
+    /// [`Settings::default_ext_enabled`], which returns `true`. Writing
+    /// `#[serde(default = "Settings::default_ext_enabled")]` on this field —
+    /// the obvious copy-paste — compiles, passes the disposition test above,
+    /// passes the settings roundtrip in `pond-infra`, and turns delegation on
+    /// for every install that upgrades into it.
+    #[test]
+    fn the_orchestrator_toggle_defaults_off_by_its_own_route() {
+        assert!(
+            !Settings::default().ext_orchestrator_enabled,
+            "the struct default is what a FAILED settings read produces via \
+             unwrap_or_default(); on failure, access narrows"
+        );
+
+        let from_nothing: Settings =
+            serde_json::from_str("{}").expect("every Settings field has a serde default");
+        assert!(
+            !from_nothing.ext_orchestrator_enabled,
+            "the serde default is what a settings payload written before this field existed \
+             deserializes to -- i.e. every pond that upgrades into this release"
+        );
+
+        assert!(
+            Settings::default_ext_enabled(),
+            "vacuity control: the shared extension default really does return true, so \
+             `default_ext_orchestrator_enabled` diverging from it is a decision and not a \
+             coincidence"
+        );
+        assert!(!Settings::default_ext_orchestrator_enabled());
+    }
+
+    /// The other direction, and the one that survives a field being added
+    /// tomorrow: derive the set of extension toggles that default off from the
+    /// serialized struct rather than from a list written today.
+    ///
+    /// It fails if `ext_orchestrator_enabled` flips on (the set empties), and it
+    /// fails if a NEW `ext_*` toggle arrives defaulting off (the set grows) —
+    /// which is a decision that should be made deliberately rather than
+    /// inherited from this one.
+    #[test]
+    fn exactly_one_extension_toggle_ships_switched_off() {
+        let value = serde_json::to_value(Settings::default()).expect("serialize Settings");
+        let off: Vec<&str> = value
+            .as_object()
+            .expect("Settings serializes to a JSON object")
+            .iter()
+            .filter(|(k, v)| k.starts_with("ext_") && *v == &serde_json::Value::Bool(false))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(
+            off,
+            vec!["ext_orchestrator_enabled"],
+            "the set of extension toggles that ship OFF changed. Adding one is a deliberate \
+             decision; losing `ext_orchestrator_enabled` from it means delegation is now on by \
+             default on every install"
         );
     }
 }

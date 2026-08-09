@@ -561,6 +561,14 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
+        upsert!(
+            "ext_orchestrator_enabled",
+            if settings.ext_orchestrator_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
 
         tx.commit().await?;
         Ok(())
@@ -952,6 +960,10 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "ext_audit_enabled" => s.ext_audit_enabled = value == "true",
         "ext_vision_enabled" => s.ext_vision_enabled = value == "true",
         "ext_sensor_enabled" => s.ext_sensor_enabled = value == "true",
+        // PAI-6 P5. `value == "true"` is the right comparison here rather than a
+        // parse-with-fallback: anything unreadable in that column is not "true",
+        // so a corrupt row leaves delegation OFF.
+        "ext_orchestrator_enabled" => s.ext_orchestrator_enabled = value == "true",
         _ => {} // unknown key — ignore
     }
 }

@@ -17,8 +17,8 @@
 //!   field and no depth field, and it is `deny_unknown_fields`, so a payload
 //!   that tries to carry one is refused rather than silently ignored. The
 //!   child's scope is computed from the parent's by [`RolePersonalData`], an
-//!   enum with **no variant that widens**: it either inherits the parent's
-//!   scope unchanged or drops to [`ProfileScope::Guest`].
+//!   enum whose variants are INTENDED not to widen: each either inherits the
+//!   parent's scope unchanged or drops to [`ProfileScope::Guest`].
 //!
 //!   That second sentence is a claim about the variants that exist today, and
 //!   a claim is not an invariant. Adding a third variant carrying
@@ -27,9 +27,21 @@
 //!   `Household` child, and leaves every test in the crate green — the guards
 //!   iterate [`RolePersonalData::ALL`], and serde's variant list, which is what
 //!   keeps `ALL` honest, cannot see a skipped variant. That mutation was
-//!   applied and run. So the computed scope goes through [`child_scope`], which
-//!   clamps any candidate the parent does not contain down to `Guest`. **The
-//!   enum states the intent; the clamp is the boundary.**
+//!   applied and run. So the enum does not decide the child's scope:
+//!   [`ChildScope`] does, and it clamps any candidate the parent does not
+//!   contain down to `Guest`.
+//!
+//!   **The enum states the intent; the type is the boundary.** That sentence
+//!   used to end "the clamp is the boundary", and it was an overclaim for a
+//!   day: the clamp was a free function called from one line of
+//!   [`DelegationAuthority::delegate`], and deleting that line left the whole
+//!   pond-core suite green — every guard called the clamp directly, so nothing
+//!   observed it through `delegate` (recorded vacuity shape 2, verified by
+//!   mutation 2026-08-09). It is a type now for exactly that reason:
+//!   [`TaskSpec`]'s scope field holds a `ChildScope`, whose only production
+//!   constructor is [`ChildScope::for_role`], whose field is private to a
+//!   module `delegate` is outside of. Dropping the clamp is a type error rather
+//!   than a green diff.
 //! - **A child cannot forge a depth.** [`DelegationDepth`] wraps a private
 //!   `u8`, derives no `Deserialize` and no `Default`, and its only increment is
 //!   a private method. The one public path from an authority to a deeper
@@ -57,11 +69,11 @@
 //! GIAP-owned key that Goose and `pond-api`'s recipe runner both ignore.
 //! PAI-6 P1 adds no migration and no table.
 
-#[cfg(test)]
-use crate::mcp::domain::tool_group::TOOLKIT_EXTENSION;
 use crate::mcp::domain::tool_group::{
     group_of_tool, groups_denied_to_guests, groups_denied_to_subagents,
 };
+#[cfg(test)]
+use crate::mcp::domain::tool_group::{ORCHESTRATOR_EXTENSION, TOOLKIT_EXTENSION};
 use crate::models::services::context::model_class::runs_on_this_device;
 use crate::user_data::domain::profile::ProfileScope;
 use chrono::{DateTime, Utc};
@@ -189,15 +201,30 @@ impl DelegationDepth {
 
 /// What a role may do with the speaker's personal data.
 ///
-/// **There is no variant that widens.** That is the whole design: the child's
-/// profile scope is a function of the parent's, and this enum's codomain
-/// contains only the parent's own scope and [`ProfileScope::Guest`]. A role
-/// cannot ask to run as `Household`, and it cannot ask to run as a named owner
-/// — which would be meaningless anyway, since which member is speaking is a
-/// per-turn fact and a role is a stored config.
+/// **No variant is INTENDED to widen**, and read that word. The design is that
+/// the child's profile scope is a function of the parent's, and that this
+/// enum's codomain contains only the parent's own scope and
+/// [`ProfileScope::Guest`]: a role cannot ask to run as `Household`, and it
+/// cannot ask to run as a named owner — which would be meaningless anyway,
+/// since which member is speaking is a per-turn fact and a role is a stored
+/// config.
 ///
-/// `Inherit` is the serde default, and that is safe for the same reason: it
-/// produces the parent's scope exactly, never more.
+/// **That is an intent, not a guarantee, and this type is the wrong place to
+/// look for the guarantee.** Nothing stops the next person adding a variant
+/// whose [`narrow`](Self::narrow) arm returns [`ProfileScope::Household`]; the
+/// compiler is happy to let them, and if the variant carries `#[serde(skip)]`
+/// then [`ALL`](Self::ALL) and every guard that iterates it are blind to it
+/// too. Verified by mutation, 2026-08-09: all 893 tests green while a `Guest`
+/// parent produced a `Household` child. What refuses that is [`ChildScope`],
+/// which clamps the value this enum produces down to something the parent
+/// contains, whatever shape it turned out to be — and which the compiler makes
+/// unavoidable, because a `ChildScope` is the only thing that fits
+/// [`TaskSpec`]'s scope field and [`ChildScope::for_role`] is its only
+/// production constructor.
+///
+/// `Inherit` is the serde default, and that is safe for the same reason every
+/// other arm is: not because the arm is written correctly, but because the
+/// clamp sees the value afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RolePersonalData {
@@ -231,10 +258,9 @@ impl RolePersonalData {
     /// this array, and is quantified over by nothing. Adding one with a
     /// `narrow` arm returning [`ProfileScope::Household`] left all 893 tests
     /// green while a `Guest` parent produced a `Household` child (verified by
-    /// mutation, 2026-08-09). What refuses that today is
-    /// [`child_scope`], which clamps the value instead of enumerating the
-    /// enum. Treat `ALL` as the set of inputs the guards SEE, never as the set
-    /// of inputs that are SAFE.
+    /// mutation, 2026-08-09). What refuses that today is [`ChildScope`], which
+    /// clamps the value instead of enumerating the enum. Treat `ALL` as the set
+    /// of inputs the guards SEE, never as the set of inputs that are SAFE.
     ///
     /// [`RedactionKind::ALL`]: crate::security::domain::redaction::RedactionKind::ALL
     /// [`OnboardingStep::ALL`]: crate::user_data::domain::onboarding::OnboardingStep::ALL
@@ -242,11 +268,12 @@ impl RolePersonalData {
 
     /// The scope this role ASKS the child to run under, given the parent's.
     ///
-    /// Not the scope the child gets: [`DelegationAuthority::delegate`] puts
-    /// this through [`child_scope`], which is where "never wider" is actually
-    /// enforced. The distinction matters because this `match` is the one place
-    /// a future variant could express a widening, and the compiler is happy to
-    /// let it.
+    /// Not the scope the child gets, and the return type is the tell: a
+    /// `ProfileScope` does not fit [`TaskSpec`]'s scope field. The only caller
+    /// is [`ChildScope::for_role`], which clamps this answer to something the
+    /// parent contains and is where "never wider" is actually enforced. The
+    /// distinction matters because this `match` is the one place a future
+    /// variant could express a widening, and the compiler is happy to let it.
     ///
     /// This `match` is exhaustive, so a new variant breaks the build here. The
     /// arm you are about to write should also be added to [`ALL`](Self::ALL) —
@@ -602,13 +629,18 @@ impl DelegationAuthority {
         // that sends nonsense is told the nonsense, not the depth cap -- and
         // either way nothing is constructed.
         let depth = self.depth.deeper()?;
-        let scope = child_scope(role.personal_data.narrow(&self.scope), &self.scope);
-        // `&scope`, not `&self.scope`. The subtraction is keyed on the CHILD's
-        // scope, and the only case where the two differ is the exact one this
-        // exists for: a Household parent running a `personal_data: deny` role.
-        // Pass the parent's and that case -- a Guest-scoped child still holding
-        // `giap-memory` -- is precisely what survives.
-        let tool_groups = narrow_child_groups(&role.tool_groups, &self.tool_groups, &scope);
+        // The ONLY producer of the value that fills `TaskSpec::scope`, and the
+        // only one there can be: see [`ChildScope`]. This line cannot be
+        // simplified to `role.personal_data.narrow(&self.scope)` -- that is a
+        // `ProfileScope`, and the field is not.
+        let scope = ChildScope(role.personal_data.narrow(&self.scope));
+        // `scope.get()`, not `&self.scope`. The subtraction is keyed on the
+        // CHILD's scope, and the only case where the two differ is the exact
+        // one this exists for: a Household parent running a
+        // `personal_data: deny` role. Pass the parent's and that case -- a
+        // Guest-scoped child still holding `giap-memory` -- is precisely what
+        // survives.
+        let tool_groups = narrow_child_groups(&role.tool_groups, &self.tool_groups, scope.get());
         Ok(TaskSpec {
             id: uuid::Uuid::new_v4().to_string(),
             role: role.name.clone(),
@@ -624,38 +656,128 @@ impl DelegationAuthority {
     }
 }
 
-/// The scope a child actually runs under: what the role asked for, clamped to
-/// the parent.
+/// A one-type module, so that the clamp cannot be bypassed rather than merely
+/// documented.
 ///
-/// **This is PAI-6 invariant 1 for the profile axis, and it is the enforcement
-/// of it.** Every other statement of that invariant in this module is a claim
-/// about [`RolePersonalData`]'s codomain — true today, and true only for as
-/// long as somebody remembers it while adding a variant. The guard that was
-/// supposed to catch a widening variant iterates [`RolePersonalData::ALL`],
-/// and a variant carrying `#[serde(skip)]` never reaches that list: it
-/// compiles, it turns a `Guest` parent into a `Household` child, and the whole
-/// suite stays green. That mutation was applied and run.
+/// Rust privacy is per-MODULE, not per-type. A `struct ChildScope(ProfileScope)`
+/// declared beside [`DelegationAuthority::delegate`] has a field `delegate` can
+/// fill directly, so the newtype would be a comment with a type signature.
+/// Inside this module the field is private to this module, `delegate` is
+/// outside it, and [`ChildScope::for_role`] is the only constructor the rest of
+/// the file can reach.
 ///
-/// So the invariant is enforced on the VALUE rather than on the enum. A
-/// candidate the parent does not contain is not a narrowing of anything, and
-/// the answer is [`ProfileScope::Guest`] — which reaches no row at all — not
-/// the candidate. **On failure, access narrows.** Refusing outright was the
-/// alternative and is worse here: the caller is a stored role read off disk, a
-/// refusal turns a widening bug into an outage on every delegation, and the
-/// narrowest possible scope is already a correct answer.
-///
-/// Pure and total on purpose, in the same shape as `classify_outcome` and
-/// `build_child_plan` in the adapter. It can therefore be exercised over every
-/// ordered pair of scope shapes, INCLUDING the pairs no `RolePersonalData`
-/// variant can produce today — which is the entire point, because the pairs a
-/// future variant produces are exactly the ones today's guards cannot see.
-fn child_scope(candidate: ProfileScope, parent: &ProfileScope) -> ProfileScope {
-    if candidate.is_within(parent) {
-        candidate
-    } else {
-        ProfileScope::Guest
+/// The module exists rather than a free function because a free function has a
+/// CALL SITE, and a call site can be deleted. This one was, in a mutation that
+/// left all 899 pond-core tests green (2026-08-09).
+mod child_scope {
+    use super::{ProfileScope, RolePersonalData};
+
+    /// The scope a child actually runs under: what the role asked for, clamped
+    /// to the parent.
+    ///
+    /// **This is PAI-6 invariant 1 for the profile axis, and it is the
+    /// enforcement of it.** Every other statement of that invariant in this
+    /// module is a claim about [`RolePersonalData`]'s codomain — true today,
+    /// and true only for as long as somebody remembers it while adding a
+    /// variant. The guard that was supposed to catch a widening variant
+    /// iterates [`RolePersonalData::ALL`], and a variant carrying
+    /// `#[serde(skip)]` never reaches that list: it compiles, it turns a
+    /// `Guest` parent into a `Household` child, and the whole suite stays
+    /// green. That mutation was applied and run.
+    ///
+    /// So the invariant is enforced on the VALUE rather than on the enum. A
+    /// candidate the parent does not contain is not a narrowing of anything,
+    /// and the answer is [`ProfileScope::Guest`] — which reaches no row at all
+    /// — not the candidate. **On failure, access narrows.** Refusing outright
+    /// was the alternative and is worse here: the caller is a stored role read
+    /// off disk, a refusal turns a widening bug into an outage on every
+    /// delegation, and the narrowest possible scope is already a correct
+    /// answer.
+    ///
+    /// # Why it is a type and not a function
+    ///
+    /// It was a function, `child_scope(candidate, parent)`, and the clamp
+    /// worked: break its body and the sweep next door fails. What did not work
+    /// was the WIRE. Deleting the call from `delegate` — one line, leaving
+    /// `role.personal_data.narrow(&self.scope)` behind — left the entire
+    /// pond-core suite green, because every guard called the clamp directly and
+    /// nothing observed it through `delegate`. No behavioural test could have
+    /// caught it either, and that is the part worth understanding before
+    /// "simplifying" this back: for both variants that exist today the clamp is
+    /// the identity, so `delegate` behaves identically with and without it. The
+    /// defect is invisible until the day somebody adds the widening variant,
+    /// which is the day it matters.
+    ///
+    /// A type fixes precisely that. [`super::TaskSpec`]'s scope field is a
+    /// `ChildScope`, `ChildScope`'s field is private to this module, and
+    /// [`for_role`](Self::for_role) is its only constructor outside it. There
+    /// is no line to delete: deleting it does not compile.
+    ///
+    /// **rustc will offer you the way out, and it is wrong.** The error for
+    /// the deleted call reads "help: try wrapping the expression in
+    /// `ChildScope` (its field is private, but it's local to this crate and its
+    /// privacy can be changed)". Taking that suggestion — making the field
+    /// `pub(super)`, or moving this type up a module — restores the defect
+    /// exactly, and nothing downstream would fail. If a diff does it, that is
+    /// the thing to reject.
+    #[derive(Debug, Clone)]
+    pub(super) struct ChildScope(pub(super) ProfileScope);
+
+    impl ChildScope {
+        /// The one production path from a role and a parent to a child's scope.
+        ///
+        /// It takes the [`RolePersonalData`] rather than the scope that role
+        /// asks for, so there is no candidate argument a caller could supply
+        /// twice. `clamp(c, &c)` is the identity and would have been the one
+        /// silent way to defeat a `clamp(candidate, parent)` signature from the
+        /// call site; here the only scope `delegate` holds is the parent's, so
+        /// defeating this needs a widened parent written out in
+        /// `delegate` — a literal `ProfileScope::Household` in the one function
+        /// whose whole job is narrowing — and
+        /// `no_role_setting_can_widen_the_parents_scope` fails on it.
+        pub(super) fn for_role(personal_data: RolePersonalData, parent: &ProfileScope) -> Self {
+            Self::clamp(personal_data.narrow(parent), parent)
+        }
+
+        /// Pure and total, in the same shape as `classify_outcome` and
+        /// `build_child_plan` in the adapter, so it can be exercised over every
+        /// ordered pair of scope shapes — INCLUDING the pairs no
+        /// [`RolePersonalData`] variant can produce today, which is the entire
+        /// point, because the pairs a future variant produces are exactly the
+        /// ones today's guards cannot see.
+        fn clamp(candidate: ProfileScope, parent: &ProfileScope) -> Self {
+            if candidate.is_within(parent) {
+                Self(candidate)
+            } else {
+                Self(ProfileScope::Guest)
+            }
+        }
+
+        /// The sweep's door onto [`clamp`](Self::clamp), and `#[cfg(test)]` on
+        /// purpose.
+        ///
+        /// The sweep has to hand the clamp candidate/parent pairs that no role
+        /// can produce, so it needs the two-argument form. Production must not
+        /// have it: a two-argument constructor reachable from `delegate` is one
+        /// a later edit can call as `clamp(c, &c)`, which type-checks, reads
+        /// like narrowing, and is the identity. Deleting this `#[cfg(test)]` to
+        /// use it in production is a visible two-step edit rather than a
+        /// simplification, and it is the thing to say no to in review.
+        #[cfg(test)]
+        pub(super) fn clamp_unpaired(candidate: ProfileScope, parent: &ProfileScope) -> Self {
+            Self::clamp(candidate, parent)
+        }
+
+        /// Read the clamped scope. There is no `into_inner` and no `From`: a
+        /// `ProfileScope` handed back by value is one a caller could put
+        /// somewhere a `ChildScope` was wanted.
+        pub(super) fn get(&self) -> &ProfileScope {
+            &self.0
+        }
     }
 }
+
+use self::child_scope::ChildScope;
 
 /// The child's tool groups: the intersection, minus what the child's own scope
 /// denies, minus what no subagent may hold.
@@ -680,10 +802,12 @@ fn child_scope(candidate: ProfileScope, parent: &ProfileScope) -> ProfileScope {
 fn narrow_child_groups(
     requested: &BTreeSet<String>,
     parent: &BTreeSet<String>,
-    child_scope: &ProfileScope,
+    // Named `child` rather than `child_scope` because [`child_scope`] is now a
+    // module, and a parameter wearing a module's name reads like a path.
+    child: &ProfileScope,
 ) -> BTreeSet<String> {
     let mut groups: BTreeSet<String> = requested.intersection(parent).cloned().collect();
-    if child_scope.excludes_everything() {
+    if child.excludes_everything() {
         for denied in groups_denied_to_guests() {
             groups.remove(*denied);
         }
@@ -707,7 +831,12 @@ pub struct TaskSpec {
     instructions: String,
     inputs: serde_json::Value,
     parent_session_id: String,
-    scope: ProfileScope,
+    /// A [`ChildScope`], not a `ProfileScope`, and that is the whole of PAI-6
+    /// invariant 1 on the profile axis. `ChildScope`'s field is private to its
+    /// own module, so the only value that fits here is one that went through
+    /// the clamp. Widen this back to `ProfileScope` and the clamp becomes
+    /// deletable in one green line again — which is what it was.
+    scope: ChildScope,
     tool_groups: BTreeSet<String>,
     depth: DelegationDepth,
     max_turns: u32,
@@ -736,7 +865,7 @@ impl TaskSpec {
     }
 
     pub fn profile_scope(&self) -> &ProfileScope {
-        &self.scope
+        self.scope.get()
     }
 
     /// The groups the child may use. **Empty means empty.**
@@ -792,7 +921,11 @@ impl TaskSpec {
     pub fn child_authority(&self, child_session_id: impl Into<String>) -> DelegationAuthority {
         DelegationAuthority {
             session_id: child_session_id.into(),
-            scope: self.scope.clone(),
+            // Unwrapped deliberately: this is the child's own authority, and
+            // the parent of whatever IT delegates to. The clamp is applied
+            // afresh against this scope by the next `delegate`, so carrying the
+            // wrapper down would say "already clamped" about the wrong parent.
+            scope: self.scope.get().clone(),
             tool_groups: self.tool_groups.clone(),
             depth: self.depth,
         }
@@ -921,7 +1054,7 @@ impl TaskRun {
 /// mechanism strings are the reason each entry may not be deleted casually —
 /// they name the control that is absent for a subagent, not a preference.
 #[cfg(test)]
-const GROUPS_NO_SUBAGENT_MAY_HOLD: [(&str, &str); 5] = [
+const GROUPS_NO_SUBAGENT_MAY_HOLD: [(&str, &str); 6] = [
     (
         "giap-draft",
         "approve_draft and reject_draft DECIDE, and the gate that would check who decided \
@@ -948,6 +1081,12 @@ const GROUPS_NO_SUBAGENT_MAY_HOLD: [(&str, &str); 5] = [
         "giap-schedule",
         "schedules future work that runs with the household's authority long after the \
          delegation that created it has ended",
+    ),
+    (
+        ORCHESTRATOR_EXTENSION,
+        "delegate is refused for a child anyway -- may_delegate() is false at depth 1 -- so this \
+         one is withheld for the OTHER reason the list exists: a tool a 2-4B model can see but \
+         cannot use costs turns off a budget of six discovering that",
     ),
 ];
 
@@ -1217,11 +1356,24 @@ mod scope_inheritance_tests {
     /// Every scope shape, plus a SECOND owner.
     ///
     /// Two members are INCOMPARABLE — neither contains the other — and that is
-    /// the pair [`child_scope`] exists for, so a fixture with one `Owner`
-    /// cannot produce the input the clamp is being tested on.
+    /// the pair [`ChildScope`] exists for, so a fixture with one `Owner` cannot
+    /// produce the input the clamp is being tested on.
+    ///
+    /// The second id is [`SECOND_EXEMPLAR_OWNER_ID`] rather than a string
+    /// written out here. It was written out here, and the two copies could
+    /// silently converge: replacing this literal with [`EXEMPLAR_OWNER_ID`]
+    /// deleted the incomparable pair from the sweep below and left all 899
+    /// tests green (verified by mutation, 2026-08-09). Sharing the constant
+    /// puts both fixtures under one distinctness guard,
+    /// `profile::scope_lattice_tests::the_second_owner_really_is_a_different_member`.
+    ///
+    /// [`SECOND_EXEMPLAR_OWNER_ID`]: crate::user_data::domain::profile::SECOND_EXEMPLAR_OWNER_ID
+    /// [`EXEMPLAR_OWNER_ID`]: crate::user_data::domain::profile::EXEMPLAR_OWNER_ID
     fn candidate_scopes() -> Vec<ProfileScope> {
         let mut scopes = ProfileScope::every_shape();
-        scopes.push(ProfileScope::Owner("a-different-member".into()));
+        scopes.push(ProfileScope::Owner(
+            crate::user_data::domain::profile::SECOND_EXEMPLAR_OWNER_ID.to_string(),
+        ));
         scopes
     }
 
@@ -1229,39 +1381,48 @@ mod scope_inheritance_tests {
     /// over every ordered pair of scope shapes rather than over the pairs
     /// today's [`RolePersonalData`] happens to produce.
     ///
-    /// That distinction is the whole reason [`child_scope`] was lifted out of
-    /// `delegate` as a pure function. The guards next door iterate
+    /// That distinction is the whole reason the clamp is a pure function rather
+    /// than three lines inside `delegate`. The guards next door iterate
     /// [`RolePersonalData::ALL`], and a variant carrying `#[serde(skip)]` never
     /// enters that array: it widened a `Guest` parent to `Household` with all
     /// 893 tests green. This test does not need to know what variants exist.
+    ///
+    /// It reaches the clamp through [`ChildScope::clamp_unpaired`], which is
+    /// `#[cfg(test)]`: production has no two-argument constructor, on purpose.
+    /// See [`ChildScope`].
     #[test]
     fn no_candidate_scope_survives_a_parent_that_does_not_contain_it() {
-        let mut clamped = 0;
+        let mut clamped_incomparable_owners = 0;
         let mut passed_through = 0;
         for candidate in candidate_scopes() {
             for parent in candidate_scopes() {
-                let result = child_scope(candidate.clone(), &parent);
+                let clamped = ChildScope::clamp_unpaired(candidate.clone(), &parent);
+                let result = clamped.get();
                 assert!(
                     result.is_within(&parent),
-                    "child_scope({candidate:?}, {parent:?}) gave {result:?}, which the parent \
-                     does not contain"
+                    "the clamp of {candidate:?} under {parent:?} gave {result:?}, which the \
+                     parent does not contain"
                 );
                 if candidate.is_within(&parent) {
                     assert_eq!(
-                        result, candidate,
-                        "child_scope narrowed {candidate:?} under {parent:?}, which already \
+                        result, &candidate,
+                        "the clamp narrowed {candidate:?} under {parent:?}, which already \
                          contained it -- a role that inherits must inherit"
                     );
                     passed_through += 1;
                 } else {
                     assert_eq!(
                         result,
-                        ProfileScope::Guest,
-                        "child_scope({candidate:?}, {parent:?}) answered something other than \
-                         Guest for a candidate the parent does not contain. On failure, access \
-                         narrows"
+                        &ProfileScope::Guest,
+                        "the clamp of {candidate:?} under {parent:?} answered something other \
+                         than Guest for a candidate the parent does not contain. On failure, \
+                         access narrows"
                     );
-                    clamped += 1;
+                    if let (ProfileScope::Owner(a), ProfileScope::Owner(b)) = (&candidate, &parent)
+                    {
+                        assert_ne!(a, b, "is_within says one owner is outside itself");
+                        clamped_incomparable_owners += 1;
+                    }
                 }
             }
         }
@@ -1269,13 +1430,22 @@ mod scope_inheritance_tests {
         // than as a count: a count would have to be recomputed every time
         // `every_shape()` grows, and would then be pinned to whatever the code
         // did that day.
+        //
+        // The narrowing side is counted at the resolution that matters rather
+        // than as a bare `clamped > 0`. Two DIFFERENT owners are the one input
+        // class this clamp exists for, and `clamped > 0` is satisfied without
+        // it by Household-under-Guest and Owner-under-Guest — so the sweep
+        // could stop seeing the incomparable pair entirely and still pass,
+        // which is exactly what collapsing the two owner ids did.
         assert!(
-            clamped > 0,
-            "no pair was clamped, so this test never exercised the narrowing branch"
+            clamped_incomparable_owners > 0,
+            "the sweep never clamped a pair of DIFFERENT owners, so it did not exercise the \
+             input class the clamp exists for. Either `candidate_scopes` stopped producing two \
+             distinct owners, or two members stopped being incomparable"
         );
         assert!(
             passed_through > 0,
-            "every pair was clamped, so child_scope could be `|_, _| Guest` and pass"
+            "every pair was clamped, so the clamp could be `|_, _| Guest` and pass"
         );
     }
 
@@ -1286,15 +1456,58 @@ mod scope_inheritance_tests {
     fn one_members_scope_is_not_reachable_from_anothers() {
         let jerry = ProfileScope::Owner("jerry".into());
         let liz = ProfileScope::Owner("liz".into());
-        assert_eq!(child_scope(liz.clone(), &jerry), ProfileScope::Guest);
-        assert_eq!(child_scope(jerry.clone(), &liz), ProfileScope::Guest);
-        assert_eq!(
-            child_scope(ProfileScope::Household, &jerry),
-            ProfileScope::Guest
-        );
+        let clamp = |candidate: ProfileScope, parent: &ProfileScope| {
+            ChildScope::clamp_unpaired(candidate, parent).get().clone()
+        };
+        assert_eq!(clamp(liz.clone(), &jerry), ProfileScope::Guest);
+        assert_eq!(clamp(jerry.clone(), &liz), ProfileScope::Guest);
+        assert_eq!(clamp(ProfileScope::Household, &jerry), ProfileScope::Guest);
         // And the control: within is left alone, so the clamp is not a blanket.
-        assert_eq!(child_scope(jerry.clone(), &jerry), jerry);
-        assert_eq!(child_scope(jerry.clone(), &ProfileScope::Household), jerry);
+        assert_eq!(clamp(jerry.clone(), &jerry), jerry);
+        assert_eq!(clamp(jerry.clone(), &ProfileScope::Household), jerry);
+    }
+
+    /// The WIRE, which is the thing every other test in this module cannot
+    /// see.
+    ///
+    /// The sweep above proves the clamp clamps. Nothing proved that `delegate`
+    /// still calls it: replacing
+    /// `ChildScope::for_role(role.personal_data, &self.scope)` with
+    /// `role.personal_data.narrow(&self.scope)` left all 899 pond-core tests
+    /// green (verified by mutation, 2026-08-09), and no behavioural test could
+    /// have caught it, because for both variants that exist today the clamp is
+    /// the identity. That is recorded vacuity shape 2 — a gate tested while its
+    /// wiring is unguarded — and it is the shape that shipped PAI-1 P5 inert
+    /// for a whole phase.
+    ///
+    /// So the wire is held by the TYPE, and this test is how that fact fails
+    /// loudly rather than silently. `only_compiles_while_the_field_is_clamped`
+    /// borrows [`TaskSpec`]'s scope field as a [`ChildScope`]. Widen the field
+    /// back to `ProfileScope` — the edit that makes the mutation above compile
+    /// again — and this stops compiling, so the revert is a build break naming
+    /// this test, not a green diff. The runtime half is a control: it fails if
+    /// the field and the accessor ever stop being the same value.
+    #[test]
+    fn the_specs_scope_can_only_be_a_value_that_went_through_the_clamp() {
+        fn only_compiles_while_the_field_is_clamped(spec: &TaskSpec) -> &ChildScope {
+            &spec.scope
+        }
+
+        for personal_data in RolePersonalData::ALL {
+            for parent_scope in parents() {
+                let parent = DelegationAuthority::root(
+                    "s1",
+                    parent_scope.clone(),
+                    ["giap-weather".to_string()].into_iter().collect(),
+                );
+                let spec = parent.delegate(&role(personal_data), request()).unwrap();
+                assert_eq!(
+                    only_compiles_while_the_field_is_clamped(&spec).get(),
+                    spec.profile_scope(),
+                    "TaskSpec's clamped field and its accessor disagree"
+                );
+            }
+        }
     }
 
     /// PAI-6 invariant 1, for the profile axis. Exhaustive over both the enum

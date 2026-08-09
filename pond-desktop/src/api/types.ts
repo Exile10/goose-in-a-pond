@@ -192,6 +192,12 @@ export interface Settings {
   ext_audit_enabled?: boolean;
   ext_vision_enabled?: boolean;
   ext_sensor_enabled?: boolean;
+  /**
+   * Delegation to saved agent roles. The one extension toggle that ships OFF —
+   * turning it on lets the assistant run a second agent autonomously on this
+   * device. Read it as `=== true`, never `!== false`: absent must mean off.
+   */
+  ext_orchestrator_enabled?: boolean;
 
   // API keys are NOT on Settings (PAI-2 P2). They live in the secret store and
   // are managed through listSecretKeys / setSecret / deleteSecret; the server
