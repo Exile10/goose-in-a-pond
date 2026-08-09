@@ -182,7 +182,18 @@ Proposals are delivered to **the profile's devices**, not broadcast. That means:
   `sqlite_notification_queue` (so a phone that was off gets it on reconnect) and `fcm_push_relay`
   (so a backgrounded phone wakes and fetches the content locally, with nothing sensitive crossing
   Google's infrastructure — the existing design is already right for this).
-- Device resolution comes from PAI-1: profile → paired devices → push tokens.
+- Device resolution comes from PAI-1: profile → paired devices → push tokens. **That chain does not
+  exist in code, re-verified 2026-08-09, and this is P5's real prerequisite rather than a detail.**
+  `PushToken` is `{device_id, token, platform, updated_at}` and `PairingCode` is
+  `{code, expires_at}`; neither carries a `profile_id`, and no migration adds one. PAI-1 is stamped
+  COMPLETE, so the ledger row will not warn you — the missing rung is recorded separately in
+  `00-checklist.md`'s 2026-08-05 entry, which says device pairing capturing a household member "gets
+  its own phase" and that `paired_device_profile` and PAI-7's "that profile's devices" both become
+  live when it lands. Until then invariant 4 (proposals are addressed to a profile, never broadcast)
+  has no mechanism at the delivery end: `broadcast_notification_sender.rs` says in its own doc
+  comment that targeted `send()` is exercised by nothing and every production producer calls
+  `broadcast()`. Landing P5 against the current types would either broadcast a targeted proposal or
+  silently deliver nothing.
 
 **Unprompted speech** is opt-in and tightly gated: only when that profile is identified as present,
 only outside quiet hours, only for categories the user enabled, never mid-conversation, and never

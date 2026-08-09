@@ -50,19 +50,31 @@ Installable via `routes.rs:225-230`, with repo-relative script args anchored at 
 `record_egress` (`lib.rs:15-30`). Base URLs are consts with a `with_base_url()` used only by wiremock
 tests.
 
-**Secret storage.** `SecretRepository` (`security/ports/secret.rs:10-21`) with
-`SecretKind::{ApiKey, OAuthFlow, Generic}`. Values are never returned through REST.
+**Secret storage.** `SecretRepository` (`security/ports/secret.rs`, the trait and nothing else) with
+`SecretKind::{ApiKey, OAuthFlow, Generic}` — which lives in `security/domain/secret.rs`, a different
+module. Re-verified 2026-08-09; the citation used to name one file for both and there is no enum in
+the port file. Values are never returned through REST.
 
 ### 1.3 What is missing structurally
 
-- **No inbound ingestion of any kind.** Webhooks are outbound only
-  (`pond-infra-scheduler/src/webhook_executor.rs:34-55`); there is no receiver. Grep for an
-  `/ingest` or `/context/` route returns nothing.
+- **No inbound ingestion of any kind.** Webhooks are outbound only; there is no receiver. Grep for
+  an `/ingest` or `/context/` route returns nothing — still true, re-verified 2026-08-09. **But the
+  citation was pointing at dead code**, which matters because P7 will want to wire its receiver
+  beside the sender: `pond-infra-scheduler`'s `WebhookTaskExecutor` is re-exported by that crate's
+  `lib.rs` and constructed nowhere, and has been dead since PAI-2 P3 found it on 2026-08-05. The
+  live outbound path is the `TaskKind::Webhook` arm in `pond-server/src/schedule_executors.rs`,
+  which carries its own comment saying there are two webhook executors and they are not
+  interchangeable.
 - **GOTG pushes almost nothing.** The mobile companion has no dedicated crate and no dedicated
   endpoints — it drives the same REST API with `client_type: "gotg"`. It sends exactly two things:
   its push token (`routes.rs:140-143`) and a heartbeat. No contacts, location, calendar, photos or
-  health data. The only upload paths in the whole API are `/transcribe`, `/faces/*` and chat image
-  attachments.
+  health data. **Correction, 2026-08-09 — this sentence used to say the only upload paths in the
+  whole API are `/transcribe`, `/faces/*` and chat image attachments, and that was already known to
+  be false**: `00-checklist.md` recorded the undercount on 2026-08-04 and the correction was never
+  propagated back here. Grepping `Multipart` in `routes.rs` today finds `transcribe`,
+  `calibrate_wake_word`, `read_face_multipart`, `register_face_handler` and `identify_face_handler`.
+  It matters because PAI-1 and PAI-2 both lean on that absence argument, and an absence argument
+  that undercounts its own surface is worth nothing. Grep the symbol before you reuse the claim.
 - **Memory has no notion of provenance beyond `source`**, and no per-item retention.
 
 ---
@@ -113,7 +125,13 @@ pub struct ContextItem {
 `Option<String>` for an owner becomes `None` everywhere (see PAI-1 §1.2); this type does not offer
 that option.
 
-Migration `0039_context_sources.sql` and `0040_context_items.sql`. Retention is governed by
+Migration `0041_context_sources.sql` and `0042_context_items.sql`. **Re-verified 2026-08-09, and the
+numbers moved:** this document was written when 0039 and 0040 were free, and PAI-5 has since taken
+both — `0039_reasoning_tokens.sql` (P2) and `0040_session_thinking.sql` (P6, `bc3aa9df`). Confirm the
+next free number by listing `crates/pond-infra/migrations/system/` rather than trusting this line,
+which will rot again. And whatever the number, the migration must work against a database that
+ALREADY HAS ROWS: every install after the first is an upgrade, and a migration that only works on an
+empty file works exactly once. Retention is governed by
 `retention_events_by_category` and `retention_sensitive_days` — both of which already exist and are
 currently **headless** (`settings.rs` `HEADLESS_BY_DESIGN`). This workstream gives them a UI, because
 "how long does GIAP keep my e-mail" is not a setting to hide.
