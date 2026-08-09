@@ -28,6 +28,18 @@
 //!   [`MAX_DELEGATION_DEPTH`]. A subagent is handed its authority; it never
 //!   builds one.
 //!
+//! # Invariant 1's third axis, and the accident that satisfies it
+//!
+//! The invariant reads "not tools, not profile, not **network**", and this
+//! module has nothing to say about network. That axis holds today by accident
+//! of another workstream: PAI-2's network mode is a process-global
+//! `static RwLock<NetworkMode>` in [`crate::shared::services::egress`], so an
+//! in-process child physically cannot hold a mode its parent does not. The
+//! accident expires the day a child runs out of process, or the day network
+//! mode becomes per-session — at which point the axis needs a field on
+//! [`TaskSpec`] like the other two. Nothing will notice on its own: there is no
+//! test here to fail, because there is not yet anything to test.
+//!
 //! # What is deliberately NOT here
 //!
 //! No persistence. A role is stored inside the YAML of an existing row in the
@@ -170,9 +182,33 @@ pub enum RolePersonalData {
 }
 
 impl RolePersonalData {
+    /// Every variant, in the same shape as [`RedactionKind::ALL`] and
+    /// [`OnboardingStep::ALL`] elsewhere in this crate.
+    ///
+    /// It exists so a guard can iterate the ENUM rather than an array literal
+    /// of today's variants. That distinction is not cosmetic: the scope guard
+    /// used to loop over `[Inherit, Deny]` written out by hand, so a third
+    /// variant whose [`narrow`](Self::narrow) arm returned
+    /// [`ProfileScope::Household`] compiled, widened a `Guest` parent to the
+    /// whole household, and failed nothing.
+    ///
+    /// A list can go stale, so it is not trusted on its own —
+    /// `all_lists_every_variant_the_enum_actually_has` derives the real variant
+    /// set from the enum's own `Deserialize` impl and fails if this array is
+    /// missing one.
+    ///
+    /// [`RedactionKind::ALL`]: crate::security::domain::redaction::RedactionKind::ALL
+    /// [`OnboardingStep::ALL`]: crate::user_data::domain::onboarding::OnboardingStep::ALL
+    pub const ALL: [RolePersonalData; 2] = [RolePersonalData::Inherit, RolePersonalData::Deny];
+
     /// The child's scope, given the parent's.
     ///
     /// Guaranteed by construction to satisfy `result.is_within(parent)`.
+    ///
+    /// This `match` is exhaustive, so a new variant breaks the build here. The
+    /// arm you are about to write must also be added to [`ALL`](Self::ALL), or
+    /// every scope guard in this module will keep iterating a set that does not
+    /// contain it.
     fn narrow(self, parent: &ProfileScope) -> ProfileScope {
         match self {
             RolePersonalData::Inherit => parent.clone(),
@@ -409,6 +445,25 @@ impl DelegationAuthority {
     /// post-guest-subtraction set, not the catalog. Passing the catalog here
     /// would make every subsequent intersection a no-op, which is the shape
     /// PAI-1 P5 shipped and had to repair.
+    ///
+    /// # Why this stays `pub` even though its only argument is a string
+    ///
+    /// It takes a session id as a bare string and stamps
+    /// [`DelegationDepth::ROOT`] on it, and nothing in the tree can answer "is
+    /// this session a subagent's?" — no migration carries a parent, depth or
+    /// subagent column. So on its face anything in the workspace can mint an
+    /// authority claiming to be a root turn.
+    ///
+    /// What makes that safe is that an authority is a **ceiling, not a key**.
+    /// P3 closed the live path from the other end: the edge builds the turn's
+    /// authority inside the turn with [`for_turn`](Self::for_turn), and
+    /// `TurnAuthorityRegistry` refuses a spawn whose parent turn is not live, so
+    /// a hand-made authority opens no door. And what a forged one could still
+    /// ask for is bounded here —
+    /// `forged_authority_tests::the_widest_authority_anyone_could_forge_still_cannot_widen_a_child`
+    /// mints the widest authority expressible and shows the child it produces
+    /// still loses every group no subagent may hold and still cannot delegate
+    /// again.
     pub fn root(
         session_id: impl Into<String>,
         scope: ProfileScope,
@@ -860,6 +915,86 @@ mod depth_tests {
 }
 
 #[cfg(test)]
+mod forged_authority_tests {
+    use super::*;
+    use crate::mcp::domain::tool_group::TOOL_GROUPS;
+
+    fn request() -> TaskRequest {
+        TaskRequest {
+            role: "r".to_string(),
+            instructions: "go".to_string(),
+            inputs: serde_json::Value::Null,
+        }
+    }
+
+    /// [`DelegationAuthority::root`] is a public depth-0 constructor keyed only
+    /// on a session-id string, and nothing in this tree can answer "is that
+    /// session a subagent's?" — no migration carries a parent, depth or
+    /// subagent column. So anything in the workspace can hand itself an
+    /// authority that claims to be a root turn.
+    ///
+    /// It stays `pub` — pond-adapters-goose's orchestrator tests construct one
+    /// — and this is the test that says why that is now safe. Two reasons, and
+    /// only the second is testable from `pond-core`:
+    ///
+    /// 1. P3 closed the live path from the other end. The edge builds the
+    ///    turn's authority inside the turn via
+    ///    [`DelegationAuthority::for_turn`], and `TurnAuthorityRegistry` refuses
+    ///    a spawn whose parent turn is not live, so a hand-made authority is not
+    ///    a key to anything.
+    /// 2. An authority is a **ceiling, not a capability**. What is asserted
+    ///    below: mint the widest one expressible — the entire tool catalog, the
+    ///    whole household, depth 0 — and the child it can produce still loses
+    ///    every group no subagent may hold, and still cannot delegate again.
+    #[test]
+    fn the_widest_authority_anyone_could_forge_still_cannot_widen_a_child() {
+        let every_group: BTreeSet<String> = TOOL_GROUPS
+            .iter()
+            .map(|g| g.extension.to_string())
+            .collect();
+        let forged = DelegationAuthority::root(
+            "a-session-id-that-nobody-checked",
+            ProfileScope::Household,
+            every_group.clone(),
+        );
+        let role = AgentRole::new(
+            "r",
+            "go",
+            every_group.clone(),
+            RolePersonalData::Inherit,
+            3,
+            0.5,
+        )
+        .unwrap();
+        let spec = forged.delegate(&role, request()).unwrap();
+
+        for denied in groups_denied_to_subagents() {
+            assert!(
+                !spec.tool_groups().contains(*denied),
+                "a forged root authority handed a child `{denied}`, which no subagent may hold"
+            );
+            assert!(!spec.grants_tool(&format!("{denied}__anything")));
+        }
+
+        // The forged root spends its one level immediately, so the tree it can
+        // start is one deep however it was constructed.
+        assert_eq!(spec.depth().get(), 1);
+        let child = spec.child_authority("child");
+        assert!(!child.may_delegate());
+        assert!(matches!(
+            child.delegate(&role, request()),
+            Err(DelegationRefused::DepthExceeded { .. })
+        ));
+
+        // Vacuity control: the delegation really happened and really granted
+        // something, so the refusals above are about the denylist and the depth
+        // cap rather than about nothing having been produced.
+        assert!(spec.grants_tool("giap-weather__get_forecast"));
+        assert!(!spec.tool_groups().is_empty());
+    }
+}
+
+#[cfg(test)]
 mod scope_inheritance_tests {
     use super::*;
 
@@ -891,12 +1026,62 @@ mod scope_inheritance_tests {
         ]
     }
 
+    /// `RolePersonalData::ALL` is what every scope guard in this module
+    /// iterates, so a variant missing from it is a variant nothing checks for
+    /// widening. An array literal cannot see a variant added tomorrow, and a
+    /// hand-written second list is just another array literal — so derive the
+    /// truth from the enum itself. serde's `unknown variant` error names every
+    /// variant the `Deserialize` impl knows about, and that impl is generated
+    /// from the enum, so a new variant turns up here without anyone
+    /// remembering this file.
+    #[test]
+    fn all_lists_every_variant_the_enum_actually_has() {
+        let message = serde_json::from_str::<RolePersonalData>("\"definitely_not_a_variant\"")
+            .expect_err("that is not a variant")
+            .to_string();
+        // `unknown variant `x`, expected one of `inherit`, `deny`` for three or
+        // more, and `expected `inherit` or `deny`` for two. Both shapes are a
+        // run of backticked names whose first entry is the bad one.
+        let from_the_enum: Vec<&str> = message.split('`').skip(1).step_by(2).skip(1).collect();
+        assert!(
+            !from_the_enum.is_empty(),
+            "no variant names could be read out of serde's message {message:?}, so this test \
+             can no longer see a new variant at all"
+        );
+        let listed: Vec<String> = RolePersonalData::ALL
+            .iter()
+            .map(|v| {
+                serde_json::to_string(v)
+                    .expect("a unit variant serializes")
+                    .trim_matches('"')
+                    .to_string()
+            })
+            .collect();
+        for variant in &from_the_enum {
+            assert!(
+                listed.iter().any(|l| l == variant),
+                "RolePersonalData has a variant `{variant}` that RolePersonalData::ALL does not \
+                 list. Every scope guard in this module iterates ALL, so an unlisted variant is \
+                 one that nothing tests for widening"
+            );
+        }
+        assert_eq!(
+            from_the_enum.len(),
+            listed.len(),
+            "RolePersonalData::ALL and the enum disagree on how many variants exist: \
+             {from_the_enum:?} against {listed:?}"
+        );
+    }
+
     /// PAI-6 invariant 1, for the profile axis. Exhaustive over both the enum
-    /// and the three scope shapes, because there are only two variants and the
-    /// point is that NEITHER can widen.
+    /// and the three scope shapes, and the enum half is exhaustive because it
+    /// iterates [`RolePersonalData::ALL`] rather than an array literal of the
+    /// variants that happened to exist the day it was written — which is what
+    /// it used to do, and which is why a third variant returning
+    /// `ProfileScope::Household` could widen a Guest parent and fail nothing.
     #[test]
     fn no_role_setting_can_widen_the_parents_scope() {
-        for personal_data in [RolePersonalData::Inherit, RolePersonalData::Deny] {
+        for personal_data in RolePersonalData::ALL {
             for parent_scope in parents() {
                 let parent = DelegationAuthority::root(
                     "s1",
@@ -945,9 +1130,57 @@ mod scope_inheritance_tests {
             ProfileScope::Guest,
             ["giap-weather".to_string()].into_iter().collect(),
         );
-        for personal_data in [RolePersonalData::Inherit, RolePersonalData::Deny] {
+        for personal_data in RolePersonalData::ALL {
             let spec = parent.delegate(&role(personal_data), request()).unwrap();
             assert_eq!(spec.profile_scope(), &ProfileScope::Guest);
+        }
+    }
+
+    /// The narrowing happens in `delegate`, but the value a running child
+    /// actually holds comes from `TaskSpec::child_authority` — a second copy,
+    /// and therefore a second chance to widen.
+    ///
+    /// The only test that read `child_authority(...).profile_scope()` used a
+    /// HOUSEHOLD parent, and Household is the widest scope there is, so its
+    /// fixture could not tell a copied scope from a hardcoded maximal one:
+    /// replacing `self.scope.clone()` with `ProfileScope::Household` handed
+    /// every subagent the whole household and left the suite green. Every
+    /// parent shape here is one that answer fails, and the claim is stated with
+    /// [`ProfileScope::is_within`] rather than by writing the lattice out again.
+    #[test]
+    fn a_childs_own_authority_is_the_specs_and_never_wider() {
+        // Deliberately wider than the role asks for, so the tool assertion
+        // below can tell "the spec's set" from "the parent's set".
+        let parent_groups: BTreeSet<String> = ["giap-weather".to_string(), "giap-news".to_string()]
+            .into_iter()
+            .collect();
+        for personal_data in RolePersonalData::ALL {
+            for parent_scope in parents() {
+                let parent =
+                    DelegationAuthority::root("s1", parent_scope.clone(), parent_groups.clone());
+                let spec = parent.delegate(&role(personal_data), request()).unwrap();
+                let child = spec.child_authority("s1-child");
+
+                assert_eq!(
+                    child.profile_scope(),
+                    spec.profile_scope(),
+                    "a {personal_data:?} child of a {parent_scope:?} parent runs under a scope \
+                     its own spec never granted"
+                );
+                assert!(
+                    child.profile_scope().is_within(&parent_scope),
+                    "child_authority widened {parent_scope:?} to {:?}",
+                    child.profile_scope()
+                );
+                assert_eq!(
+                    child.tool_groups(),
+                    spec.tool_groups(),
+                    "a child's authority holds tools its spec did not"
+                );
+                assert!(!child.tool_groups().contains("giap-news"));
+                assert_eq!(child.depth(), spec.depth());
+                assert_eq!(child.session_id(), "s1-child");
+            }
         }
     }
 }
@@ -1117,7 +1350,7 @@ mod tool_narrowing_tests {
                 parent_scope.clone(),
                 groups(&["giap-draft", "giap-weather"]),
             );
-            for personal_data in [RolePersonalData::Inherit, RolePersonalData::Deny] {
+            for personal_data in RolePersonalData::ALL {
                 let role = AgentRole::new(
                     "r",
                     "go",
@@ -1415,6 +1648,76 @@ giap_role:
         }
     }
 
+    /// The test above does not test `deny_unknown_fields`, and I only found
+    /// that out by deleting the attribute and watching all four of its cases
+    /// stay green. Every one of them fails on `tool_groups` being REQUIRED —
+    /// including the `toolgroups:` typo, which errors on the missing
+    /// `tool_groups` rather than on the unknown one.
+    ///
+    /// These cases keep `tool_groups` valid and misspell one of the four
+    /// OPTIONAL fields, which is the only shape the attribute is load-bearing
+    /// for. Without it `personaldata: deny` parses as
+    /// `RolePersonalData::Inherit` — the child silently keeping the parent's
+    /// entire personal scope, on exactly the input a human got wrong. That is
+    /// the widening default this whole module exists to refuse.
+    #[test]
+    fn a_typo_on_an_optional_field_refuses_rather_than_silently_defaulting() {
+        for (typo, field, consequence) in [
+            (
+                "personaldata: deny",
+                "personal_data",
+                "the child keeps the parent's entire personal scope",
+            ),
+            (
+                "personal-data: deny",
+                "personal_data",
+                "the child keeps the parent's entire personal scope",
+            ),
+            (
+                "max_turn: 4",
+                "max_turns",
+                "the child gets the default turn budget instead of the one written down",
+            ),
+            (
+                "contextfraction: 0.3",
+                "context_fraction",
+                "the child claims the default share of the parent's window",
+            ),
+            (
+                "instruction: go",
+                "instructions",
+                "the child runs the recipe's prompt instead of the role's",
+            ),
+        ] {
+            let yaml = format!("instructions: go\ngiap_role:\n  tool_groups: []\n  {typo}\n");
+            let parsed = AgentRole::from_recipe_yaml("r", &yaml);
+            assert!(
+                matches!(parsed, Err(RoleError::Yaml { .. })),
+                "`{typo}` was accepted as a role block, so `{field}` is unset and defaults: \
+                 {consequence}. Got {parsed:?}"
+            );
+        }
+    }
+
+    /// Vacuity control for the test above: the correctly-spelled fields parse
+    /// AND take effect, so the refusals next door are about the spelling rather
+    /// than about the optional fields being unreadable in general.
+    #[test]
+    fn the_correctly_spelled_optional_fields_parse_and_take_effect() {
+        let yaml = "instructions: from the recipe\n\
+                    giap_role:\n  \
+                      tool_groups: []\n  \
+                      personal_data: deny\n  \
+                      max_turns: 4\n  \
+                      context_fraction: 0.3\n  \
+                      instructions: from the block\n";
+        let role = AgentRole::from_recipe_yaml("r", yaml).unwrap().unwrap();
+        assert_eq!(role.personal_data(), RolePersonalData::Deny);
+        assert_eq!(role.max_turns(), 4);
+        assert!((role.context_fraction() - 0.3).abs() < f32::EPSILON);
+        assert_eq!(role.instructions(), "from the block");
+    }
+
     /// Vacuity control for the test above: the well-formed sibling of those
     /// cases must parse, or the assertions are only proving that YAML is hard.
     #[test]
@@ -1437,6 +1740,56 @@ giap_role:
         let yaml = "instructions: go\ngiap_role:\n  tool_groups: []\n";
         let role = AgentRole::from_recipe_yaml("r", yaml).unwrap().unwrap();
         assert!(role.requested_tool_groups().is_empty());
+    }
+
+    /// The turn budget and its cap, pinned to the literals the way
+    /// `depth_tests::the_depth_cap_is_one` pins its own.
+    ///
+    /// Every other assertion about these two numbers is self-referential —
+    /// `MAX_ROLE_MAX_TURNS + 1` for the refusal, `== DEFAULT_ROLE_MAX_TURNS`
+    /// for the default — so they follow the constants wherever the constants
+    /// go. 6 -> 25 and 12 -> 100 together left the whole file green, and the
+    /// comment next door claiming the default is "not Goose's 25" could not
+    /// see 25.
+    #[test]
+    fn the_role_turn_budget_and_its_cap_are_the_numbers_the_design_chose() {
+        assert_eq!(
+            DEFAULT_ROLE_MAX_TURNS, 6,
+            "the unstated turn budget moved. Goose's own default is 25, which is minutes of \
+             wall clock on an Orin with the parent's turn blocked behind it — if this is now \
+             25, say why in the constant's doc"
+        );
+        assert_eq!(
+            MAX_ROLE_MAX_TURNS, 12,
+            "the largest budget a stored role may ask for moved. It is a refusal rather than a \
+             clamp, so raising it is a decision about how long a subagent may hold the GPU"
+        );
+        assert!(
+            DEFAULT_ROLE_MAX_TURNS <= MAX_ROLE_MAX_TURNS,
+            "the default turn budget is above its own cap, so every role that states nothing \
+             is refused"
+        );
+    }
+
+    /// The default share of the parent's window, pinned to its literal and
+    /// wired to the behaviour that reads it — nothing read
+    /// `DEFAULT_CONTEXT_FRACTION` at all, so 0.5 -> 1.0 was green, and 1.0 is a
+    /// role claiming the parent's WHOLE history budget.
+    #[test]
+    fn an_unstated_context_fraction_is_half_the_parents_budget() {
+        assert!(
+            (DEFAULT_CONTEXT_FRACTION - 0.5).abs() < f32::EPSILON,
+            "the default context fraction moved to {DEFAULT_CONTEXT_FRACTION}; at 1.0 a role \
+             that states nothing claims the parent's entire history budget"
+        );
+        let role =
+            AgentRole::from_recipe_yaml("r", "instructions: go\ngiap_role:\n  tool_groups: []\n")
+                .unwrap()
+                .unwrap();
+        assert!(
+            (role.context_fraction() - DEFAULT_CONTEXT_FRACTION).abs() < f32::EPSILON,
+            "a role that states no context_fraction did not get the documented default"
+        );
     }
 
     #[test]
@@ -1621,6 +1974,19 @@ mod concurrency_tests {
         assert_eq!(
             max_concurrent_subagents("openai"),
             REMOTE_SUBAGENT_CONCURRENCY
+        );
+    }
+
+    /// The remote number, pinned to its literal. The test above asserts only
+    /// `> 1` and an equality against the constant itself, so 3 -> 64 was green
+    /// — and an unmeasured constant is exactly the kind that drifts, because
+    /// there is no measurement to contradict it.
+    #[test]
+    fn the_remote_concurrency_number_is_the_one_that_was_written_down() {
+        assert_eq!(
+            REMOTE_SUBAGENT_CONCURRENCY, 3,
+            "the hosted-provider concurrency moved. Nothing has measured it, so a change here \
+             is a guess replacing a guess and belongs in the constant's doc"
         );
     }
 
