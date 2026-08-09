@@ -38,7 +38,7 @@
 //! |---|---|
 //! | 1 — never wider | [`child_extensions`] intersects THREE independent sets and populates `available_tools` explicitly; an extension whose tool list comes out empty is dropped, never passed as `vec![]` |
 //! | 2 — `summon`/`orchestrator`/`todo` stay stripped | [`GOOSE_STRIPPED_BUILTINS`] is now the single source for `goose_agent.rs`'s strip list, this file's plan-time refusal, and the post-run audit in [`stripped_builtins_present`] — which is read AFTER the drain, not before the run |
-//! | 3 — concurrency 1 on this device | ONE process-wide [`Semaphore`] ([`process_subagent_permits`]), acquired with [`subagent_permits`] permits on the only path that can start a child, AND with [`parent_turn_permits`] by every on-device parent turn ([`claim_device_for_turn`]) — P4, because a child does not queue behind a parent's provider call, it overwrites the one retained KV prefix. A synchronous child INHERITS its own parent's claim rather than deadlocking against it |
+//! | 3 — concurrency 1 on this device | ONE process-wide [`Semaphore`] ([`process_subagent_permits`]), acquired with [`subagent_permits`] permits on the only path that can start a child, AND with [`parent_turn_permits`] by every on-device parent turn ([`claim_device_for_turn`]) — P4, because a child does not queue behind a parent's provider call, it overwrites the one retained KV prefix. A synchronous child INHERITS its own parent's claim rather than deadlocking against it, and inheriting means taking the parent hold's own one-permit semaphore, so SIBLINGS of one delegating turn still run one at a time |
 //! | 3b — a subagent is a second claim on one window | [`DeviceLedger`] holds each live child's `context_fraction` for as long as the run does, and `GooseAdapter::turn_profile` shrinks the parent's `history_token_budget` — and only that — by what it finds there |
 //! | 4 — child turns never reach the parent's history | the drain loop keeps only the text of the child's last completed assistant TURN ([`ChildTurns`]), and [`ChildRunner::release`] deletes the child's engine session afterwards |
 //! | 5 — cancellable, and a parent cancels its children | one [`CancellationToken`] per run in the registry, plus `cancel_children_of` |
@@ -222,12 +222,34 @@ pub struct DeviceLedger {
     /// not return to zero. A parent whose budget never fully came back would
     /// lose recall for the rest of the conversation, silently.
     reservations: Mutex<HashMap<String, Vec<f32>>>,
-    /// GIAP session id -> how many of its live turns hold the device permit.
+    /// GIAP session id -> its live turns' hold on the device.
+    device_holders: Mutex<HashMap<String, DeviceHoldState>>,
+}
+
+/// One session's device hold, and the semaphore its children share.
+struct DeviceHoldState {
+    /// How many live turns of this session hold the device permit.
     ///
     /// A count rather than a flag because one session can have two streams
     /// open (a voice turn and a chat turn), and the second one ending must not
     /// tell `spawn` that the first has released the device.
-    device_holders: Mutex<HashMap<String, usize>>,
+    holders: usize,
+    /// ONE permit, taken by every child that INHERITS this hold.
+    ///
+    /// P4 gave an inheriting child `needed = 0`, and `acquire_many_owned(0)`
+    /// never blocks. But a device hold is a property of the SESSION, so every
+    /// child of the delegating turn inherited it: N concurrent delegations
+    /// from one parent turn all ran at once on the one GPU, overwriting each
+    /// other's retained KV prefix. That is invariant 3 with its on-device half
+    /// deleted, by the very pass written to avoid the deadlock — and the
+    /// ledger already models the state it breaks in, since `reservations`
+    /// holds a `Vec` of live children per session.
+    ///
+    /// A child must not queue behind its own PARENT (which is blocked inside a
+    /// tool call, not talking to the provider) and must still queue behind its
+    /// SIBLINGS. Those are two different questions, so they are two different
+    /// semaphores rather than two readings of one.
+    children: Arc<Semaphore>,
 }
 
 /// The one ledger on this pond. See [`DeviceLedger`] for why it is not a
@@ -244,7 +266,7 @@ impl DeviceLedger {
         self.reservations.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn lock_holders(&self) -> std::sync::MutexGuard<'_, HashMap<String, usize>> {
+    fn lock_holders(&self) -> std::sync::MutexGuard<'_, HashMap<String, DeviceHoldState>> {
         self.device_holders
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -279,10 +301,17 @@ impl DeviceLedger {
 
     /// Record that a turn of `giap_session_id` holds the device permit.
     fn hold_device(self: &Arc<Self>, giap_session_id: &str) -> DeviceHold {
-        *self
-            .lock_holders()
+        let mut holders = self.lock_holders();
+        let state = holders
             .entry(giap_session_id.to_string())
-            .or_insert(0) += 1;
+            .or_insert_with(|| DeviceHoldState {
+                holders: 0,
+                // One. Siblings of one delegating turn serialise against each
+                // other exactly as any two on-device children do.
+                children: Arc::new(Semaphore::new(1)),
+            });
+        state.holders += 1;
+        drop(holders);
         DeviceHold {
             ledger: Arc::clone(self),
             session_id: giap_session_id.to_string(),
@@ -291,12 +320,29 @@ impl DeviceLedger {
 
     /// Whether a live turn of this session already holds the device permit.
     ///
-    /// This is what stops a synchronous delegation deadlocking against its own
-    /// parent — see [`claim_device_for_turn`].
+    /// Diagnostics and tests. **`spawn` deliberately does not read this**: a
+    /// `bool` answers "may this child skip the queue" when the question is
+    /// *which* queue, and answering the first is what let every child of one
+    /// delegating turn run at once. [`inherited_child_permits`](Self::inherited_child_permits)
+    /// answers the second.
     pub fn session_holds_device(&self, giap_session_id: &str) -> bool {
         self.lock_holders()
             .get(giap_session_id)
-            .is_some_and(|held| *held > 0)
+            .is_some_and(|state| state.holders > 0)
+    }
+
+    /// The semaphore an inheriting child of this session must take a permit
+    /// from, or `None` when no live turn of it holds the device.
+    ///
+    /// `Some` is not a free pass. It is a semaphore of ONE, so a child never
+    /// queues behind the parent that spawned it and always queues behind its
+    /// siblings — see [`DeviceHoldState::children`], which is the regression
+    /// this returns a semaphore rather than a `bool` to prevent.
+    pub fn inherited_child_permits(&self, giap_session_id: &str) -> Option<Arc<Semaphore>> {
+        self.lock_holders()
+            .get(giap_session_id)
+            .filter(|state| state.holders > 0)
+            .map(|state| Arc::clone(&state.children))
     }
 
     /// Live children of this session. Diagnostics and tests only.
@@ -345,13 +391,19 @@ impl Drop for DeviceHold {
     fn drop(&mut self) {
         let mut holders = self.ledger.lock_holders();
         let empty = match holders.get_mut(&self.session_id) {
-            Some(held) => {
-                *held = held.saturating_sub(1);
-                *held == 0
+            Some(state) => {
+                state.holders = state.holders.saturating_sub(1);
+                state.holders == 0
             }
             None => false,
         };
         if empty {
+            // A child that inherited this hold and is still running keeps its
+            // own `Arc` of the sub-semaphore, so removing the entry only stops
+            // a LATER child inheriting a hold nobody has. That window — a
+            // parent's stream dropped by the client while its child runs on —
+            // is the same one inheritance has always had, and it narrows: the
+            // next child acquires from the process semaphore instead.
             holders.remove(&self.session_id);
         }
     }
@@ -603,6 +655,34 @@ impl ChildTurns {
     pub fn finish(mut self) -> (Option<String>, u32) {
         self.close_run();
         (self.last_completed, self.turns)
+    }
+}
+
+/// The whole of the drain loop's per-event decision, out here where a test can
+/// run it.
+///
+/// `GooseAdapter::run_child_agent` needs a real provider and a real Goose
+/// session store, so nothing without an engine can reach the loop that feeds
+/// [`ChildTurns`] — and the guard standing for it asserted only that certain
+/// strings appeared in that loop's source. Both defects the turn-counting fix
+/// closed can be reintroduced without moving one of those strings: closing the
+/// run after every assistant message restores P2's semantics exactly (every
+/// streamed fragment its own turn, every delegation `TurnBudgetExhausted`), and
+/// accumulating the empty string instead of the message makes every child
+/// answer nothing. Both were applied and the whole suite stayed green.
+///
+/// So the mapping lives here, driven by the `Frag` harness in
+/// `orchestrator/tests.rs` from role-tagged fragments, and the tripwire over
+/// the loop is left with the one thing that genuinely cannot be lifted: which
+/// two expressions the loop passes.
+pub fn child_stream_step(turns: &mut ChildTurns, is_assistant: bool, text: &str) {
+    if is_assistant {
+        turns.assistant_message(text);
+    } else {
+        // Goose returns a tool response as a `User` message. That is the
+        // boundary between one provider call and the next, which is what a
+        // turn actually is.
+        turns.other_role_message();
     }
 }
 
@@ -1090,16 +1170,25 @@ impl Orchestrator for GooseOrchestrator {
         // `sse_semaphore` permits, four of them would take the interactive chat
         // pool down until the process restarts. Inheriting is not a relaxation
         // of invariant 3 — the parent cannot reply while its child runs.
-        let inherited = self.ledger.session_holds_device(spec.parent_session_id());
-        let needed = if inherited {
-            0
-        } else {
-            subagent_permits(&env.provider_name)
+        //
+        // What inheriting must NOT mean is `needed = 0`, which is what P4
+        // wrote. A device hold belongs to the SESSION, so every child of the
+        // delegating turn inherited it and `acquire_many_owned(0)` never
+        // blocks: three delegations issued in one parent turn ran three
+        // abreast on the one GPU. The parent's hold therefore carries a
+        // semaphore of ONE for its children to share — a child skips its
+        // parent's claim and still queues behind its siblings.
+        let (device, needed) = match self
+            .ledger
+            .inherited_child_permits(spec.parent_session_id())
+        {
+            Some(siblings) => (siblings, 1),
+            None => (self.permits.clone(), subagent_permits(&env.provider_name)),
         };
         let permit = tokio::select! {
             biased;
             _ = cancel.cancelled() => None,
-            acquired = self.permits.clone().acquire_many_owned(needed) => Some(acquired?),
+            acquired = device.acquire_many_owned(needed) => Some(acquired?),
         };
         let Some(_permit) = permit else {
             // Cancelled while queued. Nothing ran, so there is nothing to
