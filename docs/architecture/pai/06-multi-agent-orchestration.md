@@ -626,7 +626,13 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
    a Household parent's child to `Guest` cannot leave it holding `giap-memory`. The child gets the
    boundary twice: `ExtensionConfig::available_tools`, checked inside `dispatch_tool_call`, and
    its own `ShimControls` entry, published before its first provider call so the tool is never
-   even listed to it.)*
+   even listed to it.)* *(The **network** axis is named in the invariant and enforced by nothing
+   in PAI-6. It holds today by accident of PAI-2: `NETWORK_MODE` is a process-global
+   `static RwLock<NetworkMode>` in `shared/services/egress.rs`, so an in-process child cannot hold
+   a mode its parent does not. That accident expires the day a child runs out of process or
+   network mode becomes per-session, at which point the axis needs a field on `TaskSpec` like the
+   other two. Recorded in the `orchestration.rs` module doc, because there is nothing yet to
+   test and therefore nothing that will notice on its own.)*
 2. Goose's `summon`, `orchestrator` and `todo` stay stripped. **Building orchestration does not
    mean un-stripping them.** The hazard is not that a direct child-loop call bypasses the strip —
    a fresh `Agent` has no extensions to strip — it is
