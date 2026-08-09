@@ -56,6 +56,7 @@ use pond_core::shared::domain::orchestration::{
     max_concurrent_subagents, TaskRun, TaskSpec, TaskStatus, REMOTE_SUBAGENT_CONCURRENCY,
 };
 use pond_core::shared::ports::orchestrator::Orchestrator;
+use pond_core::shared::services::turn_authority::TurnAuthorityRegistry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
@@ -175,6 +176,18 @@ pub struct ChildPlan {
     pub system_prompt: String,
     pub user_message: String,
     pub extensions: Vec<ExtensionConfig>,
+    /// Every fully-qualified (`extension__tool`) name the child may call.
+    ///
+    /// PAI-6 P3. Derived from `extensions` in [`build_child_plan`] so the two
+    /// cannot disagree, and published to the child session's `ShimControls`
+    /// before the first provider call. That is the SECOND layer of invariant 1's
+    /// tool axis: `ExtensionConfig::available_tools` is checked inside
+    /// `dispatch_tool_call`, which stops a call, and this one stops the tool
+    /// being LISTED to the model at all. The shim is otherwise inert for a
+    /// child — `ShimControls::existing_session` returns `None` for a session
+    /// GIAP never chatted in, and `enforce_tools(tools, &None)` is a no-op with
+    /// no warning.
+    pub allowed_tool_names: Vec<String>,
     pub max_turns: u32,
 }
 
@@ -397,6 +410,7 @@ pub fn build_child_plan(
         system_prompt,
         user_message: child_user_message(spec),
         extensions,
+        allowed_tool_names: tool_names,
         max_turns: spec.max_turns(),
     })
 }
@@ -527,14 +541,22 @@ pub struct GooseOrchestrator {
     /// the device, not of a session, so the limit is process-wide.
     permits: Arc<Semaphore>,
     tasks: Mutex<TaskRegistry>,
+    /// The same registry `GooseAdapter` publishes each turn's authority into.
+    ///
+    /// PAI-6 P3. Two things depend on it, and both are refusals rather than
+    /// conveniences: a spec whose parent turn is no longer live does not run at
+    /// all, and a child that does run gets a token DERIVED from the parent's, so
+    /// cancelling the parent cancels its children (invariant 5's other half).
+    authorities: Arc<TurnAuthorityRegistry>,
 }
 
 impl GooseOrchestrator {
-    pub fn new(runner: Arc<dyn ChildRunner>) -> Self {
+    pub fn new(runner: Arc<dyn ChildRunner>, authorities: Arc<TurnAuthorityRegistry>) -> Self {
         Self {
             runner,
             permits: Arc::new(Semaphore::new(SUBAGENT_PERMITS)),
             tasks: Mutex::new(TaskRegistry::default()),
+            authorities,
         }
     }
 
@@ -547,6 +569,28 @@ impl GooseOrchestrator {
 #[async_trait]
 impl Orchestrator for GooseOrchestrator {
     async fn spawn(&self, spec: TaskSpec) -> Result<TaskRun> {
+        // PAI-6 P3, and the first thing checked because it is the cheapest
+        // refusal. A `TaskSpec` was authorised by a parent turn; if that turn is
+        // over, the authority behind it is stale and the only safe answer is no.
+        // This is also what makes the registry load-bearing rather than
+        // decorative: there is no `spawn` path that runs without a live parent.
+        //
+        // The token is DERIVED from the parent's rather than minted fresh, which
+        // is invariant 5's other half. Goose's own background path mints an
+        // unrelated root token and relies on a `Drop` sweep at shutdown;
+        // `child_token()` is unused anywhere in the engine.
+        let cancel = self
+            .authorities
+            .parent_turn_token(spec.parent_session_id())
+            .map(|parent| parent.child_token())
+            .ok_or_else(|| {
+                anyhow!(
+                    "no live turn holds the authority for session `{}` - refusing to run a \
+                     delegation whose parent has already ended",
+                    spec.parent_session_id()
+                )
+            })?;
+
         let env = self.runner.environment(spec.parent_session_id()).await?;
         let child_session_id = self.runner.open_child_session(spec.role()).await?;
         let plan = match build_child_plan(&spec, &child_session_id, &env) {
@@ -557,7 +601,6 @@ impl Orchestrator for GooseOrchestrator {
             }
         };
 
-        let cancel = CancellationToken::new();
         let mut run = TaskRun::started(&spec, chrono::Utc::now());
         self.with_registry(|registry| registry.insert(run.clone(), cancel.clone()));
 

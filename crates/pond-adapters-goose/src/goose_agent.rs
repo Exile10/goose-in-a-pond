@@ -262,6 +262,14 @@ pub struct GooseAdapter {
     /// provider handed to Goose — GIAP's last-mile veto over the system
     /// prompt, Goose's `<turn-context>` message injection, and the tools list.
     shim_controls: Arc<crate::provider_shim::ShimControls>,
+    /// Each live turn's [`DelegationAuthority`], keyed by the ENGINE session id
+    /// its tool calls carry. PAI-6 P3.
+    ///
+    /// Published at the point the turn's allow-set is published to
+    /// `shim_controls` and revoked when the turn's stream is dropped, so a
+    /// `delegate` tool call can only ever be authorised by a turn that is still
+    /// running. Handed to `GooseOrchestrator` so the two read the same map.
+    turn_authorities: Arc<pond_core::shared::services::turn_authority::TurnAuthorityRegistry>,
     /// Maps GIAP session IDs → Goose session IDs (Goose auto-generates its own IDs).
     goose_session_map: Mutex<HashMap<String, String>>,
     /// Goose sessions that have already had GIAP builtin extensions loaded.
@@ -505,6 +513,9 @@ impl GooseAdapter {
             last_window: Mutex::new(None),
             last_verbatim_days: Mutex::new(None),
             shim_controls: Arc::new(crate::provider_shim::ShimControls::default()),
+            turn_authorities: Arc::new(
+                pond_core::shared::services::turn_authority::TurnAuthorityRegistry::new(),
+            ),
             goose_session_map: Mutex::new(HashMap::new()),
             loaded_sessions: Mutex::new(HashSet::new()),
             tool_registry,
@@ -724,6 +735,18 @@ impl GooseAdapter {
                 0
             }
         }
+    }
+
+    /// The registry each live turn's delegation authority is published into.
+    ///
+    /// PAI-6 P3. `GooseOrchestrator` needs the SAME registry this adapter writes
+    /// to — a second one would answer `None` for every spawn and refuse every
+    /// delegation, which is the safe direction but is also a feature that does
+    /// nothing. Wiring is `GooseOrchestrator::new(runner, adapter.turn_authorities())`.
+    pub fn turn_authorities(
+        &self,
+    ) -> Arc<pond_core::shared::services::turn_authority::TurnAuthorityRegistry> {
+        self.turn_authorities.clone()
     }
 
     /// Resolve (and create if needed) the Goose-internal session for a given GIAP session ID.
@@ -3633,9 +3656,41 @@ impl GooseAdapter {
         let cancel_token = CancellationToken::new();
         let cancel_guard = cancel_token.clone().drop_guard();
 
+        // ── PAI-6 P3: this turn's delegation authority ────────────────────────
+        //
+        // The ceiling on anything this turn delegates to. Deliberately built
+        // HERE and from these two values:
+        //
+        // - `turn_scope` is `request.profile_scope`, which `resolve_turn_scope`
+        //   decided at the API edge from the session's stored identity. Nothing
+        //   a model emits reaches it, and `AgentRequest` is never deserialized
+        //   from an HTTP body, so it is not forgeable by a caller either.
+        // - `allowed_tools` is the SAME binding published to the shim two steps
+        //   up: post-selection and post-guest-subtraction. Passing the catalog,
+        //   or the set before section 6d, would make every intersection
+        //   downstream a no-op — the exact shape PAI-1 P5 shipped and had to
+        //   repair. `authority_is_built_from_the_published_allow_set` fails if
+        //   this call is ever moved above that subtraction.
+        //
+        // The lease is moved into the stream closure beside `cancel_guard`, so
+        // the authority dies with the turn: a delegation can only ever be
+        // authorised while the turn that authorised it is still running.
+        let authority_lease = self.turn_authorities.publish(
+            &goose_sid,
+            pond_core::shared::domain::orchestration::DelegationAuthority::for_turn(
+                session_id.clone(),
+                turn_scope.clone(),
+                allowed_tools.iter().map(String::as_str),
+            ),
+            cancel_token.clone(),
+        );
+
         let stream = async_stream::stream! {
             // Hold the guard — dropped when the stream is dropped → cancels token.
             let _guard = cancel_guard;
+            // Same lifetime, same reason: dropped with the stream, which revokes
+            // this turn's authority to delegate.
+            let _authority_lease = authority_lease;
 
             yield Ok(AgentStreamEvent::Status { content: "Agent working...".to_string() });
             let mut total_output_chars: usize = 0;
@@ -4373,7 +4428,14 @@ impl GooseAdapter {
     }
 
     /// Delete a child's engine session once its run is over.
+    ///
+    /// Also drops its `ShimControls` entry. That map evicts OLDEST-FIRST with no
+    /// regard for whether an entry is live, so leaving a child's entry to age
+    /// out would mean sixty-four delegations silently evicting a long-running
+    /// PARENT's allow-set — after which the parent's turns are pass-through and
+    /// a Guest's `subtract_guest_denied_tools` result goes with them. PAI-6 P3.
     pub(crate) async fn release_child_session(&self, child_session_id: &str) {
+        self.shim_controls.forget_session(child_session_id);
         if let Err(e) = self.session_manager.delete_session(child_session_id).await {
             tracing::warn!("Failed to release subagent engine session '{child_session_id}': {e}");
         }
@@ -4413,6 +4475,29 @@ impl GooseAdapter {
         // to a parent. The consequence is that the child's TOOL SET is its only
         // safety boundary, which is why `available_tools` is populated
         // explicitly and why nothing that actuates a device belongs in a role.
+        // ── PAI-6 P3: the child's second tool layer, and its prompt ───────────
+        //
+        // Published BEFORE the child's first provider call, which is the whole
+        // requirement: `ShimControls::existing_session` deliberately does not
+        // create entries, so a session GIAP never chatted in resolves to `None`
+        // and `enforce_tools(tools, &None)` is a silent no-op. A subagent is
+        // exactly that kind of session. Without this the child's only tool
+        // boundary is `ExtensionConfig::available_tools`, which is real (it
+        // refuses inside `dispatch_tool_call`) but is one layer, and it only
+        // stops the CALL — the tool is still listed to the model, which then
+        // spends turns trying it.
+        //
+        // The system override is not a nicety either. A child's prompt is the
+        // parent's static prefix plus GIAP's delegation envelope, so
+        // `enforce_system`'s `incoming.starts_with(prefix)` matches and the
+        // rebuild would discard the envelope — the turn budget, "you cannot
+        // delegate", and the exact tool names — and splice in the GLOBAL
+        // extension appendix instead. Silently: the rebuild "succeeds", so the
+        // `system_appendix_dropped` warning does not fire.
+        let child_controls = self.shim_controls.session(&plan.child_session_id);
+        child_controls.set_allowed_tools(plan.allowed_tool_names.iter().cloned().collect());
+        child_controls.set_system_override(Some(plan.system_prompt.clone()));
+
         let config = AgentConfig::new(
             self.session_manager.clone(),
             goose::config::permission::PermissionManager::instance(),

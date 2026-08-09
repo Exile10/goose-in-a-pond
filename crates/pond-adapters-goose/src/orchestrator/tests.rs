@@ -14,6 +14,7 @@ use pond_core::models::services::context::model_class::ON_DEVICE_PROVIDERS;
 use pond_core::shared::domain::orchestration::{
     AgentRole, DelegationAuthority, RolePersonalData, TaskRequest,
 };
+use pond_core::shared::services::turn_authority::TurnAuthorityLease;
 use pond_core::user_data::domain::profile::ProfileScope;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -50,6 +51,47 @@ fn spec_for(role: &AgentRole, parent_groups: &[&str]) -> TaskSpec {
         },
     )
     .expect("fixture delegation is authorised")
+}
+
+/// The GIAP session id every fixture spec names as its parent.
+const PARENT_SESSION: &str = "parent-session";
+
+/// An orchestrator whose parent turn is LIVE, published the way
+/// `GooseAdapter::chat_stream` publishes one.
+///
+/// PAI-6 P3 made this mandatory rather than incidental: `spawn` refuses a spec
+/// whose parent turn has ended, because the authority behind it is then stale.
+/// The lease has to be held by the caller for exactly as long as the parent's
+/// stream closure holds its own — which is why it comes back rather than being
+/// dropped here.
+fn live_turn(runner: Arc<dyn ChildRunner>) -> (Arc<GooseOrchestrator>, TurnAuthorityLease) {
+    let (orchestrator, lease, _token) = live_turn_with_token(runner);
+    (orchestrator, lease)
+}
+
+fn live_turn_with_token(
+    runner: Arc<dyn ChildRunner>,
+) -> (
+    Arc<GooseOrchestrator>,
+    TurnAuthorityLease,
+    CancellationToken,
+) {
+    let authorities = Arc::new(TurnAuthorityRegistry::new());
+    let token = CancellationToken::new();
+    let lease = authorities.publish(
+        "parent-goose-session",
+        DelegationAuthority::root(
+            PARENT_SESSION,
+            ProfileScope::Household,
+            ["giap-weather".to_string()].into_iter().collect(),
+        ),
+        token.clone(),
+    );
+    (
+        Arc::new(GooseOrchestrator::new(runner, authorities)),
+        lease,
+        token,
+    )
 }
 
 fn parent_tools(entries: &[(&str, &[&str])]) -> BTreeMap<String, BTreeSet<String>> {
@@ -90,6 +132,10 @@ fn extension_name(config: &ExtensionConfig) -> String {
 #[derive(Default)]
 struct FakeRunnerState {
     plans: Mutex<Vec<ChildPlan>>,
+    /// Child engine sessions this fake was asked to create. PAI-6 P3 refuses
+    /// some delegations before the engine is touched at all, and "refused" has
+    /// to be distinguishable from "ran and failed".
+    opened: Mutex<Vec<String>>,
     released: Mutex<Vec<String>>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
@@ -149,7 +195,13 @@ impl ChildRunner for FakeRunner {
 
     async fn open_child_session(&self, plan_role: &str) -> Result<String> {
         let n = self.state.session_seq.fetch_add(1, Ordering::SeqCst);
-        Ok(format!("child-{plan_role}-{n}"))
+        let id = format!("child-{plan_role}-{n}");
+        self.state
+            .opened
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(id.clone());
+        Ok(id)
     }
 
     async fn run(&self, plan: ChildPlan, cancel: CancellationToken) -> Result<ChildOutcome> {
@@ -222,7 +274,7 @@ async fn only_one_on_device_child_runs_at_a_time() {
     );
     let runner = Arc::new(FakeRunner::new(env).holding_for(60));
     let state = runner.state.clone();
-    let orchestrator = Arc::new(GooseOrchestrator::new(runner));
+    let (orchestrator, _turn) = live_turn(runner);
 
     let mut handles = Vec::new();
     for _ in 0..3 {
@@ -255,7 +307,7 @@ async fn the_overlap_detector_can_actually_see_overlap() {
     );
     let runner = Arc::new(FakeRunner::new(env).holding_for(60));
     let state = runner.state.clone();
-    let orchestrator = Arc::new(GooseOrchestrator::new(runner));
+    let (orchestrator, _turn) = live_turn(runner);
 
     let mut handles = Vec::new();
     for _ in 0..3 {
@@ -438,7 +490,7 @@ async fn a_child_that_ended_up_with_a_stripped_builtin_has_its_result_discarded(
                 .collect(),
         }),
     );
-    let orchestrator = GooseOrchestrator::new(runner);
+    let (orchestrator, _turn) = live_turn(runner);
 
     let run = orchestrator
         .spawn(spec_for(&role, &["giap-weather"]))
@@ -590,7 +642,7 @@ async fn a_child_cancelled_mid_run_reports_cancelled_not_completed() {
                 loaded_extensions: BTreeSet::new(),
             }),
     );
-    let orchestrator = GooseOrchestrator::new(runner);
+    let (orchestrator, _turn) = live_turn(runner);
 
     let run = orchestrator
         .spawn(spec_for(&role, &["giap-weather"]))
@@ -612,7 +664,7 @@ async fn cancelling_a_parent_cancels_the_child_that_is_still_running() {
         parent_tools(&[("giap-weather", &["get_weather"])]),
     );
     let runner = Arc::new(FakeRunner::new(env).holding_for(120));
-    let orchestrator = Arc::new(GooseOrchestrator::new(runner));
+    let (orchestrator, _turn) = live_turn(runner);
 
     let spawner = {
         let orchestrator = orchestrator.clone();
@@ -645,7 +697,7 @@ async fn cancelling_a_different_parent_leaves_this_ones_children_alone() {
         parent_tools(&[("giap-weather", &["get_weather"])]),
     );
     let runner = Arc::new(FakeRunner::new(env).holding_for(120));
-    let orchestrator = Arc::new(GooseOrchestrator::new(runner));
+    let (orchestrator, _turn) = live_turn(runner);
 
     let spawner = {
         let orchestrator = orchestrator.clone();
@@ -737,7 +789,7 @@ async fn a_finished_run_can_be_polled_and_listed_and_an_unknown_one_cannot() {
     );
     let runner = Arc::new(FakeRunner::new(env));
     let state = runner.state.clone();
-    let orchestrator = GooseOrchestrator::new(runner);
+    let (orchestrator, _turn) = live_turn(runner);
 
     let run = orchestrator
         .spawn(spec_for(&role, &["giap-weather"]))
@@ -798,5 +850,235 @@ fn eviction_never_removes_a_run_that_is_still_going() {
     assert!(
         !registry.tasks.contains_key(&running_ids[0]),
         "eviction did not reclaim the finished run, so the registry grows without bound"
+    );
+}
+
+// ── PAI-6 P3: scope inheritance at the edge ─────────────────────────────────
+
+/// The refusal that makes the authority registry load-bearing rather than
+/// decorative. A `TaskSpec` was authorised by a turn; once that turn has ended
+/// the authority behind it is stale, and this programme's rule is that access
+/// narrows on failure.
+#[tokio::test]
+async fn a_delegation_whose_parent_turn_has_ended_does_not_run() {
+    let role = role("researcher", &["giap-weather"]);
+    let env = env_with(
+        "anthropic",
+        parent_tools(&[("giap-weather", &["get_weather"])]),
+    );
+    let runner = Arc::new(FakeRunner::new(env));
+    let state = runner.state.clone();
+    let (orchestrator, lease) = live_turn(runner);
+
+    let spec = spec_for(&role, &["giap-weather"]);
+    drop(lease);
+
+    let refused = orchestrator
+        .spawn(spec)
+        .await
+        .expect_err("a delegation ran after its parent turn had ended");
+    assert!(
+        refused.to_string().contains("parent-session"),
+        "the refusal does not name the session whose turn is gone: {refused}"
+    );
+    assert!(
+        state.plans.lock().unwrap().is_empty(),
+        "the engine ran a delegation nobody live had authorised"
+    );
+    assert!(
+        state.opened.lock().unwrap().is_empty(),
+        "a child engine session was created for a delegation that was refused"
+    );
+}
+
+/// Vacuity control for the test above: the SAME spec runs when the lease is
+/// still held, so the refusal is about the turn having ended and not about the
+/// fixture being unrunnable.
+#[tokio::test]
+async fn the_same_delegation_runs_while_its_parent_turn_is_live() {
+    let role = role("researcher", &["giap-weather"]);
+    let env = env_with(
+        "anthropic",
+        parent_tools(&[("giap-weather", &["get_weather"])]),
+    );
+    let runner = Arc::new(FakeRunner::new(env));
+    let (orchestrator, _turn) = live_turn(runner);
+    let run = orchestrator
+        .spawn(spec_for(&role, &["giap-weather"]))
+        .await
+        .expect("a live parent turn must be able to delegate");
+    assert_eq!(run.status, TaskStatus::Completed);
+}
+
+/// PAI-6 invariant 5's other half, which P2 left open because the parent turn's
+/// token was a stack local in a stream closure with no accessor. The child's
+/// token is DERIVED from the parent's rather than minted fresh, so cancelling
+/// the turn — a voice interrupt, a dropped stream, a client hanging up —
+/// reaches the child without anything having to remember to call
+/// `cancel_children_of`.
+#[tokio::test]
+async fn cancelling_the_parents_turn_cancels_a_child_derived_from_it() {
+    let role = role("researcher", &["giap-weather"]);
+    let env = env_with(
+        "anthropic",
+        parent_tools(&[("giap-weather", &["get_weather"])]),
+    );
+    let runner = Arc::new(FakeRunner::new(env).holding_for(120));
+    let (orchestrator, _turn, parent_token) = live_turn_with_token(runner);
+
+    let spawner = {
+        let orchestrator = orchestrator.clone();
+        let spec = spec_for(&role, &["giap-weather"]);
+        tokio::spawn(async move { orchestrator.spawn(spec).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    parent_token.cancel();
+
+    let run = spawner.await.unwrap().unwrap();
+    assert_eq!(
+        run.status,
+        TaskStatus::Cancelled,
+        "the parent's TURN was cancelled and its child carried on - the child's token is not \
+         derived from the parent's"
+    );
+    assert_eq!(run.result_for_parent(), None);
+}
+
+/// The child's shim allow-set and its `available_tools` must be the same
+/// decision expressed twice, not two lists that can drift. `build_child_plan`
+/// derives one from the other for exactly that reason.
+#[test]
+fn the_plans_allowed_tool_names_are_its_available_tools_and_nothing_else() {
+    let role = role("researcher", &["giap-weather"]);
+    let spec = spec_for(&role, &["giap-weather", "giap-memory"]);
+    let env = env_with(
+        "ollama",
+        parent_tools(&[
+            ("giap-weather", &["get_weather", "get_forecast"]),
+            ("giap-memory", &["recall_memories"]),
+        ]),
+    );
+    let plan = build_child_plan(&spec, "child-1", &env).unwrap();
+
+    let from_extensions: BTreeSet<String> = plan
+        .extensions
+        .iter()
+        .flat_map(|config| match config {
+            ExtensionConfig::Builtin {
+                name,
+                available_tools,
+                ..
+            } => available_tools
+                .iter()
+                .map(|tool| format!("{name}__{tool}"))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        })
+        .collect();
+    let published: BTreeSet<String> = plan.allowed_tool_names.iter().cloned().collect();
+    assert_eq!(
+        published, from_extensions,
+        "the shim allow-set and available_tools disagree; one of the two layers of invariant \
+         1 is guarding a different set from the other"
+    );
+    assert_eq!(
+        published,
+        ["giap-weather__get_weather", "giap-weather__get_forecast"]
+            .into_iter()
+            .map(String::from)
+            .collect::<BTreeSet<_>>(),
+        "the role asked for giap-weather only and the plan published something else"
+    );
+    assert!(
+        !published.contains("giap-memory__recall_memories"),
+        "a tool the role never asked for was published to the child's shim entry"
+    );
+}
+
+/// The "test the INPUT, not just the gate" guard.
+///
+/// `DelegationAuthority::delegate` intersects with whatever the root authority
+/// holds, so every assertion in `pond-core` about narrowing is only worth
+/// something if the root is built from the turn's REAL post-selection,
+/// post-guest-subtraction allow-set. That construction lives inside
+/// `chat_stream`, which needs a live engine, so this reads the source: it fails
+/// if the publish is moved above the guest subtraction, if it stops using the
+/// same `allowed_tools` binding that is published to the shim, or if the scope
+/// stops coming from `turn_scope`.
+///
+/// PAI-1 P5 shipped inert for exactly the first of those reasons, and PAI-5 P1
+/// leaked for the second: the gate was right and one of its inputs was not.
+#[test]
+fn the_turn_authority_is_built_from_the_published_allow_set() {
+    let source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/goose_agent.rs"))
+            .expect("goose_agent.rs is next door");
+    let code = strip_line_comments(&source);
+
+    let subtract = code
+        .find("subtract_guest_denied_tools")
+        .expect("PAI-1 P5's guest subtraction is gone from the turn path");
+    let publish_to_shim = code
+        .find("set_allowed_tools(allowed_tools.clone())")
+        .expect("the turn's allow-set is no longer published to the shim");
+    let publish_authority = code
+        .find("turn_authorities.publish")
+        .expect("no turn publishes a delegation authority, so PAI-6 P3 is inert");
+
+    assert!(
+        publish_authority > subtract,
+        "the delegation authority is built BEFORE the guest subtraction, so a Guest turn would \
+         hand a subagent the personal-data groups the turn itself was denied"
+    );
+    assert!(
+        publish_authority > publish_to_shim,
+        "the delegation authority is built from an allow-set that is not the one published to \
+         the shim; the two can now disagree"
+    );
+
+    let call = &code[publish_authority..(publish_authority + 700).min(code.len())];
+    assert!(
+        call.contains("turn_scope.clone()"),
+        "the child's profile scope no longer comes from the turn's resolved scope"
+    );
+    assert!(
+        call.contains("allowed_tools.iter().map(String::as_str)"),
+        "the authority's tool set is no longer derived from the turn's allow-set: {call}"
+    );
+    assert!(
+        call.contains("cancel_token.clone()"),
+        "the turn's cancellation token is not published, so a child cannot derive one from it"
+    );
+}
+
+/// The second layer of the child's tool boundary has to be in place before the
+/// child's first provider call, or the shim is pass-through for that call and
+/// the model is shown tools it may not use.
+#[test]
+fn the_child_agent_publishes_its_boundary_before_it_replies() {
+    let source =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/goose_agent.rs"))
+            .expect("goose_agent.rs is next door");
+    let code = strip_line_comments(&source);
+
+    let allow = code
+        .find("child_controls.set_allowed_tools(plan.allowed_tool_names")
+        .expect("the child's allow-set is not published to the shim at all");
+    let system = code
+        .find("child_controls.set_system_override(Some(plan.system_prompt")
+        .expect("the child's system prompt is not claimed, so the shim rebuilds it away");
+    let reply = code
+        .find(".reply(user_message.clone()")
+        .expect("the child loop no longer replies");
+    assert!(
+        allow < reply && system < reply,
+        "the child's boundary is published after its first provider call, so that call is \
+         pass-through"
+    );
+
+    assert!(
+        code.contains("self.shim_controls.forget_session(child_session_id)"),
+        "a finished child's shim entry is left to age out; sixty-four of them evict a live \
+         parent's allow-set, oldest-first"
     );
 }

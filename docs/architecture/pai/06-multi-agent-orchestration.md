@@ -505,16 +505,82 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
   Goose session store, so everything that DECIDES was split out into pure functions and the
   registry, and those are driven through the real `spawn` against a fake engine. The engine drive
   is owed a live run.
-- **P3** Scope inheritance: `DelegationAuthority::root` constructed at the edge from the turn's
-  resolved scope and its **post-selection, post-guest-subtraction** tool set; tool groups narrowed
-  per role; draft gate enforced inside subagents. Two traps. First, publish the child's allow-set
-  into `ShimControls` **and** set `ExtensionConfig::available_tools`; the shim alone is inert for a
-  session GIAP never chatted in, and an empty `available_tools` means *all tools*. Second, the
-  draft gate cannot resolve a subagent at all today: `actor_for_engine_session` walks
-  `engine_session_map`, which only `resolve_goose_session` writes, so a child's actor is `None` →
-  `REASON_UNRESOLVED_ACTOR`, which under the default `PolicyMode::Audit` **proceeds**. P3 is a
-  mapping task before it is a wiring task. Test against the DEFAULT configuration
-  (`tool_selection_mode = "all"`), or it repeats PAI-1 P5 exactly.
+- **P3 — LANDED 2026-08-09.** Scope inheritance. The turn's real authority published at the edge,
+  tool groups narrowed by the role *and* by the child's own scope, and the draft gate answered by
+  withholding rather than by checking.
+
+  **The draft half, respecified — read this before assuming it was skipped.** The bullet said
+  "draft gate enforced inside subagents", and called it a mapping task. It cannot be either.
+  `engine_session_map.session_id` is the PRIMARY KEY, so pointing a child's engine session at the
+  parent's row would **overwrite the parent's own pairing** and lose its conversation; N children
+  to one parent needs a second table, i.e. the migration and persistence this workstream keeps
+  refusing. And even a working mapping would be *wrong*: a role with `personal_data: deny`
+  produces a `Guest` child, and resolving that child through the parent's session hands it the
+  parent's scope straight back — the gate would then permit exactly what the role withheld. There
+  is no approval path to fall back on either, because a subagent is forced to `GooseMode::Auto`
+  (any approval-requiring mode hangs forever on the child's `confirmation_rx`). So the
+  enforcement is `tool_group.rs :: groups_denied_to_subagents()`: **`giap-draft` is not something
+  a subagent can hold.** That is the same move PAI-1 P5 made for guests, for the reason the
+  checklist already records — *when the thing you want to check has no identity, move the check to
+  the layer that hands it out.* Four more groups are on that list for mechanisms rather than
+  taste: `giap-toolkit`, because `enable_tool_group` widens an allow-set keyed by the
+  process-global `current_session_id()`, so a child holding it could widen its own narrowing or
+  its parent's; `giap-device-control` and `giap-system`, which actuate, write and execute with no
+  approval path left once draft is gone; and `giap-schedule`, which commits future work carrying
+  the household's authority long after the delegation has ended. The cost is stated in the code
+  and accepted: **a subagent has no clock**, because `get_current_time` sits in `giap-system` next
+  to `write_file`. A role that needs the date gets it in its instructions.
+
+  **The narrowing that was missing, and it was the sharpest defect in the phase.** P1 computed the
+  child's tool set from the intersection alone. A `Household` parent running a role with
+  `personal_data: deny` therefore produced a child whose scope said `Guest` while it still held
+  `giap-memory` — whose MCP tools carry no session at all and read the household's memory
+  regardless of what any scope says. `narrow_child_groups` now subtracts `groups_denied_to_guests`
+  keyed on the **child's** scope, not the parent's. A scope that says Guest while the tools say
+  Household is not a narrowing, it is a laundering route.
+
+  **The edge, and the input trap.** `DelegationAuthority::for_turn` takes tool NAMES, and
+  `chat_stream` hands it the same `allowed_tools` binding it publishes to `ShimControls` — after
+  section 6d's guest subtraction, not before. Taking group names would have let a second list
+  drift from the first; taking the catalog would have made every downstream intersection a no-op,
+  which is precisely how PAI-1 P5 shipped inert. `the_turn_authority_is_built_from_the_published_allow_set`
+  fails if the publish is moved above the subtraction, if it stops using that binding, or if the
+  scope stops coming from `turn_scope`. That guard reads source because the construction is inside
+  a function that needs a live engine; it is a tripwire on the INPUT, which is what PAI-5 P1
+  lacked when it gated on `show_thinking && !voice` with the other input hardcoded false.
+
+  **A silent P2 defect this phase found and fixed.** A child's system prompt is the parent's static
+  prefix plus GIAP's delegation envelope, so `enforce_system`'s `incoming.starts_with(prefix)`
+  matched and **the shim rebuilt the envelope away on every provider call**, splicing in the global
+  extension appendix in its place. The envelope is where a child is told its turn budget, that it
+  cannot delegate, and the exact tool names it holds. It failed silently in both directions: the
+  rebuild "succeeded", so `system_appendix_dropped` never fired. `SessionControls::set_system_override`
+  is the fix, and the two tests that pin it drive the real `Provider::stream` — every existing shim
+  test calls `enforce_system` directly, which is exactly why nothing saw this.
+
+  **Invariant 5's other half is closed, and not by the method that was written for it.** P2 left
+  `cancel_children_of` with no caller because the parent turn's token was a stack local. The token
+  is now published beside the authority, and `spawn` derives the child's token from the parent's
+  with `child_token()` — so a voice interrupt, a dropped stream or a client hanging up reaches the
+  child through the `DropGuard` that already exists, with nothing having to remember to call
+  anything. `cancel_children_of` remains for the explicit cases (a deleted session, a shutdown).
+
+  **What I rejected.** A second table mapping child engine sessions to parents — see above; it
+  would have been persistence for a resolution that is wrong even when it works. Threading a
+  `ProfileScope` into the MCP servers per call so a subagent's `giap-memory` reads could be
+  scoped — the only mechanism there is the process-global `current_session_id()` that PAI-1
+  already refused to build on, and it would trade a withheld group for a misattribution bug.
+  Refusing a delegation outright when its role names a denied group: filtering is what
+  `subtract_guest_denied_tools` does, the envelope tells the child its real list, and a role that
+  names `giap-draft` alongside four useful groups should still run.
+
+  **Still not done.** Nothing calls `spawn` — P5's `delegate` tool is the first caller, and it is
+  what turns the registry from a published fact into an answered question. `run_child_agent` still
+  has no test for the same reason P2 recorded: it needs a real provider and a real Goose session
+  store, so the shim publication inside it is guarded by a source canary on the ORDER of the calls
+  rather than by observing the provider. And a subagent's `giap-memory` reads are still unscoped
+  at the MCP server, exactly as they are for an Owner's own turn — PAI-1's open gap, not one this
+  phase widened.
 - **P4** Budget: `context_fraction` through `CompactionProfile`, shrinking `history_token_budget`
   only (section 3.5); parent budget shrinks while a child is live; depth capped at 1.
 - **P5** `giap-orchestrator` MCP extension + `ext_orchestrator_enabled`. The toggle needs its **own**
@@ -553,7 +619,14 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
 1. A subagent's scope is a subset of its parent's. Never wider — not tools, not profile, not
    network. *(P1: structural for the profile axis — `RolePersonalData` has no widening value and
    `TaskRequest` cannot name a scope. Runtime intersection for the tool axis, with `grants_tool`
-   denying an empty set and an unknown prefix.)*
+   denying an empty set and an unknown prefix.)* *(P3 makes the ceiling real and couples the two
+   axes: `DelegationAuthority::for_turn` builds the parent's set from the turn's actual
+   post-selection, post-guest-subtraction allow-set — the same binding published to `ShimControls`
+   — and `narrow_child_groups` then subtracts what the CHILD's scope denies, so a role that drops
+   a Household parent's child to `Guest` cannot leave it holding `giap-memory`. The child gets the
+   boundary twice: `ExtensionConfig::available_tools`, checked inside `dispatch_tool_call`, and
+   its own `ShimControls` entry, published before its first provider call so the tool is never
+   even listed to it.)*
 2. Goose's `summon`, `orchestrator` and `todo` stay stripped. **Building orchestration does not
    mean un-stripping them.** The hazard is not that a direct child-loop call bypasses the strip —
    a fresh `Agent` has no extensions to strip — it is
@@ -582,10 +655,12 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
    anywhere in Goose, and GIAP's parent-turn token is a stack local inside a stream closure with no
    registry and no accessor. Hence `Orchestrator::cancel_children_of`. *(P2: one
    `CancellationToken` per run in the orchestrator's registry, checked while queued and re-checked
-   after the await — Goose returns `Ok(partial_text)` on cancel, so the `Result` cannot say. What
-   is still missing is the OTHER end: nothing calls `cancel_children_of` yet, because the parent
-   turn's token is still a stack local. Whatever ends a parent — a cancelled turn, a deleted
-   session, a shutdown — has to call it, and that is P3/P5 wiring.)*
+   after the await — Goose returns `Ok(partial_text)` on cancel, so the `Result` cannot say.)*
+   *(P3 closes the other end, by derivation rather than by a callback: the turn's token is
+   published beside its authority, and `spawn` takes `parent.child_token()` instead of minting a
+   root. So the `DropGuard` the chat stream already holds cancels the children too, and there is
+   no path where a parent ends and a child does not hear about it. `cancel_children_of` stays for
+   the explicit cases — a deleted session, a shutdown — and still has no caller.)*
 6. Depth is capped. A recursive delegation loop on a home server is a fire. *(P1: `DelegationDepth`
    cannot be constructed from a number, deserialized, or defaulted; the only public path to a
    deeper one refuses at `MAX_DELEGATION_DEPTH`.)*
@@ -613,7 +688,13 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
   `depth_tests`, and `scope_lattice_tests` on `ProfileScope::is_within`. Every one was
   mutation-tested — widening the lattice, making `Deny` return `Household`, raising the depth cap,
   turning the intersection into a union, and defaulting `grants_tool` to true all fail a named
-  assertion.)*
+  assertion.)* *(P3 added the axis P1 could not: the child's tool set is narrowed by the CHILD's
+  scope, so `a_child_dropped_to_guest_loses_the_groups_a_guest_is_denied` fails if the subtraction
+  is keyed on the parent's, and `an_inheriting_child_of_a_household_parent_keeps_memory` is its
+  vacuity control — without it the first test passes against an implementation that simply deletes
+  memory from every child. `the_turn_authority_is_built_from_the_published_allow_set` is the input
+  guard: it reads `goose_agent.rs` and fails if the authority is built before the guest
+  subtraction, from a different set than the shim's, or from a scope that is not `turn_scope`.)*
 - **Budget** — with a child live, the parent's history budget shrinks by `context_fraction`; assert
   that **either** the sum fits inside `usable_prompt_tokens` **or** the effective budget is exactly
   `MIN_HISTORY_TOKENS`. The unconditional form of that assertion is wrong: `trim_history` floors
