@@ -5,7 +5,12 @@ Requirement: *GIAP needs to be proactive, not just reactive.* Part of the
 Prerequisites: [PAI-1](./01-identity-and-profile-boundaries.md) (who to tell) and
 [PAI-6](./06-multi-agent-orchestration.md) (what runs the background thinking).
 
-Verified against code 2026-08-03.
+Verified against code 2026-08-03. **Re-verified 2026-08-09**, and the substance held — every symbol
+this document names still exists and compiles, which is not what the last two re-verification passes
+in this programme found. What rotted was citations: eight `file:line` references had drifted by up to
+a thousand lines, and rather than bump them I have replaced them with the symbol, because bumping
+buys about a week. Two claims did change and are marked in place: section 3.4's device-resolution
+chain does not exist in code, and the `main.rs` bus bridge has moved ~200 lines.
 
 ---
 
@@ -28,7 +33,7 @@ parsing an attribute map"). `EventBus::publish` is non-blocking and infallible; 
 a `Stream` (`:92-100`). Adapter: `shared/services/in_process_event_bus.rs`.
 
 **Two consumers exist:** the rules engine, and a bridge that appends bus traffic to the durable
-event log (`main.rs:2667-2678`). There is no time event, no presence event, no session event.
+event log (`main.rs`, the task that does `event_bus.subscribe()` beside the `run_rules_engine` spawn -- grep the symbol, the line has already moved ~200 once). There is no time event, no presence event, no session event.
 
 ### 1.2 Rules fire, but only rules the user wrote
 
@@ -43,7 +48,7 @@ execution path and get run records and SSE for free. Good design.
 
 Two limits worth naming: the debounce map is **in-memory**, so cooldowns reset on restart; and
 sensor rules have no dedicated REST route — they are created by POSTing a `SensorTrigger` kind to
-`/schedules` (`routes.rs:6498-6521`), with the MCP tools (`create_sensor_rule`, `list_sensor_rules`,
+`/schedules` (`routes.rs :: create_schedule`, which takes a `kind` field including `SensorTrigger`), with the MCP tools (`create_sensor_rule`, `list_sensor_rules`,
 `delete_sensor_rule`) as the real interface.
 
 ### 1.3 Vision detects, and nothing reasons about it
@@ -75,21 +80,21 @@ The complete list of unprompted notification producers:
 
 | Site | Trigger |
 |---|---|
-| `main.rs:2660` | schedule completion or failure |
-| `schedule_executors.rs:107` | a fired rule's `Notify` action |
+| `main.rs`, the schedule-completion broadcast | schedule completion or failure |
+| `schedule_executors.rs`, the `sender.broadcast(n)` in the rule executor | a fired rule's `Notify` action |
 | `pond-mcp-server/src/system.rs:214` | the `send_notification` tool — model-initiated, but **only inside a user-started turn** |
 | `routes.rs:542` | a device-pairing security notice |
 
 **All four call `broadcast()`.** The durable offline queue and the FCM relay are only reachable from
-the targeted `send()` path (`broadcast_notification_sender.rs:68`), so `sqlite_notification_queue`
+the targeted `send()` path (`broadcast_notification_sender.rs :: send`, whose own doc comment records that nothing exercises it), so `sqlite_notification_queue`
 and `fcm_push_relay` — both real, both tested, the latter carrying a genuinely thoughtful
 content-free wake-ping design (`fcm_push_relay.rs:1-26`) — have **no production producer**.
 
 ### 1.6 GIAP never speaks first
 
 Every `voice_output.speak()` call site is downstream of a user utterance
-(`shared/services/chat.rs:933,953,1127,1593,1604`) or an explicit `/tts` request
-(`routes.rs:6395`). The voice child is a separate OS process and cannot reach `AppState` at all.
+(`shared/services/chat.rs` -- five `voice_output.speak()` call sites, all downstream of a user utterance; the count is the durable fact, the line numbers have drifted ~130) or an explicit `/tts` request
+(`routes.rs`, the `tts.speak(&text)` call). The voice child is a separate OS process and cannot reach `AppState` at all.
 GIAP is visually proactive at best.
 
 ---
@@ -145,7 +150,7 @@ pub struct Proposal {
 
 Proposals land in **the draft system that already exists**. `giap-draft` is unconditionally
 registered as a safety extension (`giap_registration.rs:64`) and already models save / list /
-approve / reject (`pond-mcp-server/src/draft.rs:97,167,200,248`), with a UI. Reusing it means
+approve / reject (`pond-mcp-server/src/draft.rs :: save_draft` / `list_drafts` / `approve_draft` / `reject_draft`), with a UI. Reusing it means
 proactive actions inherit an approval flow that is already built, already understood, and already
 trusted — rather than a second, parallel confirmation mechanism users would have to learn.
 
