@@ -18,8 +18,18 @@
 //!   that tries to carry one is refused rather than silently ignored. The
 //!   child's scope is computed from the parent's by [`RolePersonalData`], an
 //!   enum with **no variant that widens**: it either inherits the parent's
-//!   scope unchanged or drops to [`ProfileScope::Guest`]. There is no value of
-//!   any type in this module that expresses "run wider than my parent".
+//!   scope unchanged or drops to [`ProfileScope::Guest`].
+//!
+//!   That second sentence is a claim about the variants that exist today, and
+//!   a claim is not an invariant. Adding a third variant carrying
+//!   `#[serde(skip)]`, whose [`RolePersonalData::narrow`] arm returns
+//!   [`ProfileScope::Household`], compiles, turns a `Guest` parent into a
+//!   `Household` child, and leaves every test in the crate green — the guards
+//!   iterate [`RolePersonalData::ALL`], and serde's variant list, which is what
+//!   keeps `ALL` honest, cannot see a skipped variant. That mutation was
+//!   applied and run. So the computed scope goes through [`child_scope`], which
+//!   clamps any candidate the parent does not contain down to `Guest`. **The
+//!   enum states the intent; the clamp is the boundary.**
 //! - **A child cannot forge a depth.** [`DelegationDepth`] wraps a private
 //!   `u8`, derives no `Deserialize` and no `Default`, and its only increment is
 //!   a private method. The one public path from an authority to a deeper
@@ -47,6 +57,8 @@
 //! GIAP-owned key that Goose and `pond-api`'s recipe runner both ignore.
 //! PAI-6 P1 adds no migration and no table.
 
+#[cfg(test)]
+use crate::mcp::domain::tool_group::TOOLKIT_EXTENSION;
 use crate::mcp::domain::tool_group::{
     group_of_tool, groups_denied_to_guests, groups_denied_to_subagents,
 };
@@ -82,6 +94,21 @@ pub const DEFAULT_ROLE_MAX_TURNS: u32 = 6;
 pub const MAX_ROLE_MAX_TURNS: u32 = 12;
 
 /// Share of the parent's history budget a role claims when it does not say.
+///
+/// It is **spent, not merely carried**, and that has been true only since
+/// PAI-6 P4 — grep the chain rather than trusting this sentence:
+/// [`TaskSpec::context_fraction`] is what `GooseOrchestrator::spawn` hands
+/// `DeviceLedger::reserve` for as long as the child lives,
+/// `GooseAdapter::turn_profile` reads it back as `reserved_fraction`, and
+/// `CompactionProfile::with_history_reserved` takes it off the parent's
+/// `history_token_budget` and nothing else. At 1.0 a role that states nothing
+/// takes the whole of that budget, floored at `MIN_HISTORY_TOKENS` rather than
+/// at zero.
+///
+/// Worth saying explicitly because the number was pinned by a test whose
+/// failure message described that consequence for a day in which no code
+/// implemented it. A pin on a constant nothing reads teaches the next reader
+/// something false about the system.
 pub const DEFAULT_CONTEXT_FRACTION: f32 = 0.5;
 
 /// The one key GIAP owns inside a recipe's YAML.
@@ -197,18 +224,35 @@ impl RolePersonalData {
     /// set from the enum's own `Deserialize` impl and fails if this array is
     /// missing one.
     ///
+    /// **That derivation has a hole, and it is why this list is no longer the
+    /// boundary.** The widening surface — [`narrow`](Self::narrow), reached
+    /// through [`AgentRole::new`] — is serde-independent, so a variant carrying
+    /// `#[serde(skip)]` never appears in serde's error message, never enters
+    /// this array, and is quantified over by nothing. Adding one with a
+    /// `narrow` arm returning [`ProfileScope::Household`] left all 893 tests
+    /// green while a `Guest` parent produced a `Household` child (verified by
+    /// mutation, 2026-08-09). What refuses that today is
+    /// [`child_scope`], which clamps the value instead of enumerating the
+    /// enum. Treat `ALL` as the set of inputs the guards SEE, never as the set
+    /// of inputs that are SAFE.
+    ///
     /// [`RedactionKind::ALL`]: crate::security::domain::redaction::RedactionKind::ALL
     /// [`OnboardingStep::ALL`]: crate::user_data::domain::onboarding::OnboardingStep::ALL
     pub const ALL: [RolePersonalData; 2] = [RolePersonalData::Inherit, RolePersonalData::Deny];
 
-    /// The child's scope, given the parent's.
+    /// The scope this role ASKS the child to run under, given the parent's.
     ///
-    /// Guaranteed by construction to satisfy `result.is_within(parent)`.
+    /// Not the scope the child gets: [`DelegationAuthority::delegate`] puts
+    /// this through [`child_scope`], which is where "never wider" is actually
+    /// enforced. The distinction matters because this `match` is the one place
+    /// a future variant could express a widening, and the compiler is happy to
+    /// let it.
     ///
     /// This `match` is exhaustive, so a new variant breaks the build here. The
-    /// arm you are about to write must also be added to [`ALL`](Self::ALL), or
-    /// every scope guard in this module will keep iterating a set that does not
-    /// contain it.
+    /// arm you are about to write should also be added to [`ALL`](Self::ALL) —
+    /// not because omitting it is dangerous any more, but because every scope
+    /// guard in this module iterates that list and an omitted variant is one
+    /// nothing exercises.
     fn narrow(self, parent: &ProfileScope) -> ProfileScope {
         match self {
             RolePersonalData::Inherit => parent.clone(),
@@ -558,7 +602,7 @@ impl DelegationAuthority {
         // that sends nonsense is told the nonsense, not the depth cap -- and
         // either way nothing is constructed.
         let depth = self.depth.deeper()?;
-        let scope = role.personal_data.narrow(&self.scope);
+        let scope = child_scope(role.personal_data.narrow(&self.scope), &self.scope);
         // `&scope`, not `&self.scope`. The subtraction is keyed on the CHILD's
         // scope, and the only case where the two differ is the exact one this
         // exists for: a Household parent running a `personal_data: deny` role.
@@ -577,6 +621,39 @@ impl DelegationAuthority {
             max_turns: role.max_turns,
             context_fraction: role.context_fraction,
         })
+    }
+}
+
+/// The scope a child actually runs under: what the role asked for, clamped to
+/// the parent.
+///
+/// **This is PAI-6 invariant 1 for the profile axis, and it is the enforcement
+/// of it.** Every other statement of that invariant in this module is a claim
+/// about [`RolePersonalData`]'s codomain — true today, and true only for as
+/// long as somebody remembers it while adding a variant. The guard that was
+/// supposed to catch a widening variant iterates [`RolePersonalData::ALL`],
+/// and a variant carrying `#[serde(skip)]` never reaches that list: it
+/// compiles, it turns a `Guest` parent into a `Household` child, and the whole
+/// suite stays green. That mutation was applied and run.
+///
+/// So the invariant is enforced on the VALUE rather than on the enum. A
+/// candidate the parent does not contain is not a narrowing of anything, and
+/// the answer is [`ProfileScope::Guest`] — which reaches no row at all — not
+/// the candidate. **On failure, access narrows.** Refusing outright was the
+/// alternative and is worse here: the caller is a stored role read off disk, a
+/// refusal turns a widening bug into an outage on every delegation, and the
+/// narrowest possible scope is already a correct answer.
+///
+/// Pure and total on purpose, in the same shape as `classify_outcome` and
+/// `build_child_plan` in the adapter. It can therefore be exercised over every
+/// ordered pair of scope shapes, INCLUDING the pairs no `RolePersonalData`
+/// variant can produce today — which is the entire point, because the pairs a
+/// future variant produces are exactly the ones today's guards cannot see.
+fn child_scope(candidate: ProfileScope, parent: &ProfileScope) -> ProfileScope {
+    if candidate.is_within(parent) {
+        candidate
+    } else {
+        ProfileScope::Guest
     }
 }
 
@@ -829,6 +906,51 @@ impl TaskRun {
     }
 }
 
+/// The groups no subagent may hold, written out INDEPENDENTLY of
+/// [`groups_denied_to_subagents`], each with the mechanism it breaks.
+///
+/// Two guards in this file iterate that function to prove a child loses what
+/// it names. Iterating the source of truth covers a group ADDED to the list
+/// without anyone remembering this file, and covers **nothing at all** when one
+/// is removed from it, because the loop shrinks with the list: deleting
+/// `giap-system`, and separately `giap-schedule`, each left all 893 tests
+/// green. Both mutations were applied and run, 2026-08-09. Only three of the
+/// five entries were pinned by name anywhere in the tree.
+///
+/// This is the other direction. The two together are the guard, and the
+/// mechanism strings are the reason each entry may not be deleted casually —
+/// they name the control that is absent for a subagent, not a preference.
+#[cfg(test)]
+const GROUPS_NO_SUBAGENT_MAY_HOLD: [(&str, &str); 5] = [
+    (
+        "giap-draft",
+        "approve_draft and reject_draft DECIDE, and the gate that would check who decided \
+         cannot resolve a subagent's engine session, so under the default PolicyMode::Audit \
+         it proceeds",
+    ),
+    (
+        TOOLKIT_EXTENSION,
+        "enable_tool_group WIDENS an allow-set keyed by the process-global current_session_id(), \
+         which a child does not own -- so a child holding it could widen its own narrowing, or \
+         its parent's",
+    ),
+    (
+        "giap-device-control",
+        "actuates the house, and a subagent is forced to GooseMode::Auto with no approval path \
+         left once draft is withheld",
+    ),
+    (
+        "giap-system",
+        "write_file, run_shell_command and send_notification: writes and executes, with no \
+         approval path",
+    ),
+    (
+        "giap-schedule",
+        "schedules future work that runs with the household's authority long after the \
+         delegation that created it has ended",
+    ),
+];
+
 #[cfg(test)]
 mod depth_tests {
     use super::*;
@@ -968,12 +1090,27 @@ mod forged_authority_tests {
         .unwrap();
         let spec = forged.delegate(&role, request()).unwrap();
 
+        // Named INDEPENDENTLY of `groups_denied_to_subagents()`. Looping that
+        // function here is what the previous version did, and it made this
+        // assertion shrink with the list it was meant to defend -- see
+        // `GROUPS_NO_SUBAGENT_MAY_HOLD`.
+        for (denied, mechanism) in GROUPS_NO_SUBAGENT_MAY_HOLD {
+            assert!(
+                !spec.tool_groups().contains(denied),
+                "a forged root authority handed a child `{denied}`, which no subagent may hold: \
+                 {mechanism}"
+            );
+            assert!(!spec.grants_tool(&format!("{denied}__anything")));
+        }
+        // And the other direction: whatever else the shared list names today is
+        // withheld too, so a group added to it is covered without anyone
+        // remembering this file.
         for denied in groups_denied_to_subagents() {
             assert!(
                 !spec.tool_groups().contains(*denied),
-                "a forged root authority handed a child `{denied}`, which no subagent may hold"
+                "a forged root authority handed a child `{denied}`, which the subagent denylist \
+                 names"
             );
-            assert!(!spec.grants_tool(&format!("{denied}__anything")));
         }
 
         // The forged root spends its one level immediately, so the tree it can
@@ -1018,12 +1155,16 @@ mod scope_inheritance_tests {
         }
     }
 
+    /// Every parent shape a delegation can start from.
+    ///
+    /// [`ProfileScope::every_shape`] rather than a literal of today's three:
+    /// this helper WAS that literal, which is recorded vacuity shape 4 and is
+    /// the same defect the commit that wrote it had just removed for
+    /// [`RolePersonalData`] twenty lines above. `ProfileScope` had no shared
+    /// list at the time; it has one now, guarded by
+    /// `profile::scope_lattice_tests::every_shape_lists_every_variant_the_enum_has`.
     fn parents() -> Vec<ProfileScope> {
-        vec![
-            ProfileScope::Guest,
-            ProfileScope::Owner("jerry".into()),
-            ProfileScope::Household,
-        ]
+        ProfileScope::every_shape()
     }
 
     /// `RolePersonalData::ALL` is what every scope guard in this module
@@ -1073,8 +1214,93 @@ mod scope_inheritance_tests {
         );
     }
 
+    /// Every scope shape, plus a SECOND owner.
+    ///
+    /// Two members are INCOMPARABLE — neither contains the other — and that is
+    /// the pair [`child_scope`] exists for, so a fixture with one `Owner`
+    /// cannot produce the input the clamp is being tested on.
+    fn candidate_scopes() -> Vec<ProfileScope> {
+        let mut scopes = ProfileScope::every_shape();
+        scopes.push(ProfileScope::Owner("a-different-member".into()));
+        scopes
+    }
+
+    /// The enforcement of PAI-6 invariant 1 on the profile axis, quantified
+    /// over every ordered pair of scope shapes rather than over the pairs
+    /// today's [`RolePersonalData`] happens to produce.
+    ///
+    /// That distinction is the whole reason [`child_scope`] was lifted out of
+    /// `delegate` as a pure function. The guards next door iterate
+    /// [`RolePersonalData::ALL`], and a variant carrying `#[serde(skip)]` never
+    /// enters that array: it widened a `Guest` parent to `Household` with all
+    /// 893 tests green. This test does not need to know what variants exist.
+    #[test]
+    fn no_candidate_scope_survives_a_parent_that_does_not_contain_it() {
+        let mut clamped = 0;
+        let mut passed_through = 0;
+        for candidate in candidate_scopes() {
+            for parent in candidate_scopes() {
+                let result = child_scope(candidate.clone(), &parent);
+                assert!(
+                    result.is_within(&parent),
+                    "child_scope({candidate:?}, {parent:?}) gave {result:?}, which the parent \
+                     does not contain"
+                );
+                if candidate.is_within(&parent) {
+                    assert_eq!(
+                        result, candidate,
+                        "child_scope narrowed {candidate:?} under {parent:?}, which already \
+                         contained it -- a role that inherits must inherit"
+                    );
+                    passed_through += 1;
+                } else {
+                    assert_eq!(
+                        result,
+                        ProfileScope::Guest,
+                        "child_scope({candidate:?}, {parent:?}) answered something other than \
+                         Guest for a candidate the parent does not contain. On failure, access \
+                         narrows"
+                    );
+                    clamped += 1;
+                }
+            }
+        }
+        // Vacuity controls, both directions, stated as "at least one" rather
+        // than as a count: a count would have to be recomputed every time
+        // `every_shape()` grows, and would then be pinned to whatever the code
+        // did that day.
+        assert!(
+            clamped > 0,
+            "no pair was clamped, so this test never exercised the narrowing branch"
+        );
+        assert!(
+            passed_through > 0,
+            "every pair was clamped, so child_scope could be `|_, _| Guest` and pass"
+        );
+    }
+
+    /// The pair the clamp is really for, named rather than left to the sweep:
+    /// two household members are elsewhere from each other, not ordered, so a
+    /// role that somehow asked to run as Liz under Jerry's turn gets Guest.
+    #[test]
+    fn one_members_scope_is_not_reachable_from_anothers() {
+        let jerry = ProfileScope::Owner("jerry".into());
+        let liz = ProfileScope::Owner("liz".into());
+        assert_eq!(child_scope(liz.clone(), &jerry), ProfileScope::Guest);
+        assert_eq!(child_scope(jerry.clone(), &liz), ProfileScope::Guest);
+        assert_eq!(
+            child_scope(ProfileScope::Household, &jerry),
+            ProfileScope::Guest
+        );
+        // And the control: within is left alone, so the clamp is not a blanket.
+        assert_eq!(child_scope(jerry.clone(), &jerry), jerry);
+        assert_eq!(child_scope(jerry.clone(), &ProfileScope::Household), jerry);
+    }
+
     /// PAI-6 invariant 1, for the profile axis. Exhaustive over both the enum
-    /// and the three scope shapes, and the enum half is exhaustive because it
+    /// and every scope shape — the scope half through
+    /// [`ProfileScope::every_shape`] rather than a count written into this
+    /// sentence, and the enum half because it
     /// iterates [`RolePersonalData::ALL`] rather than an array literal of the
     /// variants that happened to exist the day it was written — which is what
     /// it used to do, and which is why a third variant returning
@@ -1332,6 +1558,67 @@ mod tool_narrowing_tests {
         }
     }
 
+    /// The half the test above cannot do. It iterates
+    /// `groups_denied_to_subagents()`, so **removing** an entry removes the
+    /// assertion with it — deleting `giap-system`, and separately
+    /// `giap-schedule`, each left the whole suite green. This one drives the
+    /// same behaviour from [`GROUPS_NO_SUBAGENT_MAY_HOLD`], which the shared
+    /// list cannot edit.
+    ///
+    /// It asserts the BEHAVIOUR, not the contents of a list: a Household parent
+    /// that holds the group, and a role that asks for it, must still produce a
+    /// child that does not have it. A source-text tripwire would pass against
+    /// any renaming of the same defect.
+    #[test]
+    fn the_named_groups_never_reach_a_child_however_wide_the_parent() {
+        for (group, mechanism) in GROUPS_NO_SUBAGENT_MAY_HOLD {
+            let spec = parent(&[group, "giap-weather"])
+                .delegate(&role_wanting(&[group, "giap-weather"]), request())
+                .unwrap();
+            assert!(
+                !spec.tool_groups().contains(group),
+                "a Household parent holding `{group}` handed it to a child. It is withheld \
+                 because {mechanism}"
+            );
+            assert!(
+                !spec.grants_tool(&format!("{group}__anything")),
+                "a child could call a `{group}` tool. It is withheld because {mechanism}"
+            );
+            // Vacuity control, inline: the delegation really produced a child
+            // with tools, so the refusal is about `{group}` and not about
+            // nothing having been granted at all.
+            assert!(
+                spec.grants_tool("giap-weather__get_forecast"),
+                "the fixture produced an empty child, so the `{group}` assertion above proves \
+                 nothing"
+            );
+        }
+    }
+
+    /// The two lists must stay the same set, so that adding a group to the
+    /// shared denylist forces somebody to record the mechanism it exists for,
+    /// and removing one is an edit to a failing test rather than a quiet
+    /// deletion.
+    ///
+    /// `tool_group.rs :: a_subagent_keeps_the_read_only_research_groups` is the
+    /// anti-over-denial control on the other side, so pinning equality here
+    /// cannot ratchet the list towards denying everything.
+    #[test]
+    fn the_independently_named_groups_are_exactly_the_shared_denylist() {
+        let named: BTreeSet<&str> = GROUPS_NO_SUBAGENT_MAY_HOLD
+            .iter()
+            .map(|(group, _)| *group)
+            .collect();
+        let shared: BTreeSet<&str> = groups_denied_to_subagents().iter().copied().collect();
+        assert_eq!(
+            named, shared,
+            "the subagent denylist and the mechanisms recorded for it have diverged. If a group \
+             was added, record why a subagent may not hold it; if one was removed, say which \
+             control now covers it -- withholding IS the control for these, there is no second \
+             one"
+        );
+    }
+
     /// The draft half of PAI-6 P3, stated as the thing it actually prevents.
     /// `approve_draft` is gated by `is_draft_decision_permitted`, which
     /// resolves its actor through `engine_session_map` -- a table no subagent's
@@ -1340,11 +1627,9 @@ mod tool_narrowing_tests {
     /// PROCEEDS. Withholding the group is the enforcement.
     #[test]
     fn a_subagent_can_never_reach_a_draft_decision_tool() {
-        for parent_scope in [
-            ProfileScope::Household,
-            ProfileScope::Owner("jerry".into()),
-            ProfileScope::Guest,
-        ] {
+        // `every_shape()`, not a literal of today's three -- the literal that
+        // used to be here could not see a fourth scope shape.
+        for parent_scope in ProfileScope::every_shape() {
             let authority = DelegationAuthority::root(
                 "s1",
                 parent_scope.clone(),
@@ -1773,14 +2058,23 @@ giap_role:
 
     /// The default share of the parent's window, pinned to its literal and
     /// wired to the behaviour that reads it — nothing read
-    /// `DEFAULT_CONTEXT_FRACTION` at all, so 0.5 -> 1.0 was green, and 1.0 is a
-    /// role claiming the parent's WHOLE history budget.
+    /// `DEFAULT_CONTEXT_FRACTION` at all, so 0.5 -> 1.0 was green.
+    ///
+    /// The consequence in the failure message is now real, and was not when
+    /// this pin was written: PAI-6 P4 made `TaskSpec::context_fraction` the
+    /// argument to `DeviceLedger::reserve`, which `GooseAdapter::turn_profile`
+    /// spends through `CompactionProfile::with_history_reserved`. Stated with
+    /// the symbol chain rather than a `file:line`, and worth re-grepping —
+    /// a pin whose message describes a consequence no code implements is worse
+    /// than no pin, because a reader believes it.
     #[test]
     fn an_unstated_context_fraction_is_half_the_parents_budget() {
         assert!(
             (DEFAULT_CONTEXT_FRACTION - 0.5).abs() < f32::EPSILON,
-            "the default context fraction moved to {DEFAULT_CONTEXT_FRACTION}; at 1.0 a role \
-             that states nothing claims the parent's entire history budget"
+            "the default context fraction moved to {DEFAULT_CONTEXT_FRACTION}. It is spent, not \
+             carried: TaskSpec::context_fraction -> DeviceLedger::reserve -> \
+             GooseAdapter::turn_profile -> CompactionProfile::with_history_reserved, so at 1.0 a \
+             role that states nothing takes the parent's whole history budget"
         );
         let role =
             AgentRole::from_recipe_yaml("r", "instructions: go\ngiap_role:\n  tool_groups: []\n")
