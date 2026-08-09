@@ -4382,15 +4382,13 @@ impl GooseAdapter {
             // Unprefixed names, because that is what Goose matches
             // `available_tools` against: `dispatch_tool_call` checks
             // `is_tool_available(&resolved.actual_tool_name)`, not the
-            // `extension__tool` name the model sees. An unprefixed tool is
-            // Goose plumbing (the final-output tool, platform tools) and
-            // belongs to no extension, so it is skipped rather than guessed at.
-            let Some(sep) = name.find(pond_core::mcp::domain::tool_group::TOOL_NAME_SEPARATOR)
-            else {
+            // `extension__tool` name the model sees. A name with no prefix at
+            // all belongs to no extension — Goose plumbing, or one of the
+            // `unprefixed_tools: true` platform extensions — and
+            // `split_extension_tool` drops it rather than guess an owner.
+            let Some((extension, bare)) = crate::orchestrator::split_extension_tool(&name) else {
                 continue;
             };
-            let (extension, rest) = name.split_at(sep);
-            let bare = &rest[pond_core::mcp::domain::tool_group::TOOL_NAME_SEPARATOR.len()..];
             parent_tools
                 .entry(extension.to_string())
                 .or_default()
@@ -4534,7 +4532,12 @@ impl GooseAdapter {
             .override_system_prompt(plan.system_prompt.clone())
             .await;
 
-        let loaded_extensions: std::collections::BTreeSet<String> = child
+        // Read once here and again after the drain, and unioned. Neither read
+        // alone is the audit: this one can only report what `add_extension` was
+        // just handed — which `child_extensions` already refused, so on its own
+        // it is an audit that cannot fail — and the post-run read alone would
+        // miss an extension that loaded and was removed again mid-run.
+        let mut loaded_extensions: std::collections::BTreeSet<String> = child
             .list_extensions()
             .await
             .into_iter()
@@ -4554,6 +4557,28 @@ impl GooseAdapter {
         };
         let user_message = Message::user().with_text(&plan.user_message);
 
+        // PAI-4 P5. A child replies through the SAME engine and the same
+        // provider as its parent, with its own system prompt and its own tool
+        // block, so the single retained KV prefix the parent's next turn hopes
+        // to be served off is about to be overwritten. Nothing said so, and the
+        // parent's next turn compares hashes it alone owns — finds them equal,
+        // takes the `prefix_changed == false` branch, and calls
+        // `note_prefix_served()`, recording as WARM a prefix that is cold. The
+        // trimmer's age rung reads that posture.
+        //
+        // Recorded BEFORE the reply rather than after it, because the honest
+        // answer to "did the child touch the provider" once `reply` has been
+        // started is "assume yes": a stream that fails part-way has still
+        // prefilled. Over-reporting cold costs one re-compaction decision;
+        // under-reporting it costs a silent 3.7s re-prefill the compaction path
+        // thought it had avoided.
+        //
+        // `PromptChanged` is the closest of the six existing reasons — the
+        // static prefix the engine holds really is a different one. A
+        // `DelegatedRun` variant would read better in a trace and is a
+        // `pond-core` change this one does not own.
+        self.note_prefix_invalidated(InvalidationReason::PromptChanged);
+
         let mut stream =
             goose::session_context::with_session_id(Some(plan.child_session_id.clone()), async {
                 child
@@ -4563,23 +4588,29 @@ impl GooseAdapter {
             .await
             .map_err(|e| anyhow!("Failed to start the subagent reply: {e}"))?;
 
-        let mut last_text: Option<String> = None;
-        let mut assistant_turns: u32 = 0;
+        // One `AgentEvent::Message` is a FRAGMENT, not a turn — see the
+        // provider table above `ReasoningCoalescer` in this file, and
+        // `ChildTurns`, which owns the rule. Counting them as turns is what
+        // reported every successful delegation as `TurnBudgetExhausted`;
+        // assigning `last_text` per message is what made the "answer" the last
+        // streamed word.
+        let mut turns = crate::orchestrator::ChildTurns::default();
         while let Some(event) = stream.next().await {
             match event {
                 Ok(goose::agents::AgentEvent::Message(msg)) => {
                     if msg.role == rmcp::model::Role::Assistant {
-                        assistant_turns = assistant_turns.saturating_add(1);
                         // `as_concat_text()` filters on `as_text()`, which
                         // returns `None` for `MessageContent::Thinking`. That is
                         // load-bearing, not incidental: PAI-5's reasoning gate
                         // lives at this adapter's own producer, a path a child
                         // does not go through, so a child's reasoning would
                         // otherwise reach the parent as its answer.
-                        let text = msg.as_concat_text();
-                        if !text.trim().is_empty() {
-                            last_text = Some(text);
-                        }
+                        turns.assistant_message(&msg.as_concat_text());
+                    } else {
+                        // Goose returns a tool response as a `User` message.
+                        // That is the boundary between one provider call and
+                        // the next, which is what a turn actually is.
+                        turns.other_role_message();
                     }
                 }
                 Ok(_) => {}
@@ -4593,6 +4624,20 @@ impl GooseAdapter {
             }
         }
         drop(stream);
+        let (last_text, assistant_turns) = turns.finish();
+
+        // The post-run half of the invariant-2 audit. `add_extension` is not the
+        // only way an extension can arrive — a Goose sync could re-arm a
+        // `default_enabled` platform extension, which is what
+        // `EnabledExtensionsState::extensions_or_default` does — and asking
+        // before the run could only ever echo back what was just handed over.
+        loaded_extensions.extend(
+            child
+                .list_extensions()
+                .await
+                .into_iter()
+                .map(|e| e.to_string()),
+        );
 
         Ok(crate::orchestrator::ChildOutcome {
             last_text,
