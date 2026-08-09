@@ -9,6 +9,7 @@ pub mod finance;
 pub mod knowledge;
 pub mod memory;
 pub mod news;
+pub mod orchestrator;
 pub mod schedule;
 pub mod secrets;
 pub mod sensors;
@@ -147,6 +148,7 @@ pub use finance::FinanceMcpServer;
 pub use knowledge::{clean_query_for_search, KnowledgeMcpServer};
 pub use memory::{auto_classify_segment, parse_memory_segment, parse_memory_tier, MemoryMcpServer};
 pub use news::NewsMcpServer;
+pub use orchestrator::OrchestratorMcpServer;
 pub use schedule::{try_upcoming_schedules_context, ScheduleMcpServer};
 pub use sensors::SensorsMcpServer;
 pub use system::SystemMcpServer;
@@ -164,6 +166,11 @@ pub use finance::{init_finance_deps, spawn_finance_server};
 pub use knowledge::{init_knowledge_deps, spawn_knowledge_server};
 pub use memory::{init_memory_deps, spawn_memory_server};
 pub use news::{init_news_deps, spawn_news_server};
+// PAI-6 P5. `init_orchestrator_deps` is deliberately NOT called from
+// `register_giap_extensions`: the orchestrator is a Goose adapter and this crate
+// is built before it, so pond-server installs the handle once the adapter
+// exists — the same shape as `init_toolkit_deps`.
+pub use orchestrator::{init_orchestrator_deps, spawn_orchestrator_server, OrchestratorDeps};
 pub use schedule::{init_schedule_deps, spawn_schedule_server};
 pub use secrets::{init_secret_deps, secret};
 pub use sensors::{init_sensor_deps, spawn_sensor_server};

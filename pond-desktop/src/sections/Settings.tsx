@@ -665,6 +665,16 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
             <Switch isSelected={(s as Record<string, unknown>)[key] !== false} onChange={(v) => patch(key as keyof SettingsType, v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch>
           </Row>
         ))}
+        {/*
+          Deliberately NOT in EXT_TOOLS above. That map renders `!== false`, so a
+          key the server has not sent yet reads as ON while settings are still
+          loading — harmless for a module that defaults on, wrong in the widening
+          direction for the only one that defaults off. This row is `=== true`:
+          absent means off, unreadable means off.
+        */}
+        <Row label="Delegation to saved roles" hint="Let the assistant hand work to a saved agent role that runs on its own. Off by default: a delegated agent acts without asking.">
+          <Switch isSelected={s.ext_orchestrator_enabled === true} onChange={(v) => patch("ext_orchestrator_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch>
+        </Row>
       </Section>
       <Section title="Vision / Cameras">
         <Row label="Enable vision" hint="On-device camera event detection (motion, objects) via the vision MCP server">

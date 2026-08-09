@@ -6072,6 +6072,33 @@ async fn build_goose_backend(
                 as Arc<
                     dyn pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl,
                 >));
+            // PAI-6 P5: the `delegate` tool's handles. Installed here for the
+            // same ordering reason as the toolkit's, and with one detail that
+            // decides whether the feature works at all: the registry passed
+            // here must be `adapter.turn_authorities()`, the SAME map the
+            // adapter publishes each turn's authority into. A freshly
+            // constructed registry compiles, and then answers `None` to every
+            // lookup — which the tool correctly reads as "no live turn" and
+            // refuses, so the failure would look like a working guard rather
+            // than like broken wiring.
+            //
+            // Installed unconditionally, like `init_audit_deps`: the toggle
+            // gates REGISTRATION (in `register_giap_extensions`), so with it off
+            // no server is ever spawned and these handles are simply unused.
+            {
+                let runner: Arc<dyn pond_adapters_goose::orchestrator::ChildRunner> =
+                    Arc::new(pond_adapters_goose::GooseChildRunner::new(adapter.clone()));
+                let orchestrator: Arc<dyn pond_core::shared::ports::orchestrator::Orchestrator> =
+                    Arc::new(pond_adapters_goose::GooseOrchestrator::new(
+                        runner,
+                        adapter.turn_authorities(),
+                    ));
+                pond_mcp_server::init_orchestrator_deps(pond_mcp_server::OrchestratorDeps::new(
+                    orchestrator,
+                    adapter.turn_authorities(),
+                    recipe_repo,
+                ));
+            }
             let agent: Arc<dyn Agent> = adapter;
             (agent, Some(ext_mgr), tool_caller, default_registry)
         }

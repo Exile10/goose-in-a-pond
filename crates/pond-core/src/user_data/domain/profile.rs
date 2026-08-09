@@ -59,10 +59,24 @@ pub enum ProfileScope {
 /// The owner id [`ProfileScope::every_shape`] puts inside its `Owner`.
 ///
 /// Arbitrary — `Owner` needs a payload and a guard quantifying over shapes does
-/// not care which member. A guard that needs TWO owners has to supply the
-/// second itself, because two members are incomparable rather than ordered
-/// (see [`ProfileScope::is_within`]).
+/// not care which member. A guard that needs TWO owners takes the second from
+/// [`SECOND_EXEMPLAR_OWNER_ID`], because two members are incomparable rather
+/// than ordered (see [`ProfileScope::is_within`]).
 pub const EXEMPLAR_OWNER_ID: &str = "exemplar-owner";
+
+/// A second owner id, DIFFERENT from [`EXEMPLAR_OWNER_ID`], for the guards that
+/// need an incomparable pair.
+///
+/// It lives beside `every_shape`'s id rather than inside each test module for
+/// one reason: two copies of "a-different-member" can silently converge, and a
+/// fixture whose two owners are the same member turns every
+/// "two members are incomparable" assertion into a scope compared with itself.
+/// PAI-6's scope-inheritance sweep had its own copy, and rewriting that copy to
+/// [`EXEMPLAR_OWNER_ID`] left all 899 pond-core tests green (verified by
+/// mutation, 2026-08-09). One constant means one distinctness guard —
+/// `scope_lattice_tests::the_second_owner_really_is_a_different_member` — covers
+/// every fixture that uses it.
+pub const SECOND_EXEMPLAR_OWNER_ID: &str = "a-different-member";
 
 impl ProfileScope {
     /// One value of every shape this enum has.
@@ -80,9 +94,11 @@ impl ProfileScope {
     /// **What this list is and is not.** It is coverage: it decides which
     /// inputs the guards see. It is NOT the enforcement of PAI-6 invariant 1 —
     /// a list cannot be, because a variant can be added without touching it.
-    /// The enforcement is `orchestration::child_scope`, which clamps any
+    /// The enforcement is `orchestration::ChildScope`, which clamps any
     /// candidate the parent does not contain down to [`Guest`](Self::Guest),
-    /// whatever shape the candidate turned out to be.
+    /// whatever shape the candidate turned out to be, and which is a type
+    /// rather than a function so that the clamp cannot be unwired from its one
+    /// call site.
     ///
     /// [`RedactionKind::ALL`]: crate::security::domain::redaction::RedactionKind::ALL
     /// [`OnboardingStep::ALL`]: crate::user_data::domain::onboarding::OnboardingStep::ALL
@@ -224,18 +240,25 @@ mod scope_lattice_tests {
     /// from three tests at once.
     fn every_scope() -> Vec<ProfileScope> {
         let mut scopes = ProfileScope::every_shape();
-        scopes.push(ProfileScope::Owner(SECOND_OWNER_ID.to_string()));
+        scopes.push(ProfileScope::Owner(SECOND_EXEMPLAR_OWNER_ID.to_string()));
         scopes
     }
 
-    const SECOND_OWNER_ID: &str = "a-different-member";
-
+    /// The distinctness guard for BOTH fixtures that hold two owners: this
+    /// module's [`every_scope`], and PAI-6's
+    /// `orchestration::scope_inheritance_tests::candidate_scopes`. That second
+    /// one used to carry its own copy of the string, so this guard could not
+    /// see it — and rewriting that copy to [`EXEMPLAR_OWNER_ID`] left the whole
+    /// suite green while deleting the incomparable pair from the clamp's sweep.
+    /// Both now read [`SECOND_EXEMPLAR_OWNER_ID`], which is why this assertion
+    /// is worth more than it looks.
     #[test]
     fn the_second_owner_really_is_a_different_member() {
         assert_ne!(
-            SECOND_OWNER_ID, EXEMPLAR_OWNER_ID,
+            SECOND_EXEMPLAR_OWNER_ID, EXEMPLAR_OWNER_ID,
             "the fixture's two owners are the same member, so every 'two members are \
-             incomparable' assertion below is comparing a scope with itself"
+             incomparable' assertion below is comparing a scope with itself -- and so is \
+             PAI-6's scope-inheritance sweep, which reads the same constant"
         );
         let owners = every_scope()
             .iter()
@@ -257,7 +280,7 @@ mod scope_lattice_tests {
     ///
     /// This net has a known hole — a variant carrying `#[serde(skip)]` is
     /// invisible to it — and that hole is why the profile axis is not defended
-    /// by this list at all. It is defended by `orchestration::child_scope`,
+    /// by this list at all. It is defended by `orchestration::ChildScope`,
     /// which clamps rather than enumerates. Read this as coverage breadth, not
     /// as the boundary.
     #[test]
@@ -385,13 +408,18 @@ mod scope_gating_tests {
     /// A scope must survive a serialization round trip unchanged, because it
     /// rides `AgentRequest` which is `Serialize`/`Deserialize`. A variant that
     /// silently widened across that boundary would be undetectable.
+    ///
+    /// The input set is [`ProfileScope::every_shape`] and not an array literal
+    /// of today's three, which is what it was — recorded vacuity shape 4, and
+    /// twenty lines below the commit that introduced `every_shape` to remove
+    /// exactly that shape from the guards next door. A literal cannot see a
+    /// variant added tomorrow, and the entry deleted from a literal fails
+    /// nothing; `every_shape` is itself guarded, by
+    /// `scope_lattice_tests::every_shape_lists_every_variant_the_enum_has`, so
+    /// an entry deleted from IT fails there.
     #[test]
     fn every_scope_round_trips_through_serde() {
-        for scope in [
-            ProfileScope::Owner("jerry".into()),
-            ProfileScope::Household,
-            ProfileScope::Guest,
-        ] {
+        for scope in ProfileScope::every_shape() {
             let json = serde_json::to_string(&scope).expect("scope must serialize");
             let back: ProfileScope = serde_json::from_str(&json).expect("scope must deserialize");
             assert_eq!(back, scope, "round trip changed the scope: {json}");
