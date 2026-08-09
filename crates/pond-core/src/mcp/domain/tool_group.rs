@@ -206,6 +206,57 @@ pub fn groups_denied_to_guests() -> &'static [&'static str] {
     ]
 }
 
+/// Groups a SUBAGENT must never be given, whatever role asked for it and
+/// however wide its parent was.
+///
+/// PAI-6 P3. This is the same move PAI-1 P5 made for guests, for the same
+/// reason: **when the thing you want to check has no identity, move the check
+/// to the layer that hands it out.** A subagent has no identity two separate
+/// controls need:
+///
+/// - Its tool calls carry the CHILD's engine session id in `agent-session-id`,
+///   and nothing writes that id into `engine_session_map`. So
+///   `RepoDraftAuthority::actor_for_engine_session` returns `None`,
+///   `is_draft_decision_permitted` answers `REASON_UNRESOLVED_ACTOR`, and under
+///   the DEFAULT `PolicyMode::Audit` that **proceeds and logs**. A subagent
+///   could approve any staged action on a default install.
+/// - It runs under `GooseMode::Auto`, which is mandatory rather than chosen:
+///   any approval-requiring mode hangs forever on the child's
+///   `confirmation_rx`, because nothing forwards an ActionRequired message to a
+///   parent. So a subagent cannot be gated by approval at all, and its tool set
+///   is its only boundary.
+///
+/// Withholding is therefore the enforcement, not a substitute for it.
+/// Deliberately a denylist for the same reason as the guest one, and
+/// deliberately applied to the derived set rather than to the role's request:
+/// `giap-draft`, `giap-system` and `giap-toolkit` are all `core`, so anything
+/// that re-runs selection would put them straight back.
+///
+/// The cost is real and is accepted: a subagent has no clock, because
+/// `get_current_time` lives in `giap-system` next to `write_file`. A role that
+/// needs the date should be given it in its instructions.
+pub fn groups_denied_to_subagents() -> &'static [&'static str] {
+    &[
+        // `approve_draft`/`reject_draft` DECIDE, and the gate that would check
+        // who decided cannot resolve a subagent (see above).
+        "giap-draft",
+        // `enable_tool_group` WIDENS an allow-set keyed by the process-global
+        // `current_session_id()`, which a child does not own. A child holding
+        // this could widen its own narrowing -- or its parent's. This is the
+        // most direct breach of invariant 1 available anywhere in the tree.
+        TOOLKIT_EXTENSION,
+        // Actuates the house. There is no approval path for a subagent, and the
+        // one it would otherwise take -- staging a draft -- is denied above.
+        "giap-device-control",
+        // `write_file`, `run_shell_command` and `send_notification`. Writes and
+        // executes, with no approval path.
+        "giap-system",
+        // Schedules future work that will run with the household's authority,
+        // long after the delegation that created it has ended.
+        "giap-schedule",
+    ]
+}
+
 pub fn core_group_names() -> Vec<&'static str> {
     TOOL_GROUPS
         .iter()
@@ -332,6 +383,62 @@ mod guest_denylist_tests {
             assert!(
                 !denied.contains(&neutral),
                 "{neutral} carries no personal data and a guest should keep it"
+            );
+        }
+    }
+
+    /// Same typo hazard as the guest list, and the same consequence: a name
+    /// that matches no group removes nothing.
+    #[test]
+    fn every_subagent_denied_group_actually_exists() {
+        for name in groups_denied_to_subagents() {
+            assert!(
+                TOOL_GROUPS.iter().any(|g| g.extension == *name),
+                "the subagent denylist names a group that does not exist: {name} -- a typo \
+                 here silently hands a subagent the access it was meant to withhold"
+            );
+        }
+    }
+
+    /// The three the list exists for, named individually so removing one is a
+    /// deliberate edit with a failing test rather than a quiet deletion.
+    ///
+    /// Each is here for a mechanism, not a vibe: `giap-draft` because the draft
+    /// gate cannot resolve a subagent actor and audit mode proceeds;
+    /// `giap-toolkit` because `enable_tool_group` widens an allow-set keyed by
+    /// the process-global session id; `giap-device-control` because a subagent
+    /// is forced to `GooseMode::Auto` and has no approval path left once draft
+    /// is gone.
+    #[test]
+    fn the_subagent_denylist_covers_deciding_widening_and_actuating() {
+        let denied = groups_denied_to_subagents();
+        for required in ["giap-draft", TOOLKIT_EXTENSION, "giap-device-control"] {
+            assert!(
+                denied.contains(&required),
+                "{required} must be withheld from subagents; see the doc comment for the \
+                 mechanism each one breaks"
+            );
+        }
+    }
+
+    /// Vacuity control. If the list grew to cover every group, a subagent would
+    /// be useless and the narrowing would be indistinguishable from "no
+    /// subagents". The research surface the workstream exists for must survive.
+    #[test]
+    fn a_subagent_keeps_the_read_only_research_groups() {
+        let denied = groups_denied_to_subagents();
+        for kept in [
+            "giap-weather",
+            "giap-knowledge",
+            "giap-news",
+            "giap-finance",
+            "giap-device",
+            "giap-memory",
+        ] {
+            assert!(
+                !denied.contains(&kept),
+                "{kept} reads rather than decides; denying it leaves subagents unable to do \
+                 the one job they were built for"
             );
         }
     }

@@ -35,7 +35,9 @@
 //! GIAP-owned key that Goose and `pond-api`'s recipe runner both ignore.
 //! PAI-6 P1 adds no migration and no table.
 
-use crate::mcp::domain::tool_group::group_of_tool;
+use crate::mcp::domain::tool_group::{
+    group_of_tool, groups_denied_to_guests, groups_denied_to_subagents,
+};
 use crate::models::services::context::model_class::runs_on_this_device;
 use crate::user_data::domain::profile::ProfileScope;
 use chrono::{DateTime, Utc};
@@ -420,6 +422,34 @@ impl DelegationAuthority {
         }
     }
 
+    /// The authority of a turn, built from the exact tool names that turn was
+    /// given.
+    ///
+    /// PAI-6 P3. This is what the edge calls, and taking TOOL NAMES rather than
+    /// group names is the point: the adapter holds one set — the
+    /// post-selection, post-guest-subtraction allow-set it publishes to the
+    /// provider shim — and this derives the groups from that same set rather
+    /// than letting the caller assemble a second list that could disagree.
+    /// Passing the catalog, or the pre-subtraction set, would make every
+    /// downstream intersection a no-op; that is the shape PAI-1 P5 shipped and
+    /// had to repair, and it is the single easiest way to make this whole
+    /// workstream inert.
+    ///
+    /// An unprefixed name (Goose plumbing: the final-output tool, platform
+    /// tools) belongs to no group and is dropped, exactly as
+    /// [`TaskSpec::grants_tool`] would deny it.
+    pub fn for_turn<'a>(
+        session_id: impl Into<String>,
+        scope: ProfileScope,
+        allowed_tools: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let tool_groups: BTreeSet<String> = allowed_tools
+            .into_iter()
+            .filter_map(|tool| group_of_tool(tool).map(str::to_string))
+            .collect();
+        Self::root(session_id, scope, tool_groups)
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -474,11 +504,12 @@ impl DelegationAuthority {
         // either way nothing is constructed.
         let depth = self.depth.deeper()?;
         let scope = role.personal_data.narrow(&self.scope);
-        let tool_groups: BTreeSet<String> = role
-            .tool_groups
-            .intersection(&self.tool_groups)
-            .cloned()
-            .collect();
+        // `&scope`, not `&self.scope`. The subtraction is keyed on the CHILD's
+        // scope, and the only case where the two differ is the exact one this
+        // exists for: a Household parent running a `personal_data: deny` role.
+        // Pass the parent's and that case -- a Guest-scoped child still holding
+        // `giap-memory` -- is precisely what survives.
+        let tool_groups = narrow_child_groups(&role.tool_groups, &self.tool_groups, &scope);
         Ok(TaskSpec {
             id: uuid::Uuid::new_v4().to_string(),
             role: role.name.clone(),
@@ -492,6 +523,43 @@ impl DelegationAuthority {
             context_fraction: role.context_fraction,
         })
     }
+}
+
+/// The child's tool groups: the intersection, minus what the child's own scope
+/// denies, minus what no subagent may hold.
+///
+/// PAI-6 P3, and the whole of it for the tool axis. Three subtractions, in this
+/// order, and every one of them can only ever remove:
+///
+/// 1. **Intersect with the parent.** Invariant 1. The parent's set is the
+///    turn's real post-selection, post-guest-subtraction allow-set (see
+///    [`DelegationAuthority::for_turn`]), so this is a ceiling and not a
+///    formality.
+/// 2. **Subtract what the CHILD's scope denies.** This is the subtraction the
+///    obvious implementation misses, and it is where the profile axis and the
+///    tool axis meet. A `Household` parent running a role with
+///    `personal_data: deny` produces a `Guest` child — and without this line
+///    that Guest child keeps `giap-memory`, whose MCP tools carry no session
+///    and read the household's memory regardless. A scope that says Guest while
+///    the tools say Household is not a narrowing, it is a laundering route.
+/// 3. **Subtract [`groups_denied_to_subagents`].** Withheld from every child at
+///    every scope, because the controls those groups depend on cannot see a
+///    subagent at all.
+fn narrow_child_groups(
+    requested: &BTreeSet<String>,
+    parent: &BTreeSet<String>,
+    child_scope: &ProfileScope,
+) -> BTreeSet<String> {
+    let mut groups: BTreeSet<String> = requested.intersection(parent).cloned().collect();
+    if child_scope.excludes_everything() {
+        for denied in groups_denied_to_guests() {
+            groups.remove(*denied);
+        }
+    }
+    for denied in groups_denied_to_subagents() {
+        groups.remove(*denied);
+    }
+    groups
 }
 
 /// A child agent run that has been authorised but not yet started.
@@ -964,6 +1032,210 @@ mod tool_narrowing_tests {
         assert!(!spec.grants_tool("platform__manage_schedule"));
         assert!(!spec.grants_tool("unprefixed"));
         assert!(!spec.grants_tool("some-user-mcp-server__do_it"));
+    }
+
+    /// PAI-6 P3, and the sharpest defect it fixes. `personal_data: deny` drops
+    /// the child to `Guest`; before P3 the tool set was computed from the
+    /// PARENT's scope, so a Household parent produced a Guest child still
+    /// holding `giap-memory` -- whose MCP tools carry no session at all and
+    /// read the household's memory regardless of what the scope says. A scope
+    /// that says Guest while the tools say Household is a laundering route, not
+    /// a narrowing.
+    #[test]
+    fn a_child_dropped_to_guest_loses_the_groups_a_guest_is_denied() {
+        let spec = parent(&["giap-memory", "giap-weather", "giap-vision"])
+            .delegate(
+                &AgentRole::new(
+                    "r",
+                    "go",
+                    groups(&["giap-memory", "giap-weather", "giap-vision"]),
+                    RolePersonalData::Deny,
+                    3,
+                    0.5,
+                )
+                .unwrap(),
+                request(),
+            )
+            .unwrap();
+
+        assert_eq!(spec.profile_scope(), &ProfileScope::Guest);
+        assert_eq!(spec.tool_groups(), &groups(&["giap-weather"]));
+        assert!(!spec.grants_tool("giap-memory__recall_memories"));
+        assert!(!spec.grants_tool("giap-memory__forget_memory"));
+        assert!(!spec.grants_tool("giap-vision__who_was_seen"));
+    }
+
+    /// Vacuity control for the test above. The subtraction must be keyed on the
+    /// CHILD's scope, not applied unconditionally: an `Inherit` role under a
+    /// Household parent keeps `giap-memory`, or the previous test would pass
+    /// against an implementation that simply deleted memory from every child.
+    #[test]
+    fn an_inheriting_child_of_a_household_parent_keeps_memory() {
+        let spec = parent(&["giap-memory", "giap-weather"])
+            .delegate(&role_wanting(&["giap-memory", "giap-weather"]), request())
+            .unwrap();
+        assert_eq!(spec.profile_scope(), &ProfileScope::Household);
+        assert!(spec.grants_tool("giap-memory__recall_memories"));
+    }
+
+    /// Exhaustive over the denylist rather than naming two of it, so a group
+    /// added there later is covered without anyone remembering this file.
+    #[test]
+    fn no_subagent_gets_a_group_the_subagent_denylist_names() {
+        let denied: Vec<&str> = groups_denied_to_subagents().to_vec();
+        let spec = parent(&denied)
+            .delegate(&role_wanting(&denied), request())
+            .unwrap();
+        assert!(
+            spec.tool_groups().is_empty(),
+            "a role asked for the whole subagent denylist and kept {:?}",
+            spec.tool_groups()
+        );
+        for group in &denied {
+            assert!(
+                !spec.grants_tool(&format!("{group}__anything")),
+                "{group} is on the subagent denylist and reached a child anyway"
+            );
+        }
+    }
+
+    /// The draft half of PAI-6 P3, stated as the thing it actually prevents.
+    /// `approve_draft` is gated by `is_draft_decision_permitted`, which
+    /// resolves its actor through `engine_session_map` -- a table no subagent's
+    /// engine session is in. The gate therefore answers
+    /// `REASON_UNRESOLVED_ACTOR`, which under the DEFAULT `PolicyMode::Audit`
+    /// PROCEEDS. Withholding the group is the enforcement.
+    #[test]
+    fn a_subagent_can_never_reach_a_draft_decision_tool() {
+        for parent_scope in [
+            ProfileScope::Household,
+            ProfileScope::Owner("jerry".into()),
+            ProfileScope::Guest,
+        ] {
+            let authority = DelegationAuthority::root(
+                "s1",
+                parent_scope.clone(),
+                groups(&["giap-draft", "giap-weather"]),
+            );
+            for personal_data in [RolePersonalData::Inherit, RolePersonalData::Deny] {
+                let role = AgentRole::new(
+                    "r",
+                    "go",
+                    groups(&["giap-draft", "giap-weather"]),
+                    personal_data,
+                    3,
+                    0.5,
+                )
+                .unwrap();
+                let spec = authority.delegate(&role, request()).unwrap();
+                assert!(
+                    !spec.grants_tool("giap-draft__approve_draft"),
+                    "a {parent_scope:?} parent with {personal_data:?} handed a child the \
+                     ability to approve staged actions"
+                );
+                assert!(!spec.grants_tool("giap-draft__reject_draft"));
+                // Vacuity control, inline: the refusal is about draft, not
+                // about the delegation having produced nothing at all.
+                assert!(spec.grants_tool("giap-weather__get_forecast"));
+            }
+        }
+    }
+
+    /// `for_turn` is what the edge calls. Its input is the turn's real allow-set
+    /// -- tool names -- and the groups it derives must be exactly the groups of
+    /// those names, so that a guest subtraction the adapter already applied is
+    /// carried through rather than undone.
+    #[test]
+    fn a_turn_authority_is_exactly_the_groups_of_the_tools_that_turn_held() {
+        let authority = DelegationAuthority::for_turn(
+            "s1",
+            ProfileScope::Guest,
+            [
+                "giap-weather__get_forecast",
+                "giap-weather__current_conditions",
+                "giap-knowledge__lookup",
+                // Goose plumbing: belongs to no group and must not become one.
+                "final_output",
+                "platform__manage_schedule",
+            ],
+        );
+        assert_eq!(
+            authority.tool_groups(),
+            &groups(&["giap-weather", "giap-knowledge", "platform"])
+        );
+        assert!(!authority.tool_groups().contains("final_output"));
+    }
+
+    /// Every tool a full-surface turn could hold, one per group in the catalog.
+    /// The point is that it is NOT hand-filtered: the guest fixture below is
+    /// derived from this by the same function production derives it with.
+    fn a_full_turns_tools() -> Vec<String> {
+        use crate::mcp::domain::tool_group::{TOOL_GROUPS, TOOL_NAME_SEPARATOR};
+        TOOL_GROUPS
+            .iter()
+            .map(|g| format!("{}{TOOL_NAME_SEPARATOR}a_tool", g.extension))
+            .collect()
+    }
+
+    /// The failure this phase is most likely to ship: a turn whose allow-set was
+    /// already guest-subtracted must not have `giap-memory` reappear in its
+    /// authority.
+    ///
+    /// The fixture is built the way PRODUCTION builds it -- the full surface
+    /// put through `subtract_guest_denied_tools`, the same call `chat_stream`
+    /// makes at section 6d -- rather than by hand-writing a list that has
+    /// already had memory taken out of it. This programme's `ProfileScope::Owner`
+    /// incident was exactly a hand-built fixture that no code path could
+    /// produce; a hand-built post-subtraction list here would assert that
+    /// memory is absent from a list I removed it from myself.
+    #[test]
+    fn a_guest_turns_authority_cannot_contain_what_the_turn_was_denied() {
+        let full = a_full_turns_tools();
+        let guest_turn_tools =
+            crate::mcp::services::tool_selection::subtract_guest_denied_tools(full.iter());
+        let authority = DelegationAuthority::for_turn(
+            "s1",
+            ProfileScope::Guest,
+            guest_turn_tools.iter().map(String::as_str),
+        );
+        for denied in groups_denied_to_guests() {
+            assert!(
+                !authority.tool_groups().contains(*denied),
+                "{denied} was subtracted from the turn and reappeared in its authority"
+            );
+        }
+        let spec = authority
+            .delegate(&role_wanting(&["giap-memory", "giap-weather"]), request())
+            .unwrap();
+        assert!(!spec.grants_tool("giap-memory__recall_memories"));
+        assert!(spec.grants_tool("giap-weather__get_forecast"));
+    }
+
+    /// Vacuity control for the test above, and the reason it is worth having:
+    /// the SAME full surface, NOT guest-subtracted, does produce an authority
+    /// holding `giap-memory`. So the assertion is about the subtraction being
+    /// carried through, not about the catalog never having contained memory
+    /// and not about `for_turn` dropping personal-data groups on its own --
+    /// which it must not do, because a Household turn is entitled to them.
+    #[test]
+    fn the_same_surface_without_the_subtraction_does_carry_memory() {
+        let full = a_full_turns_tools();
+        let authority = DelegationAuthority::for_turn(
+            "s1",
+            ProfileScope::Household,
+            full.iter().map(String::as_str),
+        );
+        for denied in groups_denied_to_guests() {
+            assert!(
+                authority.tool_groups().contains(*denied),
+                "{denied} is missing from a FULL turn's authority, so the guest test next door \
+                 proves nothing about the subtraction"
+            );
+        }
+        let spec = authority
+            .delegate(&role_wanting(&["giap-memory"]), request())
+            .unwrap();
+        assert!(spec.grants_tool("giap-memory__recall_memories"));
     }
 
     /// A typo in a stored role must lose the group, never gain one.
