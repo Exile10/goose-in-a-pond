@@ -581,8 +581,95 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
   rather than by observing the provider. And a subagent's `giap-memory` reads are still unscoped
   at the MCP server, exactly as they are for an Owner's own turn — PAI-1's open gap, not one this
   phase widened.
-- **P4** Budget: `context_fraction` through `CompactionProfile`, shrinking `history_token_budget`
-  only (section 3.5); parent budget shrinks while a child is live; depth capped at 1.
+- **P4 — LANDED 2026-08-09.** Budget: `context_fraction` reaches `CompactionProfile`, the parent's
+  history budget shrinks while a child is live, and the parent's own turns now take the same
+  concurrency permit a child does.
+
+  **The reservation touches one field, and that is the whole design.**
+  `CompactionProfile::with_history_reserved` moves `history_token_budget` and nothing else. The
+  implementation that suggests itself — re-derive the profile from a scaled window — compiles,
+  reads well and shrinks every preamble allowance with it, so the system prompt is rebuilt at a
+  smaller size and the KV prefix MOVES: a full re-prefill charged to the parent's next turn, to
+  save tokens on a working set the trimmer was about to cut anyway. Delegating would then cost
+  exactly the thing delegation is justified by. `a_reservation_takes_working_set_and_never_preamble`
+  asserts every field by hand and
+  `a_live_child_shrinks_the_parents_history_and_leaves_its_prefix_alone` asserts the adapter applies
+  it that way rather than by scaling its resolved window.
+
+  **Respecified against the phase text: the reservation comes out of the CLAMPED budget, not the
+  declared one.** Section 7's assertion is only true that way. At an 8,192 window the profile
+  declares 4,000 history tokens while `usable_history_tokens` allows 3,668, so taking 30% of the
+  declared number leaves the parent 2,800 — the clamp then cuts it back to 2,800 anyway, and 2,800
+  plus the child's 1,200 plus the preamble is 7,500 against a 7,168-token usable prompt. Two agents
+  each believing they own the window is the failure this exists to prevent, and subtracting from
+  the declared allowance reproduces it. Reserving out of `min(declared, usable)` makes the section 7
+  disjunction hold exactly: the sum fits, or the parent is on `MIN_HISTORY_TOKENS` and the declared
+  sum overshoots by exactly that floor.
+  `a_parents_budget_and_its_childs_reservation_fit_the_window_or_hit_the_floor` sweeps eight windows
+  by seven fractions and fails if a case reaches neither branch;
+  `a_child_that_takes_the_whole_budget_leaves_the_parent_exactly_on_the_floor` is the floor case, and
+  it asserts that the unconditional form of the assertion would be FALSE there — so a future author
+  cannot quietly simplify it.
+
+  **`effective_history_budget` is new, and it exists because the phase had nothing to assert on.**
+  The trimmed budget was a local inside a 200-line function, and its only downstream observable is
+  how many turns got dropped — which moves for four other reasons. `trim_history` now calls it and
+  nothing else recomputes the clamp.
+
+  **Invariant 3's other half, which P2 left open and named.** Every on-device parent turn now takes
+  `parent_turn_permits` from the same process-wide semaphore, held for the whole turn by a guard the
+  stream drops. The predicate is `max_concurrent_subagents`, so ollama and llamafile — HTTP to
+  `127.0.0.1`, same GPU — are covered, and a hosted provider takes nothing at all, so four hosted
+  conversations still run four abreast. The cost is stated rather than hidden: two concurrent
+  on-device chat turns are now serialised against each other where they used to interleave between
+  provider calls. That is a real behaviour change for every install, and it is the right one — the
+  engine already serialises the calls themselves behind one mutex, and interleaving only ever bought
+  each turn a re-prefill of the other's prefix.
+
+  **The deadlock this could have shipped, and did not.** A synchronous delegation runs INSIDE its
+  parent's turn, and that turn now holds every permit on this device. A child that queued for them
+  would wait on a parent that is waiting on the child, forever, while holding one of `main.rs`'s
+  four `sse_semaphore` permits — so four delegating turns would take the interactive chat pool down
+  until the process restarted, answering every later stream 503. Nothing calls `spawn` until P5, so
+  it would not have surfaced in this phase at all. A child whose own parent's turn holds the device
+  therefore INHERITS it instead of acquiring, which is not a relaxation: the parent cannot reply
+  while its child runs. `a_child_runs_under_its_parents_device_claim_rather_than_deadlocking_behind_it`
+  fails by timeout without it, and
+  `a_child_of_another_session_waits_for_the_turn_that_holds_the_device` is its vacuity control —
+  inheritance is keyed on the child's own parent, not granted to everybody.
+
+  **The `sse_semaphore` consequence is real and is NOT closed here.** Even with inheritance, a
+  delegating turn holds one of four interactive permits for as long as its child runs, so four
+  concurrent delegations still leave nothing for a fifth stream. `Semaphore::new(4)` lives in
+  `main.rs`, outside this phase's footprint, and the fix is not a bigger number — it is that a
+  delegation which may run for minutes does not belong on the interactive pool. **P5 owns this
+  decision**, because P5 is what makes a delegating turn reachable: either the `delegate` tool
+  returns quickly and delegation becomes P8's background path, or the SSE pool gains a separate
+  allowance for turns that are waiting on a child rather than on a provider.
+
+  **Depth was verified, not reimplemented.** `MAX_DELEGATION_DEPTH` is 1;
+  `DelegationDepth::deeper` is private and refuses at the cap; the type has no `Deserialize`, no
+  `Default` and no public constructor from a number, so its only public path remains
+  `delegate` → `child_authority`. `nothing_in_this_adapter_can_construct_a_delegation_depth` reads
+  `orchestrator.rs` and `goose_agent.rs` with comments stripped and fails if this crate ever names
+  the constructor, and it reads the cap from the domain rather than restating it.
+
+  **What I rejected.** A mutable budget field on `CompactionProfile` — section 3.5 warned against it
+  and it would have made a per-turn value into shared state. Passing the ledger as a constructor
+  argument — same argument as the semaphore: `DeviceLedger::default()` at a call site looks exactly
+  like correct wiring and silently answers "no child is live". Reading the reservation at the three
+  budget call sites instead of once inside `turn_profile` — PAI-3 P5 exists because two of four
+  sites forgot the prompt-side clamp, and this would have been the same defect one phase later.
+  Giving the child its own trimmed history budget: nothing trims a child's conversation, its length
+  is bounded by `max_turns`, and inventing a second trim path for it is P8's problem if it is
+  anyone's.
+
+  **Still not done.** A synchronous delegation cannot shrink its OWN turn's trim: `trim_goose_history`
+  runs before `Agent::reply`, so by the time a child exists the parent has already budgeted. The
+  reservation binds a *concurrent* turn of the same conversation and, when P8 lands, a background
+  child that outlives the turn that spawned it. That is worth saying plainly because the phase text
+  reads as though it binds the delegating turn itself, and it does not. Section 3.4's measurement —
+  parent context growth with delegation versus inline — is still owed and still needs the Orin.
 - **P5** `giap-orchestrator` MCP extension + `ext_orchestrator_enabled`. The toggle needs its **own**
   `default_*` fn returning `false` and a `false` in the `impl Default for Settings` body — reusing
   `Settings::default_ext_enabled()` (which returns `true`) ships orchestration on for every install.
@@ -647,7 +734,16 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
    otherwise — `local`, `gguf`, `ollama`, `llamafile`. This used to say "`local`/`gguf`", which is
    the narrow reading PAI-4 P2 already had to fix once. See section 3.4. *(P2: one process-wide
    `Semaphore`, acquired on the only path that starts a child. **The semaphore does NOT yet cover
-   the parent's turns**, which this invariant also requires — owed by P4.)*
+   the parent's turns**, which this invariant also requires — owed by P4.)* *(P4 closes it: every
+   on-device parent turn takes `parent_turn_permits` of the same semaphore, held for the whole turn
+   by a guard the stream drops, so a child cannot reply between two of the parent's provider calls
+   and overwrite the one retained KV prefix. The predicate is `max_concurrent_subagents` again, so
+   a hosted provider's turns take nothing and four hosted conversations still run four abreast. A
+   SYNCHRONOUS child inherits its own parent's claim rather than acquiring — the parent is blocked
+   in a tool call, not talking to the provider, and acquiring would deadlock it against its own
+   child while stranding an `sse_semaphore` permit. What this does NOT bound is that pool: a
+   delegating turn still holds one of `main.rs`'s four interactive permits for the whole of its
+   child's run, and P5 owns that decision.)*
 4. Subagent conversations never enter the parent's `session_messages`; only results do. Satisfied
    by construction — `ChatService` is the sole writer of that table and the child loop never
    touches it — with one caveat worth stating: the child's turns *are* persisted, into Goose's own
