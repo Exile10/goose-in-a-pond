@@ -238,6 +238,56 @@ mod tests {
         .unwrap()
     }
 
+    /// A raw INSERT into `drafts`, for the triggers -- the layer that has to
+    /// hold for a row that reaches the table some way other than through
+    /// [`SqliteProposalRepository::save`].
+    ///
+    /// It BINDS the three constants rather than repeating their values as SQL
+    /// literals, and that is the whole reason it exists as a helper. The
+    /// trigger tests used to write `'proactive'`, `'proposal'` and
+    /// `'giap:proactive'` by hand, which tested 0041 against a shape production
+    /// does not produce: changing `PROPOSAL_ORIGIN` disabled both rationale
+    /// triggers for every row the repository writes, and pond-core and
+    /// pond-infra both stayed green. See
+    /// `the_origin_constant_is_the_literal_the_migrations_hardcode` for the
+    /// other half of that tie.
+    async fn insert_raw(
+        pool: &Pool<Sqlite>,
+        id: &str,
+        expires_at: Option<&str>,
+        rationale: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO drafts (id, session_id, kind, summary, payload, status, \
+             created_at, origin, expires_at, rationale) \
+             VALUES (?, ?, ?, 's', '{}', 'pending', '2026-08-10T00:00:00Z', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(PROPOSAL_SESSION_ID)
+        .bind(PROPOSAL_DRAFT_KIND)
+        .bind(PROPOSAL_ORIGIN)
+        .bind(expires_at)
+        .bind(rationale)
+        .execute(pool)
+        .await
+        .map(|_| ())
+    }
+
+    /// A live expiry for [`insert_raw`], in the spelling `sql_ts` writes.
+    fn raw_expiry() -> String {
+        sql_ts(Utc::now() + Duration::hours(2))
+    }
+
+    const MIGRATION_0041: &str = include_str!("../migrations/system/0041_proposals.sql");
+    const MIGRATION_0042: &str = include_str!("../migrations/system/0042_proposal_expiry.sql");
+
+    /// 0042's two triggers, named once so the upgrade test drops exactly what
+    /// the file creates.
+    const EXPIRY_TRIGGERS: [&str; 2] = [
+        "trg_drafts_proposal_needs_an_expiry_on_insert",
+        "trg_drafts_proposal_needs_an_expiry_on_update",
+    ];
+
     async fn db() -> (tempfile::TempDir, Pool<Sqlite>) {
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::Database::init(tmp.path()).await.unwrap();
@@ -343,6 +393,77 @@ mod tests {
         assert_eq!(status, "pending");
     }
 
+    /// The other half of `LIVE_PREDICATE`, which had no guard at all: widening
+    /// `status = 'pending'` to admit `'approved'` and `'rejected'` left the
+    /// whole pond-infra suite green, so the port's own promise that `get_live`
+    /// "returns `Ok(None)` for expired, decided and absent alike" was prose
+    /// with nothing behind it.
+    ///
+    /// A decided proposal resurfacing is invariant 7's other failure mode --
+    /// "an assistant that surfaces yesterday's suggestion has failed twice" --
+    /// and it is the worse one, because the row is not merely stale, it is one
+    /// the member already answered.
+    ///
+    /// Driven over both terminal decisions and over `'expired'`, and with the
+    /// read clock held at creation time throughout, so nothing here can pass
+    /// because the expiry clause caught it instead.
+    ///
+    /// Creation is `Utc::now()` rather than the frozen `at(0)`, and that is not
+    /// cosmetic: 0041's approve trigger compares against SQLite's own
+    /// `datetime('now')`, not against the injected clock the read path uses, so
+    /// a fixture created in 2026-07 is already unapprovable and the `'approved'`
+    /// arm would abort before this test ever reached its assertion. The two
+    /// clocks are deliberately different -- a trigger cannot be handed one --
+    /// and a test that straddles both has to satisfy each.
+    #[tokio::test]
+    async fn a_proposal_the_member_already_decided_is_never_shown_again() {
+        for decided in ["approved", "rejected", "expired"] {
+            let (_tmp, pool) = db().await;
+            let repo = SqliteProposalRepository::new(pool.clone());
+            let created = Utc::now();
+            repo.save(&proposal("decided", "liz", created, Duration::hours(6)))
+                .await
+                .unwrap();
+            repo.save(&proposal(
+                "still-pending",
+                "liz",
+                created,
+                Duration::hours(6),
+            ))
+            .await
+            .unwrap();
+
+            // Vacuity control, taken BEFORE the status moves: both are visible
+            // while both are pending, so the assertions below are about the
+            // status filter and not about a fixture that was never readable.
+            assert_eq!(
+                repo.list_live_for("liz", created).await.unwrap().len(),
+                2,
+                "{decided}: both proposals must be live before one is decided, or this \
+                 test proves nothing"
+            );
+
+            sqlx::query("UPDATE drafts SET status = ? WHERE id = 'decided'")
+                .bind(decided)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            assert!(
+                repo.get_live("decided", created).await.unwrap().is_none(),
+                "a proposal already marked '{decided}' must not be readable: invariant 7 \
+                 is broken by re-surfacing a suggestion the member has answered, not only \
+                 by re-surfacing a stale one"
+            );
+            let live = repo.list_live_for("liz", created).await.unwrap();
+            assert_eq!(
+                live.iter().map(|p| p.id()).collect::<Vec<_>>(),
+                vec!["still-pending"],
+                "list_live_for must drop the '{decided}' proposal and keep the pending one"
+            );
+        }
+    }
+
     /// The format contract between this file and 0041's triggers. If `sql_ts`
     /// ever emits something `datetime()` cannot parse, every proposal silently
     /// becomes expired -- a narrowing failure, so nothing else would notice.
@@ -409,17 +530,11 @@ mod tests {
     #[tokio::test]
     async fn sqlite_refuses_to_store_a_proposal_without_a_rationale() {
         let (_tmp, pool) = db().await;
+        let expiry = raw_expiry();
         for blank in [None, Some(""), Some("   ")] {
-            let err = sqlx::query(
-                "INSERT INTO drafts (id, session_id, kind, summary, payload, status, \
-                 created_at, origin, expires_at, rationale) \
-                 VALUES ('x', 'giap:proactive', 'proposal', 's', '{}', 'pending', \
-                 '2026-08-10T00:00:00Z', 'proactive', '2026-08-10T06:00:00Z', ?)",
-            )
-            .bind(blank)
-            .execute(&pool)
-            .await
-            .expect_err("a rationale-less proposal must not be storable");
+            let err = insert_raw(&pool, "x", Some(expiry.as_str()), blank)
+                .await
+                .expect_err("a rationale-less proposal must not be storable");
             assert!(
                 err.to_string().contains("must carry a rationale"),
                 "the refusal must name the defect, got: {err}"
@@ -429,15 +544,286 @@ mod tests {
         // Vacuity control: the same INSERT with a rationale succeeds, so the
         // three refusals above are about the rationale and not about the shape
         // of the statement.
+        insert_raw(&pool, "x", Some(expiry.as_str()), Some("because"))
+            .await
+            .unwrap();
+    }
+
+    /// 0042. Invariant 7 at the storage layer, which 0041 gave to the rationale
+    /// and not to the expiry: a row with `origin = 'proactive'` and a NULL
+    /// `expires_at` was storable, and 0041's approve trigger keys on
+    /// `OLD.expires_at IS NOT NULL`, so that row was approvable forever.
+    ///
+    /// Both doors are driven. The UPDATE one is the half that does the work: an
+    /// INSERT-only trigger is walked straight past by
+    /// `UPDATE drafts SET origin = 'proactive'` against a legacy row, and every
+    /// legacy row has no expiry -- which is the argument 0041 makes for its own
+    /// pair of rationale triggers.
+    #[tokio::test]
+    async fn sqlite_refuses_to_store_a_proposal_without_an_expiry() {
+        let (_tmp, pool) = db().await;
+
+        let err = insert_raw(&pool, "no-expiry", None, Some("because"))
+            .await
+            .expect_err("a proposal with no expiry must not be storable: it can never expire");
+        assert!(
+            err.to_string().contains("must carry an expiry"),
+            "the refusal must name the defect, got: {err}"
+        );
+
+        // The other door: a legacy draft -- no origin, no expiry, which is every
+        // draft in every pond today -- turned proactive by an UPDATE.
         sqlx::query(
-            "INSERT INTO drafts (id, session_id, kind, summary, payload, status, \
-             created_at, origin, expires_at, rationale) \
-             VALUES ('x', 'giap:proactive', 'proposal', 's', '{}', 'pending', \
-             '2026-08-10T00:00:00Z', 'proactive', '2026-08-10T06:00:00Z', 'because')",
+            "INSERT INTO drafts (id, session_id, kind, summary, payload, status, created_at) \
+             VALUES ('legacy', 'sess-a', 'shell_command', 's', '{}', 'pending', \
+             '2026-08-10T00:00:00Z')",
         )
         .execute(&pool)
         .await
-        .unwrap();
+        .expect("a legacy draft is exactly what save_draft writes and must stay storable");
+
+        // The rationale is supplied in the same statement on purpose: without
+        // it 0041's rationale trigger also matches, SQLite does not promise
+        // which of two eligible triggers aborts first, and this test would then
+        // pass or fail on the message of a rule it is not about.
+        let err = sqlx::query(
+            "UPDATE drafts SET origin = ?, rationale = 'because' WHERE id = 'legacy'",
+        )
+        .bind(PROPOSAL_ORIGIN)
+        .execute(&pool)
+        .await
+        .expect_err(
+            "relabelling an expiry-less row as proactive must not mint an immortal proposal",
+        );
+        assert!(
+            err.to_string().contains("must carry an expiry"),
+            "the refusal must name the defect, got: {err}"
+        );
+
+        // Vacuity control: the same UPDATE that also supplies an expiry and a
+        // rationale succeeds, so the refusals above are about the missing
+        // expiry and not about relabelling a row at all.
+        sqlx::query("UPDATE drafts SET origin = ?, expires_at = ?, rationale = 'because' WHERE id = 'legacy'")
+            .bind(PROPOSAL_ORIGIN)
+            .bind(raw_expiry())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    /// A migration must work against a database that ALREADY HAS ROWS, and the
+    /// row that decides it here is one only an UPGRADE can be holding:
+    /// proactive, with no expiry. A fresh database cannot produce it, because
+    /// every migration is applied at once and 0042's own INSERT trigger refuses
+    /// it -- so a test that only ever sees a fresh database cannot see this at
+    /// all.
+    ///
+    /// The defect it guards is not the refusal, it is the FREEZE. 0042's rule
+    /// is stated over a row's state rather than over the transition into it, so
+    /// without the data fix at the top of the file a pre-existing row in the
+    /// forbidden state can never be updated again -- not rejected, not swept,
+    /// and not released by the two UPDATEs inside 0038's `BEFORE DELETE ON
+    /// profiles` trigger. That last one aborts the DELETE, so removing a
+    /// household member fails on a row nobody can see. Confirmed by removing
+    /// the data fix: this test's final `DELETE FROM profiles` then fails with
+    /// SQLITE error 19.
+    ///
+    /// The migration is re-run from the FILE's own text, not from a copy of its
+    /// statements. A fixture that restated the fix would be testing a migration
+    /// that does not exist.
+    #[tokio::test]
+    async fn migration_0042_does_not_freeze_a_row_that_predates_it() {
+        let (_tmp, pool) = db().await;
+
+        // Rewind to the 0041 world.
+        for trigger in EXPIRY_TRIGGERS {
+            sqlx::query(&format!("DROP TRIGGER {trigger}"))
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|e| panic!("0042 must have created {trigger}: {e}"));
+        }
+        insert_raw(&pool, "immortal", None, Some("because"))
+            .await
+            .expect("with 0042's triggers dropped, the pre-0042 row must be writable");
+        sqlx::query("UPDATE drafts SET profile_id = 'liz' WHERE id = 'immortal'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(MIGRATION_0042)
+            .execute(&pool)
+            .await
+            .expect("0042 must apply to a database that already holds rows");
+
+        let (status, expires_at): (String, Option<String>) =
+            sqlx::query_as("SELECT status, expires_at FROM drafts WHERE id = 'immortal'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "expired");
+        assert!(
+            expires_at.is_some(),
+            "the row must come out of the upgrade with an expiry, or every later write to it \
+             aborts"
+        );
+
+        // Vacuity control: the triggers really were re-created, so the write
+        // below succeeds because the row was fixed and not because the rule
+        // went missing with the DROP.
+        let err = insert_raw(&pool, "another", None, Some("because"))
+            .await
+            .expect_err("0042's INSERT trigger must be in force after the file is re-run");
+        assert!(
+            err.to_string().contains("must carry an expiry"),
+            "got: {err}"
+        );
+
+        // The half that matters: a household member can still be removed.
+        sqlx::query("DELETE FROM profiles WHERE id = 'liz'")
+            .execute(&pool)
+            .await
+            .expect(
+                "0038's profile-delete trigger updates this row, so a frozen row blocks the \
+                 deletion of a household member entirely",
+            );
+    }
+
+    /// The workspace's `crates/` directory, for the reachability guard below.
+    const CRATES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+
+    /// Every `.rs` file under `crates/`, as `(path, source)`.
+    fn workspace_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(e) => panic!("cannot read {}: {e}", dir.display()),
+            };
+            for entry in entries {
+                let path = entry.expect("read dir entry").path();
+                if path.is_dir() {
+                    // `target` can appear under a crate on some layouts and is
+                    // generated, not authored.
+                    if path.file_name().and_then(|n| n.to_str()) != Some("target") {
+                        walk(&path, out);
+                    }
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let src = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+                    out.push((path.display().to_string(), src));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(std::path::Path::new(CRATES_DIR), &mut out);
+        out
+    }
+
+    /// PAI-7 P3a's central claim, re-proved on every run instead of asserted in
+    /// prose: **nothing outside this file constructs a proposal repository.**
+    ///
+    /// The reason this is a test rather than a sentence in the stamp is that
+    /// the usual tripwire cannot fire. Every symbol in the proposal domain is
+    /// `pub` in a library crate, so `dead_code` says nothing about a type no
+    /// production path can reach -- which is exactly how PAI-1 P5 was recorded
+    /// as landed while being inert on every install, and how PAI-6 P1's clamp
+    /// shipped with its one call site missing. An unreachable mechanism has to
+    /// be claimed positively, the way `UNGATED_SENDERS` claims the egress
+    /// partition, or the next reader assumes reachability from the fact that it
+    /// compiles.
+    ///
+    /// **This test is meant to fail one day.** When PAI-7 P4 adds
+    /// `SqliteProposalRepository::new(db.system.clone())` to `serve()` in
+    /// `crates/pond-server/src/main.rs`, delete it, and update the P3a stamp in
+    /// `docs/architecture/pai/07-proactive-intelligence.md` section 3.2 and the
+    /// ledger in the same change. Deleting it silently is the failure it exists
+    /// to prevent, in the other direction.
+    #[test]
+    fn nothing_outside_this_file_constructs_a_proposal_repository_yet() {
+        let sources = workspace_sources();
+        let this_file = "sqlite_proposal.rs";
+
+        // The vacuity controls come first, because a walk that found nothing
+        // proves nothing and would report the happiest possible answer.
+        assert!(
+            sources.len() > 100,
+            "the source walk found only {} files under {CRATES_DIR}: it is looking in the \
+             wrong place, and the assertion below would pass against an empty set",
+            sources.len()
+        );
+        let sibling_construction: Vec<&str> = sources
+            .iter()
+            .filter(|(path, src)| {
+                !path.ends_with(this_file) && src.contains("SqliteDraftRepository::new(")
+            })
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert!(
+            !sibling_construction.is_empty(),
+            "the walk cannot see a construction site it is KNOWN to be able to see: \
+             SqliteDraftRepository::new( is called from pond-server. Either the walk does not \
+             reach other crates, or that wiring moved -- and until this control passes, the \
+             assertion below is not evidence of anything"
+        );
+
+        let constructors: Vec<&str> = sources
+            .iter()
+            .filter(|(path, src)| {
+                !path.ends_with(this_file) && src.contains("SqliteProposalRepository::new(")
+            })
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert!(
+            constructors.is_empty(),
+            "a proposal repository is now constructed outside its own module, in {constructors:?}. \
+             That is good news and this test is the wrong shape for it: PAI-7 P3a is stamped \
+             as domain-and-persistence-only in docs/architecture/pai/07-proactive-intelligence.md \
+             section 3.2, on the strength of this assertion. Delete this test and correct the \
+             stamp and the ledger in the same change."
+        );
+    }
+
+    /// The SQL half of the `PROPOSAL_ORIGIN` contract, which nothing tied down.
+    ///
+    /// 0041's two rationale triggers and 0042's two expiry triggers each
+    /// hardcode the literal `'proactive'` in a `WHEN` clause. Renaming the Rust
+    /// constant therefore disables all four for every row this repository
+    /// writes -- invariant 2's and invariant 7's storage layers stop applying,
+    /// silently, with pond-core and pond-infra entirely green. The migration's
+    /// own header says the constant "is load-bearing in SQL as well as in
+    /// Rust", and that sentence was the only thing holding it.
+    ///
+    /// Asserted as two COUNTS rather than as a `contains`. A presence check
+    /// passes while a fifth trigger keyed on some other origin value is added
+    /// beside these, and it cannot tell "the constant moved" from "the
+    /// migration moved" -- the generic count is the vacuity control for the
+    /// bound one, and it fails first if the search has stopped describing the
+    /// file.
+    #[test]
+    fn the_origin_constant_is_the_literal_the_migrations_hardcode() {
+        for (name, sql, triggers) in [
+            ("0041_proposals.sql", MIGRATION_0041, 2usize),
+            ("0042_proposal_expiry.sql", MIGRATION_0042, 2usize),
+        ] {
+            let any = sql.matches("NEW.origin = '").count();
+            assert_eq!(
+                any, triggers,
+                "{name} no longer has {triggers} triggers keyed on an origin literal, it has \
+                 {any}. Either a trigger was added or removed -- in which case update this \
+                 count -- or the WHEN clause was rewritten and the assertion below has \
+                 stopped describing the file."
+            );
+            let bound = sql
+                .matches(format!("NEW.origin = '{PROPOSAL_ORIGIN}'").as_str())
+                .count();
+            assert_eq!(
+                bound, triggers,
+                "{name} hardcodes an origin literal that PROPOSAL_ORIGIN ({PROPOSAL_ORIGIN:?}) \
+                 no longer matches: {bound} of its {triggers} origin-keyed triggers agree with \
+                 the constant. Every row SqliteProposalRepository::save writes would slip past \
+                 the rest, so the storage layer under PAI-7 invariants 2 and 7 would stop \
+                 applying without one test going red."
+            );
+        }
     }
 
     /// 0041's update trigger. An expired row may not be approved, whoever asks
