@@ -13,20 +13,28 @@
 //! here keeps every input in one place and keeps the row a record rather than a
 //! verdict.
 //!
-//! # The rung that does not exist yet
+//! # The rung that exists in storage and is not yet supplied
 //!
-//! **A paired device cannot currently be resolved to a household member.**
-//! `session_tokens` stores `device_id` and `client_id` and no profile; neither
-//! do `push_tokens`, `pairing_codes`, or `handshake_challenges`. Nothing in the
-//! schema links a phone to the person holding it, because the pairing flow
-//! never asks. This is the *strongest* rung in the designed chain and it is
-//! absent, so [`ResolutionInputs::paired_device_profile`] exists, is honoured,
-//! and is fed `None` by every caller today.
+//! **Until 2026-08-10 a paired device could not be resolved to a household
+//! member at all**: `session_tokens` stored `device_id` and `client_id` and no
+//! profile, and neither did `push_tokens`, `pairing_codes` or
+//! `handshake_challenges`. PAI-1 P9 built that link --
+//! [`DeviceAttribution::device_profile`] over `devices.profile_id` (migration
+//! 0043), captured at pairing-code issuance so the pairing client cannot name
+//! its own member.
 //!
-//! That is recorded rather than worked around. Inferring the owner from
-//! `settings.primary_profile_id` would attribute every phone in the house to
-//! one person, which is worse than admitting we do not know -- a wrong
-//! attribution is the one outcome PAI-1 exists to prevent.
+//! [`DeviceAttribution::device_profile`]: crate::user_data::ports::device_attribution::DeviceAttribution::device_profile
+//!
+//! **[`ResolutionInputs::paired_device_profile`] is still fed `None` by every
+//! caller.** The storage exists; the handler that would populate it does not.
+//! `crates/pond-infra/tests/device_profile_rung_is_not_wired_yet.rs` fails the
+//! day that changes, because this rung going live changes what an unidentified
+//! speaker can reach and must be a decision rather than a discovery.
+//!
+//! Inferring the owner from `settings.primary_profile_id` remains refused --
+//! it would attribute every phone in the house to one person, which is worse
+//! than admitting we do not know. A wrong attribution is the one outcome PAI-1
+//! exists to prevent.
 
 use crate::user_data::domain::profile::ProfileScope;
 use crate::user_data::domain::session::{IdentificationSource, SessionIdentity};
@@ -40,8 +48,10 @@ use crate::user_data::domain::session::{IdentificationSource, SessionIdentity};
 pub struct ResolutionInputs<'a> {
     /// The member owning the paired device that authenticated this request.
     ///
-    /// Always `None` today. See the module docs: the pairing flow does not
-    /// capture a member, so there is nothing to look up.
+    /// Always `None` today, and no longer for want of a place to look it up:
+    /// PAI-1 P9 built `DeviceAttribution` over `devices.profile_id`, and the
+    /// remaining half is the handler that resolves the request's token to a
+    /// device and asks. See the module docs.
     pub paired_device_profile: Option<&'a str>,
     /// What the session row says, from [`SessionStorage::get_session_identity`].
     ///
