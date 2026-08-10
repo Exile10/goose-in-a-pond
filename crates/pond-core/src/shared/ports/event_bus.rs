@@ -314,15 +314,93 @@ mod tests {
 
     /// The bus is serialised (it crosses a broadcast channel and is the shape
     /// the event log records), so the new variants must round-trip.
+    ///
+    /// **Compared whole, not by discriminant.** The first version of this test
+    /// asserted only that a `Time` came back a `Time`, which is true of a
+    /// payload with every field dropped — and `session_id` carries
+    /// `skip_serializing_if`, so silently dropping a field is exactly the
+    /// mistake available here. Comparing the payload also means a field added
+    /// to either struct tomorrow is covered without anyone remembering to
+    /// extend this.
     #[test]
-    fn the_new_variants_round_trip_through_serde() {
-        for event in [time_tick(), session_event(SessionPhase::Resumed, None)] {
-            let json = serde_json::to_string(&event).expect("serialises");
-            let back: BusEvent = serde_json::from_str(&json).expect("deserialises");
-            assert_eq!(
-                std::mem::discriminant(&event),
-                std::mem::discriminant(&back)
-            );
+    fn the_new_variants_round_trip_with_their_payloads_intact() {
+        let tick = TimeTick {
+            boundary: TimeBoundary::Hour,
+            at: chrono::Utc::now(),
+            local_hour: 12,
+        };
+        match round_trip(BusEvent::Time(tick.clone())) {
+            BusEvent::Time(back) => assert_eq!(back, tick, "the tick lost a field in transit"),
+            other => panic!("a Time came back as {other:?}"),
         }
+
+        // Both shapes of `session_id`: the one that serialises and the one
+        // `skip_serializing_if` omits, which must come back `None` rather
+        // than failing to deserialise for want of the field.
+        for lifecycle in [
+            SessionLifecycle {
+                phase: SessionPhase::Started,
+                session_id: Some("sess-42".into()),
+                at: chrono::Utc::now(),
+                idle_secs: 0,
+            },
+            SessionLifecycle {
+                phase: SessionPhase::Resumed,
+                session_id: None,
+                at: chrono::Utc::now(),
+                idle_secs: 1_800,
+            },
+        ] {
+            match round_trip(BusEvent::Session(lifecycle.clone())) {
+                BusEvent::Session(back) => assert_eq!(
+                    back, lifecycle,
+                    "the session transition lost a field in transit"
+                ),
+                other => panic!("a Session came back as {other:?}"),
+            }
+        }
+    }
+
+    /// Vacuity control for the round-trip above: an event whose payload is
+    /// altered does *not* compare equal, so the assertions there are about the
+    /// wire format and not about a `PartialEq` that answers `true` to
+    /// everything.
+    #[test]
+    fn the_round_trip_comparison_can_actually_fail() {
+        let at = chrono::Utc::now();
+        let tick = TimeTick {
+            boundary: TimeBoundary::Hour,
+            at,
+            local_hour: 12,
+        };
+        assert_ne!(
+            tick,
+            TimeTick {
+                local_hour: 13,
+                ..tick.clone()
+            },
+            "a tick that lost its hour must not compare equal to one that kept it"
+        );
+
+        let started = SessionLifecycle {
+            phase: SessionPhase::Started,
+            session_id: Some("sess-42".into()),
+            at,
+            idle_secs: 0,
+        };
+        assert_ne!(
+            started,
+            SessionLifecycle {
+                session_id: None,
+                ..started.clone()
+            },
+            "a transition that lost its session id must not compare equal to one that kept it"
+        );
+    }
+
+    fn round_trip(event: BusEvent) -> BusEvent {
+        let json = serde_json::to_string(&event).expect("a bus event serialises");
+        serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("a bus event must deserialise from {json}: {e}"))
     }
 }
