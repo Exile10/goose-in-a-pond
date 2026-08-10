@@ -237,41 +237,71 @@ mod tests {
     /// The failure this whole gate exists to prevent: a pond that booted and
     /// was never touched is not an idle user, it is an unused machine. It must
     /// stay silent however long it sits, and however many times it is polled.
+    ///
+    /// **The polling window has to cross the idle threshold, and this is the
+    /// second version of this test.** The first stepped `idle_for` by a minute
+    /// over ten polls, topping out well short of the threshold — so it passed
+    /// with the `saw_activity_since_start` gate DELETED, and proved only that
+    /// an active pond is quiet while it is active. A mutation run caught it.
+    /// Ten polls of ten minutes cross the threshold five times over.
     #[test]
     fn an_untouched_pond_publishes_nothing() {
         let mut obs = ActivityObserver::starting_from(Some(t(-10)));
+        let mut crossed_the_threshold = false;
         for poll in 0..10 {
+            let idle_for = Duration::from_secs(10 * 60 * poll);
+            crossed_the_threshold |= idle_for >= THRESHOLD;
             let events = obs.observe(
                 &[],
                 ActivityInputs {
                     saw_activity_since_start: false,
-                    idle_for: Duration::from_secs(60 * poll),
+                    idle_for,
                     ..inputs(0)
                 },
             );
-            assert!(events.is_empty(), "poll {poll} published {events:?}");
+            assert!(
+                events.is_empty(),
+                "an untouched pond published {events:?} at poll {poll}, {}s idle",
+                idle_for.as_secs()
+            );
         }
+        assert!(
+            crossed_the_threshold,
+            "this test proves nothing unless its polls reach {}s of idle",
+            THRESHOLD.as_secs()
+        );
     }
 
     /// Vacuity control for the test above: the same observer, given activity,
     /// does publish. Without this the silence assertion would also pass
     /// against an observer that can never say anything at all.
+    ///
+    /// The first poll is deliberately past the threshold. Ungated, it would
+    /// record an `Idle` baseline from the boot clock and the next poll would
+    /// announce a `Resumed` nobody performed.
     #[test]
     fn the_same_observer_does_publish_once_activity_is_real() {
         let mut obs = ActivityObserver::starting_from(Some(t(-10)));
-        assert!(obs
-            .observe(
+        assert!(
+            obs.observe(
                 &[],
                 ActivityInputs {
                     saw_activity_since_start: false,
+                    idle_for: Duration::from_secs(30 * 60),
                     ..inputs(0)
                 }
             )
-            .is_empty());
-        assert!(obs.observe(&[], inputs(0)).is_empty(), "baseline is silent");
+            .is_empty(),
+            "an untouched pond is not an idle user, however long it has sat"
+        );
+        assert!(
+            obs.observe(&[], inputs(0)).is_empty(),
+            "the first observation after real activity is a baseline, not a Resumed"
+        );
         assert_eq!(
             phases(&obs.observe(&[], inputs(16 * 60))),
-            vec![SessionPhase::Idle]
+            vec![SessionPhase::Idle],
+            "and once there is a baseline to depart from, going quiet is published"
         );
     }
 
@@ -359,7 +389,16 @@ mod tests {
             },
         ];
         let mut obs = ActivityObserver::starting_from(Some(t(-200)));
-        assert!(obs.observe(&existing, inputs(0)).is_empty());
+        let announced = obs.observe(&existing, inputs(0));
+        assert!(
+            announced.is_empty(),
+            "a restart announced {} conversation(s) that already existed as newly started: {:?}",
+            announced.len(),
+            announced
+                .iter()
+                .map(|e| e.session_id.as_deref().unwrap_or("-"))
+                .collect::<Vec<_>>()
+        );
 
         // Vacuity control: the same list *without* the seed is announced, so
         // the assertion above is about the seed and not about an observer that
