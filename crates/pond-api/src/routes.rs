@@ -1320,6 +1320,28 @@ impl TurnAccumulator {
             AgentStreamEvent::TurnLimitReached { max_turns } => StreamStep::Frame(
                 json!({"type": "turn_limit_reached", "max_turns": max_turns}).to_string(),
             ),
+            // PAI-6 P6. A frame and NOTHING else: no `full_text`, no
+            // `tool_results`, no timing slot. Those three fields are what this
+            // struct exists to persist, and invariant 4 says a subagent's
+            // activity never becomes the parent's history — only its final
+            // result does, which arrives as the `delegate` tool's ToolResult
+            // through the arm above. `absorb_progress_leaves_the_turn_untouched`
+            // is the guard.
+            AgentStreamEvent::SubagentProgress {
+                task_id,
+                role,
+                status,
+                detail,
+            } => StreamStep::Frame(
+                json!({
+                    "type": "subagent_progress",
+                    "task_id": task_id,
+                    "role": role,
+                    "status": status,
+                    "detail": detail,
+                })
+                .to_string(),
+            ),
             AgentStreamEvent::Done { usage, stats, .. } => StreamStep::TurnComplete { usage, stats },
             AgentStreamEvent::Error { content } => {
                 StreamStep::Frame(json!({"error": content}).to_string())
@@ -13394,6 +13416,9 @@ mod tests {
 
     use pond_core::models::ports::agent::AgentStreamEvent;
     use pond_core::models::ports::provider::UsageStats;
+    // Not re-exported through `models::ports::agent`, which names the three
+    // types the port's signatures need and nothing else.
+    use pond_core::shared::domain::agent::SubagentStatus;
 
     /// An accumulator configured the way `/agent/chat/stream` configures one.
     fn accumulator() -> TurnAccumulator {
@@ -13706,5 +13731,83 @@ mod tests {
         }));
         assert_eq!(err["error"], "the model went away");
         assert!(err.get("type").is_none());
+    }
+
+    /// PAI-6 P6 / invariant 4: a subagent's activity reaches the CLIENT and
+    /// never the parent's history.
+    ///
+    /// The accumulator's three top fields are what both handlers persist --
+    /// `full_text` becomes the assistant message and `tool_results` become its
+    /// tool rows. A progress frame that touched either would put a child's
+    /// conversation into `session_messages`, which is the one thing this
+    /// workstream is not allowed to do; the parent takes back exactly one
+    /// string, the `delegate` tool's result, through the `ToolResult` arm.
+    ///
+    /// The tool-timing fields are asserted too, and that is not padding: the
+    /// obvious way to write the `Tool` arm is to reuse the `ToolCall` arm, and
+    /// doing so would report the CHILD's tool as this turn's last tool in
+    /// `TurnMetrics` -- a plausible-looking number about the wrong agent.
+    #[test]
+    fn absorb_progress_leaves_the_turn_untouched() {
+        let mut turn = accumulator();
+        // A prior real tool call, so the assertions below distinguish "the
+        // progress frame did not write" from "nothing was ever written".
+        turn.absorb(AgentStreamEvent::ToolCall {
+            id: "call-1".to_string(),
+            tool: "giap-orchestrator__delegate".to_string(),
+            input: None,
+        });
+
+        for (status, detail) in [
+            (SubagentStatus::Queued, None),
+            (SubagentStatus::Running, None),
+            (
+                SubagentStatus::Tool,
+                Some("giap-memory__recall_memories".to_string()),
+            ),
+            (SubagentStatus::Completed, None),
+        ] {
+            let frame = frame_of(turn.absorb(AgentStreamEvent::SubagentProgress {
+                task_id: "task-1".to_string(),
+                role: "researcher".to_string(),
+                status,
+                detail: detail.clone(),
+            }));
+            assert_eq!(
+                frame,
+                json!({
+                    "type": "subagent_progress",
+                    "task_id": "task-1",
+                    "role": "researcher",
+                    "status": status.as_str(),
+                    "detail": detail,
+                }),
+                "the frame the client receives must be this frame whole"
+            );
+        }
+
+        assert!(
+            turn.full_text.is_empty(),
+            "a subagent's progress joined the parent's answer text, which is \
+             what gets persisted as the assistant message -- PAI-6 invariant 4 \
+             says only the delegation's RESULT may do that"
+        );
+        assert!(
+            turn.tool_results.is_empty(),
+            "a subagent's progress was persisted as one of the parent turn's \
+             tool results"
+        );
+        assert_eq!(
+            turn.last_tool_name.as_deref(),
+            Some("giap-orchestrator__delegate"),
+            "the child's tool overwrote the parent's own last tool, so \
+             TurnMetrics now reports a tool this turn never called"
+        );
+        assert!(
+            turn.last_tool_latency_ms.is_none(),
+            "a progress frame closed the parent's open tool-call timing, so the \
+             delegate call's latency is now the gap before the child's first \
+             tool instead of the whole delegation"
+        );
     }
 }

@@ -1205,7 +1205,15 @@ impl ChatService {
                 // The engine's cap message itself arrives as Text and IS spoken;
                 // this structured marker is for clients that can offer a
                 // continue affordance, which a voice turn cannot.
-                | AgentStreamEvent::TurnLimitReached { .. } => {
+                | AgentStreamEvent::TurnLimitReached { .. }
+                // PAI-6 P6. A voice turn has no tree to draw, and narrating a
+                // delegation ("the researcher is calling recall_memories") is
+                // the same mistake the ToolCall arm above already refuses:
+                // announcements the user hears instead of an answer. It is also
+                // deliberately not appended to `full_text` here or anywhere —
+                // that string is what gets persisted, and invariant 4 keeps a
+                // subagent's activity out of the parent's history.
+                | AgentStreamEvent::SubagentProgress { .. } => {
                     // Not spoken during streaming — informational only
                 }
             }

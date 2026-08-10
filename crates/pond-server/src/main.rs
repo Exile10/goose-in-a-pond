@@ -6661,6 +6661,22 @@ async fn stream_agent_response(
                      send \"continue\" to resume)\x1b[0m"
                 );
             }
+            // PAI-6 P6. On stderr with the other progress chatter, so piping
+            // stdout still yields exactly the assistant's answer. `detail` is a
+            // tool name or a GIAP-authored reason and is printed as it arrives;
+            // it never carries the child's own text.
+            AgentStreamEvent::SubagentProgress {
+                role,
+                status,
+                detail,
+                ..
+            } => {
+                eprint!("\r\x1b[K\x1b[2m  [{role}] {}", status.as_str());
+                if let Some(detail) = detail {
+                    eprint!(" {detail}");
+                }
+                eprintln!("\x1b[0m");
+            }
             AgentStreamEvent::Error { content } => {
                 eprintln!("\n  error: {content}");
                 std::process::exit(1);
