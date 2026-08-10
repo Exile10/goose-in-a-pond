@@ -8187,16 +8187,9 @@ async fn agent_chat_stream(
             .map(|s| s.persist_thinking)
             .unwrap_or(false);
 
-        let mut chat_service = pond_core::shared::services::chat::ChatService::new(
-            agent.clone(),
-            session_id.clone(),
-            storage.clone(),
-        )
-        .with_thinking(persist_thinking);
-        if let Some(event_log) = state.event_log.clone() {
-            chat_service = chat_service.with_event_log(event_log);
-        }
-
+        // The session row first, because both things below depend on it: the
+        // scope resolution reads the session's identity, and the user message is
+        // a row against it.
         if storage.get_session(&session_id).await.is_err() {
             if let Err(e) = storage.create_session(session_id.clone()).await {
                 yield Ok(Event::default().data(json!({"error": e.to_string()}).to_string()));
@@ -8204,19 +8197,58 @@ async fn agent_chat_stream(
             }
         }
 
+        // Resolved here, not before the stream: this route creates the session
+        // row inside the stream body, so resolving earlier would read the
+        // identity of a session that does not exist yet and miss a binding
+        // written by PUT /sessions/{id}/user against a freshly minted id.
+        //
+        // PAI-5 P7 moved it ABOVE the `ChatService` rather than below, and that
+        // ordering is the whole safety of this phase. `ChatService`'s default
+        // scope is `ProfileScope::Household`, and the scope is what memory
+        // extraction is attributed to. Enabling extraction here -- which is
+        // exactly what P7 asks for -- while building the service before the
+        // scope was known would have written a Guest's turn, or one member's,
+        // into the whole household's memory. The default was harmless only
+        // because extraction was off on this route. A widening default reached
+        // by ordering is still a widening default.
+        let turn_scope = resolve_turn_scope(&state, &session_id).await;
+
+        let mut chat_service = pond_core::shared::services::chat::ChatService::new(
+            agent.clone(),
+            session_id.clone(),
+            storage.clone(),
+        )
+        .with_profile_scope(turn_scope.clone())
+        .with_thinking(persist_thinking);
+        // PAI-5 P7 parity. `/chat/stream` has owned extraction since it was
+        // written; this route persisted its turns and never extracted from them,
+        // so a whole conversation held here contributed nothing to memory.
+        // Guarded exactly as the other handler guards it, so a pond with no
+        // extractor configured behaves as it did before.
+        if let (Some(ext), Some(svc)) =
+            (state.memory_extractor.clone(), state.memory_extraction_service.clone())
+        {
+            chat_service = chat_service.with_memory_extraction(
+                ext,
+                svc,
+                state.memory_repo.clone(),
+            );
+        }
+        if let Some(event_log) = state.event_log.clone() {
+            chat_service = chat_service.with_event_log(event_log);
+        }
+
         if let Err(e) = chat_service.persist_user_message_with_images(&message, images.clone()).await {
             yield Ok(Event::default().data(json!({"error": format!("Failed to persist user message: {}", e)}).to_string()));
             return;
         }
 
+        // `message` is moved into the `AgentRequest` below, and extraction needs
+        // the user's own words when the turn ends.
+        let user_message_for_extraction = message.clone();
+
         let mut full_text = String::new();
         let mut tool_results: Vec<String> = Vec::new();
-
-        // Resolved here, not before the stream: this route creates the session
-        // row inside the stream body, so resolving earlier would read the
-        // identity of a session that does not exist yet and miss a binding
-        // written by PUT /sessions/{id}/user against a freshly minted id.
-        let turn_scope = resolve_turn_scope(&state, &session_id).await;
         let request = AgentRequest {
             message,
             session_id: session_id.clone(),
@@ -8351,11 +8383,17 @@ async fn agent_chat_stream(
         }
 
         // ── Persist assistant turn ──────────────────────────────────────────
-        let _ = chat_service.persist_assistant_turn(
+        // PAI-5 P7. `persist_assistant_turn_with_extraction` owns both concerns,
+        // which is why this route calls it rather than persisting and then
+        // extracting: a handler cannot accidentally drop extraction by
+        // refactoring the block, because there is no separate call to drop.
+        // That is the same reason `/chat/stream` uses it.
+        let _ = chat_service.persist_assistant_turn_with_extraction(
             tool_results,
             &full_text,
             None,
             None,
+            &user_message_for_extraction,
         ).await;
     };
 

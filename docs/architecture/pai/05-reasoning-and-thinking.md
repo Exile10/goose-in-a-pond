@@ -742,8 +742,42 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   it would have accumulated reasoning text (which restates household context verbatim) on disk with
   no setting to refuse it and no surface to view or delete it. Waiting one run cost nothing and
   avoided shipping a privacy store whose only property was that it existed.
-- **P7** Unify the two stream handlers; `/agent/chat/stream` gains full parity, including memory
-  extraction.
+- **P7 — PARTIALLY LANDED 2026-08-10. The parity half is done; the unification half is not, and I
+  am splitting the bullet rather than stamping the whole thing.**
+
+  **What landed.** `/agent/chat/stream` now extracts memory from its turns. It had been building a
+  `ChatService`, persisting the user message and persisting the assistant turn, and never wiring an
+  extractor — so an entire conversation held on that route contributed nothing to memory, and
+  nothing in the suite objected. It now takes `.with_memory_extraction(...)` under the same guard
+  `/chat/stream` uses, and calls `persist_assistant_turn_with_extraction`, which owns both concerns
+  in one call precisely so a later refactor has no separate extraction call to drop.
+
+  **The defect this phase was one line away from shipping, which is the part worth reading.**
+  `ChatService`'s default scope is `ProfileScope::Household`, and the scope is what extraction is
+  attributed to. `agent_chat_stream` resolves the turn's real scope *after* the session row exists —
+  which it must, because this route creates that row inside the stream body — but it was building
+  the `ChatService` thirty lines *before* that resolution and never calling `with_profile_scope`.
+  While extraction was off, that default was inert. Switching extraction on without moving the
+  resolution would have written a Guest's turn, or one member's, into the whole household's memory.
+  The `chat.rs` comment claiming "the REST handlers set a resolved scope" was true of one handler
+  and false of the other. The session row is now created first, the scope resolved second, and the
+  service built third. **A widening default reached by ordering is still a widening default**, and
+  it is invisible to any test that only checks the calls are present.
+
+  `crates/pond-api/tests/stream_handler_parity.rs` guards it, and asserts ORDER and ARGUMENTS rather
+  than presence — the drain-loop tripwire in PAI-6 had five string-presence assertions and let two
+  production-shaped mutations restore the original defect in full. Mutation-tested: removing
+  `.with_profile_scope(turn_scope.clone())` still compiles, because `turn_scope` is used by the
+  `AgentRequest` regardless, and fails two named assertions.
+
+  **What did NOT land, and why it is its own change.** The handlers are not unified. They diverge
+  more than the bullet implies and not where it implies: both cover the same ten `AgentStreamEvent`
+  variants, and the frame JSON is the same — the divergence is auxiliary (`/chat/stream` accumulates
+  per-tool timing and telemetry the other does not) and structural (`chat_stream` is a thin wrapper
+  that takes an SSE permit and delegates to `chat_stream_inner`; `agent_chat_stream` carries its
+  body inline with no inner). Unifying means restructuring the busiest file in the programme, and it
+  is worth doing before PAI-6 P6 lands, because P6 must otherwise write its new variant's arm twice
+  into two blocks that have already drifted.
 
 ---
 
