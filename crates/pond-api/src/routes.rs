@@ -13372,4 +13372,273 @@ mod tests {
         assert_eq!(clean, "Some text");
         assert!(hint.is_none(), "missing colon should not produce a hint");
     }
+
+    // ── The stream translator ────────────────────────────────────────────
+    //
+    // PAI-5 P7. `TurnAccumulator::absorb` is now the only place an
+    // `AgentStreamEvent` becomes an SSE frame, which makes it the only place a
+    // frame's shape can regress -- for BOTH routes at once. These are
+    // behavioural: the inputs are the values the live `GooseAdapter` yields,
+    // and the assertions are on the JSON a browser receives and on the state
+    // the handler persists and reports afterwards. `stream_handler_parity.rs`
+    // covers the other half, that no second match appears.
+
+    use pond_core::models::ports::agent::AgentStreamEvent;
+    use pond_core::models::ports::provider::UsageStats;
+
+    /// An accumulator configured the way `/agent/chat/stream` configures one.
+    fn accumulator() -> TurnAccumulator {
+        TurnAccumulator::new(crate::thought_filter::ThoughtFilter::new())
+    }
+
+    fn frame_of(step: StreamStep) -> Value {
+        match step {
+            StreamStep::Frame(data) => {
+                serde_json::from_str(&data).expect("a frame is JSON the browser can parse")
+            }
+            other => panic!("expected a frame, got {other:?}"),
+        }
+    }
+
+    /// Long enough to clear the filter's lookahead, which holds back a tail
+    /// that might turn out to be the start of a `<|channel>` tag. A short
+    /// fixture emits nothing and would make every assertion here vacuous.
+    const SENTENCE: &str = "The kettle is on and the hallway lights are off, as you asked earlier.";
+
+    #[test]
+    fn a_visible_token_becomes_a_text_frame_and_joins_the_answer() {
+        let mut turn = accumulator();
+        let frame = frame_of(turn.absorb(AgentStreamEvent::Text {
+            content: SENTENCE.to_string(),
+        }));
+
+        assert_eq!(frame["type"], "text");
+        let shown = frame["content"].as_str().expect("content is a string");
+        assert!(
+            !shown.is_empty() && SENTENCE.starts_with(shown),
+            "the frame must carry what the filter released, got {shown:?}"
+        );
+        // The desktop reads `token`; the hub reads `content`. Both, or one of
+        // the two surfaces renders an empty message.
+        assert_eq!(frame["token"], frame["content"]);
+        assert_eq!(
+            turn.full_text, shown,
+            "the persisted answer must be exactly what was shown"
+        );
+    }
+
+    #[test]
+    fn text_the_filter_is_still_holding_emits_nothing() {
+        let mut turn = accumulator();
+        let step = turn.absorb(AgentStreamEvent::Text {
+            content: "<|channel>thought I should check the".to_string(),
+        });
+
+        assert_eq!(
+            step,
+            StreamStep::Nothing,
+            "reasoning markup must not reach the browser as answer text"
+        );
+        assert!(turn.full_text.is_empty());
+        assert!(
+            turn.ttft.is_none(),
+            "time-to-first-token is about the answer, not about a swallowed chunk"
+        );
+    }
+
+    #[test]
+    fn the_first_visible_token_stamps_ttft_and_a_later_one_does_not_move_it() {
+        let mut turn = accumulator();
+        turn.absorb(AgentStreamEvent::Text {
+            content: SENTENCE.to_string(),
+        });
+        let first = turn.ttft.expect("the first visible token stamps TTFT");
+        turn.absorb(AgentStreamEvent::Text {
+            content: SENTENCE.to_string(),
+        });
+        assert_eq!(
+            turn.ttft,
+            Some(first),
+            "TTFT is the FIRST token; re-stamping it reports the last one instead"
+        );
+    }
+
+    /// PAI-3 and PAI-4 read this timing off `TurnMetrics`. It is gathered
+    /// nowhere else, so deleting it here is a silent regression in a workstream
+    /// that has no test in this crate.
+    #[test]
+    fn a_tool_call_and_its_result_time_the_turn() {
+        let mut turn = accumulator();
+        let call = frame_of(turn.absorb(AgentStreamEvent::ToolCall {
+            tool: "giap-weather__get_weather".to_string(),
+            id: "call-1".to_string(),
+            input: Some(json!({"location": "Nairobi"})),
+        }));
+        assert_eq!(call["type"], "tool_call");
+        assert_eq!(call["id"], "call-1");
+        assert_eq!(call["input"]["location"], "Nairobi");
+        assert_eq!(
+            turn.last_tool_name.as_deref(),
+            Some("giap-weather__get_weather")
+        );
+        assert!(
+            turn.tool_call_start.is_some(),
+            "without a start instant the result below has nothing to subtract from"
+        );
+
+        let result = frame_of(turn.absorb(AgentStreamEvent::ToolResult {
+            tool: "giap-weather__get_weather".to_string(),
+            id: "call-1".to_string(),
+            content: "24C and clear".to_string(),
+        }));
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["content"], "24C and clear");
+        assert!(
+            turn.last_tool_latency_ms.is_some(),
+            "the result must close the timing the call opened, or TurnMetrics \
+             reports a tool with no latency"
+        );
+        assert!(
+            turn.tool_call_start.is_none(),
+            "the start instant is consumed, so a second result cannot re-time \
+             the first call"
+        );
+
+        assert_eq!(turn.tool_results.len(), 1, "the turn persists one result");
+        let persisted: Value = serde_json::from_str(&turn.tool_results[0]).unwrap();
+        assert_eq!(persisted["tool_call_id"], "call-1");
+        assert_eq!(persisted["content"], "24C and clear");
+    }
+
+    /// The MCP-UI marker is a rendering instruction, not something to keep.
+    #[test]
+    fn a_ui_hint_rides_the_frame_and_stays_out_of_the_transcript() {
+        let mut turn = accumulator();
+        let frame = frame_of(turn.absorb(AgentStreamEvent::ToolResult {
+            tool: "giap-weather__get_weather".to_string(),
+            id: "call-1".to_string(),
+            content: "[[[mcp-ui:weather:{\"temp\":24}]]]\n24C and clear".to_string(),
+        }));
+
+        assert_eq!(frame["ui"]["card_type"], "weather");
+        assert_eq!(frame["ui"]["data"]["temp"], 24);
+        assert_eq!(frame["content"], "24C and clear");
+
+        let persisted: Value = serde_json::from_str(&turn.tool_results[0]).unwrap();
+        assert_eq!(
+            persisted["content"], "24C and clear",
+            "the marker must not be persisted -- it would be replayed into the \
+             next prompt as literal text"
+        );
+    }
+
+    /// The reasoning comes back so the HANDLER can offer it to its own
+    /// `ChatService`, which holds the `persist_thinking` gate.
+    ///
+    /// The translator is handed no service on purpose. If it recorded, both
+    /// routes would inherit a decision neither could see at its call site, and
+    /// the gate PAI-5 P6 put in one place would be reached from a function that
+    /// does not know whose turn it is.
+    #[test]
+    fn a_reasoning_passage_comes_back_whole_for_the_persistence_owner() {
+        let mut turn = accumulator();
+        let step = turn.absorb(AgentStreamEvent::Thinking {
+            content: "  the kettle is a device, so I should look it up  ".to_string(),
+        });
+
+        let StreamStep::Reasoning { frame, block } = step else {
+            panic!("thinking must come back as Reasoning, not as a bare frame");
+        };
+        assert_eq!(
+            block, "  the kettle is a device, so I should look it up  ",
+            "the handler needs the passage as the model wrote it, not the frame"
+        );
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["type"], "thinking");
+        assert_eq!(frame["content"], block);
+        assert!(
+            turn.full_text.is_empty(),
+            "reasoning is never part of the answer that gets persisted"
+        );
+    }
+
+    /// `Done` is the one variant the two routes disagree about, so it must not
+    /// arrive as a frame.
+    ///
+    /// If the translator emitted one, `/chat/stream` would send a `done` before
+    /// it had persisted anything -- and its real `done`, the one carrying the
+    /// usage totals, would then be the second -- while `/agent/chat/stream`
+    /// would send two.
+    #[test]
+    fn the_engines_done_is_numbers_for_the_route_to_report_not_a_frame() {
+        let mut turn = accumulator();
+        let step = turn.absorb(AgentStreamEvent::Done {
+            session_id: "s-1".to_string(),
+            model_role: "chat".to_string(),
+            usage: Some(UsageStats {
+                prompt_tokens: 1_200,
+                completion_tokens: 96,
+                reasoning_tokens: Some(40),
+            }),
+            stats: None,
+        });
+
+        let StreamStep::TurnComplete { usage, stats } = step else {
+            panic!("Done must come back as TurnComplete, got {step:?}");
+        };
+        let usage = usage.expect("the engine's usage is carried through, not dropped");
+        assert_eq!(usage.prompt_tokens, 1_200);
+        assert_eq!(usage.completion_tokens, 96);
+        assert_eq!(
+            usage.reasoning_tokens,
+            Some(40),
+            "PAI-5 P2 reports reasoning ALONGSIDE the completion count"
+        );
+        assert!(stats.is_none());
+    }
+
+    /// Every remaining variant is a frame carrying the `type` the desktop
+    /// switches on. A frame whose `type` is wrong renders as nothing at all.
+    #[test]
+    fn the_status_shaped_variants_keep_the_type_the_client_switches_on() {
+        let mut turn = accumulator();
+        for (step, expected_type) in [
+            (
+                turn.absorb(AgentStreamEvent::Status {
+                    content: "Agent working".to_string(),
+                }),
+                "status",
+            ),
+            (
+                turn.absorb(AgentStreamEvent::ReviewStatus {
+                    content: "Reviewing answer".to_string(),
+                }),
+                "review_status",
+            ),
+            (
+                turn.absorb(AgentStreamEvent::ReviewRevision {
+                    content: "A better answer".to_string(),
+                    score: 4,
+                    rounds: 2,
+                }),
+                "review_revision",
+            ),
+            (
+                turn.absorb(AgentStreamEvent::TurnLimitReached { max_turns: 25 }),
+                "turn_limit_reached",
+            ),
+        ] {
+            assert_eq!(frame_of(step)["type"], expected_type);
+        }
+
+        // The error frame is the exception: it carries no `type` at all, and
+        // the client detects it by the presence of `error`. Changing that to a
+        // typed frame would silently stop every existing client from showing
+        // failures.
+        let err = frame_of(turn.absorb(AgentStreamEvent::Error {
+            content: "the model went away".to_string(),
+        }));
+        assert_eq!(err["error"], "the model went away");
+        assert!(err.get("type").is_none());
+    }
 }
