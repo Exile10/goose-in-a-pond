@@ -1139,6 +1139,195 @@ fn image_limit_response(
     }
 }
 
+// ── One engine event, one SSE frame ───────────────────────────────────────────
+
+/// What one `AgentStreamEvent` means to a chat SSE stream.
+///
+/// PAI-5 P7. Both stream handlers cover the same variants and emit the same
+/// frame JSON, and each used to carry its own copy of the match. Two exhaustive
+/// matches over an enum that is still growing is a standing promise to write
+/// every new variant twice — and they had already drifted, which is how
+/// `/agent/chat/stream` came to persist turns it never extracted memory from.
+///
+/// The two outcomes that are NOT simply a frame are the two places the routes
+/// legitimately differ, so they come back as data rather than being resolved
+/// here:
+///
+/// * [`StreamStep::Reasoning`] — the frame is identical, but the passage has to
+///   reach the handler's OWN `ChatService`, which holds the `persist_thinking`
+///   gate. The translator is handed no service and therefore cannot record
+///   against the wrong one, and each handler keeps a visible `record_thinking`
+///   call rather than inheriting one it cannot see.
+/// * [`StreamStep::TurnComplete`] — `/chat/stream` yields a `turn_stats` frame
+///   here and its `done` frame much later, after persistence, telemetry and the
+///   context-pressure check; `/agent/chat/stream` closes on the spot. That is a
+///   routing decision, not a frame shape.
+#[derive(Debug, PartialEq)]
+enum StreamStep {
+    /// Emit nothing. The thought filter swallowed the whole chunk — it is
+    /// inside a reasoning block, or holding back a possible partial tag.
+    Nothing,
+    /// One SSE frame, ready to yield verbatim.
+    Frame(String),
+    /// A reasoning passage: the frame to show, and the same text for the
+    /// handler to offer its persistence owner.
+    Reasoning { frame: String, block: String },
+    /// The engine finished the turn, with whatever numbers it reported.
+    TurnComplete {
+        usage: Option<pond_core::models::ports::provider::UsageStats>,
+        stats: Option<pond_core::shared::domain::turn_stats::TurnStats>,
+    },
+}
+
+/// The one shape of a `tool_result` SSE frame.
+///
+/// Four sites build this — the `ToolResult` arm and the Harmony-envelope
+/// fallback in each handler — and the optional `ui` key is what the MCP-UI
+/// renderer keys off. A site that forgot it renders a card as raw text.
+fn tool_result_frame(tool: &str, id: &str, content: &str, ui_hint: Option<Value>) -> String {
+    let mut ev = json!({
+        "type": "tool_result",
+        "tool": tool,
+        "id": id,
+        "content": content,
+    });
+    if let Some(ui) = ui_hint {
+        ev["ui"] = ui;
+    }
+    ev.to_string()
+}
+
+/// The per-turn state a chat SSE handler accumulates while the engine streams.
+///
+/// The three fields at the top are what both handlers need in order to persist
+/// the turn; the four below them are the per-tool and first-token timing that
+/// `/chat/stream` reports as `TurnMetrics` (PAI-3 and PAI-4 read it). They are
+/// gathered on both routes because a recorder that only runs for one caller is
+/// a behaviour flag wearing a struct, and the cost is one `Instant` per tool
+/// call.
+struct TurnAccumulator {
+    /// Strips Harmony `<|channel>thought … <channel|>` and `<think>…</think>`
+    /// out of the visible token stream, and captures what it strips.
+    thought: crate::thought_filter::ThoughtFilter,
+    /// The assistant's visible answer, as persisted.
+    full_text: String,
+    /// One JSON row per tool result, as persisted.
+    tool_results: Vec<String>,
+    /// When the first visible token arrived, as a fallback for an engine that
+    /// reports no TTFT of its own.
+    ttft: Option<std::time::Instant>,
+    tool_call_start: Option<std::time::Instant>,
+    /// The most recent tool call's name and wall-clock latency. When a turn
+    /// invokes several tools only the last survives — `TurnMetrics` has one
+    /// slot.
+    last_tool_name: Option<String>,
+    last_tool_latency_ms: Option<u64>,
+}
+
+impl TurnAccumulator {
+    /// The filter is the caller's, because the two routes configure it
+    /// differently: `/chat/stream` captures thinking blocks when the user asked
+    /// to see them and never in voice mode, `/agent/chat/stream` never does.
+    fn new(thought: crate::thought_filter::ThoughtFilter) -> Self {
+        Self {
+            thought,
+            full_text: String::new(),
+            tool_results: Vec::new(),
+            ttft: None,
+            tool_call_start: None,
+            last_tool_name: None,
+            last_tool_latency_ms: None,
+        }
+    }
+
+    /// A tool the model asked for as Harmony text markup rather than through
+    /// the structured protocol, executed by the handler as a fallback.
+    ///
+    /// It never produced an `AgentStreamEvent::ToolCall`, so the timing has to
+    /// be recorded by hand or the turn reports no tool at all.
+    fn note_fallback_tool(&mut self, name: &str, latency: std::time::Duration) {
+        self.last_tool_name = Some(name.to_string());
+        self.last_tool_latency_ms = Some(latency.as_millis() as u64);
+    }
+
+    /// Fold one engine event into the turn and say what the stream should emit.
+    ///
+    /// **This is the only match on `AgentStreamEvent` in this file, and that is
+    /// the point of it** — `stream_handler_parity.rs` fails if a second one
+    /// appears. A new variant is written here once, and both routes carry it.
+    fn absorb(&mut self, event: pond_core::models::ports::agent::AgentStreamEvent) -> StreamStep {
+        use pond_core::models::ports::agent::AgentStreamEvent;
+
+        match event {
+            AgentStreamEvent::Status { content } => {
+                StreamStep::Frame(json!({"type": "status", "content": content}).to_string())
+            }
+            AgentStreamEvent::Thinking { content } => StreamStep::Reasoning {
+                frame: json!({"type": "thinking", "content": content}).to_string(),
+                block: content,
+            },
+            AgentStreamEvent::ToolCall { tool, id, input } => {
+                self.tool_call_start = Some(std::time::Instant::now());
+                self.last_tool_name = Some(tool.clone());
+                StreamStep::Frame(
+                    json!({"type": "tool_call", "tool": tool, "id": id, "input": input})
+                        .to_string(),
+                )
+            }
+            AgentStreamEvent::ToolResult { tool, id, content } => {
+                if let Some(start) = self.tool_call_start.take() {
+                    self.last_tool_latency_ms = Some(start.elapsed().as_millis() as u64);
+                }
+                let (clean_content, ui_hint) = extract_ui_hint(&content);
+                self.tool_results.push(
+                    json!({
+                        "tool_call_id": id,
+                        "tool": tool,
+                        "content": clean_content,
+                    })
+                    .to_string(),
+                );
+                StreamStep::Frame(tool_result_frame(&tool, &id, &clean_content, ui_hint))
+            }
+            AgentStreamEvent::Text { content } => {
+                let visible = self.thought.push(&content);
+                if visible.is_empty() {
+                    StreamStep::Nothing
+                } else {
+                    if self.ttft.is_none() {
+                        self.ttft = Some(std::time::Instant::now());
+                    }
+                    self.full_text.push_str(&visible);
+                    StreamStep::Frame(
+                        json!({"type": "text", "content": visible, "token": visible}).to_string(),
+                    )
+                }
+            }
+            AgentStreamEvent::ReviewStatus { content } => {
+                StreamStep::Frame(json!({"type": "review_status", "content": content}).to_string())
+            }
+            AgentStreamEvent::ReviewRevision {
+                content,
+                score,
+                rounds,
+            } => StreamStep::Frame(
+                json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds})
+                    .to_string(),
+            ),
+            // Its own event type so the UI can offer a one-click continue
+            // instead of leaving the engine's "would you like me to continue?"
+            // as an unanswerable sentence.
+            AgentStreamEvent::TurnLimitReached { max_turns } => StreamStep::Frame(
+                json!({"type": "turn_limit_reached", "max_turns": max_turns}).to_string(),
+            ),
+            AgentStreamEvent::Done { usage, stats, .. } => StreamStep::TurnComplete { usage, stats },
+            AgentStreamEvent::Error { content } => {
+                StreamStep::Frame(json!({"error": content}).to_string())
+            }
+        }
+    }
+}
+
 /// Shared SSE pipeline used by both `chat_stream` and `run_recipe`.
 ///
 /// Callers handle activity touching, body parsing, and semaphore acquisition;
@@ -1151,7 +1340,6 @@ fn chat_stream_inner(
     req: ChatRequest,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     use futures::StreamExt;
-    use pond_core::models::ports::agent::AgentStreamEvent;
 
     let stream = async_stream::stream! {
         let _permit = permit;
@@ -1282,24 +1470,17 @@ fn chat_stream_inner(
             profile_context: profile_context_for(&state, &turn_scope).await,
         };
 
-        let mut full_text = String::new();
-        let mut tool_results: Vec<String> = Vec::new();
-        let mut ttft_instant: Option<std::time::Instant> = None;
-        // Tracks the most recent tool call's name and wall-clock latency, used
-        // to populate per-turn telemetry below. When a turn invokes several
-        // tools, only the last one is recorded — TurnMetrics has a single slot.
-        let mut last_tool_name: Option<String> = None;
-        let mut last_tool_latency_ms: Option<u64> = None;
-        let mut tool_call_start: Option<std::time::Instant> = None;
-        // Filter Harmony-style `<|channel>thought ... <channel|>` reasoning
-        // preambles and `<think>…</think>` blocks out of the per-token stream.
-        // When show_thinking is enabled, capture thinking blocks as SSE events.
+        // The turn's own state: the visible answer, the tool results that go
+        // with it, and the per-tool timing this route reports as TurnMetrics.
+        // The filter strips Harmony-style `<|channel>thought ... <channel|>`
+        // preambles and `<think>…</think>` blocks out of the per-token stream;
+        // when show_thinking is enabled it captures them as SSE events instead.
         // Voice mode always disables thinking capture.
-        let mut thought = if settings.show_thinking && !req.voice_mode {
+        let mut turn = TurnAccumulator::new(if settings.show_thinking && !req.voice_mode {
             crate::thought_filter::ThoughtFilter::new().with_thinking_capture()
         } else {
             crate::thought_filter::ThoughtFilter::new()
-        };
+        });
         let mut agent_stream = match state.agent.chat_stream(agent_req).await {
             Ok(s) => s,
             Err(e) => {
@@ -1332,72 +1513,22 @@ fn chat_stream_inner(
                     deadline = tokio::time::Instant::now() + idle_budget;
                     match event_result {
                         Ok(event) => {
-                            let maybe_data = match event {
-                                AgentStreamEvent::Status { content } => {
-                                    Some(json!({"type": "status", "content": content}).to_string())
+                            match turn.absorb(event) {
+                                StreamStep::Nothing => {}
+                                StreamStep::Frame(data) => {
+                                    yield Ok(Event::default().data(data));
                                 }
-                                AgentStreamEvent::Thinking { content } => {
+                                StreamStep::Reasoning { frame, block } => {
                                     // PAI-5 P6. Offer it to the persistence
                                     // owner; `record_thinking` drops it unless
                                     // the user turned `persist_thinking` on.
                                     // The SSE frame is unchanged either way --
                                     // showing it live and keeping it are
                                     // different consents.
-                                    chat_service.record_thinking(content.clone());
-                                    Some(json!({"type": "thinking", "content": content}).to_string())
+                                    chat_service.record_thinking(block);
+                                    yield Ok(Event::default().data(frame));
                                 }
-                                AgentStreamEvent::ToolCall { tool, id, input } => {
-                                    tool_call_start = Some(std::time::Instant::now());
-                                    last_tool_name = Some(tool.clone());
-                                    Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
-                                }
-                                AgentStreamEvent::ToolResult { tool, id, content } => {
-                                    if let Some(start) = tool_call_start.take() {
-                                        last_tool_latency_ms = Some(start.elapsed().as_millis() as u64);
-                                    }
-                                    let (clean_content, ui_hint) = extract_ui_hint(&content);
-                                    let mut ev = serde_json::json!({
-                                        "type": "tool_result",
-                                        "tool": tool,
-                                        "id": id,
-                                        "content": clean_content
-                                    });
-                                    if let Some(ui) = ui_hint {
-                                        ev["ui"] = ui;
-                                    }
-                                    tool_results.push(json!({
-                                        "tool_call_id": id,
-                                        "tool": tool,
-                                        "content": clean_content,
-                                    }).to_string());
-                                    Some(ev.to_string())
-                                }
-                                AgentStreamEvent::Text { content } => {
-                                    let visible = thought.push(&content);
-                                    if visible.is_empty() {
-                                        None
-                                    } else {
-                                        if ttft_instant.is_none() {
-                                            ttft_instant = Some(std::time::Instant::now());
-                                        }
-                                        full_text.push_str(&visible);
-                                        Some(json!({"type": "text", "content": visible, "token": visible}).to_string())
-                                    }
-                                }
-                                AgentStreamEvent::ReviewStatus { content } => {
-                                    Some(json!({"type": "review_status", "content": content}).to_string())
-                                }
-                                AgentStreamEvent::ReviewRevision { content, score, rounds } => {
-                                    Some(json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds}).to_string())
-                                }
-                                // Its own event type so the UI can offer a
-                                // one-click continue instead of leaving the
-                                // engine's "would you like me to continue?" as
-                                // an unanswerable sentence.
-                                AgentStreamEvent::TurnLimitReached { max_turns } => {
-                                    Some(json!({"type": "turn_limit_reached", "max_turns": max_turns}).to_string())
-                                }
-                                AgentStreamEvent::Done { usage, stats, .. } => {
+                                StreamStep::TurnComplete { usage, stats } => {
                                     if let Some(u) = usage {
                                         usage_prompt_tokens = u.prompt_tokens;
                                         usage_completion_tokens = u.completion_tokens;
@@ -1420,17 +1551,14 @@ fn chat_stream_inner(
                                         turn_stats = Some(s);
                                         yield Ok(Event::default().data(payload.to_string()));
                                     }
+                                    // The `done` frame for this route is emitted
+                                    // at the very end, after persistence and
+                                    // telemetry, and carries the usage totals.
                                     continue;
                                 }
-                                AgentStreamEvent::Error { content } => {
-                                    Some(json!({"error": content}).to_string())
-                                }
-                            };
-                            if let Some(data) = maybe_data {
-                                yield Ok(Event::default().data(data));
                             }
                             // Emit captured thinking blocks as SSE events (when show_thinking is on)
-                            for thinking_content in thought.take_thinking() {
+                            for thinking_content in turn.thought.take_thinking() {
                                 let data = json!({"type": "thinking", "content": thinking_content}).to_string();
                                 yield Ok(Event::default().data(data));
                             }
@@ -1438,7 +1566,7 @@ fn chat_stream_inner(
                             // tool-call envelope (`<|tool_call> ... <tool_call|>`).
                             // The model emitted tool calls as Harmony text markup instead of
                             // the structured protocol. Execute them directly as a fallback.
-                            for body in thought.take_tool_calls() {
+                            for body in turn.thought.take_tool_calls() {
                                 if let Some((name, args)) = crate::thought_filter::parse_tool_envelope(&body) {
                                     tracing::info!(tool = %name, "Executing text-based tool call (model used Harmony format)");
                                     let call_id = uuid::Uuid::new_v4().to_string();
@@ -1448,25 +1576,17 @@ fn chat_stream_inner(
                                     ));
                                     let call_start = std::time::Instant::now();
                                     let call_result = state.agent.call_tool(&session_id, &name, &args).await;
-                                    last_tool_name = Some(name.clone());
-                                    last_tool_latency_ms = Some(call_start.elapsed().as_millis() as u64);
+                                    turn.note_fallback_tool(&name, call_start.elapsed());
                                     match call_result {
                                         Ok(result_text) => {
                                             let (clean, ui_hint) = extract_ui_hint(&result_text);
-                                            let mut ev = json!({
-                                                "type": "tool_result",
-                                                "tool": name,
-                                                "id": call_id,
-                                                "content": clean
-                                            });
-                                            if let Some(ui) = ui_hint {
-                                                ev["ui"] = ui;
-                                            }
-                                            yield Ok(Event::default().data(ev.to_string()));
+                                            yield Ok(Event::default().data(
+                                                tool_result_frame(&name, &call_id, &clean, ui_hint)
+                                            ));
                                         }
                                         Err(e) => {
                                             yield Ok(Event::default().data(
-                                                json!({"type": "tool_result", "tool": name, "id": call_id, "content": format!("Tool error: {e}")}).to_string()
+                                                tool_result_frame(&name, &call_id, &format!("Tool error: {e}"), None)
                                             ));
                                         }
                                     }
@@ -1505,9 +1625,9 @@ fn chat_stream_inner(
         // Flush any tail buffered by the thought filter (e.g. text after the
         // last `<channel|>` that had not yet exceeded the safe-emit threshold).
         if !timed_out {
-            let tail = thought.flush();
+            let tail = turn.thought.flush();
             if !tail.is_empty() {
-                full_text.push_str(&tail);
+                turn.full_text.push_str(&tail);
                 let data = json!({"type": "text", "content": tail, "token": tail}).to_string();
                 yield Ok(Event::default().data(data));
             }
@@ -1539,9 +1659,9 @@ fn chat_stream_inner(
                     let status = json!({"type": "review_status", "content": "Reviewing answer..."}).to_string();
                     yield Ok(Event::default().data(status));
 
-                    match reviewer.review(&req.message, &full_text, None).await {
+                    match reviewer.review(&req.message, &turn.full_text, None).await {
                         Ok(result) if result.was_revised => {
-                            full_text = result.final_answer.clone();
+                            turn.full_text = result.final_answer.clone();
                             let data = json!({
                                 "type": "review_revision",
                                 "content": result.final_answer,
@@ -1572,8 +1692,8 @@ fn chat_stream_inner(
         // accidentally omit extraction by refactoring this block.
         let _ = chat_service
             .persist_assistant_turn_with_extraction(
-                tool_results,
-                &full_text,
+                std::mem::take(&mut turn.tool_results),
+                &turn.full_text,
                 Some((usage_prompt_tokens, usage_completion_tokens)),
                 Some(&model_name_for_done),
                 &req.message,
@@ -1638,7 +1758,7 @@ fn chat_stream_inner(
                     .as_ref()
                     .and_then(|s| s.ttft_ms)
                     .or_else(|| {
-                        ttft_instant.map(|t| t.duration_since(turn_start).as_millis() as u64)
+                        turn.ttft.map(|t| t.duration_since(turn_start).as_millis() as u64)
                     })
                     .unwrap_or(total_latency_ms);
 
@@ -1667,8 +1787,12 @@ fn chat_stream_inner(
                     completion_tokens: usage_completion_tokens,
                     ttft_ms,
                     total_latency_ms,
-                    tool_name: last_tool_name.clone(),
-                    tool_latency_ms: last_tool_latency_ms,
+                    // PAI-3 / PAI-4 read this. The accumulator gathers it from
+                    // the `ToolCall` / `ToolResult` pair and from the Harmony
+                    // fallback above; losing it is a silent regression in a
+                    // different workstream, not a cosmetic one.
+                    tool_name: turn.last_tool_name.clone(),
+                    tool_latency_ms: turn.last_tool_latency_ms,
                     tool_cache_hit: None,
                     context_utilization_pct,
                     model_name: model_name_for_done.clone(),
