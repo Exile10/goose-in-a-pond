@@ -16,24 +16,59 @@ chain does not exist in code, and the `main.rs` bus bridge has moved ~200 lines.
 
 ## 1. What is true today
 
-### 1.1 There is an event bus, and it is narrow
+### 1.1 There is an event bus, and P1 has widened it
 
-`shared/ports/event_bus.rs:29-33`:
+**Rewritten 2026-08-10.** This section described a three-variant enum and ended "there is no time
+event, no presence event, no session event". P1 falsified all three sentences and left them
+standing; that is the claim-rot rule, so it is fixed here rather than noted.
+
+`shared/ports/event_bus.rs :: BusEvent`:
 
 ```rust
 pub enum BusEvent {
     Sensor(SensorReading),
     Camera(CameraEvent),
     Device(DeviceStateChanged),
+    Time(TimeTick),               // PAI-7 P1 — one per local hour boundary
+    Session(SessionLifecycle),    // PAI-7 P1 — started / idle / resumed
 }
 ```
 
-A closed enum, deliberately (`:25-28`: so consumers "can pattern-match ergonomically instead of
-parsing an attribute map"). `EventBus::publish` is non-blocking and infallible; `subscribe` returns
-a `Stream` (`:92-100`). Adapter: `shared/services/in_process_event_bus.rs`.
+Still a closed enum, deliberately, so consumers "can pattern-match ergonomically instead of parsing
+an attribute map". `EventBus::publish` is non-blocking and infallible; `subscribe` returns a
+`Stream`. Adapter: `shared/services/in_process_event_bus.rs`.
 
-**Two consumers exist:** the rules engine, and a bridge that appends bus traffic to the durable
-event log (`main.rs`, the task that does `event_bus.subscribe()` beside the `run_rules_engine` spawn -- grep the symbol, the line has already moved ~200 once). There is no time event, no presence event, no session event.
+**The first three variants are device-shaped and the last two are not**, which is why
+`BusEvent::trigger_view` now returns `Option<TriggerEventView>` — `None` for `Time` and `Session` —
+and why `rules_engine.rs :: rules_to_fire` returns an empty fire list the moment it sees one. A
+rule the API accepts with `device_id: None, signal: None` matches *anything* in its family, so a
+placeholder view would run the automations somebody wrote about their house on the hour, every
+hour. `TriggerEventView` is `#[non_exhaustive]` for that reason: outside pond-core the struct
+literal does not compile, so a consumer cannot answer the `None` with a view of its own. That is a
+compiler check, not a test, and it is the only guard at the rules engine's own decision point —
+`rules_to_fire` still has no test that feeds it a clock or session event (recorded gap, 2026-08-10).
+
+**Publishers (P1, `main.rs`):** `run_time_ticker` sleeps to the next wall-clock hour
+(`time_tick::secs_to_next_hour_from`, which takes the clock reading rather than a minute and a
+second, because two positional `u32`s swap silently inside a timer loop); `run_session_activity_observer`
+polls the session store every 60s and folds it through `ActivityObserver::poll`.
+
+**A scheduled run is not a person.** Every `AgentPrompt` schedule fire and every rule
+`AgentPrompt` action creates a session row (`schedule_executors.rs`, `sched-{task_id}-{unix_ts}`),
+and the `sessions` table has no origin column, so P1 classifies by id:
+`session_activity::SessionOrigin` / `POND_AUTHORED_SESSION_PREFIXES`, applied by `human_activity`
+to **both** the arrival list and the activity clock. Without it a cron line at 3am publishes
+`Started`, opens the never-at-startup gate, and fifteen minutes later publishes `Idle` — a complete
+synthetic presence cycle on an empty house, which is worse than no presence signal because P4 acts
+on it with confidence. The deny-list's completeness is itself a test
+(`pond-core/tests/session_origin_covers_every_minted_session.rs`), which fails when a file that
+mints session rows has no recorded origin.
+
+**Consumers: still none for the new variants.** The rules engine skips them and the bus-to-event-log
+bridge records them (`main.rs`, the task that does `event_bus.subscribe()` beside the
+`run_rules_engine` spawn — grep the symbol). Deciding anything about a tick or a presence
+transition is P4's, and the separation is the point: an event nobody can trust is worse than no
+event.
 
 ### 1.2 Rules fire, but only rules the user wrote
 
@@ -149,16 +184,99 @@ pub struct Proposal {
 ```
 
 Proposals land in **the draft system that already exists**. `giap-draft` is unconditionally
-registered as a safety extension (`giap_registration.rs:64`) and already models save / list /
-approve / reject (`pond-mcp-server/src/draft.rs :: save_draft` / `list_drafts` / `approve_draft` / `reject_draft`), with a UI. Reusing it means
+registered as a safety extension (`giap_registration.rs :: register_builtin_extension("giap-draft", ...)`) and already models save / list /
+approve / reject (`pond-mcp-server/src/draft.rs :: save_draft` / `list_drafts` / `approve_draft` / `reject_draft`). Reusing it means
 proactive actions inherit an approval flow that is already built, already understood, and already
 trusted — rather than a second, parallel confirmation mechanism users would have to learn.
+
+**Corrected 2026-08-10.** This paragraph used to end "…`reject_draft`), with a UI". There is no
+drafts UI. `pond-desktop/src` contains no drafts surface at all — every occurrence of "draft" in it
+is local editor state (`secretDraft`, `inlineDraft`, the composer's `draft`) — and there is no
+`/drafts` REST route in `pond-api` for one to call. The draft flow is model-facing only, through the
+four `giap-draft` tools. The argument for reusing drafts still holds, because it is an argument
+about the *approval flow*, but "reuse the surface that exists" is not one of its premises: P3's
+remainder has to build that surface rather than add a card to it.
 
 Approve-once and always-approve-this-kind are the obvious follow-ons, and they are how the system
 earns autonomy incrementally instead of demanding it up front.
 
 `rationale` is mandatory. An assistant that says "you asked me to watch for this, and the delivery
 window closes at six" is helpful; one that says "I did a thing" is alarming.
+
+#### AS LANDED — P3a, 2026-08-10. Domain and persistence only; NOTHING CONSTRUCTS IT YET.
+
+Read the second half of this stamp before quoting the first. P3 is **not** closed: what landed is a
+validated type, a port, an adapter and two migrations, with **no producer, no consumer and no
+construction site anywhere in the tree**. That is a legitimate shape — PAI-6 P1 was the same shape
+and says so — but it is only legitimate when it says so, and the usual tripwire cannot say it here:
+every symbol is `pub` in a library crate, so `dead_code` never fires. PAI-1 P5 shipped inert for a
+whole phase behind exactly that blind spot.
+
+**What landed.** `Proposal`, `ProposalAudience`, `BusEventRef`, `ProposalPayload` and
+`ProposalError` in `pond-core/src/user_data/domain/proposal.rs`; the `ProposalRepository` port;
+`SqliteProposalRepository` in `pond-infra`; migrations `0041_proposals.sql` (three columns on
+`drafts`, an index, and three triggers) and `0042_proposal_expiry.sql`; and — a separate, live
+change — `Draft.expires_at` with the expiry refusal in `DraftMcpServer::decide`.
+
+**Respecified against the sketch above, and why.** `profile_scope: ProfileScope` became
+`audience: ProposalAudience`. Of that type's three shapes, invariant 5 forbids `Guest` and
+invariant 4 forbids `Household` — `Household` is not a weaker address than `Owner`, it *is* the
+broadcast, and it is the value a defaulted field lands on. A type with one admissible shape out of
+three should not be that type, so the audience holds a profile id in a one-type module where the
+field cannot be filled from outside. `created_at` was added because the TTL ceiling needs a birth
+time to measure from, and `MAX_PROPOSAL_TTL` (24h) was added because `expires_at` alone is satisfied
+by the year 3000. `Proposal` derives no `Deserialize`: a derive is a second constructor that skips
+every check, and the stored form is what a bug reaches first.
+
+**What is NOT reached, stated as facts rather than as a caveat.**
+
+- Nothing constructs `SqliteProposalRepository`. No `AppState` field, no `main.rs` line, no route,
+  no test outside the adapter's own module. `grep -rn 'SqliteProposalRepository\|ProposalRepository'
+  crates/ --include='*.rs'` returns the port, the adapter, and one comment.
+- Therefore no `drafts` row in production can carry `origin = 'proactive'` or a non-NULL
+  `expires_at`. `SqliteProposalRepository::save` is the only writer of either, and `save_draft`
+  binds `expires_at: None` deliberately (a draft the user is being asked to confirm in the same
+  breath does not expire).
+- Therefore 0041's and 0042's triggers are dormant, `list_live_for` and `get_live` would return
+  nothing if called, and `expire_due` has no caller at all.
+- The one exception, and it is real: the **draft** expiry half runs on every approval today.
+  `DraftMcpServer::decide` evaluates `draft.is_live_at` and `SqliteDraftRepository::list_pending`
+  filters on the column, for every draft, every turn. Those guards are *in* the path rather than
+  beside it; they simply never see a non-NULL value yet.
+
+**Why I did not wire it anyway.** The obvious move was a reader: teach `list_drafts` to append the
+caller's live proposals, since it already resolves the caller's `ProfileScope` from the engine's
+`_meta`. I rejected it. A reader with no writer is a fixture production cannot produce, which is
+this programme's most-recorded test defect and not a thing to build deliberately; it would still
+need an installer call in `main.rs` that this round did not own, so it would have shipped a second
+inert layer under the first rather than replacing it; and PAI-6 P1 already rejected the same move in
+the same words — "a no-op adapter to make the port look wired — this programme already has three
+correct-but-unreachable mechanisms and each cost a later round more than the gap would have".
+
+**The exact call site that will reach it, and the phase that owns it.** P4, the `proactive-reviewer`,
+is the producer and is the first phase that can honestly construct any of this:
+
+1. `serve()` in `crates/pond-server/src/main.rs`, on the line after
+   `let draft_repo = Arc::new(SqliteDraftRepository::new(db.system.clone()));` — the same pool, the
+   same shape: `let proposal_repo: Arc<dyn ProposalRepository> =
+   Arc::new(SqliteProposalRepository::new(db.system.clone()));`.
+2. The reviewer loop holds it and calls `save` for each accepted impulse, gated by
+   `consolidation_schedule.rs :: should_run` (section 3.3).
+3. The read side gets its first caller in the same phase, and the cheapest honest one is
+   `DraftMcpServer::list_drafts` — it already knows who is asking, and `ProposalAudience` is exactly
+   the `Owner(id)` its `owner_stamp` resolves. `expire_due` belongs on the reviewer's own tick; it
+   is tidying, and nothing's correctness depends on it, because every read filters expiry in SQL.
+
+**P3b, still owed and not started.** `GET /api/v1/proposals` and a surface to render it. See the
+correction above: that surface does not exist for drafts either, so P3b is "build the approval
+surface", not "add a proposal card to it". Until P3b, a proposal that P4 writes is visible only to
+the model, through `giap-draft`.
+
+**Two clocks, worth knowing before writing a test here.** The read path takes an injected `now` (the
+port makes it a parameter of every method, so expiry cannot be skipped and does not need a sweeper).
+0041's approve trigger cannot be handed one and compares against SQLite's own `datetime('now')`. A
+fixture frozen in the past is therefore live to the reader and already unapprovable to the trigger —
+which is not a defect, but it is how a test written with one clock in mind fails against the other.
 
 ### 3.3 The background reasoner
 
@@ -232,6 +350,10 @@ memory extraction, decay and consolidation already exist.
 ## 4. Phases
 
 - **P1** Widen `BusEvent` with `Time`, `Session`; publishers for both. No behaviour change.
+  **LANDED 2026-08-10.** See 1.1 for what is true now. Two things a later phase must not assume:
+  the observer publishes nothing about sessions the pond minted for itself (`SessionOrigin`), and
+  `rules_to_fire`'s refusal to act on a viewless event is guarded by `#[non_exhaustive]` rather
+  than by a test at that call site.
 - **P2** `Presence` events from PAI-1's identification chain.
 - **P3** `Proposal` domain + persistence in the drafts table; proposal UI in the existing drafts
   surface.
