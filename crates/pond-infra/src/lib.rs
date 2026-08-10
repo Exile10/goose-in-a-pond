@@ -23,6 +23,7 @@ pub mod sqlite_notification_queue;
 pub mod sqlite_profile;
 pub mod sqlite_prompt_extra;
 pub mod sqlite_prompt_template;
+pub mod sqlite_proposal;
 pub mod sqlite_push_token;
 pub mod sqlite_recipe;
 pub mod sqlite_security_policy;
