@@ -380,18 +380,51 @@ the tree instead of a spinner. Subagent output is **not** persisted into the par
 `session_messages` — only its final result, as a tool result, which is what keeps the context
 isolation real.
 
-**`notification_tx` cannot feed this on its own**, and the earlier wording that said it could would
-have produced a progress stream that fires only when a child happens to call a tool and shows
-nothing at all for a text-only subagent. The channel receives exactly one shape,
-`{"type":"subagent_tool_request","subagent_id":…,"tool_call":{"name","arguments"}}`, emitted only
-for `MessageContent::ToolRequest`. There is no status, no turn counter, no tool result and no
-completion event on it. P6 needs both channels: `on_message` (a synchronous `Fn(&Message)` called
-inline in the drain loop) for lifecycle and turn counting, `notification_tx` for the tool name.
-Two consequences: the notification carries `tool_call.arguments` **verbatim**, which on this pond
-can include household memory queries and device state, so P6 forwards the tool NAME and drops the
-arguments (PAI-2's minimisation rule); and `on_message` sees `MessageContent::Thinking`, so PAI-5's
-reasoning gate — which lives at the `GooseAdapter` producer, a path this does not go through — has
-to be re-applied here or a subagent's reasoning reaches the consumer.
+#### CORRECTION (2026-08-10): BOTH channels this section named are unreachable, and P6 needs neither
+
+The paragraph that stood here told an implementer to use two things that do not exist on GIAP's
+path, and it is why every attempt at P6 stalled at "let me look at the code seams". It said: *"P6
+needs both channels: `on_message` (a synchronous `Fn(&Message)` called inline in the drain loop) for
+lifecycle and turn counting, `notification_tx` for the tool name."*
+
+`on_message`, `OnMessageCallback` and `notification_tx` are all fields of **`SubagentRunParams`**,
+the parameter struct of `run_subagent_task` — and `goose/crates/goose/src/agents/mod.rs` declares
+`pub(crate) mod subagent_handler;`, re-exporting only `SUBAGENT_TOOL_REQUEST_TYPE` and `TaskConfig`.
+**P2 decided not to call `run_subagent_task` and could not have if it wanted to.** This section was
+written before that decision and never revisited, which is the third time PAI-6 has specified a
+phase against code that is not reachable (`subagent_system.md` deleted, `ModelRouter` never
+compiled).
+
+Worse than unreachable: **`notification_tx` is a name that also exists in GIAP**, in `main.rs`, as
+the broadcast behind `GET /notifications/stream`. It is an unrelated channel. An implementer who
+greps the symbol finds a live one and wires P6 to the wrong thing.
+
+**Owning the child loop makes both unnecessary, and gives P6 strictly more than either offered.**
+`GooseAdapter::run_child_agent`'s drain loop already receives every `AgentEvent::Message` inline —
+that IS `on_message`, with ownership rather than a borrow — and `msg.content` carries every
+`MessageContent`, so `ToolRequest` is in hand without a second channel. Two things follow, and both
+are improvements rather than compromises:
+
+- **PAI-2 minimisation gets stronger, not weaker.** The old design had the arguments cross a channel
+  verbatim — on this pond they can carry household memory queries and device state — and had P6 drop
+  them on receipt. Reading `ToolRequest` in the loop means the tool NAME is taken and the arguments
+  are never put on a channel at all. Do not reintroduce a channel that carries them.
+- **PAI-5's reasoning gate still has to be re-applied here**, and this is the one part of the
+  original paragraph that survives intact. `MessageContent::Thinking` is right there in `msg.content`.
+  PAI-5 P1 gates once at the `GooseAdapter` producer and the child path does not go through it, so
+  without a gate a subagent's reasoning reaches the consumer on an install with `show_thinking` OFF.
+  Note the existing drain deliberately uses `as_concat_text()`, which returns `None` for `Thinking`
+  and is load-bearing for exactly this reason — a P6 that reads `msg.content` directly loses that
+  protection and must replace it rather than inherit it.
+
+**What is genuinely still open is the transport, and it is the real design question.**
+`run_child_agent` executes *inside* the parent's turn, underneath the `delegate` tool call, while the
+parent's `async_stream::stream!` is parked on `goose_stream.next().await`. A frame produced in the
+child loop therefore has no path to the parent's stream without a side channel that the parent's
+loop also selects on. That is P6's actual work: pick the channel, key it so a frame reaches the right
+parent and only that parent, and make the parent's drain `select!` over both without starving either.
+Do not spend time on `on_message`/`notification_tx`; they are a dead end this document sent people
+down.
 
 Also compiler-forced: a new `AgentStreamEvent` variant breaks four exhaustive matches
 (`routes.rs :: chat_stream`, `routes.rs :: agent_chat_stream`, `chat.rs`'s voice/workflow consumer,
