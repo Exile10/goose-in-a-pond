@@ -46,9 +46,15 @@
 //!
 //! # What this deliberately does not do
 //!
-//! It does not stream. `spawn` runs the child to completion and returns a
-//! terminal [`TaskRun`]; `poll` exists so P8 can add a background path without
-//! changing the port. Progress frames are P6, per-role models are P7.
+//! The RESULT does not stream. `spawn` runs the child to completion and returns
+//! a terminal [`TaskRun`]; `poll` exists so P8 can add a background path
+//! without changing the port. Per-role models are P7.
+//!
+//! **This paragraph said "it does not stream" until P6 landed on 2026-08-10**,
+//! and that is now only true of the result. [`ProgressBus`] carries lifecycle
+//! and tool-name frames out to the parent's chat stream while a run is in
+//! flight — deliberately NOT through the port, whose return type is the one
+//! string invariant 4 allows a parent to take back.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;

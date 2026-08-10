@@ -373,12 +373,18 @@ delegation decides and executes. And if a subagent can ever run under a `Guest` 
 `giap-orchestrator` belongs in `groups_denied_to_guests()` — delegation is a way to reach a tool
 you were denied.
 
-### 3.7 Streaming
+### 3.7 Streaming — LANDED (P6, 2026-08-10)
 
 `AgentStreamEvent::SubagentProgress { task_id, role, status, detail }`, so the desktop can render
 the tree instead of a spinner. Subagent output is **not** persisted into the parent's
 `session_messages` — only its final result, as a tool result, which is what keeps the context
 isolation real.
+
+As landed, `status` is a closed `SubagentStatus` enum (`queued` / `running` / `tool` / `completed` /
+`cancelled` / `turn_budget_exhausted` / `failed`) and `detail` carries a tool NAME or a
+GIAP-authored failure reason — never the child's prose, its reasoning, or a tool call's arguments.
+The transport is in the block below; the correction that follows is what unblocked the phase and is
+worth reading before anything else in this section.
 
 #### CORRECTION (2026-08-10): BOTH channels this section named are unreachable, and P6 needs neither
 
@@ -417,21 +423,60 @@ are improvements rather than compromises:
   and is load-bearing for exactly this reason — a P6 that reads `msg.content` directly loses that
   protection and must replace it rather than inherit it.
 
-**What is genuinely still open is the transport, and it is the real design question.**
+**What was genuinely still open is the transport, and it was the real design question.**
 `run_child_agent` executes *inside* the parent's turn, underneath the `delegate` tool call, while the
 parent's `async_stream::stream!` is parked on `goose_stream.next().await`. A frame produced in the
 child loop therefore has no path to the parent's stream without a side channel that the parent's
-loop also selects on. That is P6's actual work: pick the channel, key it so a frame reaches the right
+loop also selects on. That was P6's actual work: pick the channel, key it so a frame reaches the right
 parent and only that parent, and make the parent's drain `select!` over both without starving either.
 Do not spend time on `on_message`/`notification_tx`; they are a dead end this document sent people
 down.
 
-Also compiler-forced: a new `AgentStreamEvent` variant breaks four exhaustive matches
-(`routes.rs :: chat_stream`, `routes.rs :: agent_chat_stream`, `chat.rs`'s voice/workflow consumer,
-and `main.rs`'s CLI renderer) but **not** `pond-agent/src/agent.rs` or `delegation.rs`, both of
-which use `_ => {}` — and `pond-agent` is `cargo check`-only in CI. The two `routes.rs` blocks are
-not identical (PAI-5 P7's unification is still open), so P6 writes its arm twice and a test that
-only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
+#### THE TRANSPORT, AS LANDED (P6, 2026-08-10)
+
+`ProgressBus` in `orchestrator.rs`: an unbounded `mpsc` per live turn, in a process-wide map keyed by
+the parent's **GIAP session id**, with the parent's drain running `next_parent_step` — a `biased`
+`select!` with the progress receiver first and `goose_stream.next()` second.
+
+- **Unbounded**, because the sender is the child loop running underneath the parent's own poll: a
+  bounded channel that filled would deadlock the future that drains it. The volume is a frame per
+  lifecycle transition plus one per tool call, against a role capped at twelve turns.
+- **Keyed by session and handed to ONE subscriber**, not broadcast-and-filter. A filter is a thing
+  that can be got wrong, and getting it wrong shows one member's delegation inside another's chat.
+  Routing at the map makes the failure a lost frame instead of a misdelivered one. The residual
+  coarseness — two concurrent turns of one session, newest subscriber wins — is the same one
+  `DeviceLedger` and `parent_turn_token` already have and cannot cross a profile boundary.
+- **The bias is progress-first, and it cannot starve the engine.** A synchronous child is polled
+  only when the engine future is polled, so a frame cannot exist unless the engine branch has just
+  run; the bias drains what that poll produced and hands control straight back. Both directions are
+  pinned by tests, one against a hot engine and one against an engine that parks mid-poll.
+- **Cancel-safety** is what the loop rests on: losing the race drops a `Next` future, not the
+  stream, and an `async_stream` generator's state lives in the stream itself.
+
+**PAI-5's reasoning gate is re-applied structurally, not by a check.** `child_tool_names` is the only
+thing that reads a child's `msg.content`, and it returns a list of tool NAMES — so there is no value
+it can return that carries reasoning, answer text, or a call's arguments. A source tripwire fails if
+anything else in the drain reads `msg.content` again.
+
+**Deliberately deferred: a child's reasoning is never surfaced, even with `show_thinking` on.** The
+frames carry no child-authored prose at all. Surfacing it would need the parent's per-turn
+`show_thinking && !voice_mode` value inside the child loop, which does not have it, and the child's
+own `PromptState` sets `thinking_enabled: false` — so the feature would ship with a gate to maintain
+and almost no input to show. If it is ever wanted, the honest shape is a flag declared by the
+SUBSCRIBER (the parent's turn knows the value, including voice) and enforced at `ProgressBus::publish`,
+not a producer-side check.
+
+Also compiler-forced: a new `AgentStreamEvent` variant breaks **three** exhaustive matches —
+`routes.rs :: TurnAccumulator::absorb`, `chat.rs`'s voice/workflow consumer, and `main.rs`'s CLI
+renderer — but **not** `pond-agent/src/agent.rs` or `delegation.rs`, both of which use `_ => {}`,
+and `pond-agent` is `cargo check`-only in CI.
+
+**This paragraph said FOUR matches and "P6 writes its arm twice" until 2026-08-10, and that is now
+wrong**: PAI-5 P7's unification landed, so `chat_stream` and `agent_chat_stream` both fold their
+events through one `absorb`, and `stream_handler_parity.rs` fails if a second match appears in
+either. P6 wrote its arm once. `SubagentProgress` is on that guard's distinctive-variant list, and
+a partial `match … _ => {}` bolted beside the fold in `agent_chat_stream` fails it by name — the
+mutation was run.
 
 ---
 
@@ -810,8 +855,38 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
   has not sent yet cannot read ON for the one module that defaults off. And both agents that wrote
   this phase died mid-run on API errors, so the work was validated by the coordinator against the
   gates rather than by its authors.
-- **P6** `SubagentProgress` streaming + desktop rendering. See section 3.7 for what the notification
-  channel actually carries.
+- **P6 — LANDED 2026-08-10.** `AgentStreamEvent::SubagentProgress { task_id, role, status, detail }`,
+  the `ProgressBus` that carries it out of a child's loop, and the tree both desktop chat surfaces
+  draw from it. Section 3.7's `THE TRANSPORT, AS LANDED` block holds the design and what was
+  rejected; this is what the phase is worth reading for.
+
+  **The correction dated 2026-08-10 above saved the phase and is the reason it exists.** Five
+  attempts stalled on `on_message` and `notification_tx`, which are fields of a parameter struct
+  behind `pub(crate) mod subagent_handler` — and `notification_tx` is also a live GIAP symbol
+  (`main.rs`'s `GET /notifications/stream` broadcast), so grepping it finds a real channel with
+  nothing to do with this. Owning the child loop means every `AgentEvent::Message` is already in
+  hand.
+
+  **Respecified against the phase text.** The bullet said "streaming"; what a subagent streams is
+  the thing invariant 4 forbids reaching the parent. So the frames carry lifecycle plus tool NAMES
+  and nothing else: no child prose, no reasoning, no tool arguments (PAI-2 minimisation — on this
+  pond they can be a household memory query or device state). The parent still takes back exactly
+  one string, the `delegate` tool's result. `absorb_progress_leaves_the_turn_untouched` is the
+  consumer-side guard: `TurnAccumulator`'s `full_text` and `tool_results` are what both routes
+  PERSIST, and a progress arm that touched either would put a child's activity into
+  `session_messages`.
+
+  **What the mutations found.** Reusing the `ToolCall` arm's timing reports the CHILD's tool as the
+  parent turn's last tool in `TurnMetrics` — a plausible number about the wrong agent. Swapping the
+  select's bias delivers no frames at all against a hot engine, which is the shipped spinner
+  restored. Gating the desktop tree on `!streaming` — the shape every other note on a message uses —
+  hides it for exactly the minutes it exists to cover.
+
+  **Still owed.** The drain's emit path needs a live provider, so it is covered by an
+  argument-and-order source tripwire rather than by a test that runs it; the same limitation the
+  P2/P3 tripwires above record. And nothing has yet driven this on the Orin, so the integration
+  measurement in section 7 — parent context growth with a delegation versus inline — remains
+  untaken.
 - **P7** Per-role model assignment. **There is no `ModelRouter` and no `ModelRole` type** — start
   from `GooseAdapter::ensure_provider_current`, which caches `(Arc<dyn Provider>, ModelConfig)` on
   a single `provider:model` key, plus the `think`/`task` rows of `model_role_assignments` that the
@@ -896,6 +971,13 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
    `child_stream_step`, a pure function beside `ChildTurns`, because the drain loop it was lifted
    out of needs a live provider — both the turn count and the text argument could be broken with
    the whole suite green, and were, by mutations that restored the original defect exactly.)*
+   *(P6 adds a second thing that leaves a child and must not be persisted: an
+   `AgentStreamEvent::SubagentProgress` frame. It reaches the CLIENT and nothing else — the
+   `absorb` arm returns a frame and writes neither `full_text` nor `tool_results`, which are the two
+   fields both stream handlers hand to `ChatService`, and the voice consumer treats it as silent.
+   `absorb_progress_leaves_the_turn_untouched` fails on both natural regressions. The frame's
+   `detail` cannot carry a transcript in the first place: its only producers are `child_tool_names`,
+   which returns tool names, and the run's own GIAP-authored error.)*
 5. Every spawn is cancellable, and cancelling a parent cancels its children. **This is entirely new
    work.** Goose's own background path mints an unrelated root token, `child_token()` is unused
    anywhere in Goose, and GIAP's parent-turn token is a stack local inside a stream closure with no
