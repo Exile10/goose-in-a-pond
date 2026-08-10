@@ -4542,16 +4542,18 @@ fn has_display() -> bool {
 ///
 /// Returns `None` when there are no sessions or the read fails; callers treat
 /// that as "no observable out-of-process activity".
+///
+/// **Sessions the pond minted for itself do not count** (`human_activity`,
+/// PAI-7 P1). Every `AgentPrompt` schedule fire creates a `sched-*` row and
+/// bumps its `updated_at`, so without the filter a cron line running at 3am is
+/// indistinguishable here from the user returning — which both opens the
+/// never-on-startup gate on a pond nobody has touched and holds consolidation
+/// off as if somebody were typing.
 async fn newest_session_activity(
     storage: &dyn pond_core::user_data::ports::session_storage::SessionStorage,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    storage
-        .list_sessions()
-        .await
-        .ok()?
-        .into_iter()
-        .map(|s| s.updated_at)
-        .max()
+    let sessions = storage.list_sessions().await.ok()?;
+    pond_core::shared::domain::session_activity::human_activity(&sessions).newest_activity
 }
 
 // ── PAI-7 P1: clock and session-activity publishers on the event bus ────────
@@ -4577,12 +4579,13 @@ async fn newest_session_activity(
 /// ended with.
 async fn run_time_ticker(bus: std::sync::Weak<dyn pond_core::shared::ports::event_bus::EventBus>) {
     use chrono::Timelike;
-    use pond_core::shared::domain::time_tick::{secs_to_next_hour, TimeBoundary, TimeTick};
+    use pond_core::shared::domain::time_tick::{secs_to_next_hour_from, TimeBoundary, TimeTick};
     use pond_core::shared::ports::event_bus::BusEvent;
 
     loop {
-        let now = chrono::Local::now();
-        let wait = secs_to_next_hour(now.minute(), now.second());
+        // The clock reading goes in whole. Splitting it into a minute and a
+        // second here is what let the two swap unnoticed.
+        let wait = secs_to_next_hour_from(&chrono::Local::now());
         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
 
         // Upgrade per iteration and drop it again before the next sleep.
@@ -4599,24 +4602,6 @@ async fn run_time_ticker(bus: std::sync::Weak<dyn pond_core::shared::ports::even
     }
 }
 
-/// Seed for the session-activity watermark: the newest `created_at` the pond
-/// already holds.
-///
-/// **A failed read seeds `now`, never `None`.** `None` is the positive claim
-/// "this pond has no conversations", and an observer that believes it
-/// announces the entire chat history as newly started on its first poll —
-/// a hundred "the user just started talking" events, every one of them false.
-/// The failure direction has to be the quiet one.
-fn session_watermark_seed<E>(
-    sessions: Result<Vec<pond_core::user_data::domain::session::Session>, E>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    match sessions {
-        Ok(sessions) => sessions.iter().map(|s| s.created_at).max(),
-        Err(_) => Some(now),
-    }
-}
-
 /// Publish [`BusEvent::Session`] transitions — a conversation started, the
 /// pond went quiet, the user came back.
 ///
@@ -4627,14 +4612,19 @@ fn session_watermark_seed<E>(
 /// "the user has gone quiet" — a second, disagreeing one would have the bus
 /// saying the user left while the gate that runs background work says they are
 /// still here.
+///
+/// **This loop decides nothing.** It reads the store, reads the clocks, and
+/// hands both to `ActivityObserver::poll` — the seed, the machine-session
+/// filter, the never-at-startup gate and the idle arithmetic all live in
+/// pond-core, where a mutation to any of them fails a test. Three of them used
+/// to be expressed here, inside a timer loop, and all three could be broken
+/// with the whole suite green.
 async fn run_session_activity_observer(
     bus: std::sync::Weak<dyn pond_core::shared::ports::event_bus::EventBus>,
     storage: Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>,
     last_user_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
 ) {
-    use pond_core::shared::domain::session_activity::{
-        ActivityInputs, ActivityObserver, SessionStart,
-    };
+    use pond_core::shared::domain::session_activity::{ActivityObserver, PollClock};
     use pond_core::shared::ports::event_bus::BusEvent;
     use pond_core::user_data::services::consolidation_schedule as sched;
 
@@ -4646,10 +4636,7 @@ async fn run_session_activity_observer(
     let started_at = std::time::Instant::now();
     let started_at_utc = chrono::Utc::now();
 
-    let mut observer = ActivityObserver::starting_from(session_watermark_seed(
-        storage.list_sessions().await,
-        started_at_utc,
-    ));
+    let mut observer = ActivityObserver::seeded_from(storage.list_sessions().await);
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
@@ -4668,30 +4655,15 @@ async fn run_session_activity_observer(
                 continue;
             }
         };
-        let db_activity = sessions.iter().map(|s| s.updated_at).max();
-        let in_process_at = *last_user_activity.read().await;
-        let now = chrono::Utc::now();
 
-        let starts: Vec<SessionStart<'_>> = sessions
-            .iter()
-            .map(|s| SessionStart {
-                id: &s.id,
-                created_at: s.created_at,
-            })
-            .collect();
-
-        let transitions = observer.observe(
-            &starts,
-            ActivityInputs {
-                saw_activity_since_start: sched::saw_activity_since_start(
-                    started_at,
-                    in_process_at,
-                    started_at_utc,
-                    db_activity,
-                ),
-                idle_for: sched::combined_idle_for(in_process_at, db_activity, now),
+        let transitions = observer.poll(
+            &sessions,
+            PollClock {
+                started_at,
+                started_at_utc,
+                in_process_at: *last_user_activity.read().await,
+                now: chrono::Utc::now(),
                 idle_threshold,
-                now,
             },
         );
         for transition in transitions {
@@ -7677,55 +7649,7 @@ mod tests {
         );
     }
 
-    // ── session_watermark_seed (PAI-7 P1) ─────────────────────────────────
-
-    fn session_created_at(
-        id: &str,
-        created_at: chrono::DateTime<chrono::Utc>,
-    ) -> pond_core::user_data::domain::session::Session {
-        let mut session = pond_core::user_data::domain::session::Session::new(id.to_string());
-        session.created_at = created_at;
-        session
-    }
-
-    /// The direction this helper exists to fail in. A read error is not the
-    /// same claim as "this pond has no conversations", and confusing the two
-    /// announces every session the pond has ever held as newly started.
-    #[test]
-    fn a_failed_session_read_seeds_now_rather_than_replaying_history() {
-        let now = chrono::Utc::now();
-        let seed =
-            session_watermark_seed::<std::io::Error>(Err(std::io::Error::other("db is busy")), now);
-        assert_eq!(
-            seed,
-            Some(now),
-            "a failed read must seed the watermark at now, not at None"
-        );
-    }
-
-    #[test]
-    fn a_populated_pond_seeds_its_newest_conversation() {
-        let now = chrono::Utc::now();
-        let sessions = vec![
-            session_created_at("older", now - chrono::Duration::hours(3)),
-            session_created_at("newest", now - chrono::Duration::minutes(2)),
-            session_created_at("middle", now - chrono::Duration::hours(1)),
-        ];
-        assert_eq!(
-            session_watermark_seed::<std::io::Error>(Ok(sessions), now),
-            Some(now - chrono::Duration::minutes(2)),
-            "the seed is the newest created_at, whatever order the rows arrive in"
-        );
-    }
-
-    /// Vacuity control for the two above: an empty pond really does seed
-    /// `None`, so `Some(now)` on failure is a decision and not the only value
-    /// this function can return.
-    #[test]
-    fn an_empty_pond_seeds_nothing_so_its_first_conversation_is_announced() {
-        assert_eq!(
-            session_watermark_seed::<std::io::Error>(Ok(Vec::new()), chrono::Utc::now()),
-            None
-        );
-    }
+    // The session-activity seed's guards moved to pond-core with the code
+    // (`shared/domain/session_activity.rs`), because CI only `cargo check`s
+    // this crate — a test that lives here never runs in CI at all.
 }
