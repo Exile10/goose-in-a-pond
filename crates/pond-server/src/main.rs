@@ -2894,6 +2894,19 @@ async fn run_server(
         ));
     }
 
+    // The other half of the event spine (PAI-7 P1): the pond's own clock and
+    // the user's presence at it. Spawned here, beside the two consumers, so
+    // the whole spine reads in one place. Both hold the bus weakly — see
+    // `run_time_ticker` — and both publish only; the rules engine skips these
+    // events because they have no device-shaped view, and the bridge above
+    // records them in the event log like any other bus traffic.
+    tokio::spawn(run_time_ticker(Arc::downgrade(&event_bus)));
+    tokio::spawn(run_session_activity_observer(
+        Arc::downgrade(&event_bus),
+        session_storage.clone(),
+        last_user_activity.clone(),
+    ));
+
     // Matter bridge (#195): syncs commissioned fabric nodes into the device
     // registry and turns sensor attribute updates into BusEvent::Sensor, so
     // #92 rules and the activity feed react to Matter sensors natively.
@@ -4539,6 +4552,158 @@ async fn newest_session_activity(
         .into_iter()
         .map(|s| s.updated_at)
         .max()
+}
+
+// ── PAI-7 P1: clock and session-activity publishers on the event bus ────────
+//
+// Both publish and nothing consumes: the rules engine now skips these events
+// (they have no `trigger_view`) and the bus-to-event-log bridge records them.
+// Deciding anything about them is PAI-7 P4's, and that separation is the point
+// of the phase — an event nobody can trust is worse than no event.
+
+/// Publish one [`BusEvent::Time`] per local hour boundary.
+///
+/// **Cadence is computed from the wall clock each time**, not by ticking a
+/// fixed hour-long interval, so the tick lands on the hour rather than an hour
+/// after whenever the pond happened to boot. A machine that slept through
+/// three hours publishes one tick when it wakes rather than three: the tick is
+/// a heartbeat, and a backlog of "it is now 2am" is noise.
+///
+/// **The bus is held weakly.** This is the one task on the spine with no input
+/// stream of its own — the rules engine and the event-log bridge both end when
+/// the bus's senders drop. A strong `Arc` here would keep the bus, and so
+/// their streams, alive for exactly as long as this loop, which is what turns
+/// a background timer into something that outlives the shutdown it should have
+/// ended with.
+async fn run_time_ticker(bus: std::sync::Weak<dyn pond_core::shared::ports::event_bus::EventBus>) {
+    use chrono::Timelike;
+    use pond_core::shared::domain::time_tick::{secs_to_next_hour, TimeBoundary, TimeTick};
+    use pond_core::shared::ports::event_bus::BusEvent;
+
+    loop {
+        let now = chrono::Local::now();
+        let wait = secs_to_next_hour(now.minute(), now.second());
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+
+        // Upgrade per iteration and drop it again before the next sleep.
+        let Some(bus) = bus.upgrade() else {
+            tracing::debug!("time ticker: event bus dropped — stopping");
+            break;
+        };
+        let local = chrono::Local::now();
+        bus.publish(BusEvent::Time(TimeTick {
+            boundary: TimeBoundary::Hour,
+            at: chrono::Utc::now(),
+            local_hour: local.hour() as u8,
+        }));
+    }
+}
+
+/// Seed for the session-activity watermark: the newest `created_at` the pond
+/// already holds.
+///
+/// **A failed read seeds `now`, never `None`.** `None` is the positive claim
+/// "this pond has no conversations", and an observer that believes it
+/// announces the entire chat history as newly started on its first poll —
+/// a hundred "the user just started talking" events, every one of them false.
+/// The failure direction has to be the quiet one.
+fn session_watermark_seed<E>(
+    sessions: Result<Vec<pond_core::user_data::domain::session::Session>, E>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    match sessions {
+        Ok(sessions) => sessions.iter().map(|s| s.created_at).max(),
+        Err(_) => Some(now),
+    }
+}
+
+/// Publish [`BusEvent::Session`] transitions — a conversation started, the
+/// pond went quiet, the user came back.
+///
+/// Reuses the consolidation scheduler's activity model wholesale:
+/// `saw_activity_since_start` for the never-at-startup guard,
+/// `combined_idle_for` so an out-of-process voice turn counts, and
+/// `INACTIVITY_THRESHOLD_SECS` as the threshold. One pond, one definition of
+/// "the user has gone quiet" — a second, disagreeing one would have the bus
+/// saying the user left while the gate that runs background work says they are
+/// still here.
+async fn run_session_activity_observer(
+    bus: std::sync::Weak<dyn pond_core::shared::ports::event_bus::EventBus>,
+    storage: Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>,
+    last_user_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
+) {
+    use pond_core::shared::domain::session_activity::{
+        ActivityInputs, ActivityObserver, SessionStart,
+    };
+    use pond_core::shared::ports::event_bus::BusEvent;
+    use pond_core::user_data::services::consolidation_schedule as sched;
+
+    const POLL_SECS: u64 = 60;
+    let idle_threshold = std::time::Duration::from_secs(sched::INACTIVITY_THRESHOLD_SECS);
+
+    // Baselines for the never-at-startup guard, captured before the first
+    // poll so the activity clock's boot value can never pass for activity.
+    let started_at = std::time::Instant::now();
+    let started_at_utc = chrono::Utc::now();
+
+    let mut observer = ActivityObserver::starting_from(session_watermark_seed(
+        storage.list_sessions().await,
+        started_at_utc,
+    ));
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
+
+        let Some(bus) = bus.upgrade() else {
+            tracing::debug!("session activity observer: event bus dropped — stopping");
+            break;
+        };
+
+        // One read serves both halves: which conversations exist, and the
+        // newest `updated_at` (the out-of-process activity source).
+        let sessions = match storage.list_sessions().await {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                tracing::debug!(error = %e, "session activity observer: session read failed");
+                continue;
+            }
+        };
+        let db_activity = sessions.iter().map(|s| s.updated_at).max();
+        let in_process_at = *last_user_activity.read().await;
+        let now = chrono::Utc::now();
+
+        let starts: Vec<SessionStart<'_>> = sessions
+            .iter()
+            .map(|s| SessionStart {
+                id: &s.id,
+                created_at: s.created_at,
+            })
+            .collect();
+
+        let transitions = observer.observe(
+            &starts,
+            ActivityInputs {
+                saw_activity_since_start: sched::saw_activity_since_start(
+                    started_at,
+                    in_process_at,
+                    started_at_utc,
+                    db_activity,
+                ),
+                idle_for: sched::combined_idle_for(in_process_at, db_activity, now),
+                idle_threshold,
+                now,
+            },
+        );
+        for transition in transitions {
+            tracing::debug!(
+                phase = transition.phase.as_str(),
+                session_id = transition.session_id.as_deref().unwrap_or("-"),
+                idle_secs = transition.idle_secs,
+                "session lifecycle"
+            );
+            bus.publish(BusEvent::Session(transition));
+        }
+    }
 }
 
 /// Run one consolidation pass in the configured mode, apply the accepted
@@ -7509,6 +7674,58 @@ mod tests {
                 .as_deref(),
             Some("gemma3:4b"),
             "tool_model should be synced from tool role assignment"
+        );
+    }
+
+    // ── session_watermark_seed (PAI-7 P1) ─────────────────────────────────
+
+    fn session_created_at(
+        id: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> pond_core::user_data::domain::session::Session {
+        let mut session = pond_core::user_data::domain::session::Session::new(id.to_string());
+        session.created_at = created_at;
+        session
+    }
+
+    /// The direction this helper exists to fail in. A read error is not the
+    /// same claim as "this pond has no conversations", and confusing the two
+    /// announces every session the pond has ever held as newly started.
+    #[test]
+    fn a_failed_session_read_seeds_now_rather_than_replaying_history() {
+        let now = chrono::Utc::now();
+        let seed =
+            session_watermark_seed::<std::io::Error>(Err(std::io::Error::other("db is busy")), now);
+        assert_eq!(
+            seed,
+            Some(now),
+            "a failed read must seed the watermark at now, not at None"
+        );
+    }
+
+    #[test]
+    fn a_populated_pond_seeds_its_newest_conversation() {
+        let now = chrono::Utc::now();
+        let sessions = vec![
+            session_created_at("older", now - chrono::Duration::hours(3)),
+            session_created_at("newest", now - chrono::Duration::minutes(2)),
+            session_created_at("middle", now - chrono::Duration::hours(1)),
+        ];
+        assert_eq!(
+            session_watermark_seed::<std::io::Error>(Ok(sessions), now),
+            Some(now - chrono::Duration::minutes(2)),
+            "the seed is the newest created_at, whatever order the rows arrive in"
+        );
+    }
+
+    /// Vacuity control for the two above: an empty pond really does seed
+    /// `None`, so `Some(now)` on failure is a decision and not the only value
+    /// this function can return.
+    #[test]
+    fn an_empty_pond_seeds_nothing_so_its_first_conversation_is_announced() {
+        assert_eq!(
+            session_watermark_seed::<std::io::Error>(Ok(Vec::new()), chrono::Utc::now()),
+            None
         );
     }
 }
