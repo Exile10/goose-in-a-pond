@@ -270,7 +270,9 @@ mod tests {
             cooldown_secs: 60,
         };
         let bus_event = BusEvent::Camera(event);
-        let view = bus_event.trigger_view();
+        let view = bus_event
+            .trigger_view()
+            .expect("a camera event is device-shaped");
         assert!(
             rule.matches(&view, chrono::NaiveTime::from_hms_opt(20, 0, 0).unwrap()),
             "the automation rule must match the on-device detection"

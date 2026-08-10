@@ -350,7 +350,9 @@ async fn occupancy_update_reaches_the_bus_and_matches_a_rule() {
         }],
         cooldown_secs: 60,
     };
-    let view = event.trigger_view();
+    let view = event
+        .trigger_view()
+        .expect("a sensor reading is device-shaped");
     assert!(
         rule.matches(&view, chrono::NaiveTime::from_hms_opt(20, 0, 0).unwrap()),
         "the automation rule must match the Matter sensor update"
