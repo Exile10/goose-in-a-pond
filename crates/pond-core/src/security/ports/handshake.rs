@@ -107,6 +107,14 @@ pub struct PairingCode {
     pub code: String,
     /// RFC3339 expiry of the code.
     pub expires_at: String,
+    /// The household member the device pairing with this code becomes.
+    ///
+    /// `None` -- the default and the only value any shipped caller produces
+    /// today -- pairs an **unattributed** device: registered and usable, and
+    /// not any member's phone. See [`Handshake::issue_pairing_code_for`] for
+    /// why the member is captured here rather than in [`VerifyRequest`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
 }
 
 /// Driven Port: device authentication and pairing.
@@ -160,12 +168,45 @@ pub trait Handshake: Send + Sync {
         Err(anyhow::anyhow!("refresh not supported by this adapter"))
     }
 
-    /// Issue a single-use pairing code for the operator to read aloud / type
-    /// into a client. Returns the plaintext code (the only place it is visible).
-    async fn issue_pairing_code(&self) -> Result<PairingCode> {
+    /// Issue a single-use pairing code **bound to a household member**, for the
+    /// operator to read aloud / type into a client. Returns the plaintext code
+    /// (the only place it is visible).
+    ///
+    /// `profile_id: None` issues an ordinary unattributed code, which is what
+    /// [`issue_pairing_code`](Self::issue_pairing_code) does and what every
+    /// shipped caller does today.
+    ///
+    /// # Why the member is captured here and not in [`VerifyRequest`]
+    ///
+    /// The obvious alternative is for the pairing client to say who it is. That
+    /// is the same shape as the live hole PAI-1 P4 closed on
+    /// `PUT /sessions/{id}/user`, which took a `profile_id` from the request
+    /// body and bound it at `Explicit` strength with no ownership check at all.
+    /// It would be worse here: `IdentificationSource::PairedDevice` is the
+    /// **strongest** rung of `identity_resolution::resolve` and outranks both
+    /// face and explicit, so a client-asserted profile would not merely be
+    /// unproven -- it would outrank every proof the pond can actually make.
+    ///
+    /// A pairing code, by contrast, is minted on the host: both
+    /// `handshake_pairing_code` and `handshake_issue_pairing_code` refuse a
+    /// non-loopback peer inside the handler. Binding the member at issuance
+    /// means the answer to "whose device is this?" comes from somebody standing
+    /// at the pond, and the pairing client cannot influence it.
+    async fn issue_pairing_code_for(&self, _profile_id: Option<&str>) -> Result<PairingCode> {
         Err(anyhow::anyhow!(
             "pairing-code issuance not supported by this adapter"
         ))
+    }
+
+    /// Issue an unattributed single-use pairing code.
+    ///
+    /// Kept as the zero-argument form because it is what the loopback issuance
+    /// route and the startup banner call, and an unattributed pair is the right
+    /// default: pairing usually happens before anyone has said who they are.
+    /// Adapters implement [`issue_pairing_code_for`](Self::issue_pairing_code_for);
+    /// this delegates, so an adapter cannot support one and not the other.
+    async fn issue_pairing_code(&self) -> Result<PairingCode> {
+        self.issue_pairing_code_for(None).await
     }
 
     /// The most recently issued, unexpired, unconsumed pairing code, if any.
