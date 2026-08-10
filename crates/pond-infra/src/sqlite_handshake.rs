@@ -1069,9 +1069,11 @@ mod tests {
     // directly and no production path did; a fixture production cannot produce
     // tests a system that does not exist.
 
-    /// The whole rung, through the writers production uses: a code issued for
-    /// Liz pairs a phone that is Liz's, and that phone's push token is
-    /// reachable from her profile alone.
+    /// The rung, through the writers production uses: a code issued for Liz
+    /// pairs a phone that is Liz's and is not Jerry's. The push-token hop off
+    /// the same column is asserted in
+    /// `sqlite_device_attribution::tests::a_profile_can_be_asked_for_its_devices_and_their_push_tokens`;
+    /// no token is registered here, so this test does not claim it.
     #[tokio::test]
     async fn pairing_with_a_members_code_makes_the_device_theirs() {
         let (hs, pool) = fresh_with_household().await;
