@@ -8247,7 +8247,6 @@ async fn agent_chat_stream(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     use futures::stream::StreamExt;
-    use pond_core::models::ports::agent::AgentStreamEvent;
     use pond_core::shared::domain::agent::AgentRequest;
 
     // Resets the inactivity clock and interrupts any background consolidation.
@@ -8371,8 +8370,11 @@ async fn agent_chat_stream(
         // the user's own words when the turn ends.
         let user_message_for_extraction = message.clone();
 
-        let mut full_text = String::new();
-        let mut tool_results: Vec<String> = Vec::new();
+        // The same accumulator `/chat/stream` uses, so both routes fold an
+        // engine event into a turn the one way. This route never captures
+        // thinking blocks out of the token stream -- it takes the engine's
+        // structured `Thinking` events and nothing else.
+        let mut turn = TurnAccumulator::new(crate::thought_filter::ThoughtFilter::new());
         let request = AgentRequest {
             message,
             session_id: session_id.clone(),
@@ -8393,79 +8395,37 @@ async fn agent_chat_stream(
             }
         };
 
-        // See chat_stream above for rationale — same Harmony preamble filter.
-        let mut thought = crate::thought_filter::ThoughtFilter::new();
-
         while let Some(event_result) = agent_stream.next().await {
             match event_result {
                 Ok(event) => {
-                    let maybe_data = match event {
-                        AgentStreamEvent::Status { content } => {
-                            Some(json!({"type": "status", "content": content}).to_string())
+                    match turn.absorb(event) {
+                        StreamStep::Nothing => {}
+                        StreamStep::Frame(data) => {
+                            yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
                         }
-                        AgentStreamEvent::Thinking { content } => {
+                        StreamStep::Reasoning { frame, block } => {
                             // PAI-5 P6, same contract as `chat_stream`: offered
                             // unconditionally, kept only if the user said so.
-                            chat_service.record_thinking(content.clone());
-                            Some(json!({"type": "thinking", "content": content}).to_string())
+                            chat_service.record_thinking(block);
+                            yield Ok::<Event, std::convert::Infallible>(Event::default().data(frame));
                         }
-                        AgentStreamEvent::ToolCall { tool, id, input } => {
-                            Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
+                        // This route closes on the engine's `Done` and reports
+                        // no usage, which is why the numbers are dropped here
+                        // rather than in the translator. `/chat/stream` keeps
+                        // them and emits its `done` after persistence.
+                        StreamStep::TurnComplete { .. } => {
+                            yield Ok::<Event, std::convert::Infallible>(Event::default().data(
+                                json!({"done": true, "session_id": session_id.clone()}).to_string()
+                            ));
                         }
-                        AgentStreamEvent::ToolResult { tool, id, content } => {
-                            let (clean_content, ui_hint) = extract_ui_hint(&content);
-                            tool_results.push(json!({
-                                "tool_call_id": id,
-                                "tool": tool,
-                                "content": clean_content,
-                            }).to_string());
-                            let mut ev = serde_json::json!({
-                                "type": "tool_result",
-                                "tool": tool,
-                                "id": id,
-                                "content": clean_content
-                            });
-                            if let Some(ui) = ui_hint {
-                                ev["ui"] = ui;
-                            }
-                            Some(ev.to_string())
-                        }
-                        AgentStreamEvent::Text { content } => {
-                            let visible = thought.push(&content);
-                            if visible.is_empty() {
-                                None
-                            } else {
-                                full_text.push_str(&visible);
-                                Some(json!({"type": "text", "content": visible, "token": visible}).to_string())
-                            }
-                        }
-                        AgentStreamEvent::ReviewStatus { content } => {
-                            Some(json!({"type": "review_status", "content": content}).to_string())
-                        }
-                        AgentStreamEvent::ReviewRevision { content, score, rounds } => {
-                            Some(json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds}).to_string())
-                        }
-                        // Parity with /chat/stream — see the note there.
-                        AgentStreamEvent::TurnLimitReached { max_turns } => {
-                            Some(json!({"type": "turn_limit_reached", "max_turns": max_turns}).to_string())
-                        }
-                        AgentStreamEvent::Done { .. } => {
-                            Some(json!({"done": true, "session_id": session_id.clone()}).to_string())
-                        }
-                        AgentStreamEvent::Error { content } => {
-                            Some(json!({"error": content}).to_string())
-                        }
-                    };
-                    if let Some(data) = maybe_data {
-                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
                     }
                     // Emit thinking blocks captured by the filter
-                    for thinking_content in thought.take_thinking() {
+                    for thinking_content in turn.thought.take_thinking() {
                         let data = json!({"type": "thinking", "content": thinking_content}).to_string();
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
                     }
                     // Execute Harmony-format tool-call envelopes captured by ThoughtFilter.
-                    for body in thought.take_tool_calls() {
+                    for body in turn.thought.take_tool_calls() {
                         if let Some((name, args)) = crate::thought_filter::parse_tool_envelope(&body) {
                             tracing::info!(tool = %name, "Executing text-based tool call (agent chat)");
                             let call_id = uuid::Uuid::new_v4().to_string();
@@ -8473,21 +8433,24 @@ async fn agent_chat_stream(
                             yield Ok::<Event, std::convert::Infallible>(Event::default().data(
                                 json!({"type": "tool_call", "tool": name.clone(), "id": call_id.clone(), "input": args_val}).to_string()
                             ));
-                            match state.agent.call_tool(&session_id, &name, &args).await {
+                            let call_start = std::time::Instant::now();
+                            let call_result = state.agent.call_tool(&session_id, &name, &args).await;
+                            turn.note_fallback_tool(&name, call_start.elapsed());
+                            match call_result {
                                 Ok(result_text) => {
                                     let (clean, ui_hint) = extract_ui_hint(&result_text);
-                                    let mut ev = json!({"type": "tool_result", "tool": name, "id": call_id, "content": clean});
-                                    if let Some(ui) = ui_hint {
-                                        ev["ui"] = ui;
-                                    }
-                                    yield Ok::<Event, std::convert::Infallible>(Event::default().data(ev.to_string()));
+                                    yield Ok::<Event, std::convert::Infallible>(Event::default().data(
+                                        tool_result_frame(&name, &call_id, &clean, ui_hint)
+                                    ));
                                 }
                                 Err(e) => {
                                     yield Ok::<Event, std::convert::Infallible>(Event::default().data(
-                                        json!({"type": "tool_result", "tool": name, "id": call_id, "content": format!("Tool error: {e}")}).to_string()
+                                        tool_result_frame(&name, &call_id, &format!("Tool error: {e}"), None)
                                     ));
                                 }
                             }
+                        } else {
+                            tracing::warn!("Unrecognised tool-call envelope: {body}");
                         }
                     }
                 }
@@ -8499,9 +8462,9 @@ async fn agent_chat_stream(
             }
         }
 
-        let tail = thought.flush();
+        let tail = turn.thought.flush();
         if !tail.is_empty() {
-            full_text.push_str(&tail);
+            turn.full_text.push_str(&tail);
             let data = json!({"type": "text", "content": tail, "token": tail}).to_string();
             yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
         }
@@ -8513,8 +8476,8 @@ async fn agent_chat_stream(
         // refactoring the block, because there is no separate call to drop.
         // That is the same reason `/chat/stream` uses it.
         let _ = chat_service.persist_assistant_turn_with_extraction(
-            tool_results,
-            &full_text,
+            std::mem::take(&mut turn.tool_results),
+            &turn.full_text,
             None,
             None,
             &user_message_for_extraction,
