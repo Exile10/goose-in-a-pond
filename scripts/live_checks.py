@@ -140,17 +140,44 @@ def new_profile(name):
 
 
 def section_schema():
-    print("\n=== P2: migration 0037 on a real database file ===")
+    print("\n=== P2: migrations on a real database file ===")
     con = db()
-    rows = con.execute(
-        "SELECT version, success FROM _sqlx_migrations ORDER BY version DESC LIMIT 3"
-    ).fetchall()
-    check("0037 applied and successful", any(r[0] == 37 and r[1] == 1 for r in rows), str(rows))
-    check(
-        "0037 applied exactly once",
-        [r[0] for r in con.execute("SELECT version FROM _sqlx_migrations WHERE version = 37")]
-        == [37],
-    )
+    # Ask for the versions BY NAME, never for "the last three". The window form
+    # was here and it broke the day 0038 landed: 0037 fell off the end of a
+    # `LIMIT 3` and the check reported a missing migration that was present and
+    # successful, which the very next assertion proved by querying it directly.
+    # A window that has to keep up with the tree is a check that fails on
+    # unrelated work -- the programme's recorded vacuity shape 4, in mirror.
+    #
+    # Each entry is (version, what it is, which workstream owes it). Add a row
+    # when you add a migration; that is the whole maintenance burden, and it is
+    # the one that fails loudly rather than silently.
+    OWED_MIGRATIONS = [
+        (37, "session identification", "PAI-1 P2"),
+        (39, "reasoning_tokens", "PAI-5 P2"),
+        (40, "session_thinking side table", "PAI-5 P6"),
+    ]
+    applied = {
+        r[0]: r[1] for r in con.execute("SELECT version, success FROM _sqlx_migrations").fetchall()
+    }
+    for version, what in ((v, w) for v, w, _ in OWED_MIGRATIONS):
+        check(
+            "%04d applied and successful (%s)" % (version, what),
+            applied.get(version) == 1,
+            "row: %r" % (applied.get(version),),
+        )
+    for version, what, owner in OWED_MIGRATIONS:
+        check(
+            "%04d applied exactly once" % version,
+            [
+                r[0]
+                for r in con.execute(
+                    "SELECT version FROM _sqlx_migrations WHERE version = ?", (version,)
+                )
+            ]
+            == [version],
+            "%s owes this one" % owner,
+        )
     cols = [c[1] for c in con.execute("PRAGMA table_info(sessions)").fetchall()]
     for col in ("profile_id", "identification_source", "identification_confidence"):
         check("sessions.%s present" % col, col in cols)

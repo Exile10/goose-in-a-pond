@@ -630,10 +630,13 @@ impl DelegationAuthority {
         // either way nothing is constructed.
         let depth = self.depth.deeper()?;
         // The ONLY producer of the value that fills `TaskSpec::scope`, and the
-        // only one there can be: see [`ChildScope`]. This line cannot be
-        // simplified to `role.personal_data.narrow(&self.scope)` -- that is a
-        // `ProfileScope`, and the field is not.
-        let scope = ChildScope(role.personal_data.narrow(&self.scope));
+        // only one there can be: see [`ChildScope`]. It goes through `for_role`
+        // rather than wrapping `narrow` directly, and that distinction is the
+        // whole of the type's value -- wrapping skips the clamp, which is the
+        // very thing `ChildScope` exists to make unskippable. The field is
+        // private to `child_scope`, so this is now the only expression that
+        // type-checks here.
+        let scope = ChildScope::for_role(role.personal_data, &self.scope);
         // `scope.get()`, not `&self.scope`. The subtraction is keyed on the
         // CHILD's scope, and the only case where the two differ is the exact
         // one this exists for: a Household parent running a
@@ -721,7 +724,7 @@ mod child_scope {
     /// exactly, and nothing downstream would fail. If a diff does it, that is
     /// the thing to reject.
     #[derive(Debug, Clone)]
-    pub(super) struct ChildScope(pub(super) ProfileScope);
+    pub(super) struct ChildScope(ProfileScope);
 
     impl ChildScope {
         /// The one production path from a role and a parent to a child's scope.
