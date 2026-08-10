@@ -13,6 +13,8 @@ import { ResultCard } from "./chat/ResultCard";
 import type { CardKind } from "./chat/ResultCard";
 import { TurnStatsFooter } from "../../components/TurnStatsFooter";
 import { ContextPressureNote } from "../../components/ContextPressureNote";
+import { SubagentTree, applySubagentProgress } from "../../components/SubagentTree";
+import type { SubagentRun } from "../../components/SubagentTree";
 import { AttachmentTray } from "../../components/AttachmentTray";
 import { prepareImage, validateAttachmentSet } from "../../lib/imageAttach";
 import type { PreparedImage } from "../../lib/imageAttach";
@@ -32,6 +34,9 @@ interface ChatMessage {
   /** Set when the server said the context window is filling — renders the
    *  pressure note and the manual compaction control (PAI-4 P7b). */
   contextWarning?: ContextWarning;
+  /** PAI-6 P6. Delegations this turn started, folded from `subagent_progress`
+   *  frames through the shared reducer. */
+  delegations?: SubagentRun[];
   /** Local preview URLs for images attached to a live-sent message. */
   images?: string[];
 }
@@ -306,6 +311,16 @@ export function ChatHubView() {
             setMsgs((prev) =>
               prev.map((m) => (m.id === agentMsg.id ? { ...m, turnLimit: limit } : m)),
             );
+          } else if (ev.type === "subagent_progress") {
+            // PAI-6 P6. Attach by id — same reasoning as turn_stats — and fold
+            // through the shared reducer rather than a second copy of it.
+            setMsgs((prev) =>
+              prev.map((m) =>
+                m.id === agentMsg.id
+                  ? { ...m, delegations: applySubagentProgress(m.delegations ?? [], ev) }
+                  : m,
+              ),
+            );
           } else if (ev.type === "context_warning") {
             // PAI-4 P7b. The window is filling. Attach by id — same reasoning
             // as turn_stats — so the note lands on this turn and not on
@@ -394,6 +409,12 @@ export function ChatHubView() {
           <div key={m.id} className={`ch-row ch-row--${m.who}`}>
             {m.who === "goose" && <GooseAvatar />}
             <div className="ch-bubble-wrap">
+              {/* PAI-6 P6. Live, not gated on `!m.streaming`: a delegating
+                  turn is blocked inside one tool call for the whole of its
+                  child's run. */}
+              {m.who === "goose" && m.delegations && m.delegations.length > 0 && (
+                <SubagentTree runs={m.delegations} />
+              )}
               <div className={`ch-bubble ch-bubble--${m.who}`}>
                 {m.images && m.images.length > 0 && (
                   <div className="ch-bubble__images">

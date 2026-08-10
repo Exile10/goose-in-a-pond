@@ -438,7 +438,24 @@ export interface ChatStreamRequest {
   images?: ImageAttachment[];
 }
 
-export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision" | "turn_stats" | "turn_limit_reached" | "context_warning";
+export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision" | "turn_stats" | "turn_limit_reached" | "context_warning" | "subagent_progress";
+
+/**
+ * PAI-6 P6. Where one delegation has got to.
+ *
+ * The spellings are `SubagentStatus::as_str` in `pond-core`, pinned against
+ * that enum's serde on the Rust side by `the_wire_spelling_is_the_serialized_spelling`.
+ * `tool` is the state a delegating turn spends most of its wall clock in, and
+ * the only one that says anything is still happening.
+ */
+export type SubagentStatus =
+  | "queued"
+  | "running"
+  | "tool"
+  | "completed"
+  | "cancelled"
+  | "turn_budget_exhausted"
+  | "failed";
 
 // Sent as a fresh user turn when the agent stopped on its turn budget. The
 // backend has no dedicated resume endpoint — a continuation IS just the next
@@ -524,6 +541,20 @@ export interface ChatEvent {
   };
   /** Turn budget that was exhausted — present on "turn_limit_reached" events. */
   max_turns?: number;
+  /** PAI-6 P6 — present on "subagent_progress" events. The run this frame is
+   *  about; one turn may delegate the same role twice, so the id and not the
+   *  role is what groups a tree's nodes. */
+  task_id?: string;
+  /** The delegated role — the label on a tree node. Present on
+   *  "subagent_progress" events only; a chat event has no other notion of a
+   *  role. */
+  role?: string;
+  /** Present on "subagent_progress" events. */
+  status?: SubagentStatus;
+  /** A tool NAME while a child is calling one, or the pond's own reason when a
+   *  run failed. Never the child's words, its reasoning, or a tool call's
+   *  arguments — the server cannot put those here (PAI-2 minimisation). */
+  detail?: string;
   done?: boolean;
   session_id?: string;      // present on done events
   model_role?: string;      // present on done events (chat | think | task)
