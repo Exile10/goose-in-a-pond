@@ -331,7 +331,9 @@ fn agent_chat_stream_knows_who_is_speaking_before_it_builds_the_service() {
 ///
 /// This is the property the unification half of P7 bought, and the only thing
 /// that keeps it: two exhaustive matches over an enum that is still growing is a
-/// standing promise to write every new variant twice. PAI-6 P6 adds one. When
+/// standing promise to write every new variant twice. PAI-6 P6 added one --
+/// `SubagentProgress` -- and wrote its arm ONCE, which is what P7 bought and is
+/// the reason this guard exists rather than a note in a document. When
 /// the second copy exists, the cheap thing to do is write the arm into whichever
 /// handler you were looking at -- which is how these two came to disagree about
 /// tool timing, and how `/agent/chat/stream` came to stream reasoning it never
@@ -359,13 +361,17 @@ fn the_engine_event_match_lives_in_exactly_one_place() {
     // that says it is gets deleted rather than obeyed. Any second fold has to
     // name the six below -- exhaustively if it is a copy, and at least one of
     // them if it is a partial `match … _ => {}` bolted on beside the real one.
-    const DISTINCTIVE_VARIANTS: [&str; 6] = [
+    const DISTINCTIVE_VARIANTS: [&str; 7] = [
         "Thinking",
         "ToolCall",
         "ToolResult",
         "ReviewStatus",
         "ReviewRevision",
         "TurnLimitReached",
+        // PAI-6 P6. The newest variant is the one most likely to be handled
+        // twice, because the arm is written while its producer is being built
+        // and a handler is the obvious place to put it.
+        "SubagentProgress",
     ];
 
     let translator = strip_line_comments(method_body(TRANSLATOR));

@@ -98,6 +98,36 @@ pub enum AgentStreamEvent {
     TurnLimitReached {
         max_turns: u32,
     },
+    /// A delegation running underneath this turn changed state — PAI-6 P6.
+    ///
+    /// A delegating turn is otherwise a spinner: the parent is parked inside one
+    /// `delegate` tool call for the whole of a child's run, which on-device is
+    /// minutes, and nothing reaches the client until the tool result does. These
+    /// frames are what let a client draw the tree instead.
+    ///
+    /// # What it may carry, and what it may not
+    ///
+    /// PAI-6 invariant 4 says a subagent's conversation never becomes the
+    /// parent's history — only its final result, as a tool result. A progress
+    /// frame is about a child, so it is a frame and nothing else: no consumer
+    /// may fold `detail` into the turn's text or its persisted tool results.
+    ///
+    /// `detail` is deliberately narrow. It carries a tool NAME while a child is
+    /// calling one, and a GIAP-authored reason when a run fails. It never
+    /// carries the child's prose, its reasoning, or a tool call's ARGUMENTS —
+    /// on this pond those can be a household memory query or device state
+    /// (PAI-2 minimisation), and the producer that fills this field cannot
+    /// express any of them. See `orchestrator.rs :: child_tool_names`.
+    SubagentProgress {
+        /// The `TaskRun` id, so a client can group frames per child rather than
+        /// per role — one turn may delegate the same role twice.
+        task_id: String,
+        /// The role that was delegated to, for the label on the tree.
+        role: String,
+        status: SubagentStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     Done {
         session_id: String,
         model_role: String,
@@ -111,6 +141,83 @@ pub enum AgentStreamEvent {
     Error {
         content: String,
     },
+}
+
+/// Where a delegation has got to, as a client sees it — PAI-6 P6.
+///
+/// A closed set rather than a free string, so a consumer that adds a branch is
+/// told when a new state appears instead of silently rendering nothing. It is
+/// deliberately NOT
+/// [`TaskStatus`](crate::shared::domain::orchestration::TaskStatus): that enum
+/// is the run's lifecycle and has no way to say "the child is calling a tool",
+/// which is the state a delegating turn spends most of its wall clock in and the
+/// only one that says anything is still happening.
+///
+/// [`From<TaskStatus>`](Self::from) is an exhaustive match, so a lifecycle state
+/// added over there is a compile error here rather than a frame nobody drew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentStatus {
+    /// Authorised, waiting for the device. On-device this is where a second
+    /// delegation from the same turn sits while its sibling runs.
+    Queued,
+    /// Holding the device and replying.
+    Running,
+    /// Calling a tool. `detail` is the tool's name and never its arguments.
+    Tool,
+    /// Finished with an answer, which arrives separately as the `delegate` tool
+    /// result — never in a progress frame.
+    Completed,
+    /// Stopped, by the parent or by the parent's own turn ending.
+    Cancelled,
+    /// Ran out of turns. Whatever came back is a budget message, not an answer.
+    TurnBudgetExhausted,
+    /// Did not produce an answer. `detail` is GIAP's own reason.
+    Failed,
+}
+
+impl SubagentStatus {
+    /// Every variant, so a guard can iterate them rather than list them.
+    pub const ALL: [SubagentStatus; 7] = [
+        SubagentStatus::Queued,
+        SubagentStatus::Running,
+        SubagentStatus::Tool,
+        SubagentStatus::Completed,
+        SubagentStatus::Cancelled,
+        SubagentStatus::TurnBudgetExhausted,
+        SubagentStatus::Failed,
+    ];
+
+    /// The wire spelling, for a renderer that has no serializer to hand.
+    ///
+    /// `the_wire_spelling_is_the_serialized_spelling` pins this against serde
+    /// for every variant. Two spellings of one state is how a client ends up
+    /// with a branch that can never be true.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubagentStatus::Queued => "queued",
+            SubagentStatus::Running => "running",
+            SubagentStatus::Tool => "tool",
+            SubagentStatus::Completed => "completed",
+            SubagentStatus::Cancelled => "cancelled",
+            SubagentStatus::TurnBudgetExhausted => "turn_budget_exhausted",
+            SubagentStatus::Failed => "failed",
+        }
+    }
+}
+
+impl From<crate::shared::domain::orchestration::TaskStatus> for SubagentStatus {
+    fn from(status: crate::shared::domain::orchestration::TaskStatus) -> Self {
+        use crate::shared::domain::orchestration::TaskStatus;
+        match status {
+            TaskStatus::Queued => SubagentStatus::Queued,
+            TaskStatus::Running => SubagentStatus::Running,
+            TaskStatus::Completed => SubagentStatus::Completed,
+            TaskStatus::Cancelled => SubagentStatus::Cancelled,
+            TaskStatus::TurnBudgetExhausted => SubagentStatus::TurnBudgetExhausted,
+            TaskStatus::Failed => SubagentStatus::Failed,
+        }
+    }
 }
 
 /// The four states of the workflow loop.
@@ -406,5 +513,76 @@ mod agent_request_scope_tests {
         let legacy = r#"{"message":"hi","session_id":"s1","model_role":"chat"}"#;
         let parsed: AgentRequest = serde_json::from_str(legacy).expect("legacy payload must parse");
         assert_eq!(parsed.profile_scope, ProfileScope::Household);
+    }
+
+    /// PAI-6 P6. The renderer's spelling and the wire's spelling are the same
+    /// string for every state.
+    ///
+    /// `main.rs` prints [`SubagentStatus::as_str`] while `routes.rs` serializes
+    /// the value into the SSE frame, so the two are read by different clients
+    /// and would drift silently. Iterating [`SubagentStatus::ALL`] rather than
+    /// listing cases here is deliberate: a variant added without a spelling is
+    /// caught by the `as_str` match arm, and a variant added without an `ALL`
+    /// entry is caught by the length assertion below.
+    #[test]
+    fn the_wire_spelling_is_the_serialized_spelling() {
+        assert_eq!(
+            SubagentStatus::ALL.len(),
+            7,
+            "SubagentStatus::ALL no longer lists every variant, so every guard \
+             that iterates it now skips one"
+        );
+        for status in SubagentStatus::ALL {
+            let wire = serde_json::to_value(status).expect("status serializes");
+            assert_eq!(
+                wire.as_str(),
+                Some(status.as_str()),
+                "{status:?} serializes as {wire} but renders as `{}` -- a client \
+                 branching on one of those two spellings can never be true",
+                status.as_str()
+            );
+        }
+    }
+
+    /// A progress frame is about a CHILD, and carries no room for its
+    /// conversation.
+    ///
+    /// PAI-6 invariant 4 and PAI-2's minimisation rule meet on this variant:
+    /// `detail` is the only free-text field it has, and the whole design rests
+    /// on that field being narrow. This pins the SHAPE -- four keys, `detail`
+    /// absent when there is none -- so that a later change adding, say, a
+    /// `text` or `thinking` key to the wire has to argue with a test.
+    #[test]
+    fn a_progress_frame_carries_four_fields_and_no_transcript() {
+        let event = AgentStreamEvent::SubagentProgress {
+            task_id: "t1".into(),
+            role: "researcher".into(),
+            status: SubagentStatus::Tool,
+            detail: Some("giap-weather__get_forecast".into()),
+        };
+        let json = serde_json::to_value(&event).expect("event serializes");
+        let object = json.as_object().expect("an object");
+        let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["detail", "role", "status", "task_id", "type"],
+            "the progress frame grew a field. Every field on it is visible to \
+             the desktop and to any paired client, so a new one is a decision \
+             about what a subagent may say about itself"
+        );
+        assert_eq!(object["type"], "subagent_progress");
+
+        let quiet = AgentStreamEvent::SubagentProgress {
+            task_id: "t1".into(),
+            role: "researcher".into(),
+            status: SubagentStatus::Queued,
+            detail: None,
+        };
+        let json = serde_json::to_value(&quiet).expect("event serializes");
+        assert!(
+            json.get("detail").is_none(),
+            "a frame with no detail must omit the key rather than send null"
+        );
     }
 }
