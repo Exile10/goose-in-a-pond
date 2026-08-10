@@ -660,11 +660,14 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(status, "expired");
-        assert!(
-            expires_at.is_some(),
-            "the row must come out of the upgrade with an expiry, or every later write to it \
-             aborts"
+        assert_eq!(
+            (status.as_str(), expires_at.is_some()),
+            ("expired", true),
+            "0042's data fix did not run over the pre-upgrade row: it is still {status} with \
+             expires_at = {expires_at:?}. A proactive row with no expiry is FROZEN by the \
+             triggers this file creates -- every later write to it aborts, including the two \
+             inside 0038's profile-delete trigger, which makes a household member unremovable. \
+             Fix the data before constraining it."
         );
 
         // Vacuity control: the triggers really were re-created, so the write
