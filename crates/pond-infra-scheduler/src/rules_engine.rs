@@ -40,7 +40,13 @@ fn rules_to_fire(
     now: Instant,
     cooldowns: &mut HashMap<String, Instant>,
 ) -> Vec<String> {
-    let view = event.trigger_view();
+    // Not every bus event is device-shaped. A time tick or a session
+    // transition (PAI-7 P1) has no device, signal or value, so no rule can
+    // match it — and it must not be given a placeholder view, because a rule
+    // with no device/signal filter matches everything in its family.
+    let Some(view) = event.trigger_view() else {
+        return Vec::new();
+    };
     let mut fired = Vec::new();
     for rule in rules {
         let TaskKind::SensorTrigger(spec) = &rule.kind else {
