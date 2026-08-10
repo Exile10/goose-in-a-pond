@@ -31,6 +31,7 @@ use pond_core::security::ports::handshake::{
     ChallengeResponse, Handshake, HandshakeRequest, HandshakeResponse, InitRequest, PairingCode,
     RefreshRequest, VerifyRequest,
 };
+use pond_core::user_data::ports::device_attribution::checked_profile_id;
 
 const PAIRING_CODE_TTL_MIN: i64 = 10;
 const CHALLENGE_TTL_SEC: i64 = 60;
@@ -393,6 +394,19 @@ impl Handshake for SqliteHandshakeAdapter {
 
         // 4. Consume the matched code (single-use on success), register the
         //    device, then mint tokens.
+        //
+        //    PAI-1: the code carries the household member the operator issued it
+        //    for, and that is the ONLY thing that attributes the device. Nothing
+        //    in `request` is consulted, deliberately -- see
+        //    `Handshake::issue_pairing_code_for` for why a client-asserted
+        //    profile would outrank every proof the pond can make.
+        let code_profile: Option<String> =
+            sqlx::query_scalar("SELECT profile_id FROM pairing_codes WHERE code_hash = ?")
+                .bind(&code_hash)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
+
         sqlx::query("UPDATE pairing_codes SET consumed_at = ? WHERE code_hash = ?")
             .bind(&attempt_at)
             .bind(&code_hash)
@@ -405,14 +419,22 @@ impl Handshake for SqliteHandshakeAdapter {
             .device_name
             .clone()
             .unwrap_or_else(|| format!("gotg-{}", client_id.chars().take(8).collect::<String>()));
-        let _ = sqlx::query(
+        // `profile_id = excluded.profile_id` on conflict, so a re-pair always
+        // ends at exactly what the code said. An ordinary unattributed code
+        // therefore RELEASES a previous attribution rather than inheriting it:
+        // `device_id` is the client's own self-reported id, so keeping the old
+        // owner would let whoever re-pairs that id become the previous owner.
+        // Losing an attribution is a narrowing and the operator can re-issue;
+        // inheriting one is the impersonation this rung exists to prevent.
+        let registered = sqlx::query(
             "INSERT INTO devices (id, name, hostname, device_type, ip_address,
-                capabilities, last_seen, is_online, created_at, updated_at)
-             VALUES (?, ?, '', ?, '', '[]', ?, 1, ?, ?)
+                capabilities, last_seen, is_online, created_at, updated_at, profile_id)
+             VALUES (?, ?, '', ?, '', '[]', ?, 1, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                name = excluded.name, device_type = excluded.device_type,
                last_seen = excluded.last_seen,
-               is_online = 1, updated_at = excluded.updated_at",
+               is_online = 1, updated_at = excluded.updated_at,
+               profile_id = excluded.profile_id",
         )
         .bind(&device_id)
         .bind(&device_name)
@@ -420,8 +442,21 @@ impl Handshake for SqliteHandshakeAdapter {
         .bind(&attempt_at)
         .bind(&attempt_at)
         .bind(&attempt_at)
+        .bind(&code_profile)
         .execute(&self.pool)
         .await;
+        // The result was discarded outright before PAI-1's rung; it still does
+        // not fail the pair (a client with a valid MAC has paired, whatever the
+        // registry did), but it is no longer invisible. The attribution rides on
+        // this statement, so a swallowed error here is a device that is silently
+        // nobody's.
+        if let Err(e) = &registered {
+            tracing::warn!(
+                error = %e,
+                device = %device_id,
+                "device row not written during pairing; the device is unattributed"
+            );
+        }
 
         let (session, refresh, expires) = self
             .issue_session_pair(&client_id, &client_type, &device_id)
@@ -475,18 +510,27 @@ impl Handshake for SqliteHandshakeAdapter {
         ))
     }
 
-    async fn issue_pairing_code(&self) -> Result<PairingCode> {
+    async fn issue_pairing_code_for(&self, profile_id: Option<&str>) -> Result<PairingCode> {
+        // A blank id is refused rather than stored: it is neither NULL nor a
+        // member, so `ON DELETE SET NULL` could never clear it and the delivery
+        // query would return the device to nobody forever.
+        let profile_id = profile_id.map(checked_profile_id).transpose()?;
         let code = Self::random_pairing_code();
         let code_hash = Self::sha256_hex(code.as_bytes());
         let now = Utc::now();
         let expires = now + Duration::minutes(PAIRING_CODE_TTL_MIN);
 
+        // The foreign key on `profile_id` (migration 0043) does the existence
+        // check: issuing a code for a member who has been deleted fails here
+        // rather than minting a code that would attribute a phone to a ghost.
         sqlx::query(
-            "INSERT INTO pairing_codes (code_hash, created_at, expires_at) VALUES (?, ?, ?)",
+            "INSERT INTO pairing_codes (code_hash, created_at, expires_at, profile_id) \
+             VALUES (?, ?, ?, ?)",
         )
         .bind(&code_hash)
         .bind(now.to_rfc3339())
         .bind(expires.to_rfc3339())
+        .bind(profile_id)
         .execute(&self.pool)
         .await?;
         ISSUED_CODE_CACHE
@@ -495,31 +539,34 @@ impl Handshake for SqliteHandshakeAdapter {
             .insert(code_hash, code.clone());
         tracing::info!(
             expires_at = %expires.to_rfc3339(),
+            attributed = profile_id.is_some(),
             "issued pairing code (valid {PAIRING_CODE_TTL_MIN}m)"
         );
 
         Ok(PairingCode {
             code,
             expires_at: expires.to_rfc3339(),
+            profile_id: profile_id.map(str::to_string),
         })
     }
 
     async fn current_pairing_code(&self) -> Result<Option<PairingCode>> {
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT code_hash, expires_at FROM pairing_codes
+        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT code_hash, expires_at, profile_id FROM pairing_codes
              WHERE consumed_at IS NULL AND expires_at > ?
              ORDER BY created_at DESC LIMIT 1",
         )
         .bind(Utc::now().to_rfc3339())
         .fetch_optional(&self.pool)
         .await?;
-        let Some((hash, expires_at)) = row else {
+        let Some((hash, expires_at, profile_id)) = row else {
             return Ok(None);
         };
         let cache = ISSUED_CODE_CACHE.read().await;
         Ok(cache.get(&hash).map(|code| PairingCode {
             code: code.clone(),
             expires_at,
+            profile_id: profile_id.clone(),
         }))
     }
 }
