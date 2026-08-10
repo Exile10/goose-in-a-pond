@@ -34,6 +34,18 @@
 //!
 //! A widening default reached by ordering is still a widening default, and it is
 //! invisible to any test that only checks the calls are present.
+//!
+//! # What the unification half added
+//!
+//! Both handlers now fold engine events through one `TurnAccumulator::absorb`
+//! rather than each carrying its own exhaustive match. That is guarded here as
+//! an ABSENCE -- no handler matches `AgentStreamEvent` itself -- because the
+//! defect it prevents is a new variant being written into one copy and not the
+//! other. The frames that come out of the translator are guarded behaviourally,
+//! in `routes.rs`'s own test module, where real `AgentStreamEvent` values go in
+//! and the JSON a browser receives comes out. Neither test is worth much without
+//! the other: this one proves there is a single answer, that one proves the
+//! answer is right.
 
 const ROUTES: &str = include_str!("../src/routes.rs");
 
@@ -48,6 +60,43 @@ const ROUTES: &str = include_str!("../src/routes.rs");
 const CHAT: &str = "chat_stream_inner";
 const AGENT: &str = "agent_chat_stream";
 
+/// The one function that turns an engine event into an SSE frame.
+///
+/// It is a method on `TurnAccumulator`, so it is indented -- the slicer looks
+/// for the signature anywhere, and its region runs to the next top-level item,
+/// which is the rest of the `impl`. That is the region the assertions want:
+/// "the match, and nothing else in this file".
+const TRANSLATOR: &str = "absorb";
+
+/// `routes.rs` with its test module removed.
+///
+/// Every count below has to be over production code. The unit tests for the
+/// translator construct `AgentStreamEvent` values by the dozen, and a guard that
+/// counted those would report a second match on the day somebody wrote a test
+/// for the first one.
+fn production() -> &'static str {
+    let code = ROUTES
+        .split_once("#[cfg(test)]")
+        .map(|(before, _)| before)
+        .unwrap_or_else(|| panic!("routes.rs has no test module -- did the file move?"));
+    // Vacuity control for the split itself. A `#[cfg(test)]` added ABOVE the
+    // handlers would shrink this to a preamble, and every `assert!(!contains)`
+    // below would pass for the wrong reason.
+    for needle in [
+        "fn chat_stream_inner(",
+        "async fn agent_chat_stream(",
+        "fn absorb(",
+    ] {
+        assert!(
+            code.contains(needle),
+            "the production slice of routes.rs no longer contains `{needle}` -- \
+             a `#[cfg(test)]` item now sits above it, so this file is measuring \
+             a preamble and its absence assertions mean nothing"
+        );
+    }
+    code
+}
+
 /// The body of one function, from its signature to the start of the next
 /// top-level item.
 ///
@@ -55,11 +104,12 @@ const AGENT: &str = "agent_chat_stream";
 /// silently finds nothing turns every assertion below into a vacuous pass, which
 /// is the failure shape this file exists to avoid.
 fn handler_body(name: &str) -> &'static str {
+    let src = production();
     let (sig, start) = [format!("async fn {name}("), format!("fn {name}(")]
         .into_iter()
-        .find_map(|sig| ROUTES.find(&sig).map(|at| (sig, at)))
+        .find_map(|sig| src.find(&sig).map(|at| (sig, at)))
         .unwrap_or_else(|| panic!("{name} is gone from routes.rs -- this guard needs rewriting"));
-    let rest = &ROUTES[start + sig.len()..];
+    let rest = &src[start + sig.len()..];
     // The next top-level `async fn` / `fn` at column zero ends the body.
     let end = rest
         .find("\nasync fn ")
@@ -69,6 +119,22 @@ fn handler_body(name: &str) -> &'static str {
         .min()
         .unwrap_or(rest.len());
     &rest[..end]
+}
+
+/// Line comments removed, so that a count below is a count of CODE.
+///
+/// Rule one of this programme's vacuous-test list is a guard satisfied by
+/// comment prose. Without this, ten `// AgentStreamEvent::Whatever` lines in the
+/// translator would clear its vacuity floor with no match present at all, and a
+/// single one in a handler would fail this file for a comment.
+fn strip_line_comments(src: &str) -> String {
+    src.lines()
+        .map(|l| match l.find("//") {
+            Some(at) => &l[..at],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn position(body: &str, needle: &str, handler: &str) -> usize {
@@ -160,6 +226,67 @@ fn agent_chat_stream_knows_who_is_speaking_before_it_builds_the_service() {
     assert!(
         scoped > built,
         "with_profile_scope is not applied to the constructed service"
+    );
+}
+
+/// The match on `AgentStreamEvent` lives in EXACTLY ONE place.
+///
+/// This is the property the unification half of P7 bought, and the only thing
+/// that keeps it: two exhaustive matches over an enum that is still growing is a
+/// standing promise to write every new variant twice. PAI-6 P6 adds one. When
+/// the second copy exists, the cheap thing to do is write the arm into whichever
+/// handler you were looking at -- which is how these two came to disagree about
+/// tool timing, and how `/agent/chat/stream` came to stream reasoning it never
+/// offered to its `ChatService`.
+///
+/// Deliberately phrased as "none outside" rather than "ten inside": a guard
+/// naming today's variants cannot see the one added tomorrow, which is the
+/// assertion-window failure this programme keeps re-learning.
+#[test]
+fn the_engine_event_match_lives_in_exactly_one_place() {
+    let translator = strip_line_comments(handler_body(TRANSLATOR));
+    let inside = translator.matches("AgentStreamEvent::").count();
+
+    // Vacuity control. If the slicer or the name rots, `inside` is 0, every
+    // "not in the handler" assertion below still passes, and this file starts
+    // reporting that a match nobody can find has not been duplicated.
+    assert!(
+        inside >= 10,
+        "`{TRANSLATOR}` matches only {inside} `AgentStreamEvent::` variants. The \
+         enum has at least ten, so either this guard is pointing at the wrong \
+         function or the translator has stopped being the translator -- and \
+         every other assertion in this test is now vacuous"
+    );
+    assert!(
+        translator.len() > 1_000 && translator.len() < ROUTES.len() / 4,
+        "`{TRANSLATOR}` sliced to {} bytes of a {}-byte file, which is not the \
+         shape of one function",
+        translator.len(),
+        ROUTES.len()
+    );
+
+    for handler in [CHAT, AGENT] {
+        let body = strip_line_comments(handler_body(handler));
+        assert!(
+            !body.contains("AgentStreamEvent::"),
+            "{handler} matches engine events itself instead of folding them \
+             through `{TRANSLATOR}`. Two copies of the match is what PAI-5 P7 \
+             removed: the next variant gets written into one of them, the other \
+             silently drops it, and the two routes answer the same engine \
+             differently"
+        );
+    }
+
+    // And nowhere else in the file either -- a third stream path would drift
+    // from both.
+    let everywhere = strip_line_comments(production())
+        .matches("AgentStreamEvent::")
+        .count();
+    assert_eq!(
+        everywhere, inside,
+        "routes.rs matches `AgentStreamEvent::` in {everywhere} places but only \
+         {inside} of them are in `{TRANSLATOR}`. Every frame shape belongs to \
+         one function so that a new variant is written once"
     );
 }
 
