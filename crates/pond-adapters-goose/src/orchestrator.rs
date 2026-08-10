@@ -53,6 +53,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use pond_core::mcp::domain::tool_group::TOOL_NAME_SEPARATOR;
+use pond_core::shared::domain::agent::{AgentStreamEvent, SubagentStatus};
 use pond_core::shared::domain::orchestration::{
     max_concurrent_subagents, TaskRun, TaskSpec, TaskStatus, REMOTE_SUBAGENT_CONCURRENCY,
 };
@@ -464,6 +465,328 @@ pub async fn claim_device_for_turn(
         _hold: hold,
         _permit: permit,
     })
+}
+
+// ── The progress channel (PAI-6 P6) ─────────────────────────────────────────
+
+/// One thing a live delegation did, on its way to its parent's chat stream.
+///
+/// The adapter-side twin of
+/// [`AgentStreamEvent::SubagentProgress`](pond_core::shared::domain::agent::AgentStreamEvent::SubagentProgress),
+/// carrying the same four fields plus the routing key. It exists as its own
+/// type because the bus has to know which parent a frame is for and the stream
+/// event deliberately does not: a client is told about the delegation it is
+/// watching, never which session it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildProgress {
+    /// The GIAP session id of the parent turn that authorised the run. This is
+    /// `TaskSpec::parent_session_id`, which is what `DeviceLedger` and
+    /// `TurnAuthorityRegistry::parent_turn_token` already key on.
+    pub parent_session_id: String,
+    pub task_id: String,
+    pub role: String,
+    pub status: SubagentStatus,
+    /// A tool NAME, or a reason GIAP itself wrote. **Never the child's own
+    /// words** — see [`child_tool_names`], which is the only producer of the
+    /// tool-name case and cannot express anything else.
+    pub detail: Option<String>,
+}
+
+impl From<ChildProgress> for AgentStreamEvent {
+    fn from(progress: ChildProgress) -> Self {
+        AgentStreamEvent::SubagentProgress {
+            task_id: progress.task_id,
+            role: progress.role,
+            status: progress.status,
+            detail: progress.detail,
+        }
+    }
+}
+
+/// Where a progress frame crosses from a child's loop to its parent's stream.
+///
+/// # The problem this solves, which is the whole of P6
+///
+/// A synchronous delegation runs INSIDE its parent's turn. The parent is parked
+/// on `goose_stream.next().await`; underneath that await, Goose is dispatching
+/// the `delegate` tool call, which is running the child to completion. So the
+/// parent's stream yields nothing at all between the tool call and its result —
+/// minutes, on-device — and a frame produced in the child's loop has no path to
+/// it. It needs a side channel that the parent's drain also selects on.
+///
+/// # What was chosen, and what was rejected
+///
+/// An unbounded `mpsc` per live turn, held in a process-wide map keyed by the
+/// parent's GIAP session id, with the parent's drain doing a `biased` select on
+/// the receiver first and the engine second. Unbounded because the alternative
+/// is a bounded channel whose `send` can block, and the sender here is the child
+/// loop running underneath the parent's own poll — a full channel would deadlock
+/// the very future that drains it. The volume is bounded anyway: a frame per
+/// lifecycle transition plus one per tool call, against a role capped at twelve
+/// turns.
+///
+/// Rejected, in order of how tempting they were:
+///
+/// - **`SubagentRunParams::on_message` / `notification_tx`.** What section 3.7
+///   of the PAI-6 document told five previous attempts to use. Both are fields
+///   of the parameter struct of `run_subagent_task`, which lives behind
+///   `pub(crate) mod subagent_handler` and which P2 deliberately does not call.
+///   Worse, `notification_tx` is also a live GIAP symbol — the broadcast behind
+///   `GET /notifications/stream` in `main.rs` — so grepping the name finds a
+///   real channel that has nothing to do with this.
+/// - **A `tokio::sync::broadcast` instead of per-turn `mpsc`.** One channel
+///   every turn subscribes to means every frame reaches every live stream and
+///   each one filters by session. A filter is a thing that can be got wrong;
+///   this programme's rule is that access narrows on failure, and a missing
+///   filter would show one household member's delegation inside another's chat.
+///   Routing at the map, so a frame is only ever *handed to* one subscriber, is
+///   the narrower failure.
+/// - **Threading a `Sender` down through `TaskSpec` and `ChildPlan`.** The spec
+///   is `pond-core`'s authorisation artifact, built by
+///   `DelegationAuthority::delegate`, and putting a transport handle on it would
+///   both invert the dependency and hand every future producer of a spec a
+///   channel to fill in. The plan is the security artifact and is asserted on
+///   whole by the tests; a non-comparable field on it costs those assertions.
+/// - **Keying on the engine (Goose) session id instead.** It is the better key
+///   for an *authorisation* question, which is why `TurnAuthorityRegistry` uses
+///   it, but a `TaskSpec` carries the GIAP id and the mapping is 1:1
+///   (`engine_session_map.session_id` is the primary key). A second lookup would
+///   buy nothing and add a way for the two to disagree.
+///
+/// # What the key does NOT protect against
+///
+/// Two concurrent turns of the SAME GIAP session. The newest subscriber wins
+/// and the older turn's children lose their frames — frames, not results. That
+/// is the same coarseness `DeviceLedger` and `parent_turn_token` already have,
+/// and it stays inside one session, so it can never cross the profile boundary
+/// PAI-1 draws. It is a lost frame, never a misdelivered one.
+#[derive(Default)]
+pub struct ProgressBus {
+    subscribers: Mutex<HashMap<String, Subscriber>>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+/// One live parent turn's end of the channel.
+struct Subscriber {
+    /// Identity, so a lease that drops AFTER a newer turn subscribed removes
+    /// its own entry and not the newer one's.
+    id: u64,
+    tx: tokio::sync::mpsc::UnboundedSender<ChildProgress>,
+}
+
+/// The one bus on this pond.
+///
+/// Process-wide and not a constructor argument, for the reason recorded on
+/// [`process_subagent_permits`]: an orchestrator built per request would
+/// otherwise publish into a bus nobody is listening to, which is a feature that
+/// silently does nothing — this programme's signature failure.
+pub fn process_progress_bus() -> Arc<ProgressBus> {
+    static BUS: OnceLock<Arc<ProgressBus>> = OnceLock::new();
+    BUS.get_or_init(|| Arc::new(ProgressBus::default())).clone()
+}
+
+impl ProgressBus {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Subscriber>> {
+        self.subscribers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Listen for the delegations of `giap_session_id` until the returned
+    /// stream is dropped.
+    pub fn subscribe(self: &Arc<Self>, giap_session_id: &str) -> ProgressStream {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.lock().insert(
+            giap_session_id.to_string(),
+            Subscriber { id, tx: tx.clone() },
+        );
+        ProgressStream {
+            rx,
+            _keepalive: tx,
+            bus: Arc::downgrade(self),
+            session_id: giap_session_id.to_string(),
+            id,
+        }
+    }
+
+    /// Hand a frame to the live turn it belongs to, or drop it.
+    ///
+    /// Dropping is the ordinary case, not an error: a delegation started by the
+    /// CLI, by a recipe run, or by a client that hung up mid-turn has no stream
+    /// to reach. It is deliberately silent — a `warn!` per frame would fill the
+    /// log of every headless delegation.
+    pub fn publish(&self, frame: ChildProgress) {
+        if let Some(subscriber) = self.lock().get(&frame.parent_session_id) {
+            let _ = subscriber.tx.send(frame);
+        }
+    }
+
+    /// Live subscribers. Diagnostics and tests only.
+    pub fn subscribers(&self) -> usize {
+        self.lock().len()
+    }
+}
+
+/// A parent turn's end of the progress channel.
+///
+/// Holds a sender of its own, which is not redundancy: with only the bus's copy,
+/// a turn whose entry had been replaced would see its channel close, and
+/// `recv()` on a closed empty channel is **ready forever**. In the `biased`
+/// select below that starves the engine branch completely — the turn would stop
+/// streaming and never finish. Keeping a sender here means the channel can never
+/// close while this stream lives, so an empty channel is always `Pending`.
+pub struct ProgressStream {
+    rx: tokio::sync::mpsc::UnboundedReceiver<ChildProgress>,
+    _keepalive: tokio::sync::mpsc::UnboundedSender<ChildProgress>,
+    bus: std::sync::Weak<ProgressBus>,
+    session_id: String,
+    id: u64,
+}
+
+impl ProgressStream {
+    /// The next frame, waiting forever if there is none.
+    ///
+    /// Never returns — by design, because it is only ever awaited inside a
+    /// `select!` against something that does. Cancel-safe:
+    /// `UnboundedReceiver::recv` is, so losing the race costs nothing.
+    pub async fn next(&mut self) -> ChildProgress {
+        match self.rx.recv().await {
+            Some(frame) => frame,
+            // Unreachable while `_keepalive` is held. If it ever became
+            // reachable, hanging is the safe answer and spinning is not: this
+            // future is polled first in a biased select, so a ready `None`
+            // would starve the engine branch.
+            None => std::future::pending().await,
+        }
+    }
+}
+
+impl Drop for ProgressStream {
+    fn drop(&mut self) {
+        if let Some(bus) = self.bus.upgrade() {
+            let mut subscribers = bus.lock();
+            // Only if it is still OURS. A turn that ended after a newer turn of
+            // the same session subscribed must not take the newer one's channel
+            // with it.
+            if subscribers
+                .get(&self.session_id)
+                .is_some_and(|current| current.id == self.id)
+            {
+                subscribers.remove(&self.session_id);
+            }
+        }
+    }
+}
+
+/// What a parent's drain loop got when it asked for the next thing to happen.
+#[derive(Debug)]
+pub enum ParentStep<T> {
+    /// A child said something. Yield it and go round again — it is not an
+    /// engine event and must not be folded into the turn.
+    Progress(ChildProgress),
+    /// The engine produced an event.
+    Engine(T),
+    /// The engine's stream ended.
+    EngineEnded,
+}
+
+/// Await whichever comes first: a progress frame, or the engine's next event.
+///
+/// # Why neither side starves
+///
+/// `biased` puts progress first, and that reads like a starvation hazard until
+/// you ask where a frame comes from. A synchronous child runs *inside* the
+/// engine future — its loop is only polled when `engine.next()` is polled — so a
+/// frame cannot exist unless the engine branch has run, and each poll of it can
+/// produce only the finitely many frames the child emits before its own next
+/// await. The bias therefore drains what the last engine poll produced and hands
+/// control straight back. Without the bias, a frame could sit in the queue while
+/// the engine yields event after event, which is exactly the "no news for
+/// minutes" this phase exists to remove.
+///
+/// # Cancel-safety, which this depends on
+///
+/// Losing the race drops the `Next` future, not the stream: `StreamExt::next`
+/// borrows, and an `async_stream` generator's state lives in the stream itself,
+/// so nothing in flight is lost and the next poll resumes it. The same is true
+/// of `UnboundedReceiver::recv`. `an_engine_item_survives_a_progress_frame`
+/// pins it rather than trusting the argument.
+pub async fn next_parent_step<S>(
+    engine: &mut S,
+    progress: &mut ProgressStream,
+) -> ParentStep<S::Item>
+where
+    S: futures::Stream + Unpin,
+{
+    tokio::select! {
+        biased;
+        frame = progress.next() => ParentStep::Progress(frame),
+        item = futures::StreamExt::next(engine) => match item {
+            Some(item) => ParentStep::Engine(item),
+            None => ParentStep::EngineEnded,
+        },
+    }
+}
+
+/// Publish one frame about a live delegation, if anybody is listening.
+///
+/// The one entry point, so that every producer spells the routing key the same
+/// way and there is one place to look for what a child is allowed to say.
+pub fn report_child_progress(
+    parent_session_id: &str,
+    task_id: &str,
+    role: &str,
+    status: SubagentStatus,
+    detail: Option<String>,
+) {
+    process_progress_bus().publish(ChildProgress {
+        parent_session_id: parent_session_id.to_string(),
+        task_id: task_id.to_string(),
+        role: role.to_string(),
+        status,
+        detail,
+    });
+}
+
+/// The tool names in one of a child's messages, and NOTHING else from it.
+///
+/// # This is PAI-5's reasoning gate, re-applied
+///
+/// The drain loop reduces a child's messages with `as_concat_text()`, which
+/// filters on `as_text()` and therefore returns `None` for
+/// `MessageContent::Thinking`. That is not incidental: PAI-5 P1 gates reasoning
+/// ONCE, at the `GooseAdapter` producer, on `show_thinking && !voice_mode`, and
+/// **a child does not go through that producer**. `as_concat_text()` is what has
+/// been standing in for the gate on this path.
+///
+/// P6 has to read `msg.content` directly to see a `ToolRequest`, which loses
+/// that protection. It is replaced here rather than inherited, and structurally
+/// rather than by a check somebody has to remember: this function's return type
+/// is a list of tool NAMES, so there is no value it could return that carries a
+/// child's reasoning, its answer text, or a tool call's ARGUMENTS — which on
+/// this pond can be a household memory query or the state of a device (PAI-2
+/// minimisation). Nothing else in the loop touches `msg.content`.
+///
+/// `a_progress_frame_carries_the_tool_name_and_nothing_else` drives it with a
+/// message holding all four kinds of content at once.
+///
+/// A tool the child asked for in a way Goose could not parse (`tool_call` is
+/// `Err`) is skipped: there is no name to report, and inventing one would put a
+/// model's malformed output on the wire as though it were a call.
+pub fn child_tool_names(msg: &goose::conversation::message::Message) -> Vec<String> {
+    use goose::conversation::message::MessageContent;
+    msg.content
+        .iter()
+        .filter_map(|content| match content {
+            MessageContent::ToolRequest(request) => request
+                .tool_call
+                .as_ref()
+                .ok()
+                .map(|call| call.name.to_string()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Split a tool name the way Goose's `list_tools` reports it into
@@ -1157,6 +1480,22 @@ impl Orchestrator for GooseOrchestrator {
         run.status = TaskStatus::Queued;
         self.with_registry(|registry| registry.insert(run.clone(), cancel.clone()));
 
+        // PAI-6 P6. The first frame the parent's stream can draw a node from,
+        // and it is emitted BEFORE the permit is acquired on purpose: on-device
+        // that acquisition is where a second delegation from the same turn
+        // spends its time, and a child that is queueing is the state most in
+        // need of saying so. Every frame in this method is derived from the
+        // registry's own status, so a run that reaches a state the stream never
+        // hears about is a missing `report_child_progress` next to a
+        // `registry` call rather than a second lifecycle to keep in step.
+        report_child_progress(
+            spec.parent_session_id(),
+            &run.id,
+            &run.role,
+            SubagentStatus::Queued,
+            None,
+        );
+
         // Invariant 3, on the only path that can start a child. The permit is
         // acquired BEFORE the engine is touched and held until the run ends, so
         // there is no window in which two on-device children are both replying.
@@ -1200,6 +1539,13 @@ impl Orchestrator for GooseOrchestrator {
             });
             run.status = TaskStatus::Cancelled;
             run.finished_at = Some(chrono::Utc::now());
+            report_child_progress(
+                spec.parent_session_id(),
+                &run.id,
+                &run.role,
+                SubagentStatus::Cancelled,
+                None,
+            );
             return Ok(run);
         };
 
@@ -1207,6 +1553,13 @@ impl Orchestrator for GooseOrchestrator {
         // moment the run stops waiting and starts.
         run.status = TaskStatus::Running;
         self.with_registry(|registry| registry.start(&run.id));
+        report_child_progress(
+            spec.parent_session_id(),
+            &run.id,
+            &run.role,
+            SubagentStatus::Running,
+            None,
+        );
 
         let max_turns = plan.max_turns;
         let outcome = self.runner.run(plan, cancel.clone()).await;
@@ -1267,6 +1620,17 @@ impl Orchestrator for GooseOrchestrator {
         self.with_registry(|registry| {
             registry.finish(&run.id, status, result.clone(), error.clone())
         });
+        // The terminal frame. `error` and not `result`: a run's error is a
+        // sentence GIAP wrote about a failure, and its result is the child's own
+        // answer — which reaches the parent as the `delegate` tool's result and
+        // has no business also arriving as a progress frame. PAI-6 invariant 4.
+        report_child_progress(
+            spec.parent_session_id(),
+            &run.id,
+            &run.role,
+            SubagentStatus::from(status),
+            error.clone(),
+        );
         run.status = status;
         run.result = result;
         run.error = error;
