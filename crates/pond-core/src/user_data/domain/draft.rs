@@ -43,6 +43,29 @@ pub struct Draft {
     pub status: DraftStatus,
     /// When the draft was created.
     pub created_at: DateTime<Utc>,
+    /// When this staged action stops being approvable. `None` means never,
+    /// which is every draft `save_draft` writes and every row that existed
+    /// before migration 0041.
+    ///
+    /// Added for PAI-7's proposals, which are draft rows with an expiry
+    /// (invariant 7: "an assistant that surfaces yesterday's suggestion has
+    /// failed twice"), but it is a property of a staged action rather than of a
+    /// proposal -- [`DraftStatus::Expired`] predates both. It lives here rather
+    /// than only on `Proposal` so the ONE decision path in `giap-draft` honours
+    /// it, without that path having to know what a proposal is.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+impl Draft {
+    /// Whether this draft may still be acted on, at `now`.
+    ///
+    /// A draft with no expiry is always live. Exclusive at the boundary: a
+    /// draft is dead at the instant it expires, matching `Proposal::is_live_at`
+    /// and the `datetime(expires_at) > datetime(?)` filter the repositories use.
+    pub fn is_live_at(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_none_or(|expiry| now < expiry)
+    }
 }
 
 /// Lifecycle status of a draft.
@@ -114,6 +137,7 @@ mod tests {
             payload: r#"{"command":"ls /tmp"}"#.to_string(),
             status: DraftStatus::Pending,
             created_at: chrono::Utc::now(),
+            expires_at: None,
         };
         let json = serde_json::to_string(&draft).unwrap();
         assert!(json.contains("shell_command"));
@@ -122,5 +146,40 @@ mod tests {
         let back: Draft = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, "draft_abc123");
         assert_eq!(back.status, DraftStatus::Pending);
+        assert_eq!(back.expires_at, None);
+    }
+
+    fn expiring(expires_at: Option<chrono::DateTime<chrono::Utc>>) -> Draft {
+        Draft {
+            id: "d1".to_string(),
+            session_id: "sess_1".to_string(),
+            profile_id: None,
+            identification_source: None,
+            kind: "proposal".to_string(),
+            summary: "remind me about the parcel".to_string(),
+            payload: "{}".to_string(),
+            status: DraftStatus::Pending,
+            created_at: chrono::Utc::now(),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn a_draft_without_an_expiry_is_always_live() {
+        let d = expiring(None);
+        assert!(d.is_live_at(chrono::Utc::now()));
+        assert!(d.is_live_at(chrono::DateTime::from_timestamp(4_000_000_000, 0).unwrap()));
+    }
+
+    #[test]
+    fn a_draft_is_dead_at_its_expiry_not_after_it() {
+        let expiry = chrono::DateTime::from_timestamp(1_785_000_000, 0).unwrap();
+        let d = expiring(Some(expiry));
+        assert!(d.is_live_at(expiry - chrono::Duration::seconds(1)));
+        assert!(
+            !d.is_live_at(expiry),
+            "exclusive at the boundary, matching the SQL filter"
+        );
+        assert!(!d.is_live_at(expiry + chrono::Duration::seconds(1)));
     }
 }

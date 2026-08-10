@@ -20,10 +20,11 @@ type DraftRow = (
     String,
     String,
     String,
+    Option<String>,
 );
 
 const DRAFT_COLUMNS: &str = "id, session_id, profile_id, identification_source, \
-     kind, summary, payload, status, created_at";
+     kind, summary, payload, status, created_at, expires_at";
 
 pub struct SqliteDraftRepository {
     pool: Pool<Sqlite>,
@@ -40,8 +41,8 @@ impl DraftRepository for SqliteDraftRepository {
     async fn save(&self, draft: Draft) -> Result<()> {
         sqlx::query(
             "INSERT INTO drafts (id, session_id, profile_id, identification_source, \
-             kind, summary, payload, status, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             kind, summary, payload, status, created_at, expires_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&draft.id)
         .bind(&draft.session_id)
@@ -52,14 +53,28 @@ impl DraftRepository for SqliteDraftRepository {
         .bind(&draft.payload)
         .bind(draft.status.to_string())
         .bind(draft.created_at.to_rfc3339())
+        // Seconds precision and a `Z` suffix, matching `sqlite_proposal.rs`:
+        // migration 0041's triggers compare this column with `datetime()`, so
+        // the two writers must agree on a spelling SQLite can parse.
+        .bind(
+            draft
+                .expires_at
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        )
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
     async fn list_pending(&self, session_id: &str) -> Result<Vec<Draft>> {
+        // The expiry half is PAI-7 invariant 7 on the shared read path: a
+        // staged action past its expiry is not listed, whether or not anything
+        // ever swept it. `datetime()` on both sides rather than a string
+        // compare, and it fails closed -- an unreadable expiry yields NULL,
+        // NULL is not true, so the row is treated as expired.
         let sql = format!(
             "SELECT {DRAFT_COLUMNS} FROM drafts WHERE session_id = ? AND status = 'pending' \
+             AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) \
              ORDER BY created_at DESC"
         );
         let rows: Vec<DraftRow> = sqlx::query_as(&sql)
@@ -108,6 +123,7 @@ fn row_to_draft(row: DraftRow) -> Result<Draft> {
         payload,
         status,
         created_at,
+        expires_at,
     ) = row;
     let status: DraftStatus = status
         .parse()
@@ -115,6 +131,15 @@ fn row_to_draft(row: DraftRow) -> Result<Draft> {
     let created_at = chrono::DateTime::parse_from_rfc3339(&created_at)
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .unwrap_or_else(|_| chrono::Utc::now());
+    // An unreadable expiry becomes the UNIX epoch, not `None`. `None` means
+    // "never expires", so degrading to it would turn a corrupt timestamp into
+    // an immortal staged action -- a widening default reached by a parse
+    // failure. The epoch is in the past, so the draft reads as expired.
+    let expires_at = expires_at.map(|raw| {
+        chrono::DateTime::parse_from_rfc3339(&raw)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::DateTime::UNIX_EPOCH)
+    });
 
     Ok(Draft {
         id,
@@ -130,6 +155,7 @@ fn row_to_draft(row: DraftRow) -> Result<Draft> {
         payload,
         status,
         created_at,
+        expires_at,
     })
 }
 
@@ -148,6 +174,7 @@ mod tests {
             payload: "{}".to_string(),
             status: DraftStatus::Pending,
             created_at: chrono::Utc::now(),
+            expires_at: None,
         }
     }
 
@@ -216,5 +243,72 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// PAI-7 invariant 7 on the shared read path. An expiry that only a sweeper
+    /// honours stops holding the day the sweeper fails to start, so `list_pending`
+    /// filters it in SQL. Nothing swept anything in this test.
+    #[tokio::test]
+    async fn an_expired_draft_is_not_listed_and_a_live_one_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Database::init(tmp.path()).await.unwrap();
+        let repo = SqliteDraftRepository::new(db.system.clone());
+
+        let mut stale = pending("stale", None);
+        stale.expires_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let mut fresh = pending("fresh", None);
+        fresh.expires_at = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+        let forever = pending("forever", None);
+        for d in [stale, fresh, forever] {
+            repo.save(d).await.unwrap();
+        }
+
+        let mut listed: Vec<String> = repo
+            .list_pending("20260805_1")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec!["forever".to_string(), "fresh".to_string()],
+            "an expired draft must not be listed; one with no expiry must be"
+        );
+
+        // The row is untouched -- the refusal came from the read filter, not
+        // from a status something had already changed.
+        let status: String = sqlx::query_scalar("SELECT status FROM drafts WHERE id = 'stale'")
+            .fetch_one(&db.system)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending");
+    }
+
+    /// A corrupt expiry must read as expired, never as "never expires".
+    /// `None` is the widening value here, so the parse failure must not degrade
+    /// to it.
+    #[tokio::test]
+    async fn an_unreadable_expiry_degrades_to_expired_not_to_immortal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::Database::init(tmp.path()).await.unwrap();
+        let repo = SqliteDraftRepository::new(db.system.clone());
+
+        repo.save(pending("d1", None)).await.unwrap();
+        sqlx::query("UPDATE drafts SET expires_at = 'not-a-time' WHERE id = 'd1'")
+            .execute(&db.system)
+            .await
+            .unwrap();
+
+        let back = repo.get("d1").await.unwrap().unwrap();
+        assert!(
+            !back.is_live_at(chrono::Utc::now()),
+            "an unreadable expiry must not become `None`, which means never expires"
+        );
+        assert!(
+            repo.list_pending("20260805_1").await.unwrap().is_empty(),
+            "SQLite cannot parse it either, so the SQL filter must exclude it too"
+        );
     }
 }

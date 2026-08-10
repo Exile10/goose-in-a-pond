@@ -163,6 +163,24 @@ impl DraftMcpServer {
         if draft.status != DraftStatus::Pending {
             return format!("Draft {draft_id} is not pending — it may have already been decided.");
         }
+        // PAI-7 invariant 7, on the one path that can authorise a staged action.
+        //
+        // Approval only. Rejecting an expired proposal must stay possible:
+        // section 3.5 writes rejections back as memories, and that is how "we
+        // never want to be told about this" becomes a learned constraint rather
+        // than a setting nobody finds.
+        //
+        // This is the legible layer, not the load-bearing one. It is a branch
+        // and a branch has a call site, so migration 0041 carries the same rule
+        // as a BEFORE UPDATE trigger that aborts the transition -- which is
+        // what still holds if this block is deleted, and what covers the
+        // repositories that know nothing about proposals.
+        if new_status == DraftStatus::Approved && !draft.is_live_at(chrono::Utc::now()) {
+            return format!(
+                "Draft {draft_id} has expired and can no longer be approved. Tell the user the \
+                 suggestion is stale, and offer to look at it fresh if it still matters."
+            );
+        }
 
         let mode = match &self.authority {
             Some(auth) => auth.policy_mode().await,
@@ -319,6 +337,10 @@ impl DraftMcpServer {
             payload,
             status: DraftStatus::Pending,
             created_at: chrono::Utc::now(),
+            // A draft the user is being asked to confirm in the same breath
+            // does not expire. Proposals do, and they are written by
+            // `SqliteProposalRepository`, not here.
+            expires_at: None,
         };
 
         match self.draft_repo.save(draft).await {
@@ -624,7 +646,20 @@ mod tests {
             payload: "{}".to_string(),
             status: DraftStatus::Pending,
             created_at: chrono::Utc::now(),
+            expires_at: None,
         }
+    }
+
+    /// A staged action with an expiry -- the shape PAI-7's proposals have.
+    fn expiring_draft(id: &str, session: &str, owner: Option<&str>, live: bool) -> Draft {
+        let mut d = pending_draft(id, session, owner);
+        d.kind = "proposal".to_string();
+        d.expires_at = Some(if live {
+            chrono::Utc::now() + chrono::Duration::hours(1)
+        } else {
+            chrono::Utc::now() - chrono::Duration::hours(1)
+        });
+        d
     }
 
     fn meta_for(session: &str) -> rmcp::model::Meta {
@@ -840,5 +875,98 @@ mod tests {
     fn extract_draft_id_returns_none_when_empty() {
         let id = extract_draft_id(&None, &None, &std::collections::HashMap::new());
         assert!(id.is_none());
+    }
+
+    // ── PAI-7 invariant 7 on the decision path ──────────────────────────────
+
+    /// The expiry refusal must not depend on the policy layer: it is a property
+    /// of the staged action, not of who is asking. Driven under the mode that
+    /// permits everything (`Off` short-circuits before the ownership gate) and
+    /// under the strictest one, with an owner who WOULD be allowed.
+    #[tokio::test]
+    async fn an_expired_draft_cannot_be_approved_in_any_policy_mode() {
+        for mode in [PolicyMode::Off, PolicyMode::Audit, PolicyMode::Enforce] {
+            let repo = Arc::new(StubDraftRepo::new());
+            repo.save(expiring_draft("d1", "sess-a", Some("liz"), false))
+                .await
+                .unwrap();
+            let auth = Arc::new(StubAuthority {
+                mode,
+                scope: Some(ProfileScope::Owner("liz".into())),
+                audited: Mutex::new(Vec::new()),
+            });
+            let server = DraftMcpServer::new(repo.clone())
+                .with_authority(Some(auth as Arc<dyn DraftAuthority>));
+
+            let text = server
+                .decide(&meta_for("sess-a"), "d1", DraftStatus::Approved)
+                .await;
+
+            assert!(
+                text.contains("expired"),
+                "mode {mode:?}: the refusal must name the defect, got: {text}"
+            );
+            assert_eq!(
+                repo.get("d1").await.unwrap().unwrap().status,
+                DraftStatus::Pending,
+                "mode {mode:?}: an expired draft must not reach `approved`"
+            );
+        }
+    }
+
+    /// The vacuity control for the test above: the same owner, the same modes
+    /// and a LIVE draft must approve. Without it, a `decide` that refused
+    /// everything would pass the expiry test.
+    #[tokio::test]
+    async fn a_live_draft_with_an_expiry_still_approves() {
+        for mode in [PolicyMode::Off, PolicyMode::Audit, PolicyMode::Enforce] {
+            let repo = Arc::new(StubDraftRepo::new());
+            repo.save(expiring_draft("d1", "sess-a", Some("liz"), true))
+                .await
+                .unwrap();
+            let auth = Arc::new(StubAuthority {
+                mode,
+                scope: Some(ProfileScope::Owner("liz".into())),
+                audited: Mutex::new(Vec::new()),
+            });
+            let server = DraftMcpServer::new(repo.clone())
+                .with_authority(Some(auth as Arc<dyn DraftAuthority>));
+
+            server
+                .decide(&meta_for("sess-a"), "d1", DraftStatus::Approved)
+                .await;
+            assert_eq!(
+                repo.get("d1").await.unwrap().unwrap().status,
+                DraftStatus::Approved,
+                "mode {mode:?}"
+            );
+        }
+    }
+
+    /// Rejecting an expired proposal must stay possible. PAI-7 section 3.5
+    /// turns a rejection into a memory, which is how "we never want to be told
+    /// about the garage door during the day" becomes a learned constraint. A
+    /// guard that blocked both verbs would silently delete that feedback.
+    #[tokio::test]
+    async fn an_expired_draft_can_still_be_rejected() {
+        let repo = Arc::new(StubDraftRepo::new());
+        repo.save(expiring_draft("d1", "sess-a", Some("liz"), false))
+            .await
+            .unwrap();
+        let auth = Arc::new(StubAuthority {
+            mode: PolicyMode::Enforce,
+            scope: Some(ProfileScope::Owner("liz".into())),
+            audited: Mutex::new(Vec::new()),
+        });
+        let server =
+            DraftMcpServer::new(repo.clone()).with_authority(Some(auth as Arc<dyn DraftAuthority>));
+
+        server
+            .decide(&meta_for("sess-a"), "d1", DraftStatus::Rejected)
+            .await;
+        assert_eq!(
+            repo.get("d1").await.unwrap().unwrap().status,
+            DraftStatus::Rejected
+        );
     }
 }
