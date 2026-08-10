@@ -101,9 +101,16 @@ mod tests {
     /// tick an hour and a spinning publisher.
     #[test]
     fn a_leap_second_never_yields_a_zero_wait() {
-        assert_eq!(secs_to_next_hour(59, 60), 1);
-        assert_eq!(secs_to_next_hour(60, 60), 1);
-        assert_eq!(secs_to_next_hour(u32::MAX, u32::MAX), 1);
+        for (minute, second) in [(59, 60), (60, 60), (u32::MAX, u32::MAX)] {
+            let wait = secs_to_next_hour(minute, second);
+            assert_ne!(
+                wait, 0,
+                "{minute}:{second} is past the end of the hour and produced a zero-length wait; \
+                 the publisher sleeps on this, so zero is not one tick early, it is a spin that \
+                 publishes an unbounded burst of ticks"
+            );
+            assert_eq!(wait, 1, "an out-of-range clock waits the one-second floor");
+        }
     }
 
     /// Every reachable wall-clock position lands inside `1..=3600`, and only

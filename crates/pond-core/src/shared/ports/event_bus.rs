@@ -296,7 +296,13 @@ mod tests {
         let event = session_event(SessionPhase::Started, Some("sess-42")).to_event();
         assert_eq!(event.category, EventCategory::Agent);
         assert_eq!(event.action, "session.lifecycle");
-        assert_eq!(event.privacy_sensitivity, PrivacySensitivity::Sensitive);
+        assert_eq!(
+            event.privacy_sensitivity,
+            PrivacySensitivity::Sensitive,
+            "when somebody is at the pond is behavioral data; classifying it below Sensitive \
+             lengthens its retention and exposes it to the audit MCP reads, which exclude \
+             sensitive rows"
+        );
         assert_eq!(event.session_id.as_deref(), Some("sess-42"));
         assert_eq!(
             event.attributes.get("phase"),
