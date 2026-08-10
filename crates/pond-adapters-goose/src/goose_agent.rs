@@ -3749,6 +3749,22 @@ impl GooseAdapter {
         let turn_provider = settings.chat_provider.clone();
         let device_session_id = session_id.clone();
 
+        // ── PAI-6 P6: where this turn hears about its own delegations ────────
+        //
+        // Subscribed HERE rather than inside the closure, and to the GIAP
+        // session id, which is what a `TaskSpec` names as its parent. The
+        // ordering matters in one direction only: a frame published before the
+        // subscription exists is dropped, and `spawn` cannot run before the
+        // stream does — it refuses any delegation whose parent turn is not
+        // published, and this turn publishes its authority two statements up.
+        //
+        // Moved into the closure beside the authority lease and the device
+        // claim, so it is dropped by whatever ends the turn, including the
+        // client hanging up. Its `Drop` takes the bus entry with it, so a child
+        // that outlives its parent's stream publishes into nothing rather than
+        // into a stale channel.
+        let mut progress = crate::orchestrator::process_progress_bus().subscribe(&session_id);
+
         let stream = async_stream::stream! {
             // Hold the guard — dropped when the stream is dropped → cancels token.
             let _guard = cancel_guard;
@@ -3845,7 +3861,36 @@ impl GooseAdapter {
                     }
                 };
 
-                while let Some(event_result) = goose_stream.next().await {
+                // Labelled, and the label is load-bearing: the guard
+                // `the_last_reasoning_block_of_a_turn_is_flushed_after_the_event_loop`
+                // finds this loop's closing brace to prove the trailing flush is
+                // outside it, and a bare `loop {` would match the `'attempts`
+                // loop above instead.
+                'engine: loop {
+                    // PAI-6 P6. Two things can happen next: the engine yields,
+                    // or a delegation running underneath this turn's `delegate`
+                    // tool call says something. The second has no other route
+                    // here — the child runs INSIDE the poll of `goose_stream`,
+                    // so between the tool call and its result this stream would
+                    // otherwise yield nothing at all for the whole of the
+                    // child's run. `next_parent_step` owns the select, the
+                    // bias, and the cancel-safety argument for both branches.
+                    let event_result = match crate::orchestrator::next_parent_step(
+                        &mut goose_stream,
+                        &mut progress,
+                    ).await {
+                        crate::orchestrator::ParentStep::Progress(frame) => {
+                            // Straight out, unabsorbed. It is not an engine
+                            // event: it never becomes text, a tool result, or
+                            // anything else this turn persists. PAI-6
+                            // invariant 4 — only the delegation's RESULT does,
+                            // and that arrives as the tool response below.
+                            yield Ok(frame.into());
+                            continue 'engine;
+                        }
+                        crate::orchestrator::ParentStep::EngineEnded => break 'engine,
+                        crate::orchestrator::ParentStep::Engine(event_result) => event_result,
+                    };
                     match event_result {
                         Ok(event) => match event {
                             goose::agents::AgentEvent::Message(msg) => {
@@ -4703,6 +4748,22 @@ impl GooseAdapter {
                         msg.role == rmcp::model::Role::Assistant,
                         &msg.as_concat_text(),
                     );
+                    // PAI-6 P6. The only other thing this loop takes from a
+                    // child's message, and the reason it is a call rather than
+                    // an inline `for content in &msg.content`: reading the
+                    // content list directly is what loses `as_concat_text()`'s
+                    // accidental reasoning gate, so the reading is done by a
+                    // function whose return type cannot carry reasoning, answer
+                    // text, or the call's ARGUMENTS. See `child_tool_names`.
+                    for tool in crate::orchestrator::child_tool_names(&msg) {
+                        crate::orchestrator::report_child_progress(
+                            &plan.parent_session_id,
+                            &plan.task_id,
+                            &plan.role,
+                            pond_core::shared::domain::agent::SubagentStatus::Tool,
+                            Some(tool),
+                        );
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -5717,8 +5778,14 @@ mod tests {
 
         let loop_start = code
             .iter()
-            .position(|l| l.contains("while let Some(event_result) = goose_stream.next().await {"))
-            .expect("the goose event loop is gone");
+            .position(|l| l.contains("'engine: loop {"))
+            .expect(
+                "the goose event loop is gone. PAI-6 P6 turned it from a `while let` \
+                 over `goose_stream.next()` into a labelled `loop` that selects the \
+                 engine against the subagent progress channel; the label is what this \
+                 guard anchors on, because a bare `loop {` matches the `'attempts` \
+                 loop above it",
+            );
         let indent = |l: &String| l.len() - l.trim_start().len();
         let loop_indent = indent(&code[loop_start]);
         let loop_end = (loop_start + 1..code.len())

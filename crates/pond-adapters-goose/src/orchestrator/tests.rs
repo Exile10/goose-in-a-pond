@@ -2461,3 +2461,473 @@ fn nothing_in_this_adapter_can_construct_a_delegation_depth() {
          home server"
     );
 }
+
+// ── PAI-6 P6: what a child may say, and how it reaches its parent ───────────
+
+/// A child's message contributes its TOOL NAMES to the parent's stream and
+/// nothing else whatsoever.
+///
+/// This is PAI-5's reasoning gate re-applied, and the reason it is a test rather
+/// than a comment. The child drain reduces messages with `as_concat_text()`,
+/// which drops `MessageContent::Thinking` — the accidental gate this path has
+/// been relying on, because PAI-5 P1 gates once at the `GooseAdapter` producer
+/// and a child does not go through it. P6 has to read `msg.content` directly to
+/// see a tool call, so the fixture below carries all three things a message can
+/// leak at once: reasoning, answer text, and a tool call whose ARGUMENTS are a
+/// household memory query (PAI-2 minimisation).
+///
+/// The assertions are on the WHOLE output, not on the tool name alone. A guard
+/// that only checked the name would stay green against a version that returned
+/// the name AND appended the reasoning, which is the natural shape of the
+/// regression — "while I am here, put the thinking in the detail".
+#[test]
+fn a_progress_frame_carries_the_tool_name_and_nothing_else() {
+    const REASONING: &str = "her blood-pressure medication is in the household memory";
+    const ANSWER: &str = "Let me look that up for you.";
+    const ARGUMENT: &str = "blood pressure medication";
+
+    let arguments: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&format!(r#"{{"query":"{ARGUMENT}"}}"#)).expect("fixture args parse");
+    let msg = goose::conversation::message::Message::assistant()
+        .with_thinking(REASONING, "")
+        .with_text(ANSWER)
+        .with_tool_request(
+            "call-1",
+            Ok(
+                rmcp::model::CallToolRequestParams::new("giap-memory__recall_memories".to_string())
+                    .with_arguments(arguments),
+            ),
+        );
+
+    let names = child_tool_names(&msg);
+
+    // The leak assertions come FIRST, and the ordering is the lesson: with the
+    // equality below in front of them, a version that returned the reasoning
+    // AND the name failed on a diff that says only "left != right", and the
+    // three assertions written to name the leak never ran. That mutation was
+    // applied and is what moved these lines.
+    let everything = names.join(" ");
+    for (what, leaked) in [
+        ("the child's REASONING", REASONING),
+        ("the child's answer TEXT", ANSWER),
+        ("the tool call's ARGUMENTS", ARGUMENT),
+    ] {
+        assert!(
+            !everything.contains(leaked),
+            "{what} reached the parent's stream. `as_concat_text()` is what used to \
+             stop this on the child path and reading `msg.content` gave it up; the \
+             replacement is that this function cannot express anything but a name"
+        );
+    }
+
+    assert_eq!(
+        names,
+        vec!["giap-memory__recall_memories".to_string()],
+        "the tool name is what a parent's stream is told a child is doing"
+    );
+}
+
+/// Vacuity control for the test above.
+///
+/// Its "nothing else" assertions all hold trivially against a function that
+/// returns an empty vector for every message, which is also what a broken
+/// `MessageContent` match arm would do. A message that is PURE reasoning must
+/// produce nothing, and one carrying a tool call must produce exactly one name —
+/// so emptiness is pinned as a real answer to one input rather than as the
+/// answer to all of them.
+#[test]
+fn a_message_with_no_tool_call_contributes_no_frame() {
+    let thinking_only = goose::conversation::message::Message::assistant()
+        .with_thinking("I should check the weather first", "");
+    assert!(
+        child_tool_names(&thinking_only).is_empty(),
+        "a reasoning-only message is not a tool call and must produce no frame"
+    );
+
+    let malformed = goose::conversation::message::Message::assistant().with_tool_request(
+        "call-2",
+        Err(rmcp::model::ErrorData::invalid_params(
+            "bad arguments",
+            None,
+        )),
+    );
+    assert!(
+        child_tool_names(&malformed).is_empty(),
+        "a tool call the engine could not parse has no name to report, and inventing \
+         one puts a model's malformed output on the wire as though it were a call"
+    );
+}
+
+/// A delegation tells the parent that authorised it where it has got to.
+///
+/// Driven through the real `spawn` against the fake runner, so the frames are
+/// the ones production emits and their `task_id` is the registry's own. The
+/// sequence matters as much as the contents: `Queued` has to arrive BEFORE the
+/// device permit is acquired, because on-device that acquisition is where a
+/// second delegation from the same turn spends its whole life, and a client with
+/// no `queued` node draws nothing for it.
+#[tokio::test]
+async fn a_delegation_reports_its_lifecycle_to_the_parent_that_authorised_it() {
+    let _serialised = ONE_RUN_AT_A_TIME.lock().await;
+    const PARENT: &str = "progress-lifecycle-parent";
+
+    let mut stream = process_progress_bus().subscribe(PARENT);
+
+    let runner = Arc::new(FakeRunner::new(env_with(
+        "ollama",
+        parent_tools(&[("giap-weather", &["get_forecast"])]),
+    )));
+    let (orchestrator, _lease, _token) = live_turn_for(PARENT, runner);
+    let role = role("researcher", &["giap-weather"]);
+    let run = orchestrator
+        .spawn(spec_for_parent(&role, &["giap-weather"], PARENT))
+        .await
+        .expect("the delegation runs");
+
+    let mut seen = Vec::new();
+    while let Ok(frame) = stream.rx.try_recv() {
+        seen.push(frame);
+    }
+
+    assert_eq!(
+        seen.iter()
+            .map(|frame| frame.status)
+            .collect::<Vec<SubagentStatus>>(),
+        vec![
+            SubagentStatus::Queued,
+            SubagentStatus::Running,
+            SubagentStatus::Completed,
+        ],
+        "the parent must hear the run queue, start and finish -- got {seen:?}"
+    );
+    for frame in &seen {
+        assert_eq!(
+            frame.task_id, run.id,
+            "every frame names the run it is about"
+        );
+        assert_eq!(frame.role, "researcher");
+        assert_eq!(frame.parent_session_id, PARENT);
+        assert_eq!(
+            frame.detail, None,
+            "a lifecycle frame carries no detail; the child's answer is the \
+             delegate tool's RESULT and reaches the parent through that"
+        );
+    }
+}
+
+/// A frame reaches the parent it belongs to and no other live turn.
+///
+/// The routing property, and the one whose failure would be visible to a person:
+/// two members of a household chatting at once, one of them delegating, and the
+/// other's screen growing a tree for a task they did not ask for. The second
+/// subscriber is the control — it proves the bus was live and the first
+/// assertion is not passing because nothing was published at all.
+#[tokio::test]
+async fn a_frame_reaches_only_the_parent_it_belongs_to() {
+    let _serialised = ONE_RUN_AT_A_TIME.lock().await;
+    const MINE: &str = "progress-routing-mine";
+    const THEIRS: &str = "progress-routing-theirs";
+
+    let mut mine = process_progress_bus().subscribe(MINE);
+    let mut theirs = process_progress_bus().subscribe(THEIRS);
+
+    let runner = Arc::new(FakeRunner::new(env_with(
+        "ollama",
+        parent_tools(&[("giap-weather", &["get_forecast"])]),
+    )));
+    let (orchestrator, _lease, _token) = live_turn_for(MINE, runner);
+    let role = role("researcher", &["giap-weather"]);
+    orchestrator
+        .spawn(spec_for_parent(&role, &["giap-weather"], MINE))
+        .await
+        .expect("the delegation runs");
+
+    assert!(
+        mine.rx.try_recv().is_ok(),
+        "the parent that authorised the delegation heard nothing about it"
+    );
+    assert!(
+        theirs.rx.try_recv().is_err(),
+        "another live turn was told about a delegation it did not authorise"
+    );
+}
+
+/// A turn that ends after a newer turn of the same session started must take its
+/// own channel with it and not the newer one's.
+///
+/// The map is keyed by session, so the second subscription replaces the first.
+/// The obvious `Drop` — "remove my session's entry" — then unsubscribes the LIVE
+/// turn as the stale one is dropped, and every delegation after that publishes
+/// into nothing. Silently, because publishing to nobody is the ordinary case for
+/// a CLI or recipe run and cannot be an error.
+#[tokio::test]
+async fn a_subscription_that_ends_takes_only_its_own_channel() {
+    const SESSION: &str = "progress-restamp-session";
+    let stale = process_progress_bus().subscribe(SESSION);
+    let mut live = process_progress_bus().subscribe(SESSION);
+    drop(stale);
+
+    report_child_progress(
+        SESSION,
+        "task-1",
+        "researcher",
+        SubagentStatus::Running,
+        None,
+    );
+
+    let frame = live
+        .rx
+        .try_recv()
+        .expect("the live turn's channel must survive the stale turn's Drop");
+    assert_eq!(frame.task_id, "task-1");
+
+    drop(live);
+    // And the live turn's own Drop really does unsubscribe, or the map grows
+    // for the lifetime of a home server that is never restarted.
+    report_child_progress(
+        SESSION,
+        "task-2",
+        "researcher",
+        SubagentStatus::Running,
+        None,
+    );
+    let mut after = process_progress_bus().subscribe(SESSION);
+    assert!(
+        after.rx.try_recv().is_err(),
+        "a frame published while nobody was subscribed was delivered to the next \
+         turn of that session, which would open a delegation tree it never asked for"
+    );
+}
+
+/// The parent's drain loses no engine event to a progress frame.
+///
+/// The cancel-safety half. Losing the select race drops a `Next` future, not the
+/// stream: `StreamExt::next` borrows, and an `async_stream` generator's state
+/// lives inside the stream itself, so the dropped poll resumes rather than
+/// restarts. If that were wrong, an engine event would vanish every time a frame
+/// arrived — and the fixture publishes from INSIDE the engine's own poll and
+/// then awaits, which is exactly what a real child does: it runs underneath that
+/// poll and its next step is provider I/O.
+///
+/// The ordering here is the good one and worth stating: with the engine parked,
+/// the frames it just produced are delivered immediately rather than waiting for
+/// its next event. That is the whole point of the phase — during a delegation
+/// the engine is parked for minutes.
+#[tokio::test]
+async fn an_engine_item_survives_a_progress_frame() {
+    const SESSION: &str = "progress-interleave-session";
+    let mut progress = process_progress_bus().subscribe(SESSION);
+
+    let engine = async_stream::stream! {
+        for item in 1..=3u32 {
+            for call in 0..2u32 {
+                report_child_progress(
+                    SESSION,
+                    &format!("task-{item}"),
+                    "researcher",
+                    SubagentStatus::Tool,
+                    Some(format!("tool-{item}-{call}")),
+                );
+            }
+            // The child's next await. The parent's `Next` future is dropped
+            // here, every time, and the item after it must still arrive.
+            tokio::task::yield_now().await;
+            yield item;
+        }
+    };
+    let mut engine = Box::pin(engine);
+
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        match next_parent_step(&mut engine, &mut progress).await {
+            ParentStep::Progress(frame) => {
+                seen.push(frame.detail.expect("a tool frame names its tool"))
+            }
+            ParentStep::Engine(item) => seen.push(format!("item-{item}")),
+            ParentStep::EngineEnded => break,
+        }
+    }
+
+    assert_eq!(
+        seen,
+        vec![
+            "tool-1-0", "tool-1-1", "item-1", "tool-2-0", "tool-2-1", "item-2", "tool-3-0",
+            "tool-3-1", "item-3",
+        ],
+        "every engine item and every frame must arrive; a missing item-N is the \
+         select dropping an in-flight poll, which is the cancel-safety this loop rests on"
+    );
+}
+
+/// A frame does not wait for the engine to run out of things to say.
+///
+/// The starvation half, and the reason `next_parent_step` is `biased` with
+/// progress FIRST. This engine never goes idle: every poll has an item ready, so
+/// an engine-first bias wins every race and the frames sit in the queue until
+/// the stream ends — at which point the drain breaks and they are never
+/// delivered at all. That is precisely the shipped behaviour this phase removes,
+/// a delegating turn that says nothing until the child has finished, and it is
+/// what the mutation reproduces: swapping the two branches leaves this
+/// assertion looking at three items and no tools.
+#[tokio::test]
+async fn a_frame_does_not_wait_for_the_engine_to_go_idle() {
+    const SESSION: &str = "progress-hot-engine-session";
+    let mut progress = process_progress_bus().subscribe(SESSION);
+
+    let engine = async_stream::stream! {
+        for item in 1..=3u32 {
+            report_child_progress(
+                SESSION,
+                &format!("task-{item}"),
+                "researcher",
+                SubagentStatus::Tool,
+                Some(format!("tool-{item}")),
+            );
+            yield item;
+        }
+    };
+    let mut engine = Box::pin(engine);
+
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        match next_parent_step(&mut engine, &mut progress).await {
+            ParentStep::Progress(frame) => {
+                seen.push(frame.detail.expect("a tool frame names its tool"))
+            }
+            ParentStep::Engine(item) => seen.push(format!("item-{item}")),
+            ParentStep::EngineEnded => break,
+        }
+    }
+
+    assert_eq!(
+        seen,
+        vec!["item-1", "tool-1", "item-2", "tool-2", "item-3", "tool-3"],
+        "a frame published while the engine still had events queued was not \
+         delivered within one event of being published"
+    );
+}
+
+/// The drain reads a child's message through [`child_tool_names`] and touches
+/// its content list nowhere else — PAI-6 P6.
+///
+/// This is the tripwire half of the reasoning gate, and it is deliberately an
+/// ABSENCE plus a call shape rather than a presence check. The regression that
+/// needs catching is not "somebody deleted the progress frame"; it is somebody
+/// writing `for content in &msg.content` in this loop to get at one more thing,
+/// because that is the line at which `MessageContent::Thinking` becomes
+/// reachable again. The unit test next door proves the producer cannot leak;
+/// this proves the loop still goes through the producer.
+#[test]
+fn the_child_drain_loop_reads_message_content_only_through_the_named_producer() {
+    let drain = child_drain_loop();
+
+    assert_eq!(
+        drain.matches("child_tool_names(").count(),
+        1,
+        "the child drain loop no longer takes its tool names from exactly one \
+         child_tool_names call:\n{drain}"
+    );
+    assert_eq!(
+        call_args(&drain, "child_tool_names(").trim(),
+        "&msg",
+        "child_tool_names is called with something other than the message the loop \
+         just received"
+    );
+    assert!(
+        !drain.contains("msg.content"),
+        "the drain loop reads a child message's content list directly again. \
+         `as_concat_text()` is what has been standing in for PAI-5's reasoning gate \
+         on this path -- the child path does not go through the GooseAdapter producer \
+         that gate lives at -- so a direct read is how a subagent's reasoning reaches \
+         the UI on an install with show_thinking OFF:\n{drain}"
+    );
+
+    let frame = call_args(&drain, "report_child_progress(");
+    for (what, expected) in [
+        ("the parent it belongs to", "plan.parent_session_id"),
+        ("the run it is about", "plan.task_id"),
+        ("the role to label it with", "plan.role"),
+        ("the status", "SubagentStatus::Tool"),
+    ] {
+        assert!(
+            frame.contains(expected),
+            "the drain's progress frame does not name {what} (`{expected}`). A frame \
+             keyed on anything but the parent's GIAP session id is published to a \
+             channel nobody is listening on, which is a feature that silently does \
+             nothing:\n{frame}"
+        );
+    }
+    assert!(
+        !frame.contains("as_concat_text") && !frame.contains("arguments"),
+        "the drain's progress frame carries the child's text or its tool call's \
+         arguments; `detail` is a tool NAME (PAI-2 minimisation):\n{frame}"
+    );
+}
+
+/// The live turn subscribes to its OWN delegations, and folds the two sources
+/// through the tested select — PAI-6 P6.
+///
+/// Two arguments and one absence, all of which are silent when wrong:
+///
+/// - The subscription key. A `TaskSpec` names the GIAP session id as its
+///   parent, so subscribing with the engine session id instead compiles, runs,
+///   and delivers nothing ever. That is this programme's signature failure —
+///   a mechanism that is correct and unreachable — and it has no symptom other
+///   than the spinner P6 exists to remove.
+/// - The select's operands. `next_parent_step` is what makes the engine's poll
+///   and the progress channel share a task without either starving; a drain
+///   that awaited `goose_stream.next()` on its own would park for the whole of
+///   a child's run again.
+/// - What the Progress arm must NOT do. It is not an engine event: folding it
+///   into `total_output_chars` corrupts the fallback usage estimate for the
+///   turn, and setting `produced_visible` would tell the empty-turn recovery
+///   that a turn which produced only a delegation frame had answered the user.
+#[test]
+fn the_live_turn_subscribes_to_its_own_delegations() {
+    let stream = chat_stream_source();
+
+    assert_eq!(
+        stream.matches("process_progress_bus().subscribe(").count(),
+        1,
+        "the live turn no longer subscribes exactly once to the progress bus"
+    );
+    assert_eq!(
+        call_args(&stream, "process_progress_bus().subscribe(").trim(),
+        "&session_id",
+        "the turn subscribes with something other than its GIAP session id, which is \
+         what a TaskSpec names as its parent -- so every frame is published to a key \
+         nobody is listening on"
+    );
+
+    let select = call_args(&stream, "next_parent_step(");
+    let engine = select
+        .find("&mut goose_stream")
+        .expect("the drain no longer selects over the engine's own stream");
+    let progress = select.find("&mut progress").expect(
+        "the drain no longer selects over the progress channel, so a frame \
+                 published during a delegation waits for the child to finish",
+    );
+    assert!(
+        engine < progress,
+        "next_parent_step takes the engine first and the progress channel second; \
+         swapped, this call does not type-check today and would silently reverse the \
+         two the day both are generic:\n{select}"
+    );
+
+    let arm = &stream[stream
+        .find("ParentStep::Progress(frame)")
+        .expect("the drain no longer handles a progress frame")..];
+    let arm = &arm[..arm.find("ParentStep::EngineEnded").unwrap_or(arm.len())];
+    assert!(
+        arm.contains("yield Ok(frame.into())"),
+        "a progress frame is no longer yielded straight to the client:\n{arm}"
+    );
+    for forbidden in ["total_output_chars", "produced_visible", "turn_stats"] {
+        assert!(
+            !arm.contains(forbidden),
+            "the progress arm touches `{forbidden}`. A frame about a CHILD is not this \
+             turn's output: it must not be counted as tokens the parent produced, nor \
+             make an otherwise-empty turn look answered:\n{arm}"
+        );
+    }
+}
