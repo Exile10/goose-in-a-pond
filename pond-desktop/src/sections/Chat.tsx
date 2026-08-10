@@ -16,6 +16,8 @@ import { CONTINUE_TURN_MESSAGE } from "../api/types";
 import type { ChatEvent, ContextWarning, ImageAttachment, ModelEntry, SessionMessage, SessionSummary, TurnStats } from "../api/types";
 import { TurnStatsFooter } from "../components/TurnStatsFooter";
 import { ContextPressureNote } from "../components/ContextPressureNote";
+import { SubagentTree, applySubagentProgress } from "../components/SubagentTree";
+import type { SubagentRun } from "../components/SubagentTree";
 import { filterThinking } from "../lib/thinkFilter";
 import { prepareImage, validateAttachmentSet } from "../lib/imageAttach";
 import type { PreparedImage } from "../lib/imageAttach";
@@ -65,6 +67,10 @@ interface Message {
   /** PAI-4 P7b. Set when the turn's `context_warning` frame said the window is
    *  filling — renders the pressure line and the "Compact now" control. */
   contextWarning?: ContextWarning;
+  /** PAI-6 P6. Delegations this turn started, folded from `subagent_progress`
+   *  frames. Rendered WHILE streaming, unlike every other note here: a tree
+   *  nobody sees until the turn ends is the spinner it replaces. */
+  delegations?: SubagentRun[];
   /** Image preview URLs — either a live send's local previewUrl, or a
    *  built `${apiBase}${url}` for images replayed from session history. */
   images?: string[];
@@ -509,6 +515,17 @@ export function Chat() {
           setMessages((prev) =>
             prev.map((m) => (m.id === agentMsg.id ? { ...m, turnLimit: limit } : m)),
           );
+        } else if (ev.type === "subagent_progress") {
+          // PAI-6 P6. Attach by id — same reasoning as turn_stats — and fold
+          // through the one shared reducer, so this surface and the hub cannot
+          // disagree about what a frame means.
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === agentMsg.id
+                ? { ...m, delegations: applySubagentProgress(m.delegations ?? [], ev) }
+                : m,
+            ),
+          );
         } else if (ev.type === "context_warning") {
           // PAI-4 P7b. The window is filling. Attach by id — same reasoning as
           // turn_stats and turn_limit_reached — so the note lands on this turn
@@ -665,6 +682,12 @@ export function Chat() {
                       {msg.thinkingBlocks.map((block, i) => <p key={i}>{block}</p>)}
                     </div>
                   </details>
+                )}
+                {/* Delegation tree. Deliberately NOT gated on `!msg.streaming`:
+                    the whole point is that a turn which is blocked inside a
+                    `delegate` tool call stops looking like a hung spinner. */}
+                {msg.role === "agent" && msg.delegations && msg.delegations.length > 0 && (
+                  <SubagentTree runs={msg.delegations} />
                 )}
                 {/* Bubble */}
                 <div className={`ch-bubble ${msg.role === "user" ? "ch-bubble--user" : `ch-bubble--goose${msg.error ? " ch-bubble--error" : ""}`}`}>
