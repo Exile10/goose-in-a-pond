@@ -217,6 +217,12 @@ impl Handshake for SqliteHandshakeAdapter {
             .await?;
         ISSUED_CODE_CACHE.write().await.remove(&matched);
 
+        // PAI-1: this path writes no `devices` row at all, so there is nothing
+        // to attribute and a legacy pair is always unattributed. That is the
+        // narrowing outcome and it is left alone deliberately -- registering a
+        // device here would be a behaviour change outside this rung. The wart
+        // worth knowing about is that a member-bound code consumed here is
+        // BURNED with its attribution discarded; the operator re-issues.
         let device_id = request.client_id.clone();
         let (session, refresh, expires) = self
             .issue_session_pair(&request.client_id, &request.client_type, &device_id)
@@ -603,6 +609,8 @@ fn verify_mac(key: &[u8], challenge: &[u8], client_id: &[u8], expected: &[u8]) -
 mod tests {
     use super::*;
     use crate::db::Database;
+    use crate::sqlite_device_attribution::SqliteDeviceAttribution;
+    use pond_core::user_data::ports::device_attribution::DeviceAttribution;
     use tempfile::tempdir;
 
     async fn fresh() -> SqliteHandshakeAdapter {
@@ -613,6 +621,45 @@ mod tests {
         // under the pool).
         std::mem::forget(tmp);
         adapter
+    }
+
+    /// As `fresh`, plus the pool and two household members, for the PAI-1
+    /// attribution tests below.
+    async fn fresh_with_household() -> (SqliteHandshakeAdapter, Pool<Sqlite>) {
+        let tmp = tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        for (id, name) in [("liz", "Liz"), ("jerry", "Jerry")] {
+            sqlx::query("INSERT INTO profiles (id, display_name) VALUES (?, ?)")
+                .bind(id)
+                .bind(name)
+                .execute(&db.system)
+                .await
+                .unwrap();
+        }
+        let adapter = SqliteHandshakeAdapter::new(db.system.clone());
+        std::mem::forget(tmp);
+        (adapter, db.system)
+    }
+
+    /// Run the two-phase pair for `client_id` against `code`, honestly: the
+    /// client only ever sees the plaintext code and the challenge, exactly as a
+    /// phone does.
+    async fn pair(hs: &SqliteHandshakeAdapter, code: &str, client_id: &str) -> HandshakeResponse {
+        let init = hs
+            .init_handshake(InitRequest {
+                client_id: client_id.into(),
+                client_type: "gotg".into(),
+                client_version: "1.0".into(),
+            })
+            .await
+            .unwrap();
+        hs.verify_handshake(VerifyRequest {
+            challenge_id: init.challenge_id,
+            mac: client_mac(code, &init.challenge, client_id),
+            device_name: Some(format!("{client_id} phone")),
+        })
+        .await
+        .unwrap()
     }
 
     fn client_mac(code: &str, challenge_b64: &str, client_id: &str) -> String {
@@ -1011,6 +1058,171 @@ mod tests {
         assert_eq!(
             replay.rejection_reason.as_deref(),
             Some("invalid_or_expired_refresh")
+        );
+    }
+
+    // ── PAI-1: the device-to-profile rung ─────────────────────────────────
+    //
+    // These go through the real two-phase flow rather than writing
+    // `devices.profile_id` by hand. `ProfileScope::Owner` was inert for a whole
+    // phase because every fixture that produced an owned row set the column
+    // directly and no production path did; a fixture production cannot produce
+    // tests a system that does not exist.
+
+    /// The whole rung, through the writers production uses: a code issued for
+    /// Liz pairs a phone that is Liz's, and that phone's push token is
+    /// reachable from her profile alone.
+    #[tokio::test]
+    async fn pairing_with_a_members_code_makes_the_device_theirs() {
+        let (hs, pool) = fresh_with_household().await;
+        let pc = hs.issue_pairing_code_for(Some("liz")).await.unwrap();
+        assert_eq!(pc.profile_id.as_deref(), Some("liz"));
+
+        assert!(pair(&hs, &pc.code, "device-liz").await.accepted);
+
+        let attribution = SqliteDeviceAttribution::new(pool);
+        assert_eq!(
+            attribution.device_profile("device-liz").await.unwrap(),
+            Some("liz".to_string()),
+            "the paired device must belong to the member the code was issued for"
+        );
+        assert_eq!(
+            attribution.devices_for_profile("liz").await.unwrap(),
+            vec!["device-liz".to_string()]
+        );
+        assert!(
+            attribution
+                .devices_for_profile("jerry")
+                .await
+                .unwrap()
+                .is_empty(),
+            "Liz's phone is not Jerry's"
+        );
+    }
+
+    /// The default, and what every shipped caller does today: an unattributed
+    /// code pairs an unattributed device. It works, it is registered, and it is
+    /// nobody's -- which is the truthful answer when nobody said who was
+    /// pairing.
+    #[tokio::test]
+    async fn pairing_with_an_ordinary_code_leaves_the_device_unattributed() {
+        let (hs, pool) = fresh_with_household().await;
+        let pc = hs.issue_pairing_code().await.unwrap();
+        assert_eq!(pc.profile_id, None);
+
+        assert!(pair(&hs, &pc.code, "tablet").await.accepted);
+
+        let attribution = SqliteDeviceAttribution::new(pool);
+        assert_eq!(attribution.device_profile("tablet").await.unwrap(), None);
+        assert!(attribution
+            .devices_for_profile("liz")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The security property this design exists for. `PairedDevice` outranks
+    /// every other rung of `identity_resolution::resolve`, so a device that
+    /// could name its own member would outrank every proof the pond can make.
+    /// The pairing client's body is deserialised with the extra field present
+    /// and the device still belongs to whoever the CODE named.
+    #[tokio::test]
+    async fn the_pairing_client_cannot_name_its_own_member() {
+        let (hs, pool) = fresh_with_household().await;
+        let pc = hs.issue_pairing_code_for(Some("liz")).await.unwrap();
+        let init = hs
+            .init_handshake(InitRequest {
+                client_id: "device-liz".into(),
+                client_type: "gotg".into(),
+                client_version: "1.0".into(),
+            })
+            .await
+            .unwrap();
+
+        // Exactly the JSON a client would post, with an impersonation attempt
+        // in it. If `VerifyRequest` ever grows a profile field and honours it,
+        // this stops deserialising into "ignored" and the assertion below flips.
+        let body = serde_json::json!({
+            "challenge_id": init.challenge_id,
+            "mac": client_mac(&pc.code, &init.challenge, "device-liz"),
+            "device_name": "Liz Phone",
+            "profile_id": "jerry",
+        });
+        let request: VerifyRequest = serde_json::from_value(body).unwrap();
+        assert!(hs.verify_handshake(request).await.unwrap().accepted);
+
+        let attribution = SqliteDeviceAttribution::new(pool);
+        assert_eq!(
+            attribution.device_profile("device-liz").await.unwrap(),
+            Some("liz".to_string()),
+            "the code decides the member; the pairing client does not"
+        );
+        assert!(
+            attribution
+                .devices_for_profile("jerry")
+                .await
+                .unwrap()
+                .is_empty(),
+            "a client that asked to be Jerry must not become Jerry"
+        );
+    }
+
+    /// Re-pairing a device id with an ordinary code releases the attribution
+    /// rather than inheriting it. `device_id` is the client's own self-reported
+    /// id, so inheriting would let whoever reuses it become the previous owner.
+    /// Losing an attribution is a narrowing and the operator can re-issue.
+    #[tokio::test]
+    async fn re_pairing_with_an_ordinary_code_releases_the_previous_member() {
+        let (hs, pool) = fresh_with_household().await;
+        let liz_code = hs.issue_pairing_code_for(Some("liz")).await.unwrap();
+        assert!(pair(&hs, &liz_code.code, "device-x").await.accepted);
+        let attribution = SqliteDeviceAttribution::new(pool.clone());
+        assert_eq!(
+            attribution.device_profile("device-x").await.unwrap(),
+            Some("liz".to_string())
+        );
+
+        let plain = hs.issue_pairing_code().await.unwrap();
+        assert!(pair(&hs, &plain.code, "device-x").await.accepted);
+        assert_eq!(
+            attribution.device_profile("device-x").await.unwrap(),
+            None,
+            "an unattributed re-pair must not inherit the previous member"
+        );
+    }
+
+    /// A code outstanding when its member is deleted degrades to an ordinary
+    /// code. It must not fail the deletion and must not pair a phone to a ghost.
+    #[tokio::test]
+    async fn deleting_a_member_releases_their_outstanding_pairing_code() {
+        let (hs, pool) = fresh_with_household().await;
+        let pc = hs.issue_pairing_code_for(Some("liz")).await.unwrap();
+
+        sqlx::query("DELETE FROM profiles WHERE id = 'liz'")
+            .execute(&pool)
+            .await
+            .expect("deleting a member with an outstanding code must succeed");
+
+        assert_eq!(
+            hs.current_pairing_code().await.unwrap().unwrap().profile_id,
+            None,
+            "the code survives the member, unattributed"
+        );
+        assert!(pair(&hs, &pc.code, "device-y").await.accepted);
+        let attribution = SqliteDeviceAttribution::new(pool);
+        assert_eq!(attribution.device_profile("device-y").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_code_cannot_be_issued_for_a_member_who_does_not_exist() {
+        let (hs, _pool) = fresh_with_household().await;
+        assert!(
+            hs.issue_pairing_code_for(Some("ghost")).await.is_err(),
+            "the foreign key must refuse an unknown member"
+        );
+        assert!(
+            hs.issue_pairing_code_for(Some("   ")).await.is_err(),
+            "a blank id is neither NULL nor a member"
         );
     }
 }
