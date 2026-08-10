@@ -730,18 +730,53 @@ only drives `/chat/stream` proves nothing about `/agent/chat/stream`.
   the branch IS reached today — 28 floored of 112 checked, 84 asserted — so the test is sound as it
   stands; what is missing is the control that pins it. The one line is
   `assert!(checked - floored > 50, ...)` in `turn_trimmer.rs`.
-- **P5** `giap-orchestrator` MCP extension + `ext_orchestrator_enabled`. The toggle needs its **own**
-  `default_*` fn returning `false` and a `false` in the `impl Default for Settings` body — reusing
-  `Settings::default_ext_enabled()` (which returns `true`) ships orchestration on for every install.
-  Add a `ToolGroup` catalog entry in the same change: nothing tests that registration and catalog
-  agree, and an uncatalogued extension is treated as a user-added MCP server that selection never
-  narrows, so the one extension that should be least present would become the one that can never be
-  selected away. Do **not** add it to `dispatcher.rs` or `DIRECT_DISPATCH_ALLOWLIST`; do add
-  `giap-orchestrator__delegate` to `MUST_NEVER_BE_DIRECTLY_DISPATCHABLE`. Update the extension
-  count in `CLAUDE.md` 15 → 16, **and fix the counting recipe there while you are in the file**:
-  `grep -c 'register_builtin_extension(' giap_registration.rs` returns 15 and the import line has
-  no open paren, so CLAUDE.md's "minus the import" yields 14 — the exact wrong number this
-  programme has recorded twice.
+- **P5 — LANDED 2026-08-10 (`c0f2bf2a`).** The `giap-orchestrator` extension, the `delegate` tool,
+  and `ext_orchestrator_enabled`.
+
+  **This is the phase that made the workstream real.** P1's authority, P2's child loop and P3's
+  turn-authority registry were all correct and all inert, because nothing called
+  `Orchestrator::spawn`. `crates/pond-mcp-server/src/orchestrator.rs` is the caller. It is handed the
+  CALLER's engine session id in `_meta` — stamped by the engine rather than chosen by the model,
+  because `inject_session_context_into_extensions` retains away any caller-supplied `agent-session-id`
+  and re-inserts its own — resolves it through `TurnAuthorityRegistry::authority_for_engine_session`,
+  and refuses when that answers `None`. **Four inputs produce `None`** — a session GIAP never chatted
+  in, a subagent's own session, a turn that has ended, and a call carrying no `_meta` at all — and all
+  four get the same refusal, deliberately, because a caller that could tell them apart would
+  eventually treat one of them as benign.
+
+  The toggle got its own `default_*` fn, as the bullet required. Reusing
+  `Settings::default_ext_enabled()` returns `true` and would have shipped delegation on for every
+  install, which is the widening default this programme treats as a bug rather than a preference. All
+  five persistence pieces are present or the completeness test would have failed the build.
+
+  **The catalog entry is worth more than the line it costs, and the reason is the one the bullet
+  gave**: `is_catalog_extension` treats an unknown name as a *user-added* MCP server, which selection
+  deliberately never narrows. A builtin the catalog does not carry therefore becomes the one
+  extension that can never be selected away, is never subtracted for a guest, and is never withheld
+  from a subagent — for `giap-orchestrator` that inverts the entire intent.
+  `crates/pond-core/tests/registration_matches_the_catalog.rs` now ties `CLAUDE.md`'s count, the
+  registration list and `TOOL_GROUPS` to each other and fails if any two disagree. **It lives in
+  `pond-core` rather than in the adapter** because CI runs `cargo test -p pond-core` and only
+  `cargo check`s `pond-adapters-goose`, and a guard CI never executes is a guard that fails for the
+  first time during a release.
+
+  `giap-orchestrator` is on `groups_denied_to_subagents` and `groups_denied_to_guests`. The depth cap
+  already refuses a child's delegation, so the first is belt and braces — but the second reason is the
+  real one: a tool a 2-4B model can see and cannot use costs turns off a budget of six discovering
+  that. `giap-orchestrator__delegate` is on `MUST_NEVER_BE_DIRECTLY_DISPATCHABLE`;
+  `DIRECT_DISPATCH_ALLOWLIST` is untouched.
+
+  `CLAUDE.md` is 16 now, and its counting recipe is fixed: it said to subtract the import, but the
+  import has no open paren so the grep never counted it, and the recipe yielded 14 — the exact wrong
+  number this programme had already recorded twice. The instruction now reads "do not subtract
+  anything".
+
+  **Recorded rather than hidden.** The desktop toggle has no test. Neither does any other extension
+  toggle, so the hole is pre-existing rather than one P5 dug — but the row is not trivial: it renders
+  `=== true` where the shared `EXT_TOOLS` map renders `!== false`, precisely so that a key the server
+  has not sent yet cannot read ON for the one module that defaults off. And both agents that wrote
+  this phase died mid-run on API errors, so the work was validated by the coordinator against the
+  gates rather than by its authors.
 - **P6** `SubagentProgress` streaming + desktop rendering. See section 3.7 for what the notification
   channel actually carries.
 - **P7** Per-role model assignment. **There is no `ModelRouter` and no `ModelRole` type** — start
