@@ -2769,6 +2769,14 @@ async fn an_engine_item_survives_a_progress_frame() {
 /// a delegating turn that says nothing until the child has finished, and it is
 /// what the mutation reproduces: swapping the two branches leaves this
 /// assertion looking at three items and no tools.
+///
+/// The fixture is deliberately a shape a SYNCHRONOUS delegation cannot produce
+/// — the engine is blocked awaiting the tool result for the whole of a child's
+/// run, so it never has an event ready while frames arrive. It is the shape P8's
+/// background tasks would make, and it is pinned now because the bias is written
+/// now. Said out loud because "a fixture production cannot produce" is on this
+/// programme's list of vacuous shapes: this one is not the guard's only case,
+/// its sibling above drives the real one.
 #[tokio::test]
 async fn a_frame_does_not_wait_for_the_engine_to_go_idle() {
     const SESSION: &str = "progress-hot-engine-session";
