@@ -780,6 +780,54 @@ mod tests {
 
     // ── The rest of the constructor ────────────────────────────────────────
 
+    /// `from_parts`'s first refusal, which had no guard: deleting the
+    /// `MissingId` block left all sixteen proposal tests green, so a blank id
+    /// would have reached the `drafts` table as a row whose PRIMARY KEY is the
+    /// empty string -- and the second such proposal would fail the INSERT with
+    /// a uniqueness error nobody could read.
+    ///
+    /// Quantified over the same blank spellings as the rationale sweep, because
+    /// `"  "` is what a trimmed-but-unvalidated field produces and `""` is what
+    /// a defaulted one does.
+    #[test]
+    fn a_proposal_without_an_id_is_refused_in_every_blank_shape() {
+        let now = Utc::now();
+        for blank in ["", " ", "\t", "\n  \n"] {
+            let err = Proposal::expiring_after(
+                blank,
+                trigger(),
+                "why",
+                action(),
+                audience(),
+                0.5,
+                now,
+                Duration::hours(1),
+            )
+            .expect_err(&format!(
+                "an id of {blank:?} must be refused: it becomes the PRIMARY KEY of the \
+                 drafts row, and an empty one is what a defaulted field produces"
+            ));
+            assert!(
+                matches!(err, ProposalError::MissingId),
+                "an id of {blank:?} must be refused as MissingId, got {err:?}"
+            );
+        }
+        // Vacuity control: the same call with a real id succeeds, so the four
+        // refusals above are about the id and not about the rest of the
+        // arguments this fixture supplies.
+        assert!(Proposal::expiring_after(
+            "prop-1",
+            trigger(),
+            "why",
+            action(),
+            audience(),
+            0.5,
+            now,
+            Duration::hours(1),
+        )
+        .is_ok());
+    }
+
     #[test]
     fn confidence_must_be_a_real_number_in_range() {
         let now = Utc::now();
