@@ -62,10 +62,9 @@ const AGENT: &str = "agent_chat_stream";
 
 /// The one function that turns an engine event into an SSE frame.
 ///
-/// It is a method on `TurnAccumulator`, so it is indented -- the slicer looks
-/// for the signature anywhere, and its region runs to the next top-level item,
-/// which is the rest of the `impl`. That is the region the assertions want:
-/// "the match, and nothing else in this file".
+/// It is a method on `TurnAccumulator`, so `handler_body` is the wrong slicer
+/// for it -- see [`method_body`], which exists because the wrong slicer let a
+/// mutation of this very constant pass.
 const TRANSLATOR: &str = "absorb";
 
 /// `routes.rs` with its test module removed.
@@ -118,6 +117,32 @@ fn handler_body(name: &str) -> &'static str {
         .chain(rest.find("\npub async fn "))
         .min()
         .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// The body of one INDENTED method, from its signature to its own closing
+/// brace.
+///
+/// `handler_body` cannot do this job, and finding out why is the reason this
+/// function exists. Its region ends at the next item at column zero, and a
+/// method sits inside an `impl` -- so pointing it at `tool_result_frame`, the
+/// top-level helper immediately above `TurnAccumulator`, returned a region that
+/// swallowed the whole `impl` and therefore the translator itself. The mutation
+/// "point the guard at the wrong function" passed with five green tests.
+///
+/// Ending at `\n    }` works because rustfmt puts an item's closing brace at its
+/// own indentation, which `egress_offline_routes.rs` leans on for the same
+/// reason. Applied to a top-level `fn` it stops at the first four-space brace
+/// INSIDE it, which is why the caller's size floor now catches that mutation
+/// twice over.
+fn method_body(name: &str) -> &'static str {
+    let src = production();
+    let sig = format!("fn {name}(");
+    let start = src
+        .find(&sig)
+        .unwrap_or_else(|| panic!("{name} is gone from routes.rs -- this guard needs rewriting"));
+    let rest = &src[start + sig.len()..];
+    let end = rest.find("\n    }").unwrap_or(rest.len());
     &rest[..end]
 }
 
@@ -244,7 +269,7 @@ fn agent_chat_stream_knows_who_is_speaking_before_it_builds_the_service() {
 /// assertion-window failure this programme keeps re-learning.
 #[test]
 fn the_engine_event_match_lives_in_exactly_one_place() {
-    let translator = strip_line_comments(handler_body(TRANSLATOR));
+    let translator = strip_line_comments(method_body(TRANSLATOR));
     let inside = translator.matches("AgentStreamEvent::").count();
 
     // Vacuity control. If the slicer or the name rots, `inside` is 0, every
@@ -258,9 +283,10 @@ fn the_engine_event_match_lives_in_exactly_one_place() {
          every other assertion in this test is now vacuous"
     );
     assert!(
-        translator.len() > 1_000 && translator.len() < ROUTES.len() / 4,
+        translator.len() > 1_000 && translator.len() < ROUTES.len() / 10,
         "`{TRANSLATOR}` sliced to {} bytes of a {}-byte file, which is not the \
-         shape of one function",
+         shape of one method. Too small and the slicer stopped early; too large \
+         and it ran past the end and is quoting somebody else's code as proof",
         translator.len(),
         ROUTES.len()
     );
