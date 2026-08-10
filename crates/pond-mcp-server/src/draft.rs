@@ -966,7 +966,9 @@ mod tests {
             .await;
         assert_eq!(
             repo.get("d1").await.unwrap().unwrap().status,
-            DraftStatus::Rejected
+            DraftStatus::Rejected,
+            "the expiry guard must apply to approval only: a rejection an expired \
+             proposal cannot receive is a memory PAI-7 3.5 never gets to write"
         );
     }
 }
