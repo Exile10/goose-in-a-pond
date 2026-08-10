@@ -216,6 +216,11 @@ Resolution order when a turn arrives:
    freshness window.
 4. **Unknown** → `Guest`.
 
+Rung 1's second hop — *device maps to a profile* — is `devices.profile_id`, added by P9 on
+2026-08-10 and read through the `DeviceAttribution` port. The first hop, bearer token → device, has
+always existed (`session_tokens.device_id`, and `Handshake::client_id_for_token` names the client).
+**Neither hop is wired into a turn yet**; see P9's stamp, and the test that fails when that changes.
+
 ### 3.3 `Principal` carries the profile
 
 `security/ports/policy.rs` — `Principal` gains `profile_id: Option<String>` and
@@ -344,6 +349,13 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   exists to prevent, and worse than admitting we do not know. Capturing a member at pairing time is
   its own change, and it is also what [PAI-7](./07-proactive-intelligence.md) needs before it can
   address a notification to "that profile's devices"; that document assumes the link exists.
+
+  > **The schema half is no longer true, 2026-08-10.** P9 below adds
+  > `devices.profile_id` and `pairing_codes.profile_id` (migration 0043) and the
+  > `DeviceAttribution` port that reads them, so the link now exists in storage. The
+  > *behavioural* half of the paragraph above still stands exactly as written: no production
+  > caller supplies `paired_device_profile`, because the handler that would capture the member
+  > lives in `routes.rs`. Read P9's stamp before citing either half.
 
   **What an unidentified speaker resolves to.** `Household` while the pond has one member, `Guest`
   once it has more than one. This looks like a fudge and is not: `Household` and `Guest` differ only
@@ -516,6 +528,85 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   already correct without it, and it would convert "never attributed" into "positively assigned",
   destroying the distinction the next phase may need. The phase is closed by three tests pinning the
   behaviour rather than by SQL — which is the honest form of "already true".
+- **P9 — the device-to-profile rung. STORAGE AND DOMAIN LANDED 2026-08-10; NOTHING IN PRODUCTION
+  REACHES IT.** Read the second half of that stamp before relying on this phase for anything.
+
+  This is the phase `00-checklist.md`'s 2026-08-05 entry called for — "capturing a household member
+  at pairing time gets its own phase" — and it never ran. PAI-1's row saying `COMPLETE` is why:
+  the ledger had nothing left to warn anybody with. Meanwhile `identity_resolution::resolve`'s
+  strongest rung was decorative, and PAI-7 section 3.4's chain — profile → paired devices → push
+  tokens — did not exist at all, so its P5 could only broadcast a targeted proposal or deliver
+  nothing.
+
+  **Landed.** Migration `0043_device_profile.sql` adds `devices.profile_id` and
+  `pairing_codes.profile_id`; `user_data/ports/device_attribution.rs` (the `DeviceAttribution` port
+  plus `checked_profile_id`); `pond-infra`'s `SqliteDeviceAttribution`; `PairingCode.profile_id` and
+  `Handshake::issue_pairing_code_for`; and `SqliteHandshakeAdapter::verify_handshake` binding the
+  device to whoever the consumed code named.
+
+  **Not landed, and this is the part that matters.** No production code constructs
+  `SqliteDeviceAttribution`, and no route passes a member to `issue_pairing_code_for`. The two call
+  sites that will reach it are `handshake_issue_pairing_code` in `crates/pond-api/src/routes.rs`
+  (the loopback issuance route, which has to offer the operator the choice of member) and PAI-7 P5's
+  delivery path, which needs `push_tokens_for_profile`. Both live in files another session held when
+  this landed. **A domain-only phase is legitimate — PAI-6 P1 was one — but only when it says so**,
+  and this programme has three recorded cases of a phase stamping itself as working while inert. The
+  usual defence does not apply here: `dead_code` cannot fire for `pub` items in a library crate, so
+  its silence proves nothing.
+
+  So the claim is executable instead. `crates/pond-infra/tests/device_profile_rung_is_not_wired_yet.rs`
+  asserts that `routes.rs` still writes `paired_device_profile: None` at every occurrence, that
+  neither `main.rs` nor `routes.rs` names `DeviceAttribution` or any of its methods, and that
+  `routes.rs` does not call `issue_pairing_code_for` or read a profile off the pairing request. Each
+  failure message names this stamp. The day the rung is wired, the build breaks and somebody has to
+  rewrite this paragraph rather than remember to.
+
+  **NULL means unattributed, and the two directions off that column are deliberately not mirror
+  images.** For identity it means *I do not know*: the resolver falls through to the next rung, which
+  is today's behaviour and a narrowing. For delivery it means the device is **nobody's**:
+  `devices_for_profile` matches `profile_id = ?` and therefore returns no unattributed device, so a
+  targeted proposal reaches nobody rather than every unclaimed screen in the house. Reaching the
+  shared kitchen tablet stays the broadcast path's job, which is honest about being a broadcast.
+
+  That is a different call from the one invariant 4 makes for memory, where an unattributed fragment
+  is `Household` by positive classification — and the difference is worth stating because the two
+  look like the same question. A memory is content; a device is a destination. Reading shared content
+  discloses nothing new, while delivering a member's proposal to an unclaimed screen in a shared room
+  is precisely the disclosure this workstream exists to prevent. "Deliver to nobody" and "deliver to
+  everybody" are both failures and only one of them is a leak.
+
+  **The member is captured at code ISSUANCE, not in the pairing request**, and this is the load-bearing
+  design decision. A `profile_id` on `VerifyRequest` is the same shape as the live hole P4 closed on
+  `PUT /sessions/{id}/user` — a `profile_id` taken from the request body with no ownership check —
+  and it would be worse here, because `IdentificationSource::PairedDevice` outranks both face and
+  explicit, so a client-asserted profile would not merely be unproven: it would outrank every proof
+  this pond can actually make. A pairing code is minted on the host (`handshake_pairing_code` and
+  `handshake_issue_pairing_code` both refuse a non-loopback peer inside the handler), so binding the
+  member there means the answer comes from somebody standing at the pond. The code already has
+  single-use, expiry and hash-only-at-rest semantics and the attribution inherits all three.
+  `verify_handshake` writes `profile_id = excluded.profile_id` on conflict, so re-pairing with an
+  ordinary code **releases** an attribution rather than letting whoever reuses a self-reported
+  `device_id` inherit the previous owner.
+
+  **The delete rule, declared inline rather than as a trigger.** P2 could not do that: 0003 had
+  already declared `sessions.profile_id` with no action and SQLite cannot add one in place, so 0037
+  needed a `BEFORE DELETE` trigger. A column added now carries `ON DELETE SET NULL` itself. Verified
+  with the `sqlite3` CLI against a database with 0001–0042 applied **and rows in it**: existing
+  devices and codes read NULL and keep working, and attributing a device then deleting the member
+  leaves the phone present, its push token intact, `profile_id` NULL, and `pragma_foreign_key_check`
+  empty. Deleting a household member must not fail because they owned a phone, and must not leave
+  that phone pointing at a ghost; both halves hold, in SQLite and in
+  `deleting_a_member_releases_their_devices_and_keeps_the_phone_working`.
+
+  **No backfill.** Every existing device becomes unattributed, which is the truth — no pond has ever
+  captured who was pairing. Stamping `settings.primary_profile_id` into them would attribute every
+  phone in the house to one person, the failure P3 refused for the same reason.
+
+  **Known wart, recorded rather than fixed.** The legacy single-shot `handshake()` path writes no
+  `devices` row at all, so a legacy pair is always unattributed — narrowing, and left alone because
+  registering a device there is a behaviour change outside this rung. The consequence is that a
+  member-bound code consumed on that path is burned with its attribution discarded, and the operator
+  re-issues.
 
 ---
 
@@ -566,6 +657,30 @@ test binary before building the next. Seventeen of them link Goose statically an
 this container's disk allowance. `cargo test -p pond-api` as a single invocation fails with
 `No space left on device`, which surfaces as a linker `Bus error` and reads exactly like a code
 fault. It is not one.
+
+### What P9 actually ran (2026-08-10)
+
+`cargo fmt --check`; `cargo clippy -p pond-core -p pond-infra`; `cargo test -p pond-core` and
+`cargo test -p pond-infra`. **No live server run, and it is owed**: P9 adds a migration, which
+section 2.4 of `00-checklist.md` names as one of the four things that require one. The migration was
+instead driven by hand with the `sqlite3` CLI against a database with 0001–0042 applied and rows in
+it — which covers "does it work on a populated database" and does **not** cover startup ordering or
+route registration. The live run belongs to whoever holds the server this round.
+
+New tests, and what each would have to be broken for:
+
+| Where | Asserts |
+|---|---|
+| `ports/device_attribution.rs` | a blank profile id is refused by name rather than answered; a real one passes through unrewritten (trimming it would make the lookup disagree with the write) |
+| `sqlite_device_attribution.rs` | a device starts unattributed, can be claimed and released; a profile yields its devices *and their push tokens*; an unattributed device is in neither answer; deleting a member succeeds, releases the device, keeps the push token and leaves `pragma_foreign_key_check` empty; attributing an unregistered device, an unknown member, or a blank id all fail |
+| `sqlite_handshake.rs` | the whole rung through the real two-phase pair — a code issued for Liz produces a device that is Liz's and nobody else's; an ordinary code produces an unattributed device; **a pairing body carrying `profile_id: "jerry"` still pairs as Liz**; re-pairing with an ordinary code releases; deleting a member with an outstanding code succeeds and degrades the code |
+| `tests/device_profile_rung_is_not_wired_yet.rs` | nothing in `main.rs` or `routes.rs` reaches the rung, and every `paired_device_profile` in `routes.rs` is still `None` |
+
+The handshake tests go through `init_handshake` + `verify_handshake` with a client-computed MAC
+rather than writing `devices.profile_id` directly, deliberately. `ProfileScope::Owner` was inert for
+a whole phase because every fixture that produced an owned row set the column by hand and no
+production path did: **a test whose fixture production cannot produce tests a system that does not
+exist.**
 
 ### The plan
 
