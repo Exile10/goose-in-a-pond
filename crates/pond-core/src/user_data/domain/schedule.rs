@@ -114,7 +114,18 @@ pub struct SensorTriggerSpec {
 /// A bus event projected onto the fields trigger evaluation needs — keeps
 /// the evaluation pure and testable without importing the bus type here.
 /// Built by `BusEvent::trigger_view()`.
+///
+/// **`#[non_exhaustive]` is a safety property, not future-proofing** (PAI-7
+/// P1). `trigger_view()` returns `None` for the events that are not
+/// device-shaped — a clock tick, a session transition — because a rule written
+/// with `device_id: None, signal: None` matches *anything* in its family, so a
+/// placeholder view would fire the automations somebody wrote about their
+/// house on the hour, every hour. This attribute is what stops a consumer in
+/// another crate answering that `None` with a view of its own: outside
+/// pond-core the struct literal does not compile at all. Its fields stay
+/// readable.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct TriggerEventView<'a> {
     pub kind: TriggerSourceKind,
     pub device_id: &'a str,
