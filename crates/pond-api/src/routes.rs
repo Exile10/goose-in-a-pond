@@ -13382,6 +13382,15 @@ mod tests {
     // and the assertions are on the JSON a browser receives and on the state
     // the handler persists and reports afterwards. `stream_handler_parity.rs`
     // covers the other half, that no second match appears.
+    //
+    // Frames are compared WHOLE rather than key by key, and that is the
+    // difference between this suite and the one it replaced. A frame's `type`
+    // is the cheapest thing about it: transposing `tool` and `id` in the
+    // `tool_result` frame leaves the type untouched, and those two keys are
+    // exactly how `Chat.tsx` attaches a result to the card its call opened --
+    // `(c.callId && c.callId === evId) || (evTool && c.tool === evTool)`. A
+    // swap there matches no card, so every card keeps its spinner and shows
+    // nothing, and a suite that only read `["type"]` stayed green through it.
 
     use pond_core::models::ports::agent::AgentStreamEvent;
     use pond_core::models::ports::provider::UsageStats;
@@ -13474,9 +13483,19 @@ mod tests {
             id: "call-1".to_string(),
             input: Some(json!({"location": "Nairobi"})),
         }));
-        assert_eq!(call["type"], "tool_call");
-        assert_eq!(call["id"], "call-1");
-        assert_eq!(call["input"]["location"], "Nairobi");
+        assert_eq!(
+            call,
+            json!({
+                "type": "tool_call",
+                "tool": "giap-weather__get_weather",
+                "id": "call-1",
+                "input": {"location": "Nairobi"},
+            }),
+            "the tool_call frame is what the desktop opens a tool card from: `tool` \
+             names the card and `id` is the handle its result is matched against \
+             later. Compared whole, because a frame with two of those transposed \
+             still has the right `type`"
+        );
         assert_eq!(
             turn.last_tool_name.as_deref(),
             Some("giap-weather__get_weather")
@@ -13491,8 +13510,19 @@ mod tests {
             id: "call-1".to_string(),
             content: "24C and clear".to_string(),
         }));
-        assert_eq!(result["type"], "tool_result");
-        assert_eq!(result["content"], "24C and clear");
+        assert_eq!(
+            result,
+            json!({
+                "type": "tool_result",
+                "tool": "giap-weather__get_weather",
+                "id": "call-1",
+                "content": "24C and clear",
+            }),
+            "`tool_result_frame` is called from four sites and its two identifying \
+             arguments are adjacent `&str`s, so transposing them compiles. The \
+             desktop then matches the result to no card at all: the spinner clears \
+             and the card stays empty"
+        );
         assert!(
             turn.last_tool_latency_ms.is_some(),
             "the result must close the timing the call opened, or TurnMetrics \
@@ -13506,8 +13536,17 @@ mod tests {
 
         assert_eq!(turn.tool_results.len(), 1, "the turn persists one result");
         let persisted: Value = serde_json::from_str(&turn.tool_results[0]).unwrap();
-        assert_eq!(persisted["tool_call_id"], "call-1");
-        assert_eq!(persisted["content"], "24C and clear");
+        assert_eq!(
+            persisted,
+            json!({
+                "tool_call_id": "call-1",
+                "tool": "giap-weather__get_weather",
+                "content": "24C and clear",
+            }),
+            "the persisted row is replayed into the next prompt as the model's own \
+             tool history; a row whose id and name are transposed teaches the model \
+             it called a tool named `call-1`"
+        );
     }
 
     /// The MCP-UI marker is a rendering instruction, not something to keep.
@@ -13520,9 +13559,19 @@ mod tests {
             content: "[[[mcp-ui:weather:{\"temp\":24}]]]\n24C and clear".to_string(),
         }));
 
-        assert_eq!(frame["ui"]["card_type"], "weather");
-        assert_eq!(frame["ui"]["data"]["temp"], 24);
-        assert_eq!(frame["content"], "24C and clear");
+        assert_eq!(
+            frame,
+            json!({
+                "type": "tool_result",
+                "tool": "giap-weather__get_weather",
+                "id": "call-1",
+                "content": "24C and clear",
+                "ui": {"card_type": "weather", "data": {"temp": 24}},
+            }),
+            "a hinted result is still a `tool_result` frame and still has to reach \
+             the card its call opened -- `ui` is what that card renders as, not a \
+             substitute for the two keys that find it"
+        );
 
         let persisted: Value = serde_json::from_str(&turn.tool_results[0]).unwrap();
         assert_eq!(
@@ -13598,22 +13647,29 @@ mod tests {
     }
 
     /// Every remaining variant is a frame carrying the `type` the desktop
-    /// switches on. A frame whose `type` is wrong renders as nothing at all.
+    /// switches on, and the payload that type promises.
+    ///
+    /// The `type` alone is not the contract. `review_revision` carries two
+    /// adjacent integers that mean opposite things -- a quality score and a
+    /// count of rounds -- and the fixture uses 4 and 2 rather than one number
+    /// twice so that transposing them fails here. That is the shape of defect a
+    /// `["type"]`-only assertion is blind to, in the one variant where the
+    /// compiler cannot help either.
     #[test]
     fn the_status_shaped_variants_keep_the_type_the_client_switches_on() {
         let mut turn = accumulator();
-        for (step, expected_type) in [
+        for (step, expected) in [
             (
                 turn.absorb(AgentStreamEvent::Status {
                     content: "Agent working".to_string(),
                 }),
-                "status",
+                json!({"type": "status", "content": "Agent working"}),
             ),
             (
                 turn.absorb(AgentStreamEvent::ReviewStatus {
                     content: "Reviewing answer".to_string(),
                 }),
-                "review_status",
+                json!({"type": "review_status", "content": "Reviewing answer"}),
             ),
             (
                 turn.absorb(AgentStreamEvent::ReviewRevision {
@@ -13621,14 +13677,24 @@ mod tests {
                     score: 4,
                     rounds: 2,
                 }),
-                "review_revision",
+                json!({
+                    "type": "review_revision",
+                    "content": "A better answer",
+                    "score": 4,
+                    "rounds": 2,
+                }),
             ),
             (
                 turn.absorb(AgentStreamEvent::TurnLimitReached { max_turns: 25 }),
-                "turn_limit_reached",
+                json!({"type": "turn_limit_reached", "max_turns": 25}),
             ),
         ] {
-            assert_eq!(frame_of(step)["type"], expected_type);
+            assert_eq!(
+                frame_of(step),
+                expected,
+                "the frame the client receives must be this frame whole, not just \
+                 something with the right `type`"
+            );
         }
 
         // The error frame is the exception: it carries no `type` at all, and
