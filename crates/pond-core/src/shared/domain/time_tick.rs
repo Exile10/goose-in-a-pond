@@ -63,6 +63,19 @@ pub struct TimeTick {
     pub local_hour: u8,
 }
 
+/// Seconds from `now` until the top of the next hour.
+///
+/// **The only public form, and it takes the clock reading rather than two
+/// numbers off it.** The publisher's one production call site used to pass
+/// `(minute, second)` as bare `u32`s, which swap silently: read the other way
+/// round, 12:34:56 waits 206 seconds instead of 1504, and the hourly heartbeat
+/// becomes one every few minutes. That call site sits inside a timer loop, so
+/// nothing observed it — an unguarded argument order was the whole of the
+/// defect, and removing the argument is a better fix than testing it.
+pub fn secs_to_next_hour_from<T: chrono::Timelike>(now: &T) -> u64 {
+    secs_to_next_hour(now.minute(), now.second())
+}
+
 /// Seconds from `minute`:`second` past the hour until the top of the next hour.
 ///
 /// Pure, so the publisher's cadence is testable without a timer. **Never
@@ -70,7 +83,9 @@ pub struct TimeTick {
 /// zero-length sleep turns that loop into a spin that would publish an
 /// unbounded burst of ticks. A leap second (`second == 60`) and any other
 /// out-of-range input therefore round to one second rather than to none.
-pub fn secs_to_next_hour(minute: u32, second: u32) -> u64 {
+///
+/// Private: see [`secs_to_next_hour_from`].
+fn secs_to_next_hour(minute: u32, second: u32) -> u64 {
     const HOUR: u64 = 3600;
     HOUR.saturating_sub(u64::from(minute) * 60 + u64::from(second))
         .max(1)
@@ -133,6 +148,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The publisher's actual entry point, at a time whose two halves cannot
+    /// be confused for one another. 1504 is 12:34:56 read correctly; 206 is
+    /// the same clock read as `(second, minute)` — the swap that turns an
+    /// hourly heartbeat into one every three and a half minutes, inside a
+    /// timer loop where nobody would see it.
+    #[test]
+    fn the_wait_is_read_off_the_clock_the_right_way_round() {
+        let at = chrono::NaiveTime::from_hms_opt(12, 34, 56).expect("valid time");
+        let wait = secs_to_next_hour_from(&at);
+        assert_ne!(
+            wait, 206,
+            "the clock was read as (second, minute): 12:34:56 waits 1504s, not 206s"
+        );
+        assert_eq!(wait, 1504);
+    }
+
+    /// Vacuity control for the assertion above: the two readings really are
+    /// different numbers, so `assert_ne!(wait, 206)` is a claim about the
+    /// order and not a comparison that could never fail.
+    #[test]
+    fn the_two_readings_of_that_clock_are_different_numbers() {
+        assert_eq!(secs_to_next_hour(34, 56), 1504);
+        assert_eq!(secs_to_next_hour(56, 34), 206);
     }
 
     #[test]
