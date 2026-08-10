@@ -218,6 +218,25 @@ whole phase behind exactly that blind spot.
 `drafts`, an index, and three triggers) and `0042_proposal_expiry.sql`; and — a separate, live
 change — `Draft.expires_at` with the expiry refusal in `DraftMcpServer::decide`.
 
+0042 exists because 0041 gave invariant 2 a storage layer and did not give one to invariant 7: a row
+with `origin = 'proactive'` and a NULL `expires_at` was storable, and 0041's approve trigger keys on
+`OLD.expires_at IS NOT NULL`, so that row was approvable forever. Writing the trigger pair surfaced
+a second thing, and only running the upgrade found it: the rule is stated over a row's *state*
+rather than the transition into it, so a row already in the forbidden state would be frozen —
+including against the two `UPDATE`s inside 0038's `BEFORE DELETE ON profiles` trigger, which would
+abort the DELETE and make a household member unremovable. 0042 therefore fixes the data before it
+constrains it, and `migration_0042_does_not_freeze_a_row_that_predates_it` builds the pre-upgrade
+row a fresh database cannot hold and re-runs the file over it.
+
+**Four guards added on the repair pass, each answering a mutation that had survived.** Widening
+`LIVE_PREDICATE`'s `status = 'pending'` so a decided proposal is returned left the whole pond-infra
+suite green, which is invariant 7's other failure mode and the worse one — the member has already
+answered. Renaming `PROPOSAL_ORIGIN` disabled every origin-keyed trigger in 0041 and 0042 for every
+row the repository writes, silently, because the trigger tests wrote `'proactive'` as a SQL literal
+instead of binding the constant; they bind it now, and a counting guard ties the constant to the
+literal in both files. Deleting `from_parts`'s `MissingId` block left all sixteen proposal tests
+passing. And 0042's data fix is what keeps a pre-upgrade row from freezing the profile-delete path.
+
 **Respecified against the sketch above, and why.** `profile_scope: ProfileScope` became
 `audience: ProposalAudience`. Of that type's three shapes, invariant 5 forbids `Guest` and
 invariant 4 forbids `Household` — `Household` is not a weaker address than `Owner`, it *is* the
@@ -231,8 +250,12 @@ every check, and the stored form is what a bug reaches first.
 **What is NOT reached, stated as facts rather than as a caveat.**
 
 - Nothing constructs `SqliteProposalRepository`. No `AppState` field, no `main.rs` line, no route,
-  no test outside the adapter's own module. `grep -rn 'SqliteProposalRepository\|ProposalRepository'
-  crates/ --include='*.rs'` returns the port, the adapter, and one comment.
+  no test outside the adapter's own module. That is asserted rather than described:
+  `nothing_outside_this_file_constructs_a_proposal_repository_yet` walks every `.rs` file under
+  `crates/` on every run, and it carries its own vacuity control (the same walk must find
+  `SqliteDraftRepository::new(`, which pond-server really does call, or the walk is not looking at
+  the workspace and its happy answer means nothing). **That test is meant to fail one day**, and
+  the day it does, this stamp is what has to change with it.
 - Therefore no `drafts` row in production can carry `origin = 'proactive'` or a non-NULL
   `expires_at`. `SqliteProposalRepository::save` is the only writer of either, and `save_draft`
   binds `expires_at: None` deliberately (a draft the user is being asked to confirm in the same
