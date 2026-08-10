@@ -393,6 +393,7 @@ impl Proposal {
     }
 
     /// Build a proposal that expires `ttl` after it was created.
+    #[allow(clippy::too_many_arguments)]
     pub fn expiring_after(
         id: impl Into<String>,
         trigger: BusEventRef,
@@ -573,10 +574,14 @@ mod tests {
                 now,
                 Duration::hours(1),
             )
-            .unwrap_err();
+            .expect_err(&format!(
+                "a rationale of {blank:?} must be refused: invariant 2 says every proposal \
+                 carries a reason the user can read, and a blank one is what a defaulted \
+                 field produces"
+            ));
             assert!(
                 matches!(err, ProposalError::MissingRationale { .. }),
-                "a rationale of {blank:?} must be refused, got {err:?}"
+                "a rationale of {blank:?} must be refused as MissingRationale, got {err:?}"
             );
         }
     }
@@ -600,35 +605,47 @@ mod tests {
         // all become representable. Add a `#[serde(try_from = ...)]` wire
         // struct instead, the way `BusEventRef` does.
         let src = include_str!("proposal.rs");
-        let decl = src
-            .split("pub struct Proposal {")
-            .next()
-            .expect("the Proposal declaration moved");
-        let derive = decl
-            .rsplit("#[derive(")
-            .next()
-            .expect("Proposal lost its derive list");
         assert!(
-            !derive.contains("Deserialize"),
+            !derive_list_of(src, "Proposal").contains("Deserialize"),
             "Proposal must not derive Deserialize: it would bypass from_parts. \
-             Derive list was: {derive}"
+             Derive list was: {}",
+            derive_list_of(src, "Proposal")
         );
-        // Vacuity control for the slice above: the same search over the type
-        // that DOES derive Deserialize must find it. Without this, a typo in
-        // the split key makes the assertion pass over an empty string.
-        let payload_decl = src
-            .split("pub struct ProposalPayload {")
-            .next()
-            .expect("the ProposalPayload declaration moved");
-        let payload_derive = payload_decl
+        // Vacuity control, and it has to go through the SAME helper. An earlier
+        // version of this test had its own copy of the search for the control,
+        // so a typo in the main search key left `split` returning the whole
+        // file and `rsplit` returning whatever derive happened to be last --
+        // and the control, using its own correct key, still passed. It failed
+        // only because the tail of this file happens to contain the word
+        // "Deserialize". That is luck, not a guard. `derive_list_of` panics
+        // when the key matches nothing, and both calls share it.
+        assert!(
+            derive_list_of(src, "ProposalPayload").contains("Deserialize"),
+            "the derive-list search is broken: it cannot see ProposalPayload's \
+             own Deserialize. Found: {}",
+            derive_list_of(src, "ProposalPayload")
+        );
+    }
+
+    /// The `#[derive(...)]` list immediately above `pub struct <name> {`.
+    ///
+    /// Panics when the declaration is not found, which is the whole reason this
+    /// is a function: a `split` on a key that matches nothing returns the input
+    /// unchanged rather than failing, so a typo in a caller would silently
+    /// search the wrong text.
+    fn derive_list_of(src: &str, type_name: &str) -> String {
+        let decl = format!("\npub struct {type_name} {{");
+        let prefix = src.split(&decl).next().expect("split yields one part");
+        assert!(
+            prefix.len() < src.len(),
+            "no declaration of `{type_name}` in this file: the search key is wrong \
+             or the type was renamed"
+        );
+        prefix
             .rsplit("#[derive(")
             .next()
-            .expect("ProposalPayload lost its derive list");
-        assert!(
-            payload_derive.contains("Deserialize"),
-            "the derive-list search is broken: it cannot see ProposalPayload's \
-             own Deserialize. Found: {payload_derive}"
-        );
+            .unwrap_or_else(|| panic!("`{type_name}` has no derive list above it"))
+            .to_string()
     }
 
     // ── Invariants 4 and 5: addressed to a member, never broadcast ─────────
