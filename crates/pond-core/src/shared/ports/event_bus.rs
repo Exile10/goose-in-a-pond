@@ -98,6 +98,38 @@ impl BusEvent {
     /// which matches *any* event in that family. A synthetic view would
     /// therefore fire real automations — lights, notifications — on the hour,
     /// every hour, for rules the user wrote about their house.
+    ///
+    /// The consumer cannot route around the `None` by inventing one, and that
+    /// is enforced by the compiler rather than by a test: [`TriggerEventView`]
+    /// is `#[non_exhaustive]`, so the line the rules engine would have to
+    /// write does not compile in the rules engine's crate.
+    ///
+    /// ```compile_fail,E0639
+    /// use pond_core::user_data::domain::schedule::{TriggerEventView, TriggerSourceKind};
+    ///
+    /// // What answering `None` with a placeholder looks like. Outside
+    /// // pond-core this is a compile error, which is the point.
+    /// let placeholder = TriggerEventView {
+    ///     kind: TriggerSourceKind::Sensor,
+    ///     device_id: "",
+    ///     signal: "",
+    ///     value: None,
+    /// };
+    /// ```
+    ///
+    /// Vacuity control for the block above — a `compile_fail` example also
+    /// "passes" when the paths in it are wrong, so here are the same paths in
+    /// an example that must compile:
+    ///
+    /// ```
+    /// use pond_core::user_data::domain::schedule::{TriggerEventView, TriggerSourceKind};
+    ///
+    /// // Reading a view built by `trigger_view` is unaffected: only
+    /// // construction is closed.
+    /// fn family(view: &TriggerEventView<'_>) -> TriggerSourceKind {
+    ///     view.kind
+    /// }
+    /// ```
     pub fn trigger_view(&self) -> Option<TriggerEventView<'_>> {
         match self {
             BusEvent::Sensor(r) => Some(TriggerEventView {
