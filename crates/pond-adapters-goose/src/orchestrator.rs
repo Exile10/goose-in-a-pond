@@ -702,14 +702,21 @@ pub enum ParentStep<T> {
 /// # Why neither side starves
 ///
 /// `biased` puts progress first, and that reads like a starvation hazard until
-/// you ask where a frame comes from. A synchronous child runs *inside* the
-/// engine future — its loop is only polled when `engine.next()` is polled — so a
-/// frame cannot exist unless the engine branch has run, and each poll of it can
-/// produce only the finitely many frames the child emits before its own next
-/// await. The bias therefore drains what the last engine poll produced and hands
-/// control straight back. Without the bias, a frame could sit in the queue while
-/// the engine yields event after event, which is exactly the "no news for
-/// minutes" this phase exists to remove.
+/// you ask WHEN a frame can exist. A synchronous delegation is produced
+/// underneath the parent's own `delegate` tool call, and the engine yields
+/// nothing until that call returns — goose awaits `ToolCallResult::result`
+/// inline in its reply loop. So for the whole of a child's run the engine branch
+/// is Pending, whether the child's future is polled by this very task or by the
+/// MCP service's own, and the bias delays no engine event that exists. What it
+/// buys is that a frame is delivered as soon as the engine is not ready, instead
+/// of queueing behind however many events it has to hand — which for a
+/// delegation means "after the child has finished", the no-news-for-minutes this
+/// phase exists to remove.
+///
+/// The hot-engine case the guard drives — events always ready, frames arriving
+/// anyway — cannot happen during a synchronous delegation today. It is the shape
+/// P8's background tasks would produce, and pinning it now costs one test rather
+/// than a rediscovery then.
 ///
 /// # Cancel-safety, which this depends on
 ///

@@ -446,10 +446,13 @@ the parent's **GIAP session id**, with the parent's drain running `next_parent_s
   Routing at the map makes the failure a lost frame instead of a misdelivered one. The residual
   coarseness — two concurrent turns of one session, newest subscriber wins — is the same one
   `DeviceLedger` and `parent_turn_token` already have and cannot cross a profile boundary.
-- **The bias is progress-first, and it cannot starve the engine.** A synchronous child is polled
-  only when the engine future is polled, so a frame cannot exist unless the engine branch has just
-  run; the bias drains what that poll produced and hands control straight back. Both directions are
-  pinned by tests, one against a hot engine and one against an engine that parks mid-poll.
+- **The bias is progress-first, and it cannot delay an engine event.** A synchronous delegation is
+  produced underneath the parent's own `delegate` tool call, and goose awaits `ToolCallResult::result`
+  inline — so for the whole of a child's run the engine branch is Pending and there is nothing for
+  the bias to get in front of. What it buys is that a frame is delivered as soon as the engine is not
+  ready, rather than queueing behind however many events it has to hand. Both directions are pinned
+  by tests, one against an engine that parks mid-poll (the real shape) and one against a hot engine
+  (P8's shape, pinned early).
 - **Cancel-safety** is what the loop rests on: losing the race drops a `Next` future, not the
   stream, and an `async_stream` generator's state lives in the stream itself.
 
