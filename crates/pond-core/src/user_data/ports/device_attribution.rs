@@ -47,6 +47,123 @@ use async_trait::async_trait;
 
 use crate::user_data::domain::push_token::PushToken;
 
+/// The `target` string that means "every connected device".
+///
+/// Declared here, in the domain, and re-exported by the adapter that owns the
+/// channel (`pond_infra::broadcast_notification_sender::BROADCAST_TARGET`) so
+/// there is one spelling of it in the tree. Two would be worse than none: the
+/// targeted path recognises the sentinel in order to *refuse* it, and a second
+/// copy that drifted by one character would turn the refusal off without
+/// changing a single line of the code that reads.
+///
+/// It is reserved rather than merely conventional because a device id is
+/// caller-supplied at registration
+/// (`sqlite_device_registry::tests::register_honours_caller_supplied_stable_id`).
+/// A device registered as `"broadcast"` and then attributed to a member would
+/// make a *targeted* delivery to that member fan out to the whole household,
+/// which is precisely the failure PAI-7's invariant 4 exists to prevent.
+pub const RESERVED_BROADCAST_TARGET: &str = "broadcast";
+
+/// Why a targeted delivery reached nobody.
+///
+/// Every variant is a **refusal to deliver**, and none of them is a fallback.
+/// PAI-7 invariant 4 says a proposal is addressed to a profile and never
+/// broadcast, so "I could not work out who to send this to" has exactly one
+/// correct consequence and it is silence. Failing to deliver is a reliability
+/// failure; delivering to everybody is a privacy failure, and the second is the
+/// one this programme is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Undeliverable {
+    /// The id handed in is not a household member id (blank / whitespace).
+    /// [`checked_profile_id`]'s refusal, carried as a plan rather than as an
+    /// error, so a caller cannot turn it into a fallback with `unwrap_or`.
+    NotAMember,
+    /// The attribution read itself failed. **This is the variant the whole type
+    /// exists for.** A storage error is the moment a delivery path is most
+    /// tempted to "just broadcast so the user still gets it", and on a failed
+    /// read access must narrow, not widen.
+    AttributionUnavailable(String),
+    /// The member has no device of their own. A real, expected state: somebody
+    /// who has never paired a phone. Deliberately NOT the same thing as "send it
+    /// to the unclaimed kitchen tablet" -- see
+    /// [`DeviceAttribution::devices_for_profile`], which never returns one.
+    NoAttributedDevice,
+    /// Every device attributed to this member is the reserved broadcast
+    /// sentinel, so there is no target left that addresses a person.
+    ReservedTargetOnly,
+}
+
+impl Undeliverable {
+    /// Short, stable label for structured logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotAMember => "not_a_member",
+            Self::AttributionUnavailable(_) => "attribution_unavailable",
+            Self::NoAttributedDevice => "no_attributed_device",
+            Self::ReservedTargetOnly => "reserved_target_only",
+        }
+    }
+}
+
+/// Where a targeted notification for one household member actually goes.
+///
+/// **There is no broadcast variant, and that is the point.** This type is the
+/// same move PAI-7 P3a made with `ProposalAudience` and PAI-6 P1 made with
+/// `TaskRequest`: the rule that gets written as a runtime check is the rule a
+/// later refactor deletes, so invariant 4 is expressed as a shape instead. A
+/// delivery path that holds one of these cannot fan out to the household
+/// however its author writes the match arms, because there is no arm to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetedDelivery {
+    /// Deliver one copy per device id. Non-empty, and never contains
+    /// [`RESERVED_BROADCAST_TARGET`].
+    ToDevices(Vec<String>),
+    /// Deliver to nobody, for this reason.
+    Undeliverable(Undeliverable),
+}
+
+impl TargetedDelivery {
+    /// Turn "who is this for" plus the attribution read into a delivery plan.
+    ///
+    /// Takes the `Result` rather than the `Vec` on purpose. A signature of
+    /// `plan(profile_id, &[String])` puts the failed read back in the caller's
+    /// hands, where the shortest thing to write is
+    /// `.unwrap_or_default()` -- which answers a storage error with
+    /// [`Undeliverable::NoAttributedDevice`] and reads, in a log, exactly like a
+    /// member who owns no phone. Consuming the `Result` here makes the
+    /// distinction impossible to lose.
+    pub fn plan(profile_id: &str, attributed_devices: Result<Vec<String>>) -> Self {
+        if checked_profile_id(profile_id).is_err() {
+            return Self::Undeliverable(Undeliverable::NotAMember);
+        }
+        let devices = match attributed_devices {
+            Ok(devices) => devices,
+            Err(e) => {
+                return Self::Undeliverable(Undeliverable::AttributionUnavailable(e.to_string()))
+            }
+        };
+        if devices.is_empty() {
+            return Self::Undeliverable(Undeliverable::NoAttributedDevice);
+        }
+        let addressable: Vec<String> = devices
+            .into_iter()
+            .filter(|id| id != RESERVED_BROADCAST_TARGET)
+            .collect();
+        if addressable.is_empty() {
+            return Self::Undeliverable(Undeliverable::ReservedTargetOnly);
+        }
+        Self::ToDevices(addressable)
+    }
+
+    /// The device ids to deliver to, empty when this plan delivers to nobody.
+    pub fn devices(&self) -> &[String] {
+        match self {
+            Self::ToDevices(ids) => ids,
+            Self::Undeliverable(_) => &[],
+        }
+    }
+}
+
 /// Reject a profile id that is not a member id.
 ///
 /// A blank or whitespace-only id is a caller bug, and both plausible silent
@@ -124,5 +241,139 @@ mod tests {
                 "a blank id must be refused by name, got: {err}"
             );
         }
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The positive case, and the vacuity control for every refusal test below:
+    /// if `plan` refused everything, they would all pass while proving nothing.
+    #[test]
+    fn a_member_with_devices_is_delivered_to_each_of_them() {
+        let plan = TargetedDelivery::plan("liz", Ok(ids(&["phone-liz", "watch-liz"])));
+        assert_eq!(
+            plan,
+            TargetedDelivery::ToDevices(ids(&["phone-liz", "watch-liz"])),
+            "a member with two devices gets two targets, in the order the port returned"
+        );
+        assert_eq!(plan.devices().len(), 2);
+    }
+
+    /// PAI-7 invariant 4, in the direction that costs a privacy failure when it
+    /// is wrong. A storage error is where a delivery path is most tempted to
+    /// broadcast so that "the user still gets it".
+    #[test]
+    fn a_failed_attribution_read_delivers_to_nobody_and_says_which_failure_it_was() {
+        let plan = TargetedDelivery::plan("liz", Err(anyhow!("database is locked")));
+        match &plan {
+            TargetedDelivery::Undeliverable(Undeliverable::AttributionUnavailable(why)) => {
+                assert!(
+                    why.contains("database is locked"),
+                    "the storage error must survive into the plan, got: {why}"
+                );
+            }
+            other => panic!(
+                "a failed attribution read must be AttributionUnavailable, not {other:?}. \
+                 Answering it with an empty device list makes a broken database read, in a log, \
+                 exactly like a member who has never paired a phone"
+            ),
+        }
+        assert!(
+            plan.devices().is_empty(),
+            "nothing is delivered when the read failed"
+        );
+    }
+
+    /// The port's deliberate asymmetry, carried into the plan: an unattributed
+    /// device is nobody's, so a member who owns none is unreachable rather than
+    /// reachable through the whole house.
+    #[test]
+    fn a_member_with_no_attributed_device_is_unreachable_not_broadcast() {
+        let plan = TargetedDelivery::plan("liz", Ok(Vec::new()));
+        assert_eq!(
+            plan,
+            TargetedDelivery::Undeliverable(Undeliverable::NoAttributedDevice)
+        );
+        assert!(plan.devices().is_empty());
+    }
+
+    /// A device id is caller-supplied at registration, so `"broadcast"` is a
+    /// registrable id. Attributed to a member it would convert a targeted
+    /// delivery into a household one at the sender's `target == BROADCAST_TARGET`
+    /// branch -- the leak arriving through the front door of the very check
+    /// meant to prevent it.
+    #[test]
+    fn the_reserved_sentinel_is_never_a_delivery_target() {
+        let plan =
+            TargetedDelivery::plan("liz", Ok(ids(&[RESERVED_BROADCAST_TARGET, "phone-liz"])));
+        assert_eq!(
+            plan,
+            TargetedDelivery::ToDevices(ids(&["phone-liz"])),
+            "the sentinel is dropped and the member's real device still gets it"
+        );
+
+        let only = TargetedDelivery::plan("liz", Ok(ids(&[RESERVED_BROADCAST_TARGET])));
+        assert_eq!(
+            only,
+            TargetedDelivery::Undeliverable(Undeliverable::ReservedTargetOnly),
+            "and when the sentinel is all there is, the answer is nobody -- not everybody"
+        );
+    }
+
+    #[test]
+    fn a_blank_profile_id_produces_a_plan_rather_than_an_error_to_swallow() {
+        for blank in ["", "   "] {
+            assert_eq!(
+                TargetedDelivery::plan(blank, Ok(ids(&["phone-liz"]))),
+                TargetedDelivery::Undeliverable(Undeliverable::NotAMember),
+                "a blank id must not be allowed to reach a device list that was fetched for \
+                 somebody else"
+            );
+        }
+    }
+
+    /// Structural tripwire, and it is a COMPILE-time one rather than an
+    /// assertion: this match is exhaustive with no wildcard, so adding a
+    /// `TargetedDelivery::Broadcast` (or any other way of expressing "send it to
+    /// the household") fails to build here. A runtime assertion could not say
+    /// this at all -- the value it would need to construct is the value the type
+    /// is supposed to make unconstructible.
+    #[test]
+    fn the_delivery_plan_cannot_express_a_broadcast() {
+        let plan = TargetedDelivery::plan("liz", Ok(ids(&["phone-liz"])));
+        let described = match &plan {
+            TargetedDelivery::ToDevices(devices) => {
+                assert!(
+                    !devices.iter().any(|d| d == RESERVED_BROADCAST_TARGET),
+                    "ToDevices must never carry the sentinel: {devices:?}"
+                );
+                "to devices"
+            }
+            TargetedDelivery::Undeliverable(reason) => match reason {
+                Undeliverable::NotAMember
+                | Undeliverable::AttributionUnavailable(_)
+                | Undeliverable::NoAttributedDevice
+                | Undeliverable::ReservedTargetOnly => "to nobody",
+            },
+        };
+        assert_eq!(described, "to devices");
+    }
+
+    #[test]
+    fn every_undeliverable_reason_has_its_own_log_label() {
+        let labels = [
+            Undeliverable::NotAMember.as_str(),
+            Undeliverable::AttributionUnavailable("x".into()).as_str(),
+            Undeliverable::NoAttributedDevice.as_str(),
+            Undeliverable::ReservedTargetOnly.as_str(),
+        ];
+        let unique: std::collections::BTreeSet<&str> = labels.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "two reasons sharing a label make the two failures indistinguishable in the one \
+             place an operator looks: {labels:?}"
+        );
     }
 }
