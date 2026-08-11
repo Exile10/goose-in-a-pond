@@ -1263,11 +1263,22 @@ cannot change class quietly.
   `cargo check -p pond-server -p pond-adapters-goose` clean. **No live run** — the coordinator owns
   it, and this phase adds a route and a handler, so it needs one.
 - **P8b** BLOCKED on P8a — flip the default to `security_policy_mode = "enforce"`, only after a
-  release in `audit` whose telemetry shows what would have been denied. Note the standing
-  precondition underneath both: `is_identity_assertion_proven` currently refuses *every* remote
-  explicit identification, because no schema links a paired device to a member. Flipping before
-  that rung lands would break "this is Liz" from a phone on every pond, which is a P8b input and
-  not a P8a one.
+  release in `audit` whose telemetry shows what would have been denied.
+
+  **The standing precondition still holds and its REASON changed on 2026-08-11.** It read "no schema
+  links a paired device to a member", and that is no longer true: migration 0043 put `profile_id` on
+  `devices`, and PAI-1 P9's identity half wired the rung end to end, so a turn now knows which member
+  its paired device belongs to. `is_identity_assertion_proven` still refuses every remote explicit
+  identification anyway, for a different and much smaller reason: it reads
+  `Principal.proven_profile_id`, and the auth middleware still sets that to `None` on every path.
+  The device is surfaced on the `Principal`; the *member* is resolved downstream in
+  `resolve_turn_scope`, which is the turn's scope and not the policy layer. Two consumers, one rung,
+  and only one of them reads it.
+
+  So flipping before that is threaded would still break "this is Liz" from a phone on every pond —
+  the outcome is unchanged — but the remaining work is one attribution lookup on the way into the
+  `Principal`, not a schema. Worth re-checking before anyone plans around it: `grep -n
+  "proven_profile_id:" crates --include='*.rs' | grep -v None` returns only the field declaration.
 - **DEFERRED** SQLCipher for the full database.
 
 ---
