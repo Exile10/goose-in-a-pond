@@ -85,6 +85,7 @@ fn spec_for_parent(role: &AgentRole, parent_groups: &[&str], parent: &str) -> Ta
             role: role.name().to_string(),
             instructions: "what is the weather".to_string(),
             inputs: serde_json::Value::Null,
+            background: false,
         },
     )
     .expect("fixture delegation is authorised")

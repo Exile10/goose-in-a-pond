@@ -675,6 +675,7 @@ mod tests {
                     role: "researcher".into(),
                     instructions: "look it up".into(),
                     inputs: serde_json::Value::Null,
+                    background: false,
                 },
             )
             .unwrap();
@@ -785,6 +786,7 @@ mod tests {
             role: "researcher".into(),
             instructions: "look it up".into(),
             inputs: serde_json::Value::Null,
+            background: false,
         }
     }
 
