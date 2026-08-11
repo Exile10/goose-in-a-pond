@@ -210,39 +210,49 @@ adapter.
 
 - **P1** Domain + migrations + the ingest pipeline with **on-pond sources only** (sensor, camera,
   voice transcripts) — proves the pipeline with data GIAP already holds and no new egress.
-  **CODE LANDED 2026-08-11** (`b58361e1`, `a9062615`, `468e33d8`) **and UNREACHED.**
+  **LANDED 2026-08-11 and REACHED.** The domain, migrations and adapter landed first
+  (`b58361e1`, `a9062615`, `468e33d8`) with nothing that could produce a `RawItem`; the producer,
+  the wiring and the connect surface followed the same day. `BusProducer` bridges the event bus to
+  the pipeline, `main.rs` builds the repository and a `BusIngest` subscriber, and
+  `POST /api/v1/context/sources` is what lets a source exist at all -- without it `upsert_source`
+  had no caller and the corpus was empty by construction.
 - **P2** Retrieval: `context_items` as a second corpus in `<system-context>` with its own budget;
-  `giap-context` MCP extension. **CODE LANDED 2026-08-11 and UNREACHED**, and the extension is not
-  registered.
+  `giap-context` MCP extension. **PARTIALLY LANDED 2026-08-11.** The retrieval blend, the budget
+  split and the `giap-context` server are written, and `init_context_deps` now gives them their
+  handles. **The extension is still not registered**, so the model cannot call `search_context` or
+  `get_recent_context`. That is deliberate ordering rather than an oversight -- see below -- and
+  `context_pipeline_is_not_wired_yet.rs` keeps the one assertion that still holds.
 
-#### What "unreached" means, and what it takes to end it
+#### What landed, what did not, and why the order was forced
 
-Stated as its own block because the distinction cost a documentation error the day the code landed.
-`pub mod context;` makes all of this compile and `cargo check` is happy; a `pub` item in a library
-crate never earns a `dead_code` warning, so nothing complains. But **no production code constructs
-`SqliteContextRepository`, builds an `IngestPipeline`, or calls `init_context_deps`, and
-`giap-context` is absent from `giap_registration.rs`.** There is therefore no way to create a source,
-so `context_items` is empty on every pond that exists, and the retrieval, retention and scope layers
-are correct code operating on nothing.
+The storage half shipped a day before anything could reach it, and for that day the checklist said
+`DESIGNED` while the master roadmap repeated it -- which produced a documentation error, because
+`pub mod context;` makes all of this compile and a `pub` item in a library crate never earns a
+`dead_code` warning, so nothing complains. `context_pipeline_is_not_wired_yet.rs` was written to
+assert the absence and it caught the wiring the same day; its retirement note is the record.
 
-`crates/pond-core/tests/context_pipeline_is_not_wired_yet.rs` asserts this on every run, walks the
-whole workspace to do it, carries a control proving the walk can see the files it excludes, and
-fails with instructions naming the three documents to correct. PAI-7 P3a shipped with a guard of that
-shape and it worked; this phase shipped without one, and within a day the checklist said `DESIGNED`
-while the master roadmap repeated it.
+**What is now live:** `BusProducer` and `BusIngest` (P1's producer), the repository and pipeline in
+`main.rs`, `init_context_deps`, and `POST|GET|DELETE /api/v1/context/sources`. A member can connect
+their front-door camera or a motion sensor; its events become redacted, sensitivity-classified,
+retention-governed rows owned by them, and no other member's scope can read them.
 
-Four things stand between here and reachable, and none is large:
+**What is deliberately NOT live: `giap-context` is unregistered.** The order was forced rather than
+chosen. Registering the two read tools puts them in every turn's tool set, and on the Orin tool
+schemas are already ~88% of a 4 096-token prompt -- so before a household could have a single
+context item that was a per-turn cost forever for tools which could not return a row. Now that a
+corpus can exist the objection weakens, but registration is still four coordinated edits
+(`giap_registration.rs`, `TOOL_GROUPS`, CLAUDE.md's sentence, and an off-by-default toggle with its
+own named `default_*` fn) tied together by `registration_matches_the_catalog.rs`, and it deserves
+its own change rather than a tail on this one.
 
-1. **Register `giap-context`.** The count is asserted in three places that
-   `registration_matches_the_catalog.rs` ties together — CLAUDE.md's sentence, the registration list,
-   and `TOOL_GROUPS`. An uncatalogued builtin is treated as a *user-added* MCP server that selection
-   never narrows, which for a personal-context reader is the wrong direction.
-2. **A settings toggle**, off by default, with its own named `default_*` fn — the convention PAI-6 P5
-   and PAI-7 P4 and P6 each established for a capability nobody asked for by upgrading.
-3. **Construct the repository and install the deps** in `main.rs`, next to the other
-   `init_*_deps` calls.
-4. **Give ingest an on-pond producer**, which is what P1's own sentence asks for and the only part
-   with real design left in it.
+**One thing worth stating about the owner**, because it is the phase's security decision.
+`ContextSource.profile_id` is not an `Option`, so a source belongs to one member, and the connect
+route has **no `profile_id` field in its request body**. The owner comes from `resolve_turn_scope`
+-- PAI-1's whole lattice, including the paired-device rung that landed the same day. A body-supplied
+owner would be the hole PAI-1 P4 closed on `PUT /sessions/{id}/user`, and worse here, because every
+item the source ever produces inherits it and migration 0044 refuses to let it change afterwards.
+`Household` and `Guest` are refused rather than defaulted: a guest who could create a source would
+be writing into a member's corpus.
 
 #### The producer needs a source, and nothing can make one — the ordering this implies
 

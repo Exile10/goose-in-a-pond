@@ -63,6 +63,7 @@ use pond_core::user_data::domain::skill::UserSkill;
 
 use crate::middleware::onboarding_guard::require_onboarding_complete;
 use crate::{AppState, DownloadEntry, ModelStatusEntry};
+use pond_core::context::ports::ContextRepository;
 use pond_core::security::ports::policy::is_draft_decision_permitted;
 use pond_core::user_data::domain::draft::DraftStatus;
 use pond_core::user_data::domain::profile::ProfileScope;
@@ -239,6 +240,11 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // deliberately absent from `middleware::PUBLIC_ROUTES`: a proposal is
         // addressed to one member and an anonymous caller is not one.
         .route("/proposals", get(list_proposals))
+        .route(
+            "/context/sources",
+            get(list_context_sources).post(connect_context_source),
+        )
+        .route("/context/sources/{id}", delete(disconnect_context_source))
         .route("/proposals/{id}/decide", post(decide_proposal))
         // Foreground push: per-device notification stream (#99).
         .route("/notifications/stream", get(notifications_stream))
@@ -13514,6 +13520,225 @@ fn proven_device(
         Some(axum::Extension(principal)) => ProvenDevice::from_principal(principal),
         None => ProvenDevice::none(),
     }
+}
+
+// ── PAI-8 P1: connecting a source ──────────────────────────────────────────
+//
+// Without these there is no way to create a `ContextSource`, and with no source
+// the ingest pipeline has nothing to ingest under -- so `context_items` stays
+// empty on every pond however well the rest of it works. `upsert_source` had no
+// caller at all until this.
+//
+// Section 3.4 lists these under "New surfaces" without assigning them a phase.
+// They are P1's, because P1's own sentence -- "the ingest pipeline with on-pond
+// sources only" -- presupposes that a source can exist.
+
+/// The context repository, same story as [`proposal_repo`]: built from the pool
+/// `AppState` already holds because `lib.rs` and `main.rs` were owned by other
+/// work. It takes the redactor because storage redacts on the way in.
+fn context_repo(state: &Arc<AppState>) -> pond_infra::sqlite_context::SqliteContextRepository {
+    // `RuleRedactor` is deterministic and stateless -- the same rules over the
+    // same text -- so constructing one here cannot disagree with the one
+    // `main.rs` holds. That is the only reason this is acceptable rather than a
+    // second source of truth; if it ever grows configuration, it belongs on
+    // `AppState` beside the rest.
+    pond_infra::sqlite_context::SqliteContextRepository::new(
+        state.db.system.clone(),
+        std::sync::Arc::new(pond_infra::rule_redactor::RuleRedactor::new()),
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct ConnectSourceRequest {
+    /// `sensor` or `camera` today. Anything else is refused by
+    /// `SourceKind::availability`, which quotes its own sentence about what is
+    /// missing.
+    kind: String,
+    /// The device this source follows -- a `device_id` for a sensor, a
+    /// `camera_id` for a camera. It is matched against the bus event, so a
+    /// value naming no device produces a source that never ingests anything.
+    provider: String,
+    /// Which conversation the caller is speaking in. The OWNER is resolved from
+    /// this and the caller's proven device; see below.
+    session_id: String,
+}
+
+/// The owner of a source is resolved, never supplied.
+///
+/// **This is the whole security decision of these routes.** A `profile_id` in
+/// the request body would be a client naming whose data this is -- the same hole
+/// PAI-1 P4 closed on `PUT /sessions/{id}/user`, and worse here, because every
+/// item the source ever produces inherits the owner and migration 0044 refuses
+/// to let it change afterwards. So the body has no `profile_id` field to send,
+/// and the owner comes from `resolve_turn_scope`, which is PAI-1's whole lattice.
+///
+/// `Household` and `Guest` are refused rather than defaulted to anybody:
+/// invariant 1 says every item has an owner, and invariant 2 says a `Guest` sees
+/// no context at all -- a guest who could CREATE a source would be writing into
+/// a member's corpus.
+async fn context_source_owner(
+    state: &Arc<AppState>,
+    session_id: &str,
+    device: &ProvenDevice,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    let scope = resolve_turn_scope(state, session_id, device).await;
+    match scope.owner_id() {
+        Some(id) => Ok(id.to_string()),
+        None => Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "a context source belongs to one household member, and this caller \
+                          could not be resolved to one",
+                "scope": format!("{scope:?}"),
+            })),
+        )),
+    }
+}
+
+/// `POST /api/v1/context/sources` -- connect a sensor or camera as personal context.
+async fn connect_context_source(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Json(body): Json<ConnectSourceRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    use pond_core::context::domain::{ContextSource, SourceKind, SourceParts, SourceStatus};
+
+    let device = proven_device(principal.as_ref());
+    let owner = context_source_owner(&state, &body.session_id, &device).await?;
+
+    let Some(kind) = SourceKind::parse(&body.kind) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("unknown source kind: {}", body.kind)})),
+        ));
+    };
+    // Refuse a kind whose connector does not exist, HERE, with the domain's own
+    // sentence. A source stored now would sit in the table looking connected and
+    // never produce anything.
+    let availability = kind.availability();
+    if availability != pond_core::context::domain::SourceAvailability::Landed {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": availability.refusal(), "kind": kind.as_str()})),
+        ));
+    }
+
+    let now = chrono::Utc::now();
+    // Deterministic id, so connecting the same device twice is an update rather
+    // than a second source racing the first for the same events.
+    let id = format!("{}:{}", kind.as_str(), body.provider.trim());
+    let source = ContextSource::from_parts(SourceParts {
+        id: id.clone(),
+        kind,
+        provider: body.provider.trim().to_string(),
+        profile_id: owner.clone(),
+        scopes: Vec::new(),
+        cursor: None,
+        last_sync: None,
+        status: SourceStatus::Connected,
+        secret_ref: None,
+        created_at: now,
+    })
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+
+    context_repo(&state)
+        .upsert_source(&source)
+        .await
+        .map_err(|e| {
+            // Migration 0044 REFUSES an update that moves a source's owner or kind,
+            // with a trigger, because every stored item is denormalised under both.
+            // That is a 409 and not a 500: the caller asked for something coherent
+            // and the pond is refusing it, which they can act on.
+            let moved_owner = e.to_string().contains("cannot change owner")
+                || e.to_string().contains("cannot change kind");
+            if moved_owner {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "this source already exists and belongs to somebody else, or is a \
+                                  different kind. Disconnect it first; its items go with it.",
+                    })),
+                )
+            } else {
+                tracing::warn!(error = %e, "could not store a context source");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "could not store the source"})),
+                )
+            }
+        })?;
+
+    Ok(Json(
+        json!({"id": id, "kind": kind.as_str(), "profile_id": owner}),
+    ))
+}
+
+/// `GET /api/v1/context/sources?session_id=X` -- the sources this caller may see.
+async fn list_context_sources(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Query(query): Query<ProposalCallerQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let device = proven_device(principal.as_ref());
+    // Scoped, not filtered afterwards: `list_sources` takes the scope, and
+    // `scope.rs` answers `Guest` with nothing.
+    let scope = resolve_turn_scope(&state, &query.session_id, &device).await;
+    let sources = context_repo(&state)
+        .list_sources(&scope)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "could not list context sources");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not read sources"})),
+            )
+        })?;
+
+    Ok(Json(json!({
+        "sources": sources
+            .iter()
+            .map(|s| json!({
+                "id": s.id(),
+                "kind": s.kind().as_str(),
+                "provider": s.provider(),
+                "profile_id": s.profile_id(),
+                "status": s.status().as_str(),
+            }))
+            .collect::<Vec<_>>()
+    })))
+}
+
+/// `DELETE /api/v1/context/sources/{id}?session_id=X` -- disconnect, and say how many items went.
+///
+/// PAI-8 invariant 6 is "disconnecting a source deletes its items by default,
+/// **and says how many**". `disconnect_source` returns the count for exactly
+/// that reason, so the number is in the response body rather than a log line: a
+/// caller that cannot report it cannot satisfy the invariant.
+async fn disconnect_context_source(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Path(id): Path<String>,
+    Query(query): Query<ProposalCallerQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let device = proven_device(principal.as_ref());
+    let scope = resolve_turn_scope(&state, &query.session_id, &device).await;
+    let removed = context_repo(&state)
+        .disconnect_source(&id, &scope)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "could not disconnect a context source");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not disconnect the source"})),
+            )
+        })?;
+
+    Ok(Json(json!({"id": id, "items_removed": removed})))
 }
 
 /// PAI-1 P9's attribution repository, built from the pool `AppState` already
