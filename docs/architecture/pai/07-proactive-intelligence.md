@@ -12,15 +12,24 @@ a thousand lines, and rather than bump them I have replaced them with the symbol
 buys about a week. Two claims did change and are marked in place: section 3.4's device-resolution
 chain does not exist in code, and the `main.rs` bus bridge has moved ~200 lines.
 
+**Re-verified again 2026-08-11 with P2.** One claim had gone false in two days and is corrected in
+place: **section 3.4's "that chain does not exist in code" is no longer true.** PAI-1 P9 landed
+migration 0043 on 2026-08-11, so `devices.profile_id` and `pairing_codes.profile_id` both exist and
+`DeviceAttribution` is the port over them. What is still true is the *consequence* — nothing
+constructs it, so P5 remains blocked — but the prerequisite has changed shape from "build the
+schema" to "wire the port", and a phase reading the old sentence would go and build a column that
+is already there.
+
 ---
 
 ## 1. What is true today
 
-### 1.1 There is an event bus, and P1 has widened it
+### 1.1 There is an event bus, and P1 and P2 have widened it
 
 **Rewritten 2026-08-10.** This section described a three-variant enum and ended "there is no time
 event, no presence event, no session event". P1 falsified all three sentences and left them
-standing; that is the claim-rot rule, so it is fixed here rather than noted.
+standing; that is the claim-rot rule, so it is fixed here rather than noted. **Updated again
+2026-08-11** for P2's variant.
 
 `shared/ports/event_bus.rs :: BusEvent`:
 
@@ -30,6 +39,7 @@ pub enum BusEvent {
     Camera(CameraEvent),
     Device(DeviceStateChanged),
     Time(TimeTick),               // PAI-7 P1 — one per local hour boundary
+    Presence(ProfilePresence),    // PAI-7 P2 — a named member arrived / left
     Session(SessionLifecycle),    // PAI-7 P1 — started / idle / resumed
 }
 ```
@@ -38,9 +48,12 @@ Still a closed enum, deliberately, so consumers "can pattern-match ergonomically
 an attribute map". `EventBus::publish` is non-blocking and infallible; `subscribe` returns a
 `Stream`. Adapter: `shared/services/in_process_event_bus.rs`.
 
-**The first three variants are device-shaped and the last two are not**, which is why
-`BusEvent::trigger_view` now returns `Option<TriggerEventView>` — `None` for `Time` and `Session` —
-and why `rules_engine.rs :: rules_to_fire` returns an empty fire list the moment it sees one. A
+**The first three variants are device-shaped and the last three are not**, which is why
+`BusEvent::trigger_view` now returns `Option<TriggerEventView>` — `None` for `Time`, `Presence` and
+`Session` — and why `rules_engine.rs :: rules_to_fire` returns an empty fire list the moment it
+sees one. Presence is the one where the temptation is real, and worse than for a clock tick: a
+person arriving genuinely looks like something a rule should fire on, so a "harmless" camera-family
+view would hand every household member's arrival to the automations somebody already wrote. A
 rule the API accepts with `device_id: None, signal: None` matches *anything* in its family, so a
 placeholder view would run the automations somebody wrote about their house on the hour, every
 hour. `TriggerEventView` is `#[non_exhaustive]` for that reason: outside pond-core the struct
@@ -48,10 +61,13 @@ literal does not compile, so a consumer cannot answer the `None` with a view of 
 compiler check, not a test, and it is the only guard at the rules engine's own decision point —
 `rules_to_fire` still has no test that feeds it a clock or session event (recorded gap, 2026-08-10).
 
-**Publishers (P1, `main.rs`):** `run_time_ticker` sleeps to the next wall-clock hour
+**Publishers (P1 and P2, `main.rs`):** `run_time_ticker` sleeps to the next wall-clock hour
 (`time_tick::secs_to_next_hour_from`, which takes the clock reading rather than a minute and a
-second, because two positional `u32`s swap silently inside a timer loop); `run_session_activity_observer`
-polls the session store every 60s and folds it through `ActivityObserver::poll`.
+second, because two positional `u32`s swap silently inside a timer loop);
+`run_session_activity_observer` polls the session store every 60s and folds it through
+**both** `ActivityObserver::poll` and `PresenceObserver::observe`. One task, one read, two
+observers — a second polling loop would read the same table on its own schedule and the two could
+disagree about which conversations exist.
 
 **A scheduled run is not a person.** Every `AgentPrompt` schedule fire and every rule
 `AgentPrompt` action creates a session row (`schedule_executors.rs`, `sched-{task_id}-{unix_ts}`),
@@ -63,6 +79,11 @@ synthetic presence cycle on an empty house, which is worse than no presence sign
 on it with confidence. The deny-list's completeness is itself a test
 (`pond-core/tests/session_origin_covers_every_minted_session.rs`), which fails when a file that
 mints session rows has no recorded origin.
+
+**And it applies to presence for a second reason (P2).** `PUT /sessions/{id}/user` binds whatever
+session id it is handed, including a `sched-` one, so an *attributed* cron fire is a row production
+can produce rather than a hypothetical. `PresenceObserver` refuses a non-`Human` origin before it
+resolves anybody.
 
 **Consumers: still none for the new variants.** The rules engine skips them and the bus-to-event-log
 bridge records them (`main.rs`, the task that does `event_bus.subscribe()` beside the
@@ -155,7 +176,9 @@ pub enum BusEvent {
     Camera(CameraEvent),
     Device(DeviceStateChanged),
     Time(TimeTick),                  // hourly, plus dawn/dusk/quiet-hours boundaries
-    Presence(ProfilePresence),       // a profile arrived or left (face, paired device, geofence)
+    Presence(ProfilePresence),       // a profile arrived or left. AS LANDED: face + explicit.
+                                     // Paired device reaches it only through the session row,
+                                     // and geofence does not exist — see the P2 stamp below.
     Session(SessionLifecycle),       // started, went idle, resumed after a gap
     Ingest(SourceUpdated),           // PAI-8's hook: new mail, new calendar item
 }
@@ -164,6 +187,88 @@ pub enum BusEvent {
 `Presence` is the one that makes proactivity feel personal rather than mechanical, and PAI-1's
 identification chain is exactly what produces it. `Session` is what tells the proposer the user is
 *available* — the difference between a helpful nudge and an interruption.
+
+#### AS LANDED — P2, 2026-08-11. Publisher only; the FACE and EXPLICIT rungs, no geofence.
+
+**What landed.** `PresenceTransition`, `ProfilePresence`, `PresenceEvidence`, `PresenceInputs` and
+`PresenceObserver` in `shared/domain/session_activity.rs`; `BusEvent::Presence` with its event-log
+projection and its `trigger_view` refusal; and the publisher, folded into the existing
+`run_session_activity_observer` poll in `main.rs`. No new migration, no new `Settings` field, no
+new port. Nothing consumes it — that is P4's, and P1's publishers-only rule is why these events
+are worth consuming at all.
+
+**It lives in P1's observer module rather than a module of its own**, because it is the same
+observation: the same poll of the same store, the same `SessionOrigin` filter, the same idle
+threshold. Splitting it would have produced exactly what `human_activity` was written as one
+function to prevent — two places where one gets fixed and the other does not.
+
+**Naming is delegated, not re-derived.** `PresenceObserver` never decides who anybody is: it hands
+the session row to PAI-1's `identity_resolution::resolve` and publishes only for
+`ProfileScope::Owner`. `Household` and `Guest` leave by the same door as an unattributed session,
+so invariants 4 and 5 are the resolver's existing behaviour rather than a second copy of it that
+can drift. `ProfilePresence.profile_id` is a `String` with no anonymous variant, which makes
+invariant 4 structural: this type cannot express "somebody is here".
+
+**The `paired_device` rung cannot reach a background poll, and the reason is worth writing down**
+because it looks like an oversight. `ResolutionInputs::paired_device_profile` wants the member
+owning the device that authenticated *this request*; a timer has no request and no token. PAI-1 P9
+landing `DeviceAttribution` did not change that. The rung still reaches presence — through the
+session row, the moment a handler binds one at `PairedDevice` strength — and the `source` on every
+event is what says which rung it was. So presence today is the **face** and **explicit** rungs:
+`POST /sessions/{id}/identify-user` and `PUT /sessions/{id}/user`.
+
+**Geofence: there is nothing, and I did not invent one.** Section 6 defers it, GOTG has no
+background location, and a `Geofence` variant on `IdentificationSource` with no producer would be
+the third correct-but-unreachable mechanism this programme is carrying.
+
+**What "arrived" and "departed" actually mean.** Presence is keyed on `sessions.updated_at` — when
+somebody last *spoke* — and never on when an attribution was written, because
+`set_session_identity` deliberately leaves `updated_at` alone. Three consequences, each of them a
+recorded trap in a new shape:
+
+- **A photograph is not a person in the room.** A face bound to a conversation nobody has touched
+  for three hours leaves the evidence stale, so it publishes nothing. That is the strongest defence
+  available from here; the identification edge itself (`/sessions/{id}/identify-user` takes a
+  multipart image from any caller) is PAI-1's anti-spoofing problem, not this observer's, and until
+  it is solved the `source` field is how a consumer knows to discount the claim.
+- **A restart is not everybody arriving.** The first observation records the level and publishes
+  nothing, exactly as `ActivityObserver::seeded_from` does for conversations. The pond restarts on
+  every deploy. Cost, stated rather than hidden: a member who genuinely arrives during the first
+  poll after boot is recorded rather than announced.
+- **A departure is a decision, because nothing observes one.** No geofence, no door sensor bound to
+  a person, no camera that reports an empty room — so absence is the evidence ageing past the same
+  `INACTIVITY_THRESHOLD_SECS` that decides `SessionPhase::Idle`, evaluated on the same poll. One
+  pond, one definition of gone quiet; two would have the bus saying a member is still here after it
+  had already said the pond went idle. It lags by up to threshold + 60s, and `Departed` means "the
+  pond stopped being able to say this member is here", including when a binding is simply released.
+
+Re-identification is not an arrival in any of its four shapes: the same session polled again, a
+second conversation opened by the same member, an upgrade from a face match to an explicit binding,
+and two conversations naming one member in one poll (strongest rung wins, then the more recent).
+
+**Reachability, stated as a fact rather than a caveat.** The publisher is unconditionally spawned
+in `run_server` and runs every 60 seconds on a default install, so unlike P3a there is no inert
+layer here. Its *input* is the constraint: presence requires an attributed session, and
+**no shipped surface attributes one**. `pond-desktop/src` calls exactly one profile route
+(`GET /api/v1/profiles`); the two binding routes are reachable over REST by a paired client, and
+the face one additionally needs a face-recognition adapter configured. So on a stock install with
+the shipped app, this publishes nothing until PAI-1's identification gets a caller — which is
+PAI-1's outstanding work, not a gap in this phase, and it is the same reason P4 will have nobody to
+address until it lands.
+
+**Verification.** Sixteen unit tests, and nine mutations run against them (each applied, run,
+reverted): deleting the origin filter, deleting the freshness check, weakening it from `>=` to `>`,
+replacing the resolver with the session row's raw `profile_id`, mapping `Household`/`Guest` to the
+primary member the way `routes.rs :: profile_context_for` does, removing the baseline, giving
+presence a camera-family `trigger_view`, logging it below `Sensitive`, inverting the
+strongest-rung tie-break, and removing departures. Each failed with a message naming the defect.
+Two things that mutation pass revealed and that a later change should know: the
+`Household`/`Guest` tests are only load-bearing against a mutation that supplies a *name* for those
+scopes (with an unattributed row there is no name to leak, so the raw-`profile_id` mutation slips
+past them and is caught instead by `a_profile_id_with_no_source_is_not_presence`); and the
+`seeded()` helper's own baseline assertion is vacuous wherever it is called with an empty session
+list, so `a_restart_does_not_announce_the_household_as_arriving` is the only test that pins the
+baseline.
 
 ### 3.2 Propose, do not act
 
@@ -328,18 +433,25 @@ Proposals are delivered to **the profile's devices**, not broadcast. That means:
   `sqlite_notification_queue` (so a phone that was off gets it on reconnect) and `fcm_push_relay`
   (so a backgrounded phone wakes and fetches the content locally, with nothing sensitive crossing
   Google's infrastructure — the existing design is already right for this).
-- Device resolution comes from PAI-1: profile → paired devices → push tokens. **That chain does not
-  exist in code, re-verified 2026-08-09, and this is P5's real prerequisite rather than a detail.**
-  `PushToken` is `{device_id, token, platform, updated_at}` and `PairingCode` is
-  `{code, expires_at}`; neither carries a `profile_id`, and no migration adds one. PAI-1 is stamped
-  COMPLETE, so the ledger row will not warn you — the missing rung is recorded separately in
-  `00-checklist.md`'s 2026-08-05 entry, which says device pairing capturing a household member "gets
-  its own phase" and that `paired_device_profile` and PAI-7's "that profile's devices" both become
-  live when it lands. Until then invariant 4 (proposals are addressed to a profile, never broadcast)
-  has no mechanism at the delivery end: `broadcast_notification_sender.rs` says in its own doc
-  comment that targeted `send()` is exercised by nothing and every production producer calls
-  `broadcast()`. Landing P5 against the current types would either broadcast a targeted proposal or
-  silently deliver nothing.
+- Device resolution comes from PAI-1: profile → paired devices → push tokens. **Corrected
+  2026-08-11 — that chain now exists in storage.** It did not on 2026-08-09, and this paragraph said
+  so; PAI-1 P9 landed migration 0043 two days later, adding `profile_id` to `devices` (ON DELETE SET
+  NULL) and to `pairing_codes`, captured at code **issuance** so a pairing client cannot name its
+  own member. `DeviceAttribution` is the port: `device_profile` for the identity direction,
+  `devices_for_profile` / `push_tokens_for_profile` for the delivery one, and an unattributed device
+  is deliberately returned by neither — deliver to nobody, never to everybody. `PushToken` still has
+  no `profile_id` and deliberately so: one writable source of truth, reached through
+  `push_tokens.device_id`.
+
+  **What has not changed is P5's blockage, only its shape.** Nothing constructs
+  `SqliteDeviceAttribution` — `crates/pond-infra/tests/device_profile_rung_is_not_wired_yet.rs`
+  asserts that on every run and is written to fail the day it stops being true — and no route
+  captures a member at issuance yet. So P5's prerequisite is now "wire the port and give issuance
+  the question", not "build the schema", and a phase reading the old sentence would go and add a
+  column that is already there. Until then invariant 4 has no mechanism at the delivery end:
+  `broadcast_notification_sender.rs` says in its own doc comment that targeted `send()` is exercised
+  by nothing and every production producer calls `broadcast()`. Landing P5 against unattributed
+  devices would silently deliver nothing.
 
 **Unprompted speech** is opt-in and tightly gated: only when that profile is identified as present,
 only outside quiet hours, only for categories the user enabled, never mid-conversation, and never
@@ -377,7 +489,13 @@ memory extraction, decay and consolidation already exist.
   the observer publishes nothing about sessions the pond minted for itself (`SessionOrigin`), and
   `rules_to_fire`'s refusal to act on a viewless event is guarded by `#[non_exhaustive]` rather
   than by a test at that call site.
-- **P2** `Presence` events from PAI-1's identification chain.
+- **P2** `Presence` events from PAI-1's identification chain. **LANDED 2026-08-11.** See the P2
+  stamp in 3.1 for what is true now. Four things a later phase must not assume: presence is the
+  **face and explicit** rungs only, and there is no geofence source of any kind; a `Departed` is the
+  pond's own timeout, not an observation of somebody leaving; a member who is present when the
+  process starts is recorded rather than announced, so P4 must read the *absence* of an `Arrived` as
+  "no edge crossed" and never as "nobody is home"; and the whole thing is silent on a stock install
+  until PAI-1's identification routes get a caller.
 - **P3** `Proposal` domain + persistence in the drafts table; proposal UI in the existing drafts
   surface.
 - **P4** The `proactive-reviewer` role, gated by the `should_run` shape from
@@ -408,7 +526,11 @@ memory extraction, decay and consolidation already exist.
   the honest first step; inferring rules unsupervised is a much larger claim.
 - **Cross-household coordination.** One pond, one household.
 - **Geofencing.** Needs GOTG background location, which is a PAI-8 concern and a battery
-  conversation.
+  conversation. **Still true after P2, and worth saying in the positive:** there is no geofence in
+  this tree — no location source, no `Geofence` identification rung, nothing that could produce one.
+  A presence event never means "left the house"; it means the pond's evidence about a member went
+  stale. Anything downstream that reads it as geography is reading something that was never
+  measured.
 - **Anomaly detection on camera events.** Genuinely valuable and genuinely a research task; the
   classifier currently emits a top label above 0.5 confidence and nothing models what is *normal*
   for this home.
