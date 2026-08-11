@@ -406,11 +406,28 @@ impl LocalInferenceLlmAdapter {
     /// The lever is `KV_KIB_PER_TOKEN`, and that is precisely the one that needs
     /// the device.
     ///
-    /// **The check that settles it is one line on the device**: load E4B and
-    /// read the two `llama_kv_cache: size` lines. Two caches with a fixed second
-    /// one means the measured slope holds, E4B's real ceiling is ~84k tokens,
-    /// and both `KV_KIB_PER_TOKEN` and `MAX_CTX` can rise. One cache covering 42
-    /// layers means the pessimistic slope is right and nothing moves.
+    /// **Half-settled on the device, 2026-08-12, by reading the vendored source
+    /// rather than running it.** The mechanism is present: 0.1.146 ships
+    /// `llama.cpp/src/llama-kv-cache-iswa.cpp`, and its `llama-model.cpp` reads
+    /// `LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN` into `hparams.swa_layers` for
+    /// the `gemma4` arch — the same metadata key E4B's GGUF declares. So the
+    /// device takes the same split-cache path the Mac measurement was taken on,
+    /// and the no-iswa worst case this slope defends against is very probably
+    /// not the world we are in.
+    ///
+    /// **Very probably is not measured, and this constant can OOM a board**, so
+    /// it has not moved. What remains is to see the ALLOCATION rather than the
+    /// code path: load E4B and read the `llama_kv_cache: size` lines. Two caches
+    /// with a fixed second one confirms 16 KiB/token + 40 MiB, puts E4B's real
+    /// ceiling near 84k tokens, and lets both `KV_KIB_PER_TOKEN` and `MAX_CTX`
+    /// rise.
+    ///
+    /// Two practical notes for whoever does it. The pond runs as a live user
+    /// service (`goose-in-a-pond.service`, port 8080) and its provider
+    /// initialises lazily, so a running pond that has not chatted has logged
+    /// nothing to read. And goose's `tracing_setup.rs` carves `llama-cpp-2` down
+    /// to ERROR, so llama.cpp's own log needs `RUST_LOG` raised or the lines
+    /// never appear at all.
     ///
     /// `apply_jetson_settings` re-stamps the registry at every provider init,
     /// so this cannot be worked around by editing registry.json — it has to be
