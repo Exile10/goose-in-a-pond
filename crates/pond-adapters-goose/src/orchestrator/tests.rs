@@ -3149,3 +3149,298 @@ fn the_child_loop_slice_is_the_child_loop() {
         "the child-loop slice ran past the end of run_child_agent"
     );
 }
+
+// ── PAI-6 P8: background delegations ────────────────────────────────────────
+//
+// Two things decide whether this is real: that it is REFUSED where the model is
+// on this device, and that cancellation still reaches a run which by definition
+// outlives the turn that asked for it.
+
+/// A spec that asked to run in the background, for a named parent session.
+fn background_spec_for(role: &AgentRole, parent_groups: &[&str], parent: &str) -> TaskSpec {
+    DelegationAuthority::root(
+        parent,
+        ProfileScope::Household,
+        parent_groups.iter().map(|g| g.to_string()).collect(),
+    )
+    .delegate(
+        role,
+        TaskRequest {
+            role: role.name().to_string(),
+            instructions: "what is the weather".to_string(),
+            inputs: serde_json::Value::Null,
+            background: true,
+        },
+    )
+    .expect("fixture delegation is authorised")
+}
+
+fn weather_env(provider: &str) -> ChildEnvironment {
+    env_with(
+        provider,
+        parent_tools(&[("giap-weather", &["get_forecast"])]),
+    )
+}
+
+/// **The refusal, against a local provider fixture.** Quantified over the shared
+/// list, and asserted on the message rather than on the error type, because what
+/// has to be true is that a 2-4B model reads it and does something else.
+#[tokio::test]
+async fn a_background_run_is_refused_on_every_provider_that_runs_on_this_device() {
+    let _serial = ONE_RUN_AT_A_TIME.lock().await;
+    for provider in ON_DEVICE_PROVIDERS {
+        let runner = Arc::new(FakeRunner::new(weather_env(provider)));
+        let state = runner.state.clone();
+        let (orchestrator, _lease, _token) =
+            live_turn_for("p8-refusal", runner as Arc<dyn ChildRunner>);
+        let spec = background_spec_for(
+            &role("researcher", &["giap-weather"]),
+            &["giap-weather"],
+            "p8-refusal",
+        );
+
+        let refusal = orchestrator
+            .spawn(spec)
+            .await
+            .expect_err("a background delegation on this device must be refused")
+            .to_string();
+        assert!(
+            refusal.contains(provider) && refusal.contains("without `background`"),
+            "{provider}: the refusal neither names the provider nor says what to do instead, so \
+             the model will retry the identical call: {refusal}"
+        );
+        // Refused BEFORE the engine was touched: no child session was opened, so
+        // there is none to leak and none to release.
+        assert!(
+            state.opened.lock().unwrap().is_empty(),
+            "{provider}: a refused background delegation still created a child engine session"
+        );
+        assert!(
+            state.plans.lock().unwrap().is_empty(),
+            "{provider}: a refused background delegation ran anyway"
+        );
+        assert_eq!(
+            process_device_ledger().reserved_fraction("p8-refusal"),
+            0.0,
+            "{provider}: a refused background delegation left a reservation behind, so the \
+             parent's history budget stays shrunk for the rest of the conversation"
+        );
+    }
+}
+
+/// Vacuity control for the refusal, and the half that makes P8 a feature: the
+/// same call on a hosted provider RETURNS before the child has finished, with a
+/// non-terminal run the caller can poll.
+#[tokio::test]
+async fn a_background_run_returns_before_the_child_finishes_and_can_be_polled() {
+    let _serial = ONE_RUN_AT_A_TIME.lock().await;
+    let runner = Arc::new(FakeRunner::new(weather_env("anthropic")).holding_for(120));
+    let state = runner.state.clone();
+    let (orchestrator, _lease, _token) =
+        live_turn_for("p8-background", runner as Arc<dyn ChildRunner>);
+    let spec = background_spec_for(
+        &role("researcher", &["giap-weather"]),
+        &["giap-weather"],
+        "p8-background",
+    );
+    let task_id = spec.id().to_string();
+
+    let started = std::time::Instant::now();
+    let run = orchestrator.spawn(spec).await.expect("hosted, so allowed");
+    let returned_in = started.elapsed();
+
+    assert!(
+        !run.status.is_terminal(),
+        "a background spawn returned a finished run, so it waited for the child after all: {:?}",
+        run.status
+    );
+    assert_eq!(
+        run.result_for_parent(),
+        None,
+        "a run that has not finished must hand the parent no answer"
+    );
+    assert!(
+        returned_in < std::time::Duration::from_millis(100),
+        "spawn took {returned_in:?} against a child that holds for 120ms, so it is still \
+         synchronous"
+    );
+
+    // And it really did run, and `poll` really does see it get there.
+    for _ in 0..100 {
+        if orchestrator
+            .poll(&task_id)
+            .await
+            .unwrap()
+            .is_some_and(|r| r.status.is_terminal())
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let finished = orchestrator
+        .poll(&task_id)
+        .await
+        .unwrap()
+        .expect("the run is still tracked");
+    assert_eq!(finished.status, TaskStatus::Completed);
+    assert_eq!(finished.result_for_parent(), Some("the weather is fine"));
+    assert_eq!(
+        state.plans.lock().unwrap().len(),
+        1,
+        "the background task did not drive the child exactly once"
+    );
+    assert_eq!(
+        process_device_ledger().reserved_fraction("p8-background"),
+        0.0,
+        "the background child's claim on its parent's history budget outlived the child"
+    );
+}
+
+/// **Invariant 5, at the point where P8 changes its shape.** A background run
+/// does NOT inherit its parent turn's token — it cannot, or it would die with
+/// the turn — so this asserts the thing that replaces it: ending the turn leaves
+/// it running, and `cancel_children_of` stops it.
+#[tokio::test]
+async fn a_background_run_survives_its_turn_and_is_still_cancellable_by_its_session() {
+    let _serial = ONE_RUN_AT_A_TIME.lock().await;
+    let runner = Arc::new(FakeRunner::new(weather_env("anthropic")).holding_for(400));
+    let (orchestrator, lease, turn_token) =
+        live_turn_for("p8-outlives", runner as Arc<dyn ChildRunner>);
+    let spec = background_spec_for(
+        &role("researcher", &["giap-weather"]),
+        &["giap-weather"],
+        "p8-outlives",
+    );
+    let task_id = spec.id().to_string();
+    orchestrator.spawn(spec).await.expect("hosted, so allowed");
+
+    // The parent's turn ends, exactly as `chat_stream` ends one: the token is
+    // cancelled and the authority lease is dropped.
+    turn_token.cancel();
+    drop(lease);
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let still = orchestrator.poll(&task_id).await.unwrap().unwrap();
+    assert!(
+        !still.status.is_terminal(),
+        "the background run died with the turn that asked for it, which makes it not a \
+         background run: {:?}",
+        still.status
+    );
+
+    // ... and the cascade that owns it now is the SESSION's.
+    let stopped = orchestrator
+        .cancel_children_of("p8-outlives")
+        .await
+        .unwrap();
+    assert_eq!(stopped, 1, "cancel_children_of did not reach the run");
+    for _ in 0..100 {
+        if orchestrator
+            .poll(&task_id)
+            .await
+            .unwrap()
+            .is_some_and(|r| r.status.is_terminal())
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let ended = orchestrator.poll(&task_id).await.unwrap().unwrap();
+    assert_eq!(
+        ended.status,
+        TaskStatus::Cancelled,
+        "a cancelled background run must not look like a completion"
+    );
+    assert_eq!(ended.result_for_parent(), None);
+}
+
+/// Vacuity control for the test above. Without it, "a background run survives
+/// the turn" would pass against an implementation where NOTHING is derived from
+/// the turn's token any more — including for synchronous children, which is
+/// invariant 5's actual mechanism.
+#[tokio::test]
+async fn a_synchronous_run_still_dies_with_the_turn_that_asked_for_it() {
+    let _serial = ONE_RUN_AT_A_TIME.lock().await;
+    let runner = Arc::new(FakeRunner::new(weather_env("anthropic")).holding_for(400));
+    let (orchestrator, _lease, turn_token) =
+        live_turn_for("p8-sync-dies", runner as Arc<dyn ChildRunner>);
+    let spec = spec_for_parent(
+        &role("researcher", &["giap-weather"]),
+        &["giap-weather"],
+        "p8-sync-dies",
+    );
+
+    let driver = tokio::spawn({
+        let orchestrator = orchestrator.clone();
+        async move { orchestrator.spawn(spec).await.unwrap() }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    turn_token.cancel();
+
+    let run = driver.await.expect("the synchronous run returns");
+    assert_eq!(
+        run.status,
+        TaskStatus::Cancelled,
+        "cancelling a parent turn no longer cancels the child it is waiting on"
+    );
+}
+
+/// `cancel(task_id)` reaches a background run too — the explicit case, as
+/// distinct from the session-wide one.
+#[tokio::test]
+async fn a_background_run_can_be_cancelled_by_its_own_id() {
+    let _serial = ONE_RUN_AT_A_TIME.lock().await;
+    let runner = Arc::new(FakeRunner::new(weather_env("anthropic")).holding_for(400));
+    let (orchestrator, _lease, _token) = live_turn_for("p8-by-id", runner as Arc<dyn ChildRunner>);
+    let spec = background_spec_for(
+        &role("researcher", &["giap-weather"]),
+        &["giap-weather"],
+        "p8-by-id",
+    );
+    let task_id = spec.id().to_string();
+    orchestrator.spawn(spec).await.expect("hosted, so allowed");
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+    orchestrator.cancel(&task_id).await.unwrap();
+    for _ in 0..100 {
+        if orchestrator
+            .poll(&task_id)
+            .await
+            .unwrap()
+            .is_some_and(|r| r.status.is_terminal())
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        orchestrator.poll(&task_id).await.unwrap().unwrap().status,
+        TaskStatus::Cancelled
+    );
+}
+
+/// A background run still has to have been authorised by a LIVE turn. The flag
+/// is a mode, not a way past PAI-6 P3's refusal.
+#[tokio::test]
+async fn a_background_run_still_needs_a_live_parent_turn() {
+    let _serial = ONE_RUN_AT_A_TIME.lock().await;
+    let runner = Arc::new(FakeRunner::new(weather_env("anthropic")));
+    let state = runner.state.clone();
+    let (orchestrator, lease, _token) = live_turn_for("p8-no-turn", runner as Arc<dyn ChildRunner>);
+    let spec = background_spec_for(
+        &role("researcher", &["giap-weather"]),
+        &["giap-weather"],
+        "p8-no-turn",
+    );
+    drop(lease);
+
+    let refusal = orchestrator
+        .spawn(spec)
+        .await
+        .expect_err("no live turn holds the authority")
+        .to_string();
+    assert!(
+        refusal.contains("already ended"),
+        "expected the stale-parent refusal, got: {refusal}"
+    );
+    assert!(state.opened.lock().unwrap().is_empty());
+}

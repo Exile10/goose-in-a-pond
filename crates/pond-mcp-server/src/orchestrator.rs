@@ -91,6 +91,20 @@ pub struct DelegateParams {
     pub instructions: Option<String>,
     /// Optional structured inputs, passed through to the agent unchanged.
     pub inputs: Option<serde_json::Value>,
+    /// Run without waiting for the answer. Only on a pond whose model runs
+    /// somewhere else; on this device it is refused. Default false.
+    ///
+    /// **Typed as a `Value` and schema'd as a boolean, on purpose.** Declaring
+    /// it `Option<bool>` would make `{"background": "true"}` — which small
+    /// models emit constantly — an rmcp deserialization failure of the whole
+    /// call, and an MCP protocol error is precisely what this module avoids: it
+    /// makes a small model retry the identical bad call. As a `Value` every
+    /// spelling reaches [`into_request`], the common ones are recovered like the
+    /// aliases beside them, and anything else is refused by [`TaskRequest`] with
+    /// a sentence naming the field.
+    #[serde(default)]
+    #[schemars(with = "Option<bool>")]
+    pub background: Option<serde_json::Value>,
     /// Catch-all for unexpected fields.
     #[serde(flatten)]
     #[schemars(skip)]
@@ -136,6 +150,17 @@ fn into_request(mut params: DelegateParams) -> Result<TaskRequest, Refusal> {
     if let Some(inputs) = params.inputs.take() {
         obj.insert("inputs".into(), inputs);
     }
+    if let Some(background) = params.background.take() {
+        // Refused HERE rather than by `TaskRequest`, because serde's own type
+        // error for a struct field does not name the field: "invalid type:
+        // string, expected a boolean" tells a 2-4B model nothing it can act on.
+        let Some(background) = coerce_bool(&background) else {
+            return Err(Refusal::Malformed(format!(
+                "`background` must be true or false, not `{background}`"
+            )));
+        };
+        obj.insert("background".into(), serde_json::Value::Bool(background));
+    }
     // Everything the model sent that is not one of the three. Left in so
     // `TaskRequest` refuses it rather than this function dropping it.
     for (k, v) in params.extra {
@@ -144,6 +169,62 @@ fn into_request(mut params: DelegateParams) -> Result<TaskRequest, Refusal> {
 
     serde_json::from_value::<TaskRequest>(serde_json::Value::Object(obj))
         .map_err(|e| Refusal::Malformed(e.to_string()))
+}
+
+/// The wire shape of a `check_task` call — PAI-6 P8.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct CheckTaskParams {
+    /// The id you were given when you started the task.
+    pub task_id: Option<String>,
+    /// Catch-all, so an invented argument name can be recovered rather than
+    /// costing a turn.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Argument names a small model invents for `task_id`.
+///
+/// Unlike [`ROLE_ALIASES`] there is nothing here that could widen anything —
+/// the id names a run, and [`authorise_task`] decides whether the caller may see
+/// it whatever the id turned out to be.
+const TASK_ID_ALIASES: [&str; 4] = ["id", "task", "taskId", "task-id"];
+
+/// Pull the task id out of a `check_task` call, or refuse.
+///
+/// A blank or missing id is refused rather than defaulted to anything — there is
+/// no sensible "the last one", and inventing one would answer a question the
+/// caller did not ask.
+pub fn check_task_id(mut params: CheckTaskParams) -> Result<String, Refusal> {
+    let id = params
+        .task_id
+        .take()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .or_else(|| take_alias(&mut params.extra, &TASK_ID_ALIASES));
+    id.ok_or_else(|| {
+        Refusal::Malformed(
+            "check_task needs the `task_id` you were given when the task started".to_string(),
+        )
+    })
+}
+
+/// The spellings of `true` and `false` a small model actually emits.
+///
+/// Recovery, not tolerance: anything NOT recognised answers `None`, and the
+/// caller refuses with a sentence naming the field. Coercing an unrecognised
+/// value to `false` would be the silent default this programme treats as a bug —
+/// the caller asked for something and was told nothing.
+fn coerce_bool(value: &serde_json::Value) -> Option<bool> {
+    match value {
+        serde_json::Value::Bool(b) => Some(*b),
+        serde_json::Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "y" | "1" => Some(true),
+            "false" | "no" | "n" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Remove the first present alias, if it holds a non-blank string.
@@ -193,6 +274,20 @@ pub enum Refusal {
     Narrowing(String),
     /// The orchestrator refused or failed to start the run.
     SpawnFailed(String),
+    /// `check_task` was given an id this conversation has no task by.
+    ///
+    /// **Two inputs land here and they must be indistinguishable**, for the same
+    /// reason [`Unauthorised`](Self::Unauthorised)'s four are: an id that no run
+    /// ever had, and an id belonging to ANOTHER conversation's run. A caller
+    /// that could tell those apart could enumerate the ids of delegations it was
+    /// not party to and learn that they exist. The trace separates them; the
+    /// message does not.
+    UnknownTask {
+        task_id: String,
+        trace: &'static str,
+    },
+    /// The orchestrator could not be asked.
+    TaskLookupFailed(String),
 }
 
 impl Refusal {
@@ -213,10 +308,10 @@ impl Refusal {
                  delegated agent may not delegate again. Finish the task you were given."
                 .to_string(),
             Refusal::Malformed(detail) => format!(
-                "That is not a valid delegation: {detail}. Call delegate with exactly two \
-                 things -- `role` (the exact name of a saved role) and `instructions` (what it \
-                 should do). You cannot choose the agent's permissions, tools or identity; they \
-                 are derived from yours."
+                "That is not a valid delegation: {detail}. Call delegate with `role` (the exact \
+                 name of a saved role) and `instructions` (what it should do), and nothing else \
+                 besides the optional `inputs` and `background`. You cannot choose the agent's \
+                 permissions, tools or identity; they are derived from yours."
             ),
             Refusal::UnknownRole(role) => format!(
                 "There is no saved role named `{role}` on this device, so there is nobody to \
@@ -239,6 +334,15 @@ impl Refusal {
                 "The delegated agent could not be started: {detail}. Do the work yourself and \
                  tell the user."
             ),
+            // ONE string for both unknown-task inputs. See the variant's doc.
+            Refusal::UnknownTask { .. } => "There is no delegated task by that id in this \
+                 conversation. If you started one, use the id you were given; otherwise there is \
+                 nothing to check."
+                .to_string(),
+            Refusal::TaskLookupFailed(detail) => format!(
+                "The delegated task could not be checked ({detail}). Tell the user, and do not \
+                 guess at what it found."
+            ),
         }
     }
 
@@ -255,6 +359,8 @@ impl Refusal {
             Refusal::RoleLookupFailed(_) => "role_lookup_failed",
             Refusal::Narrowing(_) => "narrowing_refused",
             Refusal::SpawnFailed(_) => "spawn_failed",
+            Refusal::UnknownTask { trace, .. } => trace,
+            Refusal::TaskLookupFailed(_) => "task_lookup_failed",
         }
     }
 }
@@ -352,6 +458,38 @@ pub fn decide(
         .map_err(|e| Refusal::Narrowing(e.to_string()))
 }
 
+/// Whose task is this, and may this caller see it? — PAI-6 P8.
+///
+/// **The scoping is the substance and it is not incidental.**
+/// `Orchestrator::poll` is keyed by task id alone, and a task id is a v4 UUID
+/// the model was told — so without this, a `check_task` call could read back the
+/// result of a delegation started in ANOTHER conversation, which on this pond
+/// means another household member's. `TaskRun.parent_session_id` is the GIAP
+/// session, and the caller's is the one PAI-6 P3 resolved from the engine's own
+/// `_meta`; a match is the only thing that permits an answer.
+///
+/// A foreign task and a nonexistent one produce the same refusal, deliberately:
+/// see [`Refusal::UnknownTask`].
+pub fn authorise_task(
+    run: Option<TaskRun>,
+    caller_session_id: &str,
+    task_id: &str,
+) -> Result<TaskRun, Refusal> {
+    let Some(run) = run else {
+        return Err(Refusal::UnknownTask {
+            task_id: task_id.to_string(),
+            trace: "no_such_task",
+        });
+    };
+    if run.parent_session_id != caller_session_id {
+        return Err(Refusal::UnknownTask {
+            task_id: task_id.to_string(),
+            trace: "task_of_another_session",
+        });
+    }
+    Ok(run)
+}
+
 /// What the parent is told about a finished run.
 ///
 /// Reads the answer through [`TaskRun::result_for_parent`] and never through
@@ -418,7 +556,10 @@ Hand a piece of work to a saved specialist agent and wait for what it finds. Giv
 (the exact name of a saved role on this device) and `instructions` (what it should do). The \
 agent runs with a NARROWER set of tools and permissions than you have -- derived from yours, \
 never chosen -- so you cannot ask for its scope, tools or identity. Use it for work that would \
-otherwise take you many steps; do simple things yourself.")]
+otherwise take you many steps; do simple things yourself. Set `background` to true only for \
+long work you do not need the answer to right now: you get a task id back instead of an answer \
+and check it later with check_task, and on a pond that runs its model on the device itself this \
+is refused, because there one agent can work at a time.")]
     async fn delegate(
         &self,
         ctx: RequestContext<RoleServer>,
@@ -485,12 +626,71 @@ otherwise take you many steps; do simple things yourself.")]
             groups = ?spec.tool_groups(),
             depth = spec.depth().get(),
             max_turns = spec.max_turns(),
+            background = spec.background(),
         );
         let run = deps
             .orchestrator
             .spawn(spec)
             .await
             .map_err(|e| Refusal::SpawnFailed(e.to_string()))?;
+        Ok(describe_run(&run))
+    }
+
+    #[tool(description = "\
+Check on a delegated agent you started earlier with delegate and `background`. Give it the \
+`task_id` you were told. It answers with what that agent is doing, or with what it found if it \
+has finished. You can only check tasks started in this conversation.")]
+    async fn check_task(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        params: Parameters<CheckTaskParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("check_task");
+        let text = match self.run_check(&ctx.meta, params.0).await {
+            Ok(text) => text,
+            Err(refusal) => {
+                tracing::warn!(
+                    target: "giap::trace",
+                    kind = "check_task_refused",
+                    reason = refusal.trace(),
+                    "a check_task call was refused"
+                );
+                refusal.message()
+            }
+        };
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    /// The whole of `check_task`, with the one I/O step in the middle.
+    ///
+    /// It authorises the CALLER exactly as `delegate` does before it looks
+    /// anything up — a guest, a subagent and a caller with no live turn are
+    /// refused here too, and for the same reasons — and then authorises the
+    /// TASK, which is the part that is this tool's own.
+    async fn run_check(
+        &self,
+        meta: &rmcp::model::Meta,
+        params: CheckTaskParams,
+    ) -> Result<String, Refusal> {
+        let Some(deps) = &self.deps else {
+            return Err(Refusal::Unauthorised {
+                trace: "deps_not_installed",
+            });
+        };
+        let Some(session) = crate::session_from_meta(meta) else {
+            return Err(Refusal::Unauthorised {
+                trace: "no_engine_session",
+            });
+        };
+        let authority = authorise(deps.authorities.authority_for_engine_session(&session))?;
+
+        let task_id = check_task_id(params)?;
+        let run = deps
+            .orchestrator
+            .poll(&task_id)
+            .await
+            .map_err(|e| Refusal::TaskLookupFailed(e.to_string()))?;
+        let run = authorise_task(run, authority.session_id(), &task_id)?;
         Ok(describe_run(&run))
     }
 }
@@ -915,6 +1115,172 @@ mod tests {
         // describe_run never quoting anything.
         let completed = describe_run(&run_with(TaskStatus::Completed, Some(SECRET)));
         assert!(completed.contains(SECRET));
+    }
+
+    // ── background + check_task (PAI-6 P8) ─────────────────────────────────
+
+    #[test]
+    fn a_delegation_is_synchronous_unless_the_caller_asks_otherwise() {
+        let request = into_request(params(serde_json::json!({
+            "role": "researcher",
+            "instructions": "go"
+        })))
+        .unwrap();
+        assert!(
+            !request.background,
+            "a caller that said nothing about background got a run that outlives its turn"
+        );
+    }
+
+    /// The spellings a 2-4B model actually emits. Declaring the field
+    /// `Option<bool>` would make every one of these an rmcp deserialization
+    /// failure of the whole call — a protocol error, which is the thing this
+    /// module exists to avoid.
+    #[test]
+    fn the_boolean_spellings_a_small_model_emits_are_recovered() {
+        for (spelling, expected) in [
+            (serde_json::json!(true), true),
+            (serde_json::json!("true"), true),
+            (serde_json::json!("True"), true),
+            (serde_json::json!("yes"), true),
+            (serde_json::json!("1"), true),
+            (serde_json::json!(false), false),
+            (serde_json::json!("false"), false),
+            (serde_json::json!("no"), false),
+        ] {
+            let request = into_request(params(serde_json::json!({
+                "role": "researcher",
+                "instructions": "go",
+                "background": spelling
+            })))
+            .unwrap_or_else(|e| panic!("`background: {spelling}` was not recovered: {e:?}"));
+            assert_eq!(request.background, expected, "background: {spelling}");
+        }
+    }
+
+    /// The other direction, and the one that matters: an unrecognised value is
+    /// REFUSED with a sentence naming the field, never coerced to `false`. A
+    /// caller that asked for something and was silently given the opposite has
+    /// no way to find out.
+    #[test]
+    fn an_unreadable_background_value_refuses_rather_than_defaulting() {
+        for nonsense in [
+            serde_json::json!("later"),
+            serde_json::json!(7),
+            serde_json::json!({"when": "later"}),
+        ] {
+            let refusal = into_request(params(serde_json::json!({
+                "role": "researcher",
+                "instructions": "go",
+                "background": nonsense
+            })))
+            .unwrap_err();
+            assert!(
+                matches!(refusal, Refusal::Malformed(_)),
+                "`background: {nonsense}` was accepted"
+            );
+            assert!(
+                refusal.message().contains("background"),
+                "the refusal does not name the field, so the model cannot correct it: {}",
+                refusal.message()
+            );
+        }
+    }
+
+    fn run_of(session: &str, id: &str) -> TaskRun {
+        TaskRun {
+            id: id.into(),
+            role: "researcher".into(),
+            parent_session_id: session.into(),
+            status: TaskStatus::Completed,
+            result: Some("the bins go out on Thursday".into()),
+            error: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+        }
+    }
+
+    /// **The scoping, which is what stops `check_task` being a read of anyone
+    /// else's delegation.** `Orchestrator::poll` is keyed by task id alone, and
+    /// an id is a UUID the model was told — so on a household pond, without
+    /// this, one member's conversation could read back another's result.
+    #[test]
+    fn a_task_belonging_to_another_conversation_is_not_readable() {
+        const SECRET: &str = "the bins go out on Thursday";
+        let theirs = run_of("someone-elses-session", "task-1");
+        let refusal = authorise_task(Some(theirs), "my-session", "task-1").unwrap_err();
+        assert!(
+            matches!(refusal, Refusal::UnknownTask { .. }),
+            "{refusal:?}"
+        );
+        assert!(
+            !refusal.message().contains(SECRET),
+            "the refusal leaked the other conversation's result: {}",
+            refusal.message()
+        );
+    }
+
+    /// Vacuity control: the caller's OWN task is readable, so the test above is
+    /// about the session and not about `authorise_task` refusing everything.
+    #[test]
+    fn a_task_of_this_conversation_is_readable() {
+        let mine = run_of("my-session", "task-1");
+        let run = authorise_task(Some(mine), "my-session", "task-1").expect("my own task");
+        assert_eq!(run.id, "task-1");
+        assert!(describe_run(&run).contains("the bins go out on Thursday"));
+    }
+
+    /// The same words for both, so a caller cannot probe which task ids exist —
+    /// the same property `every_unauthorised_input_is_refused_with_the_same_words`
+    /// asserts for the four unauthorised inputs, and for the same reason.
+    #[test]
+    fn a_missing_task_and_somebody_elses_are_indistinguishable_to_the_caller() {
+        let missing = authorise_task(None, "my-session", "task-1").unwrap_err();
+        let theirs =
+            authorise_task(Some(run_of("other", "task-1")), "my-session", "task-1").unwrap_err();
+        assert_eq!(missing.message(), theirs.message());
+        assert_ne!(
+            missing.trace(),
+            theirs.trace(),
+            "the log cannot tell a hallucinated id from a probe of another conversation"
+        );
+    }
+
+    #[test]
+    fn a_check_with_no_id_is_refused_rather_than_guessed_at() {
+        let refusal = check_task_id(CheckTaskParams::default()).unwrap_err();
+        assert!(matches!(refusal, Refusal::Malformed(_)));
+        assert!(refusal.message().contains("task_id"));
+    }
+
+    #[test]
+    fn the_task_id_aliases_a_small_model_invents_are_recovered() {
+        for alias in TASK_ID_ALIASES {
+            let parsed: CheckTaskParams =
+                serde_json::from_value(serde_json::json!({ alias: "task-1" }))
+                    .expect("CheckTaskParams accepts any object");
+            assert_eq!(
+                check_task_id(parsed).unwrap_or_else(|e| panic!("{alias}: {e:?}")),
+                "task-1"
+            );
+        }
+    }
+
+    /// A background run comes back non-terminal, and `describe_run` must tell
+    /// the model it is running and hand it no answer — the same path
+    /// `only_a_completed_run_hands_its_text_to_the_parent` covers, said for the
+    /// state P8 made reachable.
+    #[test]
+    fn a_running_background_task_is_reported_with_its_id_and_no_answer() {
+        let mut run = run_of("my-session", "task-7");
+        run.status = TaskStatus::Queued;
+        let described = describe_run(&run);
+        assert!(described.contains("task-7"), "{described}");
+        assert!(described.contains("still working"), "{described}");
+        assert!(
+            !described.contains("the bins go out on Thursday"),
+            "a queued run handed the parent text it has not earned: {described}"
+        );
     }
 
     #[test]
