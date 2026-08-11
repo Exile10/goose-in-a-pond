@@ -242,8 +242,35 @@ Four things stand between here and reachable, and none is large:
 3. **Construct the repository and install the deps** in `main.rs`, next to the other
    `init_*_deps` calls.
 4. **Give ingest an on-pond producer**, which is what P1's own sentence asks for and the only part
-   with real design left in it: a sensor reading is not a `ContextItem` until somebody decides which
-   readings are worth keeping and what their `external_id` is.
+   with real design left in it.
+
+#### The producer needs a source, and nothing can make one — the ordering this implies
+
+Verified 2026-08-11 by reading the port rather than the phase list. `ContextRepository::upsert_source`
+exists and has **no caller**, and `ContextSource` requires a `profile_id` that is not an `Option`,
+because "an `Option` owner becomes `None` everywhere" is PAI-1 §1.2's lesson and this type refuses to
+repeat it. So a sensor, camera or voice source belongs to **one household member**, deliberately, and
+P1's phrase "the ingest pipeline with on-pond sources only" quietly presupposes that a source can be
+created. Nothing can create one: `POST /api/v1/context/sources` is in section 3.4 and is **P3's**.
+
+That is not a defect in either phase, it is an edge the phase list does not draw, and it decides the
+order of the four steps above. Two consequences worth writing down before somebody starts:
+
+- **Do not register `giap-context` before there is a producer.** `search_context` and
+  `get_recent_context` would join the per-turn tool set and cost prompt tokens on every turn, for a
+  corpus guaranteed to be empty on every pond. The Orin measurement makes this concrete: 61 tools
+  are already ~25 000 characters of schema against a 4 096-token window, and tool schemas are ~88%
+  of the preamble. Adding two tools that cannot return anything is a straight loss, and PAI-3's
+  asymmetry rule — preamble is re-prefilled, working set is not — is the reason it is a loss on
+  every turn rather than once.
+- **Deciding which on-pond data becomes context is a design question, not a wiring one.** Two
+  candidates look easy and are not. Voice transcripts would pour every conversation turn into the
+  corpus, which is the mirror image of the mistake section 3.2 exists to prevent — memory is not
+  allowed to be a mailbox, and the corpus should not be allowed to be a chat log; memory extraction
+  already curates from those turns. Sensor readings have no owner: a hallway thermometer is a
+  household fact, and this type cannot express one, so somebody has to say whose sensor it is. The
+  coherent answer is probably per-member sources a person connects on purpose — a sensor in *my*
+  room is *my* context — which is the same answer as "wait for P3's surface".
 
 **One thing this unblocks that the ledger had wrong.** PAI-2 P6b's third part — P3's redaction
 chokepoint — was recorded as circularly blocked on PAI-8. It is not: `IngestPipeline::new` takes a
