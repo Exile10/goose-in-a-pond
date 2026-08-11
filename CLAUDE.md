@@ -80,6 +80,25 @@ cargo check -p pond-server -p pond-adapters-goose   # PRODUCTION-binary compile 
 - The **"fast crates"** are every crate that does **not** pull the Goose submodule or heavy native libs (goose, llama-cpp-2, candle, onnxruntime). The exact list is in `ci.yml`; `pond-server`, `pond-adapters-goose`, `pond-adapters-local-inference`, `pond-adapters-face-onnx`, `pond-agent`, and `pond-inference` are excluded from the fast lint/test pass and covered only by `cargo check` gates. The list is also the enforcement of the hexagonal invariant: if a crate in it grows a `goose` dependency, the split it names has quietly stopped existing. `pond-api` carried one for a single `Recipe::from_content` call, and `pond-inference` was in the list while building llama.cpp — both fixed 2026-08-06.
 - `SQLX_OFFLINE=true` is required to build offline. Note: session/settings storage uses **runtime `sqlx::query`** (not the `query!` macro), so there is **no `.sqlx/` dir** and `cargo sqlx prepare` is not needed. Settings persist as a **flat key-value table** (`settings(key,value,updated_at)`), one row per field — new fields are new rows, no migration; the API serializes the `Settings` struct directly (no DTO). A completeness test (`every_settings_field_is_dispositioned`) fails the build if a new `Settings` field is not classified UI-wired or headless.
 - CI overrides `RUSTFLAGS=""` — see the target-cpu landmine under *Goose Submodule*.
+- **Clean up build artifacts when you finish a testing session.** This workspace builds the Goose
+  submodule, llama.cpp, ONNX Runtime and candle, and `target/` reaches tens of gigabytes on a
+  laptop that also holds the models. `target/debug/incremental` is the worst of it and the least
+  valuable — it is a per-crate rebuild cache, not a dependency cache, so deleting it costs one
+  recompile of the workspace crates and nothing else:
+
+  ```bash
+  rm -rf target/debug/incremental     # the usual culprit; recovers the most, costs the least
+  cargo clean -p pond-api -p pond-core     # a specific crate's artifacts
+  cargo clean                              # everything, including the slow submodule build
+  ```
+
+  Prefer the first. Reach for a full `cargo clean` only when you are done for the day, because
+  rebuilding `pond-adapters-goose` and the submodule from cold is minutes, not seconds.
+
+  **This is not housekeeping, it is a failure mode.** A run in the PAI programme died on
+  `ld: write() failed, errno=28` with `target/debug/incremental` at 112 GB; deleting it recovered
+  84 GB. A full disk presents as a LINKER fault, not as a disk fault, so it reads like a miscompile
+  and gets debugged as one. Check `du -sh target` before diagnosing a strange link error.
 
 ### Run the server
 ```bash
