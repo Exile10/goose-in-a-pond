@@ -17,6 +17,12 @@ branch tip directly rather than this SHA.
 > implementer write code that does not compile or does nothing. They are corrected in place and
 > called out where they were. The largest is in section 1.2: **`run_subagent_task` is not
 > callable from `pond-adapters-goose`.** P2 is a fork-patch decision before it is a coding task.
+>
+> **PAI-6 is code-complete as of 2026-08-11: P1-P8 all landed.** The two things it is still owed are
+> a MEASUREMENT and a CALL SITE, both named in their phases' stamps — section 7's integration
+> comparison (parent context growth with a delegation versus inline, which needs an Orin), and a
+> production caller for `Orchestrator::cancel_children_of`, without which a deleted session does not
+> stop a background run. Neither is a design question.
 
 ---
 
@@ -89,7 +95,7 @@ What is being stripped:
 | `.../subagent_task_config.rs` | `TaskConfig { provider, model_config, parent_session_id, parent_working_dir, extensions, max_turns }` — the module is `pub(crate)` but the type is re-exported, so this one IS reachable |
 | `.../platform_extensions/summon.rs` | `load` (list/load subrecipes, recipes, agents) and `delegate` (ad-hoc or source-based subagent, `async: true` for background, then `load(taskId)` to collect) |
 | `.../platform_extensions/orchestrator.rs` | `list_sessions`, `view_session`, `start_agent`, `send_message`, `interrupt_agent` over Goose's session manager |
-| `.../subagent_execution_tool/` | **serde types only.** `mod.rs` is three lines and `notification_events.rs` holds `TaskStatus`, `TaskExecutionNotificationEvent`, `TaskExecutionStats`, `TaskInfo`, `FailedTaskInfo`. This row used to say "task execution plumbing"; there is no executor, no queue and no scheduler here. P8 has nothing to reuse |
+| `.../subagent_execution_tool/` | **serde types only.** `mod.rs` is three lines and `notification_events.rs` holds `TaskStatus`, `TaskExecutionNotificationEvent`, `TaskExecutionStats`, `TaskInfo`, `FailedTaskInfo`. This row used to say "task execution plumbing"; there is no executor, no queue and no scheduler here. P8 has nothing to reuse *(confirmed by P8 on 2026-08-11: it reused none of it, and needed none of it — a background run is `tokio::spawn` over the same `drive_run` a synchronous one awaits)* |
 | `.../recipe/` | full Recipe model, validation, templating, subrecipes |
 
 #### CORRECTION (2026-08-07): `run_subagent_task` is NOT callable, and this changes P2
@@ -277,7 +283,7 @@ none of `goose AI framework` / `AAIF` / `Agentic AI Foundation`.
 | Role definitions | `AgentRecipe` rows in the **`agent_recipes`** table — role fields ride one GIAP-owned YAML key, `giap_role`, which `RecipePrompt` and Goose's `Recipe` both ignore |
 | Reusable instruction blocks | `UserSkill` |
 | Per-role tool narrowing | `mcp/domain/tool_group.rs` + `services/tool_selection.rs` — but use `filter_tools_by_groups` (a pure intersection), **never** `select_groups`, whose every failure path widens by design |
-| Per-role model | **Nothing.** `ModelRouter` does not exist and never compiled; there is no `ModelRole` type. See P7 |
+| Per-role model | **Nothing.** `ModelRouter` does not exist and never compiled; there is no `ModelRole` type. *(P7 LANDED 2026-08-11 and reused none of it: the type is `ChildModel` in `pond-core`, the mechanism is a second `ModelConfig` on the SAME `Arc<dyn Provider>`, and there is no router. See P7's stamp for why a router would have been the wrong shape.)* |
 | Cheap in-process routing | Nothing. `DelegatingAgent` is a dead end — see section 1.1 |
 | Child agent execution | **Nothing reusable.** `run_subagent_task` is `pub(crate)`; P2 owns the loop over `Agent::with_config` / `update_provider` / `add_extension` / `override_system_prompt` / `reply`, all of which ARE re-exported |
 | Subagent system prompt | **Nothing.** GIAP's is deleted; Goose's is not substitutable. P2 builds it through `build_prompt_partition` — see section 3.2 |
@@ -326,6 +332,14 @@ The value of delegation on-device is therefore **not** wall-clock speed. It is:
 Saying this plainly matters because "multi-agent" invites an assumption of parallelism, and shipping
 serialised parallelism would be complexity with no payoff.
 
+**AS LANDED (P8, 2026-08-11): this section is now enforced at the tool surface, not only in the
+scheduler.** A `delegate` call carrying `background: true` is REFUSED outright on any provider
+`max_concurrent_subagents` limits to 1, with a sentence that names the provider and tells the model
+to ask again without it. The alternative — quietly running it in the foreground — was rejected for
+the reason this section gives: the caller was told its turn would return immediately, and it would
+not. The same reasoning refuses a per-role model on the same providers (P7): one model slot, one
+retained prefix, and the parent pays for anything that displaces either.
+
 ### 3.5 Budget: a subagent is a second claim on one window
 
 Each spawn takes `context_fraction` of the parent's budget via the governor. The parent's own
@@ -366,6 +380,25 @@ const, so grepping for `"giap-*"` string literals undercounts it):
 
 Three tools, not five, and the descriptions are written for a home assistant. The extension joins
 the core group set only when enabled, so it costs nothing in the common case.
+
+**AS LANDED there are TWO, not three (P5 2026-08-10, P8 2026-08-11).** `delegate` and `check_task`
+exist; **`list_roles` was never built and no phase owns it.** That is worth saying plainly rather
+than leaving the list to read as an inventory: `delegate` requires the caller to name a role
+exactly, and nothing in the tool surface tells a model which roles a pond has — so today the model
+learns a role's name from the user, or it does not delegate at all. Whoever builds it should note
+that it is the one tool here that is a pure read of `agent_recipes` and could plausibly live on
+`giap-toolkit` instead.
+
+`check_task` carries its own boundary and it is not the same one as `delegate`'s: `Orchestrator::poll`
+is keyed by task id alone and an id is a UUID the model was told, so `authorise_task` refuses a run
+whose `parent_session_id` is not the caller's — otherwise one household member's conversation could
+read back another's result by quoting an id. A foreign task and a nonexistent one get the same words
+and different traces, exactly as the four unauthorised inputs do.
+
+`CLAUDE.md`'s "62 tools when every toggle is on" became **63** when `check_task` landed. The
+registration cross-check (`registration_matches_the_catalog.rs`) ties the EXTENSION count, not the
+tool count, so nothing fails; the sentence is stale and `CLAUDE.md` is outside this change's
+footprint.
 
 Two things this extension must NOT do. It must not appear in `dispatcher.rs` or in
 `DIRECT_DISPATCH_ALLOWLIST`: that path runs a tool with no chat turn and therefore no caller, and
@@ -890,20 +923,111 @@ mutation was run.
   P2/P3 tripwires above record. And nothing has yet driven this on the Orin, so the integration
   measurement in section 7 — parent context growth with a delegation versus inline — remains
   untaken.
-- **P7** Per-role model assignment. **There is no `ModelRouter` and no `ModelRole` type** — start
-  from `GooseAdapter::ensure_provider_current`, which caches `(Arc<dyn Provider>, ModelConfig)` on
-  a single `provider:model` key, plus the `think`/`task` rows of `model_role_assignments` that the
-  settings write path never writes. `AgentRequest.model_role` already exists as the carrier and is
-  inert: it is read once and echoed back in `Done`, and the block headed "GooseMode from
-  model_role" is a constant. Note the collision PAI-6 never mentioned: a per-role model swaps the
-  resident GGUF, which is a full reload plus a re-prefill on the Orin, so per-role dispatch on an
-  on-device provider may be actively negative and collides with PAI-4 P5's `PrefixCacheState`.
-- **P8** Background tasks for providers that do **not** run on this device (section 3.4), with
-  `check_task`. There is no machinery to reuse: `InferencePool` is a port with zero
-  implementations, `AppState.inference_pool` is hardcoded `None`, and Goose's
-  `subagent_execution_tool/` is serde types. The existing `notification_tx` broadcast plus
-  `GET /notifications/stream` is the right transport and needs no new route — though nothing in
-  `pond-desktop/src` subscribes to it yet.
+- **P7 — LANDED 2026-08-11.** Per-role model assignment: `ChildModel` in `pond-core`, an optional
+  `model` key in a role's `giap_role` block, and `child_model_config` in the adapter.
+
+  **The collision the bullet named is the phase, and the answer is that the feature is INERT on
+  every provider that runs on this device.** `ChildModel::resolve` takes the role's request and the
+  parent's provider and answers `Assigned` only when `runs_on_this_device` is false. On-device it
+  answers `RefusedOnDevice` — carrying both the model and the provider, so the refusal is a value a
+  test can assert on rather than an absence indistinguishable from "the role named nothing" — and
+  the child runs on the resident model with the role's tools, budget and persona intact. Refusing
+  the whole delegation was the alternative and is worse: a role authored with a model would then be
+  unrunnable on the configuration this project is built for, and a role's value is not in its model.
+  `a_role_model_never_reaches_the_engine_on_a_provider_that_runs_here` quantifies that over
+  `ON_DEVICE_PROVIDERS` through the real `build_child_plan`;
+  `a_role_model_is_used_when_the_provider_runs_somewhere_else` is the vacuity control without which
+  a resolve that refused everything would pass.
+
+  **What made it cheap off-device is that there is no router and no second provider.** A child
+  already replies through its parent's `Arc<dyn Provider>`; what selects the model is the
+  `ModelConfig` on the CHILD's session row, because `Provider::stream` takes it per call and
+  `Agent::reply` reads it from the session that `update_provider` wrote. So an assignment is one
+  field in a request body — and the parent's cached `(provider, config)` pair is untouched, so a
+  delegation cannot move the model out from under the parent's own turn. `context_limit` is CLEARED
+  rather than carried: Goose backfills a `None` from the registry entry for the model actually
+  named, and a `Some` would budget a different model against the parent's window.
+
+  **On the two dead carriers the bullet asked about: P7 makes NEITHER of them live, and both should
+  go.** They are traps, not spare parts.
+
+  - `AgentRequest.model_role` is a per-TURN label — `"chat"` from both stream handlers, `"task"`
+    from `schedule_executors.rs` — read once, echoed back in the `Done` frame, and selecting
+    nothing. The block headed "GooseMode from model_role" in `goose_agent.rs` is
+    `let goose_mode = GooseMode::Auto;` and does not mention it. It cannot become P7's carrier
+    either: a delegating turn has exactly one `model_role`, and a subagent's model comes from its
+    stored role. Six tests in `pond-api` assert on the `Done` frame's `model_role`, so removing it
+    is a `pond-api`/`pond-server`/desktop change and outside this footprint. **The new type is named
+    `ChildModel` and not `ModelRole` precisely so nobody reads it as that field's home.**
+  - The `think`/`task` rows of `model_role_assignments` are written by exactly one path,
+    `POST /models/{category}/{name}/activate`, and `sync_assignments_to_settings` turns them into
+    `think_provider` / `think_model` / `task_provider` / `task_model` settings keys — which
+    `sqlite_settings.rs :: apply_key` explicitly discards as "Legacy keys — silently ignored". So
+    assigning a model to the `think` role today writes two rows nothing reads. P7 does not revive
+    them and should not: a two-slot global table cannot express a per-role model, which is the whole
+    requirement. Deleting the arms is a `pond-api`/`pond-server` change, outside this footprint.
+
+  **Still owed.** Nothing measures the off-device win, because nothing has authored a role with a
+  model. And a role naming a model the provider does not have fails at the provider, as a child
+  failure — which is the right direction (loud, isolated to one delegation) but has never been seen.
+- **P8 — LANDED 2026-08-11.** Background tasks for providers that do **not** run on this device,
+  and `check_task`.
+
+  The bullet was right that there is nothing to reuse — `InferencePool` still has zero
+  implementations, `AppState.inference_pool` is still hardcoded `None`, and
+  `subagent_execution_tool/` is still serde types — and right that the port did not need to change.
+  `Orchestrator::poll` existed for this, `TaskStatus` already had the terminal states, and neither
+  gained anything. A background `spawn` returns the `Queued` run it already constructed.
+
+  **The refusal is invariant 3 wearing different clothes, and it is tested against a local provider
+  fixture.** `BackgroundAvailability::for_provider` is derived from `max_concurrent_subagents` —
+  not a second reading of `runs_on_this_device` — so it cannot drift from the number the semaphore
+  enforces. Where one agent may hold the model at a time, a background child is not background: it
+  is the parent's next turn queueing behind it and then paying a re-prefill. `spawn` refuses after
+  the provider is known and BEFORE the engine is touched, so a refused call leaves no child engine
+  session, no plan and no reservation behind; the test asserts all three, over `ON_DEVICE_PROVIDERS`,
+  with the hosted case as the vacuity control. The refusal names the provider and tells the model to
+  call `delegate` again without `background`, because a refusal a 2-4B model cannot act on is one it
+  retries verbatim.
+
+  **The cancellation decision, stated rather than implied.** PAI-6 P3 derives a child's token from
+  the parent TURN's, and `chat_stream`'s `DropGuard` cancels that when the reply ends — so a
+  background child that inherited would die with the turn, which makes it a synchronous child with a
+  race. **A background run therefore keeps its OWN token, whose explicit owner is the parent
+  SESSION**, and its cascade is `Orchestrator::cancel_children_of` (plus `cancel` by task id). Both
+  are implemented. `a_background_run_survives_its_turn_and_is_still_cancellable_by_its_session` ends
+  the turn exactly as the chat stream does — cancel the token, drop the lease — and asserts both
+  halves; `a_synchronous_run_still_dies_with_the_turn_that_asked_for_it` is its vacuity control,
+  without which "survives the turn" would pass against an implementation that had stopped deriving
+  anything from the turn at all, which is invariant 5's mechanism for every synchronous child.
+
+  **What invariant 5 is now owed, and it is a real gap rather than a rounding error:
+  `cancel_children_of` still has NO production caller.** Deleting a session or shutting the server
+  down does not stop a background run. That is one call each in `pond-api`'s session-delete handler
+  and `pond-server`'s shutdown path, both outside this change's footprint, and it is recorded on the
+  method's own doc comment so the absence cannot be read as "nothing needs to call it". Until it
+  lands, a background delegation is bounded only by its role's `max_turns` and by the caller
+  cancelling it deliberately.
+
+  **What else is bounded and what is not.** A background child holds its `context_fraction` of the
+  parent's history budget for as long as it runs, which is what section 3.5 said should happen and
+  now finally does with a child that outlives a turn. It takes a subagent permit like any other
+  child (one of three, off-device). Its progress frames still publish to the parent session's
+  `ProgressBus`, so a later turn of the same conversation sees the tree; with no subscriber they are
+  dropped, which is P6's stated failure mode.
+
+  **Not done, deliberately.** The bullet proposed the `notification_tx` broadcast plus
+  `GET /notifications/stream` as the transport for a finished background task. That is a
+  `pond-server`/`pond-api` change, nothing in `pond-desktop/src` subscribes to that stream, and the
+  model already has a way to find out — it is told the task id and can call `check_task`. Wiring a
+  notification before anything renders it would be a mechanism with no consumer, which is the shape
+  this workstream has already shipped three times.
+
+  `giap-orchestrator__check_task` is **not** on `routes.rs :: MUST_NEVER_BE_DIRECTLY_DISPATCHABLE`,
+  and should be: it reads a child's answer, which is household data, and the direct-dispatch path
+  carries no caller for `authorise_task` to check against. It is deny-by-default today because
+  `DIRECT_DISPATCH_ALLOWLIST` is an allowlist and nothing was added to it — but the positive claim
+  belongs beside `delegate`'s, and `routes.rs` is outside this footprint.
 
 ---
 
@@ -960,6 +1084,13 @@ mutation was run.
    because the next phase builds on the row.)*
    *(What none of this bounds is the SSE pool: a delegating turn still holds one of `main.rs`'s
    four interactive permits for the whole of its child's run, and P5 owns that decision.)*
+   *(P7 and P8 are both this invariant applied to a NEW question, and both answer it by refusing.
+   A per-role model is refused on-device because a second model in the one slot is a load plus a
+   re-prefill the parent pays for; a background delegation is refused on-device because with one
+   agent at a time "background" only means the parent's next turn is waiting. Both predicates go
+   through the same place — `ChildModel::resolve` reads `runs_on_this_device`,
+   `BackgroundAvailability::for_provider` reads `max_concurrent_subagents` — so neither can drift
+   into the narrow `local`/`gguf` reading without a named test failing.)*
 4. Subagent conversations never enter the parent's `session_messages`; only results do. Satisfied
    by construction — `ChatService` is the sole writer of that table and the child loop never
    touches it — with one caveat worth stating: the child's turns *are* persisted, into Goose's own
@@ -992,6 +1123,18 @@ mutation was run.
    root. So the `DropGuard` the chat stream already holds cancels the children too, and there is
    no path where a parent ends and a child does not hear about it. `cancel_children_of` stays for
    the explicit cases — a deleted session, a shutdown — and still has no caller.)*
+   *(**P8 splits this row in two and the split is a decision, not an omission.** A BACKGROUND run
+   outlives the turn that asked for it by definition, so it cannot derive its token from that turn —
+   the chat stream's `DropGuard` would kill it the moment the parent's reply finished. It keeps its
+   own, whose owner is the parent SESSION, and its cascade is `cancel_children_of` plus `cancel` by
+   task id. Both are implemented and both are tested, with
+   `a_synchronous_run_still_dies_with_the_turn_that_asked_for_it` as the control that P3's
+   derivation is still doing its job for everything else. **The gap this leaves is that
+   `cancel_children_of` STILL has no production caller**, so a deleted session or a shutdown does
+   not stop a background run: one call each in `pond-api`'s session-delete handler and
+   `pond-server`'s shutdown path, both outside PAI-6 P8's footprint. Until those land, "cancelling a
+   parent cancels its children" is true of every synchronous child and true of a background one only
+   when something asks.)*
 6. Depth is capped. A recursive delegation loop on a home server is a fire. *(P1: `DelegationDepth`
    cannot be constructed from a number, deserialized, or defaulted; the only public path to a
    deeper one refuses at `MAX_DELEGATION_DEPTH`.)*
@@ -1058,3 +1201,25 @@ mutation was run.
   `giap_registration.rs`'s registered extensions and `tool_group.rs`'s `TOOL_GROUPS` describe the
   same set. They happen to agree at 15. P5 owes that test, because the failure mode is silent and
   it widens.
+- **Per-role model (P7)** — the assertion is the REFUSAL, quantified over `ON_DEVICE_PROVIDERS` and
+  driven through the real `build_child_plan`, with the hosted case as the vacuity control. Do not
+  write it as "the plan's model is `None`": `None` is also what a role that named nothing produces,
+  so the assertion has to be on the `ChildModel` variant AND on the `ModelConfig`
+  `child_model_config` returns. Landed as
+  `a_role_model_never_reaches_the_engine_on_a_provider_that_runs_here`,
+  `a_role_model_is_used_when_the_provider_runs_somewhere_else` and
+  `a_role_that_names_no_model_leaves_the_parents_config_alone`. **What is still owed is a
+  measurement, and it is small**: one delegation to a role naming a cheap hosted model, against the
+  same delegation without one, to confirm the child really answers on the model that was named
+  rather than on the provider's default. Nothing in this tree has authored such a role.
+- **Background (P8)** — assert the refusal against a LOCAL provider fixture, and assert what the
+  refusal did NOT do: no child engine session opened, no plan run, no reservation left behind.
+  Then assert cancellation twice, because P8 has two cancellation stories and the interesting test
+  is the pair — a background run must SURVIVE its parent turn ending and still stop on
+  `cancel_children_of`, and a synchronous one must still die with the turn. The second is the
+  vacuity control for the first: without it, an implementation that stopped deriving anything from
+  the turn passes. **What is owed is not a test**: `cancel_children_of` has no production caller, so
+  no test in any crate can show a deleted session stopping a background run, because no code path
+  does it.
+- **`list_roles` has no test because it has no code.** It is in section 3.6's tool list and no phase
+  built it; see that section.
