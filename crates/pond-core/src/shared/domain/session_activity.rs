@@ -32,15 +32,33 @@
 //! transition -- and every one of the wiring decisions that used to live in
 //! `pond-server`'s polling loop -- is unit-testable without a clock, a
 //! database, or a bus.
+//!
+//! # Presence (PAI-7 P2)
+//!
+//! [`PresenceObserver`] lives here rather than in a module of its own because
+//! it is the *same observation*: the same poll of the same store, the same
+//! [`SessionOrigin`] filter, and the same idle threshold deciding when the
+//! evidence has gone stale. Splitting it would have created the one thing
+//! `human_activity` was written to prevent -- two call sites where one gets
+//! fixed and the other does not.
+//!
+//! The difference is what it answers. Session lifecycle says *somebody* is
+//! here; presence says *who*, and it only speaks when it can name a household
+//! member ([PAI-7](../../../../../docs/architecture/pai/07-proactive-intelligence.md)
+//! invariants 4 and 5). Naming is delegated wholesale to PAI-1's
+//! [`identity_resolution::resolve`], so presence and authorisation cannot
+//! disagree about whose turn it is.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::user_data::domain::session::Session;
+use crate::user_data::domain::profile::ProfileScope;
+use crate::user_data::domain::session::{IdentificationSource, Session, SessionIdentity};
 use crate::user_data::services::consolidation_schedule as sched;
+use crate::user_data::services::identity_resolution;
 
 /// Where the user is in an interaction, as far as the pond can tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,6 +436,310 @@ impl ActivityObserver {
         }
         out
     }
+}
+
+// ── Presence (PAI-7 P2) ──────────────────────────────────────────────────
+
+/// Which way a household member's presence changed.
+///
+/// Edges, not levels. "Jerry is here" is a level and the pond re-derives it on
+/// every poll; a proposer must not be told it four hundred times a day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresenceTransition {
+    /// The pond gained fresh evidence naming this member, having had none.
+    Arrived,
+    /// The evidence the pond was holding went stale, or was released.
+    ///
+    /// **Nothing observes somebody leaving.** There is no departure signal in
+    /// this house: no geofence, no door sensor bound to a person, no camera
+    /// that reports an empty room. So absence is *decided*, by the evidence
+    /// ageing past [`PresenceInputs::presence_window`], and the honest reading
+    /// of this variant is "the pond stopped being able to say this member is
+    /// here" rather than "this member walked out".
+    Departed,
+}
+
+impl PresenceTransition {
+    /// Short, stable label for structured logs and the event log.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PresenceTransition::Arrived => "arrived",
+            PresenceTransition::Departed => "departed",
+        }
+    }
+}
+
+/// A household member arrived or left, as far as the pond can tell.
+///
+/// **[`profile_id`](Self::profile_id) is a `String` and not an `Option`, and
+/// there is no anonymous variant.** That is invariant 4 made structural: a
+/// presence event that cannot name a member is not a presence event, it is a
+/// motion sensor, and this type cannot express one. The observer's only exit
+/// with a member's name is [`ProfileScope::Owner`] -- `Household` and `Guest`
+/// both leave through the same door as an unattributed session, which is
+/// invariant 5.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfilePresence {
+    pub profile_id: String,
+    pub transition: PresenceTransition,
+    /// The rung of PAI-1's chain the belief rests on.
+    ///
+    /// Carried because a proposer must be able to weigh it. "Liz is home
+    /// because her paired phone signed a request" and "Liz is home because a
+    /// camera frame matched at 0.61" are different claims, and the second is
+    /// the one a photograph can make.
+    pub source: IdentificationSource,
+    /// Set only for [`IdentificationSource::Face`], straight off the session
+    /// row. A second threshold here would be a second definition of a good
+    /// match; the per-profile one at the identification edge is the definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    /// The conversation the belief rests on -- for [`Arrived`] the one that
+    /// named them, for [`Departed`] the one that went quiet.
+    ///
+    /// [`Arrived`]: PresenceTransition::Arrived
+    /// [`Departed`]: PresenceTransition::Departed
+    pub session_id: String,
+    pub at: DateTime<Utc>,
+}
+
+/// One conversation, as the presence observer is allowed to see it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PresenceEvidence<'a> {
+    pub session_id: &'a str,
+    /// Carried rather than re-derived, for the same reason as
+    /// [`SessionStart::origin`]: a list handed to an observer should say what
+    /// it contains.
+    pub origin: SessionOrigin,
+    /// When somebody last *said* something here (`sessions.updated_at`).
+    ///
+    /// **Not when the attribution was written**, and the difference is the
+    /// whole freshness rule. `set_session_identity` deliberately does not touch
+    /// `updated_at` (it would reorder the user's history because a camera
+    /// recognised somebody), so binding a face to a conversation that has been
+    /// quiet for three hours leaves this timestamp three hours old and produces
+    /// no presence at all. That is what stops a photograph uploaded to an old
+    /// session reading as a person in the room.
+    pub last_activity: DateTime<Utc>,
+    /// What the session row says about who is speaking, from
+    /// [`SessionStorage::get_session_identity`].
+    ///
+    /// [`SessionStorage::get_session_identity`]: crate::user_data::ports::session_storage::SessionStorage::get_session_identity
+    pub identity: &'a SessionIdentity,
+}
+
+impl<'a> PresenceEvidence<'a> {
+    /// Project one stored session and its identity.
+    ///
+    /// Which column is the activity clock and which is not is a domain
+    /// decision, so it is made here rather than at the polling loop.
+    pub fn of(session: &'a Session, identity: &'a SessionIdentity) -> Self {
+        Self {
+            session_id: &session.id,
+            origin: SessionOrigin::of(&session.id),
+            last_activity: session.updated_at,
+            identity,
+        }
+    }
+}
+
+/// Everything one presence observation needs from outside.
+///
+/// No `Default`: every field is an input to a claim about where a person is,
+/// so a caller that has not thought about one should get a compile error rather
+/// than a silent `false`. `household_has_multiple_members: false` in
+/// particular is the value that turns an unidentified speaker into the whole
+/// household.
+pub struct PresenceInputs<'a> {
+    pub sessions: &'a [PresenceEvidence<'a>],
+    /// Whether this pond has more than one household member, from
+    /// `ProfileRepository::list`. On a failed read the caller must pass
+    /// `true` -- the answer that makes an unidentified speaker a `Guest`, and
+    /// therefore the answer that publishes nothing.
+    pub household_has_multiple_members: bool,
+    /// How stale a conversation may be before the member it names stops
+    /// counting as here.
+    ///
+    /// The caller passes the same `INACTIVITY_THRESHOLD_SECS` that decides
+    /// [`SessionPhase::Idle`]. One pond, one definition of "gone quiet": two
+    /// would have the bus saying a member is still here after it has already
+    /// said the pond went idle.
+    pub presence_window: Duration,
+    pub now: DateTime<Utc>,
+}
+
+/// The evidence behind one believed-present member.
+#[derive(Debug, Clone, PartialEq)]
+struct Believed {
+    source: IdentificationSource,
+    confidence: Option<f32>,
+    session_id: String,
+    last_activity: DateTime<Utc>,
+}
+
+impl Believed {
+    /// Whether this evidence should replace `held` for the same member.
+    ///
+    /// Two conversations can name one person in the same poll. The stronger
+    /// rung wins, and on a tie the more recent one -- the same ordering
+    /// `SessionIdentity::supersedes` applies within a single session, so the
+    /// two cannot disagree about which claim is better.
+    fn beats(&self, held: &Believed) -> bool {
+        match self.source.rank().cmp(&held.source.rank()) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => self.last_activity > held.last_activity,
+        }
+    }
+}
+
+/// Turns attributed conversations into [`ProfilePresence`] edges.
+///
+/// Owned by the publisher task, which polls. Every decision it makes is in
+/// [`observe`](PresenceObserver::observe).
+#[derive(Debug, Clone, Default)]
+pub struct PresenceObserver {
+    /// Who the pond believes is here, and on what. `None` means no baseline
+    /// has been taken yet.
+    ///
+    /// **A restart is not everybody arriving.** The pond restarts on every
+    /// deploy, and a member whose conversation is still fresh would otherwise
+    /// be announced as walking in each time -- an edge nobody crossed. The
+    /// first observation records the level and publishes nothing, exactly as
+    /// [`ActivityObserver::seeded_from`] does for conversations. The cost is
+    /// real and worth stating: a member who genuinely arrives during the first
+    /// poll after boot is recorded rather than announced.
+    believed: Option<BTreeMap<String, Believed>>,
+}
+
+impl PresenceObserver {
+    /// Begin observing a pond whose current occupancy is unknown.
+    pub fn awaiting_baseline() -> Self {
+        Self::default()
+    }
+
+    /// Fold one poll in and return the transitions it produced.
+    ///
+    /// Arrivals first, then departures, each in profile-id order, so the
+    /// output is deterministic for a consumer and for a test.
+    ///
+    /// Usually empty. Somebody continuing to be here is not an event; neither
+    /// is a re-identification of somebody already present, nor the same member
+    /// opening a second conversation, nor their evidence being upgraded from a
+    /// face match to an explicit "this is Liz". All four are the same person,
+    /// still here.
+    pub fn observe(&mut self, inputs: PresenceInputs<'_>) -> Vec<ProfilePresence> {
+        let present = present_members(&inputs);
+        let Some(previous) = self.believed.replace(present.clone()) else {
+            return Vec::new(); // baseline
+        };
+
+        let mut out = Vec::new();
+        for (profile_id, evidence) in &present {
+            if !previous.contains_key(profile_id) {
+                out.push(evidence.transition(profile_id, PresenceTransition::Arrived, inputs.now));
+            }
+        }
+        for (profile_id, evidence) in &previous {
+            if !present.contains_key(profile_id) {
+                out.push(evidence.transition(profile_id, PresenceTransition::Departed, inputs.now));
+            }
+        }
+        out
+    }
+}
+
+impl Believed {
+    fn transition(
+        &self,
+        profile_id: &str,
+        transition: PresenceTransition,
+        at: DateTime<Utc>,
+    ) -> ProfilePresence {
+        ProfilePresence {
+            profile_id: profile_id.to_string(),
+            transition,
+            source: self.source,
+            confidence: self.confidence,
+            session_id: self.session_id.clone(),
+            at,
+        }
+    }
+}
+
+/// Who the evidence says is here, right now.
+///
+/// The three refusals, in order, are the whole safety surface of this phase:
+/// a conversation the pond opened for itself is not a person; a conversation
+/// nobody has spoken in recently is not evidence of anybody's whereabouts; and
+/// a speaker the resolver cannot name is not a member, whether it called them
+/// `Guest` or `Household`.
+fn present_members(inputs: &PresenceInputs<'_>) -> BTreeMap<String, Believed> {
+    let window = i64::try_from(inputs.presence_window.as_secs()).unwrap_or(i64::MAX);
+    let mut present: BTreeMap<String, Believed> = BTreeMap::new();
+
+    for evidence in inputs.sessions {
+        // A cron line at 3am creates a session row, and `PUT /sessions/{id}/user`
+        // will bind any session id it is given -- including that one. P1's
+        // filter is therefore not theoretical here: without it, attributing a
+        // scheduled run to a member makes the pond believe they are home
+        // whenever the schedule fires.
+        if !evidence.origin.is_human() {
+            continue;
+        }
+        if inputs
+            .now
+            .signed_duration_since(evidence.last_activity)
+            .num_seconds()
+            >= window
+        {
+            continue;
+        }
+
+        // PAI-1's resolver, not a second opinion. It owns the one-member
+        // `Household` fallback, the refusal to trust a profile id with no
+        // provenance, and the guest boundary -- and if any of those changes,
+        // presence follows without anyone remembering it exists.
+        let resolved = identity_resolution::resolve(&identity_resolution::ResolutionInputs {
+            // A background poll holds no request token, so the strongest rung
+            // cannot be supplied here even now that PAI-1 P9 has built it: the
+            // token belongs to an HTTP request and this is a timer. The rung
+            // still reaches presence -- through the session row, the moment a
+            // handler binds one at `PairedDevice` strength -- and the `source`
+            // this event carries is what says which rung it was.
+            paired_device_profile: None,
+            session: evidence.identity,
+            household_has_multiple_members: inputs.household_has_multiple_members,
+        });
+        let ProfileScope::Owner(profile_id) = resolved.scope else {
+            continue;
+        };
+        // "" is not a name. The type's promise is that a presence event names
+        // a member, and a blank id would keep the promise textually while
+        // addressing nobody -- the shape a defaulted field lands on.
+        if profile_id.trim().is_empty() {
+            continue;
+        }
+
+        let candidate = Believed {
+            source: resolved.source,
+            confidence: evidence.identity.confidence,
+            session_id: evidence.session_id.to_string(),
+            last_activity: evidence.last_activity,
+        };
+        match present.entry(profile_id) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(candidate);
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                if candidate.beats(slot.get()) {
+                    slot.insert(candidate);
+                }
+            }
+        }
+    }
+    present
 }
 
 #[cfg(test)]
@@ -931,5 +1253,551 @@ mod tests {
         assert_eq!(SessionPhase::Started.as_str(), "started");
         assert_eq!(SessionPhase::Idle.as_str(), "idle");
         assert_eq!(SessionPhase::Resumed.as_str(), "resumed");
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    const WINDOW: Duration = Duration::from_secs(15 * 60);
+
+    /// A session id the scheduler really mints, and one that
+    /// `PUT /sessions/{id}/user` will happily bind to a household member.
+    const A_CRON_FIRE: &str = "sched-morning-summary-1700000300";
+
+    fn t(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000 + secs, 0).expect("valid timestamp")
+    }
+
+    fn session(id: &str, updated_at: DateTime<Utc>) -> Session {
+        let mut session = Session::new(id.to_string());
+        session.created_at = updated_at;
+        session.updated_at = updated_at;
+        session.profile_id = None; // the observer reads the identity, not this
+        session
+    }
+
+    fn identity(source: IdentificationSource, who: Option<&str>) -> SessionIdentity {
+        SessionIdentity {
+            profile_id: who.map(str::to_string),
+            source,
+            confidence: match source {
+                IdentificationSource::Face => Some(0.71),
+                _ => None,
+            },
+        }
+    }
+
+    fn poll(
+        observer: &mut PresenceObserver,
+        sessions: &[PresenceEvidence<'_>],
+        household_has_multiple_members: bool,
+        now: DateTime<Utc>,
+    ) -> Vec<ProfilePresence> {
+        observer.observe(PresenceInputs {
+            sessions,
+            household_has_multiple_members,
+            presence_window: WINDOW,
+            now,
+        })
+    }
+
+    /// An observer that has already taken its baseline over `sessions`.
+    fn seeded(
+        sessions: &[PresenceEvidence<'_>],
+        household_has_multiple_members: bool,
+        now: DateTime<Utc>,
+    ) -> PresenceObserver {
+        let mut observer = PresenceObserver::awaiting_baseline();
+        let published = poll(&mut observer, sessions, household_has_multiple_members, now);
+        assert!(
+            published.is_empty(),
+            "the first observation is a baseline and must publish nothing, not {published:?}"
+        );
+        observer
+    }
+
+    fn named(events: &[ProfilePresence]) -> Vec<(&str, PresenceTransition)> {
+        events
+            .iter()
+            .map(|e| (e.profile_id.as_str(), e.transition))
+            .collect()
+    }
+
+    // ── Arrival ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_member_who_starts_talking_arrives_once_and_the_event_names_them() {
+        let mut observer = seeded(&[], true, t(0));
+
+        let row = session("sess-jerry", t(60));
+        let who = identity(IdentificationSource::Face, Some("jerry"));
+        let evidence = [PresenceEvidence::of(&row, &who)];
+
+        let events = poll(&mut observer, &evidence, true, t(70));
+        assert_eq!(named(&events), vec![("jerry", PresenceTransition::Arrived)]);
+        assert_eq!(events[0].source, IdentificationSource::Face);
+        assert_eq!(
+            events[0].confidence,
+            Some(0.71),
+            "a face match's confidence must survive -- it is how a proposer weighs the claim"
+        );
+        assert_eq!(events[0].session_id, "sess-jerry");
+        assert_eq!(events[0].at, t(70));
+
+        assert!(
+            poll(&mut observer, &evidence, true, t(80)).is_empty(),
+            "still being here is not a new arrival"
+        );
+    }
+
+    // ── The two invariants that decide who may be named ──────────────────
+
+    /// Invariant 4. The tempting wrong move in a one-member pond: the resolver
+    /// answers `Household`, there is exactly one member, so "it must be them".
+    /// It must not be them -- nothing identified anybody, and a proposal
+    /// addressed on that basis is addressed to whoever happened to be talking.
+    #[test]
+    fn an_unidentified_speaker_in_a_one_member_pond_is_not_presence() {
+        let mut observer = seeded(&[], false, t(0));
+
+        let row = session("sess-anon", t(60));
+        let nobody = SessionIdentity::unknown();
+        let events = poll(
+            &mut observer,
+            &[PresenceEvidence::of(&row, &nobody)],
+            false,
+            t(70),
+        );
+        assert!(
+            events.is_empty(),
+            "an unidentified speaker was published as {events:?}; the resolver answered \
+             Household, which is a scope and not a person"
+        );
+
+        // Vacuity control: the same pond, the same poll, an identified speaker.
+        // Without this the assertion above would also pass against an observer
+        // that can never publish in a one-member pond at all.
+        let mut control = seeded(&[], false, t(0));
+        let who = identity(IdentificationSource::Explicit, Some("jerry"));
+        assert_eq!(
+            named(&poll(
+                &mut control,
+                &[PresenceEvidence::of(&row, &who)],
+                false,
+                t(70)
+            )),
+            vec![("jerry", PresenceTransition::Arrived)]
+        );
+    }
+
+    /// Invariant 5. An unidentified person in a shared pond is a Guest, and a
+    /// Guest's presence is not the household's presence.
+    #[test]
+    fn a_guest_is_not_presence() {
+        let mut observer = seeded(&[], true, t(0));
+        let row = session("sess-visitor", t(60));
+        let nobody = SessionIdentity::unknown();
+        let events = poll(
+            &mut observer,
+            &[PresenceEvidence::of(&row, &nobody)],
+            true,
+            t(70),
+        );
+        assert!(
+            events.is_empty(),
+            "a guest session published {events:?}; invariant 5 says a Guest generates none"
+        );
+    }
+
+    /// A profile id whose provenance is missing is not evidence, and presence
+    /// inherits that refusal from the resolver rather than restating it.
+    #[test]
+    fn a_profile_id_with_no_source_is_not_presence() {
+        let mut observer = seeded(&[], true, t(0));
+        let row = session("sess-odd", t(60));
+        let unsourced = identity(IdentificationSource::Unknown, Some("jerry"));
+        assert!(
+            poll(
+                &mut observer,
+                &[PresenceEvidence::of(&row, &unsourced)],
+                true,
+                t(70)
+            )
+            .is_empty(),
+            "a profile id with no source was trusted as a person being home"
+        );
+    }
+
+    /// "" keeps the type's promise textually and addresses nobody.
+    #[test]
+    fn a_blank_profile_id_names_nobody() {
+        let mut observer = seeded(&[], true, t(0));
+        let row = session("sess-blank", t(60));
+        let blank = identity(IdentificationSource::Explicit, Some("   "));
+        assert!(
+            poll(
+                &mut observer,
+                &[PresenceEvidence::of(&row, &blank)],
+                true,
+                t(70)
+            )
+            .is_empty(),
+            "a blank profile id was published as a member arriving"
+        );
+    }
+
+    // ── What produces an identification that is not a person arriving ────
+
+    /// P1's trap, in this phase's shape. The scheduler mints a session row at
+    /// 3am, and `PUT /sessions/{id}/user` will bind any id it is handed -- so
+    /// an attributed cron fire is a fixture production can produce, not a
+    /// hypothetical. Without the origin filter the pond would believe a member
+    /// walks in every time their morning summary runs.
+    #[test]
+    fn a_scheduled_run_attributed_to_a_member_is_not_that_member_being_home() {
+        let mut observer = seeded(&[], true, t(0));
+        let cron = session(A_CRON_FIRE, t(60));
+        let who = identity(IdentificationSource::Explicit, Some("jerry"));
+        let events = poll(
+            &mut observer,
+            &[PresenceEvidence::of(&cron, &who)],
+            true,
+            t(70),
+        );
+        assert!(
+            events.is_empty(),
+            "the pond's own conversation was published as {events:?}; a proposer reads an \
+             Arrived as a household member walking in"
+        );
+
+        // Vacuity control: the identical row and identity under a person's
+        // session id does arrive, so this is the origin filter and not an
+        // observer that has stopped publishing.
+        let mut control = seeded(&[], true, t(0));
+        let human = session("sess-human", t(60));
+        assert_eq!(
+            named(&poll(
+                &mut control,
+                &[PresenceEvidence::of(&human, &who)],
+                true,
+                t(70)
+            )),
+            vec![("jerry", PresenceTransition::Arrived)]
+        );
+    }
+
+    /// The other "identification that is not an arrival": a face recognised in
+    /// a picture rather than in the room. Binding an identity does not touch
+    /// `sessions.updated_at`, so a photograph attributed to a conversation
+    /// nobody has spoken in for hours leaves the evidence stale and publishes
+    /// nothing.
+    #[test]
+    fn a_face_bound_to_a_conversation_that_went_quiet_hours_ago_is_not_a_person_in_the_room() {
+        let mut observer = seeded(&[], true, t(0));
+        let stale = session("sess-yesterday", t(60) - chrono::Duration::hours(3));
+        let liz = identity(IdentificationSource::Face, Some("liz"));
+        assert!(
+            poll(
+                &mut observer,
+                &[PresenceEvidence::of(&stale, &liz)],
+                true,
+                t(70)
+            )
+            .is_empty(),
+            "a face bound to a three-hour-old conversation was published as somebody arriving"
+        );
+
+        // Vacuity control: the same identity on a conversation somebody is
+        // actually speaking in does arrive.
+        let mut control = seeded(&[], true, t(0));
+        let live = session("sess-now", t(60));
+        assert_eq!(
+            named(&poll(
+                &mut control,
+                &[PresenceEvidence::of(&live, &liz)],
+                true,
+                t(70)
+            )),
+            vec![("liz", PresenceTransition::Arrived)]
+        );
+    }
+
+    /// The window's edge, both sides. Reached is stale; one second short of it
+    /// is not.
+    #[test]
+    fn the_freshness_window_is_closed_at_its_far_end() {
+        let jerry = identity(IdentificationSource::Explicit, Some("jerry"));
+        let window = i64::try_from(WINDOW.as_secs()).unwrap();
+
+        let just_inside = session("sess-inside", t(0));
+        let mut a = seeded(&[], true, t(0));
+        assert_eq!(
+            named(&poll(
+                &mut a,
+                &[PresenceEvidence::of(&just_inside, &jerry)],
+                true,
+                t(window - 1)
+            )),
+            vec![("jerry", PresenceTransition::Arrived)]
+        );
+
+        let at_the_edge = session("sess-edge", t(0));
+        let mut b = seeded(&[], true, t(0));
+        assert!(
+            poll(
+                &mut b,
+                &[PresenceEvidence::of(&at_the_edge, &jerry)],
+                true,
+                t(window)
+            )
+            .is_empty(),
+            "evidence exactly as old as the window still counted as somebody being here; the \
+             pond publishes Idle at the same instant, so the two would disagree"
+        );
+    }
+
+    // ── Departure ────────────────────────────────────────────────────────
+
+    /// Absence is decided, not observed, and it is decided once.
+    #[test]
+    fn evidence_going_stale_publishes_one_departure() {
+        let row = session("sess-jerry", t(0));
+        let jerry = identity(IdentificationSource::Explicit, Some("jerry"));
+        let evidence = [PresenceEvidence::of(&row, &jerry)];
+
+        let mut observer = seeded(&[], true, t(0));
+        assert_eq!(
+            named(&poll(&mut observer, &evidence, true, t(10))),
+            vec![("jerry", PresenceTransition::Arrived)]
+        );
+
+        let gone = poll(&mut observer, &evidence, true, t(20 * 60));
+        assert_eq!(named(&gone), vec![("jerry", PresenceTransition::Departed)]);
+        assert_eq!(
+            gone[0].session_id, "sess-jerry",
+            "a departure names the conversation that went quiet"
+        );
+        assert_eq!(
+            gone[0].source,
+            IdentificationSource::Explicit,
+            "and the evidence the belief had rested on"
+        );
+
+        assert!(
+            poll(&mut observer, &evidence, true, t(60 * 60)).is_empty(),
+            "staying away is not a second departure"
+        );
+    }
+
+    /// Releasing a binding (`DELETE /sessions/{id}/user`) ends the belief. The
+    /// pond has not seen anybody leave -- it has stopped being able to say who
+    /// is there, which for a proposer is the same instruction: stop addressing
+    /// them.
+    #[test]
+    fn releasing_a_binding_ends_the_belief() {
+        let row = session("sess-jerry", t(0));
+        let jerry = identity(IdentificationSource::Explicit, Some("jerry"));
+        let mut observer = seeded(&[], true, t(0));
+        assert_eq!(
+            named(&poll(
+                &mut observer,
+                &[PresenceEvidence::of(&row, &jerry)],
+                true,
+                t(10)
+            )),
+            vec![("jerry", PresenceTransition::Arrived)]
+        );
+
+        let released = SessionIdentity::unknown();
+        assert_eq!(
+            named(&poll(
+                &mut observer,
+                &[PresenceEvidence::of(&row, &released)],
+                true,
+                t(20)
+            )),
+            vec![("jerry", PresenceTransition::Departed)],
+            "the binding was released and the pond went on believing he was here"
+        );
+    }
+
+    // ── Re-identification is not an arrival ──────────────────────────────
+
+    #[test]
+    fn re_identifying_somebody_already_here_publishes_nothing() {
+        let first = session("sess-one", t(0));
+        let face = identity(IdentificationSource::Face, Some("jerry"));
+        let mut observer = seeded(&[], true, t(0));
+        assert_eq!(
+            named(&poll(
+                &mut observer,
+                &[PresenceEvidence::of(&first, &face)],
+                true,
+                t(10)
+            )),
+            vec![("jerry", PresenceTransition::Arrived)]
+        );
+
+        // The same session, re-identified more strongly.
+        let explicit = identity(IdentificationSource::Explicit, Some("jerry"));
+        assert!(
+            poll(
+                &mut observer,
+                &[PresenceEvidence::of(&first, &explicit)],
+                true,
+                t(20)
+            )
+            .is_empty(),
+            "an upgrade from a face match to an explicit binding is the same person, still here"
+        );
+
+        // A second conversation opened by the same person.
+        let second = session("sess-two", t(30));
+        assert!(
+            poll(
+                &mut observer,
+                &[
+                    PresenceEvidence::of(&first, &explicit),
+                    PresenceEvidence::of(&second, &explicit),
+                ],
+                true,
+                t(40)
+            )
+            .is_empty(),
+            "opening a second conversation is not arriving twice"
+        );
+    }
+
+    /// Two conversations naming one member in one poll: the stronger rung is
+    /// the one the event reports, whichever order they arrive in.
+    #[test]
+    fn the_strongest_evidence_wins_when_two_conversations_name_one_member() {
+        let weak_row = session("sess-face", t(30));
+        let strong_row = session("sess-explicit", t(0));
+        let weak = identity(IdentificationSource::Face, Some("jerry"));
+        let strong = identity(IdentificationSource::Explicit, Some("jerry"));
+
+        for order in [
+            [
+                PresenceEvidence::of(&weak_row, &weak),
+                PresenceEvidence::of(&strong_row, &strong),
+            ],
+            [
+                PresenceEvidence::of(&strong_row, &strong),
+                PresenceEvidence::of(&weak_row, &weak),
+            ],
+        ] {
+            let mut observer = seeded(&[], true, t(0));
+            let events = poll(&mut observer, &order, true, t(40));
+            assert_eq!(named(&events), vec![("jerry", PresenceTransition::Arrived)]);
+            assert_eq!(
+                events[0].source,
+                IdentificationSource::Explicit,
+                "the weaker rung won on ordering; the newer face row is the one that would"
+            );
+            assert_eq!(events[0].session_id, "sess-explicit");
+        }
+    }
+
+    // ── A restart is not everybody arriving ──────────────────────────────
+
+    #[test]
+    fn a_restart_does_not_announce_the_household_as_arriving() {
+        let jerry_row = session("sess-jerry", t(0));
+        let liz_row = session("sess-liz", t(0));
+        let jerry = identity(IdentificationSource::Explicit, Some("jerry"));
+        let liz = identity(IdentificationSource::Face, Some("liz"));
+        let live = [
+            PresenceEvidence::of(&jerry_row, &jerry),
+            PresenceEvidence::of(&liz_row, &liz),
+        ];
+
+        let mut observer = PresenceObserver::awaiting_baseline();
+        let first = poll(&mut observer, &live, true, t(10));
+        assert!(
+            first.is_empty(),
+            "a restart announced {first:?}; the pond restarts on every deploy and nobody \
+             crossed a threshold"
+        );
+
+        // The baseline really was taken, so the observer is quiet rather than
+        // deaf: the departure that follows is still published.
+        assert_eq!(
+            named(&poll(&mut observer, &live, true, t(30 * 60))),
+            vec![
+                ("jerry", PresenceTransition::Departed),
+                ("liz", PresenceTransition::Departed),
+            ]
+        );
+    }
+
+    /// Vacuity control for the baseline above: an observer that already has one
+    /// does publish those same two arrivals. Without it, "a restart announces
+    /// nothing" would also pass against an observer that announces nothing.
+    #[test]
+    fn the_same_rows_do_arrive_once_a_baseline_exists() {
+        let jerry_row = session("sess-jerry", t(0));
+        let liz_row = session("sess-liz", t(0));
+        let jerry = identity(IdentificationSource::Explicit, Some("jerry"));
+        let liz = identity(IdentificationSource::Face, Some("liz"));
+
+        let mut observer = seeded(&[], true, t(0));
+        assert_eq!(
+            named(&poll(
+                &mut observer,
+                &[
+                    PresenceEvidence::of(&jerry_row, &jerry),
+                    PresenceEvidence::of(&liz_row, &liz),
+                ],
+                true,
+                t(10)
+            )),
+            vec![
+                ("jerry", PresenceTransition::Arrived),
+                ("liz", PresenceTransition::Arrived),
+            ],
+            "each member is addressed by name, arrivals in profile-id order"
+        );
+    }
+
+    /// Arrivals before departures, so a handover between two members reads in
+    /// the order a consumer would want it: who is here now, then who is not.
+    #[test]
+    fn one_member_replacing_another_publishes_both_edges_arrival_first() {
+        let jerry_row = session("sess-jerry", t(0));
+        let jerry = identity(IdentificationSource::Explicit, Some("jerry"));
+        let mut observer = seeded(&[], true, t(0));
+        poll(
+            &mut observer,
+            &[PresenceEvidence::of(&jerry_row, &jerry)],
+            true,
+            t(10),
+        );
+
+        let liz_row = session("sess-liz", t(20 * 60));
+        let liz = identity(IdentificationSource::Face, Some("liz"));
+        assert_eq!(
+            named(&poll(
+                &mut observer,
+                &[
+                    PresenceEvidence::of(&jerry_row, &jerry),
+                    PresenceEvidence::of(&liz_row, &liz),
+                ],
+                true,
+                t(20 * 60 + 10)
+            )),
+            vec![
+                ("liz", PresenceTransition::Arrived),
+                ("jerry", PresenceTransition::Departed),
+            ]
+        );
+    }
+
+    #[test]
+    fn transition_labels_are_stable() {
+        assert_eq!(PresenceTransition::Arrived.as_str(), "arrived");
+        assert_eq!(PresenceTransition::Departed.as_str(), "departed");
     }
 }
