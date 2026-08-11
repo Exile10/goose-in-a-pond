@@ -134,9 +134,125 @@ pub struct TriggerEventView<'a> {
     pub value: Option<f64>,
 }
 
+/// Why a sensor rule was refused at the edge.
+///
+/// Every variant here describes a rule that would be ACCEPTED and then be
+/// silent: `matches` fails closed on a malformed time window, an empty filter
+/// string matches no device that exists, and a rule with no actions only
+/// discovers it has nothing to do when the executor bails at fire time. A
+/// household automation that quietly never runs is worse than one that was
+/// refused, because nobody goes looking for it until the thing it was supposed
+/// to prevent has happened. This is domain policy, not transport: the same
+/// answer has to hold for whichever surface accepts the rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleRejection {
+    /// No actions: the executor bails at fire time on every single fire.
+    NoActions,
+    /// `after`/`before` outside `HH:MM`. `in_time_window` fails closed on
+    /// these, so the rule matches nothing, ever.
+    MalformedTimeBound { field: &'static str, value: String },
+    /// A comparison operator without a threshold, or a threshold without an
+    /// operator. `matches` requires both, so half a condition is silently no
+    /// condition — the rule fires on every reading instead of the ones asked
+    /// for.
+    HalfCondition,
+    /// An empty `device_id` / `signal` filter, which matches no real event.
+    /// `None` is how "any" is expressed; `Some("")` is a mistake.
+    EmptyFilter { field: &'static str },
+    /// An action that cannot do anything: no device to switch, no text to
+    /// prompt with, no notification to show.
+    EmptyAction { index: usize, reason: &'static str },
+}
+
+impl std::fmt::Display for RuleRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuleRejection::NoActions => write!(
+                f,
+                "a rule needs at least one action; without one it would fire and do nothing"
+            ),
+            RuleRejection::MalformedTimeBound { field, value } => write!(
+                f,
+                "condition.{field} must be \"HH:MM\" (24-hour), got {value:?}; \
+                 an unparseable bound makes the rule match nothing at all"
+            ),
+            RuleRejection::HalfCondition => write!(
+                f,
+                "condition.op and condition.value must be given together; \
+                 one without the other is silently ignored and the rule fires on every reading"
+            ),
+            RuleRejection::EmptyFilter { field } => write!(
+                f,
+                "source.{field} is empty, which matches nothing; omit it to match anything"
+            ),
+            RuleRejection::EmptyAction { index, reason } => {
+                write!(f, "actions[{index}]: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RuleRejection {}
+
 impl SensorTriggerSpec {
     pub fn default_cooldown_secs() -> u64 {
         60
+    }
+
+    /// Refuse the rules that would be accepted and then never fire (or fire and
+    /// then fail). See [`RuleRejection`] for why each case is worth a 400
+    /// rather than silence.
+    ///
+    /// Deliberately NOT validated here: the id and the cron expression. The
+    /// scheduler adapter already rejects a duplicate id, and an event rule
+    /// never registers a cron job at all, so a second opinion on either would
+    /// be a copy of a rule that lives somewhere else and drifts from it.
+    pub fn validate(&self) -> Result<(), RuleRejection> {
+        if self.actions.is_empty() {
+            return Err(RuleRejection::NoActions);
+        }
+        if self.source.device_id.as_deref().is_some_and(str::is_empty) {
+            return Err(RuleRejection::EmptyFilter { field: "device_id" });
+        }
+        if self.source.signal.as_deref().is_some_and(str::is_empty) {
+            return Err(RuleRejection::EmptyFilter { field: "signal" });
+        }
+        if self.condition.op.is_some() != self.condition.value.is_some() {
+            return Err(RuleRejection::HalfCondition);
+        }
+        for (field, bound) in [
+            ("after", self.condition.after.as_deref()),
+            ("before", self.condition.before.as_deref()),
+        ] {
+            if let Some(v) = bound {
+                if chrono::NaiveTime::parse_from_str(v, "%H:%M").is_err() {
+                    return Err(RuleRejection::MalformedTimeBound {
+                        field,
+                        value: v.to_string(),
+                    });
+                }
+            }
+        }
+        for (index, action) in self.actions.iter().enumerate() {
+            let reason = match action {
+                TriggerAction::AgentPrompt { prompt } if prompt.trim().is_empty() => {
+                    Some("an agent action needs a prompt")
+                }
+                TriggerAction::DevicePower { device_id, .. } if device_id.trim().is_empty() => {
+                    Some("a device action needs a device_id")
+                }
+                TriggerAction::Notify { title, body }
+                    if title.trim().is_empty() && body.trim().is_empty() =>
+                {
+                    Some("a notification needs a title or a body")
+                }
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                return Err(RuleRejection::EmptyAction { index, reason });
+            }
+        }
+        Ok(())
     }
 
     /// Pure evaluation: does `event` at local wall-clock `local_time`
@@ -427,6 +543,124 @@ mod tests {
         assert!(mk(CompareOp::Lte, 20.0).matches(&ev(20.0), noon));
         assert!(mk(CompareOp::Eq, 1.0).matches(&ev(1.0), noon));
         assert!(!mk(CompareOp::Eq, 1.0).matches(&ev(0.5), noon));
+    }
+
+    // ── Rule validation (PAI-7 P8) ────────────────────────────────────────
+    //
+    // Each of these asserts the DEFECT first and the refusal second. A rule
+    // that is merely refused proves nothing; what makes the refusal worth a
+    // 400 is that the accepted version is silent.
+
+    #[test]
+    fn a_valid_rule_validates() {
+        // The vacuity control for every test below: the fixture they mutate is
+        // accepted before they touch it.
+        assert_eq!(motion_after_sunset_rule().validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_malformed_time_bound_is_refused_because_it_matches_nothing() {
+        let mut spec = motion_after_sunset_rule();
+        spec.condition.after = Some("sunset".into());
+        // The defect: the window fails closed, so this rule never fires — at
+        // 22:00, which is exactly when the user meant it to.
+        assert!(!spec.matches(&motion_event(), at("22:00")));
+        assert_eq!(
+            spec.validate(),
+            Err(RuleRejection::MalformedTimeBound {
+                field: "after",
+                value: "sunset".into(),
+            })
+        );
+        spec.condition.after = Some("18:30".into());
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn half_a_condition_is_refused_because_it_is_silently_no_condition() {
+        let mut spec = motion_after_sunset_rule();
+        spec.condition.value = None; // operator with no threshold
+                                     // The defect: `matches` needs both, so the comparison vanishes and the
+                                     // rule fires on a reading of 0.0 — the opposite of "when motion".
+        let mut quiet = motion_event();
+        quiet.value = Some(0.0);
+        assert!(spec.matches(&quiet, at("22:00")));
+        assert_eq!(spec.validate(), Err(RuleRejection::HalfCondition));
+    }
+
+    #[test]
+    fn an_empty_filter_is_refused_because_no_device_is_called_empty_string() {
+        let mut spec = motion_after_sunset_rule();
+        spec.source.device_id = Some(String::new());
+        assert!(!spec.matches(&motion_event(), at("22:00")));
+        assert_eq!(
+            spec.validate(),
+            Err(RuleRejection::EmptyFilter { field: "device_id" })
+        );
+        // `None` is how "any device" is said, and it stays legal.
+        spec.source.device_id = None;
+        assert!(spec.validate().is_ok());
+        assert!(spec.matches(&motion_event(), at("22:00")));
+    }
+
+    #[test]
+    fn a_rule_with_no_actions_is_refused() {
+        let mut spec = motion_after_sunset_rule();
+        spec.actions.clear();
+        // The defect is one layer out and cannot be asserted here: the executor
+        // bails with "sensor rule has no actions" on every fire, so the rule
+        // records a failed run each time its sensor twitches.
+        assert_eq!(spec.validate(), Err(RuleRejection::NoActions));
+    }
+
+    #[test]
+    fn an_action_that_cannot_act_is_refused_by_index() {
+        let mut spec = motion_after_sunset_rule();
+        spec.actions.push(TriggerAction::DevicePower {
+            device_id: "  ".into(),
+            on: true,
+        });
+        assert_eq!(
+            spec.validate(),
+            Err(RuleRejection::EmptyAction {
+                index: 2,
+                reason: "a device action needs a device_id",
+            })
+        );
+
+        let mut spec = motion_after_sunset_rule();
+        spec.actions = vec![TriggerAction::Notify {
+            title: " ".into(),
+            body: String::new(),
+        }];
+        assert!(matches!(
+            spec.validate(),
+            Err(RuleRejection::EmptyAction { index: 0, .. })
+        ));
+        // A notification with only a body is legal — a title-less toast still
+        // says something.
+        let spec = SensorTriggerSpec {
+            actions: vec![TriggerAction::Notify {
+                title: String::new(),
+                body: "Backyard motion".into(),
+            }],
+            ..motion_after_sunset_rule()
+        };
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn rejections_say_what_to_change() {
+        // These strings are the body of a 400. "invalid rule" would send the
+        // user to the logs.
+        let text = RuleRejection::MalformedTimeBound {
+            field: "before",
+            value: "6pm".into(),
+        }
+        .to_string();
+        assert!(text.contains("condition.before"), "{text}");
+        assert!(text.contains("HH:MM"), "{text}");
+        assert!(RuleRejection::NoActions.to_string().contains("action"));
     }
 
     #[test]
