@@ -74,7 +74,7 @@ use crate::mcp::domain::tool_group::{
 };
 #[cfg(test)]
 use crate::mcp::domain::tool_group::{ORCHESTRATOR_EXTENSION, TOOLKIT_EXTENSION};
-use crate::models::services::context::model_class::runs_on_this_device;
+use crate::models::services::context::model_class::{provider_locality, ProviderLocality};
 use crate::user_data::domain::profile::ProfileScope;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -139,16 +139,31 @@ pub const ROLE_YAML_KEY: &str = "giap_role";
 /// here would be a bug this programme has already made once and fixed once
 /// (PAI-4 P2): `ollama` and `llamafile` speak HTTP, but on a GIAP pond they
 /// speak it to `127.0.0.1`, so they are the same GPU the parent's next turn
-/// needs. [`runs_on_this_device`] is the wider deny set and therefore the safe
-/// one.
+/// needs. [`runs_on_this_device`] is the wider deny set and therefore the safer
+/// half of the answer.
+///
+/// [`runs_on_this_device`]: crate::models::services::context::model_class::runs_on_this_device
+///
+/// **It is only half, and this used to be written as `if runs_on_this_device`
+/// with parallelism as the `else`.** That made an unrecognised provider a
+/// permission: `chat_provider` is a flat settings row with no allow-list on the
+/// write path, `mock` is a shipped GIAP provider in neither list, and goose
+/// ships `lmstudio`/`llama_swap`/`omlx` declarative providers that all serve
+/// from localhost. Every one of them would have been handed
+/// [`REMOTE_SUBAGENT_CONCURRENCY`] children on the one GPU. The match below is
+/// exhaustive over [`ProviderLocality`] so the unknown case is a decision
+/// somebody wrote down rather than whatever falls out of an `else`.
 ///
 /// The remote number is a guess and is labelled as one — nothing has measured
 /// subagent concurrency against a hosted provider from this codebase.
 pub fn max_concurrent_subagents(provider: &str) -> usize {
-    if runs_on_this_device(provider) {
-        1
-    } else {
-        REMOTE_SUBAGENT_CONCURRENCY
+    match provider_locality(provider) {
+        // Known to be somebody else's hardware. Nothing on this box is
+        // contended by a second child.
+        ProviderLocality::Hosted => REMOTE_SUBAGENT_CONCURRENCY,
+        // One GPU and one retained KV prefix - or a name this pond cannot place,
+        // which must be treated as the first case until somebody says otherwise.
+        ProviderLocality::OnDevice | ProviderLocality::Unknown => 1,
     }
 }
 
@@ -197,34 +212,60 @@ pub const REMOTE_SUBAGENT_CONCURRENCY: usize = 3;
 pub enum ChildModel {
     /// The role named no model. The child runs on whatever the parent runs on.
     Inherited,
-    /// The role named a model and the provider runs somewhere else, so it is
-    /// honoured.
+    /// The role named a model and the provider is KNOWN to run somewhere else,
+    /// so it is honoured.
     Assigned(String),
     /// The role named a model and the provider runs on THIS device, so it is
     /// not.
     RefusedOnDevice { requested: String, provider: String },
+    /// The role named a model and this pond cannot place the provider, so it is
+    /// not honoured either.
+    ///
+    /// **A separate variant rather than a reuse of `RefusedOnDevice`, because
+    /// the two say different true things.** The refusal text is read by a human
+    /// looking at a log line and asking why their role's model was ignored, and
+    /// telling them `mock` "runs on this device" when what happened is that
+    /// nothing knows where it runs sends them to fix the wrong thing.
+    RefusedUnknownProvider { requested: String, provider: String },
 }
 
 impl ChildModel {
     /// Decide from the role's request and the parent's provider.
     ///
-    /// The predicate is [`runs_on_this_device`] — `local`, `gguf`, `ollama` and
-    /// `llamafile` — and not `is_local_provider`, for the reason PAI-4 P2 had to
-    /// fix once: ollama and llamafile speak HTTP, but on a GIAP pond they speak
-    /// it to `127.0.0.1`, which is the same GPU and the same one loaded model.
-    /// A version of this written against the narrow predicate would swap the
-    /// resident GGUF on two of the four providers that have one.
+    /// The predicate is [`provider_locality`], whose on-device set is `local`,
+    /// `gguf`, `ollama` and `llamafile` — and not `is_local_provider`, for the
+    /// reason PAI-4 P2 had to fix once: ollama and llamafile speak HTTP, but on
+    /// a GIAP pond they speak it to `127.0.0.1`, which is the same GPU and the
+    /// same one loaded model. A version of this written against the narrow
+    /// predicate would swap the resident GGUF on two of the four providers that
+    /// have one.
+    ///
+    /// **It asks for `Hosted`, not for `!OnDevice`, and that is the correction
+    /// P7 shipped without.** As first written this was
+    /// `if runs_on_this_device(provider) { refuse } else { assign }`, which
+    /// honours a role's model for every provider name the deny-set has not been
+    /// taught — including `mock`, which is a shipped GIAP provider serving
+    /// in-process, and including goose's own `lmstudio`, `llama_swap` and
+    /// `omlx`, which serve from localhost. Honouring it there is the exact cost
+    /// this type exists to avoid: a second set of weights in the one slot, a
+    /// load and a re-prefill the parent's next turn pays for. A role's model is
+    /// a request, and it is granted only against a positive claim that the model
+    /// is somebody else's to hold.
     pub fn resolve(requested: Option<&str>, provider: &str) -> Self {
         let Some(requested) = requested.map(str::trim).filter(|m| !m.is_empty()) else {
             return ChildModel::Inherited;
         };
-        if runs_on_this_device(provider) {
-            return ChildModel::RefusedOnDevice {
+        match provider_locality(provider) {
+            ProviderLocality::Hosted => ChildModel::Assigned(requested.to_string()),
+            ProviderLocality::OnDevice => ChildModel::RefusedOnDevice {
                 requested: requested.to_string(),
                 provider: provider.to_string(),
-            };
+            },
+            ProviderLocality::Unknown => ChildModel::RefusedUnknownProvider {
+                requested: requested.to_string(),
+                provider: provider.to_string(),
+            },
         }
-        ChildModel::Assigned(requested.to_string())
     }
 
     /// The model name to stamp on the child's `ModelConfig`, or `None` to
@@ -236,7 +277,9 @@ impl ChildModel {
     pub fn assigned(&self) -> Option<&str> {
         match self {
             ChildModel::Assigned(model) => Some(model),
-            ChildModel::Inherited | ChildModel::RefusedOnDevice { .. } => None,
+            ChildModel::Inherited
+            | ChildModel::RefusedOnDevice { .. }
+            | ChildModel::RefusedUnknownProvider { .. } => None,
         }
     }
 
@@ -251,6 +294,15 @@ impl ChildModel {
                 "role asked for model `{requested}` but `{provider}` runs on this device, where a \
                  second model is a load plus a re-prefill the parent's next turn pays for - \
                  running the child on the resident model instead"
+            )),
+            ChildModel::RefusedUnknownProvider {
+                requested,
+                provider,
+            } => Some(format!(
+                "role asked for model `{requested}` but this pond does not know where `{provider}` \
+                 runs, and a second model on THIS device is a load plus a re-prefill the parent's \
+                 next turn pays for - running the child on the resident model instead. Add \
+                 `{provider}` to HOSTED_PROVIDERS if it is served from another machine"
             )),
             ChildModel::Inherited | ChildModel::Assigned(_) => None,
         }
@@ -267,20 +319,39 @@ impl ChildModel {
 /// semaphore enforces: where only one thing may touch the model at a time, a
 /// "background" child is not background at all — it is the parent's next turn
 /// queueing behind it, and paying a re-prefill when it gets there.
+///
+/// [`runs_on_this_device`]: crate::models::services::context::model_class::runs_on_this_device
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackgroundAvailability {
     Available,
-    RefusedOnDevice { provider: String },
+    RefusedOnDevice {
+        provider: String,
+    },
+    /// The provider is in neither list, so nothing is known about who pays for
+    /// a second agent. Refused for the same reason and with a different
+    /// sentence — see [`ChildModel::RefusedUnknownProvider`].
+    RefusedUnknownProvider {
+        provider: String,
+    },
 }
 
 impl BackgroundAvailability {
+    /// **The permission still comes from [`max_concurrent_subagents`]**, not
+    /// from a second reading of the provider lists, so this cannot drift from
+    /// the number the semaphore enforces. [`provider_locality`] is consulted
+    /// only to choose which true sentence to say about a refusal that has
+    /// already been decided.
     pub fn for_provider(provider: &str) -> Self {
-        if max_concurrent_subagents(provider) <= 1 {
-            BackgroundAvailability::RefusedOnDevice {
+        if max_concurrent_subagents(provider) > 1 {
+            return BackgroundAvailability::Available;
+        }
+        if provider_locality(provider) == ProviderLocality::Unknown {
+            return BackgroundAvailability::RefusedUnknownProvider {
                 provider: provider.to_string(),
-            }
-        } else {
-            BackgroundAvailability::Available
+            };
+        }
+        BackgroundAvailability::RefusedOnDevice {
+            provider: provider.to_string(),
         }
     }
 
@@ -298,6 +369,12 @@ impl BackgroundAvailability {
                  can use it at a time - a background helper would simply be holding up your own \
                  next reply. Call delegate again without `background` and wait for the answer, or \
                  do the work yourself"
+            )),
+            BackgroundAvailability::RefusedUnknownProvider { provider } => Some(format!(
+                "this pond cannot tell where `{provider}` runs its model, so it assumes the \
+                 device itself, where one agent can use it at a time - a background helper would \
+                 simply be holding up your own next reply. Call delegate again without \
+                 `background` and wait for the answer, or do the work yourself"
             )),
         }
     }
@@ -2758,19 +2835,44 @@ mod concurrency_tests {
     fn the_predicate_is_case_insensitive_like_the_one_it_delegates_to() {
         assert_eq!(max_concurrent_subagents("Ollama"), 1);
         assert_eq!(max_concurrent_subagents("GGUF"), 1);
+        // ... and the padded case is 1 for the RIGHT reason. Dropping the trim
+        // leaves this number at 1 as an UNKNOWN provider, so the count alone
+        // cannot tell a recognised `ollama` from an unrecognised `" ollama "`.
+        assert_eq!(max_concurrent_subagents(" ollama "), 1);
+        assert_eq!(provider_locality(" ollama "), ProviderLocality::OnDevice);
+    }
+
+    /// **The fail-open this function shipped with.** It was
+    /// `if runs_on_this_device(provider) { 1 } else { REMOTE }`, so every
+    /// provider name the deny-set had not been taught was handed three children
+    /// on one GPU. None of these is hypothetical: `mock` is a shipped GIAP
+    /// provider (`--provider mock`), and `lmstudio`, `llama_swap` and `omlx` are
+    /// goose declarative providers that serve from localhost.
+    #[test]
+    fn a_provider_this_pond_cannot_place_gets_no_parallelism() {
+        for provider in [
+            "",
+            "  ",
+            "mock",
+            "lmstudio",
+            "llama_swap",
+            "omlx",
+            "pond-spark",
+        ] {
+            assert_eq!(
+                max_concurrent_subagents(provider),
+                1,
+                "`{provider}` is in neither provider list, so nothing knows whose GPU pays for a \
+                 second child - it must take the on-device answer"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod child_model_tests {
     use super::*;
-    use crate::models::services::context::model_class::ON_DEVICE_PROVIDERS;
-
-    /// A hosted provider a role could plausibly be pointed at. Written out
-    /// rather than derived, because there is no `OFF_DEVICE_PROVIDERS` constant
-    /// and inverting `ON_DEVICE_PROVIDERS` over an open string domain is not a
-    /// thing a test can do.
-    const HOSTED_PROVIDERS: [&str; 4] = ["anthropic", "openai", "openrouter", "google"];
+    use crate::models::services::context::model_class::{HOSTED_PROVIDERS, ON_DEVICE_PROVIDERS};
 
     /// **The phase's whole refusal, quantified over the shared list** rather
     /// than over `local`/`gguf`, which is the narrow reading PAI-4 P2 already
@@ -2851,6 +2953,59 @@ mod child_model_tests {
             ChildModel::resolve(Some("m"), "GGUF"),
             ChildModel::RefusedOnDevice { .. }
         ));
+        assert!(
+            matches!(
+                ChildModel::resolve(Some("m"), " ollama "),
+                ChildModel::RefusedOnDevice { .. }
+            ),
+            "a padded provider name escaped the refusal"
+        );
+    }
+
+    /// **The fail-open this resolver shipped with**, and the reason the request
+    /// is granted against a positive claim rather than against the absence of a
+    /// deny-list entry.
+    ///
+    /// As first written it was
+    /// `if runs_on_this_device { refuse } else { assign }`, so every one of
+    /// these names — `mock` is a shipped GIAP provider serving in-process, and
+    /// `lmstudio`, `llama_swap` and `omlx` are goose declarative providers
+    /// serving from localhost — got the role's model honoured, which on this
+    /// device is a second set of weights in the one slot plus the re-prefill the
+    /// parent's next turn pays for.
+    #[test]
+    fn a_model_is_not_honoured_for_a_provider_this_pond_cannot_place() {
+        for provider in [
+            "",
+            "  ",
+            "mock",
+            "lmstudio",
+            "llama_swap",
+            "omlx",
+            "pond-spark",
+        ] {
+            let decided = ChildModel::resolve(Some("qwen3-14b"), provider);
+            assert_eq!(
+                decided,
+                ChildModel::RefusedUnknownProvider {
+                    requested: "qwen3-14b".to_string(),
+                    provider: provider.to_string(),
+                },
+                "`{provider}` is in neither provider list, so nothing knows that a second model \
+                 there is somebody else's problem"
+            );
+            assert_eq!(
+                decided.assigned(),
+                None,
+                "`{provider}`: an unplaceable provider let a role's model reach an engine call \
+                 site"
+            );
+            let refusal = decided.refusal().expect("a refusal says why");
+            assert!(
+                refusal.contains("qwen3-14b") && refusal.contains("does not know where"),
+                "the refusal does not say what actually happened: {refusal}"
+            );
+        }
     }
 
     #[test]
@@ -2994,16 +3149,64 @@ mod background_tests {
         }
     }
 
+    /// **The fail-open this gate shipped with.** `for_provider` refused only
+    /// what `runs_on_this_device` recognised, so a background delegation was
+    /// PERMITTED on `mock` and on goose's localhost-serving declarative
+    /// providers — where "background" means the household's next reply is
+    /// queueing behind it.
+    #[test]
+    fn background_is_refused_for_a_provider_this_pond_cannot_place() {
+        for provider in [
+            "",
+            "  ",
+            "mock",
+            "lmstudio",
+            "llama_swap",
+            "omlx",
+            "pond-spark",
+        ] {
+            let availability = BackgroundAvailability::for_provider(provider);
+            assert_eq!(
+                availability,
+                BackgroundAvailability::RefusedUnknownProvider {
+                    provider: provider.to_string()
+                },
+                "`{provider}` is in neither provider list, so a background child may be running \
+                 on the one GPU the parent's next turn needs"
+            );
+            let refusal = availability.refusal().expect("a refusal says why");
+            assert!(
+                refusal.contains("cannot tell where"),
+                "the refusal claims to know something about `{provider}` that nothing does: \
+                 {refusal}"
+            );
+            assert!(
+                refusal.contains("without `background`"),
+                "the refusal does not tell the model what to do instead: {refusal}"
+            );
+        }
+    }
+
     /// The predicate is the semaphore's own number, not a second reading of
     /// `runs_on_this_device`. Pinning the two together is what stops them
     /// drifting into a state where one permit is enforced and background is
-    /// offered anyway.
+    /// offered anyway — and it now spans all three localities, so a future
+    /// disagreement about the UNKNOWN case fails here too.
     #[test]
     fn availability_agrees_with_the_concurrency_limit_it_is_derived_from() {
-        for provider in ON_DEVICE_PROVIDERS
-            .iter()
-            .chain(["anthropic", "openai", "Ollama", "GGUF"].iter())
-        {
+        for provider in ON_DEVICE_PROVIDERS.iter().chain(
+            [
+                "anthropic",
+                "openai",
+                "Ollama",
+                "GGUF",
+                "",
+                "mock",
+                "lmstudio",
+                "pond-spark",
+            ]
+            .iter(),
+        ) {
             let available =
                 BackgroundAvailability::for_provider(provider) == BackgroundAvailability::Available;
             assert_eq!(
