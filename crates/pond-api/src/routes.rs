@@ -36,7 +36,7 @@ use pond_core::shared::ports::event_bus::BusEvent;
 use pond_core::shared::services::chat::ChatService;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
 use pond_core::user_data::domain::profile::CreateProfileRequest;
-use pond_core::user_data::domain::schedule::TaskKind;
+use pond_core::user_data::domain::schedule::{Schedule, SensorTriggerSpec, TaskKind};
 use pond_core::user_data::domain::sensor::{CameraEvent, SensorReading};
 use pond_core::user_data::domain::session::{IdentificationSource, SessionIdentity};
 use pond_core::user_data::domain::settings::Settings;
@@ -213,6 +213,20 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/schedules/{id}/run-now", post(run_schedule_now))
         .route("/schedules/{id}/runs", get(list_schedule_runs))
         .route("/schedules/events", get(schedule_events_sse))
+        // ── Sensor rules (PAI-7 P8) ────────────────────────────────────────
+        // A rule is a `SensorTrigger` schedule. Until now the only way to make
+        // one over HTTP was to POST that kind to `/schedules` along with a cron
+        // expression the scheduler never reads, which is why the MCP tools were
+        // the real interface. These handlers name the thing, validate the spec
+        // the schedule route accepts unchecked, and refuse to reach a cron
+        // schedule by id.
+        .route("/rules", get(list_rules).post(create_rule))
+        .route(
+            "/rules/{id}",
+            get(get_rule).put(update_rule).delete(delete_rule),
+        )
+        .route("/rules/{id}/pause", post(pause_rule))
+        .route("/rules/{id}/resume", post(resume_rule))
         // Foreground push: per-device notification stream (#99).
         .route("/notifications/stream", get(notifications_stream))
         // ── Extensions (MCP/Goose extension manager) ───────────────────────────
@@ -7673,6 +7687,16 @@ async fn create_schedule(
         );
     };
 
+    // A rule can still arrive here, by naming the kind explicitly — this route
+    // predates `/rules` and clients depend on it. Validate it identically or
+    // the new surface's checks are decorative: whoever wanted to skip them
+    // would simply POST here instead. (PAI-7 P8)
+    if let TaskKind::SensorTrigger(spec) = &kind {
+        if let Some((status, body)) = rule_spec_rejection(spec) {
+            return (status, Json(body));
+        }
+    }
+
     let req = CreateScheduleRequest {
         id: api_req
             .id
@@ -7881,6 +7905,297 @@ async fn schedule_events_sse(
     };
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+// ───────────────────────── Sensor-rule Handlers (PAI-7 P8) ──────────
+//
+// A rule is a `TaskKind::SensorTrigger` schedule and nothing else — there is no
+// second store and no second execution path, because the rules engine fires
+// through the scheduler's own `run_now` and that is what gives a rule fire its
+// run record and its result event. What this surface adds is the two things
+// `/schedules` cannot: it names rules (so listing them does not mean filtering
+// a mixed list client-side, and creating one does not mean inventing a cron
+// expression the scheduler ignores), and it validates the spec.
+
+/// Project a schedule onto the rule surface. `None` when the id names a cron
+/// schedule rather than a rule.
+///
+/// Every `/rules/{id}` handler resolves through this, which is what stops the
+/// new surface being a second door onto `/schedules`: pausing or deleting the
+/// household's nightly backup by guessing its id answers 404 here.
+fn rule_view(s: &Schedule) -> Option<Value> {
+    let TaskKind::SensorTrigger(spec) = &s.kind else {
+        return None;
+    };
+    Some(json!({
+        "id": s.id,
+        "name": s.label,
+        "paused": s.paused,
+        "currently_running": s.currently_running,
+        "created_at": s.created_at,
+        // PAI-7 P8's durable cooldown stamp. Exposed because "why has this not
+        // fired" is answered by it and by nothing else on the response.
+        "last_fired": s.last_run,
+        "cooldown_secs": spec.cooldown_secs,
+        "source": spec.source,
+        "condition": spec.condition,
+        "actions": spec.actions,
+    }))
+}
+
+/// Rules never register a cron job — the rules engine fires them from the event
+/// bus — but a `Schedule` has to carry some cron string. This is the marker the
+/// scheduler and the MCP tools already use, kept here so a caller never has to
+/// supply an expression that is not read.
+const RULE_CRON: &str = "@event";
+
+/// The 400 a rule spec earns, or `None` if it is fit to store.
+///
+/// One function for all three doors — `POST /rules`, `PUT /rules/{id}` and the
+/// older `POST /schedules` — because a rule accepted through any of them is
+/// stored in the same place and fired by the same engine. A check on two of the
+/// three is not a check.
+fn rule_spec_rejection(spec: &SensorTriggerSpec) -> Option<(StatusCode, Value)> {
+    spec.validate().err().map(|rejected| {
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"error": rejected.to_string()}),
+        )
+    })
+}
+
+/// Fetch one rule, or the response that says why not.
+async fn find_rule(
+    scheduler: &Arc<dyn pond_core::user_data::ports::scheduler::SchedulerPort>,
+    id: &str,
+) -> Result<Schedule, (StatusCode, Json<Value>)> {
+    let tasks = scheduler.list_tasks().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    tasks
+        .into_iter()
+        // `rule_view` decides what a rule is, here as well as in the listing.
+        // Two encodings of "is this a rule" drift, and the direction this one
+        // would drift in is a cron schedule becoming reachable by id.
+        .find(|t| t.id == id && rule_view(t).is_some())
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("rule '{id}' not found")})),
+            )
+        })
+}
+
+/// The scheduler is optional in `AppState`; every handler here needs it.
+fn require_scheduler(
+    state: &Arc<AppState>,
+) -> Result<Arc<dyn pond_core::user_data::ports::scheduler::SchedulerPort>, (StatusCode, Json<Value>)>
+{
+    state.scheduler.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "scheduler not configured"})),
+    ))
+}
+
+/// `GET /api/v1/rules` — every sensor rule, cron schedules excluded.
+async fn list_rules(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+    let scheduler = match require_scheduler(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match scheduler.list_tasks().await {
+        Ok(tasks) => {
+            let rules: Vec<Value> = tasks.iter().filter_map(rule_view).collect();
+            (StatusCode::OK, Json(json!(rules)))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+/// Create/replace body. The spec is flattened, so the rule reads as one object
+/// rather than a schedule wrapping a kind wrapping a spec.
+#[derive(Debug, serde::Deserialize)]
+struct ApiRuleRequest {
+    /// Optional on create; a UUID is generated. Ignored on update.
+    id: Option<String>,
+    #[serde(alias = "label")]
+    name: String,
+    #[serde(flatten)]
+    spec: SensorTriggerSpec,
+}
+
+/// `POST /api/v1/rules` — create a sensor rule.
+async fn create_rule(
+    State(state): State<Arc<AppState>>,
+    result: Result<Json<ApiRuleRequest>, JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let scheduler = match require_scheduler(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let Json(req) = match result {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
+    };
+    if let Some((status, body)) = rule_spec_rejection(&req.spec) {
+        return (status, Json(body));
+    }
+
+    // Duplicate ids and the cron are the scheduler's to judge, not this
+    // handler's — see `SensorTriggerSpec::validate`.
+    let create = CreateScheduleRequest {
+        id: req.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        label: req.name,
+        cron: RULE_CRON.to_string(),
+        timezone: "UTC".to_string(),
+        kind: TaskKind::SensorTrigger(req.spec),
+    };
+    match scheduler.create_task(create).await {
+        Ok(task) => match rule_view(&task) {
+            Some(v) => (StatusCode::CREATED, Json(v)),
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "scheduler returned a non-rule for a rule create"})),
+            ),
+        },
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+/// `GET /api/v1/rules/{id}` — one rule.
+async fn get_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let scheduler = match require_scheduler(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match find_rule(&scheduler, &id).await {
+        Ok(rule) => match rule_view(&rule) {
+            Some(v) => (StatusCode::OK, Json(v)),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("rule '{id}' not found")})),
+            ),
+        },
+        Err(r) => r,
+    }
+}
+
+/// `PUT /api/v1/rules/{id}` — replace a rule's name and spec.
+async fn update_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    result: Result<Json<ApiRuleRequest>, JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let scheduler = match require_scheduler(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let Json(req) = match result {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
+    };
+    // Resolve BEFORE validating so a PUT at a cron schedule's id is a 404
+    // rather than a 400 telling the caller how to fix a rule that does not
+    // exist -- and so it can never overwrite one.
+    if let Err(r) = find_rule(&scheduler, &id).await {
+        return r;
+    }
+    if let Some((status, body)) = rule_spec_rejection(&req.spec) {
+        return (status, Json(body));
+    }
+
+    let update = UpdateScheduleRequest {
+        label: Some(req.name),
+        cron: None,
+        timezone: None,
+        kind: Some(TaskKind::SensorTrigger(req.spec)),
+    };
+    match scheduler.update_task(&id, update).await {
+        Ok(task) => match rule_view(&task) {
+            Some(v) => (StatusCode::OK, Json(v)),
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "scheduler returned a non-rule for a rule update"})),
+            ),
+        },
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+/// `DELETE /api/v1/rules/{id}` — remove a rule.
+async fn delete_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let scheduler = match require_scheduler(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = find_rule(&scheduler, &id).await {
+        return r;
+    }
+    match scheduler.delete_task(&id).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"deleted": id}))),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+/// `POST /api/v1/rules/{id}/pause` — stop the rule firing without deleting it.
+async fn pause_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let scheduler = match require_scheduler(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = find_rule(&scheduler, &id).await {
+        return r;
+    }
+    match scheduler.pause_task(&id).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"paused": id}))),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+/// `POST /api/v1/rules/{id}/resume` — let it fire again.
+async fn resume_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let scheduler = match require_scheduler(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = find_rule(&scheduler, &id).await {
+        return r;
+    }
+    match scheduler.resume_task(&id).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"resumed": id}))),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -13054,6 +13369,195 @@ mod tests {
         // qualified name — the gate sees whatever `qualify_tool_name` produced.
         let qualified = qualify_tool_name("giap-device-control", "set_device_state");
         assert!(DIRECT_DISPATCH_ALLOWLIST.contains(&qualified.as_str()));
+    }
+
+    // ── sensor rules (PAI-7 P8) ──────────────────────────────────
+
+    mod rules {
+        use super::*;
+        use pond_core::user_data::domain::schedule::{
+            SensorTriggerSpec, TriggerAction, TriggerCondition, TriggerSource, TriggerSourceKind,
+        };
+
+        fn spec() -> SensorTriggerSpec {
+            SensorTriggerSpec {
+                source: TriggerSource {
+                    kind: TriggerSourceKind::Sensor,
+                    device_id: Some("backyard-pir".into()),
+                    signal: Some("motion".into()),
+                },
+                condition: TriggerCondition::default(),
+                actions: vec![TriggerAction::Notify {
+                    title: "Motion".into(),
+                    body: "Backyard".into(),
+                }],
+                cooldown_secs: 120,
+            }
+        }
+
+        fn schedule(id: &str, kind: TaskKind) -> Schedule {
+            Schedule {
+                id: id.into(),
+                label: format!("label of {id}"),
+                cron: RULE_CRON.into(),
+                timezone: "UTC".into(),
+                kind,
+                paused: false,
+                currently_running: false,
+                last_run: None,
+                next_run: None,
+                created_at: chrono::Utc::now(),
+            }
+        }
+
+        #[test]
+        fn a_cron_schedule_is_not_a_rule() {
+            // The whole point of the id resolution: `/rules/{id}` must not be a
+            // second door onto `/schedules`. `find_rule` and the listing both
+            // ask this function, so this covers deleting and pausing too.
+            let backup = schedule(
+                "nightly-backup",
+                TaskKind::AgentPrompt {
+                    prompt: "back up".into(),
+                },
+            );
+            let leaked = "a cron schedule projected as a rule: /rules/{id} would \
+                 let a caller pause or delete the household's nightly backup by \
+                 guessing its id";
+            assert!(rule_view(&backup).is_none(), "{leaked}");
+            assert!(
+                rule_view(&schedule(
+                    "hook",
+                    TaskKind::Webhook {
+                        webhook_url: "https://example.com".into()
+                    }
+                ))
+                .is_none(),
+                "{leaked}"
+            );
+            // Vacuity control: the same projection over a real rule works, so
+            // "None" above is about the KIND and not about the fixture.
+            assert!(rule_view(&schedule("r", TaskKind::SensorTrigger(spec()))).is_some());
+        }
+
+        #[test]
+        fn the_rule_view_reports_the_durable_cooldown_stamp() {
+            // "Why has my rule not fired?" is answered by the persisted fire
+            // stamp (PAI-7 P8's first repair) and by nothing else on this
+            // response. A view that dropped it would send the user to the logs.
+            let fired_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+            let mut rule = schedule("r", TaskKind::SensorTrigger(spec()));
+            rule.last_run = Some(fired_at);
+
+            let v = rule_view(&rule).expect("a sensor rule projects");
+            assert_eq!(v["last_fired"], json!(fired_at));
+            assert_eq!(v["cooldown_secs"], json!(120));
+            assert_eq!(v["name"], json!("label of r"));
+            // The cron and timezone a rule never uses stay off the surface.
+            assert!(v.get("cron").is_none(), "{v}");
+            assert!(v.get("timezone").is_none(), "{v}");
+        }
+
+        #[test]
+        fn the_create_body_is_the_rule_itself_with_no_cron() {
+            // The shape `/schedules` forced was a schedule wrapping a kind
+            // wrapping a spec, plus a cron expression the scheduler never
+            // reads for an event rule.
+            let body = json!({
+                "name": "Backyard motion after sunset",
+                "source": {"kind": "sensor", "device_id": "backyard-pir", "signal": "motion"},
+                "condition": {"after": "18:30", "before": "06:00"},
+                "actions": [{"type": "notify", "title": "Motion", "body": "Backyard"}]
+            });
+            let req: ApiRuleRequest = serde_json::from_value(body).expect("flattened spec parses");
+            assert_eq!(req.name, "Backyard motion after sunset");
+            assert!(req.id.is_none());
+            // Not supplied, so it takes the domain default rather than 0 —
+            // which would be no debounce at all on a flapping PIR.
+            assert_eq!(req.spec.cooldown_secs, 60);
+            assert_eq!(req.spec.condition.after.as_deref(), Some("18:30"));
+            assert!(req.spec.validate().is_ok());
+        }
+
+        /// This file, for the ORDER guard below. The three handlers that store
+        /// a rule cannot be driven from a unit test — they need an `AppState`
+        /// with a live scheduler, which is an integration concern — so what is
+        /// guarded here is that each one still calls the check, and calls it
+        /// BEFORE handing the spec to the scheduler. A test asserting only that
+        /// `rule_spec_rejection` exists would pass with all three call sites
+        /// deleted.
+        const ROUTES_SRC: &str = include_str!("routes.rs");
+
+        /// The source of one handler: from its signature to the next `async fn`.
+        fn handler_body(signature: &str) -> &'static str {
+            let start = ROUTES_SRC
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature} is gone from routes.rs"));
+            let rest = &ROUTES_SRC[start + signature.len()..];
+            let end = rest
+                .find("\nasync fn ")
+                .unwrap_or_else(|| panic!("{signature} is the last handler in the file"));
+            &rest[..end]
+        }
+
+        #[test]
+        fn the_slicer_returns_one_handler_and_not_the_file() {
+            // Vacuity control for the guard below: if `handler_body` returned
+            // the whole file, every ordering assertion would pass by accident,
+            // satisfied by some other handler's code.
+            let body = handler_body("async fn create_rule(");
+            assert!(body.len() < ROUTES_SRC.len() / 4, "the slice is too big");
+            assert!(
+                body.contains("scheduler returned a non-rule for a rule create"),
+                "the slice is not create_rule's body"
+            );
+            assert!(
+                !body.contains("scheduler returned a non-rule for a rule update"),
+                "the slice ran on into update_rule"
+            );
+        }
+
+        #[test]
+        fn every_door_that_stores_a_rule_validates_first() {
+            for (signature, store_call) in [
+                ("async fn create_rule(", "create_task("),
+                ("async fn update_rule(", "update_task("),
+                // The pre-existing door. A rule can still be created here by
+                // naming the kind, so skipping it would leave the new
+                // surface's validation trivially avoidable.
+                ("async fn create_schedule(", "create_task("),
+            ] {
+                let body = handler_body(signature);
+                let check = body.find("rule_spec_rejection(").unwrap_or_else(|| {
+                    panic!(
+                        "{signature} no longer validates the rule spec — a rule with \
+                         no actions, or with a time window that parses as nothing, \
+                         would be stored and then never fire"
+                    )
+                });
+                let store = body
+                    .find(store_call)
+                    .unwrap_or_else(|| panic!("{signature} no longer calls {store_call}"));
+                assert!(
+                    check < store,
+                    "{signature} calls {store_call} before rule_spec_rejection(), \
+                     so the rule is stored whatever the check says"
+                );
+            }
+        }
+
+        #[test]
+        fn the_handlers_refuse_a_spec_the_domain_refuses() {
+            // The handlers call `validate`; this pins the cases they must be
+            // refusing, so the two cannot drift into "accepted and silent".
+            let mut bad = spec();
+            bad.actions.clear();
+            assert!(bad.validate().is_err());
+
+            let mut bad = spec();
+            bad.condition.after = Some("half six".into());
+            assert!(bad.validate().is_err());
+        }
     }
 
     // ── image attachment limits (phase F1) ───────────────────────
