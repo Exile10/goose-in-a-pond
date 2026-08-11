@@ -2940,3 +2940,212 @@ fn the_live_turn_subscribes_to_its_own_delegations() {
         );
     }
 }
+
+// ── PAI-6 P7: the role's model ──────────────────────────────────────────────
+//
+// The refusal is the phase. A per-role model on this device is a second GGUF
+// load plus a full re-prefill, on a decode path that is memory-bandwidth-bound,
+// against the one retained KV prefix the parent's next turn is hoping to be
+// served off. A feature that silently makes the headline configuration slower is
+// worse than no feature, so on-device the role's request is refused and the
+// child runs on the resident model.
+
+/// A role that asks for a model of its own.
+fn role_wanting_model(name: &str, groups: &[&str], model: &str) -> AgentRole {
+    role(name, groups)
+        .with_model(Some(model.to_string()))
+        .expect("a non-blank model is valid")
+}
+
+/// A `ModelConfig` shaped like a parent's: a model, a resolved window, and the
+/// settings a swap must not quietly drop.
+///
+/// `request_headers` is set because it is `#[serde(skip)]` — the JSON comparison
+/// below cannot see it, so a swap that dropped a provider's auth headers would
+/// otherwise look identical.
+fn parent_model_config() -> goose_providers::model::ModelConfig {
+    goose_providers::model::ModelConfig::new("parent-model")
+        .with_context_limit(Some(8192))
+        .with_temperature(Some(0.4))
+        .with_max_tokens(Some(1024))
+        .with_request_headers(Some(
+            [("x-pond".to_string(), "1".to_string())]
+                .into_iter()
+                .collect(),
+        ))
+}
+
+/// `ModelConfig` has no `PartialEq`, so "unchanged" is asserted on its
+/// serialisation plus the one field serde skips.
+fn same_config(
+    left: &goose_providers::model::ModelConfig,
+    right: &goose_providers::model::ModelConfig,
+) -> bool {
+    serde_json::to_value(left).unwrap() == serde_json::to_value(right).unwrap()
+        && left.request_headers == right.request_headers
+}
+
+/// **The on-device refusal, run rather than commented.** Quantified over the
+/// shared provider list, and driven through the real `build_child_plan` so what
+/// is asserted is the artifact the engine receives.
+#[test]
+fn a_role_model_never_reaches_the_engine_on_a_provider_that_runs_here() {
+    for provider in ON_DEVICE_PROVIDERS {
+        let role = role_wanting_model("researcher", &["giap-weather"], "qwen3-14b");
+        let spec = spec_for(&role, &["giap-weather"]);
+        let env = env_with(
+            provider,
+            parent_tools(&[("giap-weather", &["get_forecast"])]),
+        );
+        let plan = build_child_plan(&spec, "child-1", &env, None).expect("the plan is authorised");
+
+        assert_eq!(
+            plan.model,
+            ChildModel::RefusedOnDevice {
+                requested: "qwen3-14b".to_string(),
+                provider: provider.to_string(),
+            },
+            "{provider}: the plan did not record the refusal, so nothing downstream can say why \
+             the role's model was not used"
+        );
+        // And the thing that actually decides what the engine is handed.
+        let applied = child_model_config(&plan.model, parent_model_config());
+        assert_eq!(
+            applied.model_name, "parent-model",
+            "{provider}: a delegation swapped the resident model. On this device that is a full \
+             model load plus a re-prefill, and the parent's next turn pays for both"
+        );
+        assert!(
+            same_config(&applied, &parent_model_config()),
+            "{provider}: a refused role model changed the child's config anyway"
+        );
+    }
+}
+
+/// Vacuity control for the test above, and the half that makes P7 a feature
+/// rather than a refusal: off-device the role's model IS used, because there the
+/// model is a field in somebody else's request body.
+#[test]
+fn a_role_model_is_used_when_the_provider_runs_somewhere_else() {
+    for provider in ["anthropic", "openai", "openrouter"] {
+        let role = role_wanting_model("researcher", &["giap-weather"], "claude-haiku-4");
+        let spec = spec_for(&role, &["giap-weather"]);
+        let env = env_with(
+            provider,
+            parent_tools(&[("giap-weather", &["get_forecast"])]),
+        );
+        let plan = build_child_plan(&spec, "child-1", &env, None).expect("the plan is authorised");
+
+        assert_eq!(
+            plan.model,
+            ChildModel::Assigned("claude-haiku-4".to_string()),
+            "{provider}: the role's model was dropped, so P7 is inert everywhere"
+        );
+        let applied = child_model_config(&plan.model, parent_model_config());
+        assert_eq!(applied.model_name, "claude-haiku-4");
+        assert_eq!(
+            applied.context_limit, None,
+            "{provider}: the child carried the PARENT model's window onto a different model. \
+             Goose backfills a None from the registry entry for the model actually named; a Some \
+             is budgeted against the wrong one"
+        );
+        // Everything that is not the model or its window survives the swap.
+        assert_eq!(applied.temperature, Some(0.4));
+        assert_eq!(applied.max_tokens, Some(1024));
+        assert_eq!(
+            applied.request_headers,
+            parent_model_config().request_headers,
+            "{provider}: the swap dropped the provider's per-request headers, which serde skips \
+             and no JSON comparison would have seen"
+        );
+    }
+}
+
+/// The ordinary case. Every role in every pond today names no model, and that
+/// path must be byte-identical to the one before P7 existed.
+#[test]
+fn a_role_that_names_no_model_leaves_the_parents_config_alone() {
+    for provider in ON_DEVICE_PROVIDERS
+        .iter()
+        .chain(["anthropic", "openai"].iter())
+    {
+        let spec = spec_for(&role("researcher", &["giap-weather"]), &["giap-weather"]);
+        let env = env_with(
+            provider,
+            parent_tools(&[("giap-weather", &["get_forecast"])]),
+        );
+        let plan = build_child_plan(&spec, "child-1", &env, None).expect("the plan is authorised");
+        assert_eq!(plan.model, ChildModel::Inherited);
+        assert!(
+            same_config(
+                &child_model_config(&plan.model, parent_model_config()),
+                &parent_model_config()
+            ),
+            "{provider}: a role that asked for nothing changed the child's config anyway"
+        );
+    }
+}
+
+/// The residue the pure function cannot own: WHICH expression `run_child_agent`
+/// hands the engine, and WHEN.
+///
+/// Both natural regressions are ordering or argument changes rather than
+/// deletions — applying the swap after `update_provider` has already persisted
+/// the session's model config makes it a no-op, and passing the parent's config
+/// straight through makes P7 inert — so this asserts arguments and order, not
+/// presence.
+#[test]
+fn the_child_is_given_the_config_the_plan_decided_before_the_provider_is_set() {
+    let body = child_loop_source();
+
+    let args = call_args(&body, "crate::orchestrator::child_model_config(");
+    assert!(
+        args.contains("&plan.model"),
+        "the child's model config is derived from something other than the plan's decision, so \
+         the on-device refusal is being re-decided at the engine: {args}"
+    );
+    assert!(
+        args.contains("model_config"),
+        "the parent's own config is no longer the base of the child's: {args}"
+    );
+
+    let applied = body
+        .find("crate::orchestrator::child_model_config(")
+        .expect("run_child_agent no longer derives the child's model config");
+    let set = body
+        .find("child\n            .update_provider(")
+        .or_else(|| body.find(".update_provider("))
+        .expect("the child is no longer given a provider");
+    assert!(
+        applied < set,
+        "the model config is derived AFTER the child's provider is set. `update_provider` is \
+         what persists the model onto the child's session row, so a swap after it never reaches \
+         a provider call and P7 is silently inert"
+    );
+
+    // The plan's decision must not be re-read anywhere else in the loop: a
+    // second `plan.model` match beside the engine call is where the variant gets
+    // treated as an assignment and the resident GGUF gets swapped after all.
+    assert_eq!(
+        body.matches("plan.model").count(),
+        1,
+        "`plan.model` is read more than once in the child loop. One read, through \
+         `child_model_config`, is what keeps `RefusedOnDevice` from being handled a second time \
+         by somebody matching on the variant:\n{body}"
+    );
+}
+
+/// Vacuity control for the tripwire above: the slice it reads really is
+/// `run_child_agent`, and really does contain the two calls it orders. Without
+/// this, a `child_loop_source()` that silently returned the wrong text would
+/// make every assertion over it pass or panic for the wrong reason.
+#[test]
+fn the_child_loop_slice_is_the_child_loop() {
+    let body = child_loop_source();
+    assert!(body.contains("plan.child_session_id"));
+    assert!(body.contains(".reply(user_message.clone()"));
+    assert!(
+        !body.contains("pub async fn chat_stream("),
+        "the child-loop slice ran past the end of run_child_agent"
+    );
+}

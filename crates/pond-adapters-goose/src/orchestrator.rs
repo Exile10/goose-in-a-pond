@@ -61,7 +61,8 @@ use async_trait::async_trait;
 use pond_core::mcp::domain::tool_group::TOOL_NAME_SEPARATOR;
 use pond_core::shared::domain::agent::{AgentStreamEvent, SubagentStatus};
 use pond_core::shared::domain::orchestration::{
-    max_concurrent_subagents, TaskRun, TaskSpec, TaskStatus, REMOTE_SUBAGENT_CONCURRENCY,
+    max_concurrent_subagents, ChildModel, TaskRun, TaskSpec, TaskStatus,
+    REMOTE_SUBAGENT_CONCURRENCY,
 };
 use pond_core::shared::ports::orchestrator::Orchestrator;
 use pond_core::shared::services::turn_authority::TurnAuthorityRegistry;
@@ -877,6 +878,14 @@ pub struct ChildPlan {
     /// no warning.
     pub allowed_tool_names: Vec<String>,
     pub max_turns: u32,
+    /// PAI-6 P7. Which model this child runs on, already decided.
+    ///
+    /// The whole [`ChildModel`] and not an `Option<String>`, so that "the role
+    /// asked for a model and this device refused it" is a value the runner and a
+    /// test can both see, rather than an absence indistinguishable from "the
+    /// role asked for nothing". [`ChildModel::assigned`] is the only predicate
+    /// the runner may use.
+    pub model: ChildModel,
 }
 
 /// What came back from one child run, before it is classified.
@@ -1251,7 +1260,52 @@ pub fn build_child_plan(
         extensions,
         allowed_tool_names: tool_names,
         max_turns: spec.max_turns(),
+        // PAI-6 P7, decided HERE because this is the one place that holds both
+        // halves: the role's request, and the provider the parent is actually
+        // on. `GooseAdapter::run_child_agent` reads the answer and never the
+        // question -- it has no access to `spec` at all, which is what stops a
+        // second reading of `requested_model()` growing next to the engine call.
+        model: ChildModel::resolve(spec.requested_model(), &env.provider_name),
     })
+}
+
+/// Stamp a plan's model decision onto the parent's `ModelConfig` — PAI-6 P7.
+///
+/// # Why this is out here rather than inline at the engine
+///
+/// `GooseAdapter::run_child_agent` needs a live provider and a Goose session
+/// store, so nothing without an engine can reach a decision made inside it — and
+/// this programme's recorded shape for that is a source tripwire asserting that
+/// certain strings are present, which catches a textual revert and nothing else.
+/// Both of P7's natural regressions leave every string in place: matching on the
+/// variant instead of calling [`ChildModel::assigned`] treats `RefusedOnDevice`
+/// as an assignment and swaps the resident GGUF on the Orin, and carrying the
+/// parent's `context_limit` budgets a different model against the parent's
+/// window. Out here they are two assertions.
+///
+/// # Same provider, different config
+///
+/// There is no second provider built. `Provider::stream` takes the
+/// `&ModelConfig` per call and `Agent::reply` reads it from the SESSION row that
+/// `update_provider` writes, so a child session naming another model on the same
+/// `Arc<dyn Provider>` is the whole mechanism — which is exactly why it is only
+/// offered off-device, where "another model" is a field in a request body rather
+/// than a second set of weights in the one GPU.
+///
+/// `context_limit` is cleared rather than carried: Goose's `update_provider`
+/// backfills a `None` from the provider registry's entry for whatever model is
+/// now named, so the child ends up budgeted against its own window.
+pub fn child_model_config(
+    model: &ChildModel,
+    parent: goose_providers::model::ModelConfig,
+) -> goose_providers::model::ModelConfig {
+    let Some(assigned) = model.assigned() else {
+        return parent;
+    };
+    let mut cfg = parent;
+    cfg.model_name = assigned.to_string();
+    cfg.context_limit = None;
+    cfg
 }
 
 /// Decide what a finished child run actually was.
@@ -1481,6 +1535,33 @@ impl Orchestrator for GooseOrchestrator {
                 return Err(anyhow!(refused));
             }
         };
+
+        // PAI-6 P7, traced from one place so the two outcomes are read together.
+        //
+        // The refusal is not silent: it is a role's stated intent going unmet,
+        // and the person who authored the role is the only one who can decide
+        // what to do about it. It is a WARN rather than an error because the
+        // delegation itself is fine -- the child runs, on the resident model,
+        // with the tools, the budget and the persona the role asked for, all of
+        // which is where a role's value actually is.
+        match (plan.model.assigned(), plan.model.refusal()) {
+            (Some(model), _) => tracing::info!(
+                target: "giap::trace",
+                kind = "role_model_assigned",
+                task_id = %plan.task_id,
+                role = %plan.role,
+                model = %model,
+                "subagent runs on the model its role asked for"
+            ),
+            (None, Some(refusal)) => tracing::warn!(
+                target: "giap::trace",
+                kind = "role_model_refused",
+                task_id = %plan.task_id,
+                role = %plan.role,
+                "{refusal}"
+            ),
+            (None, None) => {}
+        }
 
         // Queued, not Running: the permit is acquired below and on an on-device
         // provider every child after the first waits for it. `TaskRun::started`
