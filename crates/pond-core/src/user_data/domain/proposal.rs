@@ -56,6 +56,7 @@
 //! variant, so a producer hands over `"camera"` or `"presence"` and this module
 //! never learns the difference.
 
+use crate::user_data::domain::draft::DraftStatus;
 use crate::user_data::domain::schedule::TaskKind;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -500,6 +501,210 @@ fn truncate(s: &str, max_chars: usize) -> String {
     format!("{head}...")
 }
 
+// ── What a proposal is ABOUT — PAI-7 P7's feedback loop ─────────────────────
+
+/// The event a proposal was made about, normalised so two proposals about the
+/// same thing compare equal.
+///
+/// Section 3.5's worked example is "we never want to be told about the garage
+/// door during the day", and the machinery that has to notice it is a
+/// comparison between what was rejected and what is about to be proposed again.
+/// A raw [`BusEventRef`] cannot do that job: it carries an `observed_at`, so
+/// two proposals about the same door at different minutes are different values.
+///
+/// Comparison is on the normalised text — case-folded, whitespace-collapsed,
+/// edge punctuation dropped — because both halves are model output. `"Front
+/// Door"` and `"front-door"` are the same door to everybody except `==`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct TriggerIdentity {
+    kind: String,
+    source_id: Option<String>,
+    signal: Option<String>,
+}
+
+impl TriggerIdentity {
+    /// The identity of the event this reference names, minus the timestamp.
+    pub fn of(trigger: &BusEventRef) -> Self {
+        Self {
+            kind: comparison_key(trigger.kind()),
+            source_id: trigger
+                .source_id()
+                .map(comparison_key)
+                .filter(|s| !s.is_empty()),
+            signal: trigger
+                .signal()
+                .map(comparison_key)
+                .filter(|s| !s.is_empty()),
+        }
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub fn source_id(&self) -> Option<&str> {
+        self.source_id.as_deref()
+    }
+
+    pub fn signal(&self) -> Option<&str> {
+        self.signal.as_deref()
+    }
+
+    /// A phrase naming this trigger, for the memory fact the feedback loop
+    /// writes. Third person and self-contained, because
+    /// `memory::fact_defect` discards a fact that opens with a pronoun or
+    /// points outside its own sentence.
+    pub fn describe(&self) -> String {
+        match (&self.source_id, &self.signal) {
+            (Some(source), Some(signal)) => {
+                format!("{} events from {source} ({signal})", self.kind)
+            }
+            (Some(source), None) => format!("{} events from {source}", self.kind),
+            (None, Some(signal)) => format!("{} events of type {signal}", self.kind),
+            (None, None) => format!("{} events", self.kind),
+        }
+    }
+}
+
+/// A proposal's identity for the feedback loop: what it was about, and what it
+/// suggested doing.
+///
+/// The action half is [`Proposal::summary`], which truncates at 120 characters.
+/// Two long prompts that differ only after the cut therefore share a shape, and
+/// that direction is chosen rather than tolerated: a shape collision suppresses
+/// a proposal that might have been new, and a missed match proposes again
+/// something the member has already said no to. Proactivity's failure direction
+/// is to say less.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct ProposalShape {
+    trigger: TriggerIdentity,
+    action: String,
+}
+
+impl ProposalShape {
+    /// The shape of a built proposal. The only constructor, deliberately: a
+    /// second one taking loose parts is a second definition of "the same
+    /// thing", and the two would drift apart exactly where it matters — one
+    /// used to record a rejection, the other to check it.
+    pub fn of(proposal: &Proposal) -> Self {
+        Self {
+            trigger: TriggerIdentity::of(proposal.trigger()),
+            action: comparison_key(&proposal.summary()),
+        }
+    }
+
+    pub fn trigger(&self) -> &TriggerIdentity {
+        &self.trigger
+    }
+
+    pub fn action(&self) -> &str {
+        &self.action
+    }
+}
+
+/// Case-folded, whitespace-collapsed, edge-punctuation-stripped text.
+///
+/// Per WORD rather than over the whole string, so `"Turn on the porch light."`
+/// and `"turn on the porch light"` fold together while `"front-door"` keeps its
+/// internal hyphen — the same edge-only rule `memory::split_tokens` uses, for
+/// the same reason.
+fn comparison_key(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What a member did about a proposal, and what it teaches.
+///
+/// The status is [`DraftStatus`] rather than an enum of this module's own, and
+/// that is load-bearing: a proposal IS a `drafts` row, decided through
+/// `giap-draft`'s one decision path, so a parallel enum here would be a second
+/// vocabulary for the same column that could disagree with it. The `match` in
+/// [`silences_a_repeat`](Self::silences_a_repeat) is exhaustive, so a status
+/// added to that enum has to be dispositioned here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposalDecision {
+    shape: ProposalShape,
+    status: DraftStatus,
+    decided_at: DateTime<Utc>,
+}
+
+impl ProposalDecision {
+    /// Record what happened to a proposal.
+    ///
+    /// [`DraftStatus::Pending`] is refused rather than stored as a neutral
+    /// value: an undecided proposal in a ledger of decisions is a fact nobody
+    /// stated, and every reader would have to remember to skip it.
+    pub fn recorded(
+        shape: ProposalShape,
+        status: DraftStatus,
+        decided_at: DateTime<Utc>,
+    ) -> Result<Self, ProposalError> {
+        if status == DraftStatus::Pending {
+            return Err(ProposalError::NotADecision);
+        }
+        Ok(Self {
+            shape,
+            status,
+            decided_at,
+        })
+    }
+
+    pub fn shape(&self) -> &ProposalShape {
+        &self.shape
+    }
+
+    pub fn status(&self) -> &DraftStatus {
+        &self.status
+    }
+
+    pub fn decided_at(&self) -> DateTime<Utc> {
+        self.decided_at
+    }
+
+    /// Whether this decision is a reason not to propose the same thing again.
+    ///
+    /// **Only a rejection.** An expiry is silence, not refusal — nobody
+    /// answered, and treating "the member did not get to it" as "the member
+    /// said no" would let an unattended pond talk itself into muteness, which
+    /// is the failure mode nobody would ever diagnose because its symptom is
+    /// the absence of an event.
+    pub fn silences_a_repeat(&self) -> bool {
+        match self.status {
+            DraftStatus::Rejected => true,
+            DraftStatus::Approved | DraftStatus::Expired | DraftStatus::Pending => false,
+        }
+    }
+
+    /// The sentence this decision contributes to memory, or `None` when it
+    /// teaches nothing.
+    ///
+    /// Third person and naming the user, because
+    /// `memory::MemoryExtractionService` puts every fact through
+    /// `memory::fact_defect` and demotes a `Preference` that never names the
+    /// user. This is the whole of PAI-7 section 3.5's "written back as
+    /// memories" half; the deterministic half is
+    /// `services::proactive_review::FeedbackLedger`.
+    pub fn memory_fact(&self) -> Option<String> {
+        let verb = match self.status {
+            DraftStatus::Approved => "approved",
+            DraftStatus::Rejected => "rejected",
+            // An expiry is the pond's own timeout. It is not something the user
+            // did, and writing it down as a preference would put words in their
+            // mouth.
+            DraftStatus::Expired | DraftStatus::Pending => return None,
+        };
+        Some(format!(
+            "The user {verb} a proactive suggestion about {}: {}.",
+            self.shape.trigger.describe(),
+            self.shape.action
+        ))
+    }
+}
+
 /// Why a proposal could not be built.
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum ProposalError {
@@ -517,6 +722,8 @@ pub enum ProposalError {
     TtlTooLong { id: String, hours: i64 },
     #[error("a proposal cannot be addressed to {scope}: it must name one household member")]
     UnaddressableAudience { scope: String },
+    #[error("a pending proposal is not a decision, and a ledger of decisions may not hold one")]
+    NotADecision,
 }
 
 #[cfg(test)]
@@ -916,6 +1123,205 @@ mod tests {
         let p = valid(Utc::now());
         assert_eq!(p.summary(), "tell me about the delivery");
         assert!(!p.summary().contains("closes at six"));
+    }
+
+    // ── P7: the shape a decision is recorded against ───────────────────────
+
+    /// Every status the `drafts` column can hold.
+    ///
+    /// An array, so it can go stale in the one direction an array can: a
+    /// variant added to [`DraftStatus`] is not added here by the compiler. What
+    /// covers that is the expectation being restated as its own exhaustive
+    /// `match` at each call site below — a new variant fails to compile there,
+    /// and the fix is to disposition it in both places.
+    fn every_draft_status() -> [DraftStatus; 4] {
+        [
+            DraftStatus::Pending,
+            DraftStatus::Approved,
+            DraftStatus::Rejected,
+            DraftStatus::Expired,
+        ]
+    }
+
+    fn proposal_about(source: &str, action: &str, observed_at: DateTime<Utc>) -> Proposal {
+        Proposal::expiring_after(
+            "prop-1",
+            BusEventRef::new(
+                "camera",
+                Some(source.into()),
+                Some("person".into()),
+                observed_at,
+            )
+            .unwrap(),
+            "why this matters",
+            TaskKind::AgentPrompt {
+                prompt: action.into(),
+            },
+            audience(),
+            0.7,
+            observed_at,
+            Duration::hours(1),
+        )
+        .unwrap()
+    }
+
+    /// The reason [`TriggerIdentity`] exists at all. A `BusEventRef` carries the
+    /// instant the event was seen, so two proposals about the same door a minute
+    /// apart are different values — and a feedback loop comparing those would
+    /// never match anything a member had already rejected, while looking like it
+    /// worked.
+    #[test]
+    fn the_same_suggestion_about_the_same_door_shares_a_shape_across_minutes() {
+        let noon = Utc::now();
+        let a = proposal_about("front-door", "turn on the porch light", noon);
+        let b = proposal_about(
+            "front-door",
+            "turn on the porch light",
+            noon + Duration::minutes(37),
+        );
+        assert_eq!(
+            ProposalShape::of(&a),
+            ProposalShape::of(&b),
+            "a proposal's shape must not carry the clock, or nothing ever matches a rejection"
+        );
+    }
+
+    #[test]
+    fn a_shape_folds_case_and_punctuation_but_never_two_different_devices() {
+        let now = Utc::now();
+        assert_eq!(
+            ProposalShape::of(&proposal_about(
+                "Front-Door",
+                "Turn on the porch light.",
+                now
+            )),
+            ProposalShape::of(&proposal_about(
+                "front-door",
+                "turn on the porch light",
+                now
+            )),
+            "both halves of a shape are model output; case and a full stop are not a \
+             different suggestion"
+        );
+        // Vacuity control, and it is the half that matters: if the fold were
+        // wide enough to make everything equal, the assertion above would pass
+        // for the wrong reason and one rejection would silence the house.
+        assert_ne!(
+            ProposalShape::of(&proposal_about(
+                "front-door",
+                "turn on the porch light",
+                now
+            )),
+            ProposalShape::of(&proposal_about("back-door", "turn on the porch light", now)),
+            "two different devices must not share a shape"
+        );
+        assert_ne!(
+            ProposalShape::of(&proposal_about(
+                "front-door",
+                "turn on the porch light",
+                now
+            )),
+            ProposalShape::of(&proposal_about("front-door", "unlock the front door", now)),
+            "two different suggestions must not share a shape"
+        );
+    }
+
+    #[test]
+    fn a_pending_proposal_is_not_a_decision() {
+        let shape = ProposalShape::of(&valid(Utc::now()));
+        assert!(matches!(
+            ProposalDecision::recorded(shape, DraftStatus::Pending, Utc::now()).unwrap_err(),
+            ProposalError::NotADecision
+        ));
+    }
+
+    /// Invariant-shaped: silence is not refusal. An expired proposal is one
+    /// nobody answered, and counting it as a rejection would let an unattended
+    /// pond talk itself quiet — a failure whose only symptom is the absence of
+    /// an event.
+    #[test]
+    fn only_a_rejection_silences_a_repeat() {
+        let shape = ProposalShape::of(&valid(Utc::now()));
+        for status in every_draft_status() {
+            let expected = match status {
+                DraftStatus::Rejected => true,
+                DraftStatus::Approved | DraftStatus::Expired | DraftStatus::Pending => false,
+            };
+            let Ok(decision) =
+                ProposalDecision::recorded(shape.clone(), status.clone(), Utc::now())
+            else {
+                assert_eq!(status, DraftStatus::Pending);
+                continue;
+            };
+            assert_eq!(
+                decision.silences_a_repeat(),
+                expected,
+                "{status} decided the wrong thing about whether to propose this again"
+            );
+        }
+    }
+
+    /// The P7 sentence has to survive the memory write gate it is aimed at,
+    /// and the gate is not this module's: `fact_defect` discards a fact that
+    /// opens with a pronoun or speaks in the first person, and extraction
+    /// demotes a `Preference` that never names the user. A feedback fact that
+    /// silently fails either is a loop that looks connected and teaches
+    /// nothing.
+    #[test]
+    fn a_decision_that_teaches_writes_a_fact_the_memory_gate_accepts() {
+        use crate::user_data::domain::memory::{fact_defect, names_user, normalise_fact_content};
+
+        let shape = ProposalShape::of(&proposal_about(
+            "front-door",
+            "turn on the porch light",
+            Utc::now(),
+        ));
+        for status in every_draft_status() {
+            let expected_fact = match status {
+                DraftStatus::Approved | DraftStatus::Rejected => true,
+                DraftStatus::Expired | DraftStatus::Pending => false,
+            };
+            let Ok(decision) =
+                ProposalDecision::recorded(shape.clone(), status.clone(), Utc::now())
+            else {
+                continue;
+            };
+            match decision.memory_fact() {
+                Some(fact) => {
+                    assert!(
+                        expected_fact,
+                        "{status} must teach nothing, but wrote {fact:?}"
+                    );
+                    let content = normalise_fact_content(&fact);
+                    assert_eq!(
+                        fact_defect(&content),
+                        None,
+                        "the feedback fact for {status} is one the memory write gate drops: {content:?}"
+                    );
+                    assert!(
+                        names_user(&content),
+                        "the feedback fact for {status} never names the user, so extraction \
+                         demotes it out of Preference: {content:?}"
+                    );
+                    assert!(
+                        content.contains("front-door") && content.contains("porch light"),
+                        "the feedback fact must quote what was decided about: {content:?}"
+                    );
+                }
+                None => assert!(!expected_fact, "{status} must write a fact, and wrote none"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_trigger_with_no_source_still_describes_itself() {
+        let bare = BusEventRef::new("time", None, None, Utc::now()).unwrap();
+        assert_eq!(TriggerIdentity::of(&bare).describe(), "time events");
+        let signal_only = BusEventRef::new("sensor", None, Some("co2".into()), Utc::now()).unwrap();
+        assert_eq!(
+            TriggerIdentity::of(&signal_only).describe(),
+            "sensor events of type co2"
+        );
     }
 
     #[test]
