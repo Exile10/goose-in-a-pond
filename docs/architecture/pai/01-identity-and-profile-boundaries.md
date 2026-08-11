@@ -546,11 +546,25 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   than defaulted, because defaulting would narrow correctly and still tell an operator who meant to
   bind the code to Liz that it worked.
 
-  **What is still unreached, and it is the half PAI-7 P5 needs:** nothing constructs
-  `SqliteDeviceAttribution`, so `devices_for_profile` and `push_tokens_for_profile` have no
-  production caller and no turn resolves a paired device to a member.
-  `crates/pond-infra/tests/device_profile_rung_is_not_wired_yet.rs` still holds three of its four
-  original assertions and will fail when that changes, which is the point of it.
+  **The DELIVERY half reached production 2026-08-11 too.** `main.rs` builds a
+  `SqliteDeviceAttribution` and hands it to `BroadcastNotificationSender::with_device_attribution`,
+  so `send_to_profile` resolves a member's devices instead of answering `AttributionUnavailable`,
+  which is what it did on every pond until that line. Be exact about what that buys: the path is
+  FUNCTIONAL and still UNCALLED. Nothing outside a test calls `send_to_profile`; all four production
+  notification producers still `broadcast()`, which is right for three of them — a schedule
+  completing, a rule firing and a pairing notice are household facts — and the fourth, the one that
+  makes this path matter, is PAI-7 P4's reviewer delivering a proposal to the member it is addressed
+  to. P4's domain is landed; its background loop is not.
+
+  **The IDENTITY half is what is left of P9, and it is not a wiring job.** `resolve_turn_scope`
+  still passes `paired_device_profile: None`, and `no_turn_resolves_a_paired_device_to_a_member_yet`
+  still passes because of it. The obstacle is that a turn does not know its device:
+  `session_tokens.device_id` exists and is indexed, and `client_id_for_token` already reads that
+  table, but the auth layer surfaces neither to a handler. Closing it means a `device_id_for_token`
+  on the `Handshake` port, the middleware putting it where a handler can see it, and
+  `resolve_turn_scope` taking it — at which point `IdentificationSource::PairedDevice` starts
+  outranking face and explicit identification on every turn, which is why it is worth doing
+  deliberately rather than opportunistically.
 
   This is the phase `00-checklist.md`'s 2026-08-05 entry called for — "capturing a household member
   at pairing time gets its own phase" — and it never ran. PAI-1's row saying `COMPLETE` is why:
