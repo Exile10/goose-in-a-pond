@@ -601,6 +601,14 @@ impl SettingsRepository for SqliteSettingsRepository {
         // of the two, a household switches ingest on, watches nothing arrive,
         // and reads the toggle back as `false` forever.
         upsert!(
+            "ext_context_enabled",
+            if settings.ext_context_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
             "context_ingest_enabled",
             if settings.context_ingest_enabled {
                 "true"
@@ -1020,6 +1028,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         // the same reason: a corrupt or unreadable row is not "true", so the
         // failure direction is that the pond copies nothing into the corpus.
         "context_ingest_enabled" => s.context_ingest_enabled = value == "true",
+        "ext_context_enabled" => s.ext_context_enabled = value == "true",
         _ => {} // unknown key — ignore
     }
 }

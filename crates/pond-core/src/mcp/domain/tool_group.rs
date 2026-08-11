@@ -181,6 +181,13 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
         core: false,
     },
     ToolGroup {
+        extension: "giap-context",
+        description: "The speaker's own personal context, from sources they connected: what a \
+                      camera or sensor of theirs has recorded, searched by meaning or listed by \
+                      recency. Read-only, and scoped to whoever is speaking.",
+        core: false,
+    },
+    ToolGroup {
         extension: ORCHESTRATOR_EXTENSION,
         description: "Handing a piece of work to a named specialist agent that runs on its own \
                       and reports back: research a question in depth, work through a longer task \
@@ -226,6 +233,13 @@ pub fn groups_denied_to_guests() -> &'static [&'static str] {
         "giap-vision",
         // Sensor history: when the house was empty, when somebody came home.
         "giap-sensors",
+        // PAI-8. A member's own connected sources -- what their camera saw,
+        // what their sensor recorded. Invariant 2 is "a Guest sees no context
+        // items. None.", and the tool layer already enforces it by scope, so
+        // this entry is belt AND braces: it stops the tool being OFFERED, which
+        // on a small model is the difference between a refusal and a turn spent
+        // discovering one.
+        "giap-context",
         // PAI-6 P5, and the one entry on this list that is not about reading
         // personal data. `delegate` starts an autonomous multi-turn agent under
         // `GooseMode::Auto` on the household's own hardware, and on a Jetson

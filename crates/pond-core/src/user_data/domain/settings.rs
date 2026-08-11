@@ -973,6 +973,26 @@ pub struct Settings {
     /// [`NotIngested::Disabled`]: crate::context::producer::NotIngested::Disabled
     #[serde(default = "Settings::default_context_ingest_enabled")]
     pub context_ingest_enabled: bool,
+
+    /// May the model READ the household's personal-context corpus (PAI-8 P2)?
+    ///
+    /// Separate from [`Settings::context_ingest_enabled`], which decides whether
+    /// anything is STORED, and off for a different reason. Ingest off means an
+    /// empty corpus; this off means the corpus exists and `search_context` and
+    /// `get_recent_context` are not in the model's tool set.
+    ///
+    /// **That second thing is not free, which is why it has its own switch.**
+    /// Every registered tool's schema goes into every turn's prompt, and on the
+    /// target hardware tool schemas are already about 88% of a 4 096-token
+    /// window. Two tools that can only ever answer "nothing found" -- which is
+    /// every pond until somebody connects a source -- would be a per-turn cost
+    /// forever, paid on the device least able to afford it.
+    ///
+    /// Its own named default fn returning `false`, for the reason the other
+    /// off-by-default switches in this file have one: nobody asked for it by
+    /// upgrading.
+    #[serde(default = "Settings::default_ext_context_enabled")]
+    pub ext_context_enabled: bool,
 }
 
 impl Default for Settings {
@@ -1107,6 +1127,9 @@ impl Default for Settings {
             // two and `Settings::default()` the other, so a pond can be built
             // through either door.
             context_ingest_enabled: false,
+            // PAI-8 P2. Off, like the ingest toggle above it, and for a prompt
+            // budget reason as well as a consent one -- see the field.
+            ext_context_enabled: false,
         }
     }
 }
@@ -1497,6 +1520,13 @@ impl Settings {
     /// reason the third one records: turning one of these on must be an edit to
     /// a failing test, not a character somebody changed.
     fn default_context_ingest_enabled() -> bool {
+        false
+    }
+
+    /// PAI-8 P2. See the field: off for a prompt-budget reason as well as a
+    /// consent one, which is why it is separate from the ingest toggle rather
+    /// than folded into it.
+    fn default_ext_context_enabled() -> bool {
         false
     }
 }
@@ -2208,6 +2238,7 @@ mod tests {
             // and shipping it is a `Settings.tsx` + `types.ts` change owned by
             // whoever owns those files.
             "context_ingest_enabled",
+            "ext_context_enabled",
         ];
         // Everything else is surfaced in the desktop UI (Settings tabs / hub
         // views / onboarding) and mirrored in the TS Settings type.
@@ -2499,12 +2530,25 @@ mod tests {
     /// tomorrow: derive the set of extension toggles that default off from the
     /// serialized struct rather than from a list written today.
     ///
-    /// It fails if `ext_orchestrator_enabled` flips on (the set empties), and it
-    /// fails if a NEW `ext_*` toggle arrives defaulting off (the set grows) —
-    /// which is a decision that should be made deliberately rather than
-    /// inherited from this one.
+    /// It fails if one of them flips ON (the set shrinks), and it fails if a NEW
+    /// `ext_*` toggle arrives defaulting off (the set grows) — which is a
+    /// decision that should be made deliberately rather than inherited.
+    ///
+    /// **It has fired once, and worked.** It was
+    /// `exactly_one_extension_toggle_ships_switched_off` until PAI-8 P2 added
+    /// `ext_context_enabled`, and updating it was the deliberate decision it
+    /// exists to force. The two are off for related but distinct reasons, worth
+    /// keeping separate because a later reader will be tempted to collapse them:
+    ///
+    /// - `ext_orchestrator_enabled` — turning it on means an autonomous
+    ///   multi-turn agent running under `GooseMode::Auto` on the household's own
+    ///   hardware. A consent question.
+    /// - `ext_context_enabled` — turning it on puts two tool schemas into every
+    ///   turn's prompt, and until somebody connects a source they can only
+    ///   answer "nothing found". A consent question AND a prompt-budget one, on
+    ///   a device where tool schemas are already ~88% of a 4 096-token window.
     #[test]
-    fn exactly_one_extension_toggle_ships_switched_off() {
+    fn only_the_deliberate_extension_toggles_ship_switched_off() {
         let value = serde_json::to_value(Settings::default()).expect("serialize Settings");
         let off: Vec<&str> = value
             .as_object()
@@ -2515,10 +2559,12 @@ mod tests {
             .collect();
         assert_eq!(
             off,
-            vec!["ext_orchestrator_enabled"],
+            vec!["ext_context_enabled", "ext_orchestrator_enabled"],
             "the set of extension toggles that ship OFF changed. Adding one is a deliberate \
-             decision; losing `ext_orchestrator_enabled` from it means delegation is now on by \
-             default on every install"
+             decision and belongs in this test's doc comment with its reason; losing \
+             `ext_orchestrator_enabled` means delegation is now on by default on every install, \
+             and losing `ext_context_enabled` means two personal-context tools are in every \
+             turn's prompt on every install"
         );
     }
 }

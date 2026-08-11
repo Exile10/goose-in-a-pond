@@ -217,11 +217,11 @@ adapter.
   `POST /api/v1/context/sources` is what lets a source exist at all -- without it `upsert_source`
   had no caller and the corpus was empty by construction.
 - **P2** Retrieval: `context_items` as a second corpus in `<system-context>` with its own budget;
-  `giap-context` MCP extension. **PARTIALLY LANDED 2026-08-11.** The retrieval blend, the budget
-  split and the `giap-context` server are written, and `init_context_deps` now gives them their
-  handles. **The extension is still not registered**, so the model cannot call `search_context` or
-  `get_recent_context`. That is deliberate ordering rather than an oversight -- see below -- and
-  `context_pipeline_is_not_wired_yet.rs` keeps the one assertion that still holds.
+  `giap-context` MCP extension. **LANDED 2026-08-11.** The retrieval blend, the budget split and the
+  read-only server, registered behind `ext_context_enabled` and reachable by the model. There is no
+  `ingest_context` tool and there will not be one: the corpus is written by the pipeline from
+  sources the household connected, and a tool that let the model write into it would let a prompt
+  injection plant a memo the assistant later quotes as fact.
 
 #### What landed, what did not, and why the order was forced
 
@@ -236,14 +236,22 @@ assert the absence and it caught the wiring the same day; its retirement note is
 their front-door camera or a motion sensor; its events become redacted, sensitivity-classified,
 retention-governed rows owned by them, and no other member's scope can read them.
 
-**What is deliberately NOT live: `giap-context` is unregistered.** The order was forced rather than
-chosen. Registering the two read tools puts them in every turn's tool set, and on the Orin tool
-schemas are already ~88% of a 4 096-token prompt -- so before a household could have a single
-context item that was a per-turn cost forever for tools which could not return a row. Now that a
-corpus can exist the objection weakens, but registration is still four coordinated edits
-(`giap_registration.rs`, `TOOL_GROUPS`, CLAUDE.md's sentence, and an off-by-default toggle with its
-own named `default_*` fn) tied together by `registration_matches_the_catalog.rs`, and it deserves
-its own change rather than a tail on this one.
+**`giap-context` is registered, behind `ext_context_enabled`, which ships OFF -- and the toggle is
+what resolves the objection to registering it at all.** Two read tools in every turn's prompt is a
+real cost where tool schemas are already ~88% of a 4 096-token window, and until somebody connects a
+source they could only answer "nothing found". Off by default means a pond that has not connected
+anything pays nothing, and a household that has can switch it on. It is the SECOND extension toggle
+to ship off, after `giap-orchestrator`, and
+`only_the_deliberate_extension_toggles_ship_switched_off` was renamed from
+`exactly_one_...` when it fired -- which is the deliberate decision that guard exists to force.
+
+The count moved in the three places `registration_matches_the_catalog.rs` ties together: 16 -> 17
+extensions, 62 -> 64 tools. `giap-context` is also on `groups_denied_to_guests`, alongside
+`giap-memory` and for the same reason -- invariant 2 is "a Guest sees no context items. None.", the
+tool layer already enforces it by scope, and this stops the tool being OFFERED, which on a small
+model is the difference between a refusal and a turn spent discovering one. It is deliberately NOT
+on `groups_denied_to_subagents`: it is read-only and a child inherits its parent's scope, exactly as
+`giap-memory` does.
 
 **One thing worth stating about the owner**, because it is the phase's security decision.
 `ContextSource.profile_id` is not an `Option`, so a source belongs to one member, and the connect
