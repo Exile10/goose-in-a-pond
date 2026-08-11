@@ -42,6 +42,13 @@ struct PersistedTask {
     paused: bool,
     #[serde(default)]
     created_at: Option<chrono::DateTime<Utc>>,
+    /// When this task last FIRED (not when it finished). Written for the kinds
+    /// whose debounce reads it back — see [`durable_fire_stamp`] — so a sensor
+    /// rule's cooldown survives a restart. `None` on a file written before
+    /// PAI-7 P8, which reads as "never fired": the first event after an upgrade
+    /// fires once, and the stamp exists from then on.
+    #[serde(default)]
+    last_run: Option<chrono::DateTime<Utc>>,
 }
 
 fn default_timezone() -> String {
@@ -125,12 +132,44 @@ impl CronSchedulerAdapter {
         let records: Vec<PersistedTask> = guard.values().map(|e| e.persisted.clone()).collect();
         drop(guard);
 
-        let json = serde_json::to_string_pretty(&records)?;
-        if let Some(parent) = self.persist_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        write_snapshot(&self.persist_path, &records).await
+    }
+
+    /// Record that `id` just FIRED — in memory always, and on disk for the
+    /// kinds whose debounce reads the stamp back after a restart.
+    ///
+    /// Stamped at the START of the run, not at the end, and that is the point:
+    /// a pond that crashes or is killed mid-run has still fired, and a stamp
+    /// written only on completion is exactly the one a crash loop never gets to
+    /// write. `last_run` therefore means "last fired", which is also what the
+    /// scheduler UI is asking.
+    ///
+    /// Takes the pieces rather than `&self` because both fire paths run inside
+    /// a spawned task that has outlived the borrow.
+    async fn stamp_fire(
+        tasks: &Arc<Mutex<HashMap<String, TaskEntry>>>,
+        persist_path: &std::path::Path,
+        id: &str,
+    ) {
+        let now = Utc::now();
+        let records: Vec<PersistedTask> = {
+            let mut guard = tasks.lock().await;
+            let Some(entry) = guard.get_mut(id) else {
+                return;
+            };
+            entry.last_run = Some(now);
+            entry.persisted.last_run = Some(now);
+            if !durable_fire_stamp(&Self::resolve_kind(entry)) {
+                return;
+            }
+            guard.values().map(|e| e.persisted.clone()).collect()
+        };
+
+        if let Err(e) = write_snapshot(persist_path, &records).await {
+            // A lost stamp re-fires the rule after the next restart, which is
+            // the defect this exists to fix — so it is a warning, not a debug.
+            tracing::warn!(task = %id, error = %e, "could not persist fire stamp");
         }
-        tokio::fs::write(&self.persist_path, json).await?;
-        Ok(())
     }
 
     async fn rehydrate(&self) -> Result<()> {
@@ -156,13 +195,14 @@ impl CronSchedulerAdapter {
 
             if record.paused {
                 let mut guard = self.tasks.lock().await;
+                let last_run = record.last_run;
                 guard.insert(
                     record.id.clone(),
                     TaskEntry {
                         persisted: record,
                         job_id: uuid::Uuid::nil(),
                         currently_running: false,
-                        last_run: None,
+                        last_run,
                     },
                 );
                 continue;
@@ -178,13 +218,16 @@ impl CronSchedulerAdapter {
             };
 
             let mut guard = self.tasks.lock().await;
+            // The persisted fire stamp is the whole point of PAI-7 P8's first
+            // repair: dropping it here would put the cooldown back in memory.
+            let last_run = record.last_run;
             guard.insert(
                 record.id.clone(),
                 TaskEntry {
                     persisted: record,
                     job_id,
                     currently_running: false,
-                    last_run: None,
+                    last_run,
                 },
             );
         }
@@ -211,6 +254,7 @@ impl CronSchedulerAdapter {
         let tasks = self.tasks.clone();
         let run_history = self.run_history.clone();
         let result_tx = self.result_tx.clone();
+        let persist_path = self.persist_path.clone();
         let id = task_id.to_string();
 
         let job = Job::new_async(cron, move |_uuid, _lock| {
@@ -218,6 +262,7 @@ impl CronSchedulerAdapter {
             let tasks = tasks.clone();
             let run_history = run_history.clone();
             let result_tx = result_tx.clone();
+            let persist_path = persist_path.clone();
             let id = id.clone();
             let kind = kind.clone();
             Box::pin(async move {
@@ -237,6 +282,7 @@ impl CronSchedulerAdapter {
                         entry.currently_running = true;
                     }
                 }
+                Self::stamp_fire(&tasks, &persist_path, &id).await;
 
                 // Record run start
                 let run_id = run_history.record_start(&id).await;
@@ -289,12 +335,11 @@ impl CronSchedulerAdapter {
                     });
                 }
 
-                // Mark not-running, update last_run
+                // Mark not-running. `last_run` was stamped at fire time above.
                 {
                     let mut guard = tasks.lock().await;
                     if let Some(entry) = guard.get_mut(&id) {
                         entry.currently_running = false;
-                        entry.last_run = Some(Utc::now());
                     }
                 }
             })
@@ -368,6 +413,43 @@ fn compute_next_run(cron_expr: &str, _timezone: &str) -> Option<chrono::DateTime
     }
 }
 
+/// Does this kind's fire stamp have to survive a restart?
+///
+/// Only a sensor rule reads its own last fire back: the rules engine debounces
+/// on it, so a lost stamp re-fires the rule the moment the pond comes back, and
+/// a pond that crash-loops fires it every time. That read-back is also what
+/// bounds the write — a rule cannot be stamped more often than once per
+/// `cooldown_secs`, because the cooldown is the thing the stamp enforces.
+///
+/// Everything else stays in memory. A cron task's next fire is computed from
+/// its expression rather than from its last fire, so persisting the stamp buys
+/// nothing, and a 6-field expression is allowed to fire every second — which on
+/// the Jetson's flash would be a whole-file rewrite per second. A rule with
+/// `cooldown_secs == 0` is excluded for the same reason: it debounces nothing,
+/// so it would write on every matching event.
+fn durable_fire_stamp(kind: &TaskKind) -> bool {
+    matches!(kind, TaskKind::SensorTrigger(spec) if spec.cooldown_secs > 0)
+}
+
+/// Write the task list, atomically.
+///
+/// Write-then-rename rather than truncate-then-write: `rename(2)` within a
+/// directory is atomic, so a crash can lose the newest stamp but can never
+/// leave a half-written `schedules.json` — which would lose every rule in the
+/// pond, not just a cooldown. Fire stamps make this file hot, so the window
+/// that used to be opened only by a create or a pause is now opened on every
+/// rule fire.
+async fn write_snapshot(persist_path: &std::path::Path, records: &[PersistedTask]) -> Result<()> {
+    let json = serde_json::to_string_pretty(records)?;
+    if let Some(parent) = persist_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = persist_path.with_extension("json.tmp");
+    tokio::fs::write(&tmp, json).await?;
+    tokio::fs::rename(&tmp, persist_path).await?;
+    Ok(())
+}
+
 /// Infer `TaskKind` from a legacy `payload` field.
 fn migrate_kind_from_payload(record: &PersistedTask) -> TaskKind {
     if let Some(payload) = &record.payload {
@@ -410,6 +492,7 @@ impl SchedulerPort for CronSchedulerAdapter {
             payload: None,
             paused: false,
             created_at: Some(Utc::now()),
+            last_run: None,
         };
 
         // Event-triggered rules (#92) never register a cron job — the rules
@@ -550,6 +633,7 @@ impl SchedulerPort for CronSchedulerAdapter {
         let tasks = self.tasks.clone();
         let run_history = self.run_history.clone();
         let result_tx = self.result_tx.clone();
+        let persist_path = self.persist_path.clone();
         let id = id.to_string();
         tokio::spawn(async move {
             // Mark running
@@ -559,6 +643,10 @@ impl SchedulerPort for CronSchedulerAdapter {
                     entry.currently_running = true;
                 }
             }
+            // Every sensor-rule fire arrives here: the rules engine fires a
+            // rule through `run_now`, so this is the stamp its cooldown reads
+            // back after a restart.
+            Self::stamp_fire(&tasks, &persist_path, &id).await;
 
             let run_id = run_history.record_start(&id).await;
             let start = std::time::Instant::now();
@@ -608,12 +696,11 @@ impl SchedulerPort for CronSchedulerAdapter {
                 });
             }
 
-            // Mark not-running
+            // Mark not-running. `last_run` was stamped at fire time above.
             {
                 let mut guard = tasks.lock().await;
                 if let Some(entry) = guard.get_mut(&id) {
                     entry.currently_running = false;
-                    entry.last_run = Some(Utc::now());
                 }
             }
         });
