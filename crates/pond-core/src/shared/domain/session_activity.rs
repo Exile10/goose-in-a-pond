@@ -529,44 +529,149 @@ pub struct PresenceEvidence<'a> {
     pub identity: &'a SessionIdentity,
 }
 
+/// The column presence treats as the activity clock.
+///
+/// One function, because two call sites now need the answer -- the projection
+/// below and [`attribution_candidates`] -- and the choice between the two
+/// columns is the phase's headline safety property. `sessions.created_at` says
+/// when a conversation *began*; `updated_at` says when somebody last *spoke*
+/// in it, which is the only one of the two that is about a person.
+///
+/// `set_session_identity` deliberately leaves `updated_at` alone (bumping it
+/// would reorder the user's history because a camera recognised somebody), so
+/// binding a face to a conversation quiet for three hours leaves this three
+/// hours old and produces no presence at all. That is what stops a photograph
+/// uploaded to an old session reading as somebody in the room.
+fn last_spoken_at(session: &Session) -> DateTime<Utc> {
+    session.updated_at
+}
+
+/// Whether evidence this old still counts as somebody being here.
+///
+/// Named for the same reason as [`last_spoken_at`]: the comparison is shared
+/// by [`present_members`], which refuses, and [`attribution_candidates`], which
+/// skips a read. Two spellings of "recently" would be two definitions of it.
+///
+/// Closed at the far end -- evidence exactly as old as the window is stale --
+/// because the pond publishes [`SessionPhase::Idle`] at that same instant, and
+/// the two must not disagree.
+fn is_fresh(last_activity: DateTime<Utc>, presence_window: Duration, now: DateTime<Utc>) -> bool {
+    let window = i64::try_from(presence_window.as_secs()).unwrap_or(i64::MAX);
+    now.signed_duration_since(last_activity).num_seconds() < window
+}
+
 impl<'a> PresenceEvidence<'a> {
     /// Project one stored session and its identity.
     ///
     /// Which column is the activity clock and which is not is a domain
-    /// decision, so it is made here rather than at the polling loop.
+    /// decision, so it is made in [`last_spoken_at`] rather than at the
+    /// polling loop.
     pub fn of(session: &'a Session, identity: &'a SessionIdentity) -> Self {
         Self {
             session_id: &session.id,
             origin: SessionOrigin::of(&session.id),
-            last_activity: session.updated_at,
+            last_activity: last_spoken_at(session),
             identity,
         }
     }
 }
 
+/// How stale a conversation may be before the member it names stops counting
+/// as here.
+///
+/// The same `INACTIVITY_THRESHOLD_SECS` that decides [`SessionPhase::Idle`].
+/// One pond, one definition of "gone quiet": two would have the bus saying a
+/// member is still here after it had already said the pond went idle.
+///
+/// **Bound here rather than at the publisher.** It was a field the polling
+/// loop filled in, which meant the freshness rule the whole phase rests on
+/// could be set to twenty-four hours in `main.rs` with the workspace green.
+pub const PRESENCE_WINDOW: Duration = Duration::from_secs(sched::INACTIVITY_THRESHOLD_SECS);
+
+/// The conversations whose attribution is worth a point read.
+///
+/// The publisher issues one `get_session_identity` per row it hands to the
+/// observer, and `list_sessions` has no `LIMIT` and no time bound -- it returns
+/// every conversation the pond has ever held. Three of the observer's refusals
+/// need no identity at all, so the read is skipped for the rows they would
+/// discard: a conversation the pond opened for itself, one nobody has spoken in
+/// inside [`PRESENCE_WINDOW`], and one whose `sessions.profile_id` is NULL
+/// (`get_session_identity` reads that same column, so it would answer with no
+/// profile, which resolves to `Household` or `Guest` and publishes nothing
+/// either way).
+///
+/// **Read-avoidance, not a gate.** [`present_members`] still applies origin and
+/// freshness to whatever it is handed, through the same [`is_fresh`], so a
+/// caller that ignores this function gets identical events for more money. That
+/// is what `skipping_a_read_never_changes_who_is_published` pins.
+pub fn attribution_candidates(sessions: &[Session], now: DateTime<Utc>) -> Vec<&Session> {
+    sessions
+        .iter()
+        .filter(|session| SessionOrigin::of(&session.id).is_human())
+        .filter(|session| session.profile_id.is_some())
+        .filter(|session| is_fresh(last_spoken_at(session), PRESENCE_WINDOW, now))
+        .collect()
+}
+
+/// Whether this pond has more than one household member, from the read that
+/// answers it.
+///
+/// **A failed read answers `true`.** That is the value which makes an
+/// unidentified speaker a `Guest` rather than the whole household: on failure,
+/// access narrows. The publisher used to decide this inside its own `match`
+/// arm, where the direction could be flipped with nothing to notice.
+///
+/// Stated plainly, because a guard that claims more than it holds is worse than
+/// none: **this cannot change a presence event today.** `identity_resolution`
+/// consults it only in the fallback that answers `Household` or `Guest`, and
+/// presence publishes for neither, so both values produce the same events. It
+/// is pinned anyway because the direction is the resolver's contract and
+/// because the day presence grows a `Household` path is not the day to
+/// rediscover it -- see
+/// `the_household_count_cannot_change_a_published_presence_event`.
+pub fn household_has_multiple_members<T, E>(profiles: &Result<Vec<T>, E>) -> bool {
+    match profiles {
+        Ok(members) => members.len() > 1,
+        Err(_) => true,
+    }
+}
+
 /// Everything one presence observation needs from outside.
 ///
-/// No `Default`: every field is an input to a claim about where a person is,
-/// so a caller that has not thought about one should get a compile error rather
-/// than a silent `false`. `household_has_multiple_members: false` in
-/// particular is the value that turns an unidentified speaker into the whole
-/// household.
+/// **The fields are private and [`for_poll`](PresenceInputs::for_poll) is the
+/// only way in from another crate.** Every one of them is an input to a claim
+/// about where a person is, and the freshness window in particular is not a
+/// caller's to choose -- when it was, the publisher named it, and a publisher
+/// naming it is a publisher that can get it wrong unobserved.
 pub struct PresenceInputs<'a> {
-    pub sessions: &'a [PresenceEvidence<'a>],
-    /// Whether this pond has more than one household member, from
-    /// `ProfileRepository::list`. On a failed read the caller must pass
-    /// `true` -- the answer that makes an unidentified speaker a `Guest`, and
-    /// therefore the answer that publishes nothing.
-    pub household_has_multiple_members: bool,
-    /// How stale a conversation may be before the member it names stops
-    /// counting as here.
+    sessions: &'a [PresenceEvidence<'a>],
+    /// Whether this pond has more than one household member. See
+    /// [`household_has_multiple_members`] for what a failed read must answer.
+    household_has_multiple_members: bool,
+    /// Always [`PRESENCE_WINDOW`]. Kept as a field rather than read from the
+    /// constant at the comparison so this module's own tests can place a
+    /// fixture either side of a window they name.
+    presence_window: Duration,
+    now: DateTime<Utc>,
+}
+
+impl<'a> PresenceInputs<'a> {
+    /// Build the inputs for one poll of the publisher.
     ///
-    /// The caller passes the same `INACTIVITY_THRESHOLD_SECS` that decides
-    /// [`SessionPhase::Idle`]. One pond, one definition of "gone quiet": two
-    /// would have the bus saying a member is still here after it has already
-    /// said the pond went idle.
-    pub presence_window: Duration,
-    pub now: DateTime<Utc>,
+    /// Takes what the polling loop actually holds and supplies the rest, so
+    /// the loop has no window to name.
+    pub fn for_poll(
+        sessions: &'a [PresenceEvidence<'a>],
+        household_has_multiple_members: bool,
+        now: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            sessions,
+            household_has_multiple_members,
+            presence_window: PRESENCE_WINDOW,
+            now,
+        }
+    }
 }
 
 /// The evidence behind one believed-present member.
@@ -665,6 +770,25 @@ impl PresenceObserver {
         }
         out
     }
+
+    /// Fold one poll in, where reading the store may have failed.
+    ///
+    /// `Err` publishes nothing **and leaves the belief exactly as it was**, and
+    /// the second half is the one that matters. Treating an unreadable row as
+    /// unattributed would publish a departure nobody performed; taking the
+    /// failure as a fresh start would announce everybody arriving again when
+    /// the read recovered. A failed read is "I do not know", not "the house is
+    /// empty" -- the same answer [`ActivityObserver::seeded_from`] gives, and
+    /// for the same reason.
+    ///
+    /// This lives here rather than as a `continue` in the polling loop because
+    /// a `continue` in a timer loop is a decision no test can reach.
+    pub fn observe_read<E>(&mut self, read: Result<PresenceInputs<'_>, E>) -> Vec<ProfilePresence> {
+        match read {
+            Ok(inputs) => self.observe(inputs),
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 /// Who the evidence says is here, right now.
@@ -675,7 +799,6 @@ impl PresenceObserver {
 /// a speaker the resolver cannot name is not a member, whether it called them
 /// `Guest` or `Household`.
 fn present_members(inputs: &PresenceInputs<'_>) -> BTreeMap<String, Believed> {
-    let window = i64::try_from(inputs.presence_window.as_secs()).unwrap_or(i64::MAX);
     let mut present: BTreeMap<String, Believed> = BTreeMap::new();
 
     for evidence in inputs.sessions {
@@ -687,12 +810,7 @@ fn present_members(inputs: &PresenceInputs<'_>) -> BTreeMap<String, Believed> {
         if !evidence.origin.is_human() {
             continue;
         }
-        if inputs
-            .now
-            .signed_duration_since(evidence.last_activity)
-            .num_seconds()
-            >= window
-        {
+        if !is_fresh(evidence.last_activity, inputs.presence_window, inputs.now) {
             continue;
         }
 
@@ -1259,7 +1377,9 @@ mod tests {
 mod presence_tests {
     use super::*;
 
-    const WINDOW: Duration = Duration::from_secs(15 * 60);
+    /// Taken from the constant rather than restated, so a fixture placed one
+    /// second inside the window stays one second inside it.
+    const WINDOW: Duration = PRESENCE_WINDOW;
 
     /// A session id the scheduler really mints, and one that
     /// `PUT /sessions/{id}/user` will happily bind to a household member.
@@ -1288,6 +1408,17 @@ mod presence_tests {
         session.created_at = created_at;
         session.updated_at = updated_at;
         session.profile_id = None; // the observer reads the identity, not this
+        session
+    }
+
+    /// A conversation the store says is bound to a member.
+    ///
+    /// `sessions.profile_id` is what `set_session_identity` writes and what
+    /// `get_session_identity` reads back, so a `Some` here is the row shape
+    /// that makes an identity read worth issuing.
+    fn attributed(id: &str, updated_at: DateTime<Utc>) -> Session {
+        let mut session = session(id, updated_at);
+        session.profile_id = Some("jerry".to_string());
         session
     }
 
@@ -1899,6 +2030,200 @@ mod presence_tests {
                 ("liz", PresenceTransition::Arrived),
                 ("jerry", PresenceTransition::Departed),
             ]
+        );
+    }
+
+    // ── What the publisher used to decide for itself ─────────────────────
+
+    /// The window the publisher can no longer choose. It was a field the
+    /// polling loop filled in, and setting it to twenty-four hours there left
+    /// the whole workspace green.
+    ///
+    /// Presence and [`SessionPhase::Idle`] have to age out on the same
+    /// threshold, or the bus says a member is still here after it has already
+    /// said the pond went quiet.
+    #[test]
+    fn the_freshness_window_is_the_one_that_decides_idle() {
+        assert_eq!(
+            PresenceInputs::for_poll(&[], true, t(0)).presence_window,
+            Duration::from_secs(sched::INACTIVITY_THRESHOLD_SECS),
+            "presence ages evidence out on a different clock from the one that publishes Idle, \
+             so the two will disagree about whether somebody is still at the pond"
+        );
+    }
+
+    /// [`attribution_candidates`] saves the publisher a point query per row on
+    /// a table that grows forever. It must therefore not be able to change the
+    /// answer: whatever it drops, the observer would have dropped anyway.
+    #[test]
+    fn skipping_a_read_never_changes_who_is_published() {
+        let now = t(0);
+        let window = i64::try_from(WINDOW.as_secs()).unwrap();
+
+        let rows = vec![
+            attributed("sess-live", t(-10)),
+            attributed("sess-stale", t(-window - 10)),
+            attributed(A_CRON_FIRE, t(-10)),
+            session("sess-unbound", t(-10)),
+        ];
+        let jerry = identity(IdentificationSource::Explicit, Some("jerry"));
+        let liz = identity(IdentificationSource::Face, Some("liz"));
+        let nobody = SessionIdentity::unknown();
+        let identity_of = |id: &str| -> &SessionIdentity {
+            match id {
+                "sess-unbound" => &nobody,
+                "sess-stale" => &liz,
+                _ => &jerry,
+            }
+        };
+
+        let candidates = attribution_candidates(&rows, now);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sess-live"],
+            "the read-avoidance kept the wrong rows: the pond's own cron fire, a conversation \
+             silent past the window, and a row with no attribution to read are each a query \
+             whose answer the observer discards"
+        );
+
+        let every_row: Vec<PresenceEvidence<'_>> = rows
+            .iter()
+            .map(|session| PresenceEvidence::of(session, identity_of(&session.id)))
+            .collect();
+        let read_only_the_candidates: Vec<PresenceEvidence<'_>> = candidates
+            .iter()
+            .map(|session| PresenceEvidence::of(session, identity_of(&session.id)))
+            .collect();
+
+        let mut expensive = seeded(&[], true, t(-60));
+        let mut cheap = seeded(&[], true, t(-60));
+        let from_every_row = expensive.observe(PresenceInputs::for_poll(&every_row, true, now));
+        let from_the_candidates = cheap.observe(PresenceInputs::for_poll(
+            &read_only_the_candidates,
+            true,
+            now,
+        ));
+
+        assert_eq!(
+            named(&from_every_row),
+            vec![("jerry", PresenceTransition::Arrived)],
+            "vacuity control: reading every row must still publish somebody, or the comparison \
+             below is between two empty lists"
+        );
+        assert_eq!(
+            from_every_row, from_the_candidates,
+            "skipping the identity read changed who the pond believes is here; it is an \
+             optimisation and not a gate, so the two must agree exactly"
+        );
+    }
+
+    /// On failure, access narrows. The publisher used to decide this inside a
+    /// `match` arm in a timer loop.
+    #[test]
+    fn a_household_count_that_cannot_be_read_answers_more_than_one() {
+        let unreadable: Result<Vec<u8>, ()> = Err(());
+        assert!(
+            household_has_multiple_members(&unreadable),
+            "a profile list that could not be read was answered with `one member`, which is the \
+             value that turns an unidentified speaker into the whole household"
+        );
+
+        // Vacuity control: a successful read still answers honestly, so the
+        // assertion above is about the failure and not about a function that
+        // always says true.
+        assert!(!household_has_multiple_members::<u8, ()>(&Ok(vec![])));
+        assert!(!household_has_multiple_members::<u8, ()>(&Ok(vec![1])));
+        assert!(household_has_multiple_members::<u8, ()>(&Ok(vec![1, 2])));
+    }
+
+    /// And what that direction buys presence today: nothing. Saying so is the
+    /// point -- a guard claiming more than it holds is worse than none.
+    ///
+    /// `identity_resolution::resolve` consults the count only in the fallback
+    /// that answers `Household` or `Guest`, and presence publishes for neither,
+    /// so both values produce the same events over the same rows. This is a
+    /// tripwire rather than a guard: the day presence grows a `Household` path
+    /// it fails, and the failure direction above stops being merely correct and
+    /// starts being load-bearing.
+    #[test]
+    fn the_household_count_cannot_change_a_published_presence_event() {
+        let named_row = session("sess-jerry", t(0));
+        let anon_row = session("sess-anon", t(0));
+        let jerry = identity(IdentificationSource::Explicit, Some("jerry"));
+        let nobody = SessionIdentity::unknown();
+        let evidence = [
+            PresenceEvidence::of(&named_row, &jerry),
+            PresenceEvidence::of(&anon_row, &nobody),
+        ];
+
+        let mut shared = seeded(&[], true, t(0));
+        let mut alone = seeded(&[], false, t(0));
+        let with_guests = poll(&mut shared, &evidence, true, t(10));
+        let one_member = poll(&mut alone, &evidence, false, t(10));
+
+        assert_eq!(
+            named(&with_guests),
+            vec![("jerry", PresenceTransition::Arrived)],
+            "vacuity control: an attributed row must still publish, or this compares two empty \
+             lists and would pass against an observer that has stopped speaking"
+        );
+        assert_eq!(
+            with_guests, one_member,
+            "the household count now changes a presence event, which it could not before; \
+             whatever depends on it needs `household_has_multiple_members`'s failure direction \
+             to be load-bearing rather than merely correct"
+        );
+    }
+
+    /// A store that cannot be read is not an empty house, and it is not a
+    /// fresh start either. Both wrong answers publish an edge nobody crossed.
+    #[test]
+    fn a_failed_read_publishes_nothing_and_leaves_the_belief_standing() {
+        let row = session("sess-jerry", t(0));
+        let jerry = identity(IdentificationSource::Explicit, Some("jerry"));
+        let evidence = [PresenceEvidence::of(&row, &jerry)];
+
+        // Direction one: the outage must not empty the house.
+        let mut still_here = seeded(&[], true, t(0));
+        assert_eq!(
+            named(&poll(&mut still_here, &evidence, true, t(10))),
+            vec![("jerry", PresenceTransition::Arrived)]
+        );
+        assert!(
+            still_here.observe_read::<()>(Err(())).is_empty(),
+            "an unreadable store published a transition of its own"
+        );
+        assert!(
+            poll(&mut still_here, &evidence, true, t(20)).is_empty(),
+            "the failed read was folded in as an empty house, so a member who never left \
+             departed and then arrived again when the store came back"
+        );
+
+        // Direction two: nor may it forget. A reset baseline swallows the
+        // departure that follows, which is the edge P4 acts on.
+        let mut departs = seeded(&[], true, t(0));
+        assert_eq!(
+            named(&poll(&mut departs, &evidence, true, t(10))),
+            vec![("jerry", PresenceTransition::Arrived)]
+        );
+        assert!(departs.observe_read::<()>(Err(())).is_empty());
+        assert_eq!(
+            named(&poll(&mut departs, &evidence, true, t(20 * 60))),
+            vec![("jerry", PresenceTransition::Departed)],
+            "the failed read dropped the belief it was holding, so the departure that followed \
+             was never published"
+        );
+
+        // Vacuity control: an `Ok` read is still just `observe`, so the two
+        // assertions above are about the `Err` arm and not about a method that
+        // never publishes.
+        let mut ok = seeded(&[], true, t(0));
+        assert_eq!(
+            named(&ok.observe_read::<()>(Ok(PresenceInputs::for_poll(&evidence, true, t(10))))),
+            vec![("jerry", PresenceTransition::Arrived)]
         );
     }
 

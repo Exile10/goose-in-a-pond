@@ -4620,13 +4620,29 @@ async fn run_time_ticker(bus: std::sync::Weak<dyn pond_core::shared::ports::even
 /// about which conversations exist — which is the shape of defect
 /// `human_activity` was written as one function to prevent.
 ///
-/// **This loop decides nothing.** It reads the store, reads the clocks, and
-/// hands both to the observers — the seed, the machine-session filter, the
-/// never-at-startup gate, the idle arithmetic, the presence baseline, the
-/// freshness window and the identity resolution all live in pond-core, where a
-/// mutation to any of them fails a test. Three of them used to be expressed
-/// here, inside a timer loop, and all three could be broken with the whole
-/// suite green.
+/// **What this loop decides, honestly.** The seed, the machine-session filter,
+/// the never-at-startup gate, the idle arithmetic, the presence baseline, the
+/// freshness window, which rows are worth an identity read, what an unreadable
+/// profile list means and what an unreadable identity means all live in
+/// pond-core, where a mutation to any of them fails a test.
+///
+/// This paragraph used to open "this loop decides nothing", and that was false
+/// in both halves — four of those decisions were expressed right here, and the
+/// freshness window was one of them: `presence_window` was a field this
+/// function filled in, so I could set it to twenty-four hours and `cargo check`
+/// plus the entire `pond-core` suite stayed green. `PresenceInputs`'s fields
+/// are private now and `for_poll` is the only way in, so this loop cannot name
+/// a window at all.
+///
+/// **What genuinely remains here is unguarded, and it is not nothing.**
+/// `POLL_SECS`, the two store reads, the `tracing` lines — and `idle_threshold`
+/// for [`PollClock`], which is still bound at this call site from
+/// `INACTIVITY_THRESHOLD_SECS`. That is the same gap on P1's session-lifecycle
+/// side; it is left as it is because `PollClock`'s two `Instant` fields sit
+/// next to each other, and a positional constructor to close it would trade a
+/// visible constant for two arguments that swap silently. Nothing tests this
+/// function: `crates/pond-server/tests` does not name it, and `ci.yml` runs
+/// `cargo check` for this crate and never `cargo test`.
 async fn run_session_activity_observer(
     bus: std::sync::Weak<dyn pond_core::shared::ports::event_bus::EventBus>,
     storage: Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>,
@@ -4634,10 +4650,10 @@ async fn run_session_activity_observer(
     last_user_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
 ) {
     use pond_core::shared::domain::session_activity::{
-        ActivityObserver, PollClock, PresenceEvidence, PresenceInputs, PresenceObserver,
+        attribution_candidates, household_has_multiple_members, ActivityObserver, PollClock,
+        PresenceEvidence, PresenceInputs, PresenceObserver,
     };
     use pond_core::shared::ports::event_bus::BusEvent;
-    use pond_core::user_data::domain::session::SessionIdentity;
     use pond_core::user_data::services::consolidation_schedule as sched;
 
     const POLL_SECS: u64 = 60;
@@ -4693,67 +4709,57 @@ async fn run_session_activity_observer(
 
         // ── Presence (PAI-7 P2) ──────────────────────────────────────────
         //
-        // The identity read is skipped only where the row already says there
-        // is nothing to attribute: `sessions.profile_id` NULL means
-        // `get_session_identity` would answer "nobody", which resolves to
-        // Household or Guest and publishes nothing either way. Every other
-        // decision — origin, freshness, who this is — belongs to the observer,
-        // so this loop does not pre-filter on any of them.
-        let mut attributed: Vec<(
-            &pond_core::user_data::domain::session::Session,
-            SessionIdentity,
-        )> = Vec::new();
-        let mut identities_readable = true;
-        for session in &sessions {
-            if session.profile_id.is_none() {
-                continue;
-            }
+        // Which rows are worth a `get_session_identity` is pond-core's,
+        // because it is derived from the observer's own refusals rather than
+        // invented here: `attribution_candidates` drops the pond's own
+        // conversations, the ones nobody has spoken in inside the window, and
+        // the ones whose `sessions.profile_id` is NULL. It is read-avoidance
+        // and not a gate — the observer re-applies origin and freshness to
+        // whatever it is handed, through the same predicate — and it matters
+        // because `list_sessions` has no LIMIT and no time bound, so this used
+        // to be one point query per session the pond had EVER attributed,
+        // every sixty seconds, forever, on a Jetson.
+        let mut attributed = Vec::new();
+        let mut unreadable: Option<String> = None;
+        for session in attribution_candidates(&sessions, now) {
             match storage.get_session_identity(&session.id).await {
                 Ok(identity) => attributed.push((session, identity)),
                 Err(e) => {
-                    // Skip the whole poll rather than treat an unreadable row
-                    // as unattributed. Taking the failure as "nobody is here"
-                    // would publish a departure nobody performed, and an
-                    // arrival when the read recovered.
                     tracing::debug!(
                         error = %e,
                         session_id = %session.id,
                         "presence observer: identity read failed; skipping this poll"
                     );
-                    identities_readable = false;
+                    unreadable = Some(e.to_string());
                     break;
                 }
             }
         }
-        if !identities_readable {
-            continue;
+
+        let household = profiles.list().await;
+        if let Err(e) = &household {
+            tracing::debug!(
+                error = %e,
+                "presence observer: could not count household members"
+            );
         }
 
-        // A failed profile count is answered with "there may be more than
-        // one", which makes an unidentified speaker a Guest and publishes
-        // nothing. Same direction as `resolve_turn_scope`: on failure,
-        // access narrows.
-        let household_has_multiple_members = match profiles.list().await {
-            Ok(profiles) => profiles.len() > 1,
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "presence observer: could not count household members; assuming more than one"
-                );
-                true
-            }
-        };
-
+        // What an unreadable row means, and what an unreadable profile list
+        // means, are both pond-core's answers. This loop supplies the two
+        // `Result`s and logs them; it does not get to say what they imply.
         let evidence: Vec<PresenceEvidence<'_>> = attributed
             .iter()
             .map(|(session, identity)| PresenceEvidence::of(session, identity))
             .collect();
-        for transition in presence.observe(PresenceInputs {
-            sessions: &evidence,
-            household_has_multiple_members,
-            presence_window: idle_threshold,
-            now,
-        }) {
+        let read = match unreadable {
+            Some(e) => Err(e),
+            None => Ok(PresenceInputs::for_poll(
+                &evidence,
+                household_has_multiple_members(&household),
+                now,
+            )),
+        };
+        for transition in presence.observe_read(read) {
             tracing::debug!(
                 profile_id = %transition.profile_id,
                 transition = transition.transition.as_str(),
