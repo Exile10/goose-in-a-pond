@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
 import { Settings, diffSettings, settingsValueEquals, foldServerState } from "./Settings";
 import { api } from "../api/PondApiClient";
 
@@ -42,6 +42,9 @@ vi.mock("../api/PondApiClient", () => ({
     resetWakeWordCalibration: vi.fn().mockResolvedValue(undefined),
     listModels: vi.fn().mockResolvedValue([]),
     getActiveRoles: vi.fn().mockResolvedValue({ chat: null, think: null, task: null, asr: null, tts: null }),
+    // The Extensions panel loads both of these on mount.
+    listExtensions: vi.fn().mockResolvedValue({ extensions: [] }),
+    listSecretKeys: vi.fn().mockResolvedValue([]),
   },
 }));
 
@@ -381,6 +384,260 @@ describe("Settings save payload", () => {
     // the phrase a second time and re-mark it.
     await clickSave();
     expect(vi.mocked(api.updateSettings).mock.calls.length).toBe(1);
+  });
+});
+
+// ── PAI-7 P4 and P6: speaking and acting unprompted ───────────
+//
+// These five settings were HEADLESS_BY_DESIGN in
+// crates/pond-core/src/user_data/domain/settings.rs and reachable only by
+// curl. That Rust guard checks a list of STRINGS: it cannot tell whether a
+// control exists, only that somebody classified the field. This is the part
+// that can.
+//
+// Every case below asserts the KEY the control PATCHes, not merely that
+// something rendered. A row copy-pasted from its neighbour looks identical on
+// screen and writes the neighbour's key, and nothing else in this suite — or
+// in the Rust suite — would notice. Each case also asserts the control's state
+// BEFORE acting, which is the vacuity control: a control that renders but is
+// not bound to the setting fails there rather than passing silently.
+
+/** The panel's own settings, with the five at their shipped defaults. */
+function unpromptedSettings(overrides: Record<string, unknown> = {}) {
+  return serverSettings({
+    proactive_review_enabled: false,
+    unprompted_speech_enabled: false,
+    quiet_hours_start: "22:00",
+    quiet_hours_end: "07:00",
+    unprompted_speech_categories: "alert",
+    ...overrides,
+  });
+}
+
+describe("Settings unprompted-behaviour controls", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(api.getSettings).mockResolvedValue(unpromptedSettings() as never);
+    vi.mocked(api.updateSettings).mockImplementation(
+      async (patch) => unpromptedSettings(patch as Record<string, unknown>) as never,
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  function sentPatch(): Record<string, unknown> | undefined {
+    const calls = vi.mocked(api.updateSettings).mock.calls;
+    expect(calls.length).toBeLessThanOrEqual(1);
+    return calls[0]?.[0] as Record<string, unknown> | undefined;
+  }
+
+  /**
+   * The panel's own Save, from the detail header.
+   *
+   * Not `getByText("Save")`: the API-keys section on this panel renders a Save
+   * button per secret, and a bare text query matches those too.
+   */
+  async function clickSave() {
+    const head = document.querySelector(".set__head-actions");
+    if (!head) throw new Error("no detail header");
+    fireEvent.click(within(head as HTMLElement).getByText("Save"));
+    await waitFor(() => {
+      if (!screen.queryByText("Saved")) throw new Error("save not finished");
+    });
+  }
+
+  async function openPanel() {
+    await renderSettings();
+    await navigateTo("Extensions (MCP)");
+    await waitFor(() => {
+      if (!screen.queryByText("Speaking and acting unprompted")) {
+        throw new Error("unprompted section not rendered");
+      }
+    });
+  }
+
+  it("shows all five controls, and both switches ship off", async () => {
+    await openPanel();
+
+    const start = screen.getByLabelText("Quiet hours start") as HTMLInputElement;
+    const end = screen.getByLabelText("Quiet hours end") as HTMLInputElement;
+    const categories = screen.getByLabelText("Categories it may speak") as HTMLInputElement;
+    const speech = screen.getByRole("switch", { name: "Speak without being spoken to" }) as HTMLInputElement;
+    const review = screen.getByRole("switch", { name: "Review the house unasked" }) as HTMLInputElement;
+
+    // Each one shows what the server actually holds. A control rendering a
+    // hardcoded placeholder would pass a mere presence check.
+    expect(start.value).toBe("22:00");
+    expect(end.value).toBe("07:00");
+    expect(categories.value).toBe("alert");
+    expect(speech.checked).toBe(false);
+    expect(review.checked).toBe(false);
+  });
+
+  // Ordering is the teaching, so it is asserted rather than left to review.
+  // `decide_unprompted_speech` refuses inside quiet hours BEFORE it looks at
+  // consent, presence or category. A section that put the speech switch above
+  // the window would say the opposite — that consent is the outer decision —
+  // and nothing else in either suite would object.
+  //
+  // This is also the strict form of "the five controls are grouped together":
+  // it fails if a sixth row is added to the section, not just if one is moved.
+  it("puts quiet hours above the switch they outrank", async () => {
+    await openPanel();
+
+    const card = screen.getByText("Speaking and acting unprompted").closest(".card");
+    if (!card) throw new Error("no card around the unprompted section");
+    const names = Array.from(card.querySelectorAll(".row__name")).map((el) => el.textContent);
+
+    expect(names).toEqual([
+      "Quiet hours start",
+      "Quiet hours end",
+      "Speak without being spoken to",
+      "Categories it may speak",
+      "Review the house unasked",
+    ]);
+  });
+
+  // The two switches must read `=== true`, so a settings payload that omits
+  // them — an older server, or a read that returned a partial object — has to
+  // render OFF. `!== false` would render ON and invite a household to believe
+  // the pond was already allowed to speak.
+  it("renders both switches off when the server omits them entirely", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue(serverSettings() as never);
+    await openPanel();
+
+    expect(
+      (screen.getByRole("switch", { name: "Speak without being spoken to" }) as HTMLInputElement).checked,
+      "`unprompted_speech_enabled` must be read `=== true`: an absent key rendered ON tells a household the pond may already speak to them unasked",
+    ).toBe(false);
+    expect(
+      (screen.getByRole("switch", { name: "Review the house unasked" }) as HTMLInputElement).checked,
+      "`proactive_review_enabled` must be read `=== true`: an absent key rendered ON tells a household the pond may already reason about them unasked",
+    ).toBe(false);
+  });
+
+  it("the quiet-hours start field writes quiet_hours_start and nothing else", async () => {
+    await openPanel();
+    const el = screen.getByLabelText("Quiet hours start") as HTMLInputElement;
+    expect(el.value).toBe("22:00");
+
+    fireEvent.change(el, { target: { value: "23:30" } });
+    await clickSave();
+
+    expect(sentPatch()).toEqual({ quiet_hours_start: "23:30" });
+  });
+
+  it("the quiet-hours end field writes quiet_hours_end and nothing else", async () => {
+    await openPanel();
+    const el = screen.getByLabelText("Quiet hours end") as HTMLInputElement;
+    expect(el.value).toBe("07:00");
+
+    fireEvent.change(el, { target: { value: "06:15" } });
+    await clickSave();
+
+    expect(sentPatch()).toEqual({ quiet_hours_end: "06:15" });
+  });
+
+  it("the categories field writes unprompted_speech_categories and nothing else", async () => {
+    await openPanel();
+    const el = screen.getByLabelText("Categories it may speak") as HTMLInputElement;
+    expect(el.value).toBe("alert");
+
+    fireEvent.change(el, { target: { value: "alert,reminder" } });
+    await clickSave();
+
+    expect(sentPatch()).toEqual({ unprompted_speech_categories: "alert,reminder" });
+  });
+
+  it("the speech switch writes unprompted_speech_enabled and nothing else", async () => {
+    await openPanel();
+    const el = screen.getByRole("switch", { name: "Speak without being spoken to" }) as HTMLInputElement;
+    expect(el.checked).toBe(false);
+
+    fireEvent.click(el);
+    await clickSave();
+
+    expect(sentPatch()).toEqual({ unprompted_speech_enabled: true });
+  });
+
+  it("the review switch writes proactive_review_enabled and nothing else", async () => {
+    await openPanel();
+    const el = screen.getByRole("switch", { name: "Review the house unasked" }) as HTMLInputElement;
+    expect(el.checked).toBe(false);
+
+    fireEvent.click(el);
+    await clickSave();
+
+    expect(sentPatch()).toEqual({ proactive_review_enabled: true });
+  });
+
+  // Not a duplicate of the five above. Those run one at a time, so each proves
+  // only that ITS control names the right key in isolation; two controls both
+  // writing `unprompted_speech_enabled` would still pass every one of them.
+  // This edits all five in one pass and asserts the whole body.
+  it("editing all five sends exactly those five keys", async () => {
+    await openPanel();
+
+    fireEvent.change(screen.getByLabelText("Quiet hours start"), { target: { value: "23:30" } });
+    fireEvent.change(screen.getByLabelText("Quiet hours end"), { target: { value: "06:15" } });
+    fireEvent.change(screen.getByLabelText("Categories it may speak"), { target: { value: "alert,reminder" } });
+    fireEvent.click(screen.getByRole("switch", { name: "Speak without being spoken to" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Review the house unasked" }));
+    await clickSave();
+
+    expect(sentPatch()).toEqual({
+      quiet_hours_start: "23:30",
+      quiet_hours_end: "06:15",
+      unprompted_speech_categories: "alert,reminder",
+      unprompted_speech_enabled: true,
+      proactive_review_enabled: true,
+    });
+  });
+
+  // ── Every switch on this panel must be operable ─────────────
+  //
+  // This began as a tripwire saying only two rows worked, and it was right: a
+  // `<Switch>` from @heroui/react whose children are only `Switch.Control` and
+  // `Switch.Thumb` renders two spans and stops. The `<input role="switch">`
+  // lives in `Switch.Content` (react-aria's `SwitchButton`), which twenty-two
+  // rows on this shipped panel did not use -- so they had no input, no
+  // accessible name, no click target and no `onChange`. `GuiMode.tsx` mounts
+  // this panel, so those were twenty-two settings a user could see and not
+  // change, `ext_orchestrator_enabled` among them.
+  //
+  // They are repaired, and the assertion is inverted to match: rather than
+  // listing which rows work -- a list that rots every time somebody adds a
+  // setting -- it asserts the PROPERTY. Every switch rendered here is a real
+  // switch, and every one has a name a screen reader can say.
+  it("every switch on the panel is a real, named control", async () => {
+    await openPanel();
+
+    const switches = screen.getAllByRole("switch");
+    // Vacuity control. The old shape asserted a two-element list, which would
+    // also have passed on a panel that rendered nothing; this one cannot.
+    expect(switches.length).toBeGreaterThan(15);
+
+    const unnamed = switches
+      .filter((el) => !(el.getAttribute("aria-label") ?? "").trim())
+      .map((el) => el.outerHTML.slice(0, 120));
+    expect(unnamed).toEqual([]);
+  });
+
+  // The specific row the PAI programme depends on, asserted by key rather than
+  // by presence. `proactive_review_enabled` is refused unless delegation is on,
+  // so a Settings panel where the review switch works and this one does not is
+  // one where the feature can be switched on and can never run.
+  it("the delegation switch is operable and writes ext_orchestrator_enabled", async () => {
+    await openPanel();
+    const el = screen.getByRole("switch", { name: "Delegation to saved roles" }) as HTMLInputElement;
+    expect(el.checked).toBe(false);
+
+    fireEvent.click(el);
+    await clickSave();
+
+    expect(sentPatch()).toEqual({ ext_orchestrator_enabled: true });
   });
 });
 

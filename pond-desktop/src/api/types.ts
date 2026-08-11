@@ -199,6 +199,38 @@ export interface Settings {
    */
   ext_orchestrator_enabled?: boolean;
 
+  // Speaking and acting unprompted (PAI-7 P4 and P6).
+  //
+  // Both booleans ship OFF and must be read as `=== true`, never `!== false`:
+  // a key the server has not sent yet, or a settings read that failed, has to
+  // mean "does not speak" and "does not review". These are the only settings in
+  // this type that decide whether the assistant addresses somebody who did not
+  // address it, so the widening direction is the one that matters.
+  /**
+   * May the pond reason about the household unasked, and propose things?
+   * Needs `ext_orchestrator_enabled` as well — the reviewer runs its work as a
+   * delegated child, so with delegation off there is nothing to run it in.
+   */
+  proactive_review_enabled?: boolean;
+  /** May the pond speak without having been spoken to? */
+  unprompted_speech_enabled?: boolean;
+  /**
+   * Start of the nightly window in which the pond never speaks unprompted,
+   * local `"HH:MM"`. ABSOLUTE: the server checks this window before consent,
+   * presence and category, so no combination of the others produces speech
+   * inside it. Wraps midnight when start > end; equal bounds mean silent all
+   * day; a value the server cannot parse also means silence.
+   */
+  quiet_hours_start?: string;
+  /** End of the quiet-hours window, local `"HH:MM"`. See `quiet_hours_start`. */
+  quiet_hours_end?: string;
+  /**
+   * Comma-separated notification categories that may be SPOKEN unprompted.
+   * Defaults to `"alert"` alone. An unrecognised or blank entry matches
+   * nothing, so a typo silences that category rather than opening the rest.
+   */
+  unprompted_speech_categories?: string;
+
   // API keys are NOT on Settings (PAI-2 P2). They live in the secret store and
   // are managed through listSecretKeys / setSecret / deleteSecret; the server
   // never returns a secret VALUE, only whether the key is set.
