@@ -48,6 +48,40 @@ is a latency budget as much as a context one, which is the argument for it being
 window rather than fixed: the same 1 024-token reserve is 6 % of a 16 k window and 25 % of a 4 k one,
 but it is 34 seconds either way.
 
+## CORRECTION: this is not the llama.cpp GIAP serves turns with
+
+Raised as soon as the numbers were published, and it is the right question. There are **three**
+llama.cpp builds in play on a GIAP pond and this measurement used the one that serves nothing:
+
+| build | what it is | serves turns? |
+|---|---|---|
+| `~/llama.cpp` @ `0ef6f06`, installed to `~/.local/bin` by `scripts/jetson/llama-optimization/` | upstream, built standalone for sm_87 | **no** — a benchmarking and tuning tool |
+| `llama-cpp-sys-2 = 0.1.146`'s vendored tree, built by its `build.rs` with `--features cuda` | what `goose-local-inference` links | **yes — this is the live path** |
+| the same crate as pulled by `pond-inference` | GIAP's own engine | no — PondAgent is quarantined (Q2-05) |
+
+So the table above characterises **the hardware and the model**, not the engine. Two consequences,
+and they are not the same size:
+
+- **Decode (30.35 tok/s) transfers.** It is memory-bandwidth-bound: ~102 GB/s against a 2.88 GiB
+  model is a ceiling near 35 tok/s, and 30.35 sits just under it. A different llama.cpp build cannot
+  move that much, because the bottleneck is the bus and not the kernels. `output_reserve_tokens`'
+  latency argument rests on this number and stands.
+- **Prefill (820-976 tok/s) is provisional.** It is compute-bound and therefore sensitive to exactly
+  the things that differ between these builds — flash-attention support, batch and ubatch defaults,
+  which quantisation kernels were compiled. The vendored tree is recent enough to use the
+  `llama_memory_seq_rm` API rather than `llama_kv_self_seq_rm`, but `llama-cpp-sys-2` vendors it
+  without git metadata, so the exact commit is not recoverable from the checkout.
+
+**What survives regardless:** the SHAPE. Prefill is two orders of magnitude faster per token than
+decode, it degrades with depth, and a re-prefill of a full window costs seconds while a warm turn
+costs a fraction of one. The 200x warm-versus-cold argument for PAI-4 P5 holds even if the absolute
+prefill rate moves by a third in either direction. What should not be quoted as an engine fact is
+"19.97 s at 16 384" — quote it as "about twenty seconds on this hardware with this model, measured
+on a neighbouring build".
+
+Closing this properly means benchmarking through `goose-local-inference` itself, which is the same
+deploy PAI-4 P5's second clause needs. One run answers both.
+
 ## What this does NOT settle, stated plainly
 
 - **The warm path is arithmetic here, not a measurement.** `llama-bench` starts cold every time, and

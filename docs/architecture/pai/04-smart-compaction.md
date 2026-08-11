@@ -584,6 +584,15 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   prefix costs 4.19 s at 4k and **19.97 s at the pond's real 16 384 window**, growing faster than
   linearly because the rate itself degrades with depth. Decode is flat at 30.35 tok/s.
 
+  **Caveat that qualifies every absolute number above: the sweep used the STANDALONE llama.cpp
+  (`0ef6f06`, installed by `scripts/jetson/llama-optimization/`), not the tree `llama-cpp-sys-2
+  0.1.146` vendors and `goose-local-inference` actually links.** Decode is memory-bandwidth-bound
+  and transfers between builds; prefill is compute-bound and does not necessarily. The SHAPE — two
+  orders of magnitude between prefill and decode per token, degrading with depth, seconds for a
+  full re-prefill against a fraction of one for a warm turn — is what the argument rests on, and it
+  survives a third either way. Quote the numbers as "this hardware and model on a neighbouring
+  build", not as engine facts.
+
   **First clause — "cold-cache recompaction shows no TTFT penalty" — HOLDS.** When the prefix is
   already cold the turn pays that prefill whatever the trimmer decides, so recompacting at that
   moment is free: the work is already owed. The disjunction is the right shape.

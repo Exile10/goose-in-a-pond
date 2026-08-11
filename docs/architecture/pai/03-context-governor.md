@@ -358,6 +358,12 @@ Once occupancy is measured rather than estimated, `ContextHealth.should_compact`
   decode streams the weights and the weights do not grow with context. So reserving *R* output
   tokens costs `R / 30.35` seconds of generation: 512 tokens is 17 s, 1 024 is 34 s.
 
+  This number is the one that transfers. Decode is memory-bandwidth-bound — ~102 GB/s against a
+  2.88 GiB model ceilings near 35 tok/s and 30.35 sits just under it — so it is a property of the
+  bus rather than of the kernels, and it holds across llama.cpp builds. That matters because the
+  sweep used the standalone llama.cpp rather than the tree `goose-local-inference` links; the
+  prefill half of that measurement is provisional for the same reason, and this half is not.
+
   **That is the argument for deriving the reserve from the window rather than fixing it**, and it is
   a different argument from the one this phase was designed on. A flat 1 024-token reserve is 6 % of
   a 16 k window and 25 % of a 4 k one — but it is thirty-four seconds either way, and a user waiting
