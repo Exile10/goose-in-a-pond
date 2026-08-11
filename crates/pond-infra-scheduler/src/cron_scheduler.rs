@@ -413,6 +413,19 @@ fn compute_next_run(cron_expr: &str, _timezone: &str) -> Option<chrono::DateTime
     }
 }
 
+/// Refuse a task kind the scheduler must not store.
+///
+/// Only sensor rules have anything to check today — the domain owns what makes
+/// one storable ([`SensorTriggerSpec::validate`]) and this is the seam that
+/// makes the answer unavoidable rather than per-caller.
+fn validate_kind(kind: &TaskKind) -> Result<()> {
+    if let TaskKind::SensorTrigger(spec) = kind {
+        spec.validate()
+            .map_err(|rejected| anyhow::anyhow!("{rejected}"))?;
+    }
+    Ok(())
+}
+
 /// Does this kind's fire stamp have to survive a restart?
 ///
 /// Only a sensor rule reads its own last fire back: the rules engine debounces
@@ -475,6 +488,16 @@ fn migrate_kind_from_payload(record: &PersistedTask) -> TaskKind {
 #[async_trait]
 impl SchedulerPort for CronSchedulerAdapter {
     async fn create_task(&self, req: CreateScheduleRequest) -> Result<Schedule> {
+        // A rule that can never fire is refused at the STORE, not at one of the
+        // doors. There are four: `POST /rules`, `POST /schedules`, the
+        // `create_sensor_rule` MCP tool and the `update` paths — and the MCP
+        // tool reaches this port directly without passing through the API at
+        // all, so a check that lived only in `routes.rs` would leave the model
+        // able to write the rules a person is refused. See
+        // `SensorTriggerSpec::validate` for what each rejection prevents; every
+        // one of them would otherwise be stored and then be silent.
+        validate_kind(&req.kind)?;
+
         // Reject duplicates
         {
             let guard = self.tasks.lock().await;
@@ -709,6 +732,11 @@ impl SchedulerPort for CronSchedulerAdapter {
     }
 
     async fn update_task(&self, id: &str, req: UpdateScheduleRequest) -> Result<Schedule> {
+        // Same reasoning as `create_task`: an update is another way to arrive
+        // at a stored rule that can never fire.
+        if let Some(kind) = &req.kind {
+            validate_kind(kind)?;
+        }
         let cron_changed = req.cron.is_some();
 
         // Read current state and apply non-cron changes first.
@@ -1118,6 +1146,115 @@ mod tests {
             .update_task("ghost", UpdateScheduleRequest::default())
             .await
             .is_err());
+    }
+
+    // ── Rules that can never fire are refused at the STORE (PAI-7 P8) ────
+
+    fn rule_req(
+        id: &str,
+        actions: Vec<pond_core::user_data::domain::schedule::TriggerAction>,
+    ) -> CreateScheduleRequest {
+        use pond_core::user_data::domain::schedule::{
+            SensorTriggerSpec, TriggerCondition, TriggerSource, TriggerSourceKind,
+        };
+        CreateScheduleRequest {
+            id: id.to_string(),
+            label: format!("rule {id}"),
+            cron: "@event".to_string(),
+            timezone: "UTC".to_string(),
+            kind: TaskKind::SensorTrigger(SensorTriggerSpec {
+                source: TriggerSource {
+                    kind: TriggerSourceKind::Sensor,
+                    device_id: Some("backyard-pir".into()),
+                    signal: Some("motion".into()),
+                },
+                condition: TriggerCondition::default(),
+                actions,
+                cooldown_secs: 60,
+            }),
+        }
+    }
+
+    fn notify() -> Vec<pond_core::user_data::domain::schedule::TriggerAction> {
+        vec![
+            pond_core::user_data::domain::schedule::TriggerAction::Notify {
+                title: "Motion".into(),
+                body: "Backyard".into(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_can_never_fire_is_refused_at_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sched = make_scheduler(tmp.path()).await;
+
+        // The control first, so "refused" below is about the SPEC and not about
+        // the fixture or the adapter.
+        sched.create_task(rule_req("good", notify())).await.unwrap();
+
+        let err = sched
+            .create_task(rule_req("actionless", vec![]))
+            .await
+            .expect_err(
+                "a rule with no actions was stored: the MCP tool writes through this port                  without passing the API, so a check that lives only in routes.rs lets the                  model create the rules a person is refused",
+            );
+        assert!(err.to_string().contains("action"), "{err}");
+        assert_eq!(sched.list_tasks().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_update_cannot_smuggle_in_a_rule_that_can_never_fire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sched = make_scheduler(tmp.path()).await;
+        sched.create_task(rule_req("r", notify())).await.unwrap();
+
+        let bad = rule_req("r", vec![]).kind;
+        let err = sched
+            .update_task(
+                "r",
+                UpdateScheduleRequest {
+                    kind: Some(bad),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("update is another door onto a stored rule");
+        assert!(err.to_string().contains("action"), "{err}");
+
+        // And the good rule is still the one stored.
+        let tasks = sched.list_tasks().await.unwrap();
+        match &tasks[0].kind {
+            TaskKind::SensorTrigger(spec) => assert_eq!(spec.actions.len(), 1),
+            other => panic!("expected the rule, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rule_stored_before_the_check_existed_still_loads() {
+        // Rehydration deliberately does NOT validate. Refusing to load would
+        // delete somebody's automation on upgrade, which is a worse answer than
+        // keeping a rule that does nothing — and they can now see why it does
+        // nothing, because an edit to it is refused with the reason.
+        let tmp = tempfile::tempdir().unwrap();
+        let stored = serde_json::json!([{
+            "id": "legacy-rule",
+            "label": "Actionless",
+            "cron": "@event",
+            "timezone": "UTC",
+            "kind": {"type": "sensor_trigger", "source": {"kind": "sensor"}, "actions": []},
+            "paused": false
+        }]);
+        tokio::fs::write(
+            tmp.path().join("schedules.json"),
+            serde_json::to_string_pretty(&stored).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let sched = make_scheduler(tmp.path()).await;
+        let tasks = sched.list_tasks().await.unwrap();
+        assert_eq!(tasks.len(), 1, "an existing rule must survive the upgrade");
     }
 
     #[tokio::test]
