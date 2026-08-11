@@ -533,6 +533,133 @@ pub fn reasoning_budget_tokens(profile: &CompactionProfile, effort: ReasoningEff
     share.max(MIN_REASONING_BUDGET_TOKENS)
 }
 
+// ── PAI-5 P5: a reserve derived from what reasoning actually costs ──────────
+
+/// Fewest observations before this pond's own behaviour may move the reserve.
+///
+/// Below this the anchor stands. A handful of short thinking blocks is not
+/// evidence that reasoning is cheap here — it is evidence that nobody has asked
+/// a hard question yet — and the anchor was not a guess: it came from an
+/// observed mid-generation overrun on the Orin. Talking ourselves below a value
+/// that was set by a conversation dying is the one direction this must not move.
+pub const MIN_REASONING_SAMPLES: usize = 20;
+
+/// The step a derived reserve is rounded up to.
+///
+/// **This constant is what keeps this feature from fighting invariant 1**, and
+/// it is not a tidiness choice. `turn_profile` is the single producer of every
+/// budget in the live adapter and it runs PER TURN, so a reserve recomputed from
+/// a growing sample set would take a slightly different value on most turns.
+///
+/// Be exact about what that costs, because the first draft of this comment was
+/// not. The reserve feeds [`CompactionProfile::usable_prompt_tokens`] and
+/// [`usable_history_tokens`](CompactionProfile::usable_history_tokens), both of
+/// which are consumed by the turn trimmer. It does **not** move the preamble:
+/// the number actually rendered into the system prompt is
+/// [`reasoning_budget_words`], which takes `(effort, compact_prompt)` and never
+/// the profile. So a moving reserve does not re-render the prompt — it moves the
+/// point at which history is trimmed, and a trim drops the oldest messages, so
+/// everything after the preamble shifts and the reusable prefix truncates back
+/// to the preamble. The history re-prefills; the preamble does not.
+///
+/// That is a smaller cost than "the whole prompt" and still worth avoiding on
+/// every turn, on a device whose prefill runs at 674-976 tok/s. Quantising to
+/// 256 tokens means a new sample moves the reserve only when it crosses a step,
+/// which is rare and, when it happens, buys a correct budget for one trim.
+/// `a_growing_sample_set_does_not_move_the_reserve_every_turn` is the guard.
+///
+/// Quantising to 256 tokens means a new sample moves the reserve only when it
+/// crosses a step, which is rare and, when it happens, buys a correct budget for
+/// one re-prefill. `a_growing_sample_set_does_not_move_the_reserve_every_turn`
+/// is the guard, and it is the most important test in this section.
+pub const RESERVE_QUANTUM_TOKENS: usize = 256;
+
+/// The most of the window the output reserve may take from observation alone.
+///
+/// A verbose model on a small window would otherwise reserve so much that no
+/// history fits, and a conversation with no history is not a conversation. The
+/// anchor may exceed this — see [`observed_output_reserve`] — because an anchor
+/// is a measured failure and this is a policy.
+pub const MAX_OBSERVED_RESERVE_SHARE: f32 = 0.25;
+
+/// The percentile of observed reasoning cost the reserve is sized to.
+///
+/// Not the mean: half of all turns would overrun, and an overrun is not a slow
+/// turn — it is llama.cpp returning `ContextLengthExceeded` mid-generation and
+/// goose reactively compacting through a path GIAP's own threshold cannot
+/// disable, so the user watches their history become a summary and their answer
+/// stop after one character.
+///
+/// Not the max either: one pathological turn would tax every later turn's
+/// history for the life of the pond.
+const REASONING_PERCENTILE: f64 = 0.95;
+
+/// Size the output reserve from what reasoning has actually cost on this pond.
+///
+/// This is PAI-5 P5. The anchor curve's `output_reserve_tokens` is a constant
+/// with a measured justification — one 306-token thinking block seen on an Orin
+/// — and a constant is what this phase exists to replace, because the cost of
+/// reasoning is a property of the MODEL and the EFFORT, both of which the
+/// household changes without telling anybody.
+///
+/// `samples` are observed `reasoning_tokens`, which PAI-5 P2 made real: they are
+/// counted through PAI-3's `TokenCounter`, reported alongside `completion_tokens`
+/// and never deducted from it, and persisted per assistant row by migration 0039
+/// as a nullable column with no `DEFAULT`, so an unmeasured turn is `None` and
+/// not a zero. **Pass only measured turns.** A `None` folded in as `0` is a
+/// vote for a smaller reserve cast by a turn that never reasoned, and it is the
+/// exact shape that would make this function argue for the bug it exists to fix.
+///
+/// The arithmetic ties itself to [`reasoning_budget_tokens`] rather than
+/// inventing a second relationship: that function gives `Thorough` half the
+/// reserve, so a reserve of `2 * p95` is the smallest one under which an
+/// observed-typical thinking block still fits at the most expensive effort the
+/// user can select. The answer keeps the other half.
+///
+/// **`reasoning_budget_tokens` has no production caller today** — checked, not
+/// assumed; the only mention outside this module is a doc comment in
+/// `settings.rs`. The relationship it states is still the right one to size
+/// against, because it is this codebase's own answer to "how much of the reserve
+/// may reasoning take", and a second answer invented here would be a second
+/// definition to keep in step. But a reader should know the 2x is anchored to a
+/// stated intent rather than to a live division, and that giving
+/// `reasoning_budget_tokens` a caller is what would make it load-bearing.
+///
+/// Order of operations, and each step narrows or is stated:
+///
+/// 1. Too few samples, or none — the anchor.
+/// 2. `2 * p95(samples)`, rounded UP to [`RESERVE_QUANTUM_TOKENS`].
+/// 3. Clamped to [`MAX_OBSERVED_RESERVE_SHARE`] of the window.
+/// 4. Floored at the anchor, **last**, so it wins even over step 3. That
+///    ordering is deliberate: the ceiling is a policy about leaving room for
+///    history, the anchor is the value at which a real conversation stopped
+///    dying, and when the two disagree the measurement wins. On the windows
+///    this runs at they do not disagree — 0.25 x 4 096 is 1 024 against a 768
+///    anchor — so this is a statement about which failure is worse, not a live
+///    branch.
+pub fn observed_output_reserve(samples: &[u32], anchor: usize, window: usize) -> usize {
+    if samples.len() < MIN_REASONING_SAMPLES {
+        return anchor;
+    }
+
+    let mut sorted: Vec<u32> = samples.to_vec();
+    sorted.sort_unstable();
+    // Nearest-rank: the smallest observation at or above the percentile. On 20
+    // samples that is the 19th, so one outlier does not set the reserve and the
+    // top 5% still does.
+    let rank = ((sorted.len() as f64) * REASONING_PERCENTILE).ceil() as usize;
+    let index = rank.saturating_sub(1).min(sorted.len() - 1);
+    let p95 = sorted[index] as usize;
+
+    let needed = p95.saturating_mul(2);
+    let quantised = needed
+        .div_ceil(RESERVE_QUANTUM_TOKENS)
+        .saturating_mul(RESERVE_QUANTUM_TOKENS);
+
+    let ceiling = ((window as f32) * MAX_OBSERVED_RESERVE_SHARE) as usize;
+    quantised.min(ceiling).max(anchor)
+}
+
 /// The window the compact tier is sampled at when only `compact_prompt` is known.
 ///
 /// 8,192 is not an arbitrary pick: `ContextGovernor::prompt_window` clamps every
@@ -1773,6 +1900,160 @@ mod tests {
              a_reservation_takes_working_set_and_never_preamble asserts on each of them by hand, \
              so decide whether a subagent reservation may move the new one and add it there",
             fields.len()
+        );
+    }
+
+    // ── PAI-5 P5: the observed reserve ─────────────────────────────────────
+
+    /// Twenty samples of `cost`, the minimum that lets observation speak.
+    fn samples(cost: u32) -> Vec<u32> {
+        vec![cost; MIN_REASONING_SAMPLES]
+    }
+
+    #[test]
+    fn a_pond_with_too_little_evidence_keeps_the_measured_anchor() {
+        for n in 0..MIN_REASONING_SAMPLES {
+            let observed = vec![4_000u32; n];
+            assert_eq!(
+                observed_output_reserve(&observed, 768, 4_096),
+                768,
+                "{n} samples moved the reserve. Below the minimum the anchor stands, because a \
+                 handful of observations is not evidence about this pond -- and these samples are \
+                 huge, so a test that only tried SMALL ones would pass while the guard was gone"
+            );
+        }
+        // Vacuity control: the same enormous cost DOES move it once there is
+        // enough of it, so the loop above is the sample-count rule and not some
+        // other refusal.
+        assert!(observed_output_reserve(&samples(4_000), 768, 4_096) > 768);
+    }
+
+    /// The guard that keeps this feature from being worse than the bug.
+    ///
+    /// `turn_profile` builds a profile PER TURN and is the single producer of
+    /// every budget in the live adapter. If the reserve moved with each new
+    /// sample, the prompt would be budgeted against a slightly different number
+    /// on most turns, the rendered preamble would shift, and the KV prefix would
+    /// stop matching -- a full re-prefill every turn, measured at 4.19 s on the
+    /// Orin at 4 096 and 19.97 s at 16 384.
+    #[test]
+    fn a_growing_sample_set_does_not_move_the_reserve_every_turn() {
+        // A conversation whose reasoning cost climbs, which is what a longer,
+        // harder conversation actually does. The first draft of this test used
+        // `300 + turn % 17`, which cycles through seventeen values, so the p95
+        // stops moving once they have all been seen -- and the test passed with
+        // the quantisation DELETED. It is written against the unquantised count
+        // now, so it cannot pass without the thing it names.
+        let mut observed: Vec<u32> = Vec::new();
+        let mut reserves: Vec<usize> = Vec::new();
+        let mut raw: Vec<usize> = Vec::new();
+        for turn in 0..120u32 {
+            observed.push(200 + turn * 3);
+            reserves.push(observed_output_reserve(&observed, 768, 32_768));
+
+            // What the same derivation would produce with no quantisation: the
+            // control this test is measured against.
+            let mut sorted = observed.clone();
+            sorted.sort_unstable();
+            let rank = ((sorted.len() as f64) * REASONING_PERCENTILE).ceil() as usize;
+            let index = rank.saturating_sub(1).min(sorted.len() - 1);
+            raw.push(((sorted[index] as usize) * 2).max(768));
+        }
+        let changes = reserves.windows(2).filter(|w| w[0] != w[1]).count();
+        let raw_changes = raw.windows(2).filter(|w| w[0] != w[1]).count();
+
+        assert!(
+            raw_changes > 40,
+            "the control moved only {raw_changes} times, so this fixture does not exercise \
+             quantisation at all and the assertion below would pass without it"
+        );
+        assert!(
+            changes * 5 < raw_changes,
+            "the reserve moved {changes} times across 120 turns where the unquantised derivation \
+             moved {raw_changes}. Every move shifts the trim point, which truncates the \
+             reusable KV prefix back to the preamble and re-prefills the history. Quantisation to \
+             {RESERVE_QUANTUM_TOKENS} tokens is what bounds it; without it PAI-5 P5 pays that on \
+             nearly every turn"
+        );
+        // Vacuity control: this must not pass because the reserve never moves at
+        // all. A step change in reasoning cost has to be picked up.
+        let cheap = observed_output_reserve(&samples(100), 256, 8_192);
+        let dear = observed_output_reserve(&samples(900), 256, 8_192);
+        assert!(
+            dear > cheap,
+            "the reserve is inert: {cheap} for 100-token reasoning and {dear} for 900. A constant \
+             that never moves is the thing this phase replaced"
+        );
+    }
+
+    #[test]
+    fn the_reserve_is_sized_so_a_typical_thinking_block_still_fits_at_thorough() {
+        // The relationship this phase rests on: `reasoning_budget_tokens` gives
+        // Thorough half the reserve, so a reserve derived from observation must
+        // leave an observed-typical block room at the most expensive effort.
+        for cost in [120u32, 300, 640] {
+            let reserve = observed_output_reserve(&samples(cost), 256, 32_768);
+            let profile = CompactionProfile {
+                output_reserve_tokens: reserve,
+                ..CompactionProfile::from_context_window(32_768)
+            };
+            let budget = reasoning_budget_tokens(&profile, ReasoningEffort::Thorough);
+            assert!(
+                budget >= cost as usize,
+                "reasoning costs {cost} tokens here and Thorough is budgeted {budget}. The block \
+                 would be cut off or overrun the window mid-generation, which is the failure \
+                 PAI-5 P5 exists to remove"
+            );
+        }
+    }
+
+    #[test]
+    fn observation_can_never_lower_the_reserve_below_the_measured_anchor() {
+        // A pond that has only ever seen trivial reasoning.
+        let reserve = observed_output_reserve(&samples(8), 768, 4_096);
+        assert_eq!(
+            reserve, 768,
+            "cheap reasoning talked the reserve below the anchor. The anchor came from an \
+             observed mid-generation overrun on real hardware; observation may raise it and must \
+             never lower it"
+        );
+    }
+
+    #[test]
+    fn a_verbose_model_cannot_reserve_the_whole_window_away_from_history() {
+        let window = 4_096;
+        let reserve = observed_output_reserve(&samples(9_000), 768, window);
+        let share = reserve as f32 / window as f32;
+        assert!(
+            share <= MAX_OBSERVED_RESERVE_SHARE + f32::EPSILON,
+            "a verbose model took {share} of the window ({reserve} of {window}). A conversation \
+             with no room for history is not a conversation"
+        );
+    }
+
+    #[test]
+    fn one_outlier_does_not_set_the_reserve_but_the_top_of_the_range_does() {
+        let mut mostly_cheap = vec![100u32; MIN_REASONING_SAMPLES];
+        mostly_cheap[0] = 20_000;
+        let with_outlier = observed_output_reserve(&mostly_cheap, 256, 32_768);
+        let without = observed_output_reserve(&samples(100), 256, 32_768);
+        assert_eq!(
+            with_outlier, without,
+            "a single 20,000-token turn moved the reserve. The mean would let it; a percentile \
+             must not, or every pond is taxed forever by its worst turn"
+        );
+
+        // And the other direction, which the assertion above does not cover: a
+        // genuinely dearer TOP of the range must move it. A p95 that ignored
+        // everything above the median would also pass the first assertion.
+        let mut top_heavy = vec![100u32; MIN_REASONING_SAMPLES];
+        for slot in top_heavy.iter_mut().take(3) {
+            *slot = 1_200;
+        }
+        assert!(
+            observed_output_reserve(&top_heavy, 256, 32_768) > without,
+            "three dear turns in twenty did not move the reserve; the percentile is reading too \
+             low and turns will be cut off"
         );
     }
 }
