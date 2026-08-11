@@ -592,6 +592,23 @@ impl Believed {
             std::cmp::Ordering::Equal => self.last_activity > held.last_activity,
         }
     }
+
+    /// Report this belief as an edge in `transition`'s direction.
+    fn transition(
+        &self,
+        profile_id: &str,
+        transition: PresenceTransition,
+        at: DateTime<Utc>,
+    ) -> ProfilePresence {
+        ProfilePresence {
+            profile_id: profile_id.to_string(),
+            transition,
+            source: self.source,
+            confidence: self.confidence,
+            session_id: self.session_id.clone(),
+            at,
+        }
+    }
 }
 
 /// Turns attributed conversations into [`ProfilePresence`] edges.
@@ -647,24 +664,6 @@ impl PresenceObserver {
             }
         }
         out
-    }
-}
-
-impl Believed {
-    fn transition(
-        &self,
-        profile_id: &str,
-        transition: PresenceTransition,
-        at: DateTime<Utc>,
-    ) -> ProfilePresence {
-        ProfilePresence {
-            profile_id: profile_id.to_string(),
-            transition,
-            source: self.source,
-            confidence: self.confidence,
-            session_id: self.session_id.clone(),
-            at,
-        }
     }
 }
 
