@@ -3022,7 +3022,40 @@ fn a_role_model_never_reaches_the_engine_on_a_provider_that_runs_here() {
     }
 }
 
-/// Vacuity control for the test above, and the half that makes P7 a feature
+/// The same refusal for a provider that is in NEITHER list, through the same
+/// composition — because "not on the deny-list" was what P7 first read as
+/// permission, and the plan is where that permission would have become a model
+/// swap on a box nothing knows anything about.
+#[test]
+fn a_role_model_never_reaches_the_engine_on_a_provider_this_pond_cannot_place() {
+    for provider in ["mock", "lmstudio", "pond-spark", ""] {
+        let role = role_wanting_model("researcher", &["giap-weather"], "qwen3-14b");
+        let spec = spec_for(&role, &["giap-weather"]);
+        let env = env_with(
+            provider,
+            parent_tools(&[("giap-weather", &["get_forecast"])]),
+        );
+        let plan = build_child_plan(&spec, "child-1", &env, None).expect("the plan is authorised");
+
+        assert_eq!(
+            plan.model,
+            ChildModel::RefusedUnknownProvider {
+                requested: "qwen3-14b".to_string(),
+                provider: provider.to_string(),
+            },
+            "`{provider}`: the plan honoured a role's model for a provider nothing can place"
+        );
+        let applied = child_model_config(&plan.model, parent_model_config());
+        assert_eq!(
+            applied.model_name, "parent-model",
+            "`{provider}`: a delegation swapped the resident model on the strength of an \
+             unrecognised provider name"
+        );
+        assert!(same_config(&applied, &parent_model_config()));
+    }
+}
+
+/// Vacuity control for the two tests above, and the half that makes P7 a feature
 /// rather than a refusal: off-device the role's model IS used, because there the
 /// model is a field in somebody else's request body.
 #[test]
@@ -3185,10 +3218,19 @@ fn weather_env(provider: &str) -> ChildEnvironment {
 /// **The refusal, against a local provider fixture.** Quantified over the shared
 /// list, and asserted on the message rather than on the error type, because what
 /// has to be true is that a 2-4B model reads it and does something else.
+///
+/// The unrecognised names are in the same loop rather than in a second test:
+/// `spawn` asks one question — `BackgroundAvailability::for_provider(&env.provider_name)` —
+/// and every provider it cannot place must reach the same three assertions, or
+/// the composition has a second reading of the provider name in it.
 #[tokio::test]
 async fn a_background_run_is_refused_on_every_provider_that_runs_on_this_device() {
     let _serial = ONE_RUN_AT_A_TIME.lock().await;
-    for provider in ON_DEVICE_PROVIDERS {
+    for provider in ON_DEVICE_PROVIDERS
+        .iter()
+        .copied()
+        .chain(["mock", "lmstudio"])
+    {
         let runner = Arc::new(FakeRunner::new(weather_env(provider)));
         let state = runner.state.clone();
         let (orchestrator, _lease, _token) =
@@ -3199,11 +3241,15 @@ async fn a_background_run_is_refused_on_every_provider_that_runs_on_this_device(
             "p8-refusal",
         );
 
-        let refusal = orchestrator
-            .spawn(spec)
-            .await
-            .expect_err("a background delegation on this device must be refused")
-            .to_string();
+        let refusal = match orchestrator.spawn(spec).await {
+            Err(refused) => refused.to_string(),
+            Ok(run) => panic!(
+                "`{provider}` is not known to run somewhere else, so a background delegation on \
+                 it must be refused - it started anyway ({:?}), and the parent's next reply is \
+                 now queueing behind a child nobody is waiting for",
+                run.status
+            ),
+        };
         assert!(
             refusal.contains(provider) && refusal.contains("without `background`"),
             "{provider}: the refusal neither names the provider nor says what to do instead, so \
@@ -3231,6 +3277,22 @@ async fn a_background_run_is_refused_on_every_provider_that_runs_on_this_device(
 /// Vacuity control for the refusal, and the half that makes P8 a feature: the
 /// same call on a hosted provider RETURNS before the child has finished, with a
 /// non-terminal run the caller can poll.
+///
+/// **It also asserts PAI-6 P4's reservation from OUTSIDE the child, which is the
+/// one thing only this case can do.** `while_a_child_runs_its_parents_history_budget_is_reserved`
+/// has to read the claim from inside the fake engine, because a synchronous
+/// `spawn` has already released it by the time it returns. A background `spawn`
+/// returns with the child still running, so the caller's own thread can see the
+/// claim standing — and P8 is exactly what makes that claim outlive a turn.
+/// Without this, `reserve(parent, if background { 0.0 } else { fraction })` —
+/// which is a plausible thing to write, on the argument that a background child
+/// should not shrink the parent's live window — passes the whole adapter suite:
+/// the post-run `== 0.0` check below cannot tell "held then released" from
+/// "never held".
+///
+/// The fraction is 0.6, which is neither the file's 0.3 default nor either value
+/// the synchronous test uses, so no single literal in `spawn` satisfies all
+/// three.
 #[tokio::test]
 async fn a_background_run_returns_before_the_child_finishes_and_can_be_polled() {
     let _serial = ONE_RUN_AT_A_TIME.lock().await;
@@ -3239,7 +3301,7 @@ async fn a_background_run_returns_before_the_child_finishes_and_can_be_polled() 
     let (orchestrator, _lease, _token) =
         live_turn_for("p8-background", runner as Arc<dyn ChildRunner>);
     let spec = background_spec_for(
-        &role("researcher", &["giap-weather"]),
+        &role_with_fraction("researcher", &["giap-weather"], 0.6),
         &["giap-weather"],
         "p8-background",
     );
@@ -3248,11 +3310,21 @@ async fn a_background_run_returns_before_the_child_finishes_and_can_be_polled() 
     let started = std::time::Instant::now();
     let run = orchestrator.spawn(spec).await.expect("hosted, so allowed");
     let returned_in = started.elapsed();
+    // Read before anything else: the child holds for 120ms and this is the
+    // window in which the claim is observable from out here.
+    let reserved_while_running = process_device_ledger().reserved_fraction("p8-background");
 
     assert!(
         !run.status.is_terminal(),
         "a background spawn returned a finished run, so it waited for the child after all: {:?}",
         run.status
+    );
+    assert!(
+        (reserved_while_running - 0.6).abs() < 1e-6,
+        "spawn returned with a background child running and its parent had \
+         {reserved_while_running} of its history budget reserved; the role states 0.6. 0.0 means \
+         a background delegation takes no claim on the window it is about to spend, so the \
+         parent's next turn trims as though nothing else were live"
     );
     assert_eq!(
         run.result_for_parent(),
@@ -3288,6 +3360,20 @@ async fn a_background_run_returns_before_the_child_finishes_and_can_be_polled() 
         state.plans.lock().unwrap().len(),
         1,
         "the background task did not drive the child exactly once"
+    );
+    // The same claim as seen from inside the run, so the reading above is not
+    // the only witness and the two cannot disagree.
+    let observed = state
+        .reserved_during_run
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(observed.len(), 1, "the fake engine did not run");
+    assert!(
+        (observed[0] - 0.6).abs() < 1e-6,
+        "while the background child was replying its parent had {} of its history budget \
+         reserved, and the role states 0.6",
+        observed[0]
     );
     assert_eq!(
         process_device_ledger().reserved_fraction("p8-background"),
