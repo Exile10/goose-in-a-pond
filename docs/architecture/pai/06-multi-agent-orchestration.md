@@ -1079,11 +1079,13 @@ mutation was run.
   **What `check_task` gained instead, 2026-08-11.** Its own body had never been executed by a test:
   `authorise_task` was covered as a pure function while `run_check` — the only thing that calls it —
   had no coverage at all, so deleting the call left the whole crate green and turned the tool into
-  a read of any household member's delegation result by task id. Four tests now drive `run_check`
+  a read of any household member's delegation result by task id. Five tests now drive `run_check`
   through a fake `Orchestrator` whose `poll` is keyed by task id alone, exactly as the real
   registry is: a foreign task, the caller's own (the vacuity control), an unknown id refusing in
-  the same words as a foreign one, and a guest turn that owns its task and still may not read it —
-  the last being what stops `authorise(...)` being replaced by a bare `ok_or`.
+  the same words as a foreign one, a caller with no live turn and none carrying `_meta` at all,
+  and a guest turn that owns its task and still may not read it — that last being what stops
+  `authorise(...)` being replaced by a bare `ok_or`, since the missing-turn case refuses
+  identically either way.
 
 ---
 
