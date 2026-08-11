@@ -597,6 +597,17 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
+        // PAI-8's on-pond producer. Same pair, same failure mode: with only one
+        // of the two, a household switches ingest on, watches nothing arrive,
+        // and reads the toggle back as `false` forever.
+        upsert!(
+            "context_ingest_enabled",
+            if settings.context_ingest_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
 
         tx.commit().await?;
         Ok(())
@@ -1005,6 +1016,10 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "quiet_hours_end" => s.quiet_hours_end = value.to_string(),
         "unprompted_speech_categories" => s.unprompted_speech_categories = value.to_string(),
         "proactive_review_enabled" => s.proactive_review_enabled = value == "true",
+        // PAI-8's on-pond producer. `value == "true"` for the third time and for
+        // the same reason: a corrupt or unreadable row is not "true", so the
+        // failure direction is that the pond copies nothing into the corpus.
+        "context_ingest_enabled" => s.context_ingest_enabled = value == "true",
         _ => {} // unknown key — ignore
     }
 }
