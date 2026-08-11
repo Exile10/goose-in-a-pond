@@ -2894,16 +2894,18 @@ async fn run_server(
         ));
     }
 
-    // The other half of the event spine (PAI-7 P1): the pond's own clock and
-    // the user's presence at it. Spawned here, beside the two consumers, so
-    // the whole spine reads in one place. Both hold the bus weakly — see
-    // `run_time_ticker` — and both publish only; the rules engine skips these
-    // events because they have no device-shaped view, and the bridge above
-    // records them in the event log like any other bus traffic.
+    // The other half of the event spine (PAI-7 P1 and P2): the pond's own
+    // clock, whether somebody is at it, and which household member that is.
+    // Spawned here, beside the two consumers, so the whole spine reads in one
+    // place. Both hold the bus weakly — see `run_time_ticker` — and both
+    // publish only; the rules engine skips these events because they have no
+    // device-shaped view, and the bridge above records them in the event log
+    // like any other bus traffic.
     tokio::spawn(run_time_ticker(Arc::downgrade(&event_bus)));
     tokio::spawn(run_session_activity_observer(
         Arc::downgrade(&event_bus),
         session_storage.clone(),
+        profile_repo.clone(),
         last_user_activity.clone(),
     ));
 
@@ -4603,29 +4605,39 @@ async fn run_time_ticker(bus: std::sync::Weak<dyn pond_core::shared::ports::even
 }
 
 /// Publish [`BusEvent::Session`] transitions — a conversation started, the
-/// pond went quiet, the user came back.
+/// pond went quiet, the user came back — and [`BusEvent::Presence`]
+/// transitions, which say *which household member* that was.
 ///
 /// Reuses the consolidation scheduler's activity model wholesale:
 /// `saw_activity_since_start` for the never-at-startup guard,
 /// `combined_idle_for` so an out-of-process voice turn counts, and
-/// `INACTIVITY_THRESHOLD_SECS` as the threshold. One pond, one definition of
-/// "the user has gone quiet" — a second, disagreeing one would have the bus
-/// saying the user left while the gate that runs background work says they are
-/// still here.
+/// `INACTIVITY_THRESHOLD_SECS` as the threshold — for presence too, so the
+/// bus cannot say a member is still here after it has already said the pond
+/// went idle. One pond, one definition of "the user has gone quiet".
+///
+/// **One task, one read, two observers** (PAI-7 P2). A second polling loop
+/// would read the same table on its own schedule and the two could disagree
+/// about which conversations exist — which is the shape of defect
+/// `human_activity` was written as one function to prevent.
 ///
 /// **This loop decides nothing.** It reads the store, reads the clocks, and
-/// hands both to `ActivityObserver::poll` — the seed, the machine-session
-/// filter, the never-at-startup gate and the idle arithmetic all live in
-/// pond-core, where a mutation to any of them fails a test. Three of them used
-/// to be expressed here, inside a timer loop, and all three could be broken
-/// with the whole suite green.
+/// hands both to the observers — the seed, the machine-session filter, the
+/// never-at-startup gate, the idle arithmetic, the presence baseline, the
+/// freshness window and the identity resolution all live in pond-core, where a
+/// mutation to any of them fails a test. Three of them used to be expressed
+/// here, inside a timer loop, and all three could be broken with the whole
+/// suite green.
 async fn run_session_activity_observer(
     bus: std::sync::Weak<dyn pond_core::shared::ports::event_bus::EventBus>,
     storage: Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>,
+    profiles: Arc<dyn pond_core::user_data::ports::profile::ProfileRepository + Send + Sync>,
     last_user_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
 ) {
-    use pond_core::shared::domain::session_activity::{ActivityObserver, PollClock};
+    use pond_core::shared::domain::session_activity::{
+        ActivityObserver, PollClock, PresenceEvidence, PresenceInputs, PresenceObserver,
+    };
     use pond_core::shared::ports::event_bus::BusEvent;
+    use pond_core::user_data::domain::session::SessionIdentity;
     use pond_core::user_data::services::consolidation_schedule as sched;
 
     const POLL_SECS: u64 = 60;
@@ -4637,6 +4649,7 @@ async fn run_session_activity_observer(
     let started_at_utc = chrono::Utc::now();
 
     let mut observer = ActivityObserver::seeded_from(storage.list_sessions().await);
+    let mut presence = PresenceObserver::awaiting_baseline();
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
@@ -4646,8 +4659,9 @@ async fn run_session_activity_observer(
             break;
         };
 
-        // One read serves both halves: which conversations exist, and the
-        // newest `updated_at` (the out-of-process activity source).
+        // One read serves all three halves: which conversations exist, the
+        // newest `updated_at` (the out-of-process activity source), and which
+        // rows carry an attribution to look up.
         let sessions = match storage.list_sessions().await {
             Ok(sessions) => sessions,
             Err(e) => {
@@ -4655,6 +4669,7 @@ async fn run_session_activity_observer(
                 continue;
             }
         };
+        let now = chrono::Utc::now();
 
         let transitions = observer.poll(
             &sessions,
@@ -4662,7 +4677,7 @@ async fn run_session_activity_observer(
                 started_at,
                 started_at_utc,
                 in_process_at: *last_user_activity.read().await,
-                now: chrono::Utc::now(),
+                now,
                 idle_threshold,
             },
         );
@@ -4674,6 +4689,79 @@ async fn run_session_activity_observer(
                 "session lifecycle"
             );
             bus.publish(BusEvent::Session(transition));
+        }
+
+        // ── Presence (PAI-7 P2) ──────────────────────────────────────────
+        //
+        // The identity read is skipped only where the row already says there
+        // is nothing to attribute: `sessions.profile_id` NULL means
+        // `get_session_identity` would answer "nobody", which resolves to
+        // Household or Guest and publishes nothing either way. Every other
+        // decision — origin, freshness, who this is — belongs to the observer,
+        // so this loop does not pre-filter on any of them.
+        let mut attributed: Vec<(
+            &pond_core::user_data::domain::session::Session,
+            SessionIdentity,
+        )> = Vec::new();
+        let mut identities_readable = true;
+        for session in &sessions {
+            if session.profile_id.is_none() {
+                continue;
+            }
+            match storage.get_session_identity(&session.id).await {
+                Ok(identity) => attributed.push((session, identity)),
+                Err(e) => {
+                    // Skip the whole poll rather than treat an unreadable row
+                    // as unattributed. Taking the failure as "nobody is here"
+                    // would publish a departure nobody performed, and an
+                    // arrival when the read recovered.
+                    tracing::debug!(
+                        error = %e,
+                        session_id = %session.id,
+                        "presence observer: identity read failed; skipping this poll"
+                    );
+                    identities_readable = false;
+                    break;
+                }
+            }
+        }
+        if !identities_readable {
+            continue;
+        }
+
+        // A failed profile count is answered with "there may be more than
+        // one", which makes an unidentified speaker a Guest and publishes
+        // nothing. Same direction as `resolve_turn_scope`: on failure,
+        // access narrows.
+        let household_has_multiple_members = match profiles.list().await {
+            Ok(profiles) => profiles.len() > 1,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "presence observer: could not count household members; assuming more than one"
+                );
+                true
+            }
+        };
+
+        let evidence: Vec<PresenceEvidence<'_>> = attributed
+            .iter()
+            .map(|(session, identity)| PresenceEvidence::of(session, identity))
+            .collect();
+        for transition in presence.observe(PresenceInputs {
+            sessions: &evidence,
+            household_has_multiple_members,
+            presence_window: idle_threshold,
+            now,
+        }) {
+            tracing::debug!(
+                profile_id = %transition.profile_id,
+                transition = transition.transition.as_str(),
+                source = transition.source.as_str(),
+                session_id = %transition.session_id,
+                "profile presence"
+            );
+            bus.publish(BusEvent::Presence(transition));
         }
     }
 }
