@@ -1,5 +1,6 @@
 // ── Modular MCP servers (Phase 1 split) ─────────────────────────────────────
 pub mod audit;
+pub mod context;
 pub mod device;
 pub mod device_control;
 pub mod discovery;

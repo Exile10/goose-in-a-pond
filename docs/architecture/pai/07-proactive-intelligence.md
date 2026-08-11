@@ -254,7 +254,7 @@ second conversation opened by the same member, an upgrade from a face match to a
 and two conversations naming one member in one poll (strongest rung wins, then the more recent).
 
 **Reachability, stated as a fact rather than a caveat.** The publisher is unconditionally spawned
-in `run_server` and runs every 60 seconds on a default install, so unlike P3a there is no inert
+in `run_server` and runs every 60 seconds on a default install, so unlike P3a as first landed there is no inert
 layer here. Its *input* is the constraint: presence requires an attributed session, and
 **no shipped surface attributes one**. `pond-desktop/src` calls exactly one profile route
 (`GET /api/v1/profiles`); the two binding routes are reachable over REST by a paired client, and
@@ -394,7 +394,22 @@ earns autonomy incrementally instead of demanding it up front.
 `rationale` is mandatory. An assistant that says "you asked me to watch for this, and the delivery
 window closes at six" is helpful; one that says "I did a thing" is alarming.
 
-#### AS LANDED — P3a, 2026-08-10. Domain and persistence only; NOTHING CONSTRUCTS IT YET.
+#### AS LANDED — P3a 2026-08-10 (domain and persistence), completed to **P3 on 2026-08-11** when the
+REST surface wired it.
+
+**Read the P3a half as history, not as current state.** It was stamped P3a rather than P3 because
+nothing constructed a `SqliteProposalRepository`, and that claim was defended by a test rather than
+a sentence — `nothing_outside_this_file_constructs_a_proposal_repository_yet` walked every `.rs`
+file under `crates/` and asserted the absence, because the usual tripwire cannot fire here: every
+symbol in this domain is `pub` in a library crate, so `dead_code` says nothing about a type no
+production path can reach. That is precisely how PAI-1 P5 was recorded as landed while inert, and
+how PAI-6 P1's clamp shipped with its one call site missing.
+
+**The test was written to fail one day and it did.** The proposal REST surface constructs the
+repository in `pond-api`'s `routes.rs`, so the guard fired with a message telling its reader to
+delete it and correct this stamp and the ledger in the same change — which is what happened. A
+guard asserting an absence that has ended is worse than no guard, because it fails for the right
+reason and then gets deleted for the wrong one.
 
 Read the second half of this stamp before quoting the first. P3 is **not** closed: what landed is a
 validated type, a port, an adapter and two migrations, with **no producer, no consumer and no
