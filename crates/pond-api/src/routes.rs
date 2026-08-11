@@ -1290,6 +1290,52 @@ fn tool_result_frame(tool: &str, id: &str, content: &str, ui_hint: Option<Value>
     ev.to_string()
 }
 
+/// The one shape of a `turn_stats` SSE frame.
+///
+/// PAI-5 P2's display half, and the reason it took a second phase: the number
+/// this adds — `reasoning_tokens` — has been on `TurnStats` and in
+/// `session_messages` since 2026-08-06, but this frame is built by hand from a
+/// struct, so widening the struct did not widen the frame, and `routes.rs` was
+/// held by other work at the time. The count reached
+/// `AgentStreamEvent::Done` and stopped there.
+///
+/// Two properties of that field the JSON has to preserve:
+///
+/// * It is reported **alongside** `completion_tokens`, never deducted from it.
+///   The provider's output count most likely already includes the reasoning
+///   decode, nobody has measured which way for the models GIAP pins, and
+///   subtracting a GIAP estimate from an engine-reported number corrupts the
+///   one that was actually measured.
+/// * `null` is not `0`. "Nobody counted" and "counted, and this turn thought
+///   nothing" are different facts — it is why migration 0039 has no
+///   `DEFAULT 0` — and PAI-5 P5 sizes `output_reserve_tokens` from the second.
+///   Serialising `None` as `null` keeps that distinction on the wire; a
+///   `unwrap_or(0)` here would erase it for every provider that reports no
+///   reasoning at all.
+///
+/// One function rather than a `json!` per handler for the same reason
+/// [`tool_result_frame`] is one: both stream routes emit this frame, and a
+/// field added to one copy is a client that renders it on `/chat/stream` and
+/// not on `/agent/chat/stream`.
+fn turn_stats_frame(s: &pond_core::shared::domain::turn_stats::TurnStats) -> String {
+    json!({
+        "type": "turn_stats",
+        "ttft_ms": s.ttft_ms,
+        "prefill_ms": s.prefill_ms,
+        "decode_tok_per_sec": s.decode_tok_per_sec,
+        "prefill_tok_per_sec": s.prefill_tok_per_sec,
+        "prompt_tokens": s.prompt_tokens,
+        "completion_tokens": s.completion_tokens,
+        "reasoning_tokens": s.reasoning_tokens,
+        "context_used_tokens": s.context_used_tokens,
+        "context_limit_tokens": s.context_limit_tokens,
+        "context_pct": s.context_pct(),
+        "model_load_ms": s.model_load_ms,
+        "inference_count": s.inference_count,
+    })
+    .to_string()
+}
+
 /// The per-turn state a chat SSE handler accumulates while the engine streams.
 ///
 /// The three fields at the top are what both handlers need in order to persist
@@ -1649,22 +1695,9 @@ fn chat_stream_inner(
                                         usage_completion_tokens = u.completion_tokens;
                                     }
                                     if let Some(s) = stats {
-                                        let payload = json!({
-                                            "type": "turn_stats",
-                                            "ttft_ms": s.ttft_ms,
-                                            "prefill_ms": s.prefill_ms,
-                                            "decode_tok_per_sec": s.decode_tok_per_sec,
-                                            "prefill_tok_per_sec": s.prefill_tok_per_sec,
-                                            "prompt_tokens": s.prompt_tokens,
-                                            "completion_tokens": s.completion_tokens,
-                                            "context_used_tokens": s.context_used_tokens,
-                                            "context_limit_tokens": s.context_limit_tokens,
-                                            "context_pct": s.context_pct(),
-                                            "model_load_ms": s.model_load_ms,
-                                            "inference_count": s.inference_count,
-                                        });
+                                        let payload = turn_stats_frame(&s);
                                         turn_stats = Some(s);
-                                        yield Ok(Event::default().data(payload.to_string()));
+                                        yield Ok(Event::default().data(payload));
                                     }
                                     // The `done` frame for this route is emitted
                                     // at the very end, after persistence and
@@ -2063,6 +2096,29 @@ fn derived_session_label(text: &str) -> String {
 }
 
 /// `GET /api/v1/usage/summary` — aggregate token usage across all sessions.
+///
+/// # The reasoning total, and what it costs
+///
+/// PAI-5 P2's other display surface. `total_prompt_tokens` and
+/// `total_completion_tokens` are running counters on the `sessions` row, kept
+/// by `increment_usage`; there is no such counter for reasoning, so the total
+/// here is summed from the `session_messages` rows — an O(corpus) read on a
+/// route that was O(sessions). I took that cost deliberately and it should not
+/// survive: the fix is one `SessionStorage` method
+/// (`reasoning_token_totals() -> (u64, u64)`) answering both numbers with one
+/// `SELECT SUM(reasoning_tokens), COUNT(reasoning_tokens)`, which this handler
+/// would then call instead of walking sessions. That belongs to whoever next
+/// owns `pond-core/src/user_data/ports/session_storage.rs`.
+///
+/// **`counted_reasoning_turns` is not decoration.** `total_reasoning_tokens: 0`
+/// is ambiguous between "the models did no thinking" and "nothing counted", and
+/// on a pond driven only from the desktop the honest answer is the second: both
+/// HTTP stream handlers persist through `ChatService::persist_assistant_turn`,
+/// whose usage argument is a `(prompt, completion)` tuple that cannot carry a
+/// third number, so their rows keep NULL. The count is carried end to end only
+/// on the `ChatService` path — `pond chat` and the terminal voice loop. A zero
+/// beside a zero count says "nobody counted"; a zero beside a non-zero count
+/// says the turns really did no thinking, which is what PAI-5 P5 needs to read.
 async fn usage_summary(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -2080,6 +2136,28 @@ async fn usage_summary(
         .sum();
     let total_tokens = total_prompt + total_completion;
 
+    let mut total_reasoning: u64 = 0;
+    let mut counted_reasoning_turns: u64 = 0;
+    for session in &sessions {
+        // A session whose messages cannot be read contributes nothing rather
+        // than failing the whole summary: the two provider counters above are
+        // already answerable and refusing to report them because one session's
+        // rows are unreadable trades a complete answer for none.
+        match state.session_storage.get_messages(&session.id).await {
+            Ok(messages) => {
+                for reasoning in messages.iter().filter_map(|m| m.reasoning_tokens) {
+                    total_reasoning += reasoning as u64;
+                    counted_reasoning_turns += 1;
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                session_id = %session.id,
+                "could not read a session's messages while summing reasoning tokens"
+            ),
+        }
+    }
+
     let settings = state.settings_repo.get().await.ok();
     let cloud_input = settings
         .as_ref()
@@ -2093,6 +2171,12 @@ async fn usage_summary(
     Ok(Json(json!({
         "total_prompt_tokens": total_prompt,
         "total_completion_tokens": total_completion,
+        // Deliberately NOT folded into `total_tokens`. That figure is what the
+        // cloud prices above are multiplied by, and this one is GIAP's own
+        // estimate over the thinking text rather than anything a provider
+        // billed for -- adding it would put an estimate inside a cost.
+        "total_reasoning_tokens": total_reasoning,
+        "counted_reasoning_turns": counted_reasoning_turns,
         "total_tokens": total_tokens,
         "session_count": sessions.len(),
         "cloud_input_price_per_million": cloud_input,
@@ -8825,11 +8909,26 @@ async fn agent_chat_stream(
                             chat_service.record_thinking(block);
                             yield Ok::<Event, std::convert::Infallible>(Event::default().data(frame));
                         }
-                        // This route closes on the engine's `Done` and reports
-                        // no usage, which is why the numbers are dropped here
-                        // rather than in the translator. `/chat/stream` keeps
-                        // them and emits its `done` after persistence.
-                        StreamStep::TurnComplete { .. } => {
+                        // This route closes on the engine's `Done`, which is why
+                        // the `done` frame is built here rather than in the
+                        // translator -- `/chat/stream` keeps the numbers and
+                        // emits its `done` after persistence.
+                        //
+                        // PAI-5 P2: the turn's stats go out FIRST, through the
+                        // same builder the other route uses. This route used to
+                        // drop them on the floor with a `{ .. }`, so a client
+                        // driving `/agent/chat/stream` could see no TTFT, no
+                        // decode rate, no context fill and no reasoning count
+                        // for a turn the engine had measured. `usage` is still
+                        // dropped: this route reports no totals in its `done`
+                        // frame, and inventing one now would change a shape
+                        // clients already parse.
+                        StreamStep::TurnComplete { stats, .. } => {
+                            if let Some(s) = stats {
+                                yield Ok::<Event, std::convert::Infallible>(
+                                    Event::default().data(turn_stats_frame(&s))
+                                );
+                            }
                             yield Ok::<Event, std::convert::Infallible>(Event::default().data(
                                 json!({"done": true, "session_id": session_id.clone()}).to_string()
                             ));
