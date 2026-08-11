@@ -2978,6 +2978,86 @@ async fn run_server(
         ));
     }
 
+    // ── PAI-8 P1: the personal-context corpus gets a producer ────────────
+    //
+    // Everything in `pond-core/src/context/` landed on 2026-08-11 with nothing
+    // that could produce a `RawItem`, so `context_items` was empty on every
+    // pond by construction and `context_pipeline_is_not_wired_yet.rs` asserted
+    // it. This block is what that test was written to fail on.
+    //
+    // Three things decide the shape.
+    //
+    // 1. **The redactor is not optional.** `IngestPipeline::new` takes one by
+    //    value rather than as an `Option`, so there is no "no redactor wired"
+    //    fallback to lose invariant 3 through. This is also PAI-2 P3's third
+    //    chokepoint finally getting a call site -- the one the ledger recorded
+    //    as circularly blocked on PAI-8.
+    // 2. **The toggle is answered per event, from the settings the loop last
+    //    read**, not captured at boot. `BusIngest::absorb` reads it before it
+    //    reads any store, so on a default pond the whole cost of this feature
+    //    is a bool per bus event and no query.
+    // 3. **The bus is subscribed once more rather than sharing the reviewer's
+    //    ring.** They want different things: the reviewer wants a bounded
+    //    window of recent household facts to reason over, this wants every
+    //    event exactly once so nothing is silently dropped by a ring that
+    //    wrapped.
+    {
+        let context_repo: Arc<dyn pond_core::context::ports::ContextRepository> =
+            Arc::new(pond_infra::sqlite_context::SqliteContextRepository::new(
+                db.system.clone(),
+                redactor.clone(),
+            ));
+        let pipeline = Arc::new(
+            pond_core::context::ingest::IngestPipeline::new(context_repo.clone(), redactor.clone())
+                .with_embedder(embedding_provider.clone()),
+        );
+
+        // PAI-8 P2's read surface. Installed unconditionally, like the other
+        // `init_*_deps`: registration is what the toggle gates, so with the
+        // extension unregistered these handles are simply unused.
+        pond_mcp_server::context::init_context_deps(
+            context_repo.clone(),
+            embedding_provider.clone(),
+        );
+
+        let ingest = Arc::new(pond_core::context::bus_ingest::BusIngest::new(
+            context_repo,
+            pipeline,
+        ));
+        let ingest_settings = settings_repo.clone();
+        let mut events = event_bus.subscribe();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while let Some(bus_event) = events.next().await {
+                // A settings read that fails skips the event rather than
+                // falling back to `Settings::default()`. The default is off, so
+                // both mean "do not ingest" today -- but a default is a value
+                // somebody can change, and a gate that launders an unreadable
+                // store through it would start storing the day that moved.
+                let Ok(settings) = ingest_settings.get().await else {
+                    continue;
+                };
+                match ingest
+                    .absorb(&settings, &bus_event, chrono::Utc::now())
+                    .await
+                {
+                    Ok(report) => {
+                        if !report.ingested.is_empty() {
+                            tracing::debug!(
+                                stored = report.ingested.len(),
+                                refused = report.refused,
+                                "[context] bus event ingested"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "[context] could not absorb a bus event");
+                    }
+                }
+            }
+        });
+    }
+
     // Egress tracker (#113): record every outbound HTTP call made by built-in
     // MCP tools into the same event store, so network egress is queryable via
     // `GET /api/v1/activity?category=network`.
