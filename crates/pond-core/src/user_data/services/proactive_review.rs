@@ -6,17 +6,22 @@
 //! be, how its answer becomes proposals, and which proposals the member has
 //! already said no to.
 //!
-//! # Nothing here performs I/O, and nothing here runs yet
+//! # Nothing here performs I/O, and since 2026-08-11 all of it runs
 //!
 //! Pure functions over plain values, in the same shape as
 //! [`consolidation_schedule`](super::consolidation_schedule) and for the same
 //! reason: the three rules that broke consolidation were untestable while they
-//! lived inside a loop. The loop that calls this belongs in `pond-server`'s
-//! `main.rs` and **does not exist**. Until it does, everything below is
-//! reachable only from its own tests — stated here rather than left to be
-//! discovered, because a `pub` item in a library crate never earns a
-//! `dead_code` warning and PAI-1 P5 shipped inert for a whole phase behind
-//! exactly that blind spot.
+//! lived inside a loop. The loop that calls this is
+//! `pond-server`'s `run_proactive_reviewer`, and **it exists** — this paragraph
+//! said it did not for one phase, which was true and had to stop being true for
+//! the workstream to mean anything.
+//!
+//! That the loop is reached is asserted rather than assumed:
+//! `pond-infra/tests/proactive_reviewer_is_wired.rs` fails if the `tokio::spawn`
+//! goes away. It has to be, because `ci.yml` runs `cargo check -p pond-server`
+//! and never `cargo test -p pond-server`, and because a `pub` item in a library
+//! crate never earns a `dead_code` warning — the blind spot PAI-1 P5 shipped
+//! inert behind for a whole phase.
 //!
 //! # The reviewer cannot write its own proposal, and that shapes everything
 //!
@@ -57,11 +62,14 @@ use crate::shared::domain::orchestration::{
     AgentRole, DelegationAuthority, DelegationRefused, RoleError, TaskRequest, TaskRun, TaskSpec,
     ROLE_YAML_KEY,
 };
+use crate::shared::domain::session_activity::SessionOrigin;
+use crate::shared::ports::event_bus::BusEvent;
 use crate::user_data::domain::proposal::{
     BusEventRef, Proposal, ProposalAudience, ProposalDecision, ProposalError, ProposalShape,
     TriggerIdentity,
 };
 use crate::user_data::domain::schedule::TaskKind;
+use crate::user_data::domain::session::Session;
 use crate::user_data::services::consolidation_schedule::{
     saw_activity_since_start, should_run, GateDecision, GateInputs, SkipReason,
 };
@@ -342,6 +350,36 @@ pub fn cancelled_by_activity(
 
 // ── What the child is allowed to be ─────────────────────────────────────────
 
+/// The root authority one review run stands on.
+///
+/// **Separate from [`plan_review`] because the loop needs the same value, and
+/// two constructions of it would be two ceilings.** `GooseOrchestrator::spawn`
+/// refuses any spec whose `parent_session_id` has no live turn in the
+/// `TurnAuthorityRegistry` — which is right, and which a background reviewer
+/// fails by construction, because a review has no user turn behind it. So the
+/// loop publishes *this* authority for the duration of the run and the review
+/// becomes its own parent turn.
+///
+/// That is not a workaround for the check; it is what the check was asking for.
+/// The registry entry is keyed to a cancellation token, and cancelling that
+/// token is what invariant 3 needs — a review interrupted by the user coming
+/// back must take its child down with it, and PAI-6 invariant 5 already makes
+/// that cascade work for anything the registry knows about.
+///
+/// `a_review_publishes_the_same_authority_the_orchestrator_will_look_for` pins
+/// the pairing, because the failure mode if they drift is not a wrong scope —
+/// it is every review being refused, silently, forever.
+pub fn review_authority(audience: &ProposalAudience, session_id: &str) -> DelegationAuthority {
+    DelegationAuthority::root(
+        session_id,
+        audience.scope(),
+        PROACTIVE_ROOT_GROUPS
+            .iter()
+            .map(|g| (*g).to_string())
+            .collect(),
+    )
+}
+
 /// Authorise one review run.
 ///
 /// Takes a [`ProposalAudience`] and not a `ProfileScope`, which is how
@@ -367,15 +405,7 @@ pub fn plan_review(
     brief: &str,
     inputs: serde_json::Value,
 ) -> Result<TaskSpec, DelegationRefused> {
-    let authority = DelegationAuthority::root(
-        session_id,
-        audience.scope(),
-        PROACTIVE_ROOT_GROUPS
-            .iter()
-            .map(|g| (*g).to_string())
-            .collect(),
-    );
-    authority.delegate(
+    review_authority(audience, session_id).delegate(
         role,
         TaskRequest {
             role: role.name().to_string(),
@@ -384,6 +414,160 @@ pub fn plan_review(
             background: false,
         },
     )
+}
+
+// ── Who a review is for, and what it may be told ────────────────────────────
+
+/// How far back a review may look for the member it addresses.
+///
+/// **It must be longer than the idle threshold that starts the review, and
+/// that is not a tuning choice.** A review runs after
+/// `INACTIVITY_THRESHOLD_SECS` of quiet, so by the time it starts, every
+/// conversation is by definition at least that stale — and
+/// [`attribution_candidates`], which the presence observer uses to decide who
+/// is *here*, is bounded by exactly that same threshold. Reusing it to decide
+/// who a review is *for* would return the empty list on every tick, forever,
+/// and the reviewer would look like a feature nobody had enabled rather than
+/// like one whose window was a quarter of an hour too short.
+///
+/// [`the_audience_window_outlives_the_idle_that_starts_a_review`] is the guard.
+/// Six hours is a judgement — long enough to survive an afternoon out, short
+/// enough that a suggestion is not addressed to whoever last used the pond
+/// yesterday.
+///
+/// [`attribution_candidates`]: crate::shared::domain::session_activity::attribution_candidates
+/// [`the_audience_window_outlives_the_idle_that_starts_a_review`]: #
+pub const AUDIENCE_WINDOW: Duration = Duration::hours(6);
+
+/// At most this many events go into one brief.
+///
+/// A quarter of an hour of a chatty temperature sensor is thousands of
+/// readings, and the child's window on the target hardware is 4 096 tokens
+/// **including** its role instructions. An unbounded brief does not degrade
+/// gracefully here — it evicts the schema the answer has to match.
+///
+/// The cap applies after [`brief_events`] has collapsed repeats, so it bites on
+/// twenty-four *distinct* things having happened, which is a different and much
+/// rarer event than a sensor reporting twenty-four times.
+pub const MAX_BRIEF_EVENTS: usize = 24;
+
+/// Project one bus event onto the reference a proposal can carry, or refuse it.
+///
+/// The match is exhaustive with no wildcard arm **on purpose**: a seventh
+/// `BusEvent` variant must not silently join the reviewer's diet, and the
+/// compiler is a better guard than a test for that particular mistake.
+///
+/// Two families are refused, and both refusals are load-bearing:
+///
+/// - **`Time`.** The hourly tick is a heartbeat, not a household fact. The
+///   brief already states the time, from the clock rather than from an event,
+///   so admitting these would spend the cap on "it is now 3am" and teach the
+///   model that the passage of time is something to have opinions about.
+/// - **`Session`.** A session lifecycle event is the pond noticing *itself*.
+///   Worse, `Idle` is the very transition that lets a review start, so feeding
+///   it back would hand the child its own trigger as evidence and invite a
+///   proposal about the user having stopped talking — which they had, to go to
+///   bed.
+pub fn reviewable(event: &BusEvent) -> Option<BusEventRef> {
+    // `BusEventRef::new` is fallible only for a blank `kind`, and every kind
+    // below is a literal. `.ok()` rather than an `expect` so a future arm that
+    // computes one cannot panic inside a background loop.
+    match event {
+        BusEvent::Sensor(r) => BusEventRef::new(
+            "sensor",
+            Some(r.device_id.clone()),
+            Some(r.sensor_type.clone()),
+            r.recorded_at,
+        )
+        .ok(),
+        BusEvent::Camera(c) => BusEventRef::new(
+            "camera",
+            Some(c.camera_id.clone()),
+            Some(c.event_type.clone()),
+            c.created_at,
+        )
+        .ok(),
+        BusEvent::Device(d) => BusEventRef::new(
+            "device",
+            Some(d.device_id.to_string()),
+            Some(d.key.clone()),
+            d.changed_at,
+        )
+        .ok(),
+        BusEvent::Presence(p) => BusEventRef::new(
+            "presence",
+            Some(p.profile_id.clone()),
+            Some(p.transition.as_str().to_string()),
+            p.at,
+        )
+        .ok(),
+        BusEvent::Time(_) | BusEvent::Session(_) => None,
+    }
+}
+
+/// The member one review is addressed to, or nobody.
+///
+/// Invariant 4 says a proposal is addressed to a profile and never broadcast,
+/// and this is where that gets decided. The answer is the most recently active
+/// conversation that (a) a person held — [`SessionOrigin::is_human`], so the
+/// pond's own `sched-` rows can never nominate an audience, which matters
+/// doubly here because a review's own session id starts with `sched-` — and
+/// (b) carries an attribution, inside [`AUDIENCE_WINDOW`].
+///
+/// **`None` is a first-class answer and the loop must treat it as "no review".**
+/// On a pond with no profiles, or one where nobody has been identified in six
+/// hours, there is no member to address, and the alternative to skipping is a
+/// suggestion sent to the household — which is the broadcast this workstream
+/// exists to avoid. [`ProposalAudience`] cannot express one, so a caller that
+/// ignored this would have nothing to pass.
+///
+/// [`SessionOrigin::is_human`]: crate::shared::domain::session_activity::SessionOrigin::is_human
+pub fn audience_for_review(sessions: &[Session], now: DateTime<Utc>) -> Option<ProposalAudience> {
+    let cutoff = now - AUDIENCE_WINDOW;
+    sessions
+        .iter()
+        .filter(|s| SessionOrigin::of(&s.id).is_human())
+        .filter(|s| s.updated_at > cutoff)
+        .filter_map(|s| s.profile_id.as_deref().map(|p| (s.updated_at, p)))
+        .max_by_key(|(at, _)| *at)
+        .and_then(|(_, profile_id)| ProposalAudience::for_member(profile_id).ok())
+}
+
+/// The events a review addressed to `audience` may actually be shown.
+///
+/// Three things happen here, in this order, and the first is the only one that
+/// is about safety:
+///
+/// 1. **A presence event naming somebody else is dropped.** The child's scope
+///    is `Owner(audience)` and PAI-6's clamp holds it there, but the brief is
+///    prose handed straight to the model — it goes around the scope, not
+///    through it. "Ada arrived at 18:04" in a review addressed to Liz is a
+///    disclosure the tool layer would have refused. Device, sensor and camera
+///    events are household facts and stay; a `presence` row is the one family
+///    whose `source_id` is a person.
+/// 2. **Repeats collapse to the newest.** [`TriggerIdentity`] is the same
+///    projection the feedback ledger suppresses on, so "the same thing, again"
+///    means here exactly what it means when the member says no to it.
+/// 3. **Newest first, then [`MAX_BRIEF_EVENTS`].** If the cap has to bite, it
+///    should drop the oldest, not whatever the bus happened to deliver last.
+pub fn brief_events(audience: &ProposalAudience, observed: &[BusEventRef]) -> Vec<BusEventRef> {
+    let mut newest: BTreeMap<TriggerIdentity, BusEventRef> = BTreeMap::new();
+    for event in observed {
+        if event.kind() == "presence" && event.source_id() != Some(audience.profile_id()) {
+            continue;
+        }
+        let identity = TriggerIdentity::of(event);
+        match newest.get(&identity) {
+            Some(kept) if kept.observed_at() >= event.observed_at() => {}
+            _ => {
+                newest.insert(identity, event.clone());
+            }
+        }
+    }
+    let mut events: Vec<BusEventRef> = newest.into_values().collect();
+    events.sort_by_key(|e| std::cmp::Reverse(e.observed_at()));
+    events.truncate(MAX_BRIEF_EVENTS);
+    events
 }
 
 /// The brief a review is given.
@@ -1713,6 +1897,346 @@ mod tests {
         // With nothing observed, the brief says so rather than inventing a list.
         assert!(
             review_brief(now, &[], &FeedbackLedger::empty()).contains("Nothing has been observed")
+        );
+    }
+
+    /// The refusal this phase would otherwise have hit on every single tick.
+    ///
+    /// `GooseOrchestrator::spawn` starts by asking the registry for the live
+    /// turn behind `spec.parent_session_id()` and errors when there is none —
+    /// and `parent_turn_token` matches on `authority.session_id()`, not on the
+    /// key the entry was published under. A reviewer that published under one
+    /// id and planned under another would compile, run, and refuse every
+    /// review with "no live turn holds the authority", which reads like a
+    /// correctly-working guard rather than like broken wiring.
+    #[test]
+    fn a_review_publishes_the_same_authority_the_orchestrator_will_look_for() {
+        use crate::shared::services::turn_authority::TurnAuthorityRegistry;
+        use std::sync::Arc;
+        use tokio_util::sync::CancellationToken;
+
+        let session_id = review_session_id("run-1");
+        let audience = audience();
+
+        let spec = plan_review(
+            &role(),
+            &audience,
+            &session_id,
+            "review what happened",
+            serde_json::json!({}),
+        )
+        .expect("the shipped role must be delegable under its own root authority");
+
+        let registry = Arc::new(TurnAuthorityRegistry::new());
+        let cancel = CancellationToken::new();
+        let _lease = registry.publish(
+            &session_id,
+            review_authority(&audience, &session_id),
+            cancel.clone(),
+        );
+
+        let found = registry.parent_turn_token(spec.parent_session_id()).expect(
+            "the orchestrator looks the parent turn up by the spec's parent_session_id; \
+                 without a match it refuses the spawn and no review ever runs",
+        );
+        // Not merely "a token": cancelling the loop's own token must be what
+        // reaches the child, which is invariant 3's interruption path.
+        assert!(!found.is_cancelled());
+        cancel.cancel();
+        assert!(
+            found.is_cancelled(),
+            "the registry handed back a token that is not the reviewer's, so activity could \
+             never cancel a run in flight"
+        );
+
+        // The lease revokes on drop, so a review that has ended cannot be
+        // delegated from — the same property a user's finished turn has.
+        drop(_lease);
+        assert!(registry.parent_turn_token(&session_id).is_none());
+    }
+
+    // ── Who a review is for, and what it may be told ────────────────────────
+
+    fn session(id: &str, profile_id: Option<&str>, updated_at: DateTime<Utc>) -> Session {
+        Session {
+            id: id.to_string(),
+            title: None,
+            profile_id: profile_id.map(str::to_string),
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            model_name: None,
+            created_at: updated_at,
+            updated_at,
+        }
+    }
+
+    /// The defect this phase would otherwise have shipped: a reviewer that can
+    /// never address anybody, on every pond, forever, looking exactly like a
+    /// feature nobody switched on.
+    ///
+    /// A review starts after `INACTIVITY_THRESHOLD_SECS` of quiet. The presence
+    /// observer's `attribution_candidates` is bounded by that *same* constant,
+    /// so at the moment a review becomes eligible, its answer is guaranteed
+    /// empty. Reusing it here was the obvious move and it is wrong; this pins
+    /// the relationship rather than the number, so raising the idle threshold
+    /// tomorrow fails here instead of silently switching the reviewer off.
+    #[test]
+    fn the_audience_window_outlives_the_idle_that_starts_a_review() {
+        let idle = i64::try_from(INACTIVITY_THRESHOLD_SECS).unwrap();
+        assert!(
+            AUDIENCE_WINDOW.num_seconds() > idle,
+            "AUDIENCE_WINDOW is {}s and a review cannot start until {}s of quiet — every tick \
+             would find nobody to address and the reviewer would never propose anything",
+            AUDIENCE_WINDOW.num_seconds(),
+            idle
+        );
+    }
+
+    /// Exhaustiveness is the compiler's job; what this pins is the *disposition*
+    /// — which families feed a review and which are refused — and the field
+    /// mapping, because a `source_id` and a `signal` that swap places make the
+    /// feedback ledger suppress the wrong thing.
+    #[test]
+    fn two_bus_families_are_refused_and_the_other_four_map_to_their_source_and_signal() {
+        use crate::shared::domain::session_activity::{
+            PresenceTransition, ProfilePresence, SessionLifecycle, SessionPhase,
+        };
+        use crate::shared::domain::time_tick::{TimeBoundary, TimeTick};
+        use crate::user_data::domain::device::{DeviceId, DeviceStateChanged, DeviceStateValue};
+        use crate::user_data::domain::sensor::{CameraEvent, SensorReading};
+        use crate::user_data::domain::session::IdentificationSource;
+
+        let now = Utc::now();
+
+        let sensor = reviewable(&BusEvent::Sensor(SensorReading {
+            device_id: "hallway".into(),
+            sensor_type: "temperature".into(),
+            value: 19.0,
+            unit: "C".into(),
+            recorded_at: now,
+        }))
+        .expect("a sensor reading is a household fact");
+        assert_eq!(
+            (sensor.kind(), sensor.source_id(), sensor.signal()),
+            ("sensor", Some("hallway"), Some("temperature"))
+        );
+
+        let camera = reviewable(&BusEvent::Camera(CameraEvent {
+            id: None,
+            camera_id: "front-door".into(),
+            event_type: "person".into(),
+            confidence: Some(0.8),
+            snapshot_path: None,
+            metadata: None,
+            acknowledged: false,
+            created_at: now,
+        }))
+        .expect("a camera event is a household fact");
+        assert_eq!(
+            (camera.kind(), camera.source_id(), camera.signal()),
+            ("camera", Some("front-door"), Some("person"))
+        );
+
+        let device = reviewable(&BusEvent::Device(DeviceStateChanged {
+            device_id: DeviceId::from("porch-light"),
+            key: "on".into(),
+            value: DeviceStateValue::Bool(true),
+            changed_at: now,
+        }))
+        .expect("a device state change is a household fact");
+        assert_eq!(
+            (device.kind(), device.source_id(), device.signal()),
+            ("device", Some("porch-light"), Some("on"))
+        );
+
+        let presence = reviewable(&BusEvent::Presence(ProfilePresence {
+            profile_id: EXEMPLAR_OWNER_ID.into(),
+            transition: PresenceTransition::Arrived,
+            source: IdentificationSource::Explicit,
+            confidence: None,
+            session_id: "chat-1".into(),
+            at: now,
+        }))
+        .expect("presence is what makes a suggestion timely");
+        assert_eq!(
+            (presence.kind(), presence.source_id(), presence.signal()),
+            ("presence", Some(EXEMPLAR_OWNER_ID), Some("arrived"))
+        );
+
+        assert!(
+            reviewable(&BusEvent::Time(TimeTick {
+                boundary: TimeBoundary::Hour,
+                at: now,
+                local_hour: 3,
+            }))
+            .is_none(),
+            "the hourly tick is a heartbeat; the brief already states the time from the clock"
+        );
+        assert!(
+            reviewable(&BusEvent::Session(SessionLifecycle {
+                phase: SessionPhase::Idle,
+                session_id: Some("chat-1".into()),
+                idle_secs: 900,
+                at: now,
+            }))
+            .is_none(),
+            "Idle is the transition that STARTS a review — feeding it back hands the child its \
+             own trigger as evidence"
+        );
+    }
+
+    #[test]
+    fn a_review_is_addressed_to_whoever_spoke_most_recently() {
+        let now = Utc::now();
+        let sessions = vec![
+            session("chat-old", Some("ada"), now - Duration::hours(4)),
+            session(
+                "chat-new",
+                Some(EXEMPLAR_OWNER_ID),
+                now - Duration::hours(1),
+            ),
+            session("chat-anon", None, now - Duration::minutes(1)),
+        ];
+        let audience = audience_for_review(&sessions, now).expect("somebody was here");
+        assert_eq!(
+            audience.profile_id(),
+            EXEMPLAR_OWNER_ID,
+            "an unattributed conversation is newer, but it names nobody to address"
+        );
+    }
+
+    /// A review's own session id starts with `sched-`, so this is not a
+    /// hypothetical: without the origin filter, the first review would nominate
+    /// itself as the audience for the second.
+    #[test]
+    fn the_ponds_own_conversations_never_nominate_an_audience() {
+        let now = Utc::now();
+        let mine = session(
+            &review_session_id("run-1"),
+            Some(EXEMPLAR_OWNER_ID),
+            now - Duration::minutes(1),
+        );
+        assert!(!SessionOrigin::of(&mine.id).is_human());
+        assert!(
+            audience_for_review(&[mine], now).is_none(),
+            "a review addressed to the member its own previous run was scoped to is the pond \
+             talking to itself"
+        );
+
+        // Vacuity control: the same row under a human id DOES address them, so
+        // the assertion above is the origin filter and not some other refusal.
+        let theirs = session(
+            "chat-1",
+            Some(EXEMPLAR_OWNER_ID),
+            now - Duration::minutes(1),
+        );
+        assert_eq!(
+            audience_for_review(&[theirs], now)
+                .expect("a human conversation names its member")
+                .profile_id(),
+            EXEMPLAR_OWNER_ID
+        );
+    }
+
+    #[test]
+    fn nobody_here_for_six_hours_means_no_review_rather_than_a_broadcast() {
+        let now = Utc::now();
+        let stale = session(
+            "chat-1",
+            Some(EXEMPLAR_OWNER_ID),
+            now - AUDIENCE_WINDOW - Duration::seconds(1),
+        );
+        assert!(audience_for_review(&[stale], now).is_none());
+        assert!(audience_for_review(&[], now).is_none());
+    }
+
+    /// The brief goes around the scope, not through it: it is prose handed to
+    /// the model, so PAI-6's clamp cannot see it. A presence row is the one
+    /// event family whose `source_id` is a person.
+    #[test]
+    fn a_presence_event_about_another_member_never_reaches_the_brief() {
+        let now = Utc::now();
+        let mine = BusEventRef::new(
+            "presence",
+            Some(EXEMPLAR_OWNER_ID.into()),
+            Some("arrived".into()),
+            now,
+        )
+        .unwrap();
+        let theirs = BusEventRef::new(
+            "presence",
+            Some("someone-else".into()),
+            Some("arrived".into()),
+            now,
+        )
+        .unwrap();
+        let door = BusEventRef::new(
+            "camera",
+            Some("front-door".into()),
+            Some("person".into()),
+            now,
+        )
+        .unwrap();
+
+        let shown = brief_events(&audience(), &[mine.clone(), theirs.clone(), door.clone()]);
+        assert!(
+            !shown.contains(&theirs),
+            "'someone-else arrived' in a review addressed to {} is a disclosure the tool layer \
+             would have refused",
+            EXEMPLAR_OWNER_ID
+        );
+        // Two vacuity controls, because "the list is empty" would also satisfy
+        // the assertion above: the addressed member's own presence survives,
+        // and so does a household fact that names no one.
+        assert!(
+            shown.contains(&mine),
+            "the audience's own presence is theirs"
+        );
+        assert!(shown.contains(&door), "a camera event names no member");
+    }
+
+    #[test]
+    fn a_chatty_sensor_cannot_crowd_the_brief_out_of_the_childs_window() {
+        let now = Utc::now();
+        let mut observed = Vec::new();
+        // One sensor reporting sixty times is one thing that happened.
+        for minute in 0..60 {
+            observed.push(
+                BusEventRef::new(
+                    "sensor",
+                    Some("hallway".into()),
+                    Some("temperature".into()),
+                    now - Duration::minutes(minute),
+                )
+                .unwrap(),
+            );
+        }
+        let shown = brief_events(&audience(), &observed);
+        assert_eq!(shown.len(), 1, "repeats collapse to one line");
+        assert_eq!(
+            shown[0].observed_at(),
+            now,
+            "and the line kept is the newest reading, not the first one seen"
+        );
+
+        // Distinct things, on the other hand, are capped — oldest dropped.
+        let distinct: Vec<BusEventRef> = (0..MAX_BRIEF_EVENTS + 10)
+            .map(|n| {
+                BusEventRef::new(
+                    "sensor",
+                    Some(format!("device-{n}")),
+                    Some("temperature".into()),
+                    now - Duration::minutes(n as i64),
+                )
+                .unwrap()
+            })
+            .collect();
+        let shown = brief_events(&audience(), &distinct);
+        assert_eq!(shown.len(), MAX_BRIEF_EVENTS);
+        assert_eq!(
+            shown[0].observed_at(),
+            now,
+            "newest first, so the cap drops the oldest rather than the last delivered"
         );
     }
 }

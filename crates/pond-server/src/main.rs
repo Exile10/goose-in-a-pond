@@ -2902,6 +2902,82 @@ async fn run_server(
         });
     }
 
+    // ── PAI-7 P4: the proactive reviewer ─────────────────────────────────
+    //
+    // The loop `proactive_review.rs` was written for and has been waiting on.
+    // Everything it decides lives in pond-core: when a review may start, who it
+    // is for, what it may be told, what its answer becomes. What is here is a
+    // clock, four store reads, and the delivery.
+    //
+    // Two structural facts decide the shape:
+    //
+    // 1. **A review is its own parent turn.** `GooseOrchestrator::spawn` refuses
+    //    any spec whose parent session has no live entry in the
+    //    `TurnAuthorityRegistry`, which a background loop fails by construction.
+    //    So the loop publishes `review_authority` for the length of the run.
+    //    That is not a way around the check -- the registry entry carries the
+    //    cancellation token, so publishing is what makes invariant 3's
+    //    interruption cascade to the child at all.
+    // 2. **The orchestrator is read back out of the same `OnceLock` the
+    //    `delegate` tool uses.** A second `GooseOrchestrator` would compile and
+    //    then answer `None` to every authority lookup. There is exactly one, and
+    //    when Goose init failed there is none -- which means no review.
+    {
+        let review_settings = settings_repo.clone();
+        let review_storage = session_storage.clone();
+        let review_activity = last_user_activity.clone();
+        let review_sender = targeted_notification_sender.clone();
+        let review_proposals: Arc<dyn pond_core::user_data::ports::proposal::ProposalRepository> =
+            Arc::new(pond_infra::sqlite_proposal::SqliteProposalRepository::new(
+                db.system.clone(),
+            ));
+
+        // The observed-event ring, filled by a bus subscriber and drained by the
+        // reviewer. `brief_events` collapses repeats, so this only has to be big
+        // enough that a burst between two reviews does not lose the one event
+        // that mattered; it is sized off pond-core's own cap rather than a
+        // number here, so the two cannot drift.
+        let observed: Arc<
+            tokio::sync::Mutex<
+                std::collections::VecDeque<pond_core::user_data::domain::proposal::BusEventRef>,
+            >,
+        > = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new()));
+        {
+            let observed = observed.clone();
+            let mut events = event_bus.subscribe();
+            tokio::spawn(async move {
+                use futures::StreamExt;
+                use pond_core::user_data::services::proactive_review::{
+                    reviewable, MAX_BRIEF_EVENTS,
+                };
+                let ring_capacity = MAX_BRIEF_EVENTS * 16;
+                while let Some(bus_event) = events.next().await {
+                    // `reviewable` refuses the clock tick and the session
+                    // lifecycle. Doing that HERE rather than at review time is
+                    // what stops an idle overnight pond filling the ring with
+                    // its own heartbeat and evicting the evening's camera event.
+                    let Some(reference) = reviewable(&bus_event) else {
+                        continue;
+                    };
+                    let mut ring = observed.lock().await;
+                    ring.push_back(reference);
+                    while ring.len() > ring_capacity {
+                        ring.pop_front();
+                    }
+                }
+            });
+        }
+
+        tokio::spawn(run_proactive_reviewer(
+            review_settings,
+            review_storage,
+            review_activity,
+            review_proposals,
+            review_sender,
+            observed,
+        ));
+    }
+
     // Egress tracker (#113): record every outbound HTTP call made by built-in
     // MCP tools into the same event store, so network egress is queryable via
     // `GET /api/v1/activity?category=network`.
@@ -4791,6 +4867,334 @@ async fn run_session_activity_observer(
                 "profile presence"
             );
             bus.publish(BusEvent::Presence(transition));
+        }
+    }
+}
+
+/// PAI-7 P4: think about what has happened, in idle time, and propose.
+///
+/// `proactive_review.rs` decides everything of consequence and this is the
+/// loop it was written for. What is decided *here* — and therefore what is
+/// unguarded, because `ci.yml` runs `cargo check` for this crate and never
+/// `cargo test` — is `POLL_SECS`, the store reads, and the failure direction
+/// of each of them. Those directions are the part worth reading:
+///
+/// - **A settings or session read that fails skips the tick.** Nothing is
+///   assumed about a pond that cannot be read.
+/// - **A proposal count that fails reads as the cap.** An unreadable count
+///   means no review, never an unlimited one.
+/// - **A decision read that fails skips the tick**, and this one is the least
+///   obvious. An empty ledger suppresses nothing, so treating the failure as
+///   "no decisions" would re-propose exactly the things a member has already
+///   said no to — the widening direction, reached by a plausible default.
+/// - **No orchestrator means no review.** When Goose init fell back to the mock
+///   agent there is nothing in the `OnceLock`, and the loop returns rather than
+///   running with a second one it made itself.
+///
+/// The ring is DRAINED when a review starts, so a brief says what has happened
+/// *since the last review* — which is what the brief claims when it is empty.
+/// A run that then fails loses those events; the alternative is re-reviewing
+/// the same evening forever, which is worse and much harder to notice.
+async fn run_proactive_reviewer(
+    settings_repo: Arc<dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync>,
+    storage: Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>,
+    last_user_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
+    proposals: Arc<dyn pond_core::user_data::ports::proposal::ProposalRepository>,
+    sender: Arc<pond_infra::broadcast_notification_sender::BroadcastNotificationSender>,
+    observed: Arc<
+        tokio::sync::Mutex<
+            std::collections::VecDeque<pond_core::user_data::domain::proposal::BusEventRef>,
+        >,
+    >,
+) {
+    use pond_core::mcp::ports::notification::Notification;
+    use pond_core::user_data::services::consolidation_schedule as sched;
+    use pond_core::user_data::services::proactive_review as review;
+
+    const POLL_SECS: u64 = 60;
+
+    // See the block in `run_server`: this is the SAME orchestrator and the SAME
+    // registry the `delegate` tool holds, because a second registry compiles and
+    // then refuses every spawn.
+    let Some(deps) = pond_mcp_server::installed_orchestrator_deps() else {
+        tracing::info!(
+            "proactive reviewer: no orchestrator was installed (mock agent?) — not starting"
+        );
+        return;
+    };
+    let orchestrator = deps.orchestrator();
+    let authorities = deps.authorities();
+
+    // Fallible rather than a lazy unwrap, and checked once at start rather than
+    // per tick: the recipe is text through a `deny_unknown_fields` parser, and a
+    // typo in it should stop the reviewer loudly instead of logging every minute.
+    let role = match review::proactive_reviewer_role() {
+        Ok(role) => role,
+        Err(e) => {
+            tracing::error!(error = %e, "proactive reviewer: shipped role does not parse");
+            return;
+        }
+    };
+
+    // Baselines for the never-at-startup guard, captured before the first poll.
+    let started_at = std::time::Instant::now();
+    let started_at_utc = chrono::Utc::now();
+    let idle_threshold = std::time::Duration::from_secs(sched::INACTIVITY_THRESHOLD_SECS);
+    let mut last_run: Option<std::time::Instant> = None;
+
+    tracing::info!(
+        "proactive reviewer active — off unless both `proactive_review_enabled` and \
+         `ext_orchestrator_enabled` are set"
+    );
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
+
+        let settings = match settings_repo.get().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "proactive reviewer: settings read failed");
+                continue;
+            }
+        };
+        let sessions = match storage.list_sessions().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "proactive reviewer: session read failed");
+                continue;
+            }
+        };
+        let now = chrono::Utc::now();
+
+        // Invariant 7's tidying pass. Correctness does not depend on it — every
+        // read filters expiry in SQL — but the terminal status is what the
+        // feedback ledger reads, so an unswept row teaches nothing.
+        if let Err(e) = proposals.expire_due(now).await {
+            tracing::debug!(error = %e, "proactive reviewer: expiry sweep failed");
+        }
+
+        // Invariant 4. `None` here is the whole household and an unidentified
+        // speaker both answering "not addressable", and the answer is no review.
+        //
+        // It is TRACED rather than skipped in silence, and that is a repair
+        // rather than a nicety: on a pond where nobody has been identified —
+        // which is every pond until PAI-1's identification routes get a caller —
+        // this is where the reviewer stops, on every tick, and the first probe
+        // of this loop produced no output at all. A feature that is switched on
+        // and says nothing is indistinguishable from one that is broken, and
+        // this programme has spent whole phases on that distinction.
+        let Some(audience) = review::audience_for_review(&sessions, now) else {
+            tracing::trace!(
+                sessions = sessions.len(),
+                "proactive reviewer: nobody to address — no member has been identified inside \
+                 the audience window, so there is no review to run"
+            );
+            continue;
+        };
+
+        let db_activity =
+            pond_core::shared::domain::session_activity::human_activity(&sessions).newest_activity;
+        let in_process_at = *last_user_activity.read().await;
+
+        // A rolling 24 hours, not a calendar day: the cap is about how often
+        // somebody is interrupted, and midnight is not a fact about that.
+        let proposals_today = proposals
+            .count_made_since(audience.profile_id(), now - chrono::Duration::days(1))
+            .await
+            .unwrap_or(review::MAX_PROPOSALS_PER_DAY);
+
+        let decision = review::should_review(&review::ReviewInputs::for_tick(
+            sched::GateInputs {
+                enabled: settings.proactive_review_enabled,
+                saw_activity_since_start: sched::saw_activity_since_start(
+                    started_at,
+                    in_process_at,
+                    started_at_utc,
+                    db_activity,
+                ),
+                idle_for: sched::combined_idle_for(in_process_at, db_activity, now),
+                idle_threshold,
+                since_last_run: last_run.map(|t| t.elapsed()),
+                interval_floor: sched::interval_floor_from_hours(
+                    settings.memory_consolidation_interval_hours,
+                ),
+            },
+            settings.ext_orchestrator_enabled,
+            proposals_today,
+            // The loop awaits its own run, so two can never overlap here. The
+            // input exists for a caller that does not have that property.
+            false,
+        ));
+        if let review::ReviewDecision::Skip(reason) = decision {
+            tracing::trace!(
+                reason = reason.as_str(),
+                "proactive reviewer: skipping tick"
+            );
+            continue;
+        }
+
+        // PAI-7 P7. A failed read skips the tick rather than proceeding with an
+        // empty ledger — see this function's docs for why that direction matters.
+        let decisions = match proposals
+            .decisions_since(audience.profile_id(), now - review::SUPPRESSION_WINDOW)
+            .await
+        {
+            Ok(decisions) => decisions,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "proactive reviewer: could not read prior decisions — skipping rather than \
+                     re-proposing what was already declined"
+                );
+                continue;
+            }
+        };
+        let ledger = review::FeedbackLedger::from_decisions(&decisions, now);
+
+        let events = {
+            let mut ring = observed.lock().await;
+            let drained: Vec<pond_core::user_data::domain::proposal::BusEventRef> =
+                ring.drain(..).collect();
+            review::brief_events(&audience, &drained)
+        };
+
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let session_id = review::review_session_id(&run_id);
+        let brief = review::review_brief(now, &events, &ledger);
+        let spec =
+            match review::plan_review(&role, &audience, &session_id, &brief, serde_json::json!({}))
+            {
+                Ok(spec) => spec,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "proactive reviewer: delegation refused");
+                    continue;
+                }
+            };
+
+        tracing::info!(
+            member = %audience.profile_id(),
+            events = events.len(),
+            made_today = proposals_today,
+            "idle after user activity — starting a proactive review"
+        );
+
+        // The review becomes its own parent turn for the length of the run. The
+        // lease revokes on drop, so nothing can delegate from a review that has
+        // ended — the same property a user's finished turn has.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let lease = authorities.publish(
+            &session_id,
+            review::review_authority(&audience, &session_id),
+            cancel.clone(),
+        );
+
+        // Invariant 3's second half. On the Orin this is correctness rather than
+        // politeness: the review is holding the only GPU the household's next
+        // turn needs.
+        let watcher = {
+            let watcher_activity = last_user_activity.clone();
+            let watcher_storage = storage.clone();
+            let watcher_cancel = cancel.clone();
+            let run_started = std::time::Instant::now();
+            tokio::spawn(async move {
+                const TICK_MS: u64 = 500;
+                const DB_EVERY_N_TICKS: u32 = 4;
+                let run_started_utc = chrono::Utc::now();
+                let mut tick: u32 = 0;
+                let mut db_seen: Option<chrono::DateTime<chrono::Utc>> = None;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(TICK_MS)).await;
+                    if watcher_cancel.is_cancelled() {
+                        break;
+                    }
+                    tick = tick.wrapping_add(1);
+                    if tick % DB_EVERY_N_TICKS == 0 {
+                        // A transient read failure reads as `None`, which must
+                        // never be mistaken for activity.
+                        db_seen = newest_session_activity(watcher_storage.as_ref()).await;
+                    }
+                    if review::cancelled_by_activity(
+                        run_started,
+                        *watcher_activity.read().await,
+                        run_started_utc,
+                        db_seen,
+                    ) {
+                        tracing::info!("user activity resumed — cancelling the proactive review");
+                        watcher_cancel.cancel();
+                        break;
+                    }
+                }
+            })
+        };
+
+        let run = orchestrator.spawn(spec).await;
+        watcher.abort();
+        drop(lease);
+        // An attempt spends the interval budget whether or not it produced
+        // anything, for the reason the consolidation scheduler records: retrying
+        // after the next idle window reintroduces the repeated-expensive-attempt
+        // churn the gate exists to remove.
+        last_run = Some(std::time::Instant::now());
+
+        let run = match run {
+            Ok(run) => run,
+            Err(e) => {
+                tracing::warn!(error = %e, "proactive reviewer: the run did not start");
+                continue;
+            }
+        };
+
+        // `interpret_answer` reads `result_for_parent()`, so a cancelled or
+        // turn-exhausted run yields nothing rather than partial opinions.
+        let yielded = review::interpret_answer(
+            &run,
+            &audience,
+            chrono::Utc::now(),
+            &ledger,
+            proposals_today,
+        );
+        for refusal in &yielded.refusals {
+            tracing::debug!(refusal = ?refusal, "proactive reviewer: impulse refused");
+        }
+
+        for proposal in &yielded.proposals {
+            if let Err(e) = proposals.save(proposal).await {
+                tracing::warn!(error = %e, "proactive reviewer: could not persist a proposal");
+                continue;
+            }
+            // PAI-7 P5's first production caller, and PAI-1 P9's rung earning
+            // its keep. `send_to_profile` resolves the member's paired devices
+            // and reaches NOBODY when there are none — it cannot fall back to a
+            // broadcast, because `TargetedDelivery` has no variant meaning "the
+            // household".
+            //
+            // `action_required` rather than `alert`: a proposal wants a decision,
+            // and P6's speech gate ships allowing `alert` only, so switching the
+            // pond's voice on does not also make it read out its suggestions.
+            let report = sender
+                .send_to_profile(
+                    audience.profile_id(),
+                    Notification {
+                        id: format!("proposal-{}", proposal.id()),
+                        target: String::new(),
+                        category: "action_required".to_string(),
+                        title: "A suggestion".to_string(),
+                        body: proposal.summary(),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        data: Some(serde_json::json!({
+                            "proposal_id": proposal.id(),
+                            "rationale": proposal.rationale(),
+                        })),
+                    },
+                )
+                .await;
+            tracing::info!(
+                proposal = %proposal.id(),
+                member = %audience.profile_id(),
+                queued = report.queued.len(),
+                failed = report.failed.len(),
+                "proposal made"
+            );
         }
     }
 }

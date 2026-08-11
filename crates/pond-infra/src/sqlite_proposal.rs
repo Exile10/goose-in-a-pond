@@ -6,12 +6,20 @@
 //!
 //! # The one thing to understand before editing a query here
 //!
-//! **Every read filters expiry in SQL.** PAI-7 invariant 7 is not enforced by a
-//! sweeper: [`expire_due`](ProposalRepository::expire_due) exists, nothing calls
-//! it yet (PAI-7 P4 owns the loop), and the invariant holds anyway because a
-//! proposal past its `expires_at` is not returned by anything here. If you find
-//! yourself adding a read that skips the filter, you are removing the
+//! **Every read that answers "what may this member act on" filters expiry in
+//! SQL.** PAI-7 invariant 7 is not enforced by a sweeper:
+//! [`expire_due`](ProposalRepository::expire_due) is now called once a tick by
+//! PAI-7 P4's reviewer, and the invariant would hold without it, because a
+//! proposal past its `expires_at` is not returned by any of those reads. If you
+//! find yourself adding one that skips the filter, you are removing the
 //! invariant, not optimising a query.
+//!
+//! [`count_made_since`](ProposalRepository::count_made_since) and
+//! [`decisions_since`](ProposalRepository::decisions_since) deliberately do not
+//! filter, and they are not exceptions to the rule above — they answer "how
+//! often has the pond spoken to this member" and "what did they say about it",
+//! where an expired proposal is part of the answer. Read their doc comments
+//! before assuming either is a bug.
 //!
 //! The comparison is `datetime(expires_at) > datetime(?)` rather than a string
 //! compare. That is what makes it robust to the two RFC 3339 spellings of the
@@ -23,9 +31,10 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
+use pond_core::user_data::domain::draft::DraftStatus;
 use pond_core::user_data::domain::proposal::{
-    Proposal, ProposalAudience, ProposalPayload, PROPOSAL_DRAFT_KIND, PROPOSAL_ORIGIN,
-    PROPOSAL_SESSION_ID,
+    Proposal, ProposalAudience, ProposalDecision, ProposalPayload, ProposalShape,
+    PROPOSAL_DRAFT_KIND, PROPOSAL_ORIGIN, PROPOSAL_SESSION_ID,
 };
 use pond_core::user_data::ports::proposal::ProposalRepository;
 use sqlx::{Pool, Sqlite};
@@ -202,6 +211,75 @@ impl ProposalRepository for SqliteProposalRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    async fn count_made_since(&self, profile_id: &str, since: DateTime<Utc>) -> Result<usize> {
+        // The one read in this file with no `LIVE_PREDICATE`, and the module
+        // docs' rule still holds: that rule is about not *skipping* the expiry
+        // filter on a read that answers "what may this member act on". This
+        // answers "how often has the pond spoken to them", where a dismissed
+        // and an expired proposal both count. Filtering here would make the
+        // daily cap leak by exactly the number the member had dealt with.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM drafts \
+             WHERE origin = ? AND profile_id = ? AND datetime(created_at) >= datetime(?)",
+        )
+        .bind(PROPOSAL_ORIGIN)
+        .bind(profile_id)
+        .bind(sql_ts(since))
+        .fetch_one(&self.pool)
+        .await
+        .context("counting proposals made to a member")?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    async fn decisions_since(
+        &self,
+        profile_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<ProposalDecision>> {
+        let sql = format!(
+            "SELECT {PROPOSAL_COLUMNS}, status FROM drafts \
+             WHERE origin = ? AND profile_id = ? AND status != 'pending' \
+             AND datetime(created_at) >= datetime(?) ORDER BY created_at DESC"
+        );
+        let rows: Vec<(
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+        )> = sqlx::query_as(&sql)
+            .bind(PROPOSAL_ORIGIN)
+            .bind(profile_id)
+            .bind(sql_ts(since))
+            .fetch_all(&self.pool)
+            .await
+            .context("reading a member's proposal decisions")?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(
+                |(id, pid, payload, rationale, created_at, expires_at, status)| {
+                    let created = parse_ts(&created_at).ok()?;
+                    let proposal =
+                        row_to_proposal((id, pid, payload, rationale, created_at, expires_at))
+                            .ok()?;
+                    let status: DraftStatus = status.parse().ok()?;
+                    // `created_at`, not a decided-at column, because the table has
+                    // none. The skew is bounded by PROPOSAL_TTL -- twelve hours --
+                    // since a proposal is either decided inside its life or expired
+                    // at the end of it, and it is measured against SUPPRESSION_WINDOW,
+                    // which is thirty days. Stating the direction because it is the
+                    // wrong one: a suppression ends up to half a day early, so the
+                    // pond may re-propose something marginally sooner than promised.
+                    // A `decided_at` column would fix it and costs a migration.
+                    ProposalDecision::recorded(ProposalShape::of(&proposal), status, created).ok()
+                },
+            )
+            .collect())
     }
 }
 
@@ -415,6 +493,69 @@ mod tests {
     /// arm would abort before this test ever reached its assertion. The two
     /// clocks are deliberately different -- a trigger cannot be handed one --
     /// and a test that straddles both has to satisfy each.
+    /// The daily cap counts INTERRUPTIONS, so a member who deals with their
+    /// suggestions must not thereby earn more of them.
+    ///
+    /// Counting `list_live_for` was the obvious implementation and it is the
+    /// bug: three proposals read and dismissed at breakfast would leave the
+    /// day's budget untouched, so the person most engaged with the feature is
+    /// the one it pesters hardest.
+    #[tokio::test]
+    async fn the_daily_cap_counts_what_was_said_and_not_what_is_still_pending() {
+        let (_tmp, pool) = db().await;
+        let repo = SqliteProposalRepository::new(pool.clone());
+        let created = Utc::now();
+        let midnight = created - Duration::hours(12);
+
+        for id in ["one", "two", "three"] {
+            repo.save(&proposal(id, "liz", created, Duration::hours(6)))
+                .await
+                .unwrap();
+        }
+        // Somebody else's proposals are not this member's interruptions.
+        repo.save(&proposal("theirs", "ada", created, Duration::hours(6)))
+            .await
+            .unwrap();
+        // Yesterday's are not today's.
+        repo.save(&proposal(
+            "yesterday",
+            "liz",
+            midnight - Duration::hours(1),
+            Duration::hours(6),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(repo.count_made_since("liz", midnight).await.unwrap(), 3);
+
+        // Now decide two of them and expire the third. The count must not move:
+        // this is the whole reason the method exists.
+        sqlx::query("UPDATE drafts SET status = 'approved' WHERE id = 'one'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE drafts SET status = 'rejected' WHERE id = 'two'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        repo.expire_due(created + Duration::hours(7)).await.unwrap();
+
+        assert_eq!(
+            repo.list_live_for("liz", created + Duration::hours(7))
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "vacuity control: nothing of liz's is live any more, so a count that agreed \
+             with `list_live_for` would now read zero"
+        );
+        assert_eq!(
+            repo.count_made_since("liz", midnight).await.unwrap(),
+            3,
+            "the pond spoke to liz three times today whatever she did about it"
+        );
+    }
+
     #[tokio::test]
     async fn a_proposal_the_member_already_decided_is_never_shown_again() {
         for decided in ["approved", "rejected", "expired"] {

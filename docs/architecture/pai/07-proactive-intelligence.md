@@ -526,6 +526,56 @@ granted it.
 Budget: capped turns, capped proposals, cancelled by any user activity. On the Orin this competes
 with the user for the only GPU, so "cancelled by activity" is not politeness, it is correctness.
 
+#### AS LANDED — P4 completed 2026-08-11, when the loop arrived
+
+The decision half landed on 2026-08-10 (`001865a0`) and was **inert**: `proactive_review.rs` said so
+in its own module docs, because nothing in the tree called it. `run_proactive_reviewer` in
+`pond-server/src/main.rs` is that caller, and with it P4 is whole.
+
+Four things a later phase must not assume.
+
+**A review is its own parent turn, and that is the design rather than a workaround.**
+`GooseOrchestrator::spawn` refuses any spec whose `parent_session_id` has no live entry in the
+`TurnAuthorityRegistry` — correct, and something a background loop fails by construction, since a
+review has no user turn behind it. Every review would have been refused with *"no live turn holds
+the authority"*, which reads exactly like a guard working properly. The loop therefore publishes
+`review_authority(&audience, &session_id)` for the length of the run. That is what the check was
+asking for: the registry entry carries the cancellation token, so publishing is also what makes
+invariant 3's interruption cascade to the child at all. `review_authority` is one function that
+`plan_review` also calls, because two constructions of the ceiling would be two ceilings, and if
+their session ids ever drifted the symptom would again be silent universal refusal —
+`a_review_publishes_the_same_authority_the_orchestrator_will_look_for` pins it.
+
+**The reviewer's audience window is SIX HOURS and must stay longer than the idle threshold.** The
+obvious implementation was to reuse `attribution_candidates`, which is what the presence observer
+uses to decide who is here. It is bounded by `INACTIVITY_THRESHOLD_SECS` — the same fifteen minutes
+a review waits for before it may start — so at the moment a review becomes eligible its answer is
+guaranteed empty. The reviewer would have addressed nobody, on every pond, forever, looking like a
+feature nobody had switched on.
+`the_audience_window_outlives_the_idle_that_starts_a_review` pins the relationship rather than the
+number.
+
+**Two toggles, both off.** `ext_orchestrator_enabled` asks whether a model may hand work to a
+subagent during a turn the user started; `proactive_review_enabled` (new, headless, `false`) asks
+whether the pond may start a turn of its own. Folding the second into the first would have had the
+pond begin forming opinions about somebody's house as a side effect of enabling delegation.
+
+**The brief goes around the scope, not through it.** It is prose handed straight to the model, so
+PAI-6's clamp cannot see it. `brief_events` is where a `presence` event naming a *different*
+household member is dropped — the one event family whose `source_id` is a person. It also collapses
+repeats to the newest per `TriggerIdentity` and caps the list at 24, because a quarter of an hour of
+a chatty sensor is thousands of readings and the child's window on the target hardware is 4 096
+tokens including its own instructions.
+
+**What is live-verified and what is not.** The loop starts, ticks once a minute, reads the store,
+finds an audience from a real `sessions` row and refuses at the schedule gate with
+`reason="no_activity_since_start"` — all confirmed on a scratch pond on 2026-08-11. The two gates
+that need fifteen minutes of real conversation followed by fifteen of quiet are **not** live-tested,
+and neither is a completed review; those are section 7's manual-on-the-Orin item and they are still
+owed. `ci.yml` runs `cargo check -p pond-server` and never `cargo test -p pond-server`, so
+`crates/pond-infra/tests/proactive_reviewer_is_wired.rs` asserts the wiring from the fast pass —
+without it, deleting the `tokio::spawn` leaves the whole workspace green and switches P4 off.
+
 ### 3.4 Delivery: give the targeted path its first producer
 
 Proposals are delivered to **the profile's devices**, not broadcast. That means:
@@ -544,15 +594,20 @@ Proposals are delivered to **the profile's devices**, not broadcast. That means:
   no `profile_id` and deliberately so: one writable source of truth, reached through
   `push_tokens.device_id`.
 
-  **What has not changed is P5's blockage, only its shape.** Nothing constructs
-  `SqliteDeviceAttribution` — `crates/pond-infra/tests/device_profile_rung_is_not_wired_yet.rs`
-  asserts that on every run and is written to fail the day it stops being true — and no route
-  captures a member at issuance yet. So P5's prerequisite is now "wire the port and give issuance
-  the question", not "build the schema", and a phase reading the old sentence would go and add a
-  column that is already there. Until then invariant 4 has no mechanism at the delivery end:
-  `broadcast_notification_sender.rs` says in its own doc comment that targeted `send()` is exercised
-  by nothing and every production producer calls `broadcast()`. Landing P5 against unattributed
-  devices would silently deliver nothing.
+  **Corrected again 2026-08-11: P5 is no longer blocked and is no longer unreached.** The paragraph
+  that stood here said nothing constructed `SqliteDeviceAttribution` and no route captured a member
+  at issuance. Both ended the same day, in that order, and the guards that asserted them were
+  retired with their reasoning left in place at the top of
+  `crates/pond-infra/tests/device_profile_rung_is_not_wired_yet.rs`. `main.rs` now builds the
+  attribution and hands it to `BroadcastNotificationSender::with_device_attribution`, and
+  `handshake_issue_pairing_code` calls `issue_pairing_code_for` behind a loopback-only check that is
+  still the FIRST statement in that handler.
+
+  **P5's producer is P4's reviewer**, and it landed on 2026-08-11: `run_proactive_reviewer` calls
+  `send_to_profile` for every proposal it persists. So the targeted path is functional, wired and
+  now *called*, which is three separate claims this workstream has had to make one at a time. Note
+  what remains true — the other four notification producers still `broadcast()`, correctly: a
+  schedule completing, a rule firing and a pairing notice are household facts.
 
 **Unprompted speech** is opt-in and tightly gated: only when that profile is identified as present,
 only outside quiet hours, only for categories the user enabled, never mid-conversation, and never
@@ -602,13 +657,47 @@ memory extraction, decay and consolidation already exist.
   their retention, not their audience — so P6's TTS gating and anything else that treats a presence
   row as private needs the `audit.rs` decision made first.
 - **P3** `Proposal` domain + persistence in the drafts table; proposal UI in the existing drafts
-  surface.
+  surface. **LANDED in two steps — P3a (domain and persistence) 2026-08-10, completed to P3 on
+  2026-08-11.** See the AS LANDED stamp in 3.2, including why P3a shipped with a test that walked
+  every `.rs` file in the workspace to prove nothing constructed the repository.
 - **P4** The `proactive-reviewer` role, gated by the `should_run` shape from
-  `consolidation_schedule.rs`, budget-capped, cancelled by activity.
+  `consolidation_schedule.rs`, budget-capped, cancelled by activity. **LANDED in two steps: the
+  decision half 2026-08-10 (`001865a0`), the loop 2026-08-11.** Read the AS LANDED stamp in 3.3 in
+  full before building on it — in particular that a review publishes its own turn authority, that
+  the audience window must outlive the idle threshold that starts the review, and that a completed
+  review has not been observed on real hardware.
 - **P5** Targeted delivery: profile → devices → queue + FCM. First production producer for both.
-- **P6** Opt-in unprompted TTS with presence, quiet-hours and category gating.
-- **P7** Feedback loop into memory; reviewer reads prior decisions.
-- **P8** Repairs: durable cooldowns, `TaskKind::ToolCall`, `/rules` REST, docs.
+  **LANDED 2026-08-11 and now CALLED.** It landed functional-but-unreached earlier the same day
+  (`9fcd6be1`); P4's loop is the production producer, which is what "first production producer for
+  both" was asking for. The delivery direction of PAI-1 P9's rung is therefore live end to end. What
+  is NOT exercised is the offline-device path — section 7's "with a device offline, a targeted
+  proposal is queued and delivered on reconnect" needs a real device and is still owed.
+- **P6** Opt-in unprompted TTS with presence, quiet-hours and category gating. **LANDED 2026-08-11**
+  (`fc6af35c`) — `ChatService::speak_unprompted` is the only door in the tree to an utterance nobody
+  asked for. Two things a later phase must not assume: `Option<&Settings>` with `None` meaning *the
+  read failed* refuses rather than falling back to `Settings::default()`, and quiet hours are
+  checked FIRST because invariant 6's "absolute" is a claim about ordering as much as about the
+  condition. **It has no producer.** P4's reviewer delivers proposals under category
+  `action_required`, and `unprompted_speech_categories` ships as `alert` alone, so switching the
+  pond's voice on does not also make it read out its suggestions. Wiring a producer is a decision
+  somebody has to make on purpose.
+- **P7** Feedback loop into memory; reviewer reads prior decisions. **LANDED 2026-08-11.** The
+  `FeedbackLedger` landed with P4's decision half; what arrived with the loop is its READ —
+  `ProposalRepository::decisions_since`, called every review, whose failure **skips the tick**
+  rather than proceeding with an empty ledger. That direction is the phase: an empty ledger
+  suppresses nothing, so a plausible `unwrap_or_default()` would re-propose exactly the things a
+  member has already declined. One honest approximation is recorded in `sqlite_proposal.rs`: the
+  `drafts` table has no `decided_at`, so `created_at` stands in for it. The skew is bounded by
+  `PROPOSAL_TTL` (12 h) against a `SUPPRESSION_WINDOW` of 30 days, and it errs towards suppressing
+  slightly less. A `decided_at` column would fix it and costs a migration.
+- **P8** Repairs: durable cooldowns, `TaskKind::ToolCall`, `/rules` REST, docs. **LANDED
+  2026-08-11.** Cooldowns are durable because they reset on restart, so a crash-looping pond
+  re-fired every rule.
+
+**PAI-7 is COMPLETE: P1 through P8 LANDED.** Two things it is owed and has not got, both stated
+above rather than left to be discovered: a completed review observed on real hardware (section 7's
+manual-on-the-Orin item), and the queued-then-delivered-on-reconnect path for a targeted proposal to
+a device that was switched off.
 
 ---
 

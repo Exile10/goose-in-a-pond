@@ -741,6 +741,16 @@ impl OrchestratorDeps {
             recipes,
         }
     }
+
+    /// The orchestrator delegations run through.
+    pub fn orchestrator(&self) -> Arc<dyn Orchestrator> {
+        self.orchestrator.clone()
+    }
+
+    /// The registry the adapter publishes each live turn's authority into.
+    pub fn authorities(&self) -> Arc<TurnAuthorityRegistry> {
+        self.authorities.clone()
+    }
 }
 
 static ORCHESTRATOR_DEPS: OnceLock<OrchestratorDeps> = OnceLock::new();
@@ -759,6 +769,23 @@ static ORCHESTRATOR_DEPS: OnceLock<OrchestratorDeps> = OnceLock::new();
 /// must refuse, never proceed.
 pub fn init_orchestrator_deps(deps: OrchestratorDeps) {
     let _ = ORCHESTRATOR_DEPS.set(deps);
+}
+
+/// What was installed, for a caller that must delegate without a tool call.
+///
+/// PAI-7 P4's reviewer is the one such caller: it is a background loop, not a
+/// model, so it never reaches the `delegate` tool. Reading it back out of the
+/// same `OnceLock` rather than being handed its own instance is the point —
+/// `init_orchestrator_deps`'s own doc warns that a second
+/// `TurnAuthorityRegistry` compiles and then answers `None` to every lookup,
+/// and the reviewer needs the registry the adapter publishes into for exactly
+/// the same reason the tool does. There is only one to get.
+///
+/// `None` when Goose init failed and the mock agent is serving, which is the
+/// correct direction: no orchestrator means no review, not a review that skips
+/// the authority check.
+pub fn installed_orchestrator_deps() -> Option<OrchestratorDeps> {
+    ORCHESTRATOR_DEPS.get().cloned()
 }
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
