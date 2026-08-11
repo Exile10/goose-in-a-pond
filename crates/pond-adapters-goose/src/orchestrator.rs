@@ -144,11 +144,14 @@ pub const MAX_TRACKED_TASKS: usize = 64;
 /// convention that a later caller could forget. There is no `spawn` that does
 /// not acquire.
 ///
-/// **The predicate is `max_concurrent_subagents`, which is written against
-/// `runs_on_this_device`** — `local`, `gguf`, `ollama` and `llamafile`. Ollama
-/// and llamafile speak HTTP, but on a GIAP pond they speak it to `127.0.0.1`,
-/// which is the same GPU the parent's next turn needs. PAI-4 P2 already had to
-/// fix the narrow `local`/`gguf` reading once.
+/// **The predicate is `max_concurrent_subagents`, which asks
+/// `provider_locality`** — `local`, `gguf`, `ollama` and `llamafile` run here,
+/// and so does any name in neither of its two lists. Ollama and llamafile speak
+/// HTTP, but on a GIAP pond they speak it to `127.0.0.1`, which is the same GPU
+/// the parent's next turn needs; PAI-4 P2 already had to fix the narrow
+/// `local`/`gguf` reading once. A provider nothing can place gets the same
+/// answer, because "not on the deny-list" is not evidence that the work happens
+/// somewhere else.
 ///
 /// `div_ceil` rather than `/` so an awkward ratio errs toward LESS concurrency.
 /// With `SUBAGENT_PERMITS = 3`: on-device asks for 3 of 3 (concurrency 1),
@@ -208,7 +211,9 @@ pub fn process_subagent_permits() -> Arc<Semaphore> {
 ///
 /// The predicate is [`max_concurrent_subagents`], not a name list, for the
 /// reason PAI-4 P2 had to fix once: ollama and llamafile speak HTTP to
-/// `127.0.0.1` and are on this device.
+/// `127.0.0.1` and are on this device. It answers 1 for a provider it cannot
+/// place too, so an unrecognised name makes a parent turn take the whole
+/// semaphore rather than none of it.
 pub fn parent_turn_permits(provider: &str) -> u32 {
     if max_concurrent_subagents(provider) <= 1 {
         SUBAGENT_PERMITS as u32
