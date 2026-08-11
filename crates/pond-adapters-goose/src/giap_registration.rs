@@ -178,8 +178,31 @@ pub fn register_giap_extensions(
         registered.push("giap-sensors".into());
     }
 
-    // Orchestration / delegation (PAI-6 P5). OFF by default -- and it is the
-    // only `ext_*` toggle that is, because turning it on means an autonomous
+    // Personal context (PAI-8 P2). Read-only: `search_context` and
+    // `get_recent_context`, both scoped to whoever is speaking by the engine
+    // session id in `_meta`. There is no `ingest_context` tool and there will
+    // not be one -- the corpus is written by the ingest pipeline from sources
+    // the household connected, and a tool that let the model write into it
+    // would let a prompt injection plant a memo the assistant later quotes as
+    // fact.
+    //
+    // OFF by default, for a reason the other toggles do not have. Registering
+    // puts two tool schemas into EVERY turn's prompt, and until somebody
+    // connects a source they can only ever answer "nothing found" -- so on the
+    // target hardware, where tool schemas are already ~88% of a 4 096-token
+    // window, this would be a per-turn cost forever for nothing. Its deps are
+    // installed separately (`init_context_deps` in pond-server), like
+    // giap-audit's and giap-vision's.
+    if settings.ext_context_enabled {
+        register_builtin_extension(
+            "giap-context",
+            pond_mcp_server::context::spawn_context_server,
+        );
+        registered.push("giap-context".into());
+    }
+
+    // Orchestration / delegation (PAI-6 P5). OFF by default -- and it was the
+    // only `ext_*` toggle that was until PAI-8 P2, because turning it on means an autonomous
     // multi-turn agent running under `GooseMode::Auto`, which is not something
     // an install should acquire by upgrading. `Settings::default_ext_orchestrator_enabled`
     // returns false; reusing `default_ext_enabled` here would flip that.
