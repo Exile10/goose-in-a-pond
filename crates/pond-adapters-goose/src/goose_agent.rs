@@ -4595,6 +4595,16 @@ impl GooseAdapter {
                 )
             })?;
 
+        // PAI-6 P7. The role's model, if the plan decided it gets one. The
+        // decision was made in `build_child_plan`, which is the only place that
+        // holds both the role's request and the provider the parent is on; the
+        // whole of what happens here is applying it, and the applying lives in
+        // `child_model_config` because this function cannot be reached without a
+        // live provider. Note the child's session gets its own `ModelConfig` on
+        // the SAME provider object — the parent's cached pair is untouched, so a
+        // delegation cannot move the model out from under the parent's turn.
+        let model_config = crate::orchestrator::child_model_config(&plan.model, model_config);
+
         // A FRESH agent, deliberately. `Agent::with_config` builds an
         // `ExtensionManager` with no extensions and nothing auto-loads defaults
         // into it, so the child starts with an empty tool surface and gets
