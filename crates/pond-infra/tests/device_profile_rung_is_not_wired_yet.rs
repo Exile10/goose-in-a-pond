@@ -71,30 +71,26 @@ fn no_turn_resolves_a_paired_device_to_a_member_yet() {
     );
 }
 
-/// The delivery direction. PAI-7 section 3.4 wants profile -> paired devices ->
-/// push tokens; `DeviceAttribution` is that chain and no production wiring
-/// constructs it. `AppState` is built in `main.rs`, so if it is anywhere, it is
-/// there.
-#[test]
-fn nothing_wires_the_device_attribution_repository_yet() {
-    for (name, source) in [("main.rs", MAIN), ("routes.rs", ROUTES)] {
-        for symbol in [
-            "SqliteDeviceAttribution",
-            "DeviceAttribution",
-            "set_device_profile",
-            "push_tokens_for_profile",
-            "devices_for_profile",
-        ] {
-            assert!(
-                !source.contains(symbol),
-                "{name} now reaches {symbol}. PAI-1's device-to-profile rung has its first \
-                 production caller, so the \"nothing reaches this\" stamp in \
-                 docs/architecture/pai/01-identity-and-profile-boundaries.md is now false. \
-                 Rewrite it, then delete this test."
-            );
-        }
-    }
-}
+// RETIRED 2026-08-11: `nothing_wires_the_device_attribution_repository_yet`.
+//
+// It asserted that neither `main.rs` nor `routes.rs` named `SqliteDeviceAttribution` or any of the
+// four `DeviceAttribution` methods, and it failed the moment `main.rs` built one and handed it to
+// `BroadcastNotificationSender::with_device_attribution`. Its message asked for the PAI-1 stamp to
+// be rewritten first and then for its own deletion; both were done in that order.
+//
+// The DELIVERY direction of PAI-7 section 3.4 -- profile -> paired devices -> push tokens -- now
+// has a production caller. It is worth being exact about what that does and does not mean:
+// `send_to_profile` will resolve a member's devices instead of answering `AttributionUnavailable`,
+// which it did on every pond until this wiring. Nothing yet CALLS `send_to_profile` outside a test;
+// the producer that will is PAI-7 P4's reviewer, whose domain is landed and whose background loop
+// is not. Functional and unreached are different claims and the stamp makes both.
+//
+// The IDENTITY direction is untouched and its guard is deliberately still here:
+// `no_turn_resolves_a_paired_device_to_a_member_yet` still passes, because `resolve_turn_scope`
+// still feeds `paired_device_profile: None`. That rung needs a device id at the turn, and a turn
+// does not carry one -- `session_tokens.device_id` exists but the auth layer does not surface it.
+// Until that is threaded, `IdentificationSource::PairedDevice` outranks face and explicit
+// identification in a lattice nothing can reach.
 
 // RETIRED 2026-08-11: `the_pairing_route_does_not_capture_a_member_yet`.
 //
