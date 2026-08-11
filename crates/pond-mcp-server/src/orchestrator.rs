@@ -1162,6 +1162,13 @@ mod tests {
     /// REFUSED with a sentence naming the field, never coerced to `false`. A
     /// caller that asked for something and was silently given the opposite has
     /// no way to find out.
+    ///
+    /// **The acceptance case is a `match`, not `.unwrap_err()`.** With the
+    /// `unwrap_err` this used to open with, the mutation this test exists to
+    /// catch — `coerce_bool(..).unwrap_or(false)` — panicked with serde's
+    /// rendering of the accepted `TaskRequest` and never reached the sentence
+    /// below, so the message the phase record attributed to that mutation was
+    /// one the test could not emit.
     #[test]
     fn an_unreadable_background_value_refuses_rather_than_defaulting() {
         for nonsense in [
@@ -1169,15 +1176,22 @@ mod tests {
             serde_json::json!(7),
             serde_json::json!({"when": "later"}),
         ] {
-            let refusal = into_request(params(serde_json::json!({
+            let refusal = match into_request(params(serde_json::json!({
                 "role": "researcher",
                 "instructions": "go",
                 "background": nonsense
-            })))
-            .unwrap_err();
+            }))) {
+                Err(refusal) => refusal,
+                Ok(request) => panic!(
+                    "`background: {nonsense}` was accepted and silently became \
+                     background={}, so a caller that asked for one thing was given the other \
+                     with nothing to tell it apart",
+                    request.background
+                ),
+            };
             assert!(
                 matches!(refusal, Refusal::Malformed(_)),
-                "`background: {nonsense}` was accepted"
+                "`background: {nonsense}` was refused, but not as Malformed: {refusal:?}"
             );
             assert!(
                 refusal.message().contains("background"),
@@ -1288,5 +1302,273 @@ mod tests {
         let described = describe_run(&run_with(TaskStatus::TurnBudgetExhausted, None));
         assert!(described.contains("ran out"));
         assert!(described.contains("Do not treat this as a result"));
+    }
+
+    // ── check_task at its CALL SITE ────────────────────────────────────────
+    //
+    // `authorise_task` is a pure function and the three tests above cover it as
+    // one. That is not the same claim as "`check_task` authorises", and the
+    // difference is a whole vacuity shape: deleting the `authorise_task(...)`
+    // line from `run_check` — the natural refactor regression, and the one that
+    // turns this tool into a read of any household member's delegation result by
+    // task id — left all 213 tests in this crate green, because nothing built an
+    // `OrchestratorMcpServer` with deps and therefore nothing ran `run_check` at
+    // all.
+    //
+    // The fakes below are the cheapest thing that closes it. A source tripwire
+    // over `run_check`'s body was the alternative; it would catch a textual
+    // revert and nothing else, and this programme has recorded that shape as
+    // nearly worthless. `check_task` itself needs a `RequestContext<RoleServer>`
+    // that a test cannot build, so these drive `run_check`, which is its entire
+    // body — the handler adds a `set_current_tool` call, a `tracing::warn!` and
+    // the wrap into `CallToolResult`.
+
+    struct FakeOrchestrator {
+        run: Option<TaskRun>,
+    }
+
+    #[async_trait::async_trait]
+    impl Orchestrator for FakeOrchestrator {
+        async fn spawn(&self, _spec: TaskSpec) -> anyhow::Result<TaskRun> {
+            unreachable!("check_task does not spawn")
+        }
+        /// Keyed by task id alone, exactly as the real registry is — which is
+        /// why the ownership check cannot live here.
+        async fn poll(&self, _task_id: &str) -> anyhow::Result<Option<TaskRun>> {
+            Ok(self.run.clone())
+        }
+        async fn cancel(&self, _task_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn list(&self, _parent_session_id: &str) -> anyhow::Result<Vec<TaskRun>> {
+            Ok(Vec::new())
+        }
+        async fn cancel_children_of(&self, _parent_session_id: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    struct NoRecipes;
+
+    #[async_trait::async_trait]
+    impl pond_core::user_data::ports::recipe::AgentRecipeRepository for NoRecipes {
+        async fn list(
+            &self,
+        ) -> anyhow::Result<Vec<pond_core::user_data::domain::recipe::AgentRecipe>> {
+            Ok(Vec::new())
+        }
+        async fn get_by_name(
+            &self,
+            _name: &str,
+        ) -> anyhow::Result<Option<pond_core::user_data::domain::recipe::AgentRecipe>> {
+            Ok(None)
+        }
+        async fn get_by_id(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<Option<pond_core::user_data::domain::recipe::AgentRecipe>> {
+            Ok(None)
+        }
+        async fn upsert(
+            &self,
+            _recipe: &pond_core::user_data::domain::recipe::AgentRecipe,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn meta_for(engine_session: &str) -> rmcp::model::Meta {
+        let mut m = rmcp::model::Meta::new();
+        m.0.insert(
+            crate::SESSION_ID_META_KEY.to_string(),
+            serde_json::Value::String(engine_session.to_string()),
+        );
+        m
+    }
+
+    /// A server whose one live turn belongs to GIAP session `my-session`, and
+    /// whose orchestrator will answer `poll` with `run` whatever id it is asked
+    /// for.
+    ///
+    /// The lease is returned with it: dropping it revokes the authority, and a
+    /// revoked authority refuses as unauthorised long before the task check —
+    /// which would make every assertion below pass for the wrong reason.
+    fn server_with(
+        run: Option<TaskRun>,
+    ) -> (
+        OrchestratorMcpServer,
+        pond_core::shared::services::turn_authority::TurnAuthorityLease,
+    ) {
+        server_with_scope(ProfileScope::Household, run)
+    }
+
+    fn server_with_scope(
+        scope: ProfileScope,
+        run: Option<TaskRun>,
+    ) -> (
+        OrchestratorMcpServer,
+        pond_core::shared::services::turn_authority::TurnAuthorityLease,
+    ) {
+        let authorities = Arc::new(TurnAuthorityRegistry::new());
+        let lease = authorities.publish(
+            "engine-session-1",
+            DelegationAuthority::root("my-session", scope, groups(&["giap-weather"])),
+            // `Default::default()` rather than a named constructor: the token
+            // type belongs to `tokio-util`, which this crate does not depend on
+            // and does not need to, since `publish`'s signature names it.
+            Default::default(),
+        );
+        let deps = OrchestratorDeps::new(
+            Arc::new(FakeOrchestrator { run }),
+            authorities,
+            Arc::new(NoRecipes),
+        );
+        (OrchestratorMcpServer::new(Some(deps)), lease)
+    }
+
+    fn check_for(task_id: &str) -> CheckTaskParams {
+        CheckTaskParams {
+            task_id: Some(task_id.to_string()),
+            extra: HashMap::new(),
+        }
+    }
+
+    /// **The call site, not the pure function.** `run_check` must put the
+    /// caller's own session id between `poll` and `describe_run`; a version that
+    /// hands the polled run straight to `describe_run` reads back another
+    /// household member's delegation result from an id the model was told.
+    #[tokio::test]
+    async fn check_task_does_not_read_a_task_belonging_to_another_conversation() {
+        const SECRET: &str = "the bins go out on Thursday";
+        let (server, _lease) = server_with(Some(run_of("someone-elses-session", "task-1")));
+
+        let answer = server
+            .run_check(&meta_for("engine-session-1"), check_for("task-1"))
+            .await;
+
+        match answer {
+            Err(refusal) => {
+                assert!(
+                    matches!(refusal, Refusal::UnknownTask { .. }),
+                    "expected the unknown-task refusal, got {refusal:?}"
+                );
+                assert!(
+                    !refusal.message().contains(SECRET),
+                    "the refusal leaked the other conversation's result: {}",
+                    refusal.message()
+                );
+            }
+            Ok(text) => panic!(
+                "check_task answered a task belonging to another conversation - on this pond that \
+                 is another household member's delegation result, read back from a task id: \
+                 {text}"
+            ),
+        }
+    }
+
+    /// Vacuity control for the test above, and it is doing two jobs: it proves
+    /// the refusal is about the SESSION rather than about `run_check` refusing
+    /// everything, and it proves the fixture reaches `describe_run` at all — the
+    /// authority is live, the deps are installed, the meta carries a session and
+    /// the id resolves.
+    #[tokio::test]
+    async fn check_task_answers_a_task_of_this_conversation() {
+        let (server, _lease) = server_with(Some(run_of("my-session", "task-1")));
+
+        let text = server
+            .run_check(&meta_for("engine-session-1"), check_for("task-1"))
+            .await
+            .expect("my own task is readable");
+        assert!(
+            text.contains("the bins go out on Thursday"),
+            "the caller's own finished task did not hand back its answer: {text}"
+        );
+    }
+
+    /// The third input the call site owns: a task id nothing knows. It must
+    /// refuse in the same words as the foreign one — the caller cannot be
+    /// allowed to probe which ids exist — which is asserted on the pure function
+    /// in `a_missing_task_and_somebody_elses_are_indistinguishable_to_the_caller`
+    /// and reached from here.
+    #[tokio::test]
+    async fn check_task_refuses_an_id_nothing_knows_in_the_same_words() {
+        let (server, _lease) = server_with(None);
+        let unknown = server
+            .run_check(&meta_for("engine-session-1"), check_for("task-1"))
+            .await
+            .expect_err("nothing is running under that id");
+
+        let (foreign_server, _foreign_lease) =
+            server_with(Some(run_of("someone-elses-session", "task-1")));
+        let foreign = foreign_server
+            .run_check(&meta_for("engine-session-1"), check_for("task-1"))
+            .await
+            .expect_err("that task belongs to another conversation");
+
+        assert_eq!(unknown.message(), foreign.message());
+        assert_ne!(
+            unknown.trace(),
+            foreign.trace(),
+            "the log cannot tell a hallucinated id from a probe of another conversation"
+        );
+    }
+
+    /// And the caller check, at the same call site: a tool call carrying an
+    /// engine session no live turn is published under is refused before any task
+    /// is looked up. Without this, the three tests above would still pass
+    /// against a `run_check` that had dropped `authorise` instead.
+    #[tokio::test]
+    async fn check_task_refuses_a_caller_with_no_live_turn() {
+        let (server, lease) = server_with(Some(run_of("my-session", "task-1")));
+        drop(lease);
+
+        let refusal = server
+            .run_check(&meta_for("engine-session-1"), check_for("task-1"))
+            .await
+            .expect_err("the turn that could have asked is over");
+        assert!(
+            matches!(refusal, Refusal::Unauthorised { .. }),
+            "expected the unauthorised refusal, got {refusal:?}"
+        );
+
+        // ... and so is a call carrying no engine session at all.
+        let (server, _lease) = server_with(Some(run_of("my-session", "task-1")));
+        let refusal = server
+            .run_check(&rmcp::model::Meta::new(), check_for("task-1"))
+            .await
+            .expect_err("a call with no `_meta` has no caller to authorise");
+        assert!(
+            matches!(refusal, Refusal::Unauthorised { .. }),
+            "expected the unauthorised refusal, got {refusal:?}"
+        );
+    }
+
+    /// The rest of what `authorise` decides, reached from the call site: a GUEST
+    /// turn owns its task by session id and still may not read it back.
+    ///
+    /// Without this, replacing `authorise(...)` in `run_check` with a bare
+    /// `.ok_or(Refusal::Unauthorised { .. })` passes — the missing-turn case
+    /// refuses identically either way, and a guest and a subagent would quietly
+    /// gain a tool neither is allowed.
+    #[tokio::test]
+    async fn check_task_refuses_a_guest_turn_that_owns_the_task() {
+        let (server, _lease) = server_with_scope(
+            ProfileScope::Guest,
+            // The guest's OWN task, so what is refused is the caller and not the
+            // ownership check next door.
+            Some(run_of("my-session", "task-1")),
+        );
+        let refusal = server
+            .run_check(&meta_for("engine-session-1"), check_for("task-1"))
+            .await
+            .expect_err("a guest turn may not run or read a delegation");
+        assert_eq!(
+            refusal,
+            Refusal::Guest,
+            "a guest turn reached a delegated agent's answer"
+        );
     }
 }
