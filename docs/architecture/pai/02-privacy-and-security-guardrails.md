@@ -966,16 +966,17 @@ cannot change class quietly.
   `MemoryExtractionService::run` without the `&ProfileScope` argument added by `4a86244a` /
   `1cc7a8eb`. That file is untouched by this phase and CI never builds it.
 
-- **P6b — PARTIALLY LANDED 2026-08-06. One of its three parts is done; the other two are still
-  PAI-8-blocked, and the ledger must say so or this reads as finished when two thirds of it is not.**
+- **P6b — PARTIALLY LANDED 2026-08-06. One of its three parts is done, one is no longer blocked as
+  of 2026-08-11, and one genuinely cannot be designed yet. The ledger must say so or this reads as
+  finished when two thirds of it is not.**
 
   P6b was always three things bundled behind one word. Split them:
 
   | part | state |
   |---|---|
   | the `routes.rs` egress sites left by P6a | **LANDED.** Not PAI-8-blocked; it only ever needed an uncontended tree. |
-  | draft gate for outbound connector actions | **BLOCKED**, lands with PAI-8. |
-  | P3's third chokepoint — redaction before a body leaves the pond | **BLOCKED**, and for the sharper reason: there is no call site to wire. PAI-8 creates the first one. |
+  | draft gate for outbound connector actions | **BLOCKED, and honestly so.** Not on a call site but on a *subject*: there is no connector in the tree, so there is no outbound connector action to gate. PAI-8's own phase list puts the first one at P4 (Google), and P3-P8 are unstarted. This is the one part of P6b that is waiting on work rather than on a decision. |
+  | P3's third chokepoint — redaction before a body leaves the pond | **NO LONGER BLOCKED — corrected 2026-08-11.** The reason given here was that there is no call site to wire and PAI-8 creates the first one. PAI-8 P1 landed that day, and `IngestPipeline::new` takes a `Redactor` that is deliberately **not** an `Option` — a pipeline that cannot redact does not exist, so the chokepoint is in the type rather than in a branch somebody has to remember. What is still true is that nothing CONSTRUCTS a pipeline yet (`crates/pond-core/tests/context_pipeline_is_not_wired_yet.rs` asserts it), so the chokepoint is present and unreached, which is a different claim from blocked and a much shorter distance from done. The dependency was never two-way. |
 
   **`UNGATED_SENDERS` is empty and `MAX_UNGATED` is 0.** Every file in the workspace that
   `egress_guard.rs` sees sending HTTP now either reaches the tracker or is loopback-only with a

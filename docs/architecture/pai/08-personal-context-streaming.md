@@ -210,8 +210,45 @@ adapter.
 
 - **P1** Domain + migrations + the ingest pipeline with **on-pond sources only** (sensor, camera,
   voice transcripts) — proves the pipeline with data GIAP already holds and no new egress.
+  **CODE LANDED 2026-08-11** (`b58361e1`, `a9062615`, `468e33d8`) **and UNREACHED.**
 - **P2** Retrieval: `context_items` as a second corpus in `<system-context>` with its own budget;
-  `giap-context` MCP extension.
+  `giap-context` MCP extension. **CODE LANDED 2026-08-11 and UNREACHED**, and the extension is not
+  registered.
+
+#### What "unreached" means, and what it takes to end it
+
+Stated as its own block because the distinction cost a documentation error the day the code landed.
+`pub mod context;` makes all of this compile and `cargo check` is happy; a `pub` item in a library
+crate never earns a `dead_code` warning, so nothing complains. But **no production code constructs
+`SqliteContextRepository`, builds an `IngestPipeline`, or calls `init_context_deps`, and
+`giap-context` is absent from `giap_registration.rs`.** There is therefore no way to create a source,
+so `context_items` is empty on every pond that exists, and the retrieval, retention and scope layers
+are correct code operating on nothing.
+
+`crates/pond-core/tests/context_pipeline_is_not_wired_yet.rs` asserts this on every run, walks the
+whole workspace to do it, carries a control proving the walk can see the files it excludes, and
+fails with instructions naming the three documents to correct. PAI-7 P3a shipped with a guard of that
+shape and it worked; this phase shipped without one, and within a day the checklist said `DESIGNED`
+while the master roadmap repeated it.
+
+Four things stand between here and reachable, and none is large:
+
+1. **Register `giap-context`.** The count is asserted in three places that
+   `registration_matches_the_catalog.rs` ties together — CLAUDE.md's sentence, the registration list,
+   and `TOOL_GROUPS`. An uncatalogued builtin is treated as a *user-added* MCP server that selection
+   never narrows, which for a personal-context reader is the wrong direction.
+2. **A settings toggle**, off by default, with its own named `default_*` fn — the convention PAI-6 P5
+   and PAI-7 P4 and P6 each established for a capability nobody asked for by upgrading.
+3. **Construct the repository and install the deps** in `main.rs`, next to the other
+   `init_*_deps` calls.
+4. **Give ingest an on-pond producer**, which is what P1's own sentence asks for and the only part
+   with real design left in it: a sensor reading is not a `ContextItem` until somebody decides which
+   readings are worth keeping and what their `external_id` is.
+
+**One thing this unblocks that the ledger had wrong.** PAI-2 P6b's third part — P3's redaction
+chokepoint — was recorded as circularly blocked on PAI-8. It is not: `IngestPipeline::new` takes a
+`Redactor` that is deliberately **not** an `Option`, so the chokepoint exists in the type as soon as
+anything constructs a pipeline. The dependency runs one way.
 - **P3** `POST /context/ingest` + GOTG calendar and location.
 - **P4** Google connector as the OAuth reference implementation, extending
   `builtin_oauth_providers()`.
