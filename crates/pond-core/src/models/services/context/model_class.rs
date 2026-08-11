@@ -44,6 +44,24 @@
 //! resolves downward: an unrecognised provider is still barred from `Large` until
 //! its window clears 64K, and no window at all classifies as `Small`.
 //!
+//! **That last clause is a real fail-open above 64K and it is stated rather than
+//! hidden**: an unrecognised provider reporting a 128K window is classified
+//! `Large` and may spend a model call, even though nothing here knows whose GPU
+//! pays for it. It is left as PAI-4 decided it — the cost is one summarisation
+//! call, off the critical path — and [`ProviderLocality`] now makes narrowing it
+//! a one-line change (`Hosted` rather than `!OnDevice` in [`ModelClass::classify`])
+//! for whoever owns PAI-4 next.
+//!
+//! # Two questions, not one predicate
+//!
+//! PAI-6 asks the OPPOSITE question of the same string: not "is this my GPU?"
+//! but "is this model somebody else's to hold?", because it decides whether to
+//! honour a per-role model and whether a background delegation may run. There
+//! the safe answer to an unrecognised provider is the other one, so negating
+//! [`runs_on_this_device`] would have made every unknown name a permission.
+//! [`provider_locality`] is what lets both callers take their own narrow side of
+//! the same input; see [`HOSTED_PROVIDERS`].
+//!
 //! `WindowResolution::is_exact()` is deliberately *not* consulted. Exactness
 //! decides whether budget arithmetic can be trusted to the token; it says nothing
 //! about which mechanisms are affordable, and the one direction where being wrong
@@ -78,12 +96,101 @@ pub const LARGE_WINDOW_FLOOR: usize = 65_536;
 /// work is local is the narrowing assumption.
 pub const ON_DEVICE_PROVIDERS: [&str; 4] = ["local", "gguf", "ollama", "llamafile"];
 
-/// Whether a summarisation call to `provider` would compete with this pond's own
-/// inference. See [`ON_DEVICE_PROVIDERS`].
-pub fn runs_on_this_device(provider: &str) -> bool {
-    ON_DEVICE_PROVIDERS
+/// Providers this pond knows are served from somebody else's machine.
+///
+/// **This is not the complement of [`ON_DEVICE_PROVIDERS`], and the difference
+/// is the whole reason it exists.** "Not known to run here" and "known to run
+/// elsewhere" are different claims about an open string domain, and
+/// `settings.chat_provider` is an open string domain: it is a flat settings row
+/// written by the settings UI, by onboarding and by `--provider` on the CLI,
+/// with no allow-list on the write path. `mock` is a shipped GIAP provider that
+/// is in neither list; goose itself ships `lmstudio`, `llama_swap` and `omlx`
+/// declarative providers, every one of which serves from localhost.
+///
+/// So a caller that needs "this model is somebody else's to hold" must ask for
+/// positive membership HERE, via [`provider_locality`], rather than negating the
+/// deny-set. PAI-6 P7 and P8 do exactly that.
+///
+/// Membership is a positive claim and omission is cheap: a genuinely hosted
+/// provider that is missing from this list loses a background delegation and a
+/// per-role model, which is the direction this programme requires on an unknown
+/// input. Adding a name is the decision; leaving one out is not.
+///
+/// The one direction no list can see is a hosted NAME pointed at localhost by a
+/// base-URL override (`OPENAI_HOST` and friends). That is unchanged by this
+/// list, and is the mirror of the `OLLAMA_HOST` caveat on
+/// [`ON_DEVICE_PROVIDERS`].
+pub const HOSTED_PROVIDERS: [&str; 6] = [
+    "anthropic",
+    "openai",
+    "openrouter",
+    "google",
+    "databricks",
+    "snowflake",
+];
+
+/// Where a provider's inference actually happens — three answers, not two.
+///
+/// The third one is the point. Every gate in this tree that reads a provider
+/// name is really asking one of two opposite questions, and an unrecognised name
+/// has to answer BOTH of them with "no": no, this is not known to be your GPU,
+/// and no, this is not known to be somebody else's either. A `bool` cannot say
+/// that, so whichever question was written as the `if` got the unknown case as
+/// its `else` — which is a widening default reached by not recognising an input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderLocality {
+    /// In [`ON_DEVICE_PROVIDERS`]: a call to it competes with this pond's own
+    /// inference.
+    OnDevice,
+    /// In [`HOSTED_PROVIDERS`]: a call to it is somebody else's hardware.
+    Hosted,
+    /// In neither list. Nothing may be concluded from it, and every caller must
+    /// take the narrower of its two answers.
+    Unknown,
+}
+
+impl ProviderLocality {
+    /// A short label for logs and refusal messages.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ProviderLocality::OnDevice => "on-device",
+            ProviderLocality::Hosted => "hosted",
+            ProviderLocality::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classify `provider` against the two lists.
+///
+/// Trimmed as well as case-folded, because `chat_provider` is a settings string
+/// a human can type and `"ollama "` must not be the thing that escapes the
+/// on-device answer.
+pub fn provider_locality(provider: &str) -> ProviderLocality {
+    let provider = provider.trim();
+    if ON_DEVICE_PROVIDERS
         .iter()
         .any(|p| provider.eq_ignore_ascii_case(p))
+    {
+        return ProviderLocality::OnDevice;
+    }
+    if HOSTED_PROVIDERS
+        .iter()
+        .any(|p| provider.eq_ignore_ascii_case(p))
+    {
+        return ProviderLocality::Hosted;
+    }
+    ProviderLocality::Unknown
+}
+
+/// Whether a summarisation call to `provider` would compete with this pond's own
+/// inference. See [`ON_DEVICE_PROVIDERS`].
+///
+/// **Its negation is not "runs elsewhere".** `!runs_on_this_device("mock")` is
+/// true and says nothing about where `mock` runs. A caller whose safe answer is
+/// "refuse" wants [`provider_locality`] and a positive test for
+/// [`ProviderLocality::Hosted`].
+pub fn runs_on_this_device(provider: &str) -> bool {
+    provider_locality(provider) == ProviderLocality::OnDevice
 }
 
 /// What a compaction path may do for a given [`ModelClass`].
@@ -356,9 +463,89 @@ mod tests {
         );
     }
 
+    /// The three-way answer, and the reason it is three-way: a name in neither
+    /// list must not be readable as either claim.
+    ///
+    /// `mock` and `lmstudio` are not decoration. `mock` is a shipped GIAP
+    /// provider (`--provider mock`, `ModelCategory::for_chat_provider`) that
+    /// serves in-process; `lmstudio`, `llama_swap` and `omlx` are goose
+    /// declarative providers that serve from localhost. Every one of them is
+    /// `Unknown` here, which is why a caller that needs "somebody else's
+    /// machine" must ask for `Hosted` rather than for `!OnDevice`.
+    #[test]
+    fn a_provider_in_neither_list_supports_neither_claim() {
+        for provider in ON_DEVICE_PROVIDERS {
+            assert_eq!(
+                provider_locality(provider),
+                ProviderLocality::OnDevice,
+                "{provider} is in ON_DEVICE_PROVIDERS"
+            );
+        }
+        for provider in HOSTED_PROVIDERS {
+            assert_eq!(
+                provider_locality(provider),
+                ProviderLocality::Hosted,
+                "{provider} is in HOSTED_PROVIDERS"
+            );
+        }
+        for provider in [
+            "",
+            "   ",
+            "mock",
+            "lmstudio",
+            "llama_swap",
+            "omlx",
+            "pond-spark",
+        ] {
+            assert_eq!(
+                provider_locality(provider),
+                ProviderLocality::Unknown,
+                "`{provider}` was claimed to run somewhere this pond has not been told about"
+            );
+            assert!(
+                !runs_on_this_device(provider),
+                "`{provider}` is not in the on-device list and must not be reported as if it were"
+            );
+        }
+    }
+
+    /// The two lists must not disagree, or `provider_locality` would answer by
+    /// whichever `if` was written first.
+    #[test]
+    fn no_provider_is_in_both_lists() {
+        for on_device in ON_DEVICE_PROVIDERS {
+            assert!(
+                !HOSTED_PROVIDERS
+                    .iter()
+                    .any(|hosted| hosted.eq_ignore_ascii_case(on_device)),
+                "{on_device} is in both provider lists, so its locality depends on match order"
+            );
+        }
+    }
+
+    /// Whitespace is not a classification decision either. `chat_provider` is a
+    /// settings row a human types, and `"ollama "` escaping the on-device answer
+    /// would unlock a summarisation call here and a background delegation in
+    /// PAI-6.
+    #[test]
+    fn provider_matching_ignores_surrounding_whitespace() {
+        assert!(runs_on_this_device(" ollama "));
+        assert!(runs_on_this_device("\tGGUF\n"));
+        assert_eq!(provider_locality("  anthropic  "), ProviderLocality::Hosted);
+        assert_eq!(
+            ModelClass::classify(" ollama ", 131_072),
+            ModelClass::Medium,
+            "a padded provider escaped the on-device deny-list"
+        );
+    }
+
     /// A provider nobody has heard of gets the narrowing answer at every window
     /// below the large floor, and is only trusted with the large tier once its
     /// window says it is a hosted model.
+    ///
+    /// **The last assertion is the fail-open the module doc admits to**, kept as
+    /// PAI-4 decided it and pinned here so that narrowing it is a deliberate
+    /// edit to a named test rather than a silent behaviour change.
     #[test]
     fn an_unknown_provider_narrows_below_the_large_floor() {
         assert_eq!(ModelClass::classify("", 4_096), ModelClass::Small);
