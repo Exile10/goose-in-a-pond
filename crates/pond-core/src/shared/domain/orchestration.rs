@@ -156,6 +156,153 @@ pub fn max_concurrent_subagents(provider: &str) -> usize {
 /// Unmeasured; see [`max_concurrent_subagents`].
 pub const REMOTE_SUBAGENT_CONCURRENCY: usize = 3;
 
+// ── Per-role model (PAI-6 P7) ───────────────────────────────────────────────
+
+/// Which model a child actually runs on.
+///
+/// **Named `ChildModel` and not `ModelRole`, deliberately.** There is a live
+/// `AgentRequest.model_role` in this tree; it is a per-TURN label ("chat",
+/// "task") that is read once and echoed back in the `Done` frame, it selects no
+/// model, and it has nothing to do with this. A type called `ModelRole` beside
+/// it would be read as its home.
+///
+/// # Why the on-device answer is "no", and why it is not a refusal to run
+///
+/// A role's model is a REQUEST, honoured only where honouring it is cheap. The
+/// child replies through the same `Arc<dyn Provider>` as its parent with its own
+/// [`ModelConfig`], and for a provider that speaks HTTP to somebody else's
+/// machine that is a different `model` field in a request body: no reload, no
+/// prefill, nothing the parent's next turn pays for.
+///
+/// On this device it is the opposite of cheap and the cost lands on the parent.
+/// `goose-local-inference` holds ONE loaded model with ONE retained KV prefix
+/// per slot, so a child on a second GGUF is a model load plus a full re-prefill,
+/// and then the parent's next turn is a second load plus a second re-prefill —
+/// against a decode path that is memory-bandwidth-bound on the Orin, which is
+/// the headline target. PAI-4 P5's `PrefixCacheState` exists to know when that
+/// prefix is warm; a per-role model would make it cold on every delegation.
+///
+/// So on-device the request is **refused and the child runs anyway**, on the
+/// resident model. Refusing the whole delegation was the alternative and is
+/// worse: a role authored with a model would then be unrunnable on the
+/// configuration this project is built for, and the role's tools, budget and
+/// persona — the parts that carry the value — do not depend on the model at all.
+/// The refusal is not silent: [`refusal`](Self::refusal) is a sentence, it is
+/// logged at spawn, and `ChildPlan` carries the whole enum rather than an
+/// `Option<String>` so "refused" is a value a test can see rather than an
+/// absence indistinguishable from "the role named nothing".
+///
+/// [`ModelConfig`]: https://docs.rs/goose
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChildModel {
+    /// The role named no model. The child runs on whatever the parent runs on.
+    Inherited,
+    /// The role named a model and the provider runs somewhere else, so it is
+    /// honoured.
+    Assigned(String),
+    /// The role named a model and the provider runs on THIS device, so it is
+    /// not.
+    RefusedOnDevice { requested: String, provider: String },
+}
+
+impl ChildModel {
+    /// Decide from the role's request and the parent's provider.
+    ///
+    /// The predicate is [`runs_on_this_device`] — `local`, `gguf`, `ollama` and
+    /// `llamafile` — and not `is_local_provider`, for the reason PAI-4 P2 had to
+    /// fix once: ollama and llamafile speak HTTP, but on a GIAP pond they speak
+    /// it to `127.0.0.1`, which is the same GPU and the same one loaded model.
+    /// A version of this written against the narrow predicate would swap the
+    /// resident GGUF on two of the four providers that have one.
+    pub fn resolve(requested: Option<&str>, provider: &str) -> Self {
+        let Some(requested) = requested.map(str::trim).filter(|m| !m.is_empty()) else {
+            return ChildModel::Inherited;
+        };
+        if runs_on_this_device(provider) {
+            return ChildModel::RefusedOnDevice {
+                requested: requested.to_string(),
+                provider: provider.to_string(),
+            };
+        }
+        ChildModel::Assigned(requested.to_string())
+    }
+
+    /// The model name to stamp on the child's `ModelConfig`, or `None` to
+    /// inherit the parent's.
+    ///
+    /// **The only predicate an adapter should use.** `matches!(.., Assigned(_))`
+    /// written at a call site is a second place for the refusal to be forgotten;
+    /// this answers `None` for both of the ways a child inherits.
+    pub fn assigned(&self) -> Option<&str> {
+        match self {
+            ChildModel::Assigned(model) => Some(model),
+            ChildModel::Inherited | ChildModel::RefusedOnDevice { .. } => None,
+        }
+    }
+
+    /// Why the role's model was not used, when it was not used because it was
+    /// refused. `None` for a role that named no model — nothing was refused.
+    pub fn refusal(&self) -> Option<String> {
+        match self {
+            ChildModel::RefusedOnDevice {
+                requested,
+                provider,
+            } => Some(format!(
+                "role asked for model `{requested}` but `{provider}` runs on this device, where a \
+                 second model is a load plus a re-prefill the parent's next turn pays for - \
+                 running the child on the resident model instead"
+            )),
+            ChildModel::Inherited | ChildModel::Assigned(_) => None,
+        }
+    }
+}
+
+// ── Background delegation (PAI-6 P8) ────────────────────────────────────────
+
+/// Whether a delegation on `provider` may run in the background.
+///
+/// PAI-6 invariant 3 in its other clothes. The predicate is
+/// [`max_concurrent_subagents`] rather than a second reading of
+/// [`runs_on_this_device`], so the answer here cannot drift from the number the
+/// semaphore enforces: where only one thing may touch the model at a time, a
+/// "background" child is not background at all — it is the parent's next turn
+/// queueing behind it, and paying a re-prefill when it gets there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackgroundAvailability {
+    Available,
+    RefusedOnDevice { provider: String },
+}
+
+impl BackgroundAvailability {
+    pub fn for_provider(provider: &str) -> Self {
+        if max_concurrent_subagents(provider) <= 1 {
+            BackgroundAvailability::RefusedOnDevice {
+                provider: provider.to_string(),
+            }
+        } else {
+            BackgroundAvailability::Available
+        }
+    }
+
+    /// The sentence the model reads when it asked for a background run and
+    /// cannot have one.
+    ///
+    /// It ends by telling the model what to do instead, for the reason every
+    /// refusal in `pond-mcp-server` does: a refusal a 2-4B model cannot act on
+    /// is a refusal it retries verbatim.
+    pub fn refusal(&self) -> Option<String> {
+        match self {
+            BackgroundAvailability::Available => None,
+            BackgroundAvailability::RefusedOnDevice { provider } => Some(format!(
+                "this pond runs its model on the device itself (`{provider}`), where one agent \
+                 can use it at a time - a background helper would simply be holding up your own \
+                 next reply. Call delegate again without `background` and wait for the answer, or \
+                 do the work yourself"
+            )),
+        }
+    }
+}
+
 // ── Depth ───────────────────────────────────────────────────────────────────
 
 /// How many delegations deep a turn already is.
@@ -301,6 +448,15 @@ pub struct AgentRole {
     personal_data: RolePersonalData,
     max_turns: u32,
     context_fraction: f32,
+    /// PAI-6 P7. The model this role WANTS, which is not necessarily the one it
+    /// gets — see [`ChildModel`]. `None` is the ordinary case and means "the
+    /// same model as the conversation that delegated".
+    ///
+    /// Set through [`with_model`](Self::with_model) rather than through
+    /// [`new`](Self::new), so that the six-argument constructor every existing
+    /// caller uses keeps compiling and a role acquires a model only where
+    /// somebody wrote one down.
+    model: Option<String>,
 }
 
 impl AgentRole {
@@ -341,7 +497,31 @@ impl AgentRole {
             personal_data,
             max_turns,
             context_fraction,
+            model: None,
         })
+    }
+
+    /// Attach the model this role asks for — PAI-6 P7.
+    ///
+    /// Validating rather than normalising, because `model: ""` in a role block
+    /// is a human's mistake and the rest of this type refuses those rather than
+    /// guessing past them ([`RoleError::MaxTurnsOutOfRange`] does not clamp
+    /// either). Absent is a different statement from blank: absent says
+    /// "whatever the conversation is using", blank says nothing at all.
+    pub fn with_model(mut self, model: Option<String>) -> Result<Self, RoleError> {
+        match model {
+            None => {
+                self.model = None;
+                Ok(self)
+            }
+            Some(model) if model.trim().is_empty() => {
+                Err(RoleError::EmptyModel { role: self.name })
+            }
+            Some(model) => {
+                self.model = Some(model.trim().to_string());
+                Ok(self)
+            }
+        }
     }
 
     /// Read a role out of a recipe's YAML.
@@ -379,7 +559,8 @@ impl AgentRole {
             block.personal_data,
             block.max_turns,
             block.context_fraction,
-        )
+        )?
+        .with_model(block.model)
         .map(Some)
     }
 
@@ -407,6 +588,13 @@ impl AgentRole {
 
     pub fn context_fraction(&self) -> f32 {
         self.context_fraction
+    }
+
+    /// The model this role asks for, before the provider has had a say.
+    /// Resolve it with [`ChildModel::resolve`]; do not read it directly at an
+    /// engine call site.
+    pub fn requested_model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 }
 
@@ -442,6 +630,16 @@ struct RoleBlock {
     max_turns: u32,
     #[serde(default = "default_role_context_fraction")]
     context_fraction: f32,
+    /// PAI-6 P7. Absent means "the same model as the conversation".
+    ///
+    /// It is honoured only off-device — see [`ChildModel`] — and there is
+    /// deliberately no `provider` key beside it. A role that could name its own
+    /// provider could name an off-device one on a pond configured to run
+    /// locally, which is a network egress and a data-minimisation decision
+    /// (PAI-2), not a model preference; the model axis alone cannot leave the
+    /// machine the conversation is already talking to.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 fn default_role_max_turns() -> u32 {
@@ -467,6 +665,10 @@ pub enum RoleError {
     },
     #[error("role `{role}` asks for a context fraction of {requested}; it must be in (0.0, 1.0]")]
     ContextFractionOutOfRange { role: String, requested: f32 },
+    #[error(
+        "role `{role}` has an empty `model`; leave the key out to use the conversation's model"
+    )]
+    EmptyModel { role: String },
     #[error("role `{role}` has an unreadable `{ROLE_YAML_KEY}` block: {message}")]
     Yaml { role: String, message: String },
 }
@@ -490,6 +692,22 @@ pub struct TaskRequest {
     /// Opaque structured inputs, passed through to the child's prompt.
     #[serde(default)]
     pub inputs: serde_json::Value,
+    /// PAI-6 P8. Run without holding the caller's turn open.
+    ///
+    /// **This is not an exception to the paragraph above.** It names no scope,
+    /// no tool, no depth and no session; a background child is narrowed by
+    /// exactly the same [`DelegationAuthority::delegate`] as a synchronous one,
+    /// and it is REFUSED outright on any provider that runs on this device
+    /// ([`BackgroundAvailability`]). What it does change, and the reason it is
+    /// argued rather than merely defaulted, is invariant 5's shape: a run that
+    /// outlives the turn that asked for it cannot inherit that turn's
+    /// cancellation token, so its owner becomes the parent SESSION and the
+    /// cascade becomes `Orchestrator::cancel_children_of`.
+    ///
+    /// `false` is the default in every direction — the serde default, and the
+    /// value a caller that says nothing gets.
+    #[serde(default)]
+    pub background: bool,
 }
 
 /// What a running turn is authorised to do, and therefore the ceiling on what
@@ -655,6 +873,14 @@ impl DelegationAuthority {
             depth,
             max_turns: role.max_turns,
             context_fraction: role.context_fraction,
+            // From the ROLE, never from the request: a caller that could name a
+            // model could point a child at whatever is cheapest to jailbreak,
+            // and `TaskRequest` has no field to put one in.
+            model: role.model.clone(),
+            // From the REQUEST, because it is a property of this particular
+            // delegation rather than of the persona. A role that is worth
+            // running unattended once is worth waiting for the next time.
+            background: request.background,
         })
     }
 }
@@ -844,6 +1070,14 @@ pub struct TaskSpec {
     depth: DelegationDepth,
     max_turns: u32,
     context_fraction: f32,
+    /// PAI-6 P7. What the ROLE asked for, unresolved: the provider has not been
+    /// consulted yet and is not knowable here — `pond-core` does not hold the
+    /// pond's settings. [`ChildModel::resolve`] is what turns this into a
+    /// decision, at the one place that knows which provider the parent is on.
+    model: Option<String>,
+    /// PAI-6 P8. Copied from the request, refused later by the adapter on any
+    /// provider that runs on this device.
+    background: bool,
 }
 
 impl TaskSpec {
@@ -893,6 +1127,19 @@ impl TaskSpec {
 
     pub fn context_fraction(&self) -> f32 {
         self.context_fraction
+    }
+
+    /// The model the role asked for, unresolved — PAI-6 P7. Feed it to
+    /// [`ChildModel::resolve`] with the parent's provider; do not read it at an
+    /// engine call site.
+    pub fn requested_model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// Whether this delegation asked to run without holding the caller's turn
+    /// open — PAI-6 P8. Still subject to [`BackgroundAvailability`].
+    pub fn background(&self) -> bool {
+        self.background
     }
 
     /// May the child call this fully-qualified tool?
@@ -1174,6 +1421,7 @@ mod depth_tests {
             role: role.to_string(),
             instructions: instructions.to_string(),
             inputs: serde_json::Value::Null,
+            background: false,
         }
     }
 }
@@ -1188,6 +1436,7 @@ mod forged_authority_tests {
             role: "r".to_string(),
             instructions: "go".to_string(),
             inputs: serde_json::Value::Null,
+            background: false,
         }
     }
 
@@ -1294,6 +1543,7 @@ mod scope_inheritance_tests {
             role: "r".to_string(),
             instructions: "go".to_string(),
             inputs: serde_json::Value::Null,
+            background: false,
         }
     }
 
@@ -1644,6 +1894,7 @@ mod tool_narrowing_tests {
             role: "r".to_string(),
             instructions: "go".to_string(),
             inputs: serde_json::Value::Null,
+            background: false,
         }
     }
 
@@ -2039,6 +2290,7 @@ mod request_shape_tests {
                     role: "r".into(),
                     instructions: "   ".into(),
                     inputs: serde_json::Value::Null,
+                    background: false,
                 },
             )
             .unwrap_err();
@@ -2067,6 +2319,7 @@ mod request_shape_tests {
                     role: "housekeeper".into(),
                     instructions: "go".into(),
                     inputs: serde_json::Value::Null,
+                    background: false,
                 },
             )
             .unwrap_err();
@@ -2441,6 +2694,7 @@ mod run_tests {
                     role: "r".into(),
                     instructions: "go".into(),
                     inputs: serde_json::Value::Null,
+                    background: false,
                 },
             )
             .unwrap();
@@ -2504,5 +2758,355 @@ mod concurrency_tests {
     fn the_predicate_is_case_insensitive_like_the_one_it_delegates_to() {
         assert_eq!(max_concurrent_subagents("Ollama"), 1);
         assert_eq!(max_concurrent_subagents("GGUF"), 1);
+    }
+}
+
+#[cfg(test)]
+mod child_model_tests {
+    use super::*;
+    use crate::models::services::context::model_class::ON_DEVICE_PROVIDERS;
+
+    /// A hosted provider a role could plausibly be pointed at. Written out
+    /// rather than derived, because there is no `OFF_DEVICE_PROVIDERS` constant
+    /// and inverting `ON_DEVICE_PROVIDERS` over an open string domain is not a
+    /// thing a test can do.
+    const HOSTED_PROVIDERS: [&str; 4] = ["anthropic", "openai", "openrouter", "google"];
+
+    /// **The phase's whole refusal, quantified over the shared list** rather
+    /// than over `local`/`gguf`, which is the narrow reading PAI-4 P2 already
+    /// had to fix once. `ollama` and `llamafile` speak HTTP to `127.0.0.1`: the
+    /// same GPU, the same one loaded model, the same retained KV prefix.
+    #[test]
+    fn a_role_model_is_refused_on_every_provider_that_runs_on_this_device() {
+        for provider in ON_DEVICE_PROVIDERS {
+            let decided = ChildModel::resolve(Some("qwen3-14b"), provider);
+            assert_eq!(
+                decided,
+                ChildModel::RefusedOnDevice {
+                    requested: "qwen3-14b".to_string(),
+                    provider: provider.to_string(),
+                },
+                "{provider} runs on this device, so a per-role model is a GGUF load plus a \
+                 re-prefill the parent's next turn pays for"
+            );
+            assert_eq!(
+                decided.assigned(),
+                None,
+                "{provider}: a refused model must not reach an engine call site"
+            );
+            let refusal = decided.refusal().expect("a refusal says why");
+            assert!(
+                refusal.contains("qwen3-14b") && refusal.contains(provider),
+                "the refusal names neither the model nor the provider: {refusal}"
+            );
+        }
+    }
+
+    /// Vacuity control. Without it the test above passes against a
+    /// `ChildModel::resolve` that refuses everything — which is a feature that
+    /// does not exist, described by a green suite.
+    #[test]
+    fn a_role_model_is_honoured_when_the_model_is_somebody_elses_problem() {
+        for provider in HOSTED_PROVIDERS {
+            let decided = ChildModel::resolve(Some("claude-haiku-4"), provider);
+            assert_eq!(
+                decided,
+                ChildModel::Assigned("claude-haiku-4".to_string()),
+                "{provider} runs somewhere else, so the model is a field in a request body"
+            );
+            assert_eq!(decided.assigned(), Some("claude-haiku-4"));
+            assert_eq!(
+                decided.refusal(),
+                None,
+                "{provider}: nothing was refused, so there is nothing to explain"
+            );
+        }
+    }
+
+    /// The ordinary case, and the one that must stay distinguishable from a
+    /// refusal: a role that names no model is not a role whose model was
+    /// rejected.
+    #[test]
+    fn a_role_that_names_no_model_inherits_the_conversations() {
+        for provider in ON_DEVICE_PROVIDERS.iter().chain(HOSTED_PROVIDERS.iter()) {
+            assert_eq!(ChildModel::resolve(None, provider), ChildModel::Inherited);
+            assert_eq!(
+                ChildModel::resolve(Some("   "), provider),
+                ChildModel::Inherited,
+                "{provider}: whitespace is not a model name"
+            );
+            assert_eq!(ChildModel::resolve(None, provider).refusal(), None);
+        }
+    }
+
+    /// `chat_provider` is a settings string a human can type. The predicate it
+    /// delegates to is case-insensitive and this must not lose that on the way.
+    #[test]
+    fn the_refusal_survives_the_casing_a_human_would_type() {
+        assert!(matches!(
+            ChildModel::resolve(Some("m"), "Ollama"),
+            ChildModel::RefusedOnDevice { .. }
+        ));
+        assert!(matches!(
+            ChildModel::resolve(Some("m"), "GGUF"),
+            ChildModel::RefusedOnDevice { .. }
+        ));
+    }
+
+    #[test]
+    fn a_roles_model_reaches_the_spec_it_produces() {
+        let role = AgentRole::new(
+            "researcher",
+            "look it up",
+            ["giap-weather".to_string()].into_iter().collect(),
+            RolePersonalData::Inherit,
+            3,
+            0.5,
+        )
+        .unwrap()
+        .with_model(Some("claude-haiku-4".to_string()))
+        .unwrap();
+        assert_eq!(role.requested_model(), Some("claude-haiku-4"));
+
+        let spec = DelegationAuthority::root(
+            "s",
+            ProfileScope::Household,
+            ["giap-weather".to_string()].into_iter().collect(),
+        )
+        .delegate(
+            &role,
+            TaskRequest {
+                role: "researcher".into(),
+                instructions: "go".into(),
+                inputs: serde_json::Value::Null,
+                background: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            spec.requested_model(),
+            Some("claude-haiku-4"),
+            "the role's model must survive the narrowing, or P7 is inert"
+        );
+    }
+
+    /// The request has no model field at all, so this is really a statement
+    /// about `deny_unknown_fields`: a caller cannot point a child at a model of
+    /// its choosing, only a stored role can.
+    #[test]
+    fn a_caller_cannot_name_a_model() {
+        let refused = serde_json::from_value::<TaskRequest>(serde_json::json!({
+            "role": "researcher",
+            "instructions": "go",
+            "model": "some-cheaper-model"
+        }));
+        assert!(
+            refused.is_err(),
+            "a delegate call naming a model was accepted; the model is the ROLE's to state"
+        );
+    }
+
+    #[test]
+    fn an_empty_model_in_a_role_block_refuses_rather_than_meaning_nothing() {
+        let err = AgentRole::from_recipe_yaml(
+            "researcher",
+            "giap_role:\n  tool_groups: [giap-weather]\n  instructions: go\n  model: '  '\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RoleError::EmptyModel { .. }),
+            "expected an EmptyModel refusal, got {err:?}"
+        );
+    }
+
+    /// The YAML wiring, which is the only production producer of a role's
+    /// model. Without this the field is settable and unreachable.
+    #[test]
+    fn a_role_block_can_state_a_model_and_usually_does_not() {
+        let with_model = AgentRole::from_recipe_yaml(
+            "researcher",
+            "giap_role:\n  tool_groups: [giap-weather]\n  instructions: go\n  model: gpt-5-mini\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(with_model.requested_model(), Some("gpt-5-mini"));
+
+        let without = AgentRole::from_recipe_yaml(
+            "researcher",
+            "giap_role:\n  tool_groups: [giap-weather]\n  instructions: go\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            without.requested_model(),
+            None,
+            "every role in every pond today states no model, and that must stay the quiet case"
+        );
+    }
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+    use crate::models::services::context::model_class::ON_DEVICE_PROVIDERS;
+
+    /// PAI-6 invariant 3, restated as the thing P8 refuses. Quantified over the
+    /// shared constant for the same reason `max_concurrent_subagents`'s own test
+    /// is: `local`/`gguf` is the narrow reading.
+    #[test]
+    fn background_is_refused_on_every_provider_that_runs_on_this_device() {
+        for provider in ON_DEVICE_PROVIDERS {
+            let availability = BackgroundAvailability::for_provider(provider);
+            assert_eq!(
+                availability,
+                BackgroundAvailability::RefusedOnDevice {
+                    provider: provider.to_string()
+                },
+                "{provider} has one model slot, so a background child IS the parent's next turn"
+            );
+            let refusal = availability.refusal().expect("a refusal says why");
+            assert!(
+                refusal.contains(provider),
+                "the refusal does not name the provider: {refusal}"
+            );
+            assert!(
+                refusal.contains("without `background`"),
+                "the refusal does not tell the model what to do instead, so it will retry the \
+                 identical call: {refusal}"
+            );
+        }
+    }
+
+    /// Vacuity control: a version that refused everywhere would leave the test
+    /// above green and the feature non-existent.
+    #[test]
+    fn background_is_available_where_the_model_is_somebody_elses() {
+        for provider in ["anthropic", "openai", "openrouter"] {
+            assert_eq!(
+                BackgroundAvailability::for_provider(provider),
+                BackgroundAvailability::Available,
+                "{provider} runs elsewhere, so a background child costs this pond nothing"
+            );
+            assert_eq!(
+                BackgroundAvailability::for_provider(provider).refusal(),
+                None
+            );
+        }
+    }
+
+    /// The predicate is the semaphore's own number, not a second reading of
+    /// `runs_on_this_device`. Pinning the two together is what stops them
+    /// drifting into a state where one permit is enforced and background is
+    /// offered anyway.
+    #[test]
+    fn availability_agrees_with_the_concurrency_limit_it_is_derived_from() {
+        for provider in ON_DEVICE_PROVIDERS
+            .iter()
+            .chain(["anthropic", "openai", "Ollama", "GGUF"].iter())
+        {
+            let available =
+                BackgroundAvailability::for_provider(provider) == BackgroundAvailability::Available;
+            assert_eq!(
+                available,
+                max_concurrent_subagents(provider) > 1,
+                "{provider}: background availability and the concurrency limit disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn a_delegation_is_synchronous_unless_it_says_otherwise() {
+        let parsed: TaskRequest = serde_json::from_value(serde_json::json!({
+            "role": "researcher",
+            "instructions": "go"
+        }))
+        .expect("role and instructions is a complete request");
+        assert!(
+            !parsed.background,
+            "a caller that says nothing must get a synchronous run"
+        );
+    }
+
+    #[test]
+    fn the_background_flag_reaches_the_spec() {
+        for asked in [true, false] {
+            let role = AgentRole::new(
+                "researcher",
+                "look it up",
+                ["giap-weather".to_string()].into_iter().collect(),
+                RolePersonalData::Inherit,
+                3,
+                0.5,
+            )
+            .unwrap();
+            let spec = DelegationAuthority::root(
+                "s",
+                ProfileScope::Household,
+                ["giap-weather".to_string()].into_iter().collect(),
+            )
+            .delegate(
+                &role,
+                TaskRequest {
+                    role: "researcher".into(),
+                    instructions: "go".into(),
+                    inputs: serde_json::Value::Null,
+                    background: asked,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                spec.background(),
+                asked,
+                "the request's background flag did not reach the spec"
+            );
+        }
+    }
+
+    /// A background run narrows exactly as a synchronous one does. The field is
+    /// a mode, not an authority, and this is what says so.
+    #[test]
+    fn asking_for_background_widens_nothing() {
+        let role = AgentRole::new(
+            "researcher",
+            "look it up",
+            ["giap-weather".to_string(), "giap-memory".to_string()]
+                .into_iter()
+                .collect(),
+            RolePersonalData::Deny,
+            3,
+            0.5,
+        )
+        .unwrap();
+        let authority = DelegationAuthority::root(
+            "s",
+            ProfileScope::Household,
+            ["giap-weather".to_string(), "giap-memory".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let make = |background: bool| {
+            authority
+                .delegate(
+                    &role,
+                    TaskRequest {
+                        role: "researcher".into(),
+                        instructions: "go".into(),
+                        inputs: serde_json::Value::Null,
+                        background,
+                    },
+                )
+                .unwrap()
+        };
+        let sync = make(false);
+        let background = make(true);
+        assert_eq!(sync.tool_groups(), background.tool_groups());
+        assert_eq!(sync.profile_scope(), background.profile_scope());
+        assert_eq!(sync.depth(), background.depth());
+        assert_eq!(sync.max_turns(), background.max_turns());
+        // Vacuity control for the three above: the role really does narrow, so
+        // "equal" is a statement about the flag rather than about two specs that
+        // were never narrowed at all.
+        assert_eq!(background.profile_scope(), &ProfileScope::Guest);
+        assert!(!background.tool_groups().contains("giap-memory"));
     }
 }
