@@ -79,6 +79,234 @@ fn truncate_tool_result(mut content: String) -> String {
     content
 }
 
+// ── PAI-7 P6: speaking first ─────────────────────────────────────────────────
+
+/// Local wall-clock time of day, `[0, 1440)` minutes past local midnight.
+///
+/// A newtype rather than an `(u32, u32)` pair, because `time_tick.rs` already
+/// records what two positional `u32`s cost inside a timer loop: they swap
+/// silently. `LocalTimeOfDay::new` is the only constructor and it refuses
+/// anything outside a real clock face, so a caller cannot hand the gate minute
+/// 90 and have the window quietly answer "not quiet hours".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LocalTimeOfDay(u16);
+
+impl LocalTimeOfDay {
+    /// `None` for an hour outside `0..=23` or a minute outside `0..=59`.
+    pub fn new(hour: u32, minute: u32) -> Option<Self> {
+        if hour > 23 || minute > 59 {
+            return None;
+        }
+        Some(Self((hour * 60 + minute) as u16))
+    }
+
+    /// Minutes past local midnight.
+    pub fn minutes(self) -> u16 {
+        self.0
+    }
+}
+
+/// Why the pond stayed quiet. Every variant is a refusal; there is no variant
+/// meaning "spoke anyway".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpeechRefusal {
+    /// The settings read failed, so nothing is known about consent. Silence.
+    SettingsUnreadable,
+    /// `unprompted_speech_enabled` is off. The default, and the common case.
+    NotEnabled,
+    /// Inside the quiet-hours window. PAI-7 invariant 6: absolute.
+    QuietHours,
+    /// The quiet-hours bounds could not be parsed, so the window is treated as
+    /// covering everything. A separate variant from [`Self::QuietHours`]
+    /// because one of them is the user's choice and the other is a broken row
+    /// somebody has to fix.
+    QuietHoursUnreadable,
+    /// This notification's category is not one the household enabled.
+    CategoryNotEnabled,
+    /// A turn is in flight. PAI-7 3.4: never mid-conversation.
+    MidConversation,
+    /// The utterance is addressed to `Guest`. PAI-7 invariant 5.
+    GuestSession,
+    /// The utterance is addressed to `Household`, which is not an address.
+    /// PAI-7 invariant 4 -- speaking to the room is the broadcast this
+    /// workstream exists to avoid.
+    NotAddressedToAMember,
+    /// The member it is for is not present. Speaking into an empty room is
+    /// worse than not speaking: nobody is helped and somebody else may hear it.
+    MemberNotPresent,
+    /// There is nothing to say.
+    NothingToSay,
+}
+
+impl SpeechRefusal {
+    /// Short, stable label for structured logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SettingsUnreadable => "settings_unreadable",
+            Self::NotEnabled => "not_enabled",
+            Self::QuietHours => "quiet_hours",
+            Self::QuietHoursUnreadable => "quiet_hours_unreadable",
+            Self::CategoryNotEnabled => "category_not_enabled",
+            Self::MidConversation => "mid_conversation",
+            Self::GuestSession => "guest_session",
+            Self::NotAddressedToAMember => "not_addressed_to_a_member",
+            Self::MemberNotPresent => "member_not_present",
+            Self::NothingToSay => "nothing_to_say",
+        }
+    }
+}
+
+/// What the pond did when it considered speaking first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnpromptedSpeech {
+    /// Spoken aloud.
+    Spoken,
+    /// Not spoken, for this reason.
+    Refused(SpeechRefusal),
+}
+
+/// One thing the pond is considering saying without having been asked.
+///
+/// Every input the decision depends on is a field here, and none of them is an
+/// `Option` the gate could fill in for itself. That is deliberate: PAI-5 P7 and
+/// PAI-1 P5 were both one ordering mistake from shipping a widening default
+/// reached by construction order, and the shape that prevents it is a struct
+/// the caller cannot finish building without having answered every question.
+pub struct UnpromptedUtterance<'a> {
+    /// Who this is for. Only [`ProfileScope::Owner`] can be spoken to.
+    pub audience: &'a ProfileScope,
+    /// `Notification.category` -- `alert` / `info` / `action_required`.
+    pub category: &'a str,
+    /// What would be said.
+    pub text: &'a str,
+    /// Members the pond currently believes are here, from PAI-7 P2's presence
+    /// events. An empty slice is an empty room, which is a refusal.
+    pub present_members: &'a [String],
+    /// The local wall clock, read by the caller from the same clock the rules
+    /// engine evaluates its time windows against.
+    pub now: LocalTimeOfDay,
+    /// Whether a turn is currently being served.
+    pub turn_in_flight: bool,
+}
+
+/// `true` when `now` falls inside the `[start, end)` quiet window.
+///
+/// Wraps midnight when `start > end`, which is the normal case and the one the
+/// `22:00` / `07:00` default takes. `None` when either bound is not `HH:MM`.
+///
+/// **The malformed answer is deliberately the opposite of the rules engine's.**
+/// `schedule.rs :: in_time_window` answers `false` for a malformed bound, and
+/// that is correct there: its window says when a rule MAY fire, so false means
+/// the rule does not fire. This window says when the pond MUST NOT speak, so
+/// false would mean it speaks. Both are the same principle -- on unreadable
+/// input, do less -- and they are opposite booleans because the two windows
+/// mean opposite things. Returning `Option` rather than a bare `bool` is what
+/// keeps a reader from "fixing" one to match the other.
+fn quiet_hours_cover(start: &str, end: &str, now: LocalTimeOfDay) -> Option<bool> {
+    let parse = |s: &str| {
+        let t = chrono::NaiveTime::parse_from_str(s.trim(), "%H:%M").ok()?;
+        LocalTimeOfDay::new(chrono::Timelike::hour(&t), chrono::Timelike::minute(&t))
+    };
+    let (start, end) = (parse(start)?, parse(end)?);
+    Some(if start <= end {
+        // A non-wrapping window. Equal bounds are an EMPTY window under this
+        // comparison, which would mean "never quiet" -- so they are handled by
+        // the caller, which treats them as quiet all day. See `decide`.
+        now >= start && now < end
+    } else {
+        now >= start || now < end
+    })
+}
+
+/// Whether `category` is one the household enabled for speech.
+///
+/// Splits on commas, trims, and lowercases. An empty list enables nothing, a
+/// blank entry is not a category, and an unrecognised entry matches nothing --
+/// so every way of getting the setting wrong ends in less speech rather than
+/// more.
+fn category_is_speakable(enabled: &str, category: &str) -> bool {
+    let wanted = category.trim().to_ascii_lowercase();
+    if wanted.is_empty() {
+        return false;
+    }
+    enabled
+        .split(',')
+        .map(|c| c.trim().to_ascii_lowercase())
+        .any(|c| !c.is_empty() && c == wanted)
+}
+
+/// Decide whether the pond may say this, unasked.
+///
+/// `settings` is `None` when the read FAILED. That is a refusal and not a
+/// fallback to [`Settings::default`], even though the default would also be
+/// silent today: the default is a value somebody may change, and a gate that
+/// launders an unreadable store through it would start speaking the day
+/// somebody flipped that default, with nothing in this function to review.
+///
+/// **Quiet hours are checked before consent, presence and category**, so no
+/// combination of the other inputs can produce speech inside the window.
+/// Invariant 6 says quiet hours are absolute, and "absolute" is a statement
+/// about ordering as much as about the condition.
+pub fn decide_unprompted_speech(
+    settings: Option<&crate::user_data::domain::settings::Settings>,
+    utterance: &UnpromptedUtterance<'_>,
+) -> UnpromptedSpeech {
+    use UnpromptedSpeech::Refused;
+
+    let Some(settings) = settings else {
+        return Refused(SpeechRefusal::SettingsUnreadable);
+    };
+
+    // 1. Quiet hours, first and unconditionally.
+    let start = settings.quiet_hours_start.trim();
+    let end = settings.quiet_hours_end.trim();
+    match quiet_hours_cover(start, end, utterance.now) {
+        None => return Refused(SpeechRefusal::QuietHoursUnreadable),
+        // Equal bounds describe a zero-length window, and a zero-length window
+        // is indistinguishable from "no quiet hours at all". Taking it as
+        // silence-all-day is the narrowing reading: switching quiet hours OFF
+        // is what `unprompted_speech_enabled` is for.
+        Some(_) if start == end => return Refused(SpeechRefusal::QuietHours),
+        Some(true) => return Refused(SpeechRefusal::QuietHours),
+        Some(false) => {}
+    }
+
+    // 2. Consent.
+    if !settings.unprompted_speech_enabled {
+        return Refused(SpeechRefusal::NotEnabled);
+    }
+
+    // 3. Not while somebody is talking to it.
+    if utterance.turn_in_flight {
+        return Refused(SpeechRefusal::MidConversation);
+    }
+
+    // 4. Category.
+    if !category_is_speakable(&settings.unprompted_speech_categories, utterance.category) {
+        return Refused(SpeechRefusal::CategoryNotEnabled);
+    }
+
+    // 5. Addressed to a member, and only a member.
+    let member = match utterance.audience {
+        ProfileScope::Owner(id) => id,
+        ProfileScope::Guest => return Refused(SpeechRefusal::GuestSession),
+        ProfileScope::Household => return Refused(SpeechRefusal::NotAddressedToAMember),
+    };
+
+    // 6. Present. PAI-7 P2's presence is keyed on when somebody last SPOKE, so
+    //    this is "the pond has recent evidence this member is here", never a
+    //    claim about the room.
+    if !utterance.present_members.iter().any(|p| p == member) {
+        return Refused(SpeechRefusal::MemberNotPresent);
+    }
+
+    if utterance.text.trim().is_empty() {
+        return Refused(SpeechRefusal::NothingToSay);
+    }
+
+    UnpromptedSpeech::Spoken
+}
+
 /// The tone that plays while the assistant is working, stopped exactly once.
 ///
 /// It is the only feedback between the request and the answer, so it has two
@@ -367,6 +595,49 @@ impl ChatService {
     pub fn with_profile_scope(mut self, scope: ProfileScope) -> Self {
         self.profile_scope = scope;
         self
+    }
+
+    /// Say something the user did not ask for -- or, far more often, decline to
+    /// (PAI-7 P6).
+    ///
+    /// **This is the only door.** Every other `voice_output.speak()` in this
+    /// file is downstream of a user utterance, and that is what makes the gate
+    /// meaningful: a second unprompted speaking path would not be gated by
+    /// having this one, so if one is ever added it belongs here rather than
+    /// beside it.
+    ///
+    /// `settings` is `None` when the settings read failed. The gate refuses on
+    /// that rather than falling back to a default -- see
+    /// [`decide_unprompted_speech`].
+    ///
+    /// Returns the decision rather than a `Result`, because "the pond stayed
+    /// quiet" is not an error and typing it as one invites a caller to retry it.
+    /// A synthesis or playback failure IS logged, and still reports
+    /// [`UnpromptedSpeech::Spoken`]: the decision to speak was taken and
+    /// carried out: whether the speaker worked is the audio stack's problem,
+    /// and reporting it as a refusal would make a broken speaker look like a
+    /// privacy gate doing its job.
+    pub async fn speak_unprompted(
+        &self,
+        settings: Option<&crate::user_data::domain::settings::Settings>,
+        utterance: &UnpromptedUtterance<'_>,
+    ) -> UnpromptedSpeech {
+        let decision = decide_unprompted_speech(settings, utterance);
+        match &decision {
+            UnpromptedSpeech::Refused(reason) => {
+                tracing::debug!(
+                    reason = reason.as_str(),
+                    category = %utterance.category,
+                    "declined to speak unprompted"
+                );
+            }
+            UnpromptedSpeech::Spoken => {
+                if let Err(e) = self.voice_output.speak(utterance.text).await {
+                    tracing::warn!(error = %e, "unprompted speech failed to play");
+                }
+            }
+        }
+        decision
     }
 
     pub fn with_memory_extraction(
@@ -3332,5 +3603,413 @@ mod tests {
             turn_complete_count, 0,
             "an interrupted turn must NOT emit turn_complete"
         );
+    }
+
+    // ── PAI-7 P6: speaking first ──────────────────────────────────────────
+
+    use crate::user_data::domain::settings::Settings;
+
+    fn at(hour: u32, minute: u32) -> LocalTimeOfDay {
+        LocalTimeOfDay::new(hour, minute).expect("a real clock face")
+    }
+
+    /// Speech switched on, quiet hours at their shipped default.
+    fn speech_on() -> Settings {
+        Settings {
+            unprompted_speech_enabled: true,
+            ..Default::default()
+        }
+    }
+
+    fn liz() -> ProfileScope {
+        ProfileScope::Owner("liz".to_string())
+    }
+
+    struct Utt {
+        audience: ProfileScope,
+        category: String,
+        text: String,
+        present: Vec<String>,
+        now: LocalTimeOfDay,
+        turn_in_flight: bool,
+    }
+
+    impl Utt {
+        /// The case that SHOULD speak: Liz is here, it is the afternoon, an
+        /// alert, nobody mid-turn. Every test below is this minus one thing.
+        fn speakable() -> Self {
+            Self {
+                audience: liz(),
+                category: "alert".into(),
+                text: "The freezer has been above -15 for an hour.".into(),
+                present: vec!["liz".into()],
+                now: at(14, 30),
+                turn_in_flight: false,
+            }
+        }
+        fn as_utterance(&self) -> UnpromptedUtterance<'_> {
+            UnpromptedUtterance {
+                audience: &self.audience,
+                category: &self.category,
+                text: &self.text,
+                present_members: &self.present,
+                now: self.now,
+                turn_in_flight: self.turn_in_flight,
+            }
+        }
+    }
+
+    fn decide(settings: Option<&Settings>, u: &Utt) -> UnpromptedSpeech {
+        decide_unprompted_speech(settings, &u.as_utterance())
+    }
+
+    /// The positive case, and the vacuity control for every refusal test in
+    /// this section: without it they would all pass against a gate whose body
+    /// was `Refused(NotEnabled)`.
+    #[test]
+    fn an_enabled_present_member_outside_quiet_hours_is_spoken_to() {
+        assert_eq!(
+            decide(Some(&speech_on()), &Utt::speakable()),
+            UnpromptedSpeech::Spoken
+        );
+    }
+
+    /// PAI-7 invariant 6. "Absolute" is a claim about ORDERING as much as about
+    /// the condition, so this asserts the reason is quiet hours rather than
+    /// merely that nothing was said -- a gate that refused for some other
+    /// reason first would pass a "did it stay quiet" assertion while leaving
+    /// the window overridable by whatever it checked first.
+    #[test]
+    fn quiet_hours_refuse_before_anything_else_can_permit() {
+        let mut spoke_outside = 0;
+        let mut checked = 0;
+        for category in ["alert", "info", "action_required"] {
+            for audience in [liz(), ProfileScope::Household, ProfileScope::Guest] {
+                for present in [vec![], vec!["liz".to_string()]] {
+                    for turn_in_flight in [false, true] {
+                        for enabled in [false, true] {
+                            let settings = Settings {
+                                unprompted_speech_enabled: enabled,
+                                unprompted_speech_categories: "alert,info,action_required".into(),
+                                ..Default::default()
+                            };
+                            let mut u = Utt::speakable();
+                            u.audience = audience.clone();
+                            u.category = category.into();
+                            u.present = present.clone();
+                            u.turn_in_flight = turn_in_flight;
+
+                            // 02:00 is inside the shipped 22:00-07:00 window.
+                            u.now = at(2, 0);
+                            checked += 1;
+                            assert_eq!(
+                                decide(Some(&settings), &u),
+                                UnpromptedSpeech::Refused(SpeechRefusal::QuietHours),
+                                "inside quiet hours nothing may permit speech, and the reason \
+                                 must be the window itself: category={category} \
+                                 audience={audience:?} present={present:?} \
+                                 turn_in_flight={turn_in_flight} enabled={enabled}"
+                            );
+
+                            // The vacuity control, and it is load-bearing: the
+                            // sweep above proves nothing unless the SAME
+                            // combinations can speak when the clock moves.
+                            u.now = at(14, 30);
+                            if decide(Some(&settings), &u) == UnpromptedSpeech::Spoken {
+                                spoke_outside += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 72, "the sweep must cover the whole matrix");
+        assert!(
+            spoke_outside > 0,
+            "vacuity control: no combination in this matrix speaks even outside quiet hours, so \
+             the assertions above hold for some other reason"
+        );
+    }
+
+    /// A failed settings read is silence, and NOT a fall back to
+    /// `Settings::default()` -- even though today's default is also silent.
+    /// The default is a value somebody can change; an unreadable store is not
+    /// consent, and laundering one through the other would start speaking the
+    /// day that default moved, with nothing in the gate to review.
+    #[test]
+    fn an_unreadable_settings_read_is_silence_rather_than_a_default() {
+        assert_eq!(
+            decide(None, &Utt::speakable()),
+            UnpromptedSpeech::Refused(SpeechRefusal::SettingsUnreadable)
+        );
+    }
+
+    #[test]
+    fn the_pond_says_nothing_until_a_household_switches_it_on() {
+        assert_eq!(
+            decide(Some(&Settings::default()), &Utt::speakable()),
+            UnpromptedSpeech::Refused(SpeechRefusal::NotEnabled),
+            "the shipped default is off, so a pond that upgrades into this release is quiet"
+        );
+    }
+
+    /// PAI-7 invariants 4 and 5. `Household` is refused for the same reason a
+    /// targeted notification is never broadcast: speaking into the room is
+    /// addressed to nobody and heard by everybody.
+    #[test]
+    fn only_a_named_member_is_ever_spoken_to() {
+        for (audience, expected) in [
+            (ProfileScope::Guest, SpeechRefusal::GuestSession),
+            (
+                ProfileScope::Household,
+                SpeechRefusal::NotAddressedToAMember,
+            ),
+        ] {
+            let mut u = Utt::speakable();
+            u.audience = audience.clone();
+            assert_eq!(
+                decide(Some(&speech_on()), &u),
+                UnpromptedSpeech::Refused(expected),
+                "{audience:?} is not somebody to speak to"
+            );
+        }
+    }
+
+    /// Speaking into an empty room is worse than saying nothing: nobody is
+    /// helped, and whoever IS in the room is not the person it was for.
+    #[test]
+    fn a_member_the_pond_cannot_see_is_not_spoken_to() {
+        for present in [vec![], vec!["jerry".to_string()]] {
+            let mut u = Utt::speakable();
+            u.present = present.clone();
+            assert_eq!(
+                decide(Some(&speech_on()), &u),
+                UnpromptedSpeech::Refused(SpeechRefusal::MemberNotPresent),
+                "presence {present:?} does not include the member this was for"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_said_over_the_top_of_a_turn_in_flight() {
+        let mut u = Utt::speakable();
+        u.turn_in_flight = true;
+        assert_eq!(
+            decide(Some(&speech_on()), &u),
+            UnpromptedSpeech::Refused(SpeechRefusal::MidConversation)
+        );
+    }
+
+    /// The shipped list is `alert` alone, so the category that carries every
+    /// completed scheduled task is exactly the one that stays silent.
+    #[test]
+    fn a_category_the_household_did_not_enable_is_not_spoken() {
+        for category in ["info", "action_required", "", "  ", "ALERTS"] {
+            let mut u = Utt::speakable();
+            u.category = category.into();
+            assert_eq!(
+                decide(Some(&speech_on()), &u),
+                UnpromptedSpeech::Refused(SpeechRefusal::CategoryNotEnabled),
+                "category {category:?} is not in the shipped list"
+            );
+        }
+        // Case and surrounding space are not a different category.
+        let mut u = Utt::speakable();
+        u.category = " Alert ".into();
+        assert_eq!(decide(Some(&speech_on()), &u), UnpromptedSpeech::Spoken);
+    }
+
+    /// The fail-closed direction, and the one that is the OPPOSITE of the rules
+    /// engine's. `schedule.rs :: in_time_window` answers `false` for a
+    /// malformed bound, because there false means a rule does not fire. Here
+    /// false would mean the pond speaks, so a malformed bound is quiet.
+    #[test]
+    fn quiet_hours_that_cannot_be_read_mean_quiet_rather_than_no_window() {
+        for (start, end) in [
+            ("sunset", "07:00"),
+            ("22:00", "dawn"),
+            ("", ""),
+            ("25:00", "07:00"),
+            ("22:00", "07:61"),
+            ("10pm", "7am"),
+        ] {
+            let settings = Settings {
+                unprompted_speech_enabled: true,
+                quiet_hours_start: start.into(),
+                quiet_hours_end: end.into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                decide(Some(&settings), &Utt::speakable()),
+                UnpromptedSpeech::Refused(SpeechRefusal::QuietHoursUnreadable),
+                "quiet hours {start:?}..{end:?} are unreadable, so the pond stays quiet"
+            );
+        }
+    }
+
+    /// A zero-length window is indistinguishable from "no quiet hours", and the
+    /// narrowing reading of an ambiguous setting is the quiet one. Turning
+    /// quiet hours off is what `unprompted_speech_enabled` is for.
+    #[test]
+    fn equal_quiet_bounds_are_quiet_all_day_rather_than_never() {
+        let settings = Settings {
+            unprompted_speech_enabled: true,
+            quiet_hours_start: "00:00".into(),
+            quiet_hours_end: "00:00".into(),
+            ..Default::default()
+        };
+        for hour in [0, 6, 12, 18, 23] {
+            let mut u = Utt::speakable();
+            u.now = at(hour, 0);
+            assert_eq!(
+                decide(Some(&settings), &u),
+                UnpromptedSpeech::Refused(SpeechRefusal::QuietHours),
+                "{hour}:00 with equal bounds"
+            );
+        }
+    }
+
+    #[test]
+    fn the_quiet_window_wraps_midnight_and_its_edges_are_half_open() {
+        let quiet_at = |h: u32, m: u32| {
+            quiet_hours_cover("22:00", "07:00", at(h, m)).expect("well-formed bounds")
+        };
+        assert!(quiet_at(22, 0), "the window includes its start");
+        assert!(quiet_at(23, 59));
+        assert!(quiet_at(0, 0), "and carries across midnight");
+        assert!(quiet_at(6, 59));
+        assert!(!quiet_at(7, 0), "and excludes its end");
+        assert!(!quiet_at(14, 30));
+        assert!(!quiet_at(21, 59));
+
+        // A window that does not wrap is read the same way round.
+        let daytime = |h: u32| quiet_hours_cover("09:00", "17:00", at(h, 0)).unwrap();
+        assert!(!daytime(8));
+        assert!(daytime(9));
+        assert!(daytime(16));
+        assert!(!daytime(17));
+    }
+
+    #[test]
+    fn a_time_of_day_off_the_clock_face_cannot_be_constructed() {
+        assert!(LocalTimeOfDay::new(24, 0).is_none());
+        assert!(LocalTimeOfDay::new(0, 60).is_none());
+        assert_eq!(at(23, 59).minutes(), 23 * 60 + 59);
+        // Vacuity control: the constructor really does accept the edges it
+        // should, so the two `is_none` assertions above are about the range and
+        // not about a constructor that refuses everything.
+        assert!(LocalTimeOfDay::new(23, 59).is_some());
+        assert!(LocalTimeOfDay::new(0, 0).is_some());
+    }
+
+    #[test]
+    fn every_speech_refusal_has_its_own_log_label() {
+        let labels = [
+            SpeechRefusal::SettingsUnreadable.as_str(),
+            SpeechRefusal::NotEnabled.as_str(),
+            SpeechRefusal::QuietHours.as_str(),
+            SpeechRefusal::QuietHoursUnreadable.as_str(),
+            SpeechRefusal::CategoryNotEnabled.as_str(),
+            SpeechRefusal::MidConversation.as_str(),
+            SpeechRefusal::GuestSession.as_str(),
+            SpeechRefusal::NotAddressedToAMember.as_str(),
+            SpeechRefusal::MemberNotPresent.as_str(),
+            SpeechRefusal::NothingToSay.as_str(),
+        ];
+        let unique: std::collections::BTreeSet<&str> = labels.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "two refusals sharing a label make two different failures indistinguishable in the \
+             one place anybody looks: {labels:?}"
+        );
+    }
+
+    /// The behavioural half, and the one that matters: the gate is only worth
+    /// anything if a refusal never reaches the speaker. This drives the real
+    /// `ChatService` with a capturing `VoiceOutput`, so it fails if
+    /// `speak_unprompted` is ever rearranged to speak first and decide after.
+    #[tokio::test]
+    async fn no_refusal_ever_reaches_the_speaker_and_the_allowed_case_does() {
+        async fn service_with(output: Arc<CapturingSpeak>) -> ChatService {
+            let agent = Arc::new(MockAgent::new());
+            let storage = Arc::new(InMemorySessionStorage::new());
+            storage.create_session("s1".to_string()).await.unwrap();
+            ChatService::new(agent, "s1".to_string(), storage).with_voice_output(output)
+        }
+
+        let night = Settings {
+            unprompted_speech_enabled: true,
+            quiet_hours_start: "22:00".into(),
+            quiet_hours_end: "07:00".into(),
+            ..Default::default()
+        };
+        let broken_window = Settings {
+            unprompted_speech_enabled: true,
+            quiet_hours_start: "sunset".into(),
+            ..Default::default()
+        };
+
+        // Every refusal shape, each built as the speakable case minus one thing.
+        let mut guest = Utt::speakable();
+        guest.audience = ProfileScope::Guest;
+        let mut household = Utt::speakable();
+        household.audience = ProfileScope::Household;
+        let mut absent = Utt::speakable();
+        absent.present = vec![];
+        let mut mid_turn = Utt::speakable();
+        mid_turn.turn_in_flight = true;
+        let mut wrong_category = Utt::speakable();
+        wrong_category.category = "info".into();
+        let mut at_night = Utt::speakable();
+        at_night.now = at(2, 0);
+        let mut silent = Utt::speakable();
+        silent.text = "   ".into();
+
+        let plain = Utt::speakable();
+        let off = Settings::default();
+        let cases: Vec<(&str, Option<&Settings>, &Utt)> = vec![
+            ("settings unreadable", None, &plain),
+            ("not enabled", Some(&off), &plain),
+            ("quiet hours", Some(&night), &at_night),
+            ("quiet hours unreadable", Some(&broken_window), &plain),
+            ("category", Some(&night), &wrong_category),
+            ("mid conversation", Some(&night), &mid_turn),
+            ("guest", Some(&night), &guest),
+            ("household", Some(&night), &household),
+            ("absent", Some(&night), &absent),
+            ("nothing to say", Some(&night), &silent),
+        ];
+
+        for (name, settings, utt) in cases {
+            let output = Arc::new(CapturingSpeak::default());
+            let service = service_with(output.clone()).await;
+            let decision = service
+                .speak_unprompted(settings, &utt.as_utterance())
+                .await;
+            assert!(
+                matches!(decision, UnpromptedSpeech::Refused(_)),
+                "{name} must be refused, got {decision:?}"
+            );
+            assert!(
+                output.spoken.lock().unwrap().is_empty(),
+                "{name} reached the speaker: {:?}",
+                output.spoken.lock().unwrap()
+            );
+        }
+
+        // And the control: the allowed case really does reach it, so the ten
+        // assertions above are about the gate and not about a `speak_unprompted`
+        // that never speaks.
+        let output = Arc::new(CapturingSpeak::default());
+        let service = service_with(output.clone()).await;
+        let allowed = Utt::speakable();
+        assert_eq!(
+            service
+                .speak_unprompted(Some(&night), &allowed.as_utterance())
+                .await,
+            UnpromptedSpeech::Spoken
+        );
+        assert_eq!(*output.spoken.lock().unwrap(), vec![allowed.text.clone()]);
     }
 }
