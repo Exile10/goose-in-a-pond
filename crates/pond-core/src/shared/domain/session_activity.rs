@@ -1770,6 +1770,44 @@ mod presence_tests {
         }
     }
 
+    /// The other half of that comparison, and the half `beats`'s doc-comment
+    /// states an ordering for: on an equal rung the more recent conversation
+    /// wins. Inverting it used to change nothing any test could see, because
+    /// the only other fixture with two same-rung rows asserts emptiness.
+    ///
+    /// The ordering is not arbitrary. `SessionIdentity::supersedes` is
+    /// `self.source.rank() <= existing.source.rank()`, so an equal-rung write
+    /// replaces what the row held -- newer wins there too. If presence broke
+    /// the tie the other way, the event would name an older conversation than
+    /// the session row itself considers current.
+    #[test]
+    fn on_an_equal_rung_the_conversation_spoken_in_most_recently_wins() {
+        let older = session("sess-older", t(0));
+        let newer = session("sess-newer", t(30));
+        let jerry = identity(IdentificationSource::Explicit, Some("jerry"));
+
+        for order in [
+            [
+                PresenceEvidence::of(&older, &jerry),
+                PresenceEvidence::of(&newer, &jerry),
+            ],
+            [
+                PresenceEvidence::of(&newer, &jerry),
+                PresenceEvidence::of(&older, &jerry),
+            ],
+        ] {
+            let mut observer = seeded(&[], true, t(0));
+            let events = poll(&mut observer, &order, true, t(40));
+            assert_eq!(named(&events), vec![("jerry", PresenceTransition::Arrived)]);
+            assert_eq!(
+                events[0].session_id, "sess-newer",
+                "two conversations at the same rung named one member and the stale one won; \
+                 `SessionIdentity::supersedes` breaks that tie the other way, so the event and \
+                 the session row would disagree about which claim is current"
+            );
+        }
+    }
+
     // ── A restart is not everybody arriving ──────────────────────────────
 
     #[test]
