@@ -360,12 +360,57 @@ impl LocalInferenceLlmAdapter {
     /// Context size that fits THIS model in the Jetson's LLM budget.
     ///
     /// A single hardcoded constant is wrong, and shipping one OOM-killed a
-    /// device: 16384 was derived from Gemma-4 E2B (35 layers, n_head_kv 1,
-    /// 256-wide heads) which costs ~18 KiB per token across both KV buffers.
-    /// E4B has 42 layers, n_head_kv 2 and 512-wide heads — about 4.8x that, or
-    /// ~86 KiB per token — so the same 16384 asks for ~1.4 GiB of KV on top of
-    /// 4.6 GiB of weights, exceeds the budget, and the kernel kills the server
-    /// (it took gnome-shell with it).
+    /// device: 16384 derived from E2B applied to E4B exceeds the budget and the
+    /// kernel kills the server (it took gnome-shell with it).
+    ///
+    /// # The cost model, measured 2026-08-12
+    ///
+    /// The per-token figures this comment used to carry -- E2B ~18 KiB, E4B ~86
+    /// KiB -- were estimates from attention geometry, and both are wrong,
+    /// because the SHAPE is wrong. Gemma 4 is **interleaved sliding-window
+    /// attention with KV sharing**, so llama.cpp allocates TWO caches and only
+    /// one of them scales with `n_ctx`:
+    ///
+    /// | model | scales with n_ctx | fixed (1024-cell SWA window) |
+    /// |---|---|---|
+    /// | E2B | 3 layers, 6 KiB/token | 12 MiB |
+    /// | E4B | 4 layers, 16 KiB/token | 40 MiB |
+    ///
+    /// Read off `llama_kv_cache: size = ...` at n_ctx 4096, 16384 and 32768:
+    /// the first line grows exactly linearly and the second does not move.
+    /// So the honest model is `slope * n_ctx + constant`, not `rate * n_ctx`.
+    ///
+    /// # Why the slope below is still pessimistic, and what would change it
+    ///
+    /// **That measurement was taken with brew llama.cpp b9110 on Metal. The
+    /// engine runs vendored `llama-cpp-sys-2 =0.1.146`, which is much older.**
+    /// If its llama.cpp lacks the iswa split or the KV sharing, every one of the
+    /// 42 layers stores full-context KV instead of four -- 4 KiB per layer per
+    /// token from the same measurement, so ~168 KiB/token.
+    ///
+    /// That is the number below, and the arithmetic is uncomfortable: at 8192 it
+    /// needs 1344 MiB against 1367 MiB free, which fits by 23 MiB, and at 16384
+    /// it needs 2688 MiB, which does not. The current 8192 for E4B is therefore
+    /// where the pessimistic case *just* survives -- consistent with the board
+    /// running today, and a reason not to raise the ceiling on the strength of a
+    /// Metal measurement against a different llama.cpp.
+    ///
+    /// # Raising `MAX_CTX` alone does nothing today
+    ///
+    /// Worth knowing before trying it. Under the slope below the BUDGET binds
+    /// first for both models -- E4B at 8,331 tokens and E2B at 18,265, each then
+    /// rounded down to a power of two -- so `MAX_CTX` is not the active
+    /// constraint on either. It was under the old, wrongly-shaped 96 KiB/token
+    /// model, which is where the belief that it caps E2B comes from.
+    ///
+    /// The lever is `KV_KIB_PER_TOKEN`, and that is precisely the one that needs
+    /// the device.
+    ///
+    /// **The check that settles it is one line on the device**: load E4B and
+    /// read the two `llama_kv_cache: size` lines. Two caches with a fixed second
+    /// one means the measured slope holds, E4B's real ceiling is ~84k tokens,
+    /// and both `KV_KIB_PER_TOKEN` and `MAX_CTX` can rise. One cache covering 42
+    /// layers means the pessimistic slope is right and nothing moves.
     ///
     /// `apply_jetson_settings` re-stamps the registry at every provider init,
     /// so this cannot be worked around by editing registry.json — it has to be
@@ -382,13 +427,32 @@ impl LocalInferenceLlmAdapter {
     /// `estimate_max_context_for_memory`, so the one function that knows the
     /// real geometry is the one that never gets consulted. Capping those two
     /// branches by the memory estimate would make this helper unnecessary.
-    #[cfg(feature = "cuda")]
+    ///
+    /// Compiled on every platform even though only the CUDA build calls it: the
+    /// arithmetic is pure, it is the part that can kill a board, and gating it
+    /// meant neither it nor its tests ever ran on a developer machine or in CI.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn jetson_context_size(model_bytes: u64) -> u32 {
-        /// Per-token KV cost, both buffers, for the widest geometry we ship.
-        /// E2B measures ~18 KiB, E4B ~86 KiB; 96 keeps headroom for wider.
-        const CONSERVATIVE_KV_KIB_PER_TOKEN: u64 = 96;
-        /// llama.cpp's compute buffers, roughly flat in n_ctx (they scale with
-        /// n_batch). Measured ~515 MiB on this board.
+        /// Per-token cost of the cache that GROWS with `n_ctx`.
+        ///
+        /// 168, not the measured 16, and the doc above says why: this is the
+        /// no-iswa worst case (42 layers x 4 KiB/layer/token) for an engine
+        /// whose llama.cpp may predate the split-cache implementation. It is
+        /// the one constant here that can OOM the device, so it holds the
+        /// pessimistic value until somebody reads the real allocation on the
+        /// Orin.
+        const KV_KIB_PER_TOKEN: u64 = 168;
+        /// The SWA cache, which does NOT scale with `n_ctx` -- 12 MiB on E2B,
+        /// 40 MiB on E4B, flat from 4096 to 32768. Taken at the larger, since
+        /// the budget must hold for the larger model.
+        ///
+        /// The old model had no constant term at all, which is why its
+        /// per-token rate had to absorb one and came out wrong in both
+        /// directions depending on `n_ctx`.
+        const KV_FIXED_MB: u64 = 40;
+        /// llama.cpp's compute buffers. Nearly flat in `n_ctx` -- measured
+        /// 522 MiB at both 4096 and 16384, rising to 582 MiB at 32768 -- so 600
+        /// covers the range this function can return.
         const COMPUTE_BUFFER_MB: u64 = 600;
         const MIN_CTX: u32 = 2048;
         const MAX_CTX: u32 = 16384;
@@ -396,8 +460,9 @@ impl LocalInferenceLlmAdapter {
         let model_mb = model_bytes / (1024 * 1024);
         let kv_mb = crate::scheduler::LLM_BUDGET_MB
             .saturating_sub(model_mb)
-            .saturating_sub(COMPUTE_BUFFER_MB);
-        let tokens = (kv_mb * 1024) / CONSERVATIVE_KV_KIB_PER_TOKEN;
+            .saturating_sub(COMPUTE_BUFFER_MB)
+            .saturating_sub(KV_FIXED_MB);
+        let tokens = (kv_mb * 1024) / KV_KIB_PER_TOKEN;
 
         // Largest power of two that fits, clamped.
         let mut ctx = MIN_CTX;
@@ -612,9 +677,12 @@ mod tests {
     /// The two models GIAP actually ships on the Orin, by measured file size.
     ///
     /// E4B at 16384 is what OOM-killed the device: ~4.6 GiB of weights plus
-    /// ~1.4 GiB of KV against a 6,392 MB budget. It must come back smaller.
-    /// E2B is cheap enough (~18 KiB/token measured) to keep the full window.
-    #[cfg(feature = "cuda")]
+    /// against a 6,392 MB budget. It must come back smaller than E2B's.
+    ///
+    /// No longer `#[cfg(feature = "cuda")]`: this is pure arithmetic, it is the
+    /// part that can kill a board, and gating it meant it never ran on a
+    /// developer machine or in CI -- the only places it CAN run, since the
+    /// device build is `cargo check`-only.
     #[test]
     fn jetson_context_fits_each_model_in_the_budget() {
         let e2b = LocalInferenceLlmAdapter::jetson_context_size(2_890_000_000);
@@ -625,9 +693,73 @@ mod tests {
         assert!(e4b < e2b, "a bigger model must not get a bigger context");
     }
 
+    /// The pessimistic slope is the one that keeps E4B inside the budget, and
+    /// this pins the margin rather than the verdict.
+    ///
+    /// At the no-iswa worst case the answer fits by ~23 MiB out of 1,367, and a
+    /// reader who changes `KV_KIB_PER_TOKEN` or `MAX_CTX` without measuring on
+    /// the device should see how little room there was. It is deliberately
+    /// arithmetic this test redoes rather than a number copied from the
+    /// function -- a test that recomputed it the same way would agree with any
+    /// mistake.
+    #[test]
+    fn e4b_at_its_current_window_only_just_fits_the_pessimistic_budget() {
+        const NO_ISWA_KIB_PER_TOKEN: u64 = 168;
+        let budget_mb = crate::scheduler::LLM_BUDGET_MB;
+        let weights_mb = 4_640_000_000u64 / (1024 * 1024);
+        let free_mb = budget_mb - weights_mb - 600 - 40;
+
+        let chosen = LocalInferenceLlmAdapter::jetson_context_size(4_640_000_000) as u64;
+        let needed_mb = (chosen * NO_ISWA_KIB_PER_TOKEN) / 1024;
+        assert!(
+            needed_mb <= free_mb,
+            "E4B was given {chosen} tokens, which needs {needed_mb} MiB of KV under the no-iswa \
+             worst case against {free_mb} MiB free. That is the case the device might be in, and \
+             exceeding it is what OOM-killed the board and took gnome-shell with it."
+        );
+
+        // And the other direction: doubling it does NOT fit, which is why the
+        // ceiling has not moved on the strength of a Mac measurement.
+        let doubled_mb = (chosen * 2 * NO_ISWA_KIB_PER_TOKEN) / 1024;
+        assert!(
+            doubled_mb > free_mb,
+            "doubling E4B's window now fits the pessimistic budget ({doubled_mb} MiB vs \
+             {free_mb} MiB free). Either the budget grew or the slope changed -- if the device \
+             has been measured and really does split its KV cache, raise MAX_CTX deliberately \
+             and rewrite this test rather than deleting it."
+        );
+    }
+
+    /// What the MEASURED geometry would allow, kept as an executable record of
+    /// the 2026-08-12 measurement so the number is not lost in a commit message.
+    ///
+    /// Asserts nothing about production. It exists so that whoever runs the
+    /// one-line check on the Orin can see immediately what is unlocked: E4B goes
+    /// from 8,192 to roughly 84,000 tokens of headroom, which `MAX_CTX` would
+    /// then be the only thing capping.
+    #[test]
+    fn the_measured_geometry_would_allow_far_more_than_the_pessimistic_one() {
+        // Measured on llama.cpp b9110 / Metal at n_ctx 4096, 16384 and 32768:
+        // E4B's growing cache is 16 KiB/token and its SWA cache is a flat 40 MiB.
+        const MEASURED_KIB_PER_TOKEN: u64 = 16;
+        let weights_mb = 4_640_000_000u64 / (1024 * 1024);
+        let free_mb = crate::scheduler::LLM_BUDGET_MB - weights_mb - 600 - 40;
+        let would_allow = (free_mb * 1024) / MEASURED_KIB_PER_TOKEN;
+
+        assert!(
+            would_allow > 80_000,
+            "the measured slope should leave E4B room for >80k tokens, got {would_allow}"
+        );
+        assert!(
+            would_allow > 8 * LocalInferenceLlmAdapter::jetson_context_size(4_640_000_000) as u64,
+            "the measured geometry allows less than 8x what production gives E4B; either the \
+             measurement or the production constant has changed and the gap this test records \
+             no longer exists"
+        );
+    }
+
     /// A model larger than the whole budget must still return something
     /// loadable rather than zero or a panic.
-    #[cfg(feature = "cuda")]
     #[test]
     fn jetson_context_floors_for_an_oversized_model() {
         assert_eq!(
