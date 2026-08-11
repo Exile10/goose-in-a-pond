@@ -870,6 +870,55 @@ pub struct Settings {
     /// is absent leaves this field at its default, so both mean OFF.
     #[serde(default = "Settings::default_ext_orchestrator_enabled")]
     pub ext_orchestrator_enabled: bool,
+
+    /// May the pond speak without having been spoken to (PAI-7 P6)?
+    ///
+    /// **Its own default fn, returning `false`, for the same reason
+    /// [`Settings::default_ext_orchestrator_enabled`] has one.** Every
+    /// `voice_output.speak()` in this tree today is downstream of a user
+    /// utterance or an explicit `/tts` request. An assistant that starts talking
+    /// on its own after an upgrade is a bad surprise in a way that a new button
+    /// is not, and nobody asked for it by upgrading.
+    ///
+    /// The direction is also the safe one for a failed read: an unreadable
+    /// settings row leaves this at its default, and the gate refuses outright on
+    /// a read it could not perform. Both mean silence.
+    #[serde(default = "Settings::default_unprompted_speech_enabled")]
+    pub unprompted_speech_enabled: bool,
+
+    /// Start of the nightly window in which the pond never speaks unprompted,
+    /// local `"HH:MM"` (PAI-7 P6, invariant 6 -- quiet hours are ABSOLUTE).
+    ///
+    /// Introduced here rather than earlier on purpose: `TimeBoundary` records
+    /// that quiet hours "do not exist … P6 introduces them together with the
+    /// speech gating that gives them meaning", and a window nothing consults is
+    /// a setting that lies.
+    ///
+    /// Wraps midnight when start > end, which is the normal case and the one
+    /// `22:00`/`07:00` takes. Malformed bounds mean silence, never "no quiet
+    /// hours" -- see `chat::quiet_hours_cover`.
+    #[serde(default = "Settings::default_quiet_hours_start")]
+    pub quiet_hours_start: String,
+
+    /// End of the quiet-hours window, local `"HH:MM"`. See
+    /// [`Settings::quiet_hours_start`].
+    #[serde(default = "Settings::default_quiet_hours_end")]
+    pub quiet_hours_end: String,
+
+    /// Which notification categories may be SPOKEN unprompted, comma-separated
+    /// (PAI-7 3.4's category gating, over `Notification.category`).
+    ///
+    /// Defaults to `"alert"` alone -- the narrowest value that leaves the
+    /// feature worth switching on. `info` is the category the schedule bridge
+    /// uses for every completed task, so a default including it would turn "let
+    /// the pond speak" into "the pond reads out every cron line".
+    ///
+    /// A comma-separated string rather than a `Vec` because the store is a flat
+    /// key-value table and the adapter writes one row per field; an unknown or
+    /// blank entry is not a category and is dropped, so a typo silences that
+    /// category rather than opening the rest.
+    #[serde(default = "Settings::default_unprompted_speech_categories")]
+    pub unprompted_speech_categories: String,
 }
 
 impl Default for Settings {
@@ -991,6 +1040,12 @@ impl Default for Settings {
             // The one `false` in this block, and it must stay a literal `false`
             // rather than `Self::default_ext_enabled()`. See the field.
             ext_orchestrator_enabled: false,
+            // PAI-7 P6. Off, and quiet hours already set, so switching speech
+            // on later does not also have to remember to set a window.
+            unprompted_speech_enabled: false,
+            quiet_hours_start: Self::default_quiet_hours_start(),
+            quiet_hours_end: Self::default_quiet_hours_end(),
+            unprompted_speech_categories: Self::default_unprompted_speech_categories(),
         }
     }
 }
@@ -1337,6 +1392,36 @@ impl Settings {
     /// assert on rather than only a value.
     fn default_ext_orchestrator_enabled() -> bool {
         false
+    }
+
+    /// PAI-7 P6. Deliberately NOT a bare `#[serde(default)]`, for the reason
+    /// [`Self::default_ext_orchestrator_enabled`] is not one either: a named
+    /// function is a symbol
+    /// `the_unprompted_speech_toggle_defaults_off_by_its_own_route` can assert
+    /// on, so flipping this on becomes an edit to a failing test rather than a
+    /// one-character change nothing notices.
+    fn default_unprompted_speech_enabled() -> bool {
+        false
+    }
+
+    /// 22:00 local. Quiet hours exist on a fresh install rather than having to
+    /// be discovered: the field that decides whether the pond speaks at all is
+    /// the one that is off, and a household that switches speech on should not
+    /// have to also remember to switch silence on.
+    fn default_quiet_hours_start() -> String {
+        "22:00".to_string()
+    }
+
+    /// 07:00 local.
+    fn default_quiet_hours_end() -> String {
+        "07:00".to_string()
+    }
+
+    /// `alert` only. See the field: `info` carries every completed scheduled
+    /// task, so including it by default would turn this feature into the pond
+    /// reading out its own cron log.
+    fn default_unprompted_speech_categories() -> String {
+        "alert".to_string()
     }
 }
 
@@ -2036,6 +2121,24 @@ mod tests {
             // Devices tab grows a Matter section.
             "matter_enabled",
             "matter_ws_url",
+            // PAI-7 P6's four. Headless for exactly the reason `network_mode`
+            // above is: shipping the control is a `Settings.tsx` + `types.ts`
+            // change, and those files belonged to somebody else on the round
+            // that added these fields. This classification is what the test
+            // checks, so claiming UI_WIRED without the control would assert
+            // something untrue and silence the only guard on it.
+            //
+            // These four owe a UI more than the knobs above them do, and the
+            // reason is worth stating: the others tune when a pipeline reshapes
+            // history, while `unprompted_speech_enabled` decides whether the
+            // assistant talks to you unasked. It is off, so nothing is
+            // reachable without an API call today -- but a household cannot
+            // consent to a feature it cannot see, and the quiet-hours window is
+            // the one setting people will actually want to change.
+            "unprompted_speech_enabled",
+            "quiet_hours_start",
+            "quiet_hours_end",
+            "unprompted_speech_categories",
         ];
         // Everything else is surfaced in the desktop UI (Settings tabs / hub
         // views / onboarding) and mirrored in the TS Settings type.
@@ -2214,6 +2317,61 @@ mod tests {
              coincidence"
         );
         assert!(!Settings::default_ext_orchestrator_enabled());
+    }
+
+    /// PAI-7 P6, and the same three routes as the orchestrator toggle above,
+    /// because this one has the same shape: a `bool` that must be `false` on
+    /// every pond that upgrades into the release containing it.
+    ///
+    /// The difference is what "on" costs. A delegation toggle switched on
+    /// wrongly runs an agent nobody asked for; a speech toggle switched on
+    /// wrongly means a machine starts talking in somebody's house.
+    #[test]
+    fn the_unprompted_speech_toggle_defaults_off_by_its_own_route() {
+        assert!(
+            !Settings::default().unprompted_speech_enabled,
+            "the struct default is what a FAILED settings read produces via \
+             unwrap_or_default(); on failure the pond stays quiet"
+        );
+
+        let from_nothing: Settings =
+            serde_json::from_str("{}").expect("every Settings field has a serde default");
+        assert!(
+            !from_nothing.unprompted_speech_enabled,
+            "the serde default is what a settings payload written before this field existed \
+             deserializes to -- i.e. every pond that upgrades into this release"
+        );
+        assert!(!Settings::default_unprompted_speech_enabled());
+
+        // Vacuity control: the deserialization above really did produce a
+        // populated Settings rather than something that answers `false` to
+        // everything. Without this, the assertion holds against a struct whose
+        // every bool is false for the wrong reason.
+        assert_eq!(
+            from_nothing.quiet_hours_start,
+            Settings::default_quiet_hours_start(),
+            "an empty payload must fill every other field from its default too"
+        );
+        assert!(
+            from_nothing.tool_call_validation,
+            "vacuity control: a serde default that is genuinely `true` survives the same \
+             empty payload, so `unprompted_speech_enabled` being false is a decision"
+        );
+    }
+
+    /// Quiet hours ship SET rather than empty, and the categories ship at their
+    /// narrowest. Both are what a household gets the moment somebody enables
+    /// speech, and neither is something they will be prompted to choose.
+    #[test]
+    fn a_fresh_pond_already_has_a_quiet_window_and_the_narrowest_category() {
+        let s = Settings::default();
+        assert_eq!(s.quiet_hours_start, "22:00");
+        assert_eq!(s.quiet_hours_end, "07:00");
+        assert_eq!(
+            s.unprompted_speech_categories, "alert",
+            "`info` carries every completed scheduled task, so a default including it turns \
+             this feature into the pond reading out its own cron log"
+        );
     }
 
     /// The other direction, and the one that survives a field being added

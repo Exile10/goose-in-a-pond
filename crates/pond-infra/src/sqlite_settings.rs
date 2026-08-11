@@ -569,6 +569,23 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
+        // PAI-7 P6. Without these four lines the fields deserialize, apply and
+        // then vanish on the next read -- the failure mode the roundtrip test
+        // below exists for.
+        upsert!(
+            "unprompted_speech_enabled",
+            if settings.unprompted_speech_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!("quiet_hours_start", &settings.quiet_hours_start);
+        upsert!("quiet_hours_end", &settings.quiet_hours_end);
+        upsert!(
+            "unprompted_speech_categories",
+            &settings.unprompted_speech_categories
+        );
 
         tx.commit().await?;
         Ok(())
@@ -964,6 +981,18 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         // parse-with-fallback: anything unreadable in that column is not "true",
         // so a corrupt row leaves delegation OFF.
         "ext_orchestrator_enabled" => s.ext_orchestrator_enabled = value == "true",
+        // PAI-7 P6. `value == "true"` for the same reason as the line above:
+        // anything unreadable in that column is not "true", so a corrupt row
+        // leaves the pond quiet rather than talking.
+        "unprompted_speech_enabled" => s.unprompted_speech_enabled = value == "true",
+        // The two window bounds and the category list are stored verbatim and
+        // validated where they are USED, not here. A parse at this layer would
+        // have to choose a value for a malformed row, and every choice it could
+        // make is a decision about whether the pond speaks -- which belongs to
+        // the gate, where "unparseable" means quiet hours are in force.
+        "quiet_hours_start" => s.quiet_hours_start = value.to_string(),
+        "quiet_hours_end" => s.quiet_hours_end = value.to_string(),
+        "unprompted_speech_categories" => s.unprompted_speech_categories = value.to_string(),
         _ => {} // unknown key — ignore
     }
 }
