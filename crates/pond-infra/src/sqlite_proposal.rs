@@ -691,99 +691,20 @@ mod tests {
             );
     }
 
-    /// The workspace's `crates/` directory, for the reachability guard below.
-    const CRATES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
-
-    /// Every `.rs` file under `crates/`, as `(path, source)`.
-    fn workspace_sources() -> Vec<(String, String)> {
-        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
-            let entries = match std::fs::read_dir(dir) {
-                Ok(e) => e,
-                Err(e) => panic!("cannot read {}: {e}", dir.display()),
-            };
-            for entry in entries {
-                let path = entry.expect("read dir entry").path();
-                if path.is_dir() {
-                    // `target` can appear under a crate on some layouts and is
-                    // generated, not authored.
-                    if path.file_name().and_then(|n| n.to_str()) != Some("target") {
-                        walk(&path, out);
-                    }
-                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                    let src = std::fs::read_to_string(&path)
-                        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-                    out.push((path.display().to_string(), src));
-                }
-            }
-        }
-        let mut out = Vec::new();
-        walk(std::path::Path::new(CRATES_DIR), &mut out);
-        out
-    }
-
-    /// PAI-7 P3a's central claim, re-proved on every run instead of asserted in
-    /// prose: **nothing outside this file constructs a proposal repository.**
-    ///
-    /// The reason this is a test rather than a sentence in the stamp is that
-    /// the usual tripwire cannot fire. Every symbol in the proposal domain is
-    /// `pub` in a library crate, so `dead_code` says nothing about a type no
-    /// production path can reach -- which is exactly how PAI-1 P5 was recorded
-    /// as landed while being inert on every install, and how PAI-6 P1's clamp
-    /// shipped with its one call site missing. An unreachable mechanism has to
-    /// be claimed positively, the way `UNGATED_SENDERS` claims the egress
-    /// partition, or the next reader assumes reachability from the fact that it
-    /// compiles.
-    ///
-    /// **This test is meant to fail one day.** When PAI-7 P4 adds
-    /// `SqliteProposalRepository::new(db.system.clone())` to `serve()` in
-    /// `crates/pond-server/src/main.rs`, delete it, and update the P3a stamp in
-    /// `docs/architecture/pai/07-proactive-intelligence.md` section 3.2 and the
-    /// ledger in the same change. Deleting it silently is the failure it exists
-    /// to prevent, in the other direction.
-    #[test]
-    fn nothing_outside_this_file_constructs_a_proposal_repository_yet() {
-        let sources = workspace_sources();
-        let this_file = "sqlite_proposal.rs";
-
-        // The vacuity controls come first, because a walk that found nothing
-        // proves nothing and would report the happiest possible answer.
-        assert!(
-            sources.len() > 100,
-            "the source walk found only {} files under {CRATES_DIR}: it is looking in the \
-             wrong place, and the assertion below would pass against an empty set",
-            sources.len()
-        );
-        let sibling_construction: Vec<&str> = sources
-            .iter()
-            .filter(|(path, src)| {
-                !path.ends_with(this_file) && src.contains("SqliteDraftRepository::new(")
-            })
-            .map(|(path, _)| path.as_str())
-            .collect();
-        assert!(
-            !sibling_construction.is_empty(),
-            "the walk cannot see a construction site it is KNOWN to be able to see: \
-             SqliteDraftRepository::new( is called from pond-server. Either the walk does not \
-             reach other crates, or that wiring moved -- and until this control passes, the \
-             assertion below is not evidence of anything"
-        );
-
-        let constructors: Vec<&str> = sources
-            .iter()
-            .filter(|(path, src)| {
-                !path.ends_with(this_file) && src.contains("SqliteProposalRepository::new(")
-            })
-            .map(|(path, _)| path.as_str())
-            .collect();
-        assert!(
-            constructors.is_empty(),
-            "a proposal repository is now constructed outside its own module, in {constructors:?}. \
-             That is good news and this test is the wrong shape for it: PAI-7 P3a is stamped \
-             as domain-and-persistence-only in docs/architecture/pai/07-proactive-intelligence.md \
-             section 3.2, on the strength of this assertion. Delete this test and correct the \
-             stamp and the ledger in the same change."
-        );
-    }
+    // PAI-7 P3a carried a reachability guard here --
+    // `nothing_outside_this_file_constructs_a_proposal_repository_yet` -- which walked every `.rs`
+    // file under `crates/` and asserted that no other file constructed a
+    // `SqliteProposalRepository`. It existed because the usual tripwire cannot fire: every symbol
+    // in the proposal domain is `pub` in a library crate, so `dead_code` says nothing about a type
+    // no production path can reach, which is how PAI-1 P5 was recorded as landed while inert and
+    // how PAI-6 P1's clamp shipped with its one call site missing.
+    //
+    // **It was written to fail one day, and this is that day.** The proposal REST surface wires the
+    // repository in `pond-api`'s `routes.rs`, so the claim it defended -- that P3 was
+    // persistence-only and reached nothing -- has ended. A guard asserting an absence that is over
+    // is worse than no guard: it fails for the right reason and then gets deleted for the wrong
+    // one. Removed here with the P3 stamp and the ledger corrected in the same change, which is
+    // what its own failure message asked for.
 
     /// The SQL half of the `PROPOSAL_ORIGIN` contract, which nothing tied down.
     ///

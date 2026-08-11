@@ -528,8 +528,29 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
   already correct without it, and it would convert "never attributed" into "positively assigned",
   destroying the distinction the next phase may need. The phase is closed by three tests pinning the
   behaviour rather than by SQL — which is the honest form of "already true".
-- **P9 — the device-to-profile rung. STORAGE AND DOMAIN LANDED 2026-08-10; NOTHING IN PRODUCTION
-  REACHES IT.** Read the second half of that stamp before relying on this phase for anything.
+- **P9 — the device-to-profile rung. STORAGE AND DOMAIN LANDED 2026-08-10; THE CAPTURE HALF REACHED
+  PRODUCTION 2026-08-11; THE DELIVERY HALF IS STILL UNREACHED.** Read all three clauses before
+  relying on this phase for anything.
+
+  **Updated 2026-08-11, at the demand of the guard that was written to demand it.** The loopback
+  issuance route now calls `issue_pairing_code_for`, so `devices.profile_id` is reachable in
+  production for the first time and a paired device can be somebody's. `handshake_issue_pairing_code`
+  keeps `if !peer.ip().is_loopback() { return FORBIDDEN }` as its FIRST statement, before the body is
+  read — re-checked when this stamp changed, because the whole security argument for capturing the
+  member at issuance rests on it. That argument, restated so nobody reopens it: a `profile_id` in the
+  pairing REQUEST would be a client naming its own owner, and
+  `IdentificationSource::PairedDevice` outranks both face and explicit identification, so the claim
+  would outrank every proof the pond can actually make. At issuance the answer comes from somebody
+  standing at the pond instead. An empty body still means an unattributed code, which is what the
+  CLI and the dashboard have always sent; a body that is present and unreadable is REFUSED rather
+  than defaulted, because defaulting would narrow correctly and still tell an operator who meant to
+  bind the code to Liz that it worked.
+
+  **What is still unreached, and it is the half PAI-7 P5 needs:** nothing constructs
+  `SqliteDeviceAttribution`, so `devices_for_profile` and `push_tokens_for_profile` have no
+  production caller and no turn resolves a paired device to a member.
+  `crates/pond-infra/tests/device_profile_rung_is_not_wired_yet.rs` still holds three of its four
+  original assertions and will fail when that changes, which is the point of it.
 
   This is the phase `00-checklist.md`'s 2026-08-05 entry called for — "capturing a household member
   at pairing time gets its own phase" — and it never ran. PAI-1's row saying `COMPLETE` is why:

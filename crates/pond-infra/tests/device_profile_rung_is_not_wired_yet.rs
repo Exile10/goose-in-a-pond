@@ -96,30 +96,18 @@ fn nothing_wires_the_device_attribution_repository_yet() {
     }
 }
 
-/// The capture point. `issue_pairing_code_for` is what binds a household member
-/// to a pairing code; until the loopback issuance route offers the operator that
-/// choice, every code is unattributed and so is every device that pairs with
-/// one.
-#[test]
-fn the_pairing_route_does_not_capture_a_member_yet() {
-    assert!(
-        !ROUTES.contains("issue_pairing_code_for"),
-        "the loopback issuance route now binds a household member to a pairing code. \
-         That makes `devices.profile_id` reachable in production for the first time -- \
-         update the phase stamp in \
-         docs/architecture/pai/01-identity-and-profile-boundaries.md, and check the \
-         route is still loopback-only, because the whole security argument for capturing \
-         the member at issuance rests on it."
-    );
-    // And the argument for that design: the pairing client must not be able to
-    // name its own member. `VerifyRequest` carries no profile field, and the
-    // behavioural half of this is
-    // `sqlite_handshake::tests::the_pairing_client_cannot_name_its_own_member`.
-    assert!(
-        !ROUTES.contains("request.profile_id") && !ROUTES.contains("verify.profile_id"),
-        "the pairing request is being read for a member. `PairedDevice` outranks every \
-         other rung of identity resolution, so a client-asserted profile outranks every \
-         proof this pond can make -- the same defect PAI-1 P4 closed on \
-         PUT /sessions/{{id}}/user. Capture the member at code issuance instead."
-    );
-}
+// RETIRED 2026-08-11: `the_pairing_route_does_not_capture_a_member_yet`.
+//
+// It asserted that the loopback issuance route did not yet offer the operator a member to bind a
+// pairing code to, and it failed the day `handshake_issue_pairing_code` began calling
+// `issue_pairing_code_for`. Its failure message asked for two things and both were done: the PAI-1
+// stamp was rewritten, and the route was re-checked for the property the whole security argument
+// rests on. `if !peer.ip().is_loopback() { return FORBIDDEN }` is still the FIRST statement in that
+// handler, before the body is read -- which is what makes capturing the member at issuance
+// trustworthy, since the answer then comes from somebody standing at the pond rather than from a
+// field a client can put in a request. `IdentificationSource::PairedDevice` outranks both face and
+// explicit identification, so a client-asserted member would outrank every proof the pond can make.
+//
+// The other three assertions in this file are UNCHANGED and still true: no turn resolves a paired
+// device to a member, nothing constructs the attribution repository, and no route reads a profile
+// off a pairing request. The delivery half of the rung is still unreached, and that is PAI-7 P5's.

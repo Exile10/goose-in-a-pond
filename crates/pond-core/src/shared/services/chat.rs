@@ -202,16 +202,31 @@ pub struct UnpromptedUtterance<'a> {
 /// input, do less -- and they are opposite booleans because the two windows
 /// mean opposite things. Returning `Option` rather than a bare `bool` is what
 /// keeps a reader from "fixing" one to match the other.
+///
+/// # Equal bounds are decided here, on the parsed times
+///
+/// A zero-length window is indistinguishable from "no quiet hours at all", and
+/// the narrowing reading of an ambiguous setting is the quiet one: switching
+/// quiet hours off is what `unprompted_speech_enabled` is for.
+///
+/// That decision was originally the caller's, taken as `start == end` on the
+/// two setting strings, and it was wrong -- `%H` accepts an unpadded hour, so
+/// `"9:00"` and `"09:00"` are one instant written two ways. Compared as text
+/// they read as `start < end`, take the non-wrapping arm as
+/// `now >= 9:00 && now < 9:00`, and answer NEVER QUIET: the exact inversion of
+/// what the household asked for, produced by how they spelled it. Both bounds
+/// are free text out of the settings table, so both spellings are reachable.
+/// Deciding it after the parse is what makes the two spellings one answer.
 fn quiet_hours_cover(start: &str, end: &str, now: LocalTimeOfDay) -> Option<bool> {
     let parse = |s: &str| {
         let t = chrono::NaiveTime::parse_from_str(s.trim(), "%H:%M").ok()?;
         LocalTimeOfDay::new(chrono::Timelike::hour(&t), chrono::Timelike::minute(&t))
     };
     let (start, end) = (parse(start)?, parse(end)?);
-    Some(if start <= end {
-        // A non-wrapping window. Equal bounds are an EMPTY window under this
-        // comparison, which would mean "never quiet" -- so they are handled by
-        // the caller, which treats them as quiet all day. See `decide`.
+    Some(if start == end {
+        // Zero length, so quiet all day. See the note above.
+        true
+    } else if start < end {
         now >= start && now < end
     } else {
         now >= start || now < end
@@ -3888,6 +3903,61 @@ mod tests {
         assert!(daytime(9));
         assert!(daytime(16));
         assert!(!daytime(17));
+    }
+
+    /// The same defect as the test above, reached by a route the string
+    /// comparison could not see. `"9:00"` and `"09:00"` are the same instant and
+    /// two different strings, and `%H` accepts both -- so a zero-length window
+    /// decided on the raw text reads as `start < end`, gives the non-wrapping
+    /// arm `now >= 9:00 && now < 9:00`, and answers NEVER QUIET. That is a
+    /// scope-widening default reached by spelling: the household asked for the
+    /// window the other test pins and got the opposite of it.
+    ///
+    /// Both bounds are free text. `sqlite_settings::apply_key` stores them
+    /// verbatim on purpose (a parse there would have to pick a value for a
+    /// malformed row) so `PUT /api/v1/settings` can put any of these pairs in
+    /// the table, and every one of them is a plausible thing to type.
+    #[test]
+    fn two_spellings_of_one_time_are_still_a_zero_length_window() {
+        for (start, end) in [
+            ("9:00", "09:00"),
+            ("09:00", "9:00"),
+            ("22:00", "22:0"),
+            ("07:05", "7:5"),
+        ] {
+            let settings = Settings {
+                unprompted_speech_enabled: true,
+                quiet_hours_start: start.into(),
+                quiet_hours_end: end.into(),
+                ..Default::default()
+            };
+            for hour in [0, 9, 14, 22] {
+                let mut u = Utt::speakable();
+                u.now = at(hour, 30);
+                assert_eq!(
+                    decide(Some(&settings), &u),
+                    UnpromptedSpeech::Refused(SpeechRefusal::QuietHours),
+                    "{start:?}..{end:?} is the same instant twice, so it is the zero-length \
+                     window `equal_quiet_bounds_are_quiet_all_day_rather_than_never` pins -- \
+                     but compared as TEXT it reads as a window that never covers anything, and \
+                     the pond talks at {hour}:30 in a house that asked it not to"
+                );
+            }
+        }
+    }
+
+    /// The vacuity control for the test above: a window whose bounds really are
+    /// two different instants must still be read as a window, so the assertions
+    /// there are about equal times spelled differently and not about a
+    /// `quiet_hours_cover` that answers "quiet" to everything.
+    #[test]
+    fn an_unpadded_bound_is_still_read_as_the_time_it_names() {
+        // "9:00".."17:00" -- the same window as the padded spelling, and the
+        // one the wrap test pins with `09:00`.
+        assert_eq!(quiet_hours_cover("9:00", "17:00", at(8, 59)), Some(false));
+        assert_eq!(quiet_hours_cover("9:00", "17:00", at(9, 0)), Some(true));
+        assert_eq!(quiet_hours_cover("9:00", "17:00", at(16, 59)), Some(true));
+        assert_eq!(quiet_hours_cover("9:00", "17:00", at(17, 0)), Some(false));
     }
 
     #[test]

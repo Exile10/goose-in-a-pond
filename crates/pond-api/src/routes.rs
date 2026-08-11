@@ -61,7 +61,12 @@ use pond_core::user_data::domain::skill::UserSkill;
 
 use crate::middleware::onboarding_guard::require_onboarding_complete;
 use crate::{AppState, DownloadEntry, ModelStatusEntry};
+use pond_core::security::ports::policy::is_draft_decision_permitted;
+use pond_core::user_data::domain::draft::DraftStatus;
 use pond_core::user_data::domain::profile::ProfileScope;
+use pond_core::user_data::domain::proposal::{ProposalAudience, PROPOSAL_SESSION_ID};
+use pond_core::user_data::ports::draft::DraftRepository;
+use pond_core::user_data::ports::proposal::ProposalRepository;
 
 // ───────────────────────── REST API Routes ─────────────────────────
 
@@ -227,6 +232,12 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/rules/{id}/pause", post(pause_rule))
         .route("/rules/{id}/resume", post(resume_rule))
+        // ── Proactive proposals (PAI-7 P3b) ────────────────────────────────
+        // The surface PAI-7 P3a's domain has been waiting for. Protected, and
+        // deliberately absent from `middleware::PUBLIC_ROUTES`: a proposal is
+        // addressed to one member and an anonymous caller is not one.
+        .route("/proposals", get(list_proposals))
+        .route("/proposals/{id}/decide", post(decide_proposal))
         // Foreground push: per-device notification stream (#99).
         .route("/notifications/stream", get(notifications_stream))
         // ── Extensions (MCP/Goose extension manager) ───────────────────────────
@@ -13084,6 +13095,269 @@ async fn delete_user_biometrics(
         "profile_id":      profile_id,
         "face_embeddings_deleted": deleted,
         // `voice_prints_deleted` will be populated once Phase 1 lands.
+    })))
+}
+
+// ── Proactive proposals (PAI-7 P3b) ──────────────────────────────────────────
+//
+// P3a landed the `Proposal` domain, `ProposalRepository`, `SqliteProposalRepository`
+// and migrations 0041/0042, and said in its own stamp that NOTHING constructed
+// any of it. This is the surface that lets a person see and dispose of one.
+//
+// # Reusing the drafts machinery is the design decision, not an implementation
+// # shortcut
+//
+// A proposal IS a `drafts` row (`origin = 'proactive'`), so disposing of one is
+// `DraftRepository::update_status` and the ownership question is
+// `is_draft_decision_permitted` -- the same function `giap-draft`'s
+// `DraftMcpServer::decide` asks. That means a proactive suggestion inherits an
+// approval flow that already exists rather than growing a second one, and a
+// later change to the ownership rule reaches both callers.
+//
+// **Approving does not execute anything.** It moves the row to `approved`,
+// exactly as `DraftMcpServer::apply` does. Invariant 1 is "GIAP proposes; the
+// user disposes", and the executor is PAI-7 P4's business.
+//
+// # Why the decide route reads the PROPOSAL repository and not the draft one
+//
+// `DraftRepository::get` would answer for any draft id, and this route would
+// then be a second way to decide a user-staged draft -- one that skips the
+// policy tally and the audit entry `DraftMcpServer::decide` records, which is
+// the telemetry PAI-2 P8b's enforce flip is waiting on. `get_live` answers only
+// for a row that is proactive, pending and unexpired, so an id that is anything
+// else is a 404 here and stays the MCP path's business.
+//
+// The cost of that is real and deliberate: rejecting an EXPIRED proposal is not
+// possible at this edge, though section 3.5 wants rejections as feedback. The
+// MCP path still allows it (`decide` gates only approval on liveness). Rather
+// than widen this route to every draft to get it, the honest fix is a
+// `ProposalRepository` read that returns a decided-or-expired proposal, which
+// belongs with the phase that builds the feedback loop.
+
+/// The caller of a proposal route, as one member.
+///
+/// Invariants 4 and 5 at the HTTP edge, answered by the domain's own door
+/// rather than by a check written here. [`ProposalAudience::from_scope`] admits
+/// `Owner(id)` and refuses the other two, for opposite reasons that both land
+/// on "not one member": `Guest` generates and receives nothing, and `Household`
+/// is not a weaker address than `Owner` — it *is* the broadcast.
+///
+/// **The consequence is a real cliff and I am taking it deliberately.** A
+/// session that nobody has identified resolves to `Household` on a one-member
+/// pond, so on a default install today this answers 403 and the surface is
+/// unusable until a session is bound to a member — by `PUT /sessions/{id}/user`,
+/// by a face match, or (since PAI-1 P9's HTTP half) by a device paired with a
+/// member-bound code. That is narrower than
+/// [`is_draft_decision_permitted`](pond_core::security::ports::policy::is_draft_decision_permitted),
+/// which lets `Household` decide any draft on the argument that a one-member
+/// pond has nobody to protect from. The difference is that a draft can be
+/// unowned and a proposal never is: to LIST one I would have to pick a member,
+/// and picking is the fallback PAI-1 P3 refused. Rather than let the read refuse
+/// while the write permits — you could then dispose of what you cannot see — both
+/// go through this one door.
+async fn proposal_caller(
+    state: &Arc<AppState>,
+    session_id: &str,
+) -> Result<(ProfileScope, ProposalAudience), (StatusCode, Json<Value>)> {
+    let scope = resolve_turn_scope(state, session_id).await;
+    match ProposalAudience::from_scope(&scope) {
+        Ok(audience) => Ok((scope, audience)),
+        Err(e) => {
+            tracing::info!(
+                target: "giap::trace",
+                kind = "proposal_caller_unaddressable",
+                session_id,
+                reason = %e,
+                "a proposal route refused a caller that is not one household member"
+            );
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": e.to_string(),
+                    "hint": "proposals are addressed to one household member; bind this \
+                             session to a member before reading or deciding one",
+                })),
+            ))
+        }
+    }
+}
+
+/// PAI-7 P3a's repository, built from the pool `AppState` already holds.
+///
+/// It belongs on `AppState` as an injected `Arc<dyn ProposalRepository>`, next
+/// to `session_storage` and the rest, and it is not there because `lib.rs` was
+/// owned by other work this round. Everything that needs it goes through this
+/// one function precisely so the swap is a one-line change here and no change
+/// in any handler.
+fn proposal_repo(state: &Arc<AppState>) -> pond_infra::sqlite_proposal::SqliteProposalRepository {
+    pond_infra::sqlite_proposal::SqliteProposalRepository::new(state.db.system.clone())
+}
+
+/// The drafts repository, same story as [`proposal_repo`]. A proposal is a
+/// `drafts` row, and this is what moves it to `approved` or `rejected`.
+fn draft_repo(state: &Arc<AppState>) -> pond_infra::sqlite_draft::SqliteDraftRepository {
+    pond_infra::sqlite_draft::SqliteDraftRepository::new(state.db.system.clone())
+}
+
+/// The wire shape of a proposal.
+///
+/// Built field by field from the accessors rather than by serialising the type,
+/// so the JSON is a decision rather than a consequence of the struct layout —
+/// and so `summary` (which is a method, not a field) is in it. Invariant 2's
+/// `rationale` is a top-level key beside it and never folded into the summary:
+/// a client that renders only the summary must not be able to look like it is
+/// showing the reason.
+fn proposal_json(p: &pond_core::user_data::domain::proposal::Proposal) -> Value {
+    let trigger = p.trigger();
+    json!({
+        "id": p.id(),
+        "summary": p.summary(),
+        "rationale": p.rationale(),
+        "confidence": p.confidence(),
+        "profile_id": p.audience().profile_id(),
+        "created_at": p.created_at().to_rfc3339(),
+        "expires_at": p.expires_at().to_rfc3339(),
+        "proposed_action": p.proposed_action(),
+        "trigger": {
+            "kind": trigger.kind(),
+            "source_id": trigger.source_id(),
+            "signal": trigger.signal(),
+            "observed_at": trigger.observed_at().to_rfc3339(),
+        },
+    })
+}
+
+/// Which session is asking. Required, and deliberately not defaulted: the
+/// session is how this edge learns who the caller is, and a defaulted one would
+/// resolve to `Household` — the broadcast — for every caller.
+#[derive(Deserialize)]
+struct ProposalCallerQuery {
+    session_id: String,
+}
+
+/// `GET /api/v1/proposals?session_id=X` — the live proposals addressed to the
+/// member this session belongs to, newest first.
+///
+/// There is no "list every proposal" route and there will not be one: the port
+/// has no method for it, because the only caller that could want one is a
+/// broadcast (invariant 4). Expiry is filtered in SQL on every read, so a stale
+/// suggestion cannot be listed even though nothing sweeps the table
+/// (invariant 7).
+async fn list_proposals(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ProposalCallerQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let (_scope, audience) = proposal_caller(&state, &query.session_id).await?;
+
+    let proposals = proposal_repo(&state)
+        .list_live_for(audience.profile_id(), chrono::Utc::now())
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "could not list proposals");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not read proposals"})),
+            )
+        })?;
+
+    Ok(Json(json!({
+        "profile_id": audience.profile_id(),
+        "proposals": proposals.iter().map(proposal_json).collect::<Vec<_>>(),
+    })))
+}
+
+/// Approve or reject. There is no third value and no default: a decision this
+/// route could not read is a 400, never an approval.
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ProposalDecision {
+    Approve,
+    Reject,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecideProposalRequest {
+    session_id: String,
+    decision: ProposalDecision,
+}
+
+/// `POST /api/v1/proposals/{id}/decide` — the member disposes.
+///
+/// Approving moves the row to `approved` and executes nothing; see the section
+/// header above.
+async fn decide_proposal(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<DecideProposalRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(request) = body.map_err(|_| bad_body())?;
+    let (scope, _audience) = proposal_caller(&state, &request.session_id).await?;
+
+    // Only a live proposal is decidable here, and `get_live` is what decides
+    // that this id is a proposal at all. Expired, already decided, a
+    // user-staged draft and absent are one answer on purpose.
+    let proposal = proposal_repo(&state)
+        .get_live(&id, chrono::Utc::now())
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, proposal = %id, "could not read a proposal");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not read the proposal"})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "no live proposal with that id",
+                })),
+            )
+        })?;
+
+    // The shared ownership rule, asked with the proposal's own owner and the
+    // sentinel session `SqliteProposalRepository::save` writes. `Owner(id)` may
+    // decide only its own; a different member gets `REASON_FOREIGN_DRAFT`.
+    if let Err(reason) = is_draft_decision_permitted(
+        Some(&scope),
+        &request.session_id,
+        Some(proposal.audience().profile_id()),
+        PROPOSAL_SESSION_ID,
+    ) {
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "proposal_decision_refused",
+            proposal = %id,
+            reason,
+            "a proposal decision was refused"
+        );
+        return Err((StatusCode::FORBIDDEN, Json(json!({"error": reason}))));
+    }
+
+    let status = match request.decision {
+        ProposalDecision::Approve => DraftStatus::Approved,
+        ProposalDecision::Reject => DraftStatus::Rejected,
+    };
+    draft_repo(&state)
+        .update_status(&id, status.clone())
+        .await
+        .map_err(|e| {
+            // Migration 0041's BEFORE UPDATE trigger is the layer under this
+            // one and it aborts an approval it does not like. That is a refused
+            // transition, not a broken pond.
+            tracing::warn!(error = %e, proposal = %id, "a proposal decision was not applied");
+            (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "the proposal could not be moved to that status"})),
+            )
+        })?;
+
+    Ok(Json(json!({
+        "id": id,
+        "status": status.to_string(),
+        // Said out loud because the word "approved" invites the other reading.
+        "executed": false,
     })))
 }
 
