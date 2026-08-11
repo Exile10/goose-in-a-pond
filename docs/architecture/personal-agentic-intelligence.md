@@ -262,3 +262,79 @@ All of these are now **done**. Kept as a record of what was corrected and why.
   the same directory as the ciphertext, so this protects a copied file rather than a stolen board.
 - **It does not promise first-party WhatsApp.** PAI-8 is explicit about which messaging sources
   have a sane official read API and which require a bridge the user runs themselves.
+
+---
+
+## 6. Next, after the eight — measured work the programme uncovered but did not schedule
+
+None of these is a PAI phase. They are the follow-ups the on-device measurements of 2026-08-11
+turned up, recorded here rather than in a scratch file because each has a number attached and the
+numbers are the argument. Full workings in
+[`docs/developer/orin-prefill-measurement.md`](../developer/orin-prefill-measurement.md).
+
+### 6.1 Warm the preamble at boot — the first turn is the only cold one left
+
+**The finding that makes this worth doing: the KV prefix is shared across SESSIONS, not just across
+turns.** Measured on an M4 with three interleaved turns — session A cold, then a brand-new session
+B, then back to A:
+
+| | plan | TTFT | prefill |
+|---|---|---|---|
+| A, turn 1 | `CreateContext` | 12 260 ms | 11 617 ms |
+| **B, turn 1 (new session)** | **`ReusePrefix(6953)`** | **154 ms** | **66 ms** |
+| A, turn 2 | `ReusePrefix(6845)` | 437 ms | 62 ms |
+
+A brand-new conversation reused 6 953 tokens on its *first* turn, because the system prompt and tool
+schemas sit at the front of every prompt and `ReusePrefix` matches on common prefix rather than on
+session identity. So ~6 900 tokens of preamble are shared by every conversation on the pond — desktop,
+voice, GOTG, every household member — and only each session's own tail is ever prefilled.
+
+**Which means exactly one turn on the whole pond is cold: the first one after the process starts.**
+4.8 s of model load plus 11.6 s of prefill on the Mac; the Orin's standalone prefill puts the same
+preamble nearer 8 s there. That is the moment a home assistant feels broken, and it recurs on every
+restart, deploy and reboot.
+
+There is no warm-up in the tree (`grep -n "warm_up\|prewarm" main.rs goose_agent.rs` finds nothing).
+Prefilling the shared preamble once at startup would make the first user turn `ReusePrefix` instead
+of `CreateContext`. It composes with 6.2: fewer tools means a smaller warm-up and a smaller preamble.
+
+**The honest cost, which needs measuring rather than assuming:** it spends one full prefill of GPU
+time at boot whether or not anybody speaks, and on a device that restarts often that may not pay. It
+also wants care about *what* is warmed — warming a preamble that the first real turn then diverges
+from buys nothing, so the warm-up prompt has to be the real rendered preamble, not an approximation
+of it.
+
+### 6.2 `tool_selection_mode = "relevant"` needs burn-in, and the win is 3x
+
+Same machine, model and question, `"all"` against `"relevant"`: 61 tools to 17, prompt 6 969 tokens
+to 2 495, prefill 11 690 ms to 3 326 ms, **TTFT 12 344 ms to 4 065 ms**. The model still reasoned
+(122 tokens against 128) and still answered, because what was cut is schema and not thinking. Tool
+schemas are **88 %** of a default turn's prompt — 25 449 chars of JSON for 61 tools against 2 548
+chars of system prompt.
+
+It is compatible with the prefix cache: selection resolves **once per session from the first
+message**, then caches and persists, so the tool set is stable within a session and turn 2 still
+takes `ReusePrefix` (verified — 17 tools on both turns, prefill 3 258 ms then 27 ms).
+
+**The reason it is not already the default is a real objection, and sharper than "it sometimes
+mis-scores".** The set is chosen from the FIRST message, i.e. at the least informed moment of the
+conversation, and the failure is silent: a session that opens with "what's the weather?" may never be
+offered device control, and the model does not announce a missing tool — it simply does not act.
+Burn-in means measuring that miss rate on real conversations, not deciding it is unlikely.
+
+### 6.3 The 22 % decode gap
+
+GIAP decodes at 38.9-40.4 tok/s where `llama-bench` does 50.6 on the same box and model. Decode is
+per-token, so prompt size does not explain it. Worth checking in this order: the thought filter
+running per token, SSE frame construction per token, sampler configuration differences, and PAI-5
+P2's reasoning-token accounting. It is roughly 10 tok/s on every answer the pond ever gives, which
+compounds differently from the prefill wins above — those help the first token, this helps all of
+them.
+
+### 6.4 Re-run the on-device numbers through the deployed binary
+
+The Orin sweep used the standalone `llama.cpp`, not the tree `goose-local-inference` links, so its
+prefill figures characterise the hardware rather than the engine. The Mac run closed that gap
+locally and showed no degradation; the Jetson equivalent still wants the branch deployed there, and
+the same run would also settle PAI-4 P5's second clause on the hardware that matters.
+
