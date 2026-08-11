@@ -13413,8 +13413,15 @@ mod tests {
         #[test]
         fn a_cron_schedule_is_not_a_rule() {
             // The whole point of the id resolution: `/rules/{id}` must not be a
-            // second door onto `/schedules`. `find_rule` and the listing both
-            // ask this function, so this covers deleting and pausing too.
+            // second door onto `/schedules`.
+            //
+            // This is the PROJECTION and only the projection. It said it
+            // covered deleting and pausing "too", on the grounds that
+            // `find_rule` asks the same function — and it does not: dropping
+            // `&& rule_view(t).is_some()` from `find_rule` leaves this test,
+            // and the whole of this crate's lib suite, green while PUT at a
+            // cron schedule's id answers 200. The consumers are covered in
+            // `tests/rules_surface_test.rs`, through the router.
             let backup = schedule(
                 "nightly-backup",
                 TaskKind::AgentPrompt {
@@ -13479,13 +13486,19 @@ mod tests {
             assert!(req.spec.validate().is_ok());
         }
 
-        /// This file, for the ORDER guard below. The three handlers that store
-        /// a rule cannot be driven from a unit test — they need an `AppState`
-        /// with a live scheduler, which is an integration concern — so what is
-        /// guarded here is that each one still calls the check, and calls it
-        /// BEFORE handing the spec to the scheduler. A test asserting only that
-        /// `rule_spec_rejection` exists would pass with all three call sites
-        /// deleted.
+        /// This file, for the ORDER guard below.
+        ///
+        /// The guard is a TRIPWIRE, not the coverage, and the difference is
+        /// worth stating because this said the opposite: the three handlers do
+        /// not need a live pond, they need an `AppState` with a scheduler in
+        /// it, and `tests/schedule_integration_test.rs` had been building one
+        /// with `build_router` + `oneshot` since before this surface existed.
+        /// What refuses a rule that can never fire is asserted through the
+        /// router in `tests/rules_surface_test.rs`, on the status code and on
+        /// the store afterwards. This only asks that each handler still calls
+        /// the check, still calls it BEFORE the store, and still RETURNS what
+        /// it answers — the last of those because a call whose result is
+        /// discarded satisfies an offset comparison perfectly.
         const ROUTES_SRC: &str = include_str!("routes.rs");
 
         /// The source of one handler: from its signature to the next `async fn`.
@@ -13517,6 +13530,21 @@ mod tests {
             );
         }
 
+        /// The span between one handler's rejection call and its store call —
+        /// the window the RETURN assertion below searches, and the one its
+        /// vacuity control measures. One function, so the control cannot be
+        /// measuring a window the guard does not use.
+        fn rejection_arm(signature: &str, store_call: &str) -> &'static str {
+            let body = handler_body(signature);
+            let check = body
+                .find("rule_spec_rejection(")
+                .unwrap_or_else(|| panic!("{signature} no longer validates the rule spec"));
+            let store = body
+                .find(store_call)
+                .unwrap_or_else(|| panic!("{signature} no longer calls {store_call}"));
+            &body[check..store]
+        }
+
         #[test]
         fn every_door_that_stores_a_rule_validates_first() {
             for (signature, store_call) in [
@@ -13543,7 +13571,38 @@ mod tests {
                     "{signature} calls {store_call} before rule_spec_rejection(), \
                      so the rule is stored whatever the check says"
                 );
+                // And the answer is RETURNED. `if let Some((_status, _body)) =
+                // rule_spec_rejection(..) { debug!(..) }` is a call, is before
+                // the store, and refuses nothing.
+                assert!(
+                    rejection_arm(signature, store_call).contains("return (status, Json(body))"),
+                    "{signature} calls rule_spec_rejection() and does not return \
+                     what it answers, so the 400 naming the field never reaches \
+                     the caller and the rule is stored anyway"
+                );
             }
+        }
+
+        #[test]
+        fn the_return_window_is_the_arm_and_not_the_handler() {
+            // Vacuity control for the RETURN assertion: it searches the span
+            // BETWEEN the check and the store. Every one of these handlers
+            // returns a `(status, Json(body))` tuple somewhere further down, so
+            // a window that grew to the whole body would be satisfied by that
+            // and pass against a rejection whose answer is discarded.
+            let arm = rejection_arm("async fn create_rule(", "create_task(");
+            let body = handler_body("async fn create_rule(");
+            assert!(
+                arm.len() < body.len() / 2,
+                "the window has grown into the rest of the handler: {} of {} bytes",
+                arm.len(),
+                body.len()
+            );
+            assert!(
+                !arm.contains("scheduler returned a non-rule for a rule create"),
+                "the window runs past the store call it is meant to end at, so \
+                 the `return` it finds may be one further down the handler"
+            );
         }
 
         #[test]
