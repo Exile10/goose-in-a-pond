@@ -567,12 +567,45 @@ repeats to the newest per `TriggerIdentity` and caps the list at 24, because a q
 a chatty sensor is thousands of readings and the child's window on the target hardware is 4 096
 tokens including its own instructions.
 
-**What is live-verified and what is not.** The loop starts, ticks once a minute, reads the store,
-finds an audience from a real `sessions` row and refuses at the schedule gate with
-`reason="no_activity_since_start"` — all confirmed on a scratch pond on 2026-08-11. The two gates
-that need fifteen minutes of real conversation followed by fifteen of quiet are **not** live-tested,
-and neither is a completed review; those are section 7's manual-on-the-Orin item and they are still
-owed. `ci.yml` runs `cargo check -p pond-server` and never `cargo test -p pond-server`, so
+#### MEASURED ON THE ORIN 2026-08-12 — the loop works, and produces nothing
+
+The manual-on-the-Orin item in section 7, run against the deployed binary on the Jetson with the
+service stopped and a scratch data dir. **Every gate behaved, the child ran, and zero proposals came
+out.** Both halves of that matter.
+
+What was observed, in order: the reviewer ticked once a minute refusing with `still_active` while the
+idle clock ran; at exactly fifteen minutes past the last turn it logged *"idle after user activity —
+starting a proactive review"* naming the member, `events=2`, `made_today=0`; the child agent spawned,
+ran on E2B and answered **32.4 seconds later** (22:59:13.446 → 22:59:45.841); `interpret_answer`
+parsed its JSON array; and it **refused every impulse** with
+
+> `unknown field 'type', expected one of trigger_kind, source_id, signal, rationale, suggestion,
+> confidence`
+
+Nothing reached the drafts table. So the schedule, the audience resolution, the brief, the
+delegation, the child loop, the cancellation plumbing and the answer parsing are all confirmed
+working on real hardware — and the feature still does nothing, because a 2B model does not write the
+schema it was given.
+
+**Two consequences, one fixed and one a decision.**
+
+*Fixed:* the refusals were logged at DEBUG, so a reviewer that refuses everything spends a model turn
+per interval and reports nothing at all. A run that yields no proposals from a non-empty answer now
+logs WARN, because refusing every impulse is a defect somewhere and never the intended steady state.
+A genuinely quiet day returns an empty array and lands in neither branch.
+
+*A decision, not taken here:* `ReviewerImpulse` is `deny_unknown_fields`, and the argument in its doc
+comment is that an unrecognised field "is either a typo or an attempt to name something the model may
+not name". The safety half of that does not depend on the attribute. The model cannot name an
+audience, an expiry or an id because **the struct has no such fields to read** — `interpret_answer`
+supplies all of them — so serde's default of ignoring unknown keys would leave that property exactly
+as it is. What `deny_unknown_fields` adds is rejecting a whole otherwise-valid suggestion over a
+stray label, which on a small local model is the difference between a working feature and a silent
+one. Dropping it costs precision in the refusal message for a mistyped known field, which
+`Proposal::from_parts` would refuse anyway.
+
+**What is still owed:** the offline-device delivery path. It could not be observed in this run for
+the honest reason that no proposal was produced to deliver. `ci.yml` runs `cargo check -p pond-server` and never `cargo test -p pond-server`, so
 `crates/pond-infra/tests/proactive_reviewer_is_wired.rs` asserts the wiring from the fast pass —
 without it, deleting the `tokio::spawn` leaves the whole workspace green and switches P4 off.
 
