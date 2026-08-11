@@ -2818,14 +2818,37 @@ async fn run_server(
                 push_token_repo.clone(),
             ))
         };
+    // PAI-1 P9's delivery half, and the first production caller the rung has had.
+    //
+    // Until this line `send_to_profile` answered `AttributionUnavailable` for
+    // every member on every pond: the code was correct, tested, and unreachable.
+    // That is the shape PAI-1 P5 shipped in once and PAI-6 P1's clamp shipped in
+    // again, and it is invisible to `dead_code` because every symbol involved is
+    // `pub` in a library crate.
+    let device_attribution: Arc<
+        dyn pond_core::user_data::ports::device_attribution::DeviceAttribution,
+    > = Arc::new(
+        pond_infra::sqlite_device_attribution::SqliteDeviceAttribution::new(db.system.clone()),
+    );
+
+    // The concrete type is kept alongside the trait object on purpose.
+    // `send_to_profile` is NOT on `NotificationSender` and must not be: the port
+    // is `send` (one target) and `broadcast` (the household), and a third method
+    // meaning "resolve a member to their devices" would put PAI-1's attribution
+    // chain behind a trait every mock and stub in the workspace would have to
+    // answer for. PAI-7 invariant 4 -- addressed to a profile, never broadcast --
+    // is carried by `TargetedDelivery`, which has no variant meaning "everybody",
+    // so the refusal cannot be reached by picking the wrong enum arm.
+    let targeted_notification_sender = Arc::new(
+        pond_infra::broadcast_notification_sender::BroadcastNotificationSender::new(
+            notification_tx.clone(),
+            notification_queue.clone(),
+            Some(push_relay),
+        )
+        .with_device_attribution(device_attribution.clone()),
+    );
     let notification_sender: Arc<dyn pond_core::mcp::ports::notification::NotificationSender> =
-        Arc::new(
-            pond_infra::broadcast_notification_sender::BroadcastNotificationSender::new(
-                notification_tx.clone(),
-                notification_queue.clone(),
-                Some(push_relay),
-            ),
-        );
+        targeted_notification_sender.clone();
     // Let the `send_notification` MCP tool reach connected phones too (#99).
     pond_mcp_server::init_notification_sender(notification_sender.clone());
 
