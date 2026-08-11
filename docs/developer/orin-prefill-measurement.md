@@ -159,3 +159,81 @@ against the Orin's CUDA 820-976 in the standalone sweep, so the two are not inte
 absolute latencies do not transfer. What transfers is the *mechanism*: the prefix is token-stable
 across turns, the cache is reused, and the side call does not evict it. Running this same probe on
 the Jetson needs the branch deployed there.
+
+---
+
+## Why a turn is slow, M4 Mac, 2026-08-11: it is the tool schemas, not the engine
+
+"12 seconds to answer *what time is it?*" is a fair complaint, so here is where the time goes. Three
+measurements on the same machine (Apple M4, 24 GB, `gemma-4-E2B-it-Q4_K_M`) separate the causes.
+
+### 1. The engine is already at the hardware ceiling
+
+Standalone `llama-bench` (Homebrew, Metal) against GIAP's live path on the same model:
+
+| prompt depth | standalone llama.cpp | GIAP via `goose-local-inference` |
+|---|---|---|
+| 512 | 670 tok/s | — |
+| 2 048 | 630 tok/s | — |
+| 4 096 | 596 tok/s | — |
+| 6 912 | 538 tok/s | — |
+| **~6 969 (real turn)** | — | **596 tok/s** |
+
+**GIAP's prefill matches or beats the standalone build at the same depth.** There is no engine
+overhead to remove: the retained-KV path, the provider shim and the tool filtering cost nothing
+measurable on the prefill side. Anyone hunting for a slow wrapper here will not find one.
+
+Note also that prefill degrades with depth on Metal exactly as it does on CUDA — 670 to 538 across
+this range — so a longer prompt is punished twice: more tokens, and a worse rate for all of them.
+
+### 2. The prompt is the problem, and 88 % of it is tools
+
+`provider payload size` for the turn above: `system_chars=2548`, `tools_count=61`,
+`tools_json_chars=25449`.
+
+That is 61 tool schemas on a question that needs one. Of 6 969 prompt tokens, roughly 6 100 are tool
+definitions — **about 88 %** — and at ~550 tok/s they cost about ten of the eleven-and-a-half seconds
+of prefill. The conversation itself is under a second.
+
+### 3. The lever already exists and is off by default
+
+`tool_selection_mode` defaults to `"all"`. Setting it to `"relevant"`, same machine, same model,
+same question:
+
+| | `"all"` | `"relevant"` | change |
+|---|---|---|---|
+| tools sent | 61 | **17** | -72 % |
+| tools JSON | 25 449 chars | **6 761 chars** | -73 % |
+| prompt tokens | 6 969 | **2 495** | **-64 %** |
+| prefill | 11 690 ms | **3 326 ms** | **-72 %** |
+| **TTFT** | **12 344 ms** | **4 065 ms** | **3.0x faster** |
+| prefill rate | 596 tok/s | 750 tok/s | +26 % (shallower prompt, better rate) |
+| reasoning tokens | 128 | 122 | unchanged in substance |
+
+Three times faster to first token, and the model still reasoned (122 tokens against 128) and still
+answered correctly. The reasoning budget is untouched because what was cut is schema, not thinking.
+
+**This is the single largest available win on the on-device path, it is already implemented, and it
+is one setting.** The reason it is not the default is that `"relevant"` has not had burn-in — a
+mis-scored turn silently lacks a tool it needed, which is worse than being slow. That is a real
+objection and the answer is burn-in, not permanent avoidance.
+
+### 4. One gap worth chasing separately: decode
+
+| | standalone | GIAP |
+|---|---|---|
+| decode | 50.61 tok/s | 38.9-40.0 tok/s |
+
+GIAP decodes about **22 % slower** than the same model under `llama-bench` on the same box. That is
+not the prefill story and is not explained by prompt size, since decode is per-token. Candidates, in
+the order I would check them: the thought filter running per token, SSE frame construction per token,
+sampler configuration differences, and the reasoning-token accounting added by PAI-5 P2. It is worth
+about 10 tok/s on every answer the pond ever gives.
+
+### And a genuinely surprising cross-machine result
+
+The Orin Nano's CUDA prefill (976 tok/s at 4 096) **beats this M4's Metal prefill** (596 tok/s at the
+same depth), while the M4 wins decode (50.6 against 30.4). Prefill is compute-bound and the Orin's
+CUDA kernels are strong for it; decode is memory-bandwidth-bound and the M4's unified memory is
+faster. So a long-prompt turn is *relatively* better on the Jetson and a long-answer turn is better
+on the Mac — which is the opposite of the intuition that the laptop is simply the faster machine.
