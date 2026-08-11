@@ -5237,6 +5237,29 @@ async fn run_proactive_reviewer(
             tracing::debug!(refusal = ?refusal, "proactive reviewer: impulse refused");
         }
 
+        // A run that produced words and yielded NOTHING is the failure this
+        // feature is most likely to have, and at DEBUG it is invisible.
+        //
+        // Measured on the Orin 2026-08-12: the loop fired correctly, resolved
+        // its audience, spawned a child that answered in 32 s, and every impulse
+        // was refused because a 2B model wrote a `type` field that
+        // `ReviewerImpulse` does not have. Zero proposals, one DEBUG line each,
+        // and a GPU spent per interval for nothing. On a household pond nobody
+        // would ever see the reason.
+        //
+        // WARN, not INFO: refusing every impulse is a defect somewhere -- in the
+        // prompt, in the schema, or in the model -- and it is never the intended
+        // steady state. A run that legitimately has nothing to say returns an
+        // empty array and lands in neither branch.
+        if yielded.proposals.is_empty() && !yielded.refusals.is_empty() {
+            tracing::warn!(
+                refused = yielded.refusals.len(),
+                first = ?yielded.refusals.first(),
+                "proactive review produced nothing: every impulse was refused. The review ran and \
+                 cost a model turn, so this is a defect rather than a quiet day."
+            );
+        }
+
         for proposal in &yielded.proposals {
             if let Err(e) = proposals.save(proposal).await {
                 tracing::warn!(error = %e, "proactive reviewer: could not persist a proposal");
