@@ -119,14 +119,18 @@ mod tests {
         assert_eq!(bus.subscriber_count(), 0);
     }
 
-    /// The bus carries the clock and session-activity events too (PAI-7 P1).
-    /// Cheap to assert and worth asserting: the broadcast channel clones every
-    /// event to every subscriber, so a variant that is expensive or awkward to
-    /// clone is a problem for the whole spine, not just its publisher.
+    /// The bus carries the clock, presence and session-activity events too
+    /// (PAI-7 P1 and P2). Cheap to assert and worth asserting: the broadcast
+    /// channel clones every event to every subscriber, so a variant that is
+    /// expensive or awkward to clone is a problem for the whole spine, not just
+    /// its publisher.
     #[tokio::test]
-    async fn subscribers_receive_the_clock_and_session_events() {
-        use crate::shared::domain::session_activity::{SessionLifecycle, SessionPhase};
+    async fn subscribers_receive_the_clock_presence_and_session_events() {
+        use crate::shared::domain::session_activity::{
+            PresenceTransition, ProfilePresence, SessionLifecycle, SessionPhase,
+        };
         use crate::shared::domain::time_tick::{TimeBoundary, TimeTick};
+        use crate::user_data::domain::session::IdentificationSource;
 
         let bus = InProcessEventBus::new();
         let mut sub = bus.subscribe();
@@ -135,6 +139,14 @@ mod tests {
             boundary: TimeBoundary::Hour,
             at: chrono::Utc::now(),
             local_hour: 7,
+        }));
+        bus.publish(BusEvent::Presence(ProfilePresence {
+            profile_id: "jerry".into(),
+            transition: PresenceTransition::Arrived,
+            source: IdentificationSource::Explicit,
+            confidence: None,
+            session_id: "sess-42".into(),
+            at: chrono::Utc::now(),
         }));
         bus.publish(BusEvent::Session(SessionLifecycle {
             phase: SessionPhase::Idle,
@@ -145,6 +157,13 @@ mod tests {
 
         match sub.next().await.expect("a bus event") {
             BusEvent::Time(t) => assert_eq!(t.local_hour, 7),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        match sub.next().await.expect("a bus event") {
+            BusEvent::Presence(p) => {
+                assert_eq!(p.profile_id, "jerry");
+                assert_eq!(p.transition, PresenceTransition::Arrived);
+            }
             other => panic!("unexpected event: {other:?}"),
         }
         match sub.next().await.expect("a bus event") {
