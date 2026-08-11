@@ -1269,9 +1269,23 @@ mod presence_tests {
         DateTime::from_timestamp(1_700_000_000 + secs, 0).expect("valid timestamp")
     }
 
+    /// A conversation begun and last spoken in at the same moment -- the shape
+    /// a fixture takes when the two clocks are not what it is about.
+    ///
+    /// **Every fixture in this module was once this shape**, which is how the
+    /// one line that picks the activity clock could be pointed at `created_at`
+    /// with the whole suite green. Where the difference is the point, use
+    /// [`long_running`].
     fn session(id: &str, updated_at: DateTime<Utc>) -> Session {
+        long_running(id, updated_at, updated_at)
+    }
+
+    /// A conversation begun at `created_at` and last spoken in at
+    /// `updated_at` -- the shape of every conversation that outlives its own
+    /// first minute.
+    fn long_running(id: &str, created_at: DateTime<Utc>, updated_at: DateTime<Utc>) -> Session {
         let mut session = Session::new(id.to_string());
-        session.created_at = updated_at;
+        session.created_at = created_at;
         session.updated_at = updated_at;
         session.profile_id = None; // the observer reads the identity, not this
         session
@@ -1348,6 +1362,62 @@ mod presence_tests {
         assert!(
             poll(&mut observer, &evidence, true, t(80)).is_empty(),
             "still being here is not a new arrival"
+        );
+    }
+
+    // ── The column presence is keyed on ──────────────────────────────────
+
+    /// The phase's headline safety property, and the one every other fixture
+    /// in this module is blind to. `sessions.created_at` says when a
+    /// conversation *began*; `sessions.updated_at` says when somebody last
+    /// *spoke* in it. Presence is a claim about a person, so it reads the
+    /// second: keying it on `created_at` would publish nothing for a member
+    /// talking right now in a conversation older than the window, and then
+    /// `Departed` for them on the poll after.
+    ///
+    /// No mirror fixture (`updated_at` older than `created_at`) is written,
+    /// deliberately -- that is a row no production path can produce, and a
+    /// test whose fixture production cannot produce tests a system that does
+    /// not exist. The vacuity control below is the producible half.
+    #[test]
+    fn presence_is_keyed_on_when_somebody_last_spoke_not_on_when_the_conversation_began() {
+        let jerry = identity(IdentificationSource::Explicit, Some("jerry"));
+
+        // Opened three hours ago, spoken in ten seconds ago.
+        let live = long_running("sess-long", t(0) - chrono::Duration::hours(3), t(0));
+        let mut observer = seeded(&[], true, t(0));
+        assert_eq!(
+            named(&poll(
+                &mut observer,
+                &[PresenceEvidence::of(&live, &jerry)],
+                true,
+                t(10)
+            )),
+            vec![("jerry", PresenceTransition::Arrived)],
+            "a conversation opened three hours ago and spoken in ten seconds ago is somebody in \
+             the room; keying presence on created_at instead of updated_at loses every \
+             conversation older than the window and reports the member as gone"
+        );
+
+        // Vacuity control, and the producible half of the discrimination: the
+        // same long-running conversation, silent for those three hours,
+        // publishes nothing. Without it the assertion above would also pass
+        // against an observer for which any long-running row arrives.
+        let quiet = long_running(
+            "sess-long-quiet",
+            t(0) - chrono::Duration::hours(3),
+            t(0) - chrono::Duration::hours(3),
+        );
+        let mut control = seeded(&[], true, t(0));
+        assert!(
+            poll(
+                &mut control,
+                &[PresenceEvidence::of(&quiet, &jerry)],
+                true,
+                t(10)
+            )
+            .is_empty(),
+            "a conversation nobody has spoken in for three hours was published as presence"
         );
     }
 
