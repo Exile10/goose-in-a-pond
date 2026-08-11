@@ -20,6 +20,13 @@ constructs it, so P5 remains blocked — but the prerequisite has changed shape 
 schema" to "wire the port", and a phase reading the old sentence would go and build a column that
 is already there.
 
+**Re-verified a third time 2026-08-11, repairing P2.** One claim in this document was false the day
+it was written and inherited from P1: **`PrivacySensitivity::Sensitive` does not keep an event out
+of the audit MCP reads.** `audit.rs :: MAX_SURFACEABLE` *is* `Sensitive`. Corrected in place in
+3.1's repair stamp and in `event_bus.rs`; what `Sensitive` actually buys is a seven-day retention
+sweep instead of thirty. The other four findings were guard-shaped rather than claim-shaped and are
+recorded in the same stamp.
+
 ---
 
 ## 1. What is true today
@@ -65,7 +72,7 @@ compiler check, not a test, and it is the only guard at the rules engine's own d
 (`time_tick::secs_to_next_hour_from`, which takes the clock reading rather than a minute and a
 second, because two positional `u32`s swap silently inside a timer loop);
 `run_session_activity_observer` polls the session store every 60s and folds it through
-**both** `ActivityObserver::poll` and `PresenceObserver::observe`. One task, one read, two
+**both** `ActivityObserver::poll` and `PresenceObserver::observe_read`. One task, one read, two
 observers — a second polling loop would read the same table on its own schedule and the two could
 disagree about which conversations exist.
 
@@ -269,6 +276,85 @@ past them and is caught instead by `a_profile_id_with_no_source_is_not_presence`
 `seeded()` helper's own baseline assertion is vacuous wherever it is called with an empty session
 list, so `a_restart_does_not_announce_the_household_as_arriving` is the only test that pins the
 baseline.
+
+#### REPAIRED — P2, 2026-08-11. Five findings, and three of them were in the paragraphs above
+
+The stamp above is what P2 believed on the day it landed. A review pass reproduced five defects in
+it; all five are now closed and the corrections are here rather than rewritten over the original,
+because what a phase believed while shipping is the useful record.
+
+**1. The headline property was guarded by nothing.** "Presence is keyed on `sessions.updated_at`"
+is the claim this whole section rests on, and every presence fixture set `created_at ==
+updated_at`, so `PresenceEvidence::of` could be pointed at `created_at` with all 1000 pond-core
+tests green — including the two whose *names* state the property. The regression that hides behind
+that is not cosmetic: a conversation opened three hours ago and being spoken in right now would
+publish `Departed`, and could never publish `Arrived` again. The fixture helper now takes both
+columns and `presence_is_keyed_on_when_somebody_last_spoke_not_on_when_the_conversation_began` is
+the discriminating case. The mirror fixture (`updated_at` older than `created_at`) is deliberately
+NOT written — no production path can produce that row.
+
+**2. The publisher decided four things while its doc-comment said it decided none.** Worst of them
+was the freshness window: `presence_window` was a field `main.rs` filled in, and setting it to
+twenty-four hours left `cargo check -p pond-server` and the whole pond-core suite green. Nothing
+exercises `run_session_activity_observer` — no file under `crates/pond-server/tests` names it, and
+`ci.yml` only cargo-checks the crate. Fixed structurally rather than by comment:
+`PresenceInputs`'s fields are private, `PresenceInputs::for_poll` is the only way in from another
+crate, and `PRESENCE_WINDOW` is derived from `INACTIVITY_THRESHOLD_SECS` in pond-core. Writing a
+window in `main.rs` is now E0451. The other three moved with it —
+`household_has_multiple_members(&Result)` for the failed profile count,
+`PresenceObserver::observe_read` for the failed identity read, and `attribution_candidates` for the
+row pre-filter. What remains in the loop and is still guarded by nothing is now listed in the
+function's own doc-comment, `PollClock::idle_threshold` included.
+
+**3. `Sensitive` does not do what this phase thought it did.** The claim inherited from P1 — that
+`Sensitive` "keeps it out of the audit MCP reads" — is false. `pond-mcp-server/src/audit.rs ::
+MAX_SURFACEABLE` **is** `Sensitive` and is passed as `max_sensitivity` to all three read tools, so
+`sensitivities_at_most(Sensitive)` yields Public + Internal + Sensitive: a `presence.profile` row
+is readable through `recent_activity` today, and would be at `Internal` too. The half that is true
+is retention — `pruning.rs` sweeps `>= Sensitive` at seven days and everything else at thirty — and
+that is now the whole of what the assertion messages claim. Guests cannot reach those tools at all
+(`giap-audit` is in `groups_denied_to_guests`), so the exposure is member-to-member, and the
+renderer prints timestamp/category/action without `profile_id`: an Owner turn learns that somebody
+arrived at 19:04, not who. **Open, and owed to whoever decides it:** if presence must be withheld
+from those reads, the change is in `audit.rs` — exclude the `presence.profile` action or lower
+`MAX_SURFACEABLE` — and it is a policy decision about the audit surface, not a classification.
+
+**4. `Believed::beats`'s same-rank tie-break was unguarded** despite its doc-comment naming an
+ordering. Inverting `>` to `<` changed nothing any test could see, because the only other fixture
+with two same-rung rows asserts emptiness.
+`on_an_equal_rung_the_conversation_spoken_in_most_recently_wins` asserts it in both input orders.
+The ordering is not arbitrary: `SessionIdentity::supersedes` is `rank() <= rank()`, so an
+equal-rung write replaces the row, and presence breaking the tie the other way would name a
+conversation the session row no longer considers current.
+
+**5. The poll was an N+1 that grows with history.** It issued one `get_session_identity` per
+attributed session every sixty seconds, forever, on rows `list_sessions` had already returned in
+full — and `list_sessions` has no `LIMIT` and no time bound, so after a year every session ever
+attributed was re-read once a minute to hand the observer rows the freshness gate discards
+microseconds later. `attribution_candidates` now decides which rows are worth the query, from the
+observer's own refusals. It is read-avoidance and not a gate: `present_members` re-applies origin
+and freshness through the same `is_fresh`, and
+`skipping_a_read_never_changes_who_is_published` pins that the cheap read and the expensive one
+publish identical events. The alternative fix — widening `list_sessions`'s `SELECT` and building
+`SessionIdentity` in `TryFrom<SessionRow>` — is the better shape and lands in `pond-infra`; it is
+still worth doing and would let `attribution_candidates` become a pure filter over rows already in
+hand.
+
+**One thing the repair found that is worth carrying forward:** `household_has_multiple_members`
+**cannot change a published presence event**. `identity_resolution::resolve` consults it only in
+the fallback that answers `Household` or `Guest`, and presence publishes for neither, so both
+values produce the same events over the same rows. The failure direction is still correct and
+still pinned, but it is a tripwire rather than a guard —
+`the_household_count_cannot_change_a_published_presence_event` fails the day presence grows a
+`Household` path, which is the day the direction starts being load-bearing.
+
+**Verification of the repair.** Twenty-three unit tests now, and ten further mutations run (each
+applied, run, reverted byte-identical): `updated_at` swapped for `created_at`; the tie-break
+inverted; `PRESENCE_WINDOW` widened to 24h; each of the three filters in `attribution_candidates`
+deleted; the observer's freshness drifted away from the pre-filter's; the failed read folded in as
+an empty house and as a fresh start; and the presence classification lowered to `Internal`. Each
+failed with a message naming the defect. The structural claim was checked by writing the thing it
+forbids: a `PresenceInputs` struct literal in `main.rs` is a compile error.
 
 ### 3.2 Propose, do not act
 
@@ -489,13 +575,17 @@ memory extraction, decay and consolidation already exist.
   the observer publishes nothing about sessions the pond minted for itself (`SessionOrigin`), and
   `rules_to_fire`'s refusal to act on a viewless event is guarded by `#[non_exhaustive]` rather
   than by a test at that call site.
-- **P2** `Presence` events from PAI-1's identification chain. **LANDED 2026-08-11.** See the P2
-  stamp in 3.1 for what is true now. Four things a later phase must not assume: presence is the
-  **face and explicit** rungs only, and there is no geofence source of any kind; a `Departed` is the
-  pond's own timeout, not an observation of somebody leaving; a member who is present when the
-  process starts is recorded rather than announced, so P4 must read the *absence* of an `Arrived` as
-  "no edge crossed" and never as "nobody is home"; and the whole thing is silent on a stock install
-  until PAI-1's identification routes get a caller.
+- **P2** `Presence` events from PAI-1's identification chain. **LANDED 2026-08-11, REPAIRED the
+  same day** — read both stamps in 3.1, and the repair before the landing, because three of the
+  five findings were in the landing stamp's own paragraphs. Four things a later phase must not
+  assume: presence is the **face and explicit** rungs only, and there is no geofence source of any
+  kind; a `Departed` is the pond's own timeout, not an observation of somebody leaving; a member who
+  is present when the process starts is recorded rather than announced, so P4 must read the
+  *absence* of an `Arrived` as "no edge crossed" and never as "nobody is home"; and the whole thing
+  is silent on a stock install until PAI-1's identification routes get a caller. A fifth, from the
+  repair: **`presence.profile` rows are readable through `giap-audit` today** — `Sensitive` bounds
+  their retention, not their audience — so P6's TTS gating and anything else that treats a presence
+  row as private needs the `audit.rs` decision made first.
 - **P3** `Proposal` domain + persistence in the drafts table; proposal UI in the existing drafts
   surface.
 - **P4** The `proactive-reviewer` role, gated by the `should_run` shape from
