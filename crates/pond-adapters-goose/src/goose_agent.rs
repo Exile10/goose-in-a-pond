@@ -1466,14 +1466,48 @@ impl GooseAdapter {
     /// budget in this adapter (PAI-3 P5 made it so, after two of four call
     /// sites forgot the prompt-side clamp), and a reservation applied at one of
     /// three call sites would be the same defect again.
+    /// PAI-5 P5 is applied here, and this is the only place that reads what
+    /// reasoning has actually cost. `None` -- no storage wired, or a read that
+    /// failed -- means the anchor stands, which is the value the curve already
+    /// shipped, so the failure direction is "no change".
     async fn turn_profile(&self, giap_session_id: &str) -> CompactionProfile {
         let (provider, window) = self.window_and_provider().await;
+        let observed = self.observed_reasoning_samples().await;
         Self::profile_for_session(
             &crate::orchestrator::process_device_ledger(),
             &provider,
             window.tokens,
             giap_session_id,
+            &observed,
         )
+    }
+
+    /// Recent measured `reasoning_tokens`, for PAI-5 P5's reserve.
+    ///
+    /// Bounded by ROWS SCANNED rather than by samples returned, so a pond with
+    /// thinking switched off does not walk its whole history once per turn --
+    /// see the port docs. 400 rows is roughly a fortnight of ordinary use and
+    /// costs one indexed read against `idx_session_messages_created_at`, which
+    /// is noise beside a prefill measured in seconds.
+    ///
+    /// A failed read answers with no samples rather than propagating: a turn
+    /// must not fail because the pond could not work out how much room to leave
+    /// itself, and no samples means the anchor.
+    async fn observed_reasoning_samples(&self) -> Vec<u32> {
+        const SCAN_ROWS: usize = 400;
+        let Some(storage) = &self.giap_session_storage else {
+            return Vec::new();
+        };
+        match storage.recent_reasoning_samples(SCAN_ROWS).await {
+            Ok(samples) => samples,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "could not read reasoning history; keeping the anchor output reserve"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// The ledger read and the profile build, with no live adapter around them.
@@ -1497,11 +1531,13 @@ impl GooseAdapter {
         provider: &str,
         resolved_window: usize,
         giap_session_id: &str,
+        observed_reasoning: &[u32],
     ) -> CompactionProfile {
         Self::profile_for(
             provider,
             resolved_window,
             ledger.reserved_fraction(giap_session_id),
+            observed_reasoning,
         )
     }
 
@@ -1524,12 +1560,29 @@ impl GooseAdapter {
         provider: &str,
         resolved_window: usize,
         reserved_fraction: f32,
+        observed_reasoning: &[u32],
     ) -> CompactionProfile {
-        CompactionProfile::for_windows(
+        let profile = CompactionProfile::for_windows(
             resolved_window,
             ContextGovernor::prompt_window(provider, resolved_window),
         )
-        .with_history_reserved(reserved_fraction)
+        .with_history_reserved(reserved_fraction);
+
+        // PAI-5 P5. Applied AFTER `for_windows` for the same reason
+        // `with_history_reserved` is: the anchor curve is the input, not the
+        // output. `observed_output_reserve` floors at whatever the curve chose,
+        // so a pond with too little evidence -- which is every pond on its first
+        // day, and every pond with thinking switched off, forever -- gets
+        // exactly the profile this function returned before P5 existed.
+        let reserve = pond_core::models::services::context::context_budget::observed_output_reserve(
+            observed_reasoning,
+            profile.output_reserve_tokens,
+            profile.context_window_tokens,
+        );
+        CompactionProfile {
+            output_reserve_tokens: reserve,
+            ..profile
+        }
     }
 
     /// Whether the ACTIVE model can accept image content.
@@ -6250,6 +6303,59 @@ mod tests {
     /// `0.0` that reads like a tolerance.
     const NO_LIVE_CHILD: f32 = 0.0;
 
+    /// What `turn_profile` reads out of the message store on a pond that has
+    /// not measured any reasoning -- which is every pond until `show_thinking`
+    /// is on and a model that reasons has run. PAI-5 P5's derivation floors at
+    /// the anchor, so this must reproduce the pre-P5 profile exactly, and
+    /// `an_unmeasured_pond_gets_exactly_the_profile_it_got_before_pai_5_p5`
+    /// asserts that rather than leaving it to these constants to imply.
+    const NO_REASONING_HISTORY: &[u32] = &[];
+
+    /// PAI-5 P5's wiring guard, and it is the one that matters: the derivation
+    /// is unit-tested in pond-core, but nothing there can see whether the
+    /// ADAPTER passes the anchor as the floor or, say, passes zero -- which
+    /// would compile, and would let a quiet pond talk its own reserve down to
+    /// nothing and resume ending conversations mid-generation.
+    #[test]
+    fn an_unmeasured_pond_gets_exactly_the_profile_it_got_before_pai_5_p5() {
+        for window in [4_096usize, 8_192, 32_768] {
+            let unmeasured = GooseAdapter::profile_for("local", window, NO_LIVE_CHILD, &[]);
+            let anchor = pond_core::models::services::context::context_budget::CompactionProfile::for_windows(
+                window,
+                ContextGovernor::prompt_window("local", window),
+            );
+            assert_eq!(
+                unmeasured.output_reserve_tokens, anchor.output_reserve_tokens,
+                "at window {window} an unmeasured pond's reserve moved. P5 must be inert until                  there is evidence, or every install changes behaviour on upgrade for no reason"
+            );
+        }
+    }
+
+    /// And the other direction, without which the test above is satisfied by a
+    /// feature that does nothing at all.
+    #[test]
+    fn a_pond_that_reasons_expensively_gets_a_bigger_reserve_than_the_anchor() {
+        let unmeasured = GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD, &[]);
+
+        // The sample cost is derived from the anchor rather than written down.
+        // The first draft used a flat 900, and at this window two times that
+        // quantises to exactly the anchor -- so the test failed for a true
+        // reason that had nothing to do with the wiring it was checking.
+        // Sizing off the anchor keeps it meaningful if the curve moves.
+        let dear: Vec<u32> = vec![unmeasured.output_reserve_tokens as u32; 40];
+        let measured = GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD, &dear);
+
+        assert!(
+            measured.output_reserve_tokens > unmeasured.output_reserve_tokens,
+            "40 turns of {}-token reasoning did not move the reserve ({} vs {}). The adapter is \
+             not passing the samples through, and that is invisible from pond-core -- the \
+             derivation's own tests would all still pass",
+            unmeasured.output_reserve_tokens,
+            measured.output_reserve_tokens,
+            unmeasured.output_reserve_tokens
+        );
+    }
+
     /// The wiring guard. `for_windows` is unit-tested in pond-core; what this
     /// asserts is that the adapter hands it the two windows the right way round,
     /// which is the half that cannot be checked from inside pond-core and the
@@ -6257,8 +6363,9 @@ mod tests {
     #[test]
     fn a_local_turn_budgets_history_from_the_window_and_the_preamble_from_the_clamp() {
         // A Mac that resolved 32,768: four times the KV cache of the clamp.
-        let big = GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD);
-        let clamped = GooseAdapter::profile_for("local", 8_192, NO_LIVE_CHILD);
+        let big = GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD, NO_REASONING_HISTORY);
+        let clamped =
+            GooseAdapter::profile_for("local", 8_192, NO_LIVE_CHILD, NO_REASONING_HISTORY);
 
         // Preamble: frozen at the clamp's allowance. If this grows, TTFT grows
         // with it on every single turn, because it is the KV prefix.
@@ -6288,8 +6395,8 @@ mod tests {
     /// context isolation the whole workstream is justified by.
     #[test]
     fn a_live_child_shrinks_the_parents_history_and_leaves_its_prefix_alone() {
-        let alone = GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD);
-        let sharing = GooseAdapter::profile_for("local", 32_768, 0.5);
+        let alone = GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD, NO_REASONING_HISTORY);
+        let sharing = GooseAdapter::profile_for("local", 32_768, 0.5, NO_REASONING_HISTORY);
 
         assert!(
             sharing.history_token_budget < alone.history_token_budget,
@@ -6338,8 +6445,20 @@ mod tests {
         let ledger = Arc::new(crate::orchestrator::DeviceLedger::default());
         let _child = ledger.reserve("sess-A", 0.5);
 
-        let delegating = GooseAdapter::profile_for_session(&ledger, "local", 32_768, "sess-A");
-        let bystander = GooseAdapter::profile_for_session(&ledger, "local", 32_768, "sess-B");
+        let delegating = GooseAdapter::profile_for_session(
+            &ledger,
+            "local",
+            32_768,
+            "sess-A",
+            NO_REASONING_HISTORY,
+        );
+        let bystander = GooseAdapter::profile_for_session(
+            &ledger,
+            "local",
+            32_768,
+            "sess-B",
+            NO_REASONING_HISTORY,
+        );
 
         assert!(
             delegating.history_token_budget < bystander.history_token_budget,
@@ -6351,7 +6470,8 @@ mod tests {
         );
         assert_eq!(
             bystander.history_token_budget,
-            GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD).history_token_budget,
+            GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD, NO_REASONING_HISTORY)
+                .history_token_budget,
             "a session with no live child of its own was charged for somebody else's, so the \
              lookup is not keyed by session at all"
         );
@@ -6361,7 +6481,7 @@ mod tests {
     /// redistributed — the symmetric profile, unchanged from before this phase.
     #[test]
     fn an_http_turn_is_not_clamped_at_all() {
-        let p = GooseAdapter::profile_for("ollama", 32_768, NO_LIVE_CHILD);
+        let p = GooseAdapter::profile_for("ollama", 32_768, NO_LIVE_CHILD, NO_REASONING_HISTORY);
         assert_eq!(p.system_prompt_budget, 6_000);
         assert_eq!(p.memory_token_budget, 1_500);
         assert_eq!(p.history_token_budget, 20_000);

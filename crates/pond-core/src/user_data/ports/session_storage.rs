@@ -95,6 +95,38 @@ pub trait SessionStorage: Send + Sync {
         Ok(0) // default no-op for backward compat
     }
 
+    /// What reasoning has actually cost on this pond, newest first — PAI-5 P5.
+    ///
+    /// Returns the `reasoning_tokens` of recent assistant messages that HAVE
+    /// one. `None` rows are dropped rather than folded in as zero, and that is
+    /// the whole correctness of this method: migration 0039 made the column
+    /// nullable with no `DEFAULT` precisely so an unmeasured turn is
+    /// distinguishable from a turn that did not reason, and a `0` from a turn
+    /// nobody counted is a vote for a smaller output reserve cast by evidence
+    /// that does not exist.
+    ///
+    /// `scan_limit` bounds the ROWS READ, not the samples returned. A pond with
+    /// thinking switched off has no `reasoning_tokens` anywhere, and a query
+    /// bounded only by a result count would walk the entire message history
+    /// every turn finding nothing — on a Jetson, forever.
+    ///
+    /// **The default returns no samples, and that is the narrowing direction.**
+    /// No samples means [`observed_output_reserve`] keeps the measured anchor,
+    /// which is the value the curve already shipped. A defaulted trait method is
+    /// one of this programme's recorded vacuity shapes, so it is worth being
+    /// explicit about why this one is safe: forgetting to override it cannot
+    /// produce a wrong reserve, only the previous one.
+    /// `sqlite_reads_real_reasoning_samples_rather_than_the_default` guards the
+    /// real adapter against exactly that.
+    ///
+    /// [`observed_output_reserve`]: crate::models::services::context::context_budget::observed_output_reserve
+    async fn recent_reasoning_samples(
+        &self,
+        _scan_limit: usize,
+    ) -> Result<Vec<u32>, SessionStorageError> {
+        Ok(Vec::new())
+    }
+
     /// Return the content of the earliest user message in a session, if any.
     ///
     /// Used as a read-time fallback to derive a human-readable label when a

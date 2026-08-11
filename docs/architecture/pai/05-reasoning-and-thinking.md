@@ -671,8 +671,50 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   deleting the `settings.reasoning_effort.hash()` line fails with "the fast hash misses
   reasoning_effort — it would report a changed prefix unchanged". Both restored byte-identical.
   Asserting that the identifier `reasoning_effort` appears in `prompts.rs` would have survived both.
-- **P5** `output_reserve_tokens` derived from measured reasoning behaviour rather than a constant
-  (needs P2's data).
+- **P5 — LANDED 2026-08-11.** `output_reserve_tokens` derived from measured reasoning behaviour
+  rather than a constant.
+
+  **First, what was already true and why it was not this phase.** The anchor curve's Jetson tier
+  carried 768 with the comment *"a thinking block alone measured 306 tokens on this device"*, and it
+  is easy to read that as the phase being done. It is not: that is one observation, written into a
+  constant on 2026-08-06 (`3804de0c`), and the cost of reasoning is a property of the MODEL and the
+  EFFORT, both of which a household changes without telling anybody. A constant with a measured
+  justification is still a constant.
+
+  `observed_output_reserve(samples, anchor, window)` sizes the reserve from this pond's own
+  `reasoning_tokens` — P2's data, finally read. `SessionStorage::recent_reasoning_samples` is the
+  read, `GooseAdapter::turn_profile` the caller, and `profile_for` applies it after `for_windows`
+  for the same reason `with_history_reserved` is applied there: the anchor curve is the input.
+
+  Four things a later phase must not assume.
+
+  **The reserve is QUANTISED to 256 tokens, and that is the phase's interdependency answer, not a
+  tidiness choice.** `turn_profile` is the single producer of every budget in the live adapter and
+  runs per turn, so a reserve recomputed from a growing sample set would take a slightly different
+  value on most turns. Be exact about the cost, because the first draft of the code comment was not:
+  the reserve feeds `usable_prompt_tokens` and `usable_history_tokens`, which the turn trimmer
+  consumes; it does **not** move the preamble, because the number rendered into the system prompt is
+  `reasoning_budget_words(effort, compact_prompt)`, which never sees the profile. So a moving
+  reserve shifts the TRIM POINT, and a trim drops the oldest messages, so everything after the
+  preamble moves and the reusable KV prefix truncates back to the preamble. The history re-prefills;
+  the preamble does not. Smaller than "the whole prompt", still not worth paying every turn at
+  674-976 tok/s. `a_growing_sample_set_does_not_move_the_reserve_every_turn` is the guard, and it is
+  measured against an unquantised control — **its first draft passed with the quantisation
+  deleted**, because the fixture cycled through seventeen values so the percentile stopped moving.
+
+  **Observation may only raise the reserve.** The floor is the anchor, applied last, so it wins even
+  over the 25%-of-window ceiling. The anchor is the value at which a real conversation stopped dying;
+  the ceiling is a policy about leaving room for history. When they disagree the measurement wins.
+
+  **A `None` reasoning count is not a zero.** Migration 0039 left the column nullable with no
+  `DEFAULT` for exactly this reason, and `recent_reasoning_samples` filters in SQL: a zero from a
+  turn nobody counted is a vote for a smaller reserve cast by evidence that does not exist.
+
+  **The 2x is anchored to a stated intent, not a live division.** The derivation sizes the reserve at
+  twice the p95 because `reasoning_budget_tokens` gives `Thorough` half of it — and that function
+  **has no production caller today**, checked rather than assumed; its only mention outside its own
+  module is a doc comment in `settings.rs`. Sizing against this codebase's own stated answer beats
+  inventing a second one, but giving it a caller is what would make the relationship load-bearing.
 - **P6 — LANDED 2026-08-07 (`bc3aa9df`).** `persist_thinking` side table; UI disclosure in the
   existing thinking panel; never replayed. The deferral note below it predicted the shape of the
   work correctly and was wrong about exactly one thing, which is recorded at the end.

@@ -833,6 +833,35 @@ impl SessionStorage for SqliteSessionStorage {
         Ok(count.max(0) as u64)
     }
 
+    async fn recent_reasoning_samples(
+        &self,
+        scan_limit: usize,
+    ) -> Result<Vec<u32>, SessionStorageError> {
+        // Walks `idx_session_messages_created_at` backwards and stops after
+        // `scan_limit` ROWS -- not after that many samples. See the port docs:
+        // bounding by result count would make a pond with thinking switched off
+        // scan its whole history every turn to find nothing.
+        //
+        // `IS NOT NULL` is applied in SQL rather than in Rust so a row nobody
+        // counted cannot arrive here as a zero. The distinction is migration
+        // 0039's entire reason for having no DEFAULT on that column.
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT reasoning_tokens FROM ( \
+                 SELECT reasoning_tokens FROM session_messages \
+                 ORDER BY created_at DESC LIMIT ? \
+             ) WHERE reasoning_tokens IS NOT NULL",
+        )
+        .bind(scan_limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(tokens,)| u32::try_from(tokens).unwrap_or(0))
+            .collect())
+    }
+
     async fn first_user_message(
         &self,
         session_id: &str,
@@ -1737,6 +1766,63 @@ mod tests {
     /// reasoning count reads back `None` rather than `Some(0)`. PAI-5 P5 sizes
     /// an output reserve from this column, and "nobody counted" read as "no
     /// thinking happened" would bias every reserve downwards.
+    /// PAI-5 P5's read, and the guard on the defaulted port method.
+    ///
+    /// The port defaults `recent_reasoning_samples` to an empty vec so mocks
+    /// keep compiling, and a defaulted trait method is a recorded vacuity shape
+    /// in this programme: deleting a real override leaves the tree green while
+    /// the feature quietly stops working. Here it would stop by keeping the
+    /// anchor forever, which is silent by construction. So the real adapter is
+    /// asserted to answer with real numbers.
+    #[tokio::test]
+    async fn sqlite_reads_real_reasoning_samples_rather_than_the_default() {
+        let tmp = tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        let s = SqliteSessionStorage::new(db.system);
+        s.create_session("samples".to_string()).await.unwrap();
+
+        for (id, reasoning) in [
+            ("m1", Some(120u32)),
+            ("m2", None),
+            ("m3", Some(340)),
+            ("m4", None),
+            ("m5", Some(90)),
+        ] {
+            s.add_message(
+                "samples".to_string(),
+                SessionMessage::new(
+                    id.to_string(),
+                    "samples".to_string(),
+                    ChatMessage::assistant("turn"),
+                )
+                .with_token_counts(Some(100), Some(10))
+                .with_reasoning_tokens(reasoning),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut got = s.recent_reasoning_samples(100).await.unwrap();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![90, 120, 340],
+            "an unmeasured turn must not arrive as a zero. Migration 0039 left that column \
+             nullable with no DEFAULT for exactly this reason, and a zero here is a vote for a \
+             smaller output reserve cast by a turn that never reasoned"
+        );
+
+        // `scan_limit` bounds ROWS READ, not samples returned. Reading one row
+        // can therefore yield no samples at all -- which is the point: a pond
+        // with thinking off must not walk its whole history every turn.
+        let scanned_one = s.recent_reasoning_samples(1).await.unwrap();
+        assert!(
+            scanned_one.len() <= 1,
+            "scan_limit is being applied to the sample count rather than to the rows scanned; \
+             on a pond with no reasoning that makes this a full history scan per turn"
+        );
+    }
+
     #[tokio::test]
     async fn reasoning_tokens_round_trip_beside_the_provider_counts() {
         let tmp = tempdir().unwrap();
