@@ -171,7 +171,10 @@ pub use news::{init_news_deps, spawn_news_server};
 // `register_giap_extensions`: the orchestrator is a Goose adapter and this crate
 // is built before it, so pond-server installs the handle once the adapter
 // exists — the same shape as `init_toolkit_deps`.
-pub use orchestrator::{init_orchestrator_deps, spawn_orchestrator_server, OrchestratorDeps};
+pub use orchestrator::{
+    init_orchestrator_deps, installed_orchestrator_deps, spawn_orchestrator_server,
+    OrchestratorDeps,
+};
 pub use schedule::{init_schedule_deps, spawn_schedule_server};
 pub use secrets::{init_secret_deps, secret};
 pub use sensors::{init_sensor_deps, spawn_sensor_server};

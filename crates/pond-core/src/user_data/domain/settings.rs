@@ -919,6 +919,30 @@ pub struct Settings {
     /// category rather than opening the rest.
     #[serde(default = "Settings::default_unprompted_speech_categories")]
     pub unprompted_speech_categories: String,
+
+    /// May the pond reason about what has happened, unasked (PAI-7 P4)?
+    ///
+    /// **A second toggle rather than a reuse of
+    /// [`Settings::ext_orchestrator_enabled`], because they are different
+    /// questions.** That one asks whether a model may hand work to a subagent
+    /// during a turn the user started. This one asks whether the pond may start
+    /// a turn of its own. Somebody who switches delegation on has said the
+    /// first, and folding the second into it would have the pond begin forming
+    /// opinions about their house as a side effect.
+    ///
+    /// The reviewer needs BOTH: `should_review` refuses on the orchestrator
+    /// toggle first, because with it off there is no `delegate` machinery to
+    /// run a child at all, and then on this one through
+    /// [`GateInputs::enabled`](crate::user_data::services::consolidation_schedule::GateInputs).
+    ///
+    /// Its own default fn returning `false`, for the third time in this
+    /// workstream and for the same reason each time: nobody asked for it by
+    /// upgrading. On the target hardware there is a second cost — a review
+    /// holds the only GPU the household's next turn needs.
+    ///
+    /// [`GateInputs::enabled`]: crate::user_data::services::consolidation_schedule::GateInputs
+    #[serde(default = "Settings::default_proactive_review_enabled")]
+    pub proactive_review_enabled: bool,
 }
 
 impl Default for Settings {
@@ -1046,6 +1070,8 @@ impl Default for Settings {
             quiet_hours_start: Self::default_quiet_hours_start(),
             quiet_hours_end: Self::default_quiet_hours_end(),
             unprompted_speech_categories: Self::default_unprompted_speech_categories(),
+            // PAI-7 P4. Off, like the two above it and for the same reason.
+            proactive_review_enabled: false,
         }
     }
 }
@@ -1422,6 +1448,14 @@ impl Settings {
     /// reading out its own cron log.
     fn default_unprompted_speech_categories() -> String {
         "alert".to_string()
+    }
+
+    /// PAI-7 P4. A named function for the third time, and by now the pattern is
+    /// the point: every switch in this workstream that lets the pond act on its
+    /// own has a symbol a test can assert is `false`, so turning one on is an
+    /// edit to a failing test rather than a character somebody changed.
+    fn default_proactive_review_enabled() -> bool {
+        false
     }
 }
 
@@ -2139,6 +2173,11 @@ mod tests {
             "quiet_hours_start",
             "quiet_hours_end",
             "unprompted_speech_categories",
+            // PAI-7 P4's toggle, headless for the same reason as P6's four and
+            // owing a UI just as much: a household cannot consent to the pond
+            // reasoning about them unasked if the switch is only reachable
+            // through the REST API.
+            "proactive_review_enabled",
         ];
         // Everything else is surfaced in the desktop UI (Settings tabs / hub
         // views / onboarding) and mirrored in the TS Settings type.

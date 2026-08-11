@@ -17,13 +17,13 @@
 //!
 //! Invariant 7 is enforced on the READ, not by a sweeper. An expiry that only a
 //! background task honours is one that stops holding the moment the task fails
-//! to start — and PAI-7 P4 owns the only loop that could run it. Passing the
-//! clock in makes the filter unskippable and makes it testable without waiting.
-//! [`expire_due`](ProposalRepository::expire_due) exists to keep the table tidy
-//! and to give the row a terminal status the feedback loop can read; nothing's
-//! correctness depends on it running.
+//! to start. PAI-7 P4's reviewer now runs [`expire_due`](ProposalRepository::expire_due)
+//! once a tick, and that changed nothing about this rule — which is the point of
+//! having written it this way. Passing the clock in makes the filter unskippable
+//! and makes it testable without waiting; the sweep keeps the table tidy and
+//! gives a row the terminal status the feedback loop reads.
 
-use crate::user_data::domain::proposal::Proposal;
+use crate::user_data::domain::proposal::{Proposal, ProposalDecision};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -55,4 +55,36 @@ pub trait ProposalRepository: Send + Sync {
     ///
     /// Tidying, not enforcement. See the module docs.
     async fn expire_due(&self, now: DateTime<Utc>) -> Result<u64>;
+
+    /// How many proposals were **made** to one member since `since`, whatever
+    /// became of them.
+    ///
+    /// This is what `MAX_PROPOSALS_PER_DAY` has to be counted against, and it
+    /// is deliberately the one read here that does **not** filter on live or
+    /// pending. The cap is a limit on how often the pond interrupts somebody,
+    /// and a member who has read and dismissed three suggestions has been
+    /// interrupted three times — counting only what is still pending would let
+    /// a decisive user be pestered without limit while a passive one is
+    /// protected, which is precisely backwards.
+    ///
+    /// It also makes the cap survive a restart, which an in-process counter
+    /// cannot: PAI-7's verification section asks for exactly that.
+    async fn count_made_since(&self, profile_id: &str, since: DateTime<Utc>) -> Result<usize>;
+
+    /// What one member has already decided about proposals made since `since`
+    /// — PAI-7 P7's read, and the only one the feedback loop needs.
+    ///
+    /// Pending rows are excluded, because [`ProposalDecision::recorded`] refuses
+    /// [`DraftStatus::Pending`]: a ledger of decisions containing an undecided
+    /// row is a fact nobody stated. Expiries ARE included and are not silence
+    /// dressed as refusal — `silences_a_repeat` disposes of that distinction,
+    /// which is the domain's job and not this query's.
+    ///
+    /// [`ProposalDecision::recorded`]: crate::user_data::domain::proposal::ProposalDecision::recorded
+    /// [`DraftStatus::Pending`]: crate::user_data::domain::draft::DraftStatus::Pending
+    async fn decisions_since(
+        &self,
+        profile_id: &str,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<ProposalDecision>>;
 }

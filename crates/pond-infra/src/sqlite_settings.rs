@@ -586,6 +586,17 @@ impl SettingsRepository for SqliteSettingsRepository {
             "unprompted_speech_categories",
             &settings.unprompted_speech_categories
         );
+        // PAI-7 P4's toggle. Same two lines, same failure mode if either is
+        // missing: the reviewer would be switched on, persist nothing, and be
+        // off again on the next read.
+        upsert!(
+            "proactive_review_enabled",
+            if settings.proactive_review_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
 
         tx.commit().await?;
         Ok(())
@@ -993,6 +1004,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "quiet_hours_start" => s.quiet_hours_start = value.to_string(),
         "quiet_hours_end" => s.quiet_hours_end = value.to_string(),
         "unprompted_speech_categories" => s.unprompted_speech_categories = value.to_string(),
+        "proactive_review_enabled" => s.proactive_review_enabled = value == "true",
         _ => {} // unknown key — ignore
     }
 }
