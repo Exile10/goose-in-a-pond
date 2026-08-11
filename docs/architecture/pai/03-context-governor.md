@@ -349,7 +349,30 @@ Once occupancy is measured rather than estimated, `ContextHealth.should_compact`
   195,905 windows between them — at 12,289 they declare 29,548 tokens against a 12,289-token window.
   The curve's over-commitment set is a strict subset of the tiers' (2,116 windows, down from
   54,245) and worst-case over-commitment falls from 2.404x to 1.041x.
-- **P5 — CODE LANDED 2026-08-06. THE MEASUREMENT THAT DECIDES IT IS OUTSTANDING.** The asymmetry
+- **P5 — CODE LANDED 2026-08-06. MEASURED ON THE ORIN 2026-08-11; the unit cost is now known and
+  the reserve has a latency argument as well as a context one. See
+  [`docs/developer/orin-prefill-measurement.md`](../../developer/orin-prefill-measurement.md).**
+
+  Decode on the Orin Nano with the headline `gemma-4-E2B-it-Q4_K_M` is **30.35 tok/s**, flat across
+  every prompt depth from 512 to 16 384 — which is what the memory-bandwidth model predicts, since
+  decode streams the weights and the weights do not grow with context. So reserving *R* output
+  tokens costs `R / 30.35` seconds of generation: 512 tokens is 17 s, 1 024 is 34 s.
+
+  **That is the argument for deriving the reserve from the window rather than fixing it**, and it is
+  a different argument from the one this phase was designed on. A flat 1 024-token reserve is 6 % of
+  a 16 k window and 25 % of a 4 k one — but it is thirty-four seconds either way, and a user waiting
+  on a home assistant does not care which fraction of the window it was. The reserve is a latency
+  budget that happens to be denominated in tokens.
+
+  Invariant 4 — the reserve is never zero — is unaffected and remains the point: at 30 tok/s a model
+  that runs out of room mid-answer has already spent the user's patience before it fails.
+
+  Prefill for the same model peaks at 976 tok/s near 4 096 and falls to 820 at 16 384, so a cold
+  prefix at the real window costs about twenty seconds. That number belongs to PAI-4 P5 but it bears
+  on the preamble clamp here too: anything that moves the prefix between turns of one session pays
+  it.
+
+  The original text follows; its code claims are unchanged. The asymmetry
   moved from the callers into the profile. `CompactionProfile::for_windows(context, prompt)` takes
   both windows: the preamble fields (`system_prompt_budget`, `memory_token_budget`,
   `max_memory_fragments`, and `use_compact_prompt`, which now reads the new `prompt_window_tokens`)

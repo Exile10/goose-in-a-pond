@@ -575,9 +575,31 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   would then have to reconcile with. There is no integration test asserting the refresh completed
   before the first token of the next turn (section 7); that needs a live server and belongs with
   `scripts/live-test.sh`.
-- **P5 — CODE LANDED 2026-08-06, MEASUREMENT PENDING. All three clauses shipped; the one thing
-  that decides whether the rule was worth having did not, and this bullet stays open until it
-  does.** Section 7 asks for TTFT on the turn following a compaction, warm-cache versus cold-cache,
+- **P5 — CODE LANDED 2026-08-06. MEASURED ON THE ORIN 2026-08-11, and the first clause is now
+  settled with a number behind it; the second clause is still open. See
+  [`docs/developer/orin-prefill-measurement.md`](../../developer/orin-prefill-measurement.md).**
+
+  **What the measurement says.** On the Orin Nano 8GB with the headline `gemma-4-E2B-it-Q4_K_M`,
+  prefill runs at 674 tok/s at 512, peaks at 976 at 4 096, and falls to 820 at 16 384 — so a cold
+  prefix costs 4.19 s at 4k and **19.97 s at the pond's real 16 384 window**, growing faster than
+  linearly because the rate itself degrades with depth. Decode is flat at 30.35 tok/s.
+
+  **First clause — "cold-cache recompaction shows no TTFT penalty" — HOLDS.** When the prefix is
+  already cold the turn pays that prefill whatever the trimmer decides, so recompacting at that
+  moment is free: the work is already owed. The disjunction is the right shape.
+
+  **And the warm half turns out to matter far more than the rule's phrasing suggests.** The cost of
+  a needless invalidation is not a percentage, it is roughly 0.1 s versus 20 s on the same turn — two
+  hundred times. That is the argument for the age rung being conditional rather than periodic.
+
+  **Second clause — "warm-cache turns show no new re-prefills" — STILL OPEN, and honestly so.**
+  `llama-bench` starts cold every run and `llama-cli`'s `--prompt-cache` is gone from the build on
+  the box, so the warm figure above is arithmetic (delta ÷ rate), not an observation. Demonstrating
+  that GIAP's engine actually retains a prefix turn over turn needs a TTFT trace from a deployed
+  GIAP binary; `nano` is at `445fd391`, well behind this branch. **Do not promote this bullet to a
+  bare LANDED on the strength of the first clause alone.**
+
+  The original text of this stamp follows, because the code claims in it are unchanged: Section 7 asks for TTFT on the turn following a compaction, warm-cache versus cold-cache,
   on the Orin and the Mac, and says plainly that "P5 is only correct if cold-cache recompaction
   shows no TTFT penalty and warm-cache turns show no new re-prefills". No such run exists. This is
   the second measurement-pending P5 on the ledger — PAI-3's is the other — and it is recorded as
