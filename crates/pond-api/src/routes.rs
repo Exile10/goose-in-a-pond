@@ -669,17 +669,52 @@ async fn handshake_pairing_code(
         .await
         .map_err(|e| handshake_error("pairing_code_lookup", e))?;
     match code {
-        Some(pc) => Ok(Json(json!({"code": pc.code, "expires_at": pc.expires_at}))),
+        Some(pc) => Ok(Json(json!({
+            "code": pc.code,
+            "expires_at": pc.expires_at,
+            // PAI-1 P9: whose device this code will make. `null` is an
+            // unattributed code, which is every code issued before the field
+            // existed and every code issued with no body.
+            "profile_id": pc.profile_id,
+        }))),
         None => Ok(Json(json!({"code": null}))),
     }
+}
+
+/// The optional body of `POST /handshake/pairing-code`.
+///
+/// PAI-1 P9's HTTP half. **The member is captured here, at issuance, and never
+/// from the pairing request.** `IdentificationSource::PairedDevice` outranks
+/// both face and explicit identification, so a `profile_id` the pairing client
+/// supplied would outrank every proof this pond can actually make — the same
+/// shape as the hole PAI-1 P4 closed on `PUT /sessions/{id}/user`. What makes
+/// issuance trustworthy instead is the loopback check in the handler: the
+/// answer comes from somebody standing at the pond.
+///
+/// `deny_unknown_fields` because the failure this refuses is silent otherwise:
+/// an operator who posts `profileId` would be told "issued" and handed a code
+/// that belongs to nobody, and an unattributed device is invisible until the
+/// day somebody wonders why their phone gets no proposals.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct IssuePairingCodeRequest {
+    /// The household member the device pairing with this code will belong to.
+    /// Omitted or `null` leaves it unattributed.
+    #[serde(default)]
+    profile_id: Option<String>,
 }
 
 /// Issue a **fresh** single-use pairing code. **Loopback-only** — this is the
 /// "pair a new device" action the operator triggers from the host (CLI/desktop
 /// dashboard) to pair an additional phone after the startup code is consumed.
+///
+/// Optionally binds the code to a household member; see
+/// [`IssuePairingCodeRequest`] for why that binding happens here and nowhere
+/// else.
 async fn handshake_issue_pairing_code(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if !peer.ip().is_loopback() {
         return Err((
@@ -687,12 +722,56 @@ async fn handshake_issue_pairing_code(
             Json(json!({"error": "pairing codes can only be issued on the host"})),
         ));
     }
+    // The body is optional and read as raw bytes rather than through `Json`,
+    // because this route has been POSTed with no body and no content type since
+    // #93 and both the CLI and the desktop dashboard still do that. An empty
+    // body means an unattributed code, exactly as before.
+    //
+    // A body that is PRESENT and unreadable is refused rather than defaulted.
+    // Defaulting would narrow — an unattributed code grants nothing — but it
+    // would also tell an operator who meant to bind this code to Liz that the
+    // code was issued, and the device would silently be nobody's.
+    let request: IssuePairingCodeRequest = if body.is_empty() {
+        IssuePairingCodeRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("invalid pairing-code request body: {e}"),
+                })),
+            )
+        })?
+    };
+
+    let named_a_member = request.profile_id.is_some();
     let pc = state
         .handshake
-        .issue_pairing_code()
+        .issue_pairing_code_for(request.profile_id.as_deref())
         .await
-        .map_err(|e| handshake_error("issue_pairing_code", e))?;
-    Ok(Json(json!({"code": pc.code, "expires_at": pc.expires_at})))
+        .map_err(|e| {
+            // Logged the same way either way, so the real cause is in the log
+            // and never in the response. The status differs because the cause
+            // does: the adapter leans on migration 0043's foreign key to refuse
+            // a code for a member who does not exist, and answering that with a
+            // 500 tells the operator the pond is broken when the member id is.
+            let internal = handshake_error("issue_pairing_code", e);
+            if named_a_member {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "could not issue a pairing code for that household member",
+                    })),
+                )
+            } else {
+                internal
+            }
+        })?;
+    Ok(Json(json!({
+        "code": pc.code,
+        "expires_at": pc.expires_at,
+        "profile_id": pc.profile_id,
+    })))
 }
 
 /// Start or report onboarding state (public)
