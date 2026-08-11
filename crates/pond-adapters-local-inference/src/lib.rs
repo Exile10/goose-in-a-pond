@@ -363,71 +363,56 @@ impl LocalInferenceLlmAdapter {
     /// device: 16384 derived from E2B applied to E4B exceeds the budget and the
     /// kernel kills the server (it took gnome-shell with it).
     ///
-    /// # The cost model, measured 2026-08-12
+    /// # The cost model, measured ON THE DEVICE 2026-08-12
     ///
-    /// The per-token figures this comment used to carry -- E2B ~18 KiB, E4B ~86
-    /// KiB -- were estimates from attention geometry, and both are wrong,
-    /// because the SHAPE is wrong. Gemma 4 is **interleaved sliding-window
-    /// attention with KV sharing**, so llama.cpp allocates TWO caches and only
-    /// one of them scales with `n_ctx`:
+    /// | model | first cache | second cache | total |
+    /// |---|---|---|---|
+    /// | E2B | 3 layers, 6 KiB/tok | 12 layers, 12 KiB/tok | **18 KiB/token** |
+    /// | E4B | 4 layers, 16 KiB/tok | 20 layers, 40 KiB/tok | **56 KiB/token** |
     ///
-    /// | model | scales with n_ctx | fixed (1024-cell SWA window) |
-    /// |---|---|---|
-    /// | E2B | 3 layers, 6 KiB/token | 12 MiB |
-    /// | E4B | 4 layers, 16 KiB/token | 40 MiB |
+    /// Read off `llama_kv_cache ... size = N MiB (C cells, L layers)` with the
+    /// service stopped: E4B at n_ctx 8192 gives 128 MiB + 320 MiB, E2B at 16384
+    /// gives 96 MiB + 192 MiB. **Both caches carry `n_ctx` cells**, so the cost
+    /// is linear with no constant term.
     ///
-    /// Read off `llama_kv_cache: size = ...` at n_ctx 4096, 16384 and 32768:
-    /// the first line grows exactly linearly and the second does not move.
-    /// So the honest model is `slope * n_ctx + constant`, not `rate * n_ctx`.
+    /// # A correction, because the first attempt was wrong in the unsafe direction
     ///
-    /// # Why the slope below is still pessimistic, and what would change it
+    /// I measured this on a Mac first (brew llama.cpp b9110, Metal) and got a
+    /// different SHAPE: E4B's second cache sat at a fixed 1024 cells / 40 MiB
+    /// whatever `n_ctx` was, implying 16 KiB/token plus a constant -- about a
+    /// third of the real cost. I then checked the device's vendored source,
+    /// found `llama-kv-cache-iswa.cpp` and the `sliding_window_pattern` key being
+    /// read for `gemma4`, and concluded the device took the same path.
     ///
-    /// **That measurement was taken with brew llama.cpp b9110 on Metal. The
-    /// engine runs vendored `llama-cpp-sys-2 =0.1.146`, which is much older.**
-    /// If its llama.cpp lacks the iswa split or the KV sharing, every one of the
-    /// 42 layers stores full-context KV instead of four -- 4 KiB per layer per
-    /// token from the same measurement, so ~168 KiB/token.
+    /// **It does, and that was not enough.** `llama-cpp-sys-2 =0.1.146` builds
+    /// the two caches but sizes BOTH to `n_ctx`; shrinking the SWA cache to the
+    /// sliding window is a later llama.cpp change. A source grep cannot tell
+    /// "the code path exists" from "the allocation is smaller" -- only the
+    /// allocation can.
     ///
-    /// That is the number below, and the arithmetic is uncomfortable: at 8192 it
-    /// needs 1344 MiB against 1367 MiB free, which fits by 23 MiB, and at 16384
-    /// it needs 2688 MiB, which does not. The current 8192 for E4B is therefore
-    /// where the pessimistic case *just* survives -- consistent with the board
-    /// running today, and a reason not to raise the ceiling on the strength of a
-    /// Metal measurement against a different llama.cpp.
+    /// So the figures this comment carried before any of this -- E2B ~18
+    /// KiB/token, E4B ~86 -- were right for the device, and E2B's was exact. The
+    /// commit that called them both wrong was itself wrong; the Mac numbers
+    /// describe a newer llama.cpp we do not ship.
     ///
-    /// # Raising `MAX_CTX` alone does nothing today
+    /// The lesson is the one this constant already encoded: it can OOM a board,
+    /// so it moves on a measurement from the hardware that runs it and nothing
+    /// less. Declining to move it on the Mac numbers is the only reason this is
+    /// a comment rather than an incident.
     ///
-    /// Worth knowing before trying it. Under the slope below the BUDGET binds
-    /// first for both models -- E4B at 8,331 tokens and E2B at 18,265, each then
-    /// rounded down to a power of two -- so `MAX_CTX` is not the active
-    /// constraint on either. It was under the old, wrongly-shaped 96 KiB/token
-    /// model, which is where the belief that it caps E2B comes from.
+    /// # What this allows, and what binds instead
     ///
-    /// The lever is `KV_KIB_PER_TOKEN`, and that is precisely the one that needs
-    /// the device.
+    /// At 56 KiB/token E4B's budget allows 24,997 tokens, so it rounds to
+    /// **16,384 -- double the 8,192 the old pessimistic slope gave it** -- using
+    /// 896 MiB of KV against 1,367 MiB free. E2B's 18 KiB/token allows ~172k and
+    /// is capped by `MAX_CTX`.
     ///
-    /// **Half-settled on the device, 2026-08-12, by reading the vendored source
-    /// rather than running it.** The mechanism is present: 0.1.146 ships
-    /// `llama.cpp/src/llama-kv-cache-iswa.cpp`, and its `llama-model.cpp` reads
-    /// `LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN` into `hparams.swa_layers` for
-    /// the `gemma4` arch — the same metadata key E4B's GGUF declares. So the
-    /// device takes the same split-cache path the Mac measurement was taken on,
-    /// and the no-iswa worst case this slope defends against is very probably
-    /// not the world we are in.
-    ///
-    /// **Very probably is not measured, and this constant can OOM a board**, so
-    /// it has not moved. What remains is to see the ALLOCATION rather than the
-    /// code path: load E4B and read the `llama_kv_cache: size` lines. Two caches
-    /// with a fixed second one confirms 16 KiB/token + 40 MiB, puts E4B's real
-    /// ceiling near 84k tokens, and lets both `KV_KIB_PER_TOKEN` and `MAX_CTX`
-    /// rise.
-    ///
-    /// Two practical notes for whoever does it. The pond runs as a live user
-    /// service (`goose-in-a-pond.service`, port 8080) and its provider
-    /// initialises lazily, so a running pond that has not chatted has logged
-    /// nothing to read. And goose's `tracing_setup.rs` carves `llama-cpp-2` down
-    /// to ERROR, so llama.cpp's own log needs `RUST_LOG` raised or the lines
-    /// never appear at all.
+    /// So both models now sit AT `MAX_CTX`, and it is the binding constraint for
+    /// the first time. Raising it is no longer a no-op, but it becomes a LATENCY
+    /// decision rather than a memory one: a cold prefix costs 4.19 s at 4,096
+    /// and 19.97 s at 16,384, with prefill throughput FALLING as depth grows
+    /// (976 -> 820 tok/s). E4B at 32,768 would need 1,792 MiB of KV and does not
+    /// fit regardless.
     ///
     /// `apply_jetson_settings` re-stamps the registry at every provider init,
     /// so this cannot be worked around by editing registry.json — it has to be
@@ -450,23 +435,18 @@ impl LocalInferenceLlmAdapter {
     /// meant neither it nor its tests ever ran on a developer machine or in CI.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     fn jetson_context_size(model_bytes: u64) -> u32 {
-        /// Per-token cost of the cache that GROWS with `n_ctx`.
+        /// Per-token KV cost for the widest geometry we ship, measured on the
+        /// DEVICE: E4B is 56 KiB/token across both caches, E2B 18.
         ///
-        /// 168, not the measured 16, and the doc above says why: this is the
-        /// no-iswa worst case (42 layers x 4 KiB/layer/token) for an engine
-        /// whose llama.cpp may predate the split-cache implementation. It is
-        /// the one constant here that can OOM the device, so it holds the
-        /// pessimistic value until somebody reads the real allocation on the
-        /// Orin.
-        const KV_KIB_PER_TOKEN: u64 = 168;
-        /// The SWA cache, which does NOT scale with `n_ctx` -- 12 MiB on E2B,
-        /// 40 MiB on E4B, flat from 4096 to 32768. Taken at the larger, since
-        /// the budget must hold for the larger model.
+        /// 64 rather than 56 keeps headroom for a wider model without changing
+        /// what either shipped model gets: at 64, E4B's budget still allows
+        /// 21,872 tokens and still rounds to 16,384. There is NO constant term
+        /// -- both caches carry `n_ctx` cells on this llama.cpp.
         ///
-        /// The old model had no constant term at all, which is why its
-        /// per-token rate had to absorb one and came out wrong in both
-        /// directions depending on `n_ctx`.
-        const KV_FIXED_MB: u64 = 40;
+        /// This is the constant that can OOM the board. It moves on a
+        /// measurement from the Orin and nothing less; see the correction above,
+        /// where the Mac said 16 and the device said 56.
+        const KV_KIB_PER_TOKEN: u64 = 64;
         /// llama.cpp's compute buffers. Nearly flat in `n_ctx` -- measured
         /// 522 MiB at both 4096 and 16384, rising to 582 MiB at 32768 -- so 600
         /// covers the range this function can return.
@@ -477,8 +457,7 @@ impl LocalInferenceLlmAdapter {
         let model_mb = model_bytes / (1024 * 1024);
         let kv_mb = crate::scheduler::LLM_BUDGET_MB
             .saturating_sub(model_mb)
-            .saturating_sub(COMPUTE_BUFFER_MB)
-            .saturating_sub(KV_FIXED_MB);
+            .saturating_sub(COMPUTE_BUFFER_MB);
         let tokens = (kv_mb * 1024) / KV_KIB_PER_TOKEN;
 
         // Largest power of two that fits, clamped.
@@ -691,10 +670,7 @@ impl LocalInferenceLlmAdapter {
 #[cfg(test)]
 mod tests {
 
-    /// The two models GIAP actually ships on the Orin, by measured file size.
-    ///
-    /// E4B at 16384 is what OOM-killed the device: ~4.6 GiB of weights plus
-    /// against a 6,392 MB budget. It must come back smaller than E2B's.
+    /// Both shipped models, against the DEVICE-measured cost.
     ///
     /// No longer `#[cfg(feature = "cuda")]`: this is pure arithmetic, it is the
     /// part that can kill a board, and gating it meant it never ran on a
@@ -705,78 +681,104 @@ mod tests {
         let e2b = LocalInferenceLlmAdapter::jetson_context_size(2_890_000_000);
         let e4b = LocalInferenceLlmAdapter::jetson_context_size(4_640_000_000);
         assert_eq!(e2b, 16384, "E2B should keep the full window");
-        assert!(e4b <= 8192, "E4B must shrink, got {e4b}");
-        assert!(e4b >= 2048, "E4B must stay usable, got {e4b}");
-        assert!(e4b < e2b, "a bigger model must not get a bigger context");
+        assert_eq!(
+            e4b, 16384,
+            "E4B should now get the full window too. It was 8192 under a slope three times the \
+             measured cost; the Orin says 56 KiB/token, which leaves room for 16384."
+        );
+        assert!(
+            e4b <= e2b,
+            "a bigger model must never get a bigger context, got E4B {e4b} vs E2B {e2b}"
+        );
     }
 
-    /// The pessimistic slope is the one that keeps E4B inside the budget, and
-    /// this pins the margin rather than the verdict.
+    /// E4B at its window fits the MEASURED budget with real headroom, and
+    /// doubling again does not fit at all.
     ///
-    /// At the no-iswa worst case the answer fits by ~23 MiB out of 1,367, and a
-    /// reader who changes `KV_KIB_PER_TOKEN` or `MAX_CTX` without measuring on
-    /// the device should see how little room there was. It is deliberately
-    /// arithmetic this test redoes rather than a number copied from the
-    /// function -- a test that recomputed it the same way would agree with any
-    /// mistake.
+    /// Both halves matter. The first is the safety claim; the second is why
+    /// 16384 is the honest ceiling for E4B on memory grounds and not merely
+    /// because `MAX_CTX` says so. Arithmetic is redone here rather than copied
+    /// from the function, so a test that recomputed it the same way cannot agree
+    /// with the same mistake.
     #[test]
-    fn e4b_at_its_current_window_only_just_fits_the_pessimistic_budget() {
-        const NO_ISWA_KIB_PER_TOKEN: u64 = 168;
-        let budget_mb = crate::scheduler::LLM_BUDGET_MB;
+    fn e4b_fits_its_window_and_could_not_take_another_doubling() {
+        /// Measured on the Orin: 128 MiB + 320 MiB at n_ctx 8192, both caches
+        /// carrying n_ctx cells, so 56 KiB/token with no constant term.
+        const MEASURED_KIB_PER_TOKEN: u64 = 56;
         let weights_mb = 4_640_000_000u64 / (1024 * 1024);
-        let free_mb = budget_mb - weights_mb - 600 - 40;
+        let free_mb = crate::scheduler::LLM_BUDGET_MB - weights_mb - 600;
 
         let chosen = LocalInferenceLlmAdapter::jetson_context_size(4_640_000_000) as u64;
-        let needed_mb = (chosen * NO_ISWA_KIB_PER_TOKEN) / 1024;
+        let needed_mb = (chosen * MEASURED_KIB_PER_TOKEN) / 1024;
         assert!(
-            needed_mb <= free_mb,
-            "E4B was given {chosen} tokens, which needs {needed_mb} MiB of KV under the no-iswa \
-             worst case against {free_mb} MiB free. That is the case the device might be in, and \
-             exceeding it is what OOM-killed the board and took gnome-shell with it."
+            needed_mb < free_mb,
+            "E4B was given {chosen} tokens, needing {needed_mb} MiB of KV against {free_mb} MiB \
+             free. Exceeding this is what OOM-killed the board and took gnome-shell with it."
         );
 
-        // And the other direction: doubling it does NOT fit, which is why the
-        // ceiling has not moved on the strength of a Mac measurement.
-        let doubled_mb = (chosen * 2 * NO_ISWA_KIB_PER_TOKEN) / 1024;
+        let doubled_mb = (chosen * 2 * MEASURED_KIB_PER_TOKEN) / 1024;
         assert!(
             doubled_mb > free_mb,
-            "doubling E4B's window now fits the pessimistic budget ({doubled_mb} MiB vs \
-             {free_mb} MiB free). Either the budget grew or the slope changed -- if the device \
-             has been measured and really does split its KV cache, raise MAX_CTX deliberately \
-             and rewrite this test rather than deleting it."
+            "doubling E4B's window now fits ({doubled_mb} MiB vs {free_mb} MiB free), so memory \
+             is no longer what caps it. If the budget really grew, raise MAX_CTX deliberately -- \
+             and weigh prefill, which is 19.97 s cold at 16384 and degrades with depth."
         );
     }
 
-    /// What the MEASURED geometry would allow, kept as an executable record of
-    /// the 2026-08-12 measurement so the number is not lost in a commit message.
+    /// The two models reach the same window for DIFFERENT reasons, and a reader
+    /// changing either constant should know which one they are moving.
     ///
-    /// Asserts nothing about production. It exists so that whoever runs the
-    /// one-line check on the Orin can see immediately what is unlocked: E4B goes
-    /// from 8,192 to roughly 84,000 tokens of headroom, which `MAX_CTX` would
-    /// then be the only thing capping.
+    /// E2B is capped by `MAX_CTX` with enormous room to spare; E4B is capped by
+    /// its budget, which happens to round to the same number. Raising `MAX_CTX`
+    /// would move E2B and not E4B.
+    /// The slope itself, pinned where the ceiling cannot hide it.
+    ///
+    /// **Neither shipped model can guard this constant.** Both land on 16,384
+    /// today, E2B because `MAX_CTX` caps it and E4B because its budget rounds
+    /// there -- so reverting the slope to the Mac's 16 KiB/token, which is a
+    /// third of the real cost, leaves every other test in this file green. That
+    /// mutation was run and passed, which is why this test exists. It is latent
+    /// rather than harmless: it bites the day somebody raises `MAX_CTX`.
+    ///
+    /// A model around 5.4 GB is big enough that the BUDGET decides the answer
+    /// well below the ceiling, so the slope becomes observable: 8,192 at the
+    /// measured cost, 16,384 at the Mac's.
     #[test]
-    fn the_measured_geometry_would_allow_far_more_than_the_pessimistic_one() {
-        // Measured on llama.cpp b9110 / Metal at n_ctx 4096, 16384 and 32768:
-        // E4B's growing cache is 16 KiB/token and its SWA cache is a flat 40 MiB.
-        const MEASURED_KIB_PER_TOKEN: u64 = 16;
-        let weights_mb = 4_640_000_000u64 / (1024 * 1024);
-        let free_mb = crate::scheduler::LLM_BUDGET_MB - weights_mb - 600 - 40;
-        let would_allow = (free_mb * 1024) / MEASURED_KIB_PER_TOKEN;
-
-        assert!(
-            would_allow > 80_000,
-            "the measured slope should leave E4B room for >80k tokens, got {would_allow}"
-        );
-        assert!(
-            would_allow > 8 * LocalInferenceLlmAdapter::jetson_context_size(4_640_000_000) as u64,
-            "the measured geometry allows less than 8x what production gives E4B; either the \
-             measurement or the production constant has changed and the gap this test records \
-             no longer exists"
+    fn the_per_token_slope_is_observable_on_a_model_the_ceiling_does_not_cap() {
+        let ctx = LocalInferenceLlmAdapter::jetson_context_size(5_400_000_000);
+        assert_eq!(
+            ctx, 8192,
+            "a 5.4 GB model got {ctx} tokens. At the device-measured cost it should get 8192; \
+             16384 means the slope has been lowered towards the Mac's 16 KiB/token, which \
+             describes a newer llama.cpp than the one this device ships and understates the real \
+             allocation by roughly three times."
         );
     }
 
-    /// A model larger than the whole budget must still return something
-    /// loadable rather than zero or a panic.
+    #[test]
+    fn e2b_is_ceiling_bound_and_e4b_is_budget_bound() {
+        const E2B_KIB_PER_TOKEN: u64 = 18;
+        let e2b_weights = 2_890_000_000u64 / (1024 * 1024);
+        let e2b_free = crate::scheduler::LLM_BUDGET_MB - e2b_weights - 600;
+        let e2b_allows = (e2b_free * 1024) / E2B_KIB_PER_TOKEN;
+        assert!(
+            e2b_allows > 100_000,
+            "E2B's memory should allow far more than it gets ({e2b_allows}); it is MAX_CTX that \
+             stops it, and that is a latency decision rather than a memory one"
+        );
+
+        const E4B_KIB_PER_TOKEN: u64 = 56;
+        let e4b_weights = 4_640_000_000u64 / (1024 * 1024);
+        let e4b_free = crate::scheduler::LLM_BUDGET_MB - e4b_weights - 600;
+        let e4b_allows = (e4b_free * 1024) / E4B_KIB_PER_TOKEN;
+        assert!(
+            (16_384..32_768).contains(&e4b_allows),
+            "E4B's memory should allow between one and two doublings above 16384, got \
+             {e4b_allows}. Outside that range the budget is no longer what binds it and this \
+             test's name is a lie."
+        );
+    }
+
     #[test]
     fn jetson_context_floors_for_an_oversized_model() {
         assert_eq!(
