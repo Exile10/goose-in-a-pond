@@ -111,3 +111,51 @@ Stop the GIAP service first (`systemctl --user stop giap`) or the numbers are co
 `scripts/jetson/llama-optimization/` cannot be run non-interactively; the sweep above fit without it
 because E2B is 2.88 GiB against ~4.5 GiB available, but a larger model needs that step and will hit
 the NvMap 586 MiB wall without it.
+
+---
+
+## Engine-true run, 2026-08-11 (Mac): NO DEGRADATION, and PAI-4 P5's second clause closes
+
+The correction above said the sweep used the wrong llama.cpp and that closing this properly means
+benchmarking through `goose-local-inference`. Done, on the Mac, through the live serving path —
+`GooseAdapter` -> `Agent::reply` -> `GiapProviderShim` -> `LocalInferenceProvider` -> llama.cpp —
+against an isolated `POND_DATA_DIR` with the models symlinked in, so it is real inference and it
+never touched the real pond. Two turns, one session, `gemma-4-E2B-it-Q4_K_M`.
+
+| | turn 1 (cold) | memory extraction | turn 2 (warm) |
+|---|---|---|---|
+| plan | `CreateContext` | `SacrificialContext` | **`ReusePrefix(6845)`** |
+| prompt tokens | 6 969 | 500 | 7 032 |
+| TTFT | 12 344 ms | — | **465 ms** |
+| prefill | 11 690 ms | — | **64 ms** |
+| decode | 38.9 tok/s | — | — |
+| reasoning tokens | **128** | — | 0 |
+| model_load | 4 806 ms | — | null |
+
+**No degradation after ~85 commits on this branch.** The skill's recorded baseline is "reuse-turn
+TTFT 12.4 s -> 0.65 s, prefill 11.6 s -> 66 ms"; this run gives 12.34 s -> **0.465 s** and 11.69 s ->
+**64 ms**. Marginally better, not worse. Turn-1 prompt is 6 969 tokens against the documented
+~6.9K for 60 tools, so nothing in this session's work inflated the preamble.
+
+**`session_retained=false` on turn 1 and `true` for every generation after, with the SAME
+`loaded_ptr=0x86253e840` throughout.** That is the model-slot identity check from the skill: distinct
+pointers across generations would mean the path-keyed slot regressed into a silent full model reload
+per generation.
+
+**PAI-4 P5's second clause — "warm-cache turns show no NEW re-prefills" — is now observed rather
+than argued.** Turn 2 reused 6 845 of 7 032 tokens; only the 187-token delta was prefilled, at 64 ms
+against turn 1's 11 690 ms. And the memory-extraction side call took `SacrificialContext` both times
+(cached 7 111, then 7 041) rather than clobbering the chat prefix, which is the specific failure that
+would have made the retained cache useless in practice.
+
+**PAI-5 P5 gets a real number too:** 128 reasoning tokens on the reasoning turn, 0 on the recall
+turn, measured through the live path rather than inferred. That is consistent with the 306-token
+figure in `context_budget.rs`'s Jetson anchor comment being a ceiling rather than a typical value,
+and it means the 768-token reserve at that tier holds reasoning plus a real answer with room to
+spare.
+
+**Caveat that keeps this honest: this is the Mac, not the Orin.** Metal prefill here is 596 tok/s
+against the Orin's CUDA 820-976 in the standalone sweep, so the two are not interchangeable and the
+absolute latencies do not transfer. What transfers is the *mechanism*: the prefix is token-stable
+across turns, the cache is reused, and the side call does not evict it. Running this same probe on
+the Jetson needs the branch deployed there.
