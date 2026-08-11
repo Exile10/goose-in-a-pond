@@ -17,7 +17,7 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::security::domain::event::{Event, EventCategory, PrivacySensitivity};
-use crate::shared::domain::session_activity::SessionLifecycle;
+use crate::shared::domain::session_activity::{ProfilePresence, SessionLifecycle};
 use crate::shared::domain::time_tick::TimeTick;
 use crate::user_data::domain::device::{DeviceStateChanged, DeviceStateValue};
 use crate::user_data::domain::schedule::{TriggerEventView, TriggerSourceKind};
@@ -28,8 +28,9 @@ use crate::user_data::domain::sensor::{CameraEvent, SensorReading};
 /// ergonomically instead of parsing an attribute map.
 ///
 /// The first three variants are *device-shaped*: something in the house
-/// reported a reading. The last two are not — they are the pond noticing time
-/// passing and the user arriving or going quiet (PAI-7 P1). That split is what
+/// reported a reading. The last three are not — they are the pond noticing
+/// time passing, a household member arriving or leaving, and the user going
+/// quiet (PAI-7 P1 and P2). That split is what
 /// [`trigger_view`](BusEvent::trigger_view) returns an `Option` for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "data")]
@@ -39,6 +40,12 @@ pub enum BusEvent {
     Device(DeviceStateChanged),
     /// A wall-clock boundary the pond crossed (PAI-7 P1).
     Time(TimeTick),
+    /// A named household member arrived or left (PAI-7 P2).
+    ///
+    /// The variant tag this serialises under is `"presence"`, which is the
+    /// `kind` string `BusEventRef` in the proposal domain was written to
+    /// carry.
+    Presence(ProfilePresence),
     /// The user's interaction started, went idle, or resumed (PAI-7 P1).
     Session(SessionLifecycle),
 }
@@ -68,6 +75,27 @@ impl BusEvent {
                 .attr("boundary", t.boundary.as_str())
                 .attr("local_hour", i64::from(t.local_hour))
                 .sensitivity(PrivacySensitivity::Public),
+            // Who is home and when is the most behavioral data this house
+            // holds, so it takes the same classification as a session
+            // transition and for the same reasons. `Agent` rather than
+            // `Sensor` because this is the pond's own conclusion about a
+            // person, not a reading off a device -- filing it under `Sensor`
+            // would put "Jerry arrived" in the sensor feed as though something
+            // measured it.
+            BusEvent::Presence(p) => {
+                let event = Event::new(EventCategory::Agent, "presence.profile")
+                    .attr("profile_id", p.profile_id.as_str())
+                    .attr("transition", p.transition.as_str())
+                    .attr("source", p.source.as_str())
+                    .sensitivity(PrivacySensitivity::Sensitive)
+                    .session(p.session_id.as_str());
+                match p.confidence {
+                    // Recorded so an audit can tell a 0.95 match from a 0.61
+                    // one after the fact. Invariant 3's reason, one layer out.
+                    Some(c) => event.attr("confidence", f64::from(c)),
+                    None => event,
+                }
+            }
             // When somebody is talking to the pond is behavioral data, exactly
             // like a motion reading: `Sensitive`, which both keeps it out of
             // the audit MCP reads and shortens its retention.
@@ -88,9 +116,16 @@ impl BusEvent {
     /// (#92): source family, id, signal name, and an optional numeric value
     /// (sensor value / camera confidence / numeric device state).
     ///
-    /// `None` for the events that are not device-shaped. A time tick and a
-    /// session transition have no device, no signal and no value, so there is
-    /// nothing for a `SensorTrigger` rule to compare against.
+    /// `None` for the events that are not device-shaped. A time tick, a
+    /// presence transition and a session transition have no device, no signal
+    /// and no value, so there is nothing for a `SensorTrigger` rule to compare
+    /// against.
+    ///
+    /// Presence is the one where the temptation is real — a person arriving
+    /// looks like something a rule should be able to fire on, and PAI-7 P2's
+    /// own rule is that nothing acts on a presence event this phase. Deciding
+    /// is P4's, and a `camera`-family view here would hand it straight to
+    /// every automation the user has already written.
     ///
     /// **Returning `None` rather than a placeholder view is the safety
     /// property**, not a stylistic preference: every `TriggerSourceKind` is a
@@ -155,7 +190,7 @@ impl BusEvent {
                     DeviceStateValue::Text(_) => None,
                 },
             }),
-            BusEvent::Time(_) | BusEvent::Session(_) => None,
+            BusEvent::Time(_) | BusEvent::Presence(_) | BusEvent::Session(_) => None,
         }
     }
 }
@@ -176,11 +211,14 @@ pub trait EventBus: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::domain::session_activity::{SessionLifecycle, SessionPhase};
+    use crate::shared::domain::session_activity::{
+        PresenceTransition, ProfilePresence, SessionLifecycle, SessionPhase,
+    };
     use crate::shared::domain::time_tick::{TimeBoundary, TimeTick};
     use crate::user_data::domain::schedule::{
         SensorTriggerSpec, TriggerAction, TriggerCondition, TriggerSource,
     };
+    use crate::user_data::domain::session::IdentificationSource;
 
     fn noon() -> chrono::NaiveTime {
         chrono::NaiveTime::from_hms_opt(12, 0, 0).expect("valid time")
@@ -191,6 +229,20 @@ mod tests {
             boundary: TimeBoundary::Hour,
             at: chrono::Utc::now(),
             local_hour: 12,
+        })
+    }
+
+    fn presence(transition: PresenceTransition, source: IdentificationSource) -> BusEvent {
+        BusEvent::Presence(ProfilePresence {
+            profile_id: "jerry".into(),
+            transition,
+            source,
+            confidence: match source {
+                IdentificationSource::Face => Some(0.71),
+                _ => None,
+            },
+            session_id: "sess-42".into(),
+            at: chrono::Utc::now(),
         })
     }
 
@@ -276,17 +328,23 @@ mod tests {
         }
     }
 
-    /// PAI-7 P1's whole scope discipline: the new events are published, and no
-    /// rule the user wrote can be fired by them — because there is nothing for
-    /// a rule to match against at all.
+    /// PAI-7 P1's and P2's whole scope discipline: the new events are
+    /// published, and no rule the user wrote can be fired by them — because
+    /// there is nothing for a rule to match against at all.
     ///
     /// Read this together with the test above. Alone, "has no view" is a claim
-    /// about a function; with it, it is the claim that an hourly tick cannot
-    /// run the automations somebody wrote about their house.
+    /// about a function; with it, it is the claim that an hourly tick — or a
+    /// household member walking in — cannot run the automations somebody wrote
+    /// about their house.
     #[test]
-    fn a_clock_or_session_event_has_no_view_for_a_rule_to_match() {
+    fn a_clock_presence_or_session_event_has_no_view_for_a_rule_to_match() {
         for event in [
             time_tick(),
+            presence(PresenceTransition::Arrived, IdentificationSource::Face),
+            presence(
+                PresenceTransition::Departed,
+                IdentificationSource::PairedDevice,
+            ),
             session_event(SessionPhase::Started, Some("s-1")),
             session_event(SessionPhase::Idle, None),
             session_event(SessionPhase::Resumed, None),
@@ -350,6 +408,53 @@ mod tests {
         assert_eq!(idle.privacy_sensitivity, PrivacySensitivity::Sensitive);
     }
 
+    /// Where a household member is, and when, is the most personal thing this
+    /// house records. Below `Sensitive` it would outlive its usefulness in the
+    /// log and be readable through the audit MCP tools, which exclude
+    /// sensitive rows.
+    #[test]
+    fn a_presence_transition_is_sensitive_and_names_the_member_and_the_rung() {
+        use crate::security::domain::event::AttributeValue;
+
+        let event = presence(PresenceTransition::Arrived, IdentificationSource::Face).to_event();
+        assert_eq!(event.category, EventCategory::Agent);
+        assert_eq!(event.action, "presence.profile");
+        assert_eq!(
+            event.privacy_sensitivity,
+            PrivacySensitivity::Sensitive,
+            "who is home and when is behavioral data about a named person; classifying it below \
+             Sensitive lengthens its retention and exposes it to the audit MCP reads"
+        );
+        assert_eq!(event.session_id.as_deref(), Some("sess-42"));
+        assert_eq!(
+            event.attributes.get("profile_id"),
+            Some(&AttributeValue::Text("jerry".into())),
+            "a presence event that does not name a member is a motion sensor"
+        );
+        assert_eq!(
+            event.attributes.get("transition"),
+            Some(&AttributeValue::Text("arrived".into()))
+        );
+        assert_eq!(
+            event.attributes.get("source"),
+            Some(&AttributeValue::Text("face".into())),
+            "the rung must survive into the log -- a 0.7 face match and a signed token are not \
+             the same claim"
+        );
+        assert!(
+            matches!(event.attributes.get("confidence"), Some(AttributeValue::Float(c)) if (*c - 0.71).abs() < 1e-6),
+        );
+
+        // The rungs that carry no confidence must not invent one.
+        let explicit =
+            presence(PresenceTransition::Departed, IdentificationSource::Explicit).to_event();
+        assert_eq!(explicit.attributes.get("confidence"), None);
+        assert_eq!(
+            explicit.attributes.get("transition"),
+            Some(&AttributeValue::Text("departed".into()))
+        );
+    }
+
     /// The bus is serialised (it crosses a broadcast channel and is the shape
     /// the event log records), so the new variants must round-trip.
     ///
@@ -370,6 +475,23 @@ mod tests {
         match round_trip(BusEvent::Time(tick.clone())) {
             BusEvent::Time(back) => assert_eq!(back, tick, "the tick lost a field in transit"),
             other => panic!("a Time came back as {other:?}"),
+        }
+
+        // Both shapes of presence: the face rung, whose confidence must not be
+        // dropped in transit, and a rung that carries none.
+        for source in [IdentificationSource::Face, IdentificationSource::Explicit] {
+            let BusEvent::Presence(sent) = presence(PresenceTransition::Arrived, source) else {
+                unreachable!("the helper builds a presence event")
+            };
+            match round_trip(BusEvent::Presence(sent.clone())) {
+                BusEvent::Presence(back) => {
+                    assert_eq!(
+                        back, sent,
+                        "the presence transition lost a field in transit"
+                    )
+                }
+                other => panic!("a Presence came back as {other:?}"),
+            }
         }
 
         // Both shapes of `session_id`: the one that serialises and the one
@@ -418,6 +540,28 @@ mod tests {
                 ..tick.clone()
             },
             "a tick that lost its hour must not compare equal to one that kept it"
+        );
+
+        let BusEvent::Presence(arrived) =
+            presence(PresenceTransition::Arrived, IdentificationSource::Face)
+        else {
+            unreachable!("the helper builds a presence event")
+        };
+        assert_ne!(
+            arrived,
+            ProfilePresence {
+                profile_id: "liz".into(),
+                ..arrived.clone()
+            },
+            "a presence event that named a different member must not compare equal"
+        );
+        assert_ne!(
+            arrived,
+            ProfilePresence {
+                transition: PresenceTransition::Departed,
+                ..arrived.clone()
+            },
+            "an arrival must not compare equal to a departure"
         );
 
         let started = SessionLifecycle {
