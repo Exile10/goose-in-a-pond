@@ -309,6 +309,18 @@ stay green straight through the regression. `max_concurrent_subagents` in the P1
 against the wider predicate and its test iterates `ON_DEVICE_PROVIDERS` so a provider added later
 is covered without anyone remembering the file.
 
+**A deny-set is only half the predicate, and the repair for that landed 2026-08-11.**
+`runs_on_this_device` is membership of four names, so its NEGATION is "not known to run here" —
+which is not the same claim as "runs somewhere else", and P7/P8 were written as though it were.
+`chat_provider` is a flat settings row with no allow-list on the write path; `mock` is our own
+in-process provider; goose ships `lmstudio`, `llama_swap` and `omlx` declarative providers that
+serve from localhost. Every one of them answered "not on this device" and so got parallelism, a
+per-role model and a background run. `model_class::provider_locality` now answers `OnDevice`,
+`Hosted` or `Unknown` against two named lists, the gates match on it exhaustively, and `Unknown`
+takes the on-device answer. `HOSTED_PROVIDERS` is a positive claim: a genuinely hosted provider
+missing from it loses a background run and a role model, which is the direction this programme
+requires.
+
 **Concurrency 1 is necessary and not sufficient.** `goose-local-inference`'s `LoadedModel` holds
 `session: Option<SessionKv>` — exactly ONE retained KV prefix per loaded model slot, process-wide,
 behind one async mutex. An interleaved subagent turn does not merely queue behind the parent: it
@@ -604,9 +616,10 @@ mutation was run.
 
   **Invariant 3 is a permit, not a convention.** One process-wide `Semaphore`; `spawn` acquires
   `subagent_permits(provider)` of it before touching the engine, so there is no start path that
-  does not queue. The predicate is `max_concurrent_subagents`, which is written against
-  `runs_on_this_device` — `local`, `gguf`, `ollama`, `llamafile` — and the test iterates
-  `ON_DEVICE_PROVIDERS` rather than naming two of them.
+  does not queue. The predicate is `max_concurrent_subagents`, which asks `provider_locality` —
+  `local`, `gguf`, `ollama`, `llamafile` run here, and so does any name in neither list — and the
+  test iterates `ON_DEVICE_PROVIDERS` rather than naming two of them, with a second test over
+  `mock`, `lmstudio`, `pond-spark` and the empty string for the unknown half.
 
   **Still not done, and owed by later phases.** Nothing calls `spawn`: the first caller is P5's
   `delegate` tool, and P3 owes the `DelegationAuthority::root(...)` at the edge and the
@@ -926,18 +939,29 @@ mutation was run.
 - **P7 — LANDED 2026-08-11.** Per-role model assignment: `ChildModel` in `pond-core`, an optional
   `model` key in a role's `giap_role` block, and `child_model_config` in the adapter.
 
-  **The collision the bullet named is the phase, and the answer is that the feature is INERT on
-  every provider that runs on this device.** `ChildModel::resolve` takes the role's request and the
-  parent's provider and answers `Assigned` only when `runs_on_this_device` is false. On-device it
-  answers `RefusedOnDevice` — carrying both the model and the provider, so the refusal is a value a
-  test can assert on rather than an absence indistinguishable from "the role named nothing" — and
-  the child runs on the resident model with the role's tools, budget and persona intact. Refusing
-  the whole delegation was the alternative and is worse: a role authored with a model would then be
-  unrunnable on the configuration this project is built for, and a role's value is not in its model.
+  **The collision the bullet named is the phase, and the answer is that the feature is INERT
+  wherever the model might be ours to hold.** `ChildModel::resolve` takes the role's request and the
+  parent's provider and answers `Assigned` only against a POSITIVE claim that the provider is
+  hosted. On-device it answers `RefusedOnDevice`, and for a provider in neither list it answers
+  `RefusedUnknownProvider` — each carrying both the model and the provider, so the refusal is a
+  value a test can assert on rather than an absence indistinguishable from "the role named nothing"
+  — and the child runs on the resident model with the role's tools, budget and persona intact.
+  Refusing the whole delegation was the alternative and is worse: a role authored with a model would
+  then be unrunnable on the configuration this project is built for, and a role's value is not in
+  its model.
   `a_role_model_never_reaches_the_engine_on_a_provider_that_runs_here` quantifies that over
-  `ON_DEVICE_PROVIDERS` through the real `build_child_plan`;
+  `ON_DEVICE_PROVIDERS` through the real `build_child_plan`,
+  `a_role_model_never_reaches_the_engine_on_a_provider_this_pond_cannot_place` does the same for
+  `mock`/`lmstudio`/`pond-spark`/`""`, and
   `a_role_model_is_used_when_the_provider_runs_somewhere_else` is the vacuity control without which
   a resolve that refused everything would pass.
+
+  **The third variant is a repair, dated 2026-08-11, and the shape of the mistake is worth
+  keeping.** As landed this was `if runs_on_this_device(provider) { refuse } else { assign }`, so
+  every provider name the deny-set had not been taught took the `else` — the permission — including
+  our own `mock` and goose's localhost-serving `lmstudio`. A gate whose safe answer is "refuse"
+  cannot be written as the negation of a deny-set over an open string domain; it has to ask for
+  membership of the set it trusts. See section 3.4.
 
   **What made it cheap off-device is that there is no router and no second provider.** A child
   already replies through its parent's `Arc<dyn Provider>`; what selects the model is the
@@ -970,6 +994,14 @@ mutation was run.
   **Still owed.** Nothing measures the off-device win, because nothing has authored a role with a
   model. And a role naming a model the provider does not have fails at the provider, as a child
   failure — which is the right direction (loud, isolated to one delegation) but has never been seen.
+
+  **How reachable the `Assigned` branch is, corrected.** The phase record said no UI or API authors
+  a role carrying `giap_role.model:`, which reads as "this branch needs a code change to become
+  live". It does not. `POST /api/v1/recipes` takes `{name, description, yaml}` and `create_recipe`
+  stores the YAML verbatim with no schema check, so any authenticated paired client can author such
+  a role today, and on a pond whose `chat_provider` is a name in `HOSTED_PROVIDERS` the branch
+  executes. What is true is narrower: no role in this tree carries the key, and no UI control
+  writes one.
 - **P8 — LANDED 2026-08-11.** Background tasks for providers that do **not** run on this device,
   and `check_task`.
 
@@ -980,9 +1012,14 @@ mutation was run.
   gained anything. A background `spawn` returns the `Queued` run it already constructed.
 
   **The refusal is invariant 3 wearing different clothes, and it is tested against a local provider
-  fixture.** `BackgroundAvailability::for_provider` is derived from `max_concurrent_subagents` —
-  not a second reading of `runs_on_this_device` — so it cannot drift from the number the semaphore
-  enforces. Where one agent may hold the model at a time, a background child is not background: it
+  fixture.** `BackgroundAvailability::for_provider` takes its PERMISSION from
+  `max_concurrent_subagents` — not a second reading of `runs_on_this_device` — so it cannot drift
+  from the number the semaphore enforces; since 2026-08-11 it reads `provider_locality` as well,
+  but only to choose which true sentence a refusal says, and the agreement test now spans all three
+  localities. A provider in neither list is refused with `RefusedUnknownProvider`, because it was
+  PERMITTED before that repair: `mock` and goose's localhost-serving declarative providers all
+  answered "not on this device", and there "background" means the household's next reply is
+  queueing behind a helper nobody is waiting for. See section 3.4. Where one agent may hold the model at a time, a background child is not background: it
   is the parent's next turn queueing behind it and then paying a re-prefill. `spawn` refuses after
   the provider is known and BEFORE the engine is touched, so a refused call leaves no child engine
   session, no plan and no reservation behind; the test asserts all three, over `ON_DEVICE_PROVIDERS`,
@@ -1011,7 +1048,14 @@ mutation was run.
 
   **What else is bounded and what is not.** A background child holds its `context_fraction` of the
   parent's history budget for as long as it runs, which is what section 3.5 said should happen and
-  now finally does with a child that outlives a turn. It takes a subagent permit like any other
+  now finally does with a child that outlives a turn. **That sentence was prose only until
+  2026-08-11**: `reserve(parent, if background { 0.0 } else { fraction })` passed all 201 adapter
+  tests, because the post-run `reserved_fraction == 0.0` check cannot tell "held then released"
+  from "never held" and the inside-the-child fixture was unused on this path. A background `spawn`
+  returns with the child still running, so
+  `a_background_run_returns_before_the_child_finishes_and_can_be_polled` now reads the claim from
+  the CALLER's thread — the one assertion only this case can make — at a fraction (0.6) that no
+  other fixture in the file uses. It takes a subagent permit like any other
   child (one of three, off-device). Its progress frames still publish to the parent session's
   `ProgressBus`, so a later turn of the same conversation sees the tree; with no subscriber they are
   dropped, which is P6's stated failure mode.
@@ -1025,9 +1069,21 @@ mutation was run.
 
   `giap-orchestrator__check_task` is **not** on `routes.rs :: MUST_NEVER_BE_DIRECTLY_DISPATCHABLE`,
   and should be: it reads a child's answer, which is household data, and the direct-dispatch path
-  carries no caller for `authorise_task` to check against. It is deny-by-default today because
-  `DIRECT_DISPATCH_ALLOWLIST` is an allowlist and nothing was added to it — but the positive claim
-  belongs beside `delegate`'s, and `routes.rs` is outside this footprint.
+  carries no caller for `authorise_task` to check against — so there is no task id it could safely
+  answer. It is deny-by-default today because `DIRECT_DISPATCH_ALLOWLIST` is an allowlist and
+  nothing was added to it — but the positive claim belongs beside `delegate`'s. `routes.rs` was
+  outside that phase's footprint and outside this repair's; the exact edit is one line after
+  `"giap-orchestrator__delegate",` in that array, and it is the only thing this repair leaves
+  undone.
+
+  **What `check_task` gained instead, 2026-08-11.** Its own body had never been executed by a test:
+  `authorise_task` was covered as a pure function while `run_check` — the only thing that calls it —
+  had no coverage at all, so deleting the call left the whole crate green and turned the tool into
+  a read of any household member's delegation result by task id. Four tests now drive `run_check`
+  through a fake `Orchestrator` whose `poll` is keyed by task id alone, exactly as the real
+  registry is: a foreign task, the caller's own (the vacuity control), an unknown id refusing in
+  the same words as a foreign one, and a guest turn that owns its task and still may not read it —
+  the last being what stops `authorise(...)` being replaced by a bare `ok_or`.
 
 ---
 
@@ -1088,9 +1144,16 @@ mutation was run.
    A per-role model is refused on-device because a second model in the one slot is a load plus a
    re-prefill the parent pays for; a background delegation is refused on-device because with one
    agent at a time "background" only means the parent's next turn is waiting. Both predicates go
-   through the same place — `ChildModel::resolve` reads `runs_on_this_device`,
-   `BackgroundAvailability::for_provider` reads `max_concurrent_subagents` — so neither can drift
-   into the narrow `local`/`gguf` reading without a named test failing.)*
+   through the same place — `ChildModel::resolve` and `max_concurrent_subagents` both ask
+   `model_class::provider_locality`, and `BackgroundAvailability::for_provider` reads the
+   concurrency number rather than the locality — so neither can drift into the narrow
+   `local`/`gguf` reading without a named test failing.)*
+   *(**Both shipped refusing too little, and the repair is dated 2026-08-11.** Each was written as
+   `if runs_on_this_device(provider) { refuse } else { permit }`, which makes an unrecognised
+   provider name a permission — `mock`, `lmstudio`, `llama_swap`, `omlx`, or anything the settings
+   write path is handed. The invariant is about a DEVICE, and "not in a four-name deny-set" is no
+   evidence about which device. Both gates now match exhaustively on a three-valued
+   `ProviderLocality` and give `Unknown` the on-device answer; section 3.4 carries the reasoning.)*
 4. Subagent conversations never enter the parent's `session_messages`; only results do. Satisfied
    by construction — `ChatService` is the sole writer of that table and the child loop never
    touches it — with one caveat worth stating: the child's turns *are* persisted, into Goose's own
@@ -1202,7 +1265,8 @@ mutation was run.
   same set. They happen to agree at 15. P5 owes that test, because the failure mode is silent and
   it widens.
 - **Per-role model (P7)** — the assertion is the REFUSAL, quantified over `ON_DEVICE_PROVIDERS` and
-  driven through the real `build_child_plan`, with the hosted case as the vacuity control. Do not
+  over a set of providers in neither list, driven through the real `build_child_plan`, with the
+  hosted case as the vacuity control. Do not
   write it as "the plan's model is `None`": `None` is also what a role that named nothing produces,
   so the assertion has to be on the `ChildModel` variant AND on the `ModelConfig`
   `child_model_config` returns. Landed as
