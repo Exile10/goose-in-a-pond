@@ -43,11 +43,13 @@ struct PersistedTask {
     paused: bool,
     #[serde(default)]
     created_at: Option<chrono::DateTime<Utc>>,
-    /// When this task last FIRED (not when it finished). Written for the kinds
-    /// whose debounce reads it back — see [`durable_fire_stamp`] — so a sensor
-    /// rule's cooldown survives a restart. `None` on a file written before
-    /// PAI-7 P8, which reads as "never fired": the first event after an upgrade
-    /// fires once, and the stamp exists from then on.
+    /// When this task last FIRED (not when it finished). Set for every kind;
+    /// what [`durable_fire_stamp`] decides is which kinds a fire is worth a
+    /// write FOR, so a sensor rule's cooldown survives a restart and a cron
+    /// task's stamp reaches disk on the next save somebody else asks for.
+    /// `None` on a file written before PAI-7 P8, which reads as "never fired":
+    /// the first event after an upgrade fires once, and the stamp exists from
+    /// then on.
     #[serde(default)]
     last_run: Option<chrono::DateTime<Utc>>,
 }
@@ -459,7 +461,16 @@ fn validate_kind(kind: &TaskKind) -> Result<()> {
     Ok(())
 }
 
-/// Does this kind's fire stamp have to survive a restart?
+/// Is this kind's fire worth a WRITE of its own?
+///
+/// Read the question precisely, because the loose version of it ("which kinds
+/// are persisted") is not what this decides, and the commit that added it said
+/// otherwise. `stamp_fire` sets `last_run` in memory for EVERY kind — a cron
+/// task has a last run and the schedules UI shows it — and the copy it sets
+/// includes the persisted record, so any later create, update, delete, pause or
+/// resume carries a cron task's stamp to disk on its own `save()`, and
+/// rehydration restores it. What is gated here is only whether a FIRE is itself
+/// a reason to rewrite the file, which is the part that costs flash.
 ///
 /// Only a sensor rule reads its own last fire back: the rules engine debounces
 /// on it, so a lost stamp re-fires the rule the moment the pond comes back, and
@@ -467,12 +478,13 @@ fn validate_kind(kind: &TaskKind) -> Result<()> {
 /// bounds the write — a rule cannot be stamped more often than once per
 /// `cooldown_secs`, because the cooldown is the thing the stamp enforces.
 ///
-/// Everything else stays in memory. A cron task's next fire is computed from
-/// its expression rather than from its last fire, so persisting the stamp buys
-/// nothing, and a 6-field expression is allowed to fire every second — which on
-/// the Jetson's flash would be a whole-file rewrite per second. A rule with
-/// `cooldown_secs == 0` is excluded for the same reason: it debounces nothing,
-/// so it would write on every matching event.
+/// A cron task's next fire is computed from its expression rather than from its
+/// last fire, so a write per fire buys nothing, and a 6-field expression is
+/// allowed to fire every second — which on the Jetson's flash would be a
+/// whole-file rewrite per second. A rule with `cooldown_secs == 0` is excluded
+/// for the same reason: it debounces nothing, so it would write on every
+/// matching event. Riding along on a save somebody else asked for costs neither
+/// of them anything, which is why the in-memory assignment is not gated too.
 fn durable_fire_stamp(kind: &TaskKind) -> bool {
     matches!(kind, TaskKind::SensorTrigger(spec) if spec.cooldown_secs > 0)
 }
@@ -663,10 +675,20 @@ impl SchedulerPort for CronSchedulerAdapter {
         // doors. There are four: `POST /rules`, `POST /schedules`, the
         // `create_sensor_rule` MCP tool and the `update` paths — and the MCP
         // tool reaches this port directly without passing through the API at
-        // all, so a check that lived only in `routes.rs` would leave the model
-        // able to write the rules a person is refused. See
-        // `SensorTriggerSpec::validate` for what each rejection prevents; every
-        // one of them would otherwise be stored and then be silent.
+        // all, so a check that lived only in `routes.rs` would be a check on
+        // three doors of four, which is not a check.
+        //
+        // What that fourth door actually lets through is narrower than the
+        // commit adding this said, and the difference is worth writing down:
+        // `create_sensor_rule` already rejects a malformed `after`/`before`
+        // with the identical `%H:%M` parse, already strips an empty
+        // `device_id`/`signal`, and already refuses an empty action list. Of
+        // `RuleRejection`'s five classes only two are newly reachable through
+        // it — `HalfCondition`, because the tool takes `op` and `value` from
+        // independent parameters, and `EmptyAction` for a `Notify` whose title
+        // and body are both blank, because those two it passes through
+        // unchanged. The seam is right regardless: the tool's own checks are a
+        // property of one caller, this is a property of the store.
         validate_kind(&req.kind)?;
 
         // Reject duplicates
@@ -1577,7 +1599,15 @@ mod tests {
         let corrupt = "[{\"id\":\"nightly-backup\",\"label\":\"Backup\"}, {\"id\":";
         tokio::fs::write(&path, corrupt).await.unwrap();
 
-        let sched = make_scheduler(tmp.path()).await;
+        let counter = Arc::new(AtomicU32::new(0));
+        let exec: Arc<dyn ScheduleExecutor> = Arc::new(CountingExecutor(counter));
+        let sched = CronSchedulerAdapter::new(path.clone(), tmp.path().join("runs.json"), exec)
+            .await
+            .expect(
+                "an unreadable schedules.json failed the whole scheduler: pond-server \
+                 turns that into `scheduler = None`, so every schedule endpoint answers \
+                 503 for the life of the install and the next boot does it again",
+            );
         assert!(sched.list_tasks().await.unwrap().is_empty());
 
         let mut kept = None;
