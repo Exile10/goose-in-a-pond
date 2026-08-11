@@ -87,18 +87,45 @@ pub struct Principal {
     /// The household member this caller has been **proved** to be.
     ///
     /// PAI-1 section 3.3 calls this "the single value every enforcement
-    /// decision in PAI-2 keys on". It is `None` for every caller today, and
-    /// that is a fact about the schema rather than an oversight: nothing links
-    /// a paired device to a member. `session_tokens`, `push_tokens`,
-    /// `pairing_codes` and `handshake_challenges` carry no profile column and
-    /// the pairing flow never asks who is pairing.
+    /// decision in PAI-2 keys on". It is still `None` for every caller, and
+    /// since PAI-1 P9 that is a decision rather than a fact about the schema:
+    /// `devices.profile_id` (migration 0043) now links a paired device to a
+    /// member, and [`Principal::device_id`] carries the device. Populating this
+    /// from that link would widen [`is_identity_assertion_proven`] — it would
+    /// let a paired phone assert its own member on `PUT /sessions/{id}/user` —
+    /// and would put an attribution read on the auth path of **every** request.
+    /// Both are their own phase. The turn's scope is resolved from the device
+    /// rung directly (see
+    /// [`ProvenDevice`](crate::security::domain::proven_device::ProvenDevice)),
+    /// which needs nothing from this field.
     ///
     /// **Never populate this from an asserted value.** Filling it from a
     /// request body is what [`is_identity_assertion_proven`] exists to refuse,
     /// and filling it from `settings.primary_profile_id` would attribute every
-    /// phone in the house to one person. It stays `None` until capturing a
-    /// member at pairing time lands as its own phase.
+    /// phone in the house to one person.
     pub proven_profile_id: Option<String>,
+    /// The device the pond **issued this caller's token to**, from
+    /// `Handshake::caller_for_token`.
+    ///
+    /// PAI-1 P9's identity half: `devices.profile_id` answers "whose device is
+    /// this?", and this is the id that question is asked with. Read it through
+    /// [`ProvenDevice::from_principal`], never directly, so the value cannot be
+    /// mixed up with one a client supplied.
+    ///
+    /// [`ProvenDevice::from_principal`]: crate::security::domain::proven_device::ProvenDevice::from_principal
+    ///
+    /// **Never populate this from a header, a body field or a query
+    /// parameter.** `IdentificationSource::PairedDevice` outranks face and
+    /// explicit identification, so a client-asserted device id would outrank
+    /// every proof the pond can make — the same argument that put the pairing
+    /// attribution on the CODE rather than on the pairing request.
+    ///
+    /// `None` for [`PrincipalKind::Loopback`] and [`PrincipalKind::Internal`]:
+    /// neither presented a token, so neither has a device the pond issued one
+    /// to. The dev loopback bypass in particular must stay `None` — resolving
+    /// it to "the device that paired most recently" would make every local
+    /// request speak as whoever last paired a phone.
+    pub device_id: Option<String>,
 }
 
 impl Principal {
@@ -108,6 +135,7 @@ impl Principal {
             kind: PrincipalKind::Loopback,
             remote_addr: None,
             proven_profile_id: None,
+            device_id: None,
         }
     }
 
@@ -117,6 +145,7 @@ impl Principal {
             kind: PrincipalKind::Internal,
             remote_addr: None,
             proven_profile_id: None,
+            device_id: None,
         }
     }
 
@@ -126,12 +155,25 @@ impl Principal {
             kind: PrincipalKind::Token(client_id.into()),
             remote_addr: None,
             proven_profile_id: None,
+            device_id: None,
         }
     }
 
     /// Attach the originating socket address to this principal.
     pub fn with_remote_addr(mut self, addr: impl Into<String>) -> Self {
         self.remote_addr = Some(addr.into());
+        self
+    }
+
+    /// Attach the device the pond issued this caller's token to.
+    ///
+    /// The argument must come from `Handshake::caller_for_token` and from
+    /// nowhere else — see [`Principal::device_id`]. There is exactly one
+    /// production call site, the API's auth middleware, and
+    /// `crates/pond-infra/tests/device_rung_wiring.rs` fails if a second one
+    /// appears or if that one stops passing the lookup's own answer.
+    pub fn with_device(mut self, device_id: impl Into<String>) -> Self {
+        self.device_id = Some(device_id.into());
         self
     }
 }

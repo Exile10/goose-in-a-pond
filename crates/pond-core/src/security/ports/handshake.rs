@@ -117,6 +117,37 @@ pub struct PairingCode {
     pub profile_id: Option<String>,
 }
 
+/// Who a valid session token was issued to.
+///
+/// One `session_tokens` row narrowed to the two identifiers a request can be
+/// attributed with. They are **not** interchangeable, and the difference is the
+/// whole of PAI-1's strongest rung:
+///
+/// * `client_id` is what the client called itself at `init_handshake`. It is
+///   self-reported and it names an installation, not a person. It is what the
+///   audit log records.
+/// * `device_id` is the id of the `devices` row the pair wrote, and that row is
+///   the one carrying `profile_id` (migration 0043) -- captured at pairing-CODE
+///   issuance, on the host, so no client can name its own member.
+///
+/// They hold the same string today, because
+/// `SqliteHandshakeAdapter::verify_handshake` derives the device id from the
+/// client id. They are separate fields anyway: the day a device id stops being
+/// the client's own word for itself, the identity rung must follow the column
+/// with the foreign key on it and not the other one.
+///
+/// `device_id` is not `Option`. `session_tokens.device_id` is `NOT NULL`, so a
+/// token that exists has one; "I do not know which device" is expressed by the
+/// `Option<TokenCaller>` the lookup returns, and there is deliberately no
+/// second way to say it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenCaller {
+    /// The client id the token was issued to.
+    pub client_id: String,
+    /// The `devices` row this token's pairing registered.
+    pub device_id: String,
+}
+
 /// Driven Port: device authentication and pairing.
 ///
 /// New two-phase methods carry default impls that return "unsupported" so
@@ -131,19 +162,70 @@ pub trait Handshake: Send + Sync {
     /// Validate an existing session token.
     async fn validate_token(&self, token: &str) -> Result<bool>;
 
-    /// The `client_id` a valid token was issued to, if this adapter can say.
+    /// The caller a valid token was issued to — client **and** device — if this
+    /// adapter can say.
     ///
     /// [`validate_token`](Self::validate_token) answers only yes or no, so a
     /// caller that has authenticated a request still cannot name who made it —
     /// which is why `Principal::token(..)` had nothing to populate it with and
     /// no `Principal` was ever constructed in production.
     ///
-    /// Defaulted to `Ok(None)` so adapters that cannot answer (and every
-    /// existing implementor) need no change: "I do not know" is a truthful
-    /// answer, and an audit entry saying `token:<unknown>` is better than one
-    /// naming a client id that was inferred.
-    async fn client_id_for_token(&self, _token: &str) -> Result<Option<String>> {
+    /// # Why the device rides here and cannot ride anywhere else
+    ///
+    /// `IdentificationSource::PairedDevice` is the **strongest** rung of
+    /// [`identity_resolution::resolve`], outranking both face and explicit
+    /// identification. The device id that feeds it must therefore come from the
+    /// token **the pond itself issued** — never from a header, a body field or
+    /// a query parameter, all of which a client controls and any of which would
+    /// outrank every proof the pond can actually make. This method is the only
+    /// door that answer comes through.
+    ///
+    /// [`identity_resolution::resolve`]: crate::user_data::services::identity_resolution::resolve
+    ///
+    /// # Why this is defaulted, and what stops the default being the answer
+    ///
+    /// A default on a trait that answers a security question is normally a
+    /// decision made by whoever forgot to override it — PAI-2 P7's words, and
+    /// the reason every method on
+    /// [`DeviceAttribution`](crate::user_data::ports::device_attribution::DeviceAttribution)
+    /// is required. Two things make the default the right call *here* and
+    /// neither is "it was less work":
+    ///
+    /// 1. **The default narrows.** `Ok(None)` means no device on the request,
+    ///    so the paired-device rung is skipped and resolution falls through to
+    ///    explicit, then face, then guest. A forgotten override loses a
+    ///    capability; it cannot grant one. That is the opposite of the usual
+    ///    defaulted-method hazard, where the omission is what widens access.
+    /// 2. **The forgetting is caught anyway.** The inert-feature risk is real —
+    ///    this programme has shipped three phases that were inert — so it is
+    ///    guarded twice rather than argued away:
+    ///    `crates/pond-infra/tests/device_rung_wiring.rs` walks every
+    ///    `impl Handshake for` in the workspace and fails on one that answers
+    ///    neither this method nor the allowlist, and
+    ///    [`client_id_for_token`](Self::client_id_for_token) below is derived
+    ///    from this method, so an adapter that loses the override also loses
+    ///    the client id it has been answering since #93.
+    async fn caller_for_token(&self, _token: &str) -> Result<Option<TokenCaller>> {
         Ok(None)
+    }
+
+    /// The `client_id` a valid token was issued to, if this adapter can say.
+    ///
+    /// Derived from [`caller_for_token`](Self::caller_for_token) rather than
+    /// implemented beside it, exactly as
+    /// [`issue_pairing_code`](Self::issue_pairing_code) is derived from
+    /// [`issue_pairing_code_for`](Self::issue_pairing_code_for): an adapter
+    /// cannot support one and not the other, and two lookups over the same row
+    /// cannot drift into disagreeing about which client a token belongs to.
+    ///
+    /// "I do not know" is a truthful answer, and an audit entry saying
+    /// `token:<unknown>` is better than one naming a client id that was
+    /// inferred.
+    async fn client_id_for_token(&self, token: &str) -> Result<Option<String>> {
+        Ok(self
+            .caller_for_token(token)
+            .await?
+            .map(|caller| caller.client_id))
     }
 
     /// Revoke a session token (disconnect a client).

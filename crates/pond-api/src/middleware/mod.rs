@@ -502,6 +502,16 @@ pub async fn auth_middleware(
     // desktop app — reached every protected route unauthenticated. With it off,
     // even loopback clients (including the desktop app) must present a valid
     // token obtained via the handshake.
+    //
+    // PAI-1 P9: this returns EARLY, before a token is read, so the principal it
+    // inserts carries no device and the paired-device rung is unreachable on
+    // this path. That is deliberate and it is the narrowing answer. There is no
+    // token here to look a device up by, and the two tempting substitutes are
+    // both wrong in the direction this programme exists to prevent: the most
+    // recently paired device would make every local request speak as whoever
+    // last paired a phone, and a client-supplied id would outrank every proof
+    // the pond can make. A loopback caller falls through to explicit, then
+    // face, then guest -- exactly as it did before this rung existed.
     if dev_allow_loopback() && peer_is_loopback {
         let mut req = req;
         req.extensions_mut().insert(Principal::loopback());
@@ -526,18 +536,35 @@ pub async fn auth_middleware(
     // which is why no `Principal` was ever constructed in production and
     // `SecurityPolicy::allow` had no call site it could reason from.
     //
-    // An adapter that cannot name the client returns None, and the principal
-    // says so rather than guessing. `proven_profile_id` stays None on every
-    // path here: nothing links a token to a household member yet, and inventing
-    // that link is the misattribution this whole workstream exists to prevent.
-    let client_id = state
-        .handshake
-        .client_id_for_token(&token)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "unknown".to_string());
-    let mut principal = Principal::token(client_id);
+    // An adapter that cannot name the caller returns None, and the principal
+    // says so rather than guessing.
+    //
+    // -- PAI-1 P9: the device rides here, and only from here -----------------
+    //
+    // `caller_for_token` is the ONE door the device id comes through. It is the
+    // token THIS POND ISSUED at pairing, so the chain
+    // device -> devices.profile_id -> member is unbroken and contains nothing
+    // the client said about itself. `IdentificationSource::PairedDevice`
+    // outranks face and explicit identification, so reading the device from a
+    // header, a body field or a query parameter would let a client outrank
+    // every proof the pond can make. Nothing in `headers` is consulted below
+    // except the bearer token already extracted above, and
+    // `device_rung_wiring.rs` asserts that by reading this line's ARGUMENT
+    // rather than by checking that some device is set somewhere.
+    //
+    // A failed lookup NARROWS: no client id, no device, and therefore no
+    // paired-device rung. The request is still authenticated -- `validate_token`
+    // said so -- it is simply unattributed, which is what every request was
+    // before this rung existed.
+    //
+    // `proven_profile_id` stays None on every path here. The device is the
+    // proof; turning it into a member is `resolve_turn_scope`'s job, through
+    // `DeviceAttribution`, where a failed read is a distinguishable outcome
+    // rather than an `unwrap_or_default`.
+    let mut principal = match state.handshake.caller_for_token(&token).await {
+        Ok(Some(caller)) => Principal::token(caller.client_id).with_device(caller.device_id),
+        _ => Principal::token("unknown".to_string()),
+    };
     if let Some(ci) = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()

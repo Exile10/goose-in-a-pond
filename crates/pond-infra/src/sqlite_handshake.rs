@@ -29,7 +29,7 @@ use tokio::sync::RwLock;
 
 use pond_core::security::ports::handshake::{
     ChallengeResponse, Handshake, HandshakeRequest, HandshakeResponse, InitRequest, PairingCode,
-    RefreshRequest, VerifyRequest,
+    RefreshRequest, TokenCaller, VerifyRequest,
 };
 use pond_core::user_data::ports::device_attribution::checked_profile_id;
 
@@ -237,22 +237,42 @@ impl Handshake for SqliteHandshakeAdapter {
     }
 
     /// Same predicate as [`validate_token`](Self::validate_token) — unexpired
-    /// and unrevoked — but returns the `client_id` rather than a bool, so an
-    /// authenticated request can name its caller. Deliberately does NOT touch
-    /// `last_seen_at`: this is a lookup about a request already validated, not
-    /// a second use of the token.
-    async fn client_id_for_token(&self, token: &str) -> Result<Option<String>> {
+    /// and unrevoked — but returns who the token was issued to rather than a
+    /// bool, so an authenticated request can name its caller and its device.
+    /// Deliberately does NOT touch `last_seen_at`: this is a lookup about a
+    /// request already validated, not a second use of the token.
+    ///
+    /// PAI-1 P9: `device_id` is the row `verify_handshake` registered in
+    /// `devices`, and `devices.profile_id` is the member the operator bound at
+    /// pairing-code issuance. Selecting it here is the only way that member
+    /// reaches a turn — the alternative, a client-supplied device id, would
+    /// outrank every proof the pond can make.
+    ///
+    /// The predicate is repeated rather than shared with `validate_token`
+    /// because the two answer different questions about the same row and
+    /// `validate_token` has the `last_seen_at` side effect. If they ever
+    /// disagree, this one is the stricter place to fix: a token that validates
+    /// but names nobody degrades to `<unknown>`, which is a narrowing.
+    ///
+    /// [`client_id_for_token`](Handshake::client_id_for_token) is NOT
+    /// overridden: the port derives it from this method so the two cannot drift
+    /// into disagreeing, and so an adapter that loses this override visibly
+    /// loses the client id as well.
+    async fn caller_for_token(&self, token: &str) -> Result<Option<TokenCaller>> {
         let token_hash = Self::sha256_hex(token.as_bytes());
         let now = Self::now().to_rfc3339();
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT client_id FROM session_tokens
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT client_id, device_id FROM session_tokens
              WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?",
         )
         .bind(&token_hash)
         .bind(&now)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(client_id,)| client_id))
+        Ok(row.map(|(client_id, device_id)| TokenCaller {
+            client_id,
+            device_id,
+        }))
     }
 
     async fn validate_token(&self, token: &str) -> Result<bool> {

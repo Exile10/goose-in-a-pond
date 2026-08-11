@@ -28,6 +28,7 @@ use pond_core::models::services::context::model_class::ModelClass;
 use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
 use pond_core::prompts::{builtin_template_content, ProfileContext};
 use pond_core::security::domain::event::{EventCategory, EventQuery, PrivacySensitivity};
+use pond_core::security::domain::proven_device::{DeviceRung, ProvenDevice};
 use pond_core::security::ports::handshake::{
     ChallengeResponse, HandshakeRequest, HandshakeResponse, InitRequest, RefreshRequest,
     VerifyRequest,
@@ -40,6 +41,7 @@ use pond_core::user_data::domain::schedule::{Schedule, SensorTriggerSpec, TaskKi
 use pond_core::user_data::domain::sensor::{CameraEvent, SensorReading};
 use pond_core::user_data::domain::session::{IdentificationSource, SessionIdentity};
 use pond_core::user_data::domain::settings::Settings;
+use pond_core::user_data::ports::device_attribution::DeviceAttribution;
 use pond_core::user_data::ports::device_registry::RegisterDeviceRequest;
 use pond_core::user_data::ports::scheduler::{CreateScheduleRequest, UpdateScheduleRequest};
 use pond_core::user_data::ports::session_storage::SessionStorageError;
@@ -1002,8 +1004,14 @@ struct ChatRequest {
 /// Persists both user and assistant messages to session storage.
 async fn chat(
     State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
     body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // PAI-1 P9. Taken from the request's principal before the body is even
+    // parsed, so there is no point at which a field of that body could be
+    // mistaken for it.
+    let device = proven_device(principal.as_ref());
+
     // Resets the inactivity clock and interrupts any background consolidation.
     state.note_user_activity().await;
 
@@ -1038,7 +1046,7 @@ async fn chat(
     // disagreed about the same speaker: the stream gave Guest, this gave the
     // whole household.
     let service = ChatService::new(state.agent.clone(), session_id.clone(), storage.clone())
-        .with_profile_scope(resolve_turn_scope(&state, &session_id).await);
+        .with_profile_scope(resolve_turn_scope(&state, &session_id, &device).await);
 
     let response_text = service.chat_once(req.message).await.map_err(|e| {
         (
@@ -1187,9 +1195,14 @@ async fn tts_synthesise(
 /// to session storage before yielding the final done event.
 async fn chat_stream(
     State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
     body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
 {
+    // PAI-1 P9. Read from the principal before the body is parsed; `ChatRequest`
+    // has no device field and must never grow one.
+    let device = proven_device(principal.as_ref());
+
     // Resets the inactivity clock and interrupts any background consolidation.
     state.note_user_activity().await;
 
@@ -1215,7 +1228,7 @@ async fn chat_stream(
     // event mid-conversation. Nothing has been decoded at this point.
     image_limit_response(&req.images)?;
 
-    Ok(chat_stream_inner(state, permit, req))
+    Ok(chat_stream_inner(state, permit, req, device))
 }
 
 /// Map an image-limit violation onto an HTTP status, or pass a legal set through.
@@ -1506,10 +1519,18 @@ impl TurnAccumulator {
 /// this helper owns the full agent turn — session creation, system-prompt
 /// build, llamafile startup wait, ThoughtFilter, telemetry, memory extraction —
 /// and emits the same SSE event shape regardless of entry point.
+///
+/// `device` is separate from `req` on purpose (PAI-1 P9): `ChatRequest` is
+/// deserialised from a client-controlled body, and the paired-device rung
+/// outranks every other identification the pond can make. Passing it beside the
+/// body keeps the two provenances apart in the type signature, so a future
+/// author cannot reach for `req.device_id` because there is nothing to reach
+/// for.
 fn chat_stream_inner(
     state: Arc<AppState>,
     permit: tokio::sync::OwnedSemaphorePermit,
     req: ChatRequest,
+    device: ProvenDevice,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     use futures::StreamExt;
 
@@ -1550,7 +1571,7 @@ fn chat_stream_inner(
         // WRITTEN under the identity it was READ under. Extraction stamps
         // `profile_id` from this; before it, every fragment was unattributed
         // and `Owner(id)` reads matched exactly what `Household` did.
-        let turn_scope = resolve_turn_scope(&state, &session_id).await;
+        let turn_scope = resolve_turn_scope(&state, &session_id, &device).await;
 
         let mut chat_service = pond_core::shared::services::chat::ChatService::new(
             state.agent.clone(),
@@ -8754,11 +8775,17 @@ async fn mcp_call_tool(
 /// - `{"error":"..."}` — on failure
 async fn agent_chat_stream(
     State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     use futures::stream::StreamExt;
     use pond_core::shared::domain::agent::AgentRequest;
+
+    // PAI-1 P9. This route hand-parses a raw `Value` body, which is exactly the
+    // shape where a `body["device_id"]` would be one line away from looking
+    // reasonable. It is read from the principal, before the body is touched.
+    let device = proven_device(principal.as_ref());
 
     // Resets the inactivity clock and interrupts any background consolidation.
     state.note_user_activity().await;
@@ -8845,7 +8872,7 @@ async fn agent_chat_stream(
         // into the whole household's memory. The default was harmless only
         // because extraction was off on this route. A widening default reached
         // by ordering is still a widening default.
-        let turn_scope = resolve_turn_scope(&state, &session_id).await;
+        let turn_scope = resolve_turn_scope(&state, &session_id, &device).await;
 
         let mut chat_service = pond_core::shared::services::chat::ChatService::new(
             agent.clone(),
@@ -11482,9 +11509,15 @@ impl RecipePrompt {
 async fn run_recipe(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
     body: Option<Json<RunRecipeRequest>>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
 {
+    // PAI-1 P9. A recipe run is a turn like any other and resolves the speaker
+    // the same way: the device the pond issued this caller's token to, never
+    // anything in `RunRecipeRequest`.
+    let device = proven_device(principal.as_ref());
+
     let repo = state.recipe_repo.as_ref().ok_or_else(|| {
         (
             StatusCode::NOT_IMPLEMENTED,
@@ -11550,7 +11583,7 @@ async fn run_recipe(
         canvas_mode: body.canvas_mode,
     };
 
-    Ok(chat_stream_inner(state, permit, chat_req))
+    Ok(chat_stream_inner(state, permit, chat_req, device))
 }
 
 // ───────────────────────── Face Biometrics (Phase 2) ────────────────────────
@@ -13145,9 +13178,11 @@ async fn delete_user_biometrics(
 /// **The consequence is a real cliff and I am taking it deliberately.** A
 /// session that nobody has identified resolves to `Household` on a one-member
 /// pond, so on a default install today this answers 403 and the surface is
-/// unusable until a session is bound to a member — by `PUT /sessions/{id}/user`,
-/// by a face match, or (since PAI-1 P9's HTTP half) by a device paired with a
-/// member-bound code. That is narrower than
+/// unusable until the speaker is resolved to a member — by
+/// `PUT /sessions/{id}/user`, by a face match, or (since PAI-1 P9's identity
+/// half) by the request arriving on a device paired with a member-bound code.
+/// The third of those needs no session binding at all: `resolve_turn_scope`
+/// resolves it per request, from the token. That is narrower than
 /// [`is_draft_decision_permitted`](pond_core::security::ports::policy::is_draft_decision_permitted),
 /// which lets `Household` decide any draft on the argument that a one-member
 /// pond has nobody to protect from. The difference is that a draft can be
@@ -13158,8 +13193,9 @@ async fn delete_user_biometrics(
 async fn proposal_caller(
     state: &Arc<AppState>,
     session_id: &str,
+    device: &ProvenDevice,
 ) -> Result<(ProfileScope, ProposalAudience), (StatusCode, Json<Value>)> {
-    let scope = resolve_turn_scope(state, session_id).await;
+    let scope = resolve_turn_scope(state, session_id, device).await;
     match ProposalAudience::from_scope(&scope) {
         Ok(audience) => Ok((scope, audience)),
         Err(e) => {
@@ -13245,9 +13281,14 @@ struct ProposalCallerQuery {
 /// (invariant 7).
 async fn list_proposals(
     State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
     Query(query): Query<ProposalCallerQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let (_scope, audience) = proposal_caller(&state, &query.session_id).await?;
+    // PAI-1 P9. `ProposalCallerQuery` carries the session id and nothing else;
+    // the device comes from the principal, so a query string cannot widen who
+    // this caller is addressed as.
+    let device = proven_device(principal.as_ref());
+    let (_scope, audience) = proposal_caller(&state, &query.session_id, &device).await?;
 
     let proposals = proposal_repo(&state)
         .list_live_for(audience.profile_id(), chrono::Utc::now())
@@ -13289,10 +13330,15 @@ struct DecideProposalRequest {
 async fn decide_proposal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
     body: Result<Json<DecideProposalRequest>, JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // PAI-1 P9. Read before the body: `DecideProposalRequest` is
+    // `deny_unknown_fields`, so a `device_id` in the body is a 400 rather than
+    // an identification, and this is where the real one comes from anyway.
+    let device = proven_device(principal.as_ref());
     let Json(request) = body.map_err(|_| bad_body())?;
-    let (scope, _audience) = proposal_caller(&state, &request.session_id).await?;
+    let (scope, _audience) = proposal_caller(&state, &request.session_id, &device).await?;
 
     // Only a live proposal is decidable here, and `get_live` is what decides
     // that this id is a proposal at all. Expired, already decided, a
@@ -13369,10 +13415,55 @@ async fn decide_proposal(
 /// silently win.
 ///
 /// Every failure here narrows rather than widens. A session-storage error
-/// resolves as if nothing were bound, and a profile-list error is treated as
-/// "there may be more than one member" -- both give the more restrictive
-/// answer, per invariant 2.
-async fn resolve_turn_scope(state: &Arc<AppState>, session_id: &str) -> ProfileScope {
+/// resolves as if nothing were bound, a profile-list error is treated as "there
+/// may be more than one member", and an unreadable attribution store identifies
+/// nobody -- all three give the more restrictive answer, per invariant 2.
+///
+/// # The device argument
+///
+/// PAI-1 P9's identity half. `device` is a [`ProvenDevice`], not a `&str`, and
+/// that is the whole security property: the only way to build one that names a
+/// device is [`ProvenDevice::from_principal`], and `Principal::device_id` is
+/// populated in exactly one place -- the auth middleware, from
+/// `Handshake::caller_for_token`, which reads the token this pond issued at
+/// pairing. `IdentificationSource::PairedDevice` outranks face and explicit
+/// identification, so a device id a client could supply in a header or a body
+/// would outrank every proof the pond can make. There is no constructor that
+/// takes one.
+///
+/// An unattributed device (`devices.profile_id` NULL) falls THROUGH to the next
+/// rung and resolves nobody -- migration 0043's header is explicit that the
+/// identity and delivery directions are not mirror images, and this is the
+/// identity one.
+async fn resolve_turn_scope(
+    state: &Arc<AppState>,
+    session_id: &str,
+    device: &ProvenDevice,
+) -> ProfileScope {
+    // The strongest rung first, and the read only happens when the request
+    // actually carried a device. `rung` consumes the `Result` so a failed read
+    // cannot be flattened into "unattributed" by an `unwrap_or_default`.
+    let device_rung = match device.id() {
+        None => DeviceRung::NoDevice,
+        Some(device_id) => device.rung(device_attribution(state).device_profile(device_id).await),
+    };
+    match &device_rung {
+        DeviceRung::Unavailable(why) => tracing::warn!(
+            error = %why,
+            session_id,
+            "could not read this device's household member; treating the speaker as \
+             unidentified rather than assuming one"
+        ),
+        DeviceRung::Member(profile_id) => tracing::debug!(
+            target: "giap::trace",
+            kind = "turn_device_identified",
+            session_id,
+            profile_id = %profile_id,
+            "the paired device this turn arrived on belongs to a household member"
+        ),
+        DeviceRung::NoDevice | DeviceRung::Unattributed => {}
+    }
+
     let identity = state
         .session_storage
         .get_session_identity(session_id)
@@ -13398,13 +13489,45 @@ async fn resolve_turn_scope(state: &Arc<AppState>, session_id: &str) -> ProfileS
     };
 
     identity_resolution::resolve(&identity_resolution::ResolutionInputs {
-        // No rung to resolve from: nothing links a paired device to a member.
-        // See identity_resolution's module docs.
-        paired_device_profile: None,
+        // PAI-1 P9. `Member` is the only one of the four rungs that answers
+        // `Some`; no device, an unattributed device and an unreadable
+        // attribution store all answer `None` and fall through.
+        paired_device_profile: device_rung.profile_id(),
         session: &identity,
         household_has_multiple_members,
     })
     .scope
+}
+
+/// The device the *pond* proved this request came from.
+///
+/// Every handler that resolves a turn goes through this one function, so there
+/// is a single place where a request becomes a device id and it reads only the
+/// `Principal` the auth middleware attached. A request with no principal --
+/// an in-process caller, or a wiring fault -- names no device and falls through
+/// every rung below the paired-device one, which is what it did before this
+/// rung existed.
+fn proven_device(
+    principal: Option<&axum::Extension<pond_core::security::ports::policy::Principal>>,
+) -> ProvenDevice {
+    match principal {
+        Some(axum::Extension(principal)) => ProvenDevice::from_principal(principal),
+        None => ProvenDevice::none(),
+    }
+}
+
+/// PAI-1 P9's attribution repository, built from the pool `AppState` already
+/// holds -- the same story as [`proposal_repo`].
+///
+/// It belongs on `AppState` as an injected `Arc<dyn DeviceAttribution>`, next to
+/// `profile_repo` and the rest, and it is not there because `lib.rs` and
+/// `main.rs` were owned by other work this round. Everything that needs it goes
+/// through this one function precisely so the swap is a one-line change here and
+/// no change in any handler.
+fn device_attribution(
+    state: &Arc<AppState>,
+) -> pond_infra::sqlite_device_attribution::SqliteDeviceAttribution {
+    pond_infra::sqlite_device_attribution::SqliteDeviceAttribution::new(state.db.system.clone())
 }
 
 /// The speaking member's own preferences, for the prompt.
