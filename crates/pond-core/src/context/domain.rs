@@ -650,10 +650,19 @@ mod tests {
     fn a_credential_is_gone_before_the_value_exists() {
         let item = ContextItem::from_parts(&redactor(), parts("subject", &format!("key {KEY} x")))
             .expect("valid item");
-        assert!(!item.body().contains(KEY), "{}", item.body());
+        assert!(
+            !item.body().contains(KEY),
+            "the constructor built an item whose body still holds the credential, so a \
+             `ContextItem` in hand is no longer evidence that redaction ran: {}",
+            item.body()
+        );
         assert!(item.body().contains("[redacted:api-key]"));
         assert!(item.body().contains(" x"), "prose was mangled");
-        assert!(!item.embedding_text().contains(KEY));
+        assert!(
+            !item.embedding_text().contains(KEY),
+            "the embedding would be computed over the credential, making the vector a durable \
+             derivative of it"
+        );
     }
 
     #[test]
@@ -661,7 +670,11 @@ mod tests {
         let mut p = parts("subject", "body");
         p.participants = vec![format!("bot {KEY}")];
         let item = ContextItem::from_parts(&redactor(), p).expect("valid item");
-        assert!(!item.participants()[0].contains(KEY));
+        assert!(
+            !item.participants()[0].contains(KEY),
+            "a participant reached storage unredacted: {}",
+            item.participants()[0]
+        );
         assert!(item.findings().contains(&RedactionKind::ApiKey));
     }
 
