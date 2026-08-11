@@ -943,6 +943,36 @@ pub struct Settings {
     /// [`GateInputs::enabled`]: crate::user_data::services::consolidation_schedule::GateInputs
     #[serde(default = "Settings::default_proactive_review_enabled")]
     pub proactive_review_enabled: bool,
+
+    /// May the pond turn what its own sensors and cameras report into personal
+    /// context items (PAI-8's on-pond producer)?
+    ///
+    /// This is not the same question as "is the camera on". The camera already
+    /// records events, and the sensor already records readings; both live in
+    /// their own tables under their own retention. This toggle asks whether a
+    /// household member's [`ContextSource`] may turn those events into a durable,
+    /// per-member corpus that is read back into a model's prompt. That is a
+    /// second copy, under a second owner, with a second retention window, and it
+    /// is the copy the assistant quotes.
+    ///
+    /// Its own `default_*` fn returning `false`, which is now the fourth time in
+    /// this programme and the reason has not changed: nobody asked for it by
+    /// upgrading, and reusing a shared `true`-returning default is precisely how
+    /// `ext_orchestrator_enabled` would have shipped delegation on for every
+    /// install. There is a second cost specific to this one — the corpus grows
+    /// on a Jetson with an 8 GB budget, and the growth is proportional to how
+    /// many devices a member follows.
+    ///
+    /// Off means the producer refuses every event with
+    /// [`NotIngested::Disabled`], including through the batch entry point. It
+    /// does NOT disable retrieval: a pond that ingested while it was on and then
+    /// switched off keeps and can still recall what it has, which is the honest
+    /// behaviour for a store the user can also empty by disconnecting the source.
+    ///
+    /// [`ContextSource`]: crate::context::domain::ContextSource
+    /// [`NotIngested::Disabled`]: crate::context::producer::NotIngested::Disabled
+    #[serde(default = "Settings::default_context_ingest_enabled")]
+    pub context_ingest_enabled: bool,
 }
 
 impl Default for Settings {
@@ -1072,6 +1102,11 @@ impl Default for Settings {
             unprompted_speech_categories: Self::default_unprompted_speech_categories(),
             // PAI-7 P4. Off, like the two above it and for the same reason.
             proactive_review_enabled: false,
+            // PAI-8's on-pond producer. Off, and it must stay a literal `false`
+            // here as well as in its `default_*` fn: `serde` reads one of the
+            // two and `Settings::default()` the other, so a pond can be built
+            // through either door.
+            context_ingest_enabled: false,
         }
     }
 }
@@ -1455,6 +1490,13 @@ impl Settings {
     /// own has a symbol a test can assert is `false`, so turning one on is an
     /// edit to a failing test rather than a character somebody changed.
     fn default_proactive_review_enabled() -> bool {
+        false
+    }
+
+    /// PAI-8's on-pond producer. A named function for the fourth time, for the
+    /// reason the third one records: turning one of these on must be an edit to
+    /// a failing test, not a character somebody changed.
+    fn default_context_ingest_enabled() -> bool {
         false
     }
 }
@@ -2155,29 +2197,17 @@ mod tests {
             // Devices tab grows a Matter section.
             "matter_enabled",
             "matter_ws_url",
-            // PAI-7 P6's four. Headless for exactly the reason `network_mode`
-            // above is: shipping the control is a `Settings.tsx` + `types.ts`
-            // change, and those files belonged to somebody else on the round
-            // that added these fields. This classification is what the test
-            // checks, so claiming UI_WIRED without the control would assert
-            // something untrue and silence the only guard on it.
-            //
-            // These four owe a UI more than the knobs above them do, and the
-            // reason is worth stating: the others tune when a pipeline reshapes
-            // history, while `unprompted_speech_enabled` decides whether the
-            // assistant talks to you unasked. It is off, so nothing is
-            // reachable without an API call today -- but a household cannot
-            // consent to a feature it cannot see, and the quiet-hours window is
-            // the one setting people will actually want to change.
-            "unprompted_speech_enabled",
-            "quiet_hours_start",
-            "quiet_hours_end",
-            "unprompted_speech_categories",
-            // PAI-7 P4's toggle, headless for the same reason as P6's four and
-            // owing a UI just as much: a household cannot consent to the pond
-            // reasoning about them unasked if the switch is only reachable
-            // through the REST API.
-            "proactive_review_enabled",
+            // PAI-8's on-pond producer, headless for the same reason and owing
+            // a UI for a sharper one: this switch decides whether what the
+            // household's cameras and sensors saw is copied into a per-member
+            // corpus the assistant quotes back. It is off, so nothing is
+            // reachable without an API call -- but "which of my devices feed my
+            // context" is a question a person should be able to answer in the
+            // app, and the source list that answers it has no UI either. The
+            // control belongs on the Privacy section next to `network_mode`,
+            // and shipping it is a `Settings.tsx` + `types.ts` change owned by
+            // whoever owns those files.
+            "context_ingest_enabled",
         ];
         // Everything else is surfaced in the desktop UI (Settings tabs / hub
         // views / onboarding) and mirrored in the TS Settings type.
@@ -2242,6 +2272,20 @@ mod tests {
             "primary_profile_id",
             "prompt_addendum",
             "prompt_style",
+            // PAI-7 P4 and P6's five. They were HEADLESS_BY_DESIGN for a day
+            // with a note saying they owed a UI more than the tuning knobs did,
+            // because `unprompted_speech_enabled` decides whether the assistant
+            // talks to you unasked and a household cannot consent to a feature
+            // it cannot see. They have one now, under "Speaking and acting
+            // unprompted" in `Settings.tsx`, with the quiet-hours bounds as
+            // free text rather than a time picker -- a value the server cannot
+            // parse means silence, and a picker renders such a value as blank,
+            // which reads as "not set".
+            "proactive_review_enabled",
+            "quiet_hours_end",
+            "quiet_hours_start",
+            "unprompted_speech_categories",
+            "unprompted_speech_enabled",
             "retention_event_log_days",
             "retention_sensor_days",
             "retention_session_messages_keep",
@@ -2395,6 +2439,44 @@ mod tests {
             from_nothing.tool_call_validation,
             "vacuity control: a serde default that is genuinely `true` survives the same \
              empty payload, so `unprompted_speech_enabled` being false is a decision"
+        );
+    }
+
+    /// PAI-8's on-pond producer, and the same three routes for the fourth time.
+    ///
+    /// What "on" costs here is different again from its two neighbours: not an
+    /// agent nobody asked for and not a machine talking, but a second durable
+    /// copy of everything the household's cameras and sensors saw, owned by one
+    /// named member and quoted back into a model's prompt. A pond that upgrades
+    /// into this release must not start making that copy.
+    #[test]
+    fn the_context_ingest_toggle_defaults_off_by_its_own_route() {
+        assert!(
+            !Settings::default().context_ingest_enabled,
+            "the struct default is what a FAILED settings read produces via \
+             unwrap_or_default(); on failure the pond copies nothing"
+        );
+
+        let from_nothing: Settings =
+            serde_json::from_str("{}").expect("every Settings field has a serde default");
+        assert!(
+            !from_nothing.context_ingest_enabled,
+            "the serde default is what a settings payload written before this field existed \
+             deserializes to -- i.e. every pond that upgrades into this release"
+        );
+        assert!(!Settings::default_context_ingest_enabled());
+
+        // Vacuity controls: the empty payload really did populate the struct,
+        // and a serde default that is genuinely `true` survives it. Without
+        // these, "false" holds against a value that is false for every field.
+        assert_eq!(
+            from_nothing.quiet_hours_start,
+            Settings::default_quiet_hours_start()
+        );
+        assert!(
+            from_nothing.tool_call_validation,
+            "vacuity control: a `true` serde default survives the same empty payload, so \
+             `context_ingest_enabled` being false is a decision"
         );
     }
 

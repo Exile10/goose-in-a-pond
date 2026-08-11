@@ -21,14 +21,21 @@
 //!   may see. One predicate, two implementations, cross-checked.
 //! - [`ports`] — the storage port. No default bodies, on purpose.
 //! - [`ingest`] — the pipeline, and what it refuses.
+//! - [`producer`] — the on-pond producer: the bus event to [`RawItem`] map, and
+//!   the judgement about which readings are worth a durable row.
+//! - [`bus_ingest`] — the one moving part: the producer joined to the pipeline,
+//!   so wiring it in `pond-server` is a call rather than four policy decisions.
 //! - [`retention`] — how long an item lives, and the `0 = forever` trap.
 //! - [`retrieval`] — P2: ranking and the second `<system-context>` budget.
 //!
 //! [`SourceKind::availability`]: domain::SourceKind::availability
+//! [`RawItem`]: ingest::RawItem
 
+pub mod bus_ingest;
 pub mod domain;
 pub mod ingest;
 pub mod ports;
+pub mod producer;
 pub mod retention;
 pub mod retrieval;
 pub mod scope;

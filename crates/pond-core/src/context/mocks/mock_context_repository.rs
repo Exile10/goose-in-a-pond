@@ -20,6 +20,15 @@ use crate::user_data::domain::profile::ProfileScope;
 pub struct MockContextRepository {
     sources: Mutex<Vec<ContextSource>>,
     items: Mutex<Vec<ContextItem>>,
+    /// When set, every read of the source list fails with this message.
+    ///
+    /// A store that cannot be read is not the same thing as a store with no
+    /// rows, and the difference is the whole of the failure-direction rule: a
+    /// caller that treated an unreadable source list as "no sources" would
+    /// carry on, which is the permissive answer.
+    unreadable_sources: Mutex<Option<String>>,
+    /// When set, every item write fails with this message.
+    unwritable_items: Mutex<Option<String>>,
 }
 
 impl MockContextRepository {
@@ -30,6 +39,27 @@ impl MockContextRepository {
     /// Every stored item, unscoped. For asserting what was written.
     pub fn all_items(&self) -> Vec<ContextItem> {
         self.items.lock().unwrap().clone()
+    }
+
+    /// Make [`ContextRepository::list_sources`] and
+    /// [`ContextRepository::get_source`] fail.
+    pub fn with_unreadable_sources(self, reason: &str) -> Self {
+        *self.unreadable_sources.lock().unwrap() = Some(reason.to_string());
+        self
+    }
+
+    /// Make [`ContextRepository::save_item`] fail.
+    pub fn with_unwritable_items(self, reason: &str) -> Self {
+        *self.unwritable_items.lock().unwrap() = Some(reason.to_string());
+        self
+    }
+
+    fn source_read_failure(&self) -> Option<anyhow::Error> {
+        self.unreadable_sources
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|reason| anyhow::anyhow!(reason.clone()))
     }
 }
 
@@ -47,6 +77,9 @@ impl ContextRepository for MockContextRepository {
     }
 
     async fn get_source(&self, id: &str, scope: &ProfileScope) -> Result<Option<ContextSource>> {
+        if let Some(e) = self.source_read_failure() {
+            return Err(e);
+        }
         Ok(self
             .sources
             .lock()
@@ -57,6 +90,9 @@ impl ContextRepository for MockContextRepository {
     }
 
     async fn list_sources(&self, scope: &ProfileScope) -> Result<Vec<ContextSource>> {
+        if let Some(e) = self.source_read_failure() {
+            return Err(e);
+        }
         Ok(self
             .sources
             .lock()
@@ -83,6 +119,9 @@ impl ContextRepository for MockContextRepository {
     }
 
     async fn save_item(&self, item: &ContextItem) -> Result<()> {
+        if let Some(reason) = self.unwritable_items.lock().unwrap().as_ref() {
+            return Err(anyhow::anyhow!(reason.clone()));
+        }
         let mut items = self.items.lock().unwrap();
         match items
             .iter_mut()

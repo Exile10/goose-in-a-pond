@@ -44,7 +44,13 @@ use crate::security::domain::redaction::RedactionKind;
 use crate::security::ports::redactor::Redactor;
 
 /// One thing a source produced, before this pond has touched it.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` so a producer's answer can be asserted whole rather than field by
+/// field. That matters more than it sounds: an assertion written as a handful of
+/// `assert_eq!`s on individual fields silently stops covering a field the moment
+/// one is added, which is the shape three of this programme's recorded vacuous
+/// tests had.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RawItem {
     /// The upstream's own id. What makes a re-sync idempotent.
     pub external_id: String,
