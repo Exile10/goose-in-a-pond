@@ -77,11 +77,25 @@ impl BusEvent {
                 .sensitivity(PrivacySensitivity::Public),
             // Who is home and when is the most behavioral data this house
             // holds, so it takes the same classification as a session
-            // transition and for the same reasons. `Agent` rather than
-            // `Sensor` because this is the pond's own conclusion about a
-            // person, not a reading off a device -- filing it under `Sensor`
-            // would put "Jerry arrived" in the sensor feed as though something
-            // measured it.
+            // transition and for the same reason: `Sensitive` is what puts it
+            // on the seven-day retention sweep rather than the thirty-day one.
+            //
+            // What `Sensitive` does NOT do is hide it from the audit MCP
+            // tools. `pond-mcp-server/src/audit.rs :: MAX_SURFACEABLE` IS
+            // `Sensitive`, so those reads surface everything below `Secret` --
+            // a `presence.profile` row is readable through `recent_activity`
+            // today, and classifying it lower would not change that. What
+            // keeps it from a visitor is that `giap-audit` is in
+            // `groups_denied_to_guests`; member-to-member it is exposed, and
+            // the renderer prints the timestamp and the action without the
+            // `profile_id`, so what leaks is the timing of an arrival rather
+            // than whose. Narrowing that is a change to `audit.rs`, not to
+            // this classification.
+            //
+            // `Agent` rather than `Sensor` because this is the pond's own
+            // conclusion about a person, not a reading off a device -- filing
+            // it under `Sensor` would put "Jerry arrived" in the sensor feed
+            // as though something measured it.
             BusEvent::Presence(p) => {
                 let event = Event::new(EventCategory::Agent, "presence.profile")
                     .attr("profile_id", p.profile_id.as_str())
@@ -97,8 +111,13 @@ impl BusEvent {
                 }
             }
             // When somebody is talking to the pond is behavioral data, exactly
-            // like a motion reading: `Sensitive`, which both keeps it out of
-            // the audit MCP reads and shortens its retention.
+            // like a motion reading: `Sensitive`, which shortens its retention
+            // to the sensitivity sweep's seven days.
+            //
+            // This comment used to say `Sensitive` also "keeps it out of the
+            // audit MCP reads". It does not, and never did -- see the presence
+            // arm above for where that claim goes wrong and what actually
+            // bounds who can read these rows.
             BusEvent::Session(s) => {
                 let event = Event::new(EventCategory::Agent, "session.lifecycle")
                     .attr("phase", s.phase.as_str())
@@ -379,8 +398,13 @@ mod tests {
     }
 
     /// When somebody is at the pond is behavioral data. Classifying it below
-    /// `Sensitive` would lengthen its retention and expose it to the audit MCP
-    /// reads, which exclude sensitive rows.
+    /// `Sensitive` would take it off the seven-day sensitivity sweep in
+    /// `pond-infra/src/pruning.rs` and leave it in the log for thirty.
+    ///
+    /// It would **not** change who can read it, and this doc-comment claimed
+    /// it would until 2026-08-11: `audit.rs :: MAX_SURFACEABLE` is
+    /// `Sensitive`, so the audit MCP tools surface everything below `Secret`
+    /// either way. Retention is the whole of what this assertion buys.
     #[test]
     fn a_session_transition_is_classified_sensitive_and_carries_its_session() {
         let event = session_event(SessionPhase::Started, Some("sess-42")).to_event();
@@ -390,8 +414,7 @@ mod tests {
             event.privacy_sensitivity,
             PrivacySensitivity::Sensitive,
             "when somebody is at the pond is behavioral data; classifying it below Sensitive \
-             lengthens its retention and exposes it to the audit MCP reads, which exclude \
-             sensitive rows"
+             takes it off the seven-day sensitivity sweep and leaves it in the log for thirty"
         );
         assert_eq!(event.session_id.as_deref(), Some("sess-42"));
         assert_eq!(
@@ -409,9 +432,20 @@ mod tests {
     }
 
     /// Where a household member is, and when, is the most personal thing this
-    /// house records. Below `Sensitive` it would outlive its usefulness in the
-    /// log and be readable through the audit MCP tools, which exclude
-    /// sensitive rows.
+    /// house records, so below `Sensitive` it would outlive its usefulness in
+    /// the log -- thirty days rather than seven.
+    ///
+    /// **What this test does not buy, and was written believing it did.**
+    /// `Sensitive` does not keep the row away from the audit MCP tools:
+    /// `audit.rs :: MAX_SURFACEABLE` is `Sensitive`, so `recent_activity`
+    /// surfaces `presence.profile` today and would surface it at `Internal`
+    /// too. Guests cannot reach those tools (`groups_denied_to_guests`), so
+    /// the exposure is member-to-member, and the renderer omits `profile_id` --
+    /// what an Owner turn learns is that somebody arrived at 19:04, not who.
+    /// Withholding it properly is a change to `audit.rs`, and it is not this
+    /// phase's; recorded in PAI-7 section 3.1 rather than fixed here, because
+    /// `audit.rs` is outside this change's footprint and the fix is a policy
+    /// decision about the audit surface, not about a classification.
     #[test]
     fn a_presence_transition_is_sensitive_and_names_the_member_and_the_rung() {
         use crate::security::domain::event::AttributeValue;
@@ -423,7 +457,8 @@ mod tests {
             event.privacy_sensitivity,
             PrivacySensitivity::Sensitive,
             "who is home and when is behavioral data about a named person; classifying it below \
-             Sensitive lengthens its retention and exposes it to the audit MCP reads"
+             Sensitive takes it off the seven-day sensitivity sweep and leaves a record of a \
+             member's movements in the log for thirty"
         );
         assert_eq!(event.session_id.as_deref(), Some("sess-42"));
         assert_eq!(
