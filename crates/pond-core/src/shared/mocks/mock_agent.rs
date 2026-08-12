@@ -12,12 +12,19 @@ use std::sync::Mutex;
 /// received so tests can assert on fields callers set (e.g. `voice_mode`).
 pub struct MockAgent {
     last_request: Mutex<Option<AgentRequest>>,
+    /// Every session id `forget_session` was called with, in order.
+    ///
+    /// Recorded because the port's default body is `{}` -- a test that only
+    /// calls the method proves nothing, since the no-op satisfies it just as
+    /// well as a real implementation would.
+    forgotten: Mutex<Vec<String>>,
 }
 
 impl MockAgent {
     pub fn new() -> Self {
         Self {
             last_request: Mutex::new(None),
+            forgotten: Mutex::new(Vec::new()),
         }
     }
 
@@ -25,10 +32,19 @@ impl MockAgent {
     pub fn last_request(&self) -> Option<AgentRequest> {
         self.last_request.lock().unwrap().clone()
     }
+
+    /// Session ids the caller asked the engine to forget, in order.
+    pub fn forgotten_sessions(&self) -> Vec<String> {
+        self.forgotten.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
 impl Agent for MockAgent {
+    async fn forget_session(&self, session_id: &str) {
+        self.forgotten.lock().unwrap().push(session_id.to_string());
+    }
+
     async fn chat(&self, request: AgentRequest) -> Result<AgentResponse> {
         *self.last_request.lock().unwrap() = Some(request.clone());
 

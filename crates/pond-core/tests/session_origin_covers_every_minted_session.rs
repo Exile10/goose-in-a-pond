@@ -60,6 +60,14 @@ const KNOWN_MINTERS: &[(&str, &str)] = &[
         "goose's own `session_manager`, which writes goose's sessions.db -- a different \
          store that the observer never reads",
     ),
+    (
+        "crates/pond-adapters-goose/src/session_adapter.rs",
+        "the same reason as `goose_agent.rs` above, one layer down: this is a \
+         `SessionStorage` impl that FORWARDS to goose's `session_manager`, so every id \
+         it mints lands in goose's sessions.db. It also never chooses an id -- \
+         `create_session` takes one from its caller, and that caller is already \
+         classified here. The observer reads `pond_system.db` and cannot see any of it.",
+    ),
 ];
 
 fn workspace_root() -> PathBuf {
