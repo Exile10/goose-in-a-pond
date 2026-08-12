@@ -337,6 +337,20 @@ pub struct AppState {
     /// Weather provider (Open-Meteo) for `GET /api/v1/weather`. `None` when
     /// `weather_enabled` is false or no location has been configured.
     pub weather_provider: Option<Arc<dyn WeatherProvider>>,
+    /// Private mesh (#132): who this Pond trusts and at what scope. Plain
+    /// SQLite, no extra dependency — always constructed, unlike
+    /// `mesh_transport` below.
+    pub peer_directory:
+        Arc<dyn pond_core::mesh::ports::peer_directory::PeerDirectory + Send + Sync>,
+    /// Private mesh (#132): prepaid-credit balance held with each trusted peer.
+    pub credit_ledger: Arc<dyn pond_core::mesh::ports::credit_ledger::CreditLedger + Send + Sync>,
+    /// Private mesh (#132): metered token usage pending settlement per peer.
+    pub usage_tally: Arc<dyn pond_core::mesh::ports::usage_tally::UsageTally + Send + Sync>,
+    /// Private mesh (#132): real libp2p connectivity to trusted peers. `None`
+    /// unless both the `mesh` Cargo feature is compiled in and
+    /// `settings.mesh_enabled` is true — real networking, real cost, unlike
+    /// the three ports above.
+    pub mesh_transport: Option<Arc<dyn pond_core::mesh::ports::mesh_transport::MeshTransport>>,
 }
 
 impl AppState {

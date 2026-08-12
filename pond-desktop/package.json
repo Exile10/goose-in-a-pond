@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "concurrently --kill-others-on-fail -n vite,server -c cyan,green \"vite\" \"npm run dev:server\"",
     "dev:server": "cd .. && cargo run -p pond-server -- serve",
+    "dev:server:mesh": "cd .. && cargo run -p pond-server --features mesh -- serve",
+    "dev:mesh": "concurrently --kill-others-on-fail -n vite,server -c cyan,green \"vite\" \"npm run dev:server:mesh\"",
     "dev:vite": "vite",
     "build": "vite build",
     "preview": "vite preview",

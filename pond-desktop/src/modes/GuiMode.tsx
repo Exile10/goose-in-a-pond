@@ -9,6 +9,7 @@ import { HubOverlay } from "../hub/overlays/HubOverlay";
 import { Dashboard } from "../sections/Dashboard";
 import { Chat } from "../sections/Chat";
 import { Devices } from "../sections/Devices";
+import { Mesh } from "../sections/Mesh";
 import { Pairing } from "../sections/Pairing";
 import { Schedules } from "../sections/Schedules";
 import { Memory } from "../sections/Memory";
@@ -27,6 +28,7 @@ function SectionContent({ section }: { section: GuiSection }) {
     case "dashboard": return <Dashboard />;
     case "chat":      return <Chat />;
     case "devices":   return <Devices />;
+    case "mesh":      return <Mesh />;
     case "pairing":   return <Pairing />;
     case "schedules":     return <Schedules />;
     case "notifications": return <Notifications />;
