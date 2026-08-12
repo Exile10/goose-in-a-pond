@@ -99,7 +99,12 @@ pub async fn is_running(port: u16) -> bool {
 /// First interpreter on PATH meeting [`MIN_PYTHON`].
 async fn find_python() -> Result<PathBuf> {
     for candidate in PYTHON_CANDIDATES {
-        let Ok(out) = Command::new(candidate).arg("--version").output().await else {
+        let Ok(out) = Command::new(candidate)
+            .arg("--version")
+            .kill_on_drop(true)
+            .output()
+            .await
+        else {
             continue;
         };
         // Older interpreters print the version on stderr.
@@ -129,6 +134,7 @@ async fn ensure_installed(data_dir: &Path) -> Result<()> {
     if py.exists() {
         if let Ok(out) = Command::new(&py)
             .args(["-c", "import matter_server"])
+            .kill_on_drop(true)
             .output()
             .await
         {
@@ -148,6 +154,14 @@ async fn ensure_installed(data_dir: &Path) -> Result<()> {
         .arg("-m")
         .arg("venv")
         .arg(&venv)
+        // `kill_on_drop` because this future is cancellable: the reconciler
+        // races `connect()` against a settings change, so toggling Matter off
+        // mid-install drops us here. Without it the child keeps running after
+        // the runtime has reported `Disabled`, keeps writing into the venv,
+        // and survives process exit -- `shutdown()` never sees it. Re-enabling
+        // before it finishes then finds a half-written venv and starts a
+        // second install into it.
+        .kill_on_drop(true)
         .status()
         .await
         .context("running python -m venv")?;
@@ -159,6 +173,10 @@ async fn ensure_installed(data_dir: &Path) -> Result<()> {
     let status = Command::new(&py)
         .args(["-m", "pip", "install", "--disable-pip-version-check"])
         .arg(MATTER_SERVER_SPEC)
+        // Same reasoning as the venv step above, and this is the one that
+        // matters: pip is the multi-minute part, so it is where a cancellation
+        // almost always lands.
+        .kill_on_drop(true)
         .status()
         .await
         .context("running pip install")?;

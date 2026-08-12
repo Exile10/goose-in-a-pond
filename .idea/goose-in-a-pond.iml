@@ -61,6 +61,9 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-audio/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-core/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/crates/pond-infra/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-mesh-libp2p/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-adapters-mesh-libp2p/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/pond-mesh-protocol/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/goose/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/crates/pond-mcp-server/target" />

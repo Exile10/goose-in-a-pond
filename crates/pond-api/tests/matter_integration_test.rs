@@ -22,6 +22,7 @@ use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
 use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
 use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
 use pond_core::user_data::ports::matter_runtime::MatterRuntimePort;
+use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_infra::db::Database;
 use pond_infra::mock_handshake::MockHandshake;
 use pond_infra::onboarding::SqlxOnboardingRepository;
@@ -41,11 +42,26 @@ async fn make_app(
     Option<Arc<StubMatterRuntime>>,
     tempfile::TempDir,
 ) {
+    let (router, matter, _settings, tmp) = make_app_with_settings(matter).await;
+    (router, matter, tmp)
+}
+
+/// As `make_app`, but hands back the settings repository too, so a test can
+/// seed a row the API itself refuses to write.
+async fn make_app_with_settings(
+    matter: Option<Arc<StubMatterRuntime>>,
+) -> (
+    axum::Router,
+    Option<Arc<StubMatterRuntime>>,
+    Arc<MockSettingsRepository>,
+    tempfile::TempDir,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
     let pool = db.system.clone();
     let db = Arc::new(db);
 
+    let settings_repo = Arc::new(MockSettingsRepository::new());
     let mock_hs = MockHandshake::new();
     mock_hs.add_valid_token("test-token".to_string()).await;
 
@@ -61,10 +77,18 @@ async fn make_app(
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".into(),
         tts: None,
-        settings_repo: Arc::new(MockSettingsRepository::new()),
+        settings_repo: settings_repo.clone(),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(MockDeviceRegistry),
         matter: matter.clone().map(|m| m as Arc<dyn MatterRuntimePort>),
+        peer_directory: Arc::new(
+            pond_core::mesh::mocks::mock_peer_directory::MockPeerDirectory::new(),
+        ),
+        credit_ledger: Arc::new(
+            pond_core::mesh::mocks::mock_credit_ledger::MockCreditLedger::new(),
+        ),
+        usage_tally: Arc::new(pond_core::mesh::mocks::mock_usage_tally::MockUsageTally::new()),
+        mesh_transport: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
@@ -98,7 +122,6 @@ async fn make_app(
         notification_tx: tokio::sync::broadcast::channel(16).0,
         notification_queue: None,
         notification_sender: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
@@ -124,7 +147,7 @@ async fn make_app(
     });
 
     let router = build_router(state, std::path::PathBuf::from("pond-desktop/dist"));
-    (router, matter, tmp)
+    (router, matter, settings_repo, tmp)
 }
 
 fn authed(method: Method, uri: &str, body: Option<serde_json::Value>) -> Request<Body> {
@@ -347,25 +370,28 @@ async fn deleting_a_matter_device_while_off_refuses_with_the_honest_reason() {
 /// This endpoint takes a patch over the whole of Settings, so the Matter check
 /// must not turn a bad stored controller address into a wall that blocks every
 /// unrelated save.
+///
+/// The fixture is the point. It used to store a perfectly valid
+/// `ws://127.0.0.1:5580/ws` while its comment claimed to be testing "no
+/// address", so the validation branch it exists for was never reached and the
+/// test passed with `touches_matter &&` deleted from the guard. Seeding the
+/// repository directly is the only way in: the API now rejects
+/// `matter_enabled: true` with a blank URL, which is exactly why a row in that
+/// shape can only be a legacy one.
 #[tokio::test]
 async fn a_save_that_does_not_touch_matter_is_not_blocked_by_it() {
     let runtime = Arc::new(StubMatterRuntime::disabled());
-    let (app, matter, _tmp) = make_app(Some(runtime)).await;
+    let (app, matter, settings_repo, _tmp) = make_app_with_settings(Some(runtime)).await;
 
-    // matter_enabled is on with no address — the shape an install upgraded from
-    // the headless-knob era can be in.
-    let response = app
-        .clone()
-        .oneshot(authed(
-            Method::PUT,
-            "/api/v1/settings",
-            Some(serde_json::json!({"matter_enabled": true, "matter_ws_url": "ws://127.0.0.1:5580/ws"})),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    // The shape an install upgraded from the headless-knob era can be in, and
+    // which no API call can produce: enabled, with no address.
+    let mut stored = settings_repo.get().await.unwrap();
+    stored.matter_enabled = true;
+    stored.matter_ws_url = String::new();
+    settings_repo.update(&stored).await.unwrap();
 
-    // An unrelated edit still goes through.
+    // An unrelated edit still goes through, rather than being refused because
+    // of a field the caller never touched.
     let response = app
         .oneshot(authed(
             Method::PUT,
@@ -376,7 +402,15 @@ async fn a_save_that_does_not_touch_matter_is_not_blocked_by_it() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    // And it still reconciles, so an unrelated save cannot silently strand the
-    // runtime on a stale desired state.
-    assert_eq!(matter.unwrap().applied().len(), 2);
+    // ...and it does NOT reconcile Matter. An unrelated save used to send
+    // `apply` unconditionally, and the reconciler treats "enabled but not yet
+    // Connected" as needing a restart -- so renaming the home during the
+    // multi-minute first controller install tore that install down and began
+    // it again. Retry from the Devices tab is unaffected: `saveMatter` sends
+    // both Matter keys, so it is a `touches_matter` save by construction.
+    assert!(
+        matter.unwrap().applied().is_empty(),
+        "an unrelated settings save reconciled Matter, which restarts an \
+         in-flight controller install"
+    );
 }

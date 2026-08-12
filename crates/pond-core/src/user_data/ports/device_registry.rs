@@ -98,4 +98,33 @@ pub trait DeviceRegistry: Send + Sync {
     async fn update(&self, device_id: &str, _request: UpdateDeviceRequest) -> Result<Device> {
         anyhow::bail!("this registry does not support updating device '{device_id}'")
     }
+
+    /// Replace the fields a discovery bridge derives rather than a user
+    /// chooses: what kind of device this is and what it can do.
+    ///
+    /// Separate from `update` on purpose. `update` is the Devices tab's
+    /// "Configure" save — name, hostname, room — all of which a person owns,
+    /// and none of which a bridge should overwrite behind them. These two are
+    /// the opposite: the bridge is authoritative and the user cannot set them
+    /// at all.
+    ///
+    /// It exists because registration is the only place these were ever
+    /// written, and `sync_node` registers only when the device is NEW. So a
+    /// device commissioned before a typing improvement shipped kept the old
+    /// values forever, and the fan that motivated Matter fan control stayed
+    /// `device_type: "matter"` with no capabilities through every restart —
+    /// invisible to exactly the device-type-aware routing the improvement
+    /// added.
+    ///
+    /// Default is a no-op rather than an error, unlike the three above: every
+    /// sync calls this, and a registry that cannot do it should not turn a
+    /// working bridge into a warning on every node, every reconnect.
+    async fn set_discovered_profile(
+        &self,
+        _device_id: &str,
+        _device_type: &str,
+        _capabilities: &[String],
+    ) -> Result<()> {
+        Ok(())
+    }
 }

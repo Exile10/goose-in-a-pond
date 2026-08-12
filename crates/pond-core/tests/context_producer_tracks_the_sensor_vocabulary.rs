@@ -37,7 +37,37 @@ use pond_core::context::producer::DISCRETE_SENSOR_TYPES;
 /// and `DISCRETE_SENSOR_TYPES` is an edit somebody made on purpose. A new Matter
 /// mapping belongs in exactly one of the two, and belonging to neither is what
 /// fails below.
-const KNOWN_CONTINUOUS: &[&str] = &["temperature", "humidity"];
+const KNOWN_CONTINUOUS: &[&str] = &[
+    "temperature",
+    "humidity",
+    // The environmental clusters (#195 follow-ups): each reports a
+    // `MeasuredValue` that moves continuously, so each is a sampled series and
+    // belongs in the reading history rather than as a durable context row. A
+    // pond that ingested these would be writing thousands of "the CO2 is now
+    // 812 ppm" rows a day, which is the exact failure `DISCRETE_SENSOR_TYPES`
+    // exists to prevent.
+    "illuminance",
+    "pressure",
+    "flow",
+    // `air_quality` is the AirQuality cluster's 0-6 enum, not a concentration
+    // — the borderline case in this list. It is continuous because it is a
+    // GRADE derived from the concentrations below it: it moves whenever they
+    // do, several times an hour on a busy day, so treating it as a transition
+    // would fill the corpus with "the air quality is now Fair". The event a
+    // household actually wants from this family is the alarm, and that is
+    // `smoke_alarm`, which is discrete.
+    "air_quality",
+    "carbon_monoxide",
+    "carbon_dioxide",
+    "nitrogen_dioxide",
+    "ozone",
+    "formaldehyde",
+    "pm1",
+    "pm2_5",
+    "pm10",
+    "radon",
+    "total_volatile_organic_compounds",
+];
 
 fn workspace_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is crates/pond-core.
