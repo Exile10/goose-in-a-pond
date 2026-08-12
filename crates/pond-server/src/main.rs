@@ -7151,8 +7151,21 @@ async fn sync_assignments_to_settings(
                 // The TTS engine gate elsewhere checks active_tts_model.starts_with("piper")
                 // — a bare catalog slug (e.g. "en-lessac-medium") never satisfies that, so
                 // it must be stored prefixed for piper voices.
+                //
+                // Idempotent, because this value round-trips: it is written to
+                // `active_tts_model` here and read back into a role assignment
+                // elsewhere, so a bare `format!` compounds a prefix once per
+                // settings-write/boot cycle — `piper-piper-en-lessac-medium`,
+                // then `piper-piper-piper-...`. The gate that reads it only
+                // checks `starts_with("piper")`, so nothing fails loudly; the
+                // voice filename in the same block just stops matching a real
+                // model, and TTS goes quiet for a reason nobody can see.
                 let stored_active_model = if category == "tts_piper" {
-                    format!("piper-{model_name}")
+                    if model_name.starts_with("piper-") {
+                        model_name.to_string()
+                    } else {
+                        format!("piper-{model_name}")
+                    }
                 } else {
                     model_name.to_string()
                 };

@@ -31,10 +31,36 @@ export function TranscriptFeed({
   // collapsed drawer (0px tall, e.g. Voice Mode's closed transcript panel)
   // it can never do that locally, so it escalates to the next real scroll
   // container up the tree (.vm-root) and scrolls the whole screen instead.
+  // ...but this feed is not always the element that scrolls. With `fillHeight`
+  // it renders at `maxHeight: none` inside Voice Mode's open drawer, and the
+  // DRAWER is the one carrying `overflow-y: auto` and the 38vh cap — so the
+  // feed never overflows, `scrollTo` on it is a no-op, and auto-scroll silently
+  // stopped working in the panel this component was changed for.
+  //
+  // So: scroll whichever of this element or its ancestors can actually scroll,
+  // stopping at the first `overflow-y: hidden`. That stop is what keeps the
+  // original bug fixed rather than trading one for the other — a CLOSED drawer
+  // is `max-height: 0; overflow: hidden`, so the walk halts there and nothing
+  // moves, instead of escalating to `.vm-root` and scrolling the whole screen.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+
+    const scroller = ((): HTMLElement | null => {
+      for (let node: HTMLElement | null = el; node; node = node.parentElement) {
+        const overflowY = getComputedStyle(node).overflowY;
+        if (overflowY === "hidden") return null;
+        if (
+          (overflowY === "auto" || overflowY === "scroll") &&
+          node.scrollHeight > node.clientHeight
+        ) {
+          return node;
+        }
+      }
+      return null;
+    })();
+
+    scroller?.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
   }, [messages, contextCards]);
 
   const rootStyle: React.CSSProperties = fillHeight

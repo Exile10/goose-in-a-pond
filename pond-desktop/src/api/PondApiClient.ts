@@ -927,6 +927,8 @@ export class PondApiClient {
    */
   compactSession(sessionId: string): Promise<CompactionReport> {
     return this.post(`/api/v1/sessions/${encodeURIComponent(sessionId)}/compact`);
+  }
+
   /** Delete a message and every later message in the same session — the
    *  primitive behind "edit" and "refresh" on a user message. */
   deleteMessagesFrom(sessionId: string, messageId: string): Promise<void> {

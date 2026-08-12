@@ -103,8 +103,8 @@ pub(crate) fn decode_wav_mono_f32(wav: &[u8]) -> Result<(Vec<f32>, u32)> {
 /// audio. Serializing all opens/closes through that one owner thread is what
 /// stops two capture paths (e.g. the wake-word detector and the follow-up
 /// VAD listen) from racing the same physical device.
-fn open_mic_and_confirm(mic: &MicHandle) -> Result<()> {
-    mic.open();
+fn open_mic_and_confirm(mic: &MicHandle) -> Result<u64> {
+    let generation = mic.open_session();
     if !mic.wait_for(
         |s| !matches!(s, MicState::Closed),
         std::time::Duration::from_secs(2),
@@ -112,7 +112,7 @@ fn open_mic_and_confirm(mic: &MicHandle) -> Result<()> {
         return Err(anyhow!("microphone did not respond"));
     }
     match mic.state() {
-        MicState::Open => Ok(()),
+        MicState::Open => Ok(generation),
         MicState::Denied => Err(anyhow!(
             "microphone is disabled in Settings (mic_enabled = false)"
         )),
@@ -670,7 +670,14 @@ fn detection_loop(
     // stays dark. Filtering samples after capture would leave it lit and make
     // the setting a lie.
     pond_core::models::domain::mic_gate::ensure_mic_enabled()?;
-    open_mic_and_confirm(&mic)?;
+    // Keep the generation this open claimed. Every release below is scoped to
+    // it, because this function runs on a DETACHED blocking thread: when a turn
+    // is cancelled the orchestrator stops waiting and starts the follow-up
+    // capture, and this thread then reaches its release with the device already
+    // belonging to somebody else. An unconditional close there presents as a
+    // conversation that hears nothing after the wake word, attributed to a
+    // component that has already exited.
+    let session = open_mic_and_confirm(&mic)?;
 
     let sample_rate = pond_audio::CAPTURE_RATE_HZ;
 
@@ -680,7 +687,7 @@ fn detection_loop(
     if config.cooldown_ms > 0 {
         tracing::debug!("KWS: cooldown {}ms before arming", config.cooldown_ms);
         if !sleep_unless_stopped(config.cooldown_ms, &stop) {
-            mic.close();
+            mic.close_session(session);
             return Err(anyhow!("wake-word detection cancelled"));
         }
     }
@@ -692,7 +699,7 @@ fn detection_loop(
     loop {
         if !sleep_unless_stopped(slide_ms, &stop) {
             tracing::debug!("KWS: cancelled — releasing the microphone");
-            mic.close();
+            mic.close_session(session);
             return Err(anyhow!("wake-word detection cancelled"));
         }
 
