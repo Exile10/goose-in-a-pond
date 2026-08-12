@@ -26,6 +26,7 @@ lookup returns None -- and so reports the opposite of the truth.
 """
 
 import json
+import re
 import os
 import sqlite3
 import sys
@@ -152,10 +153,16 @@ def refusal_detail(lt):
     WARN that fires when a run yields nothing, and each individual refusal at
     DEBUG. Either is a real answer; asserting a cause without one is not.
     """
+    # Strip ANSI first. tracing writes the field name and its `=` as separate
+    # styled spans, so the raw bytes are `\x1b[3mfirst\x1b[0m\x1b[2m=\x1b[0mSome(...)`
+    # and the literal "first=" never appears. The first version of this searched
+    # the raw text, found nothing, and reported "no refusal detail in the log"
+    # while the log held `missing field \`trigger_kind\`` in full.
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", lt)
     for marker in ("first=", "refusal="):
-        i = lt.rfind(marker)
+        i = plain.rfind(marker)
         if i != -1:
-            return lt[i:i + 300].splitlines()[0].strip()
+            return plain[i:i + 300].splitlines()[0].strip()
     return ""
 
 
