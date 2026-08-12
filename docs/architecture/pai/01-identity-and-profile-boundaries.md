@@ -645,6 +645,66 @@ follow-on; PAI-1 makes it a drop-in by putting `identification_source` in place 
 
 ---
 
+## 4b. P10 — a member's particulars, and who may hear them (2026-08-12)
+
+Two defects in one surface, found by asking why the assistant did not know the user's name.
+
+### The capability did not exist
+
+`particulars_for` reads `preferred_name`, `birthday`, `language` and
+`accessibility_atypical_speech` out of `profiles.preferences`. The desktop onboarding collected a
+preferred name and birthday and wrote them to **browser `localStorage`** under `giap-user-profile`.
+`PATCH /api/v1/profiles/{id}` existed and had no client method. Every piece worked; nothing joined
+them, and the model had never seen any of it.
+
+This is the third instance of one shape in this programme — reader, writer, no wire, suite green.
+The others were the 22 settings switches that rendered without an `onChange`, and the MCP extensions
+registered but unreachable. The lesson that generalises: **a field with a reader and no writer is
+indistinguishable from a working feature until somebody looks at the data**, and no unit test on
+either side can see it. What catches it is checking the stored row.
+
+### Fixing it would have opened a boundary
+
+`profile_context_for` resolves `ProfileScope::Household` to `primary_profile_id`. So the moment a
+writer existed, every unattributed turn would have stated the primary member's name and birthday —
+"the user prefers to be called Jerry", "the user's birthday is …" — while somebody else was
+speaking. The disclosure was latent for exactly as long as the bug was.
+
+Personal particulars are now `Owner`-scoped. `atypical_speech` deliberately still crosses into
+`Household`: it renders as "be patient, never correct speech patterns, interpret incomplete
+sentences charitably", which discloses nothing about anybody, and a household that configured it
+wants it applied precisely when the pond cannot tell who is speaking. **Being patient with the wrong
+person costs nothing; announcing the wrong person's birthday does.**
+
+The rule is extracted as `particulars_for(attributed, prefs)` so it is exhaustively testable without
+an `AppState`, a database or a router — it was previously reachable only through all three, which is
+why it went unexamined.
+
+### What a later change must not undo
+
+* **The key spelling is a cross-language contract.** The server reads snake_case; the desktop holds
+  camelCase. A camelCase key returns 200 from the API, populates the row, and reaches the model as
+  nothing — the original bug in a new disguise. Pinned on both sides
+  (`camel_case_keys_are_not_read_and_that_is_the_point`, and `PROFILE_PREF_KEYS` in the wizard).
+* **Booleans are the strings `"true"`/`"false"`.** `preferences` is `HashMap<String, String>` and the
+  server compares against the literal.
+* **An empty value is omitted, not written blank.** The prompt builder skips a missing key and would
+  render "The user's birthday is ." for a present-but-empty one.
+* **A fresh pond has no member.** Nothing ever created a profile or set `primary_profile_id` — this
+  pond's was configured by hand — so the wizard now ensures one before writing preferences.
+* **The migration must never win a tie.** `localStorage` is a stale copy from one browser on one
+  machine; the server is the household's record. An old laptop must not revert a name corrected on
+  a phone.
+
+### Still missing
+
+`language` has **no collector anywhere** — no UI, no API caller, only test fixtures. `Always respond
+in {language}` is unreachable in production regardless of this change, and giving it a control is its
+own change with a UX decision in it (an explicit picker, not `navigator.language`, because silently
+choosing the assistant's language from a browser setting is worse than not having it).
+
+---
+
 ## 5. Invariants
 
 1. Profile context stays in `<system-context>` on the user message. Never the system prefix.
