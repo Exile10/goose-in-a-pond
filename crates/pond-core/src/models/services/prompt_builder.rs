@@ -632,25 +632,45 @@ mod tests {
         assert!(combined.contains("Thursday, 1 May 2026"));
     }
 
+    /// Style selection, asserted by IDENTITY rather than by prose.
+    ///
+    /// This used to match phrases out of each template ("intelligent AI
+    /// copilot", "privacy-first AI copilot") and broke the moment the identity
+    /// sections were rewritten — a test about which constant is returned failing
+    /// because of wording it never meant to pin. Comparing pointers to the
+    /// constants says exactly what "selects the correct style" means and cannot
+    /// rot when the prompts are edited.
+    ///
+    /// Compared by VALUE, not by pointer: these are `const` items, which Rust
+    /// inlines at each use site, so the test's `PROMPT_BALANCED` and the
+    /// function's are separate allocations and `std::ptr::eq` reports them
+    /// unequal even when the selection is correct.
     #[test]
     fn resolve_builtin_template_selects_correct_style() {
         let mut s = Settings::default();
 
-        s.prompt_style = "balanced".to_string();
-        assert!(resolve_builtin_template(&s).contains("intelligent AI copilot"));
+        for (style, expected) in [
+            ("balanced", PROMPT_BALANCED),
+            ("concise", PROMPT_CONCISE),
+            ("technical", PROMPT_TECHNICAL),
+            ("warm", PROMPT_WARM),
+        ] {
+            s.prompt_style = style.to_string();
+            assert_eq!(
+                resolve_builtin_template(&s),
+                expected,
+                "style '{style}' did not resolve to its own template"
+            );
+        }
 
-        s.prompt_style = "concise".to_string();
-        assert!(resolve_builtin_template(&s).contains("One sentence replies"));
-
-        s.prompt_style = "technical".to_string();
-        assert!(resolve_builtin_template(&s).contains("privacy-first AI copilot"));
-
-        s.prompt_style = "warm".to_string();
-        assert!(resolve_builtin_template(&s).contains("Hey there"));
-
+        // An unknown style falls back to balanced rather than erroring or
+        // returning an empty prompt.
         s.prompt_style = "nonexistent".to_string();
-        assert!(resolve_builtin_template(&s).contains("intelligent AI copilot"));
-        // fallback to balanced
+        assert_eq!(
+            resolve_builtin_template(&s),
+            PROMPT_BALANCED,
+            "an unrecognised style must fall back to balanced"
+        );
     }
 
     #[test]
