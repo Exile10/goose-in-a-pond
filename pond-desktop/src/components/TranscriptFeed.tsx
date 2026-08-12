@@ -22,11 +22,19 @@ export function TranscriptFeed({
   fillHeight = false,
   compact = false,
 }: Props) {
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll to bottom when new messages arrive
+  // Auto-scroll to bottom when new messages arrive. Scrolls this container's
+  // own scrollTop directly rather than scrollIntoView() on a bottom marker —
+  // scrollIntoView walks up the ancestor chain looking for a scroll
+  // container that can satisfy visibility, and when this feed sits inside a
+  // collapsed drawer (0px tall, e.g. Voice Mode's closed transcript panel)
+  // it can never do that locally, so it escalates to the next real scroll
+  // container up the tree (.vm-root) and scrolls the whole screen instead.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    const el = containerRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }, [messages, contextCards]);
 
   const rootStyle: React.CSSProperties = fillHeight
@@ -35,7 +43,7 @@ export function TranscriptFeed({
 
   if (messages.length === 0) {
     return (
-      <div style={rootStyle}>
+      <div ref={containerRef} style={rootStyle}>
         <p style={styles.empty}>
           {compact ? "Say something…" : "No messages yet. Start listening to begin."}
         </p>
@@ -44,7 +52,7 @@ export function TranscriptFeed({
   }
 
   return (
-    <div style={rootStyle} role="log" aria-live="polite" aria-label="Conversation">
+    <div ref={containerRef} style={rootStyle} role="log" aria-live="polite" aria-label="Conversation">
       {messages.map((msg, idx) => {
         // Cards whose timestamp falls after this message and before the next
         const nextMsg = messages[idx + 1];
@@ -73,7 +81,7 @@ export function TranscriptFeed({
                   {msg.role === "user" ? "You" : "Pond"}
                 </Chip>
               )}
-              <p style={{ ...styles.text, fontSize: compact ? "12px" : "13px" }}>
+              <p style={{ ...styles.text, fontSize: compact ? "11px" : "13px", padding: compact ? "4px 8px" : styles.text.padding }}>
                 {msg.text || (msg.role === "agent" ? <ThinkingPlaceholder compact /> : "")}
               </p>
             </div>
@@ -91,7 +99,6 @@ export function TranscriptFeed({
           </div>
         );
       })}
-      <div ref={bottomRef} />
     </div>
   );
 }

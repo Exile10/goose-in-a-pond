@@ -20,6 +20,18 @@ impl WhisperBackend for MockBackend {
     }
 }
 
+/// A `MicHandle` backed by a scripted (no-hardware) device, for tests that
+/// only need a valid handle to construct — not to actually capture.
+fn test_mic() -> pond_audio::MicHandle {
+    let (mic, _join) = pond_audio::spawn(
+        Box::new(pond_audio::testing::ScriptedCapture::silence(0, 20)),
+        pond_audio::CAPTURE_RATE_HZ,
+        5_000,
+        true,
+    );
+    mic
+}
+
 /// The activation prompt must mention the trigger word so the user knows
 /// what to say.
 #[test]
@@ -27,6 +39,7 @@ fn wake_word_detector_prompt_mentions_goose() {
     let detector = WhisperKeywordDetector::new(
         Arc::new(MockBackend("")) as Arc<dyn WhisperBackend>,
         "goose",
+        test_mic(),
     );
     assert!(
         detector
@@ -45,5 +58,6 @@ fn wake_word_detector_is_wake_word_detector_trait_object() {
     let _: Arc<dyn WakeWordDetector> = Arc::new(WhisperKeywordDetector::new(
         Arc::new(MockBackend("")) as Arc<dyn WhisperBackend>,
         "goose",
+        test_mic(),
     ));
 }
