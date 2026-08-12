@@ -29,8 +29,13 @@
     "@tauri-apps/plugin-notification": "^2",
     "@tauri-apps/plugin-shell": "^2.3.5",
     "@tauri-apps/plugin-window-state": "^2",
+<<<<<<< HEAD
     "framer-motion": "^12.43.0",
     "lucide-react": "^1.29.0",
+=======
+    "framer-motion": "^13.0.0",
+    "lucide-react": "^1.28.0",
+>>>>>>> dep-271
     "qrcode": "^1.5.4",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
