@@ -55,3 +55,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 pond-adapters-llamafile = { workspace = true }
 pond-core = { workspace = true, features = ["test-mocks"] }
 uuid = { workspace = true }
+# Tests only: seed sensor_readings at chosen timestamps, which `record` cannot
+# do because it always stamps datetime('now').
+sqlx = { workspace = true }
