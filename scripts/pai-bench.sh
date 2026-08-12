@@ -217,19 +217,44 @@ fi
 say "Starting a scratch pond with real weights"
 mkdir -p "$DATA_DIR/models/gguf"
 
-# Resolve the model to a real path, following any symlink the real registry left.
-SRC="$(cd "$REAL_MODELS/gguf" 2>/dev/null && ls "$MODEL".gguf 2>/dev/null | head -1)"
-SRC="$REAL_MODELS/gguf/${SRC:-$MODEL.gguf}"
-SRC="$(readlink -f "$SRC" 2>/dev/null || python3 -c "import os,sys;print(os.path.realpath(sys.argv[1]))" "$SRC")"
-if [ ! -f "$SRC" ]; then
+# Resolve the model to a real file. TWO identities matter here and conflating
+# them breaks the run in two different ways.
+#
+#   ENTRY -- the name in the models directory, which is what the registry
+#            resolves. A pond's `chat_model` is the CANONICAL STEM
+#            (`gemma-4-E2B-it`) while the file carries its quant tag
+#            (`gemma-4-E2B-it-Q4_K_M.gguf`); `resolve_gguf_filename` bridges
+#            those on the Rust side, and this harness has to do the same or it
+#            reports FATAL against a model that is sitting right there. It did,
+#            on the Orin, immediately after being taught to default to the
+#            pond's own chat_model.
+#
+#   SRC   -- where the bytes actually live. The real registry leaves symlinks
+#            into `hf_cache`, so this can be a blob whose basename is a SHA.
+#            Linking under that name would give the scratch pond a model no
+#            registry can resolve, so the link is always named for the ENTRY.
+ENTRY=""
+for candidate in "$MODEL.gguf" "$MODEL"-*.gguf; do
+  if [ -e "$REAL_MODELS/gguf/$candidate" ]; then ENTRY="$candidate"; break; fi
+done
+if [ -z "$ENTRY" ]; then
   echo "FATAL: could not resolve $MODEL to a file under $REAL_MODELS/gguf" >&2
-  echo "       (looked for: $SRC)" >&2
+  echo "       (tried '$MODEL.gguf' and '$MODEL-<quant>.gguf'; present:)" >&2
+  ls -1 "$REAL_MODELS/gguf" 2>/dev/null | sed 's/^/         /' >&2
   exit 1
 fi
-if ! ln "$SRC" "$DATA_DIR/models/gguf/$MODEL.gguf" 2>/dev/null; then
+SRC="$REAL_MODELS/gguf/$ENTRY"
+SRC="$(readlink -f "$SRC" 2>/dev/null || python3 -c "import os,sys;print(os.path.realpath(sys.argv[1]))" "$SRC")"
+if [ ! -f "$SRC" ]; then
+  echo "FATAL: $ENTRY points at $SRC, which is not a file." >&2
+  echo "       A dangling symlink in the models directory -- the blob it names" >&2
+  echo "       was pruned from hf_cache." >&2
+  exit 1
+fi
+if ! ln "$SRC" "$DATA_DIR/models/gguf/$ENTRY" 2>/dev/null; then
   # Different filesystem: copy rather than symlink. Slower, still isolated.
-  echo "  (hard link failed -- copying $MODEL; scratch is on another filesystem)"
-  cp "$SRC" "$DATA_DIR/models/gguf/$MODEL.gguf" || exit 1
+  echo "  (hard link failed -- copying $ENTRY; scratch is on another filesystem)"
+  cp "$SRC" "$DATA_DIR/models/gguf/$ENTRY" || exit 1
 fi
 echo "model:     $MODEL   (chosen by: ${MODEL_SOURCE:-unknown})"
 echo "weights:   hard-linked from $SRC"
