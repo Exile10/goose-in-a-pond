@@ -50,6 +50,10 @@ pub struct SetDeviceStateParams {
     /// 0-100 percent.
     #[serde(default)]
     pub fan_speed: Option<u8>,
+    /// Fan mode: off, low, medium, high, on, auto, smart. Use this rather than
+    /// fan_speed when the user names a mode — auto and smart have no percentage.
+    #[serde(default)]
+    pub fan_mode: Option<String>,
     /// 0-100 percent open (100=fully open).
     #[serde(default)]
     pub position: Option<u8>,
@@ -107,12 +111,14 @@ impl DeviceControlMcpServer {
             && p.hue.is_none()
             && p.saturation.is_none()
             && p.fan_speed.is_none()
+            && p.fan_mode.is_none()
             && p.position.is_none()
         {
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "No change requested for '{device_id}'. Specify one of: power (on/off), \
                  brightness (0-100), target_temp (°C), locked (true/false), hue (0-360) + \
-                 saturation (0-100), fan_speed (0-100), or position (0-100 percent open)."
+                 saturation (0-100), fan_speed (0-100), fan_mode (off/low/medium/high/on/auto/\
+                 smart), or position (0-100 percent open)."
             ))]));
         }
 
@@ -208,6 +214,16 @@ impl DeviceControlMcpServer {
                 Err(e) => {
                     return Ok(guidance(format!(
                         "Couldn't set fan speed on '{device_id}': {e}"
+                    )))
+                }
+            }
+        }
+        if let Some(mode) = p.fan_mode.as_deref() {
+            match self.control.set_fan_mode(device_id, mode).await {
+                Ok(_) => applied.push(format!("fan_mode={mode}")),
+                Err(e) => {
+                    return Ok(guidance(format!(
+                        "Couldn't set fan mode on '{device_id}': {e}"
                     )))
                 }
             }
