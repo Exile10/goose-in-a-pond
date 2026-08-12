@@ -20,7 +20,7 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::bridge::{run_matter_bridge, run_matter_supervisor};
+use crate::bridge::{run_matter_bridge, run_matter_supervisor, SupervisorConfig};
 use crate::client::MatterClient;
 use crate::commissioning::MatterCommissioner;
 use crate::control::{MatterDeviceControl, NodeCache, SharedMatterClient};
@@ -411,7 +411,13 @@ async fn supervisor_reconnects_after_the_connection_drops() {
     let bus = Arc::new(InProcessEventBus::new());
 
     tokio::spawn(run_matter_supervisor(
-        url.clone(),
+        SupervisorConfig {
+            url: url.clone(),
+            // A mock server on an ephemeral loopback port: revival would find
+            // it listening and reuse it, so nothing is ever installed here.
+            data_dir: std::path::PathBuf::from("/nonexistent"),
+            child: Arc::new(tokio::sync::Mutex::new(None)),
+        },
         cell.clone(),
         client,
         events,
@@ -949,4 +955,63 @@ async fn an_empty_controller_address_is_reported_plainly() {
         unreachable!()
     };
     assert!(error.contains("no Matter controller address"), "{error}");
+}
+
+/// Teardown must kill whatever process is in the shared cell *now*, not the
+/// handle `connect` originally put there. After the supervisor respawns a dead
+/// controller those are different processes, and killing the stale one would
+/// leave the live controller running past the Pond — the orphan that let a
+/// week-old controller outlive several restarts in the first place.
+#[cfg(unix)]
+#[tokio::test]
+async fn stopping_the_controller_kills_whatever_the_cell_holds_now() {
+    /// True while the process is alive. `kill -0` signals nothing; it only
+    /// checks the pid is still there, and avoids a libc dependency for one probe.
+    async fn alive(pid: u32) -> bool {
+        tokio::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    let cell: crate::server_setup::SharedServerChild = Arc::new(tokio::sync::Mutex::new(None));
+
+    // An empty cell is the "user runs their own controller" case: nothing of
+    // GIAP's to kill, and no panic for trying.
+    crate::runtime::stop_controller(&cell).await;
+
+    // Stand in for a respawned controller: a real child, parked exactly the way
+    // `revive_local_controller` parks one.
+    let child = tokio::process::Command::new("sleep")
+        .arg("30")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawning sleep should work on any unix host");
+    let pid = child.id().expect("a freshly spawned child has a pid");
+    *cell.lock().await = Some(child);
+    assert!(
+        alive(pid).await,
+        "the stand-in controller should be running"
+    );
+
+    crate::runtime::stop_controller(&cell).await;
+
+    assert!(
+        cell.lock().await.is_none(),
+        "the handle is taken, so a second teardown cannot double-kill"
+    );
+    // `start_kill` only signals; give the OS a moment to reap before asserting.
+    let mut gone = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if !alive(pid).await {
+            gone = true;
+            break;
+        }
+    }
+    assert!(gone, "the controller process should be dead");
 }
