@@ -738,6 +738,10 @@ export interface SessionMessage {
    *  turn that was never recorded is distinguishable from one that thought
    *  nothing. */
   thinking?: string[];
+  /** Training-feedback vote from the chat UI's like/dislike controls.
+   *  `true` = liked (kept as training data), `false` = disliked (excluded),
+   *  `null`/absent = no vote. */
+  liked?: boolean | null;
 }
 
 // ── HuggingFace / Model Download ──────────────────────────────

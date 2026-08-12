@@ -153,6 +153,18 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // PAI-4 P7 — the manual axis. The time axis (P4) and the pressure axis
         // (P6) both decide for the user; this is the one a person decides.
         .route("/sessions/{session_id}/compact", post(compact_session))
+        // Delete a message and every later message in the same session — the
+        // "edit"/"refresh" primitive: the client truncates from a user
+        // message, then resubmits (same or edited text) as a normal new turn.
+        .route(
+            "/sessions/{session_id}/messages/{message_id}",
+            delete(delete_messages_from_handler),
+        )
+        // Like/dislike training-feedback on one message.
+        .route(
+            "/sessions/{session_id}/messages/{message_id}/feedback",
+            put(set_message_feedback_handler),
+        )
         // Phase F2: raw bytes for one persisted image attachment.
         .route(
             "/sessions/{session_id}/attachments/{attachment_id}",
@@ -2391,6 +2403,91 @@ async fn delete_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Delete a message and every later message in the same session.
+///
+/// DELETE /api/v1/sessions/:session_id/messages/:message_id
+///
+/// This is the "edit"/"refresh" primitive, not a general message-delete: the
+/// client truncates the conversation from a user message onward, then
+/// resubmits (unchanged for refresh, edited for edit) as a normal new turn
+/// through `/chat/stream` — no separate regenerate code path needed.
+async fn delete_messages_from_handler(
+    State(state): State<Arc<AppState>>,
+    Path((session_id, message_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    use pond_core::user_data::ports::session_storage::SessionStorageError;
+    state
+        .session_storage
+        .delete_messages_from(&session_id, &message_id)
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                SessionStorageError::SessionNotFound(_)
+                | SessionStorageError::MessageNotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json!({"error": format!("{}", e)})))
+        })?;
+
+    // Truncating `pond_system.db` is only half of forgetting a turn, and the
+    // half nobody sees. The live engine session still holds the deleted
+    // messages, so without this the model keeps being shown the exact turns the
+    // user just removed: an edit re-answers with the old answer in context, a
+    // regenerate is asked to regenerate something it can still read, and the
+    // two stores diverge for the life of the process. The user's only signal
+    // that any of that happened is an assistant that seems not to have noticed.
+    //
+    // `forget_session` drops the GIAP->engine pairing rather than replaying a
+    // deletion into the engine. That is deliberate: the next turn re-resolves
+    // the pairing and hydrates a fresh engine session from pond history, which
+    // IS the truncated history, so the two stores converge on the one that is
+    // authoritative instead of both being edited and hoping they agree. It is
+    // also a no-op when no pairing exists, so a first-turn edit costs nothing.
+    state.agent.forget_session(&session_id).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct MessageFeedbackRequest {
+    /// `true` = liked (keep as training data), `false` = disliked (excluded),
+    /// `null`/omitted = clear any prior vote.
+    #[serde(default)]
+    liked: Option<bool>,
+}
+
+/// Set or clear the like/dislike training-feedback flag on one message.
+///
+/// PUT /api/v1/sessions/:session_id/messages/:message_id/feedback
+/// Body: `{ "liked": true | false | null }`
+async fn set_message_feedback_handler(
+    State(state): State<Arc<AppState>>,
+    Path((session_id, message_id)): Path<(String, String)>,
+    body: Result<Json<MessageFeedbackRequest>, JsonRejection>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    use pond_core::user_data::ports::session_storage::SessionStorageError;
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
+    })?;
+
+    state
+        .session_storage
+        .set_message_feedback(&session_id, &message_id, req.liked)
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                SessionStorageError::SessionNotFound(_)
+                | SessionStorageError::MessageNotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json!({"error": format!("{}", e)})))
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Get messages for a session (paginated).
 ///
 /// GET /api/v1/sessions/:session_id/messages?limit=100&offset=0
@@ -2419,17 +2516,28 @@ async fn get_session_messages(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    let messages = state
-        .session_storage
-        .get_messages_paginated(&session_id, limit, offset)
-        .await
-        .map_err(|e| {
-            let status = match &e {
-                SessionStorageError::SessionNotFound(_) => StatusCode::NOT_FOUND,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            (status, Json(json!({"error": format!("{}", e)})))
-        })?;
+    // No `offset` in the query: honor the doc comment above — "most recent"
+    // means newest-first via get_recent_messages, not the oldest page that
+    // get_messages_paginated(limit, 0) would return. Callers that DO pass
+    // `offset` are doing old-style forward pagination and keep that behavior.
+    let messages = if params.contains_key("offset") {
+        state
+            .session_storage
+            .get_messages_paginated(&session_id, limit, offset)
+            .await
+    } else {
+        state
+            .session_storage
+            .get_recent_messages(&session_id, limit)
+            .await
+    }
+    .map_err(|e| {
+        let status = match &e {
+            SessionStorageError::SessionNotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(json!({"error": format!("{}", e)})))
+    })?;
 
     // Phase F2. One cheap metadata query for the whole page (no bytes read),
     // grouped by message id. Absent for sessions that never had an attachment,
@@ -2478,6 +2586,7 @@ async fn get_session_messages(
                 "role": role,
                 "content": m.message.content,
                 "created_at": m.created_at.to_rfc3339(),
+                "liked": m.liked,
             });
             if let Some(tc_id) = &m.message.tool_call_id {
                 obj["tool_call_id"] = json!(tc_id);

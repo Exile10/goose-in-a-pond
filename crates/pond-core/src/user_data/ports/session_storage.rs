@@ -398,4 +398,41 @@ pub trait SessionStorage: Send + Sync {
     ) -> Result<std::collections::HashMap<String, Vec<String>>, SessionStorageError> {
         Ok(std::collections::HashMap::new()) // default no-op for backward compat
     }
+
+    /// Set (or clear, with `None`) the liked/disliked training-feedback flag
+    /// on one message. `Some(true)` marks the turn as accepted training data,
+    /// `Some(false)` marks it excluded, `None` clears any prior vote.
+    ///
+    /// The default is a no-op error so adapters that predate the feedback UI
+    /// keep compiling; the SQLite adapter is the real implementation.
+    async fn set_message_feedback(
+        &self,
+        _session_id: &str,
+        _message_id: &str,
+        _liked: Option<bool>,
+    ) -> Result<(), SessionStorageError> {
+        Err(SessionStorageError::General(
+            "message feedback is not supported by this SessionStorage adapter".to_string(),
+        ))
+    }
+
+    /// Delete `message_id` and every later message in the same session (by
+    /// insertion order).
+    ///
+    /// Backs "edit" and "refresh" on a user message: the caller truncates
+    /// from that message onward, then resubmits the (same or edited) text as
+    /// a normal new turn through the existing chat endpoint — no separate
+    /// regenerate code path needed.
+    ///
+    /// The default is a no-op error so adapters that predate this feature
+    /// keep compiling; the SQLite adapter is the real implementation.
+    async fn delete_messages_from(
+        &self,
+        _session_id: &str,
+        _message_id: &str,
+    ) -> Result<(), SessionStorageError> {
+        Err(SessionStorageError::General(
+            "message truncation is not supported by this SessionStorage adapter".to_string(),
+        ))
+    }
 }
