@@ -145,6 +145,20 @@ def logtext():
         return ""
 
 
+def refusal_detail(lt):
+    """The first refusal the reviewer logged, as the pond itself described it.
+
+    `main.rs` emits `first=Some(Unreadable { index: 0, message: "..." })` on the
+    WARN that fires when a run yields nothing, and each individual refusal at
+    DEBUG. Either is a real answer; asserting a cause without one is not.
+    """
+    for marker in ("first=", "refusal="):
+        i = lt.rfind(marker)
+        if i != -1:
+            return lt[i:i + 300].splitlines()[0].strip()
+    return ""
+
+
 def db():
     path = os.path.join(DATA, "pond_system.db")
     if not os.path.exists(path):
@@ -549,9 +563,17 @@ def probe_proactive():
     if made:
         record(7, "a proactive review completes and yields", "PASS", "%d proposal(s)" % made)
     elif "produced nothing" in lt or "impulse refused" in lt:
+        # Report the refusal the pond actually recorded, rather than asserting a
+        # cause. The previous message here said "the model did not write the
+        # schema it was given", which was true of the run that motivated this
+        # probe (`deny_unknown_fields` refusing a stray `type` key, fixed
+        # 2026-08-12) and would have been wrong about every other reason -- low
+        # confidence, a blank rationale, a suppressed shape, the daily cap. A
+        # verdict that names a cause it did not check is how a run reports the
+        # opposite of the truth.
         record(7, "a proactive review completes and yields", "FAIL",
-               "the review ran and every impulse was refused -- the model did not "
-               "write the schema it was given")
+               "the review ran and every impulse was refused -- %s"
+               % (refusal_detail(lt) or "no refusal detail in the log; raise RUST_LOG"))
     else:
         record(7, "a proactive review completes and yields", "FAIL",
                "the review started and nothing came of it")

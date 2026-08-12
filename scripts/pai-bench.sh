@@ -33,8 +33,9 @@
 # programme paid for: the reviewer ran correctly on the Orin for 32 seconds and
 # produced nothing, and only the yield told anyone.
 #
-# Runs on macOS and Linux. Uses a scratch POND_DATA_DIR with the real models
-# symlinked in, so it gets real inference and can never touch a real pond.
+# Runs on macOS and Linux. Uses a scratch POND_DATA_DIR with ONE chat model
+# HARD-LINKED in, so it gets real inference and can never touch a real pond.
+# Not symlinked -- see the note above `link_model` for the 3.1 GB that cost.
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
