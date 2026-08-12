@@ -199,6 +199,28 @@ impl DeviceRegistry for SqliteDeviceRegistry {
             .await?
             .ok_or_else(|| anyhow::anyhow!("device '{device_id}' not found after update"))
     }
+
+    async fn set_discovered_profile(
+        &self,
+        device_id: &str,
+        device_type: &str,
+        capabilities: &[String],
+    ) -> Result<()> {
+        // Deliberately does NOT touch name, hostname or room: those belong to
+        // whoever configured the device, and this runs on every bridge sync.
+        let caps_json = serde_json::to_string(capabilities)?;
+        let now_str = Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        sqlx::query(
+            "UPDATE devices SET device_type = ?, capabilities = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(device_type)
+        .bind(&caps_json)
+        .bind(&now_str)
+        .bind(device_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

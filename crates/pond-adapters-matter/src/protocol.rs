@@ -81,11 +81,26 @@ pub const ATTR_FAN_PERCENT_SETTING: u32 = 2;
 /// FanControl `FanMode` attribute id. A fan has no On/Off cluster to switch, so
 /// this is where its power lives.
 pub const ATTR_FAN_MODE: u32 = 0;
-/// `FanMode` values GIAP writes. The enum also carries Low/Medium/High (1–3),
-/// which speed changes go through `PercentSetting` for instead — the server
-/// keeps the two in step, so there is no need to pick a discrete step here.
+/// `FanMode` values GIAP writes. Speed changes go through `PercentSetting`
+/// instead — the server keeps the two in step, so there is no need to pick a
+/// discrete step for those.
 pub const FAN_MODE_OFF: u8 = 0;
-pub const FAN_MODE_ON: u8 = 4;
+/// "Turn the fan on" writes **High**, not `FanMode::On`.
+///
+/// `On` is 4, and it is the obvious choice until you read `FanModeSequence`:
+/// it was deprecated in Matter 1.2 and appears in none of the sequences a
+/// current device advertises (`OffLowMedHigh`, `OffLowHigh`,
+/// `OffLowMedHighAuto`, `OffLowHighAuto`, `OffHighAuto`, `OffHigh`). Writing
+/// an unsupported mode is a write a conforming fan may reject — so the fix for
+/// "turn on the fan does nothing" would have shipped still not turning on the
+/// fan.
+///
+/// High is the only non-Off value present in *every* sequence, which is what
+/// makes it the safe universal choice without reading `FanModeSequence` first.
+/// Reading that attribute and picking the gentlest supported mode is the
+/// better behaviour and a bigger change; it belongs with the `set_fan_mode`
+/// validation follow-up, which has the same gap.
+pub const FAN_MODE_ON: u8 = 3;
 
 /// `FanMode` by the name a user says it. Auto and Smart are not points on the
 /// percentage scale — they hand the choice back to the device — which is why a
@@ -630,8 +645,12 @@ mod tests {
             ("off", 0u8),
             ("low", 1),
             ("medium", 2),
+            // "on" deliberately maps to High (3), not to `FanMode::On` (4).
+            // See `FAN_MODE_ON`: 4 was deprecated in Matter 1.2 and is in none
+            // of the sequences a current device advertises, so writing it is a
+            // write a conforming fan may reject.
             ("high", 3),
-            ("on", 4),
+            ("on", 3),
             ("auto", 5),
             ("smart", 6),
         ] {

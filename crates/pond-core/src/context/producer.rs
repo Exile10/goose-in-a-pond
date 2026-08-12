@@ -113,6 +113,13 @@ pub const DISCRETE_SENSOR_TYPES: &[&str] = &[
     "smoke",
     "leak",
     "button",
+    // The Matter `SmokeCoAlarm` cluster's own name for the same thing (#195).
+    // Its state is Normal/Warning/Critical rather than a boolean, but it is an
+    // ALARM: it changes rarely, every change is an event a household needs, and
+    // "the smoke alarm went to Critical at 03:12" is exactly the sentence this
+    // corpus exists to be able to say. Grouped with `smoke` above rather than
+    // replacing it, because the two names come from different bridges.
+    "smoke_alarm",
 ];
 
 /// Camera event types that mean "the pixels changed" rather than naming a thing.

@@ -218,6 +218,21 @@ impl DeviceRegistry for InMemoryRegistry {
     async fn heartbeat(&self, _id: &str) -> Result<()> {
         Ok(())
     }
+    async fn set_discovered_profile(
+        &self,
+        id: &str,
+        device_type: &str,
+        capabilities: &[String],
+    ) -> Result<()> {
+        // Implemented rather than left on the port's no-op default, because the
+        // default would make `an_already_registered_device_is_retyped_on_sync`
+        // pass whether or not the bridge calls it.
+        if let Some(d) = self.devices.lock().unwrap().get_mut(id) {
+            d.device_type = device_type.to_string();
+            d.capabilities = capabilities.to_vec();
+        }
+        Ok(())
+    }
 }
 
 async fn start_adapter(
@@ -340,7 +355,13 @@ async fn set_power_on_a_fan_writes_fan_mode() {
     assert_eq!(args["node_id"], 18);
     // endpoint/cluster/attribute — FanMode on the fan's endpoint.
     assert_eq!(args["attribute_path"], "1/514/0");
-    assert_eq!(args["value"], 4, "FanMode On");
+    // High (3), NOT FanMode::On (4). `On` was deprecated in Matter 1.2 and
+    // appears in none of the FanModeSequence values a current device
+    // advertises, so a conforming fan may reject the write — which would have
+    // left "turn on the fan" still not turning on the fan, the exact bug this
+    // path was added to fix. High is the only non-Off mode present in every
+    // sequence. See `FAN_MODE_ON`.
+    assert_eq!(args["value"], 3, "FanMode High");
 }
 
 #[tokio::test]
@@ -1298,4 +1319,120 @@ async fn stopping_the_controller_kills_whatever_the_cell_holds_now() {
         }
     }
     assert!(gone, "the controller process should be dead");
+}
+
+/// A device already in the registry gets its typing refreshed on sync.
+///
+/// Registration was the only writer of `device_type` and `capabilities`, and
+/// `sync_node` registers only when `get_device` returns `None` — so every
+/// device commissioned before a typing improvement shipped kept its old values
+/// through every restart. The fan that motivated Matter fan control stayed
+/// `device_type: "matter"` with no capabilities, and was therefore invisible to
+/// the device-type-aware routing the same change added.
+#[tokio::test]
+async fn an_already_registered_device_is_retyped_on_sync() {
+    let (url, _received) = mock_matter_server(json!([light_node_json()]), vec![]).await;
+    let (client, events) = MatterClient::connect(&url).await.unwrap();
+    let cache: NodeCache = Arc::new(RwLock::new(HashMap::new()));
+    let registry = Arc::new(InMemoryRegistry::default());
+    let bus = Arc::new(InProcessEventBus::new());
+
+    // The row an older GIAP left behind: right id, untyped, no capabilities.
+    registry
+        .register(RegisterDeviceRequest {
+            id: Some("matter-2".to_string()),
+            name: "Living Room Light".to_string(),
+            device_type: "matter".to_string(),
+            hostname: None,
+            capabilities: vec![],
+            room: None,
+        })
+        .await
+        .unwrap();
+
+    tokio::spawn(run_matter_bridge(
+        client,
+        events,
+        cache,
+        registry.clone() as Arc<dyn DeviceRegistry + Send + Sync>,
+        bus as Arc<dyn EventBus>,
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let light = registry.get_device("matter-2").await.unwrap().unwrap();
+    assert_eq!(
+        light.device_type, "light",
+        "an existing device kept its stale device_type through a full sync"
+    );
+    assert!(
+        !light.capabilities.is_empty(),
+        "an existing device kept its empty capabilities through a full sync"
+    );
+    // The user's own fields are untouched: this path must never overwrite what
+    // somebody configured in the Devices tab.
+    assert_eq!(light.name, "Living Room Light");
+}
+
+/// A resync does not replay steady sensor values onto the bus.
+///
+/// `sync_node` runs on the initial sync, on every `node_added`/`node_updated`,
+/// and on every supervisor reconnect. The #92 rules engine is LEVEL-based, so
+/// republishing a steady "occupancy = 1" is indistinguishable from occupancy
+/// starting again: a controller that reconnects a few times would re-fire every
+/// automation attached to every Matter sensor with nothing in the house having
+/// changed. The supervisor exists to reconnect often, which is what makes this
+/// the common case rather than an edge one.
+///
+/// The subscription is opened BEFORE the bridge starts, deliberately. The bus
+/// is a broadcast channel, so a subscriber that joins afterwards misses
+/// everything already published — the first version of this test did that and
+/// would have passed with the fix reverted.
+#[tokio::test]
+async fn a_resync_does_not_republish_an_unchanged_sensor_value() {
+    let (url, _received) = mock_matter_server(
+        json!([occupancy_node_json()]),
+        vec![
+            // A resync carrying exactly what the initial sync already reported.
+            json!({"event": "node_updated", "data": {
+                "node_id": 7, "available": true, "attributes": {"1/1030/0": 0}
+            }}),
+            // ...then a real change, so this test can tell "publishes nothing
+            // on a resync" apart from "has stopped publishing".
+            json!({"event": "attribute_updated", "data": [7, "1/1030/0", 1]}),
+        ],
+    )
+    .await;
+    let (client, events) = MatterClient::connect(&url).await.unwrap();
+    let cache: NodeCache = Arc::new(RwLock::new(HashMap::new()));
+    let registry = Arc::new(InMemoryRegistry::default());
+    let bus = Arc::new(InProcessEventBus::new());
+
+    let mut stream = bus.subscribe();
+
+    tokio::spawn(run_matter_bridge(
+        client,
+        events,
+        cache,
+        registry as Arc<dyn DeviceRegistry + Send + Sync>,
+        bus.clone() as Arc<dyn EventBus>,
+    ));
+
+    let mut values = Vec::new();
+    while values.len() < 2 {
+        match tokio::time::timeout(Duration::from_millis(600), stream.next()).await {
+            Ok(Some(BusEvent::Sensor(r))) if r.device_id == "matter-7" => values.push(r.value),
+            Ok(Some(_)) => continue,
+            _ => break,
+        }
+    }
+
+    // Initial sync publishes 0 (first sight). The identical resync must publish
+    // nothing. The genuine change to 1 must publish.
+    assert_eq!(
+        values,
+        vec![0.0, 1.0],
+        "expected the first sight and the real change only; a duplicate 0 means \
+         the resync republished an unchanged value and re-fired every rule \
+         attached to this sensor"
+    );
 }

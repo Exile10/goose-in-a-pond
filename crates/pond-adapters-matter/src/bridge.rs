@@ -109,7 +109,27 @@ async fn sync_node(
     // sits at a steady value is knowable immediately — otherwise it exists in
     // the device list while every question about its reading is answered "none
     // recorded", which reads as "that device is not here".
+    //
+    // Only what we have not already seen at that value, though. This function
+    // runs on the initial sync, on every `node_added`/`node_updated`, and on
+    // every supervisor reconnect, and the rules engine (#92) is LEVEL-based:
+    // republishing a steady "motion = true" is indistinguishable to it from
+    // motion starting again. A controller that reconnects a few times would
+    // re-fire every automation attached to every Matter sensor, with nothing in
+    // the house having changed — and the reconnect-often case is exactly the
+    // one the supervisor above exists to handle.
+    //
+    // First sight still publishes everything, which is the behaviour the
+    // paragraph above is about; the cache is what distinguishes the two.
+    let previous = nodes.read().await.get(&node.node_id).cloned();
     for (path, value) in &node.attributes {
+        let unchanged = previous
+            .as_ref()
+            .and_then(|p| p.attributes.get(path))
+            .is_some_and(|before| before == value);
+        if unchanged {
+            continue;
+        }
         if let Some(reading) = sensor_reading_from_update(node.node_id, path, value) {
             bus.publish(BusEvent::Sensor(reading));
         }
@@ -118,9 +138,37 @@ async fn sync_node(
     nodes.write().await.insert(node.node_id, node);
 
     match registry.get_device(&device.id).await {
-        Ok(Some(_)) => {
+        Ok(Some(existing)) => {
             if let Err(e) = registry.heartbeat(&device.id).await {
                 tracing::warn!(device = %device.id, error = %e, "matter: heartbeat failed");
+            }
+            // Re-derived typing has to reach a device that already exists, or
+            // it only ever applies to devices commissioned after the improvement
+            // shipped. Registration was the sole writer of these two fields and
+            // this arm is the "already registered" one, so every fan and sensor
+            // already on the fabric kept `device_type: "matter"` and no
+            // capabilities through every restart.
+            //
+            // Guarded on a real difference because this runs on the initial
+            // sync, on every node_added/node_updated, and on every supervisor
+            // reconnect — an unconditional UPDATE would be a write per node per
+            // reconnect for a value that almost never changes.
+            if existing.device_type != device.device_type
+                || existing.capabilities != device.capabilities
+            {
+                if let Err(e) = registry
+                    .set_discovered_profile(&device.id, &device.device_type, &device.capabilities)
+                    .await
+                {
+                    tracing::warn!(device = %device.id, error = %e, "matter: profile refresh failed");
+                } else {
+                    tracing::info!(
+                        device = %device.id,
+                        from = %existing.device_type,
+                        to = %device.device_type,
+                        "matter: re-typed an already-registered device"
+                    );
+                }
             }
         }
         Ok(None) => {
