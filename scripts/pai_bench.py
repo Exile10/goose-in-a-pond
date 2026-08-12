@@ -533,6 +533,39 @@ def probe_proactive():
                % ("is ticking" if ticking else "NOT seen -- check the startup line"))
         return
 
+    # PAI-7's gate needs somebody to ADDRESS: `audience_for_review` wants a
+    # human-origin session carrying a `profile_id`, updated inside the 6h
+    # audience window. Without one it refuses at TRACE and `continue`s, long
+    # before the "starting a proactive review" line this probe waits on -- so
+    # the run reports "the reviewer never started" and says nothing whatever
+    # about PAI-7.
+    #
+    # That is exactly what happened on the Orin on 2026-08-12 under
+    # `--only 5,7`: PAI-1's probe, which is what used to create a member and
+    # bind one, had not run. A probe whose verdict depends on which OTHER
+    # probes ran is not measuring its own capability. So it establishes its own
+    # precondition here and `--only 7` now means something on its own.
+    #
+    # Refusing to broadcast when nobody is identified is CORRECT behaviour
+    # (`nobody_here_for_six_hours_means_no_review_rather_than_a_broadcast`), and
+    # the point of setting it up is to get past it to the part under test, not
+    # to work around it.
+    code, member = req("POST", "/profiles",
+                       {"display_name": "BenchMember", "avatar_emoji": "duck"})
+    if code not in (200, 201) or not isinstance(member, dict) or not member.get("id"):
+        record(7, "a proactive review completes and yields", "SKIP",
+               "could not create a member to address the review to: HTTP %s" % code)
+        return
+    # The chat above created this session; binding an identity to it makes it a
+    # session the audience gate can see.
+    code, bound = req("PUT", "/sessions/bench-think/user", {"profile_id": member["id"]})
+    if code != 200 or not (isinstance(bound, dict) and bound.get("bound")):
+        record(7, "a proactive review completes and yields", "SKIP",
+               "could not bind an identity to the session, so there is nobody for the "
+               "reviewer to address: HTTP %s %s" % (code, bound))
+        return
+    print("     audience: %s (bound to bench-think)" % member["id"])
+
     print("     waiting out the 15-minute idle window (--slow)...")
     deadline = time.time() + 20 * 60
     while time.time() < deadline:
@@ -542,8 +575,20 @@ def probe_proactive():
         time.sleep(20)
     lt = logtext()
     if "starting a proactive review" not in lt:
+        # Say which gate, when the log says. Every refusal before the start line
+        # is TRACE or DEBUG, so a warn-rooted run legitimately has nothing --
+        # and "no reason in the log" is itself the useful report, rather than a
+        # bare "never started" that reads like the loop is dead.
+        why = ""
+        for probe in ("nobody to address", "orchestrator", "already had their day",
+                      "could not read prior decisions", "delegation refused"):
+            if probe in lt:
+                why = " -- the log mentions: %s" % probe
+                break
         record(7, "a proactive review completes and yields", "FAIL",
-               "the reviewer never started inside 20 minutes")
+               "the reviewer never started inside 20 minutes%s" % (why or
+               " (no gate reason in the log; the refusals before the start line are "
+               "TRACE/DEBUG, so raise RUST_LOG to see which one)"))
         return
     for _ in range(40):
         lt = logtext()
