@@ -3894,6 +3894,54 @@ impl GooseAdapter {
                     };
                     let attempt_msg =
                         attach_images(Message::user().with_text(&attempt_text), &turn_images);
+                    // The completeness check, armed for this turn only.
+                    //
+                    // Goose's reply loop, on a turn that finishes WITHOUT calling
+                    // a tool, re-prompts "check whether the goal has been fully
+                    // met; if not, continue working toward it" and iterates once
+                    // more. It is guarded on a goal being set, and nothing in
+                    // GIAP ever set one -- so the arm was dead and the loop
+                    // terminated on "the model stopped asking for tools", never
+                    // on "the question was answered".
+                    //
+                    // Measured 2026-08-12, "what time is it in the first 10
+                    // states of the USA alphabetically?": gemma-4-E2B made ZERO
+                    // tool calls and answered with a single time for all ten
+                    // states -- its own local clock, in fact -- and every layer
+                    // reported success. gemma-4-E4B declined honestly instead,
+                    // so the size of the failure is model-dependent, but the
+                    // absence of any check is not.
+                    //
+                    // `set_session_goal` and NOT `set_goal`: one retained
+                    // `Arc<GooseAgent>` serves up to four concurrent chat
+                    // streams (`sse_semaphore`), and the process-wide slot would
+                    // put one household member's request text into another
+                    // member's turn. That is a PAI-1 boundary crossing, not a
+                    // tidiness point, and it is why the fork carries the
+                    // session-keyed variant.
+                    //
+                    // The RAW request, never `turn_text`: the assembled text
+                    // carries `<system-context>` with memories and the turn
+                    // budget, and feeding those back as a goal would restate
+                    // household memories to the model as something to satisfy.
+                    //
+                    // Gated because it costs roughly TWICE the inferences per
+                    // turn: the check re-arms whenever the model does more work,
+                    // so it fired three times on one measured turn rather than
+                    // once. That is the mechanism and not a defect -- capping it
+                    // at a single check would have stopped the seven-tool-call
+                    // turn that finally produced an answer at around its fourth.
+                    // Defaulted ON because the measurements say it is worth the
+                    // cost; see `Settings::goal_check_enabled` for why this is a
+                    // household setting rather than a `ModelClass` tier.
+                    agent_clone
+                        .set_session_goal(
+                            &turn_goose_sid,
+                            settings
+                                .goal_check_enabled
+                                .then(|| request.message.clone()),
+                        )
+                        .await;
                     let attempt_cfg = goose::agents::types::SessionConfig {
                         id: turn_goose_sid.clone(),
                         schedule_id: None,
@@ -6091,6 +6139,86 @@ mod tests {
             assign < finalize,
             "the re-engagement count is assigned after `finalize_rates`, i.e. after the \
              turn's stats have been sealed and sent.",
+        );
+    }
+
+    /// The completeness check must be armed per SESSION and from the RAW
+    /// request. Both halves are load-bearing and both fail silently.
+    ///
+    /// Structural for the same reason as the re-engagement guard: the call sits
+    /// inside an `async_stream` that needs a real goose `Agent`, a provider and
+    /// a model to drive. What can be checked without one is which method is
+    /// called and what is handed to it, and those are exactly the two things
+    /// that go wrong.
+    ///
+    /// **`set_goal` would be a cross-profile disclosure.** `AppState` bounds
+    /// concurrent chat streams with `Semaphore::new(4)` and all four share one
+    /// retained `Arc<GooseAgent>`, so the process-wide slot means one household
+    /// member's request text is injected into another member's turn as a user
+    /// message. The fork carries `set_session_goal` precisely so this host can
+    /// arm the check at all.
+    ///
+    /// **`turn_text` would restate household memories as a goal.** The
+    /// assembled text wraps the request in `<system-context>` carrying injected
+    /// memories, dormant-tool notes and the turn budget. The goal is echoed back
+    /// to the model as "check whether this has been fully met" — feeding it the
+    /// envelope would ask the model to satisfy the memories.
+    #[test]
+    fn the_goal_is_armed_per_session_and_from_the_raw_request() {
+        let lines = stream_body_code();
+
+        let armed = lines
+            .iter()
+            .position(|l| l.contains("set_session_goal("))
+            .expect(
+                "nothing arms the per-session goal. Goose's completeness check is guarded on a \
+                 goal being set, so without this the reply loop terminates when the model stops \
+                 asking for tools and never when the question was answered -- which on 2026-08-12 \
+                 was a ten-item query answered with zero tool calls and no objection.",
+            );
+
+        // A WINDOW, not the anchor line. The call spans several lines once the
+        // argument is built, and a single-line assertion silently stopped
+        // matching the moment the setting gate was added -- reporting "nothing
+        // arms the goal" while the goal was armed immediately below.
+        let window = lines[armed..(armed + 10).min(lines.len())].join("\n");
+
+        assert!(
+            window.contains("request.message"),
+            "the goal is armed from something other than the raw request. `turn_text` carries \
+             <system-context> with injected memories and the turn budget, and the goal is echoed \
+             back to the model as a thing to satisfy. Window:\n{window}"
+        );
+        assert!(
+            !window.contains("turn_text"),
+            "the goal is armed from `turn_text`, which is the assembled envelope rather than the \
+             request. Window:\n{window}"
+        );
+        assert!(
+            window.contains("goal_check_enabled"),
+            "the goal is armed unconditionally. It costs roughly twice the inferences per turn, \
+             so it rides `Settings::goal_check_enabled`. Window:\n{window}"
+        );
+
+        // The process-wide setter must not appear in the stream at all.
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                !line.contains(".set_goal("),
+                "line {i} calls the process-wide `set_goal` (`{}`). One retained agent serves up \
+                 to four concurrent chat streams, so that slot puts one member's request text \
+                 into another member's turn. Use `set_session_goal`.",
+                line.trim()
+            );
+        }
+
+        // Armed BEFORE the reply that reads it, or the first attempt runs unguarded.
+        let reply = lines
+            .iter()
+            .position(|l| l.contains("agent_clone.reply("))
+            .expect("the stream no longer calls agent_clone.reply");
+        assert!(
+            armed < reply,
+            "the goal is armed at line {armed}, after the reply at line {reply} that reads it.",
         );
     }
 
