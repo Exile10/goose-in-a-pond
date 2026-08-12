@@ -1,31 +1,20 @@
-import { useEffect, useState } from "react";
+import { formatHubDate, useNow } from "../state/useNow";
 
 interface HubClockProps {
   big?: boolean;
 }
 
-function format(now: Date) {
+function formatTime(now: Date): { time: string; ampm: string } {
   const time = now
     .toLocaleTimeString([], { hour: "numeric", minute: "2-digit", hour12: true })
     .replace(/\s?(AM|PM)$/i, "");
   const ampm = now.getHours() >= 12 ? "PM" : "AM";
-  const date = now.toLocaleDateString(undefined, {
-    weekday: "long",
-    month: "long",
-    day: "numeric",
-  });
-  return { time, ampm, date };
+  return { time, ampm };
 }
 
 export function HubClock({ big = false }: HubClockProps) {
-  const [now, setNow] = useState(() => new Date());
-
-  useEffect(() => {
-    const id = setInterval(() => setNow(new Date()), 30_000);
-    return () => clearInterval(id);
-  }, []);
-
-  const { time, ampm, date } = format(now);
+  const now = useNow();
+  const { time, ampm } = formatTime(now);
 
   return (
     <div className={`hclock${big ? " hclock--big" : ""}`}>
@@ -33,7 +22,7 @@ export function HubClock({ big = false }: HubClockProps) {
         {time}
         <span className="hclock__ampm">{ampm}</span>
       </div>
-      <div className="hclock__date">{date}</div>
+      <div className="hclock__date">{formatHubDate(now)}</div>
     </div>
   );
 }
