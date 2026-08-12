@@ -13786,30 +13786,81 @@ fn device_attribution(
 ///
 /// Returns `None` rather than an error throughout: a missing profile means no
 /// personal context, which is a safe prompt, not a failed turn.
+/// The profile particulars a turn may state, for the scope it resolved to.
+///
+/// # Personal particulars are OWNER-scoped
+///
+/// A preferred name, a birthday and a language are facts about ONE member. The
+/// `Household` fallback resolves `primary_profile_id`, so returning them there
+/// means any unattributed turn asserts the primary member's particulars — "the
+/// user prefers to be called Jerry", "the user's birthday is …" — while somebody
+/// else is talking. That was inert only because nothing had ever written those
+/// keys (the UI saved them to browser localStorage and the server reads them
+/// from SQLite, so they were always empty); wiring the writer is exactly what
+/// would have made it live, which is why the scoping is fixed in the same
+/// change.
+///
+/// `atypical_speech` deliberately DOES survive into `Household`. It is not a
+/// disclosure about anybody — it renders as "be patient, never correct speech
+/// patterns, interpret incomplete sentences charitably" — and a household that
+/// configured it wants it applied when it cannot tell who is speaking. Being
+/// patient with the wrong person costs nothing; announcing the wrong person's
+/// birthday does.
 async fn profile_context_for(
     state: &Arc<AppState>,
     scope: &ProfileScope,
 ) -> Option<ProfileContext> {
-    let profile_id = match scope {
-        ProfileScope::Owner(id) => id.clone(),
+    // Whether the turn is attributed to ONE member, which is what makes it safe
+    // to state that member's particulars.
+    let (profile_id, attributed) = match scope {
+        ProfileScope::Owner(id) => (id.clone(), true),
         ProfileScope::Household => {
             let settings = state.settings_repo.get().await.ok()?;
-            settings.primary_profile_id.filter(|id| !id.is_empty())?
+            (
+                settings.primary_profile_id.filter(|id| !id.is_empty())?,
+                false,
+            )
         }
         ProfileScope::Guest => return None,
     };
 
     let profile = state.profile_repo.get(&profile_id).await.ok().flatten()?;
-    let prefs = &profile.preferences;
-    Some(ProfileContext {
-        preferred_name: prefs.get("preferred_name").cloned(),
-        birthday: prefs.get("birthday").cloned(),
-        language: prefs.get("language").cloned(),
+    Some(particulars_for(attributed, &profile.preferences))
+}
+
+/// The pure half of [`profile_context_for`]: given a member's stored
+/// preferences and whether the turn is attributed to that ONE member, what may
+/// the prompt state?
+///
+/// Split out so the scoping rule can be tested exhaustively without an
+/// `AppState`, a database or a router. The rule is the whole point of the
+/// function and it was previously reachable only through all three, which is
+/// why it went unexamined until the writer was traced.
+///
+/// **The key names are the contract with the writer.** They are what
+/// `PATCH /api/v1/profiles/{id}` must store, and the desktop app holds the same
+/// fields in camelCase (`preferredName`, `atypicalSpeech`). A camelCase key
+/// reaching the database reads as a successful write and changes nothing here —
+/// which is the failure this whole change exists to fix, in a new disguise.
+fn particulars_for(
+    attributed: bool,
+    prefs: &std::collections::HashMap<String, String>,
+) -> ProfileContext {
+    ProfileContext {
+        // Owner-scoped: facts about one person, stated only when the turn is
+        // attributed to that person.
+        preferred_name: attributed
+            .then(|| prefs.get("preferred_name").cloned())
+            .flatten(),
+        birthday: attributed.then(|| prefs.get("birthday").cloned()).flatten(),
+        language: attributed.then(|| prefs.get("language").cloned()).flatten(),
+        // Household-safe: an accommodation, not a disclosure. See the doc on
+        // `profile_context_for`.
         atypical_speech: prefs
             .get("accessibility_atypical_speech")
             .map(|v| v == "true")
             .unwrap_or(false),
-    })
+    }
 }
 
 /// Map a session-storage failure from an identity write onto a status code.
@@ -15189,5 +15240,111 @@ mod tests {
              delegate call's latency is now the gap before the child's first \
              tool instead of the whole delegation"
         );
+    }
+
+    // ── Profile particulars are Owner-scoped ──────────────────────────────
+
+    /// The keys the reader expects, spelled exactly as the writer must store
+    /// them. Written out rather than referenced so a rename on either side
+    /// fails a test instead of silently reading nothing.
+    fn full_prefs() -> std::collections::HashMap<String, String> {
+        [
+            ("preferred_name", "Cap"),
+            ("birthday", "1990-04-02"),
+            ("language", "sw"),
+            ("accessibility_atypical_speech", "true"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    /// An attributed turn may state the member's own particulars.
+    #[test]
+    fn an_owner_scoped_turn_states_the_members_particulars() {
+        let ctx = particulars_for(true, &full_prefs());
+        assert_eq!(ctx.preferred_name.as_deref(), Some("Cap"));
+        assert_eq!(ctx.birthday.as_deref(), Some("1990-04-02"));
+        assert_eq!(ctx.language.as_deref(), Some("sw"));
+        assert!(ctx.atypical_speech);
+    }
+
+    /// An UNATTRIBUTED turn must not. `ProfileScope::Household` falls back to
+    /// `primary_profile_id`, so without this the pond announces the primary
+    /// member's name and birthday while somebody else is talking.
+    ///
+    /// This was inert until 2026-08-12 for a reason that makes it worse rather
+    /// than better: the desktop app saved these fields to browser
+    /// `localStorage` while the server read them from SQLite, so they were
+    /// always empty. Wiring the writer is exactly what would have made a
+    /// household turn start disclosing them.
+    #[test]
+    fn a_household_turn_states_no_ones_particulars() {
+        let ctx = particulars_for(false, &full_prefs());
+        assert_eq!(
+            ctx.preferred_name, None,
+            "an unattributed turn stated the primary member's preferred name"
+        );
+        assert_eq!(
+            ctx.birthday, None,
+            "an unattributed turn stated the primary member's birthday -- a fact about one \
+             person, asserted while the pond does not know who is speaking"
+        );
+        assert_eq!(
+            ctx.language, None,
+            "an unattributed turn adopted the primary member's language, which would answer \
+             everybody else in it too"
+        );
+    }
+
+    /// The one field that deliberately crosses into an unattributed turn.
+    ///
+    /// "Be patient, never correct speech patterns, interpret incomplete
+    /// sentences charitably" discloses nothing about anybody, and a household
+    /// that configured it wants it applied precisely when the pond cannot tell
+    /// who is speaking. Asserted separately from the test above so that
+    /// tightening the scope to nothing at all is a visible decision rather than
+    /// a side effect.
+    #[test]
+    fn the_speech_accommodation_survives_an_unattributed_turn() {
+        assert!(
+            particulars_for(false, &full_prefs()).atypical_speech,
+            "the speech accommodation was dropped for unattributed turns; it is not a \
+             disclosure and dropping it makes the pond less patient with the household it was \
+             configured for"
+        );
+    }
+
+    /// Absent keys are absent, not empty strings -- the prompt builder skips
+    /// `None` and would render "The user's birthday is ." for a `Some("")`.
+    #[test]
+    fn a_profile_with_no_preferences_yields_nothing_to_state() {
+        let ctx = particulars_for(true, &std::collections::HashMap::new());
+        assert_eq!(ctx.preferred_name, None);
+        assert_eq!(ctx.birthday, None);
+        assert_eq!(ctx.language, None);
+        assert!(!ctx.atypical_speech);
+    }
+
+    /// The camelCase trap, stated as a test.
+    ///
+    /// The desktop app holds these as `preferredName` / `atypicalSpeech`. If a
+    /// writer ever stores those spellings, `PATCH /profiles/{id}` returns 200,
+    /// the row looks populated, and the prompt still says nothing -- which is
+    /// indistinguishable from the bug this replaced.
+    #[test]
+    fn camel_case_keys_are_not_read_and_that_is_the_point() {
+        let camel: std::collections::HashMap<String, String> =
+            [("preferredName", "Cap"), ("atypicalSpeech", "true")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let ctx = particulars_for(true, &camel);
+        assert_eq!(
+            ctx.preferred_name, None,
+            "camelCase keys are now read, so the two spellings have silently become \
+             equivalent and the writer contract is no longer pinned by anything"
+        );
+        assert!(!ctx.atypical_speech);
     }
 }

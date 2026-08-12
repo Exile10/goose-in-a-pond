@@ -1158,6 +1158,47 @@ export class PondApiClient {
     return this.get("/api/v1/profiles");
   }
 
+  /** A member's stored preferences, in the server's own snake_case spelling. */
+  async getProfilePrefs(profileId: string): Promise<Record<string, string>> {
+    const p = await this.get<{ preferences?: Record<string, string> }>(
+      `/api/v1/profiles/${encodeURIComponent(profileId)}`,
+    );
+    return p.preferences ?? {};
+  }
+
+  createProfile(displayName: string, avatarEmoji?: string): Promise<{
+    id: string; display_name: string; avatar_emoji: string;
+    preferences: Record<string, string>;
+  }> {
+    return this.post("/api/v1/profiles", {
+      display_name: displayName,
+      ...(avatarEmoji ? { avatar_emoji: avatarEmoji } : {}),
+    });
+  }
+
+  /**
+   * Store a household member's preferences on the SERVER.
+   *
+   * The keys are a contract with the prompt builder, which reads
+   * `preferred_name`, `birthday`, `language` and
+   * `accessibility_atypical_speech` out of `profiles.preferences`
+   * (`routes.rs :: particulars_for`). They are snake_case there and camelCase
+   * in this app's own draft types, and a camelCase key sent here returns 200,
+   * populates the row, and reaches the model as nothing at all.
+   *
+   * That is not hypothetical: until 2026-08-12 the onboarding wizard collected
+   * a preferred name and birthday and wrote them to browser `localStorage`,
+   * while the server read them from SQLite. Every piece worked and the
+   * capability did not exist. `PROFILE_PREF_KEYS` is the single spelling of
+   * these names on this side.
+   */
+  updateProfilePrefs(
+    profileId: string,
+    preferences: Record<string, string>,
+  ): Promise<{ id: string; display_name: string; preferences: Record<string, string> }> {
+    return this.patch(`/api/v1/profiles/${encodeURIComponent(profileId)}`, { preferences });
+  }
+
   async registerFace(profileId: string, frame: Blob): Promise<{
     id: string; profile_id: string; model_dims: number; created_at: string;
   }> {
