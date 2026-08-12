@@ -4594,133 +4594,124 @@ struct SensorQueryParams {
     agg: Option<String>,
 }
 
+/// Upper bound on readings returned by one sensor history query, regardless of
+/// the requested `limit`, so a wide `since`/`until` window can't pull a whole
+/// retention period into memory.
+const SENSOR_HISTORY_MAX_LIMIT: usize = 1000;
+
+fn sensor_reading_json(r: &SensorReading) -> Value {
+    json!({
+        "device_id":   r.device_id,
+        "sensor_type": r.sensor_type,
+        "value":       r.value,
+        "unit":        r.unit,
+        "recorded_at": r.recorded_at.to_rfc3339(),
+    })
+}
+
 async fn get_recent_sensors(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<SensorQueryParams>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let agg = params.agg.as_deref().map(str::to_lowercase);
-
-    // When a sensor_type + time range is given, use the history query path.
-    if let Some(ref sensor_type) = params.sensor_type {
-        if agg.as_deref() == Some("current")
-            || (params.since.is_none() && params.until.is_none() && agg.is_none())
-        {
-            // Fall through to latest-value query below only when no time bounds.
-        } else {
-            let since = params.since.as_deref().and_then(parse_sensor_datetime);
-            let until = params.until.as_deref().and_then(parse_sensor_datetime);
-            let readings = state
-                .sensor_storage
-                .get_history(&device_id, sensor_type, since, until)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": e.to_string()})),
-                    )
-                })?;
-
-            return match agg.as_deref() {
-                Some("min") => {
-                    let val = readings
-                        .iter()
-                        .map(|r| r.value)
-                        .fold(f64::INFINITY, f64::min);
-                    Ok(Json(
-                        json!({ "device_id": device_id, "sensor_type": sensor_type, "min": val, "count": readings.len() }),
-                    ))
-                }
-                Some("max") => {
-                    let val = readings
-                        .iter()
-                        .map(|r| r.value)
-                        .fold(f64::NEG_INFINITY, f64::max);
-                    Ok(Json(
-                        json!({ "device_id": device_id, "sensor_type": sensor_type, "max": val, "count": readings.len() }),
-                    ))
-                }
-                Some("avg") => {
-                    let avg = if readings.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        let sum: f64 = readings.iter().map(|r| r.value).sum();
-                        serde_json::Value::from(sum / readings.len() as f64)
-                    };
-                    Ok(Json(
-                        json!({ "device_id": device_id, "sensor_type": sensor_type, "avg": avg, "count": readings.len() }),
-                    ))
-                }
-                _ => {
-                    let list: Vec<Value> = readings
-                        .iter()
-                        .map(|r| {
-                            json!({
-                                "device_id":   r.device_id,
-                                "sensor_type": r.sensor_type,
-                                "value":       r.value,
-                                "unit":        r.unit,
-                                "recorded_at": r.recorded_at.to_rfc3339(),
-                            })
-                        })
-                        .collect();
-                    Ok(Json(json!({ "readings": list })))
-                }
-            };
+    // Reject an unrecognised `agg` rather than quietly serving raw history
+    // under it, which would answer a question the caller did not ask.
+    if let Some(a) = agg.as_deref() {
+        if !matches!(a, "min" | "max" | "avg" | "current") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid `agg`: expected one of min, max, avg, current"
+                })),
+            ));
         }
     }
 
-    // Current-value query: latest reading per sensor_type (or all types).
-    if let Some(ref sensor_type) = params.sensor_type {
-        if agg.as_deref() == Some("current") || params.since.is_none() {
-            let reading = state
-                .sensor_storage
-                .get_latest(&device_id, sensor_type)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": e.to_string()})),
-                    )
-                })?;
-            return match reading {
-                Some(r) => Ok(Json(json!({
-                    "device_id":   r.device_id,
-                    "sensor_type": r.sensor_type,
-                    "value":       r.value,
-                    "unit":        r.unit,
-                    "recorded_at": r.recorded_at.to_rfc3339(),
-                }))),
-                None => Ok(Json(json!({ "readings": [] }))),
-            };
-        }
+    // Parsed before any branch runs: a malformed bound used to fall back to an
+    // unbounded query, so a typo silently widened the window to all of history
+    // and any aggregate was computed over the wrong range.
+    let since = parse_sensor_time_param("since", params.since.as_deref())?;
+    let until = parse_sensor_time_param("until", params.until.as_deref())?;
+
+    let storage_error = |e: anyhow::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    };
+
+    // Without a sensor type there is nothing to aggregate or bound: the only
+    // meaningful answer is the device's recent readings across all types.
+    let Some(sensor_type) = params.sensor_type.as_deref() else {
+        let limit = params.limit.unwrap_or(20).min(100);
+        let readings = state
+            .sensor_storage
+            .get_recent(&device_id, limit)
+            .await
+            .map_err(storage_error)?;
+        let list: Vec<Value> = readings.iter().map(sensor_reading_json).collect();
+        return Ok(Json(json!({ "readings": list })));
+    };
+
+    // Current value: explicitly asked for, or implied by a bare sensor_type.
+    if agg.as_deref() == Some("current") || (agg.is_none() && since.is_none() && until.is_none()) {
+        let reading = state
+            .sensor_storage
+            .get_latest(&device_id, sensor_type)
+            .await
+            .map_err(storage_error)?;
+        return Ok(Json(match reading {
+            Some(r) => sensor_reading_json(&r),
+            None => json!({ "readings": [] }),
+        }));
     }
 
-    // Default: recent readings (all types) with a limit.
-    let limit = params.limit.unwrap_or(20).min(100);
-    let readings = state
+    // min/max/avg: computed by the store, so a wide window never materialises
+    // its rows here.
+    if let Some(a) = agg.as_deref() {
+        let summary = state
+            .sensor_storage
+            .aggregate(&device_id, sensor_type, since, until)
+            .await
+            .map_err(storage_error)?;
+        // The aggregate's name is itself the response key, so the body is built
+        // rather than written out. `null` for an empty window is now the typed
+        // answer instead of a serialized infinity.
+        let value = match a {
+            "min" => summary.min,
+            "max" => summary.max,
+            _ => summary.avg,
+        };
+        let mut body = serde_json::Map::new();
+        body.insert("device_id".into(), json!(device_id));
+        body.insert("sensor_type".into(), json!(sensor_type));
+        body.insert(a.into(), json!(value));
+        body.insert("count".into(), json!(summary.count));
+        body.insert("unit".into(), json!(summary.unit));
+        return Ok(Json(Value::Object(body)));
+    }
+
+    // Raw history over the requested window.
+    let limit = params
+        .limit
+        .unwrap_or(SENSOR_HISTORY_MAX_LIMIT)
+        .min(SENSOR_HISTORY_MAX_LIMIT);
+    // Ask for one more than we will return: a window holding exactly `limit`
+    // rows is complete, and reporting it as truncated would be its own wrong
+    // answer.
+    let mut readings = state
         .sensor_storage
-        .get_recent(&device_id, limit)
+        .get_history_limited(&device_id, sensor_type, since, until, limit + 1)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
-    let list: Vec<Value> = readings
-        .iter()
-        .map(|r| {
-            json!({
-                "device_id":   r.device_id,
-                "sensor_type": r.sensor_type,
-                "value":       r.value,
-                "unit":        r.unit,
-                "recorded_at": r.recorded_at.to_rfc3339(),
-            })
-        })
-        .collect();
-    Ok(Json(json!({ "readings": list })))
+        .map_err(storage_error)?;
+    let truncated = readings.len() > limit;
+    readings.truncate(limit);
+    let list: Vec<Value> = readings.iter().map(sensor_reading_json).collect();
+    // Flag a truncated series rather than letting it read as the whole window.
+    Ok(Json(
+        json!({ "readings": list, "count": readings.len(), "truncated": truncated }),
+    ))
 }
 
 fn parse_sensor_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -4729,6 +4720,28 @@ fn parse_sensor_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
             .ok()
             .map(|ndt| ndt.and_utc())
     })
+}
+
+/// Parse an optional sensor time-range param, erroring on malformed input.
+///
+/// Keeps [`parse_sensor_datetime`]'s grammar — RFC3339 or a bare
+/// `YYYY-MM-DDTHH:MM:SS` — rather than the stricter [`parse_rfc3339_param`], so
+/// requests that work today do not start failing.
+fn parse_sensor_time_param(
+    field: &str,
+    raw: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, (StatusCode, Json<Value>)> {
+    match raw {
+        None => Ok(None),
+        Some(s) => parse_sensor_datetime(s).map(Some).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({ "error": format!("invalid `{field}`: expected an RFC3339 timestamp") }),
+                ),
+            )
+        }),
+    }
 }
 
 // ── Activity query API (#114) ──────────────────────────────────────────────────
