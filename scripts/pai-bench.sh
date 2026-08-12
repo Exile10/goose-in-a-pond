@@ -107,30 +107,42 @@ fi
 # failed with `unknown model architecture: 'gemma4_mtp'`, and the run reported
 # two unrelated-looking failures and five skips. A benchmark that picks its own
 # subject will eventually pick one nobody runs.
+MODEL_SOURCE=""
+if [ -n "$MODEL" ]; then
+  MODEL_SOURCE="--model"
+fi
 if [ -z "$MODEL" ]; then
   REAL_DB="$(dirname "$REAL_MODELS")/pond_system.db"
-  if [ -f "$REAL_DB" ]; then
-    MODEL="$(sqlite3 "$REAL_DB" "SELECT value FROM settings WHERE key='chat_model';" 2>/dev/null)"
+  if [ -f "$REAL_DB" ] && command -v sqlite3 >/dev/null 2>&1; then
+    MODEL="$(sqlite3 "$REAL_DB" "SELECT value FROM settings WHERE key='chat_model';" 2>/dev/null | head -1 | tr -d ' \r\n')"
+    [ -n "$MODEL" ] && MODEL_SOURCE="this pond's chat_model setting"
   fi
 fi
 # Fall back to a quantised chat model. Q4_K_M and Q5/Q8 are what ships; F16 and
 # anything with an exotic architecture are research artefacts that happen to
 # sort first.
 if [ -z "$MODEL" ]; then
+  # LC_ALL=C so the sort is byte order rather than locale collation. Without it
+  # the "first" file differs between machines and even between shells, which is
+  # how two runs on one laptop benchmarked two different models an hour apart.
   MODEL="$(ls "$REAL_MODELS/gguf" 2>/dev/null \
     | grep -iE '\.gguf$' \
     | grep -iE 'Q[45689]_' \
-    | grep -viE 'mmproj|asr|embed|nemotron|whisper|mtp|draft' \
+    | grep -viE 'mmproj|asr|embed|nemotron|whisper|mtp|draft|assistant' \
     | sed 's/\.gguf$//' \
-    | sort \
+    | LC_ALL=C sort \
     | head -1)"
+  [ -n "$MODEL" ] && MODEL_SOURCE="fallback scan of $REAL_MODELS/gguf"
 fi
+
+# A benchmark that cannot say WHY it is measuring this model is one whose
+# numbers cannot be compared with last week's. Two runs on this laptop picked
+# different models an hour apart and nothing in the output said so.
 if [ -z "$MODEL" ]; then
   echo "FATAL: could not pick a model from $REAL_MODELS/gguf" >&2
   ls "$REAL_MODELS/gguf" >&2
   exit 1
 fi
-
 # ── Server lifecycle ─────────────────────────────────────────────────────────
 #
 # Lifted wholesale from live-test.sh, including the reasons. Never assume a
@@ -192,7 +204,7 @@ fi
 say "Starting a scratch pond with real weights"
 mkdir -p "$DATA_DIR"
 ln -s "$REAL_MODELS" "$DATA_DIR/models"
-echo "model:     $MODEL"
+echo "model:     $MODEL   (chosen by: ${MODEL_SOURCE:-unknown})"
 echo "data dir:  $DATA_DIR"
 
 # giap::trace at info carries the per-turn metrics; the adapter at debug carries
@@ -214,6 +226,50 @@ PORT_RESOLVED="$(tr -d ' \n' < "$DATA_DIR/.runtime_api_port")"
 wait_for_health "$PORT_RESOLVED" "bench server" || { tail -40 "$DATA_DIR/server.out" >&2; exit 1; }
 assert_port_owned_by "$PORT_RESOLVED" "$SERVER_PID" "bench server" || exit 1
 echo "port:      $PORT_RESOLVED (published by the server, not assumed)"
+
+# ── Arm the startup-wired capabilities, then restart ─────────────────────────
+#
+# Two capabilities are decided ONCE at boot and cannot be armed by a running
+# process, which cost this script two false SKIPs before anyone noticed:
+#
+#   giap-orchestrator  `register_giap_extensions` reads `ext_orchestrator_enabled`
+#                      at agent-build time. It ships OFF, so the extension is
+#                      never registered and `delegate` does not exist in the
+#                      model's tool set. A runtime PUT changes nothing.
+#   weather            `get_weather` gates on `state.weather_provider`, which
+#                      main.rs wires at startup from settings, and answers
+#                      `{"enabled":false}` otherwise -- indistinguishable from
+#                      the feature being off.
+#
+# So: boot once to create the database, write the settings, and boot again. The
+# model loads lazily on the first turn, so the second boot costs seconds rather
+# than a reload. Anything that CAN be set at runtime is left to the probes.
+say "Arming the startup-wired capabilities (orchestrator, weather) and restarting"
+curl -sf -X PUT "http://127.0.0.1:$PORT_RESOLVED/api/v1/settings" \
+  -H 'Content-Type: application/json' \
+  -d '{"ext_orchestrator_enabled":true,"weather_enabled":true,
+       "weather_latitude":-0.0917,"weather_longitude":34.7680,
+       "weather_location_name":"Kisumu"}' -o /dev/null \
+  || echo "  (settings PUT failed -- PAI-6 and PAI-2 will report SKIP and say why)"
+
+kill -9 "$SERVER_PID" 2>/dev/null
+wait "$SERVER_PID" 2>/dev/null
+rm -f "$DATA_DIR/.runtime_api_port"
+
+POND_DATA_DIR="$DATA_DIR" POND_DEV_ALLOW_LOOPBACK=1 \
+RUST_LOG="warn,giap::trace=info,pond_server=info,pond_adapters_goose=debug,goose_local_inference=debug,llama_cpp_2=info" \
+  "$BIN" serve --port "$START_PORT" >> "$DATA_DIR/server.out" 2>&1 < /dev/zero &
+SERVER_PID=$!
+
+wait_for_port_file "$DATA_DIR" "bench server (armed)" "$DATA_DIR/server.out" || exit 1
+PORT_RESOLVED="$(tr -d ' \n' < "$DATA_DIR/.runtime_api_port")"
+wait_for_health "$PORT_RESOLVED" "bench server (armed)" || { tail -40 "$DATA_DIR/server.out" >&2; exit 1; }
+assert_port_owned_by "$PORT_RESOLVED" "$SERVER_PID" "bench server (armed)" || exit 1
+if grep -q "giap-orchestrator" "$DATA_DIR/server.out"; then
+  echo "armed:     giap-orchestrator registered"
+else
+  echo "armed:     giap-orchestrator NOT registered -- PAI-6 will say so"
+fi
 
 # ── Probe ────────────────────────────────────────────────────────────────────
 say "Driving the eight capabilities"
