@@ -1,12 +1,30 @@
 import { useState, useEffect } from "react";
-import { Button, Separator } from "@heroui/react";
+import { Button, Separator, Switch } from "@heroui/react";
 import {
   Monitor, Cpu, Activity, Power, Settings, Plus, X, Radio, Smartphone,
-  Lightbulb, Lock, Thermometer, Fan, Blinds,
+  Lightbulb, Lock, Thermometer, Fan, Blinds, RefreshCw,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import type { Device } from "../api/types";
+import { ApiError, type Device, type MatterStatus } from "../api/types";
 import { refreshHomeData } from "../hub/state/hubDataStore";
+
+/** The server's own message, without the `ApiError:` prefix `String(e)` adds.
+ *  Users were being shown the exception class name alongside the advice. */
+function errorText(e: unknown): string {
+  return e instanceof ApiError ? e.message : String(e);
+}
+
+/** How the Matter section reads in each state. Kept as data so the chip, the
+ *  hint, and the commission gate cannot drift apart. */
+const MATTER_STATE_LABEL: Record<MatterStatus["state"], string> = {
+  disabled:    "Off",
+  connecting:  "Starting…",
+  connected:   "Connected",
+  unreachable: "Cannot reach controller",
+};
+
+/** How often to re-check while the controller is starting up. */
+const MATTER_POLL_MS = 2000;
 
 const DEVICE_TYPES = [
   { value: "host",          label: "Host / PC" },
@@ -65,6 +83,12 @@ export function Devices() {
   const [submitting, setSubmitting]   = useState(false);
   const [formError, setFormError]     = useState<string | null>(null);
 
+  // Matter section state
+  const [matter, setMatter]           = useState<MatterStatus | null>(null);
+  const [matterUrl, setMatterUrl]     = useState("");
+  const [matterBusy, setMatterBusy]   = useState(false);
+  const [matterError, setMatterError] = useState<string | null>(null);
+
   // Per-card action state
   const [busyId, setBusyId]           = useState<string | null>(null);
   const [detail, setDetail]           = useState<Device | null>(null);
@@ -80,11 +104,50 @@ export function Devices() {
     setLoading(true);
     api.listDevices()
       .then(setDevices)
-      .catch((e) => setError(String(e)))
+      .catch((e) => setError(errorText(e)))
       .finally(() => setLoading(false));
   }
 
-  useEffect(() => { load(); }, []);
+  /** Read the Matter runtime's actual state. The URL field follows it unless
+   *  the user is mid-edit, so a reload never clobbers what they are typing. */
+  function loadMatter(adoptUrl = false) {
+    return api.getMatterStatus()
+      .then((s) => {
+        setMatter(s);
+        if (adoptUrl) setMatterUrl(s.url);
+        return s;
+      })
+      .catch((e) => { setMatterError(errorText(e)); return null; });
+  }
+
+  useEffect(() => { load(); void loadMatter(true); }, []);
+
+  // Enabling installs and starts a controller, which the settings save does not
+  // wait for — so the panel watches it come up rather than claiming it is done.
+  useEffect(() => {
+    if (matter?.state !== "connecting") return;
+    const timer = setInterval(() => { void loadMatter(); }, MATTER_POLL_MS);
+    return () => clearInterval(timer);
+  }, [matter?.state]);
+
+  /** Save the Matter settings and start watching the runtime converge. Also the
+   *  retry path: re-sending an unchanged state reconnects a failed controller. */
+  async function saveMatter(enabled: boolean, url: string) {
+    setMatterBusy(true);
+    setMatterError(null);
+    try {
+      await api.updateSettings({ matter_enabled: enabled, matter_ws_url: url.trim() });
+      // Optimistic, so the chip moves the moment the toggle does; the poll
+      // above replaces this with whatever actually happened.
+      setMatter({ enabled, url: url.trim(), state: enabled ? "connecting" : "disabled" });
+      await loadMatter();
+    } catch (e) {
+      setMatterError(errorText(e));
+      void loadMatter();
+    } finally {
+      setMatterBusy(false);
+    }
+  }
 
   function openForm() {
     setName(""); setDeviceType("host"); setHostname(""); setRoom(""); setSetupCode(""); setMode("matter");
@@ -105,7 +168,7 @@ export function Devices() {
       closeForm();
       load();
     } catch (e) {
-      setFormError(String(e));
+      setFormError(errorText(e));
     } finally {
       setSubmitting(false);
     }
@@ -127,7 +190,7 @@ export function Devices() {
       load();
       void refreshHomeData();
     } catch (e) {
-      setFormError(String(e));
+      setFormError(errorText(e));
     } finally {
       setSubmitting(false);
     }
@@ -150,7 +213,7 @@ export function Devices() {
       load();
       void refreshHomeData();
     } catch (e) {
-      setError(String(e));
+      setError(errorText(e));
     } finally {
       setBusyId(null);
     }
@@ -179,7 +242,7 @@ export function Devices() {
       load();
       void refreshHomeData();
     } catch (e) {
-      setEditError(String(e));
+      setEditError(errorText(e));
     } finally {
       setEditSubmitting(false);
     }
@@ -193,7 +256,7 @@ export function Devices() {
       load();
       void refreshHomeData();
     } catch (e) {
-      setError(String(e));
+      setError(errorText(e));
     } finally {
       setBusyId(null);
     }
@@ -213,6 +276,67 @@ export function Devices() {
           </Button>
         </div>
       </div>
+
+      {/* ── Matter ────────────────────────────────────────────
+          Matter is off by default and needs a controller, so this is where it
+          gets switched on. It reports what the runtime is actually doing, not
+          just what was saved: enabling starts a controller, and "on but
+          unreachable" is a different problem from "off". */}
+      <section className="matter-panel">
+        <div className="matter-panel__head">
+          <Radio size={15} />
+          <h2 className="matter-panel__title">Matter</h2>
+          <span
+            className={`matter-panel__chip matter-panel__chip--${matter?.state ?? "disabled"}`}
+            data-testid="matter-state"
+          >
+            {MATTER_STATE_LABEL[matter?.state ?? "disabled"]}
+          </span>
+          <span className="matter-panel__spacer" />
+          <Switch
+            aria-label="Enable Matter"
+            isSelected={matter?.enabled ?? false}
+            isDisabled={matterBusy}
+            onChange={(v) => void saveMatter(v, matterUrl)}
+          >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
+        </div>
+
+        <p className="matter-panel__hint">
+          Commissions lights, locks, and sensors onto your local fabric. The
+          first time this is switched on, GIAP downloads and starts a Matter
+          controller — that can take a couple of minutes.
+        </p>
+
+        <div className="matter-panel__row">
+          <label className="matter-panel__label" htmlFor="matter-url">Controller address</label>
+          <input
+            id="matter-url"
+            className="native-input native-input--flex"
+            value={matterUrl}
+            disabled={!(matter?.enabled ?? false) || matterBusy}
+            placeholder="ws://127.0.0.1:5580/ws"
+            onChange={(e) => setMatterUrl(e.target.value)}
+            onBlur={() => {
+              // Only a real edit is worth a reconnect.
+              if (matter?.enabled && matterUrl.trim() !== matter.url) {
+                void saveMatter(true, matterUrl);
+              }
+            }}
+          />
+          {matter?.state === "unreachable" && (
+            <Button size="sm" variant="outline" isDisabled={matterBusy} onPress={() => void saveMatter(true, matterUrl)}>
+              <RefreshCw size={13} /> Retry
+            </Button>
+          )}
+        </div>
+
+        {matter?.state === "unreachable" && matter.error && (
+          <p className="text-error text-error--sm">{matter.error}</p>
+        )}
+        {matterError && <p className="text-error text-error--sm">{matterError}</p>}
+      </section>
 
       {loading && <p className="muted-12">Loading devices…</p>}
       {error   && <p className="muted-12 text-error">{error}</p>}
@@ -349,6 +473,18 @@ export function Devices() {
                       own name is used.
                     </p>
                   </div>
+
+                  {/* Commissioning needs a live controller. Say so here rather
+                      than letting the user fill the form in and fail on submit. */}
+                  {matter?.state !== "connected" && (
+                    <p className="sched-modal__cron-hint" data-testid="matter-not-ready">
+                      {matter?.state === "connecting"
+                        ? "Matter is still starting up. This will be ready in a moment."
+                        : matter?.state === "unreachable"
+                          ? "The Matter controller cannot be reached. Fix it in the Matter section of this tab."
+                          : "Matter is off. Turn it on in the Matter section of this tab first."}
+                    </p>
+                  )}
                 </>
               ) : (
                 <>
@@ -411,7 +547,7 @@ export function Devices() {
                 <Button
                   size="sm"
                   variant="primary"
-                  isDisabled={submitting || !setupCode.trim()}
+                  isDisabled={submitting || !setupCode.trim() || matter?.state !== "connected"}
                   onPress={handleCommission}
                 >
                   {/* Commissioning is slow — say so rather than looking hung. */}

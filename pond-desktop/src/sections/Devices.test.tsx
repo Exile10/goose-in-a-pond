@@ -15,6 +15,8 @@ vi.mock("../api/PondApiClient", () => ({
     markDeviceOnline: vi.fn(),
     markDeviceOffline: vi.fn(),
     updateDevice: vi.fn(),
+    getMatterStatus: vi.fn(),
+    updateSettings: vi.fn(),
   },
 }));
 
@@ -35,8 +37,17 @@ const matterLock: Device = {
   is_online: true,
 };
 
+const mocked = (fn: unknown) => fn as ReturnType<typeof vi.fn>;
+
 beforeEach(() => {
   vi.clearAllMocks();
+  // The Matter panel loads alongside the device list on every render.
+  mocked(api.getMatterStatus).mockResolvedValue({
+    enabled: true,
+    url: "ws://127.0.0.1:5580/ws",
+    state: "connected",
+  });
+  mocked(api.updateSettings).mockResolvedValue({});
 });
 afterEach(() => cleanup());
 

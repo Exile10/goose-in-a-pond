@@ -314,6 +314,7 @@ See the [TDD Guide](./docs/testing/tdd_guide.md) for the full testing philosophy
 | [Data Flow](./docs/architecture/data_flow.md) | How a request travels through the system |
 | [Visual Workflow](./docs/architecture/visual_workflow.md) | Flowcharts and sequence diagrams |
 | [Ports & Adapters Guide](./docs/creating-ports-and-adapters.md) | How to add new capabilities |
+| [Matter](./docs/matter.md) | Controller lifecycle, commissioning, and troubleshooting |
 | [TDD Guide](./docs/testing/tdd_guide.md) | Test-driven development practices |
 | [Contributing](./docs/CONTRIBUTING.md) | Contribution workflow |
 

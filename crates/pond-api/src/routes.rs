@@ -161,6 +161,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/usage/summary", get(usage_summary))
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/commission", post(commission_device))
+        .route("/matter/status", get(matter_status))
         .route(
             "/devices/{id}",
             axum::routing::delete(unregister_device).put(update_device),
@@ -3259,6 +3260,80 @@ async fn register_device(
     ))
 }
 
+/// `GET /api/v1/matter/status` — what the Matter integration is actually doing.
+///
+/// The Devices tab polls this after toggling Matter: enabling installs and
+/// starts a controller, which takes long enough that the UI has to show
+/// progress rather than pretend the save was the whole story.
+async fn matter_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let status = match &state.matter {
+        Some(matter) => matter.status().await,
+        // No Matter support wired at all. Reported as plain "off" — from the
+        // user's side there is nothing to distinguish, and nothing to fix.
+        None => pond_core::user_data::ports::matter_runtime::MatterStatus::disabled(),
+    };
+    Json(serde_json::to_value(status).unwrap_or_else(|_| json!({})))
+}
+
+/// The live commissioner, or the error explaining why there isn't one.
+///
+/// "Off" and "on but the controller is unreachable" used to collapse into a
+/// single "Matter is not enabled" 503, which sent users to look for a switch
+/// that was already on. They are kept apart here so the message names the thing
+/// that is actually wrong.
+async fn matter_commissioner(
+    state: &Arc<AppState>,
+) -> Result<
+    Arc<dyn pond_core::user_data::ports::device_commissioning::DeviceCommissioningPort>,
+    (StatusCode, Json<Value>),
+> {
+    use pond_core::user_data::ports::matter_runtime::{MatterState, MatterStatus};
+
+    let status = match &state.matter {
+        Some(matter) => {
+            if let Some(commissioner) = matter.commissioner().await {
+                return Ok(commissioner);
+            }
+            matter.status().await
+        }
+        None => MatterStatus::disabled(),
+    };
+
+    Err(match status.state {
+        MatterState::Disabled => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "Matter is off on this Pond. Turn it on in the Matter section \
+                          of the Devices tab, then try again."
+            })),
+        ),
+        MatterState::Connecting => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "Matter is still starting up — the controller is not ready yet. \
+                          Try again in a moment."
+            })),
+        ),
+        MatterState::Unreachable { error } => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": format!(
+                    "Matter is on, but the controller at {} could not be reached: {error}",
+                    status.url
+                )
+            })),
+        ),
+        // Connected without a commissioner means the runtime was torn down
+        // between the two reads. Transient by nature, so it reads as such.
+        MatterState::Connected => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "The Matter controller connection just dropped. Try again in a moment."
+            })),
+        ),
+    })
+}
+
 /// `POST /api/v1/devices/commission` — bring a Matter device onto the fabric.
 ///
 /// Distinct from `register_device` on purpose: a Matter device is not GIAP's to
@@ -3282,14 +3357,7 @@ async fn commission_device(
         )
     })?;
 
-    let Some(commissioner) = state.commissioner.clone() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": "Matter is not enabled on this Pond — turn it on in Settings first."
-            })),
-        ));
-    };
+    let commissioner = matter_commissioner(&state).await?;
 
     let raw = req.get("code").and_then(Value::as_str).unwrap_or_default();
     // Validated before it reaches the controller.
@@ -3368,15 +3436,7 @@ async fn unregister_device(
     // If we cannot reach the controller to do so, the delete is refused rather
     // than half-applied.
     if let Some(node_id) = pond_core::user_data::ports::device_commissioning::matter_node_id(&id) {
-        let Some(commissioner) = state.commissioner.clone() else {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "error": "Matter is off, so this device cannot be removed from the fabric. \
-                              Enable Matter and try again."
-                })),
-            ));
-        };
+        let commissioner = matter_commissioner(&state).await?;
         commissioner.decommission(node_id).await.map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
@@ -3902,6 +3962,31 @@ async fn update_settings(
         )
     })?;
 
+    // The controller URL is operator-supplied and gets opened as a socket, so
+    // its shape is checked here rather than at connect time — a typo should be
+    // a rejected save, not a Matter section stuck reporting "unreachable".
+    //
+    // Only when the caller actually edited Matter: this endpoint takes a patch
+    // over the whole of Settings, so validating unconditionally would let a bad
+    // stored value block every unrelated save (renaming the home, changing a
+    // model) until someone fixed a field they were not touching.
+    let touches_matter = patch
+        .as_object()
+        .is_some_and(|o| o.contains_key("matter_enabled") || o.contains_key("matter_ws_url"));
+    let matter_url = merged.matter_ws_url.trim();
+    if touches_matter
+        && merged.matter_enabled
+        && !(matter_url.starts_with("ws://") || matter_url.starts_with("wss://"))
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "The Matter controller address must be a WebSocket URL, \
+                          for example ws://127.0.0.1:5580/ws"
+            })),
+        ));
+    }
+
     // Geocode-on-save: turn the location name into coordinates so the Settings
     // page shows real lat/lon and the weather gate is satisfied without the user
     // hand-entering coordinates. Onboarding saves through this same endpoint, so
@@ -3983,6 +4068,31 @@ async fn update_settings(
     pond_core::shared::services::egress::set_network_mode(
         pond_core::shared::services::egress::NetworkMode::parse(&merged.network_mode),
     );
+
+    // Same for Matter: the toggle used to be read once at startup, so turning
+    // it on changed nothing until someone restarted the Pond — which made the
+    // "enable Matter first" error impossible to act on.
+    //
+    // Only when the caller actually edited Matter, unlike the egress gate
+    // above. That gate is a cheap idempotent write; this one can restart a
+    // controller. The reconciler treats "enabled but not yet Connected" as
+    // needing a restart, so an unconditional send meant that ANY unrelated
+    // save during the first controller install — renaming the home, changing a
+    // model — tore down a multi-minute `pip install` and started it again.
+    // Repeat that a few times and the Devices panel sits on "Starting..."
+    // forever.
+    //
+    // Retry from the Devices tab still works: `saveMatter` sends
+    // `matter_enabled` and `matter_ws_url` explicitly, so it is a
+    // `touches_matter` save by construction.
+    if touches_matter {
+        if let Some(matter) = &state.matter {
+            matter.apply(
+                merged.matter_enabled,
+                merged.matter_ws_url.trim().to_string(),
+            );
+        }
+    }
 
     // Hot-reload the ModelRouter whenever any provider/model field changes.
     let provider_keys = [
