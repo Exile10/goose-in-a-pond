@@ -3380,10 +3380,14 @@ async fn commission_device(
     let device = commissioner
         .commission(code, name.clone())
         .await
+        // `{e:#}`, not `to_string()`: the latter prints only the outermost
+        // context, so every failure reached the user as a bare "commissioning
+        // failed" while the reason it was wrapped around — the controller's own
+        // error — was dropped on the floor.
         .map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": e.to_string()})),
+                Json(json!({"error": format!("{e:#}")})),
             )
         })?;
 
