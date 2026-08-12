@@ -21,7 +21,6 @@ mod asset_root;
 mod composite_model_catalog_provider;
 mod filesystem_model_storage;
 mod http_model_downloader;
-mod inference_pool;
 mod llamafile_process;
 mod llm_memory_consolidator;
 mod llm_memory_extractor;
@@ -61,6 +60,7 @@ use pond_core::shared::services::in_process_event_bus::InProcessEventBus;
 use pond_core::shared::services::print_output::{PrintOutput, SilentOutput};
 use pond_core::shared::services::stdin_input::StdinInput;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
+use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::ports::session_storage::SessionStorage;
 use pond_core::user_data::ports::settings::SettingsRepository as _;
 use pond_core::user_data::services::onboarding::OnboardingService;
@@ -429,9 +429,69 @@ fn main() -> Result<()> {
     runtime.block_on(async_main())
 }
 
+/// Keep Goose's own on-disk state inside the pond's data directory.
+///
+/// Goose resolves every directory it owns through `Paths::get_dir`, which honours
+/// an absolute `GOOSE_PATH_ROOT` and otherwise falls back to the platform's app
+/// dir for "Block/goose". Nothing in GIAP was setting it, so the engine's
+/// `sessions.db` lived outside `POND_DATA_DIR` entirely, with three consequences:
+///
+///  1. `scripts/live-test.sh` promises a scratch run "can never touch a real
+///     pond". That was true of both pond databases and false of engine state.
+///  2. Two pond-server instances on one machine shared a single session store
+///     and a single `YYYYMMDD_N` id namespace.
+///  3. On a machine that also runs Goose CLI or Desktop, `GooseAdapter::new`
+///     adopts `list_sessions().first()` — ordered by `sort_timestamp DESC`, i.e.
+///     the user's most recent unrelated conversation — repoints its working_dir
+///     at pond-server's cwd and loads 15 `giap-*` extensions onto it.
+///
+/// Must run before anything touches `SESSION_STORAGE`, which is a `LazyLock` over
+/// `Paths::data_dir()` and therefore latches the first answer it gets. Being the
+/// first statement of `async_main` is what guarantees that.
+///
+/// Upgrading an existing pond does not lose history: `pond_system.db` is
+/// authoritative, `resolve_goose_session` re-validates a stored pairing against
+/// the engine store and finds nothing, and `hydrate_goose_session` replays the
+/// conversation from pond history into a fresh engine session.
+fn pin_goose_state_under(data_dir: &std::path::Path) {
+    // `validated_path_root` silently ignores a relative path, which would put us
+    // back on the platform default without saying so.
+    let root = match std::fs::canonicalize(data_dir) {
+        Ok(abs) => abs,
+        Err(_) => {
+            // The directory may not exist on a first run; absolute is all Goose
+            // requires, so fall back to making the configured path absolute.
+            if data_dir.is_absolute() {
+                data_dir.to_path_buf()
+            } else {
+                match std::env::current_dir() {
+                    Ok(cwd) => cwd.join(data_dir),
+                    Err(e) => {
+                        tracing::warn!(
+                            "could not make {} absolute ({e}); goose state stays in its own app dir",
+                            data_dir.display()
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+    };
+    let engine_root = root.join("engine");
+    if let Err(e) = std::fs::create_dir_all(&engine_root) {
+        tracing::warn!(
+            "could not create {} ({e}); goose state stays in its own app dir",
+            engine_root.display()
+        );
+        return;
+    }
+    std::env::set_var("GOOSE_PATH_ROOT", &engine_root);
+}
+
 async fn async_main() -> Result<()> {
     let cli = Cli::parse();
     let data_dir = default_data_dir();
+    pin_goose_state_under(&data_dir);
 
     match cli.command {
         Some(Commands::Setup { model }) => run_setup(&model).await,
@@ -547,6 +607,27 @@ async fn run_setup(model: &str) -> Result<()> {
     println!("\n  [2/8] Initializing databases...");
     let db_setup = Database::init(&data_dir).await?;
     println!("  ✅ Databases ready");
+
+    // PAI-2 P6a: `pond setup` is almost entirely downloads — whisper, piper,
+    // the chat model, the ONNX runtime — and it ran with the egress gate at its
+    // `Open` default because `set_network_mode` was only ever called by
+    // `run_server`. Installed here, before the first fetch in step 3, so a
+    // household that stored `offline` gets refusals it can act on instead of
+    // a setup command that quietly ignores the setting.
+    //
+    // This runs after the DB init because the setting lives in it; on a first
+    // run there are no rows and `Settings::default()` gives `open`, which is
+    // the same answer as before and the right one — nobody has asked for
+    // anything narrower yet.
+    pond_core::shared::services::egress::set_network_mode(
+        pond_core::shared::services::egress::NetworkMode::parse(
+            &SqliteSettingsRepository::new(db_setup.system.clone())
+                .get()
+                .await
+                .unwrap_or_default()
+                .network_mode,
+        ),
+    );
 
     // One-shot HF cache migration — moves pre-existing flat model files into
     // the content-addressed blob layout so subsequent downloads dedupe. Errors
@@ -928,11 +1009,10 @@ async fn run_server(
     );
     println!("  ╚═══════════════════════════════════════╝");
 
-    // Ensure the ONNX Runtime shared library is available — check system
-    // paths first, then auto-download from GitHub Releases if needed.
-    // Must run before any ONNX-dependent init (face recognition, embeddings).
-    ensure_onnx_runtime();
-
+    // NOTE: `ensure_onnx_runtime()` used to be called here. It moved below the
+    // `set_network_mode` install, because it can DOWNLOAD, and a download
+    // cannot be gated by a setting that has not been read yet. See PAI-2 P6a.
+    //
     // Bake in the face-recognition runtime defaults so the server Just Works
     // on a fresh install without the operator having to remember a four-line
     // env-var incantation.  Every var stays overridable — we only set it
@@ -971,6 +1051,26 @@ async fn run_server(
     // ── Load settings early (drives model selection) ─────────────────────────
     let settings_repo_early = SqliteSettingsRepository::new(db.system.clone());
     let settings = settings_repo_early.get().await.unwrap_or_default();
+
+    // PAI-2 P5: the egress gate reads a process-global, so it must be installed
+    // before any adapter exists to make an outbound call. `PUT /settings`
+    // re-installs it, so a change takes effect without a restart.
+    pond_core::shared::services::egress::set_network_mode(
+        pond_core::shared::services::egress::NetworkMode::parse(&settings.network_mode),
+    );
+
+    // Ensure the ONNX Runtime shared library is available — check system
+    // paths first, then auto-download from GitHub Releases if needed.
+    // Must run before any ONNX-dependent init (face recognition, embeddings);
+    // those all happen further down, so nothing between here and the old site
+    // (`apply_face_recognition_defaults` sets env vars, `Database::init`, the
+    // HF-cache migration, the system-dep warning) touches ONNX.
+    //
+    // It must run AFTER `set_network_mode`, not before: it downloads ~100 MB
+    // from github.com, and at the old site the process-global was still at its
+    // `Open` default, so a stored `network_mode = "offline"` did not apply to
+    // the single largest outbound transfer `serve` makes. PAI-2 P6a.
+    ensure_onnx_runtime();
 
     // Override agent_backend from DB settings (UI can change it without CLI restart).
     // CLI flag takes precedence only when explicitly set to something other than "goose".
@@ -1318,9 +1418,21 @@ async fn run_server(
     let device_registry: Arc<
         dyn pond_core::user_data::ports::device_registry::DeviceRegistry + Send + Sync,
     > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
+    // PAI-2 P3: the deterministic redactor. Rule-based, no model in the loop.
+    // Built here so it is in scope for both chokepoints below.
+    let redactor: Arc<dyn pond_core::security::ports::redactor::Redactor> =
+        Arc::new(pond_infra::rule_redactor::RuleRedactor::new());
+    // Chokepoint 1: every memory write, whatever wrote it. Wrapping the one
+    // construction covers extraction, the giap-memory MCP tool, POST /memories
+    // and consolidation -- and a writer nobody has added yet.
     let memory_repo: Arc<
         dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync,
-    > = Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+    > = Arc::new(
+        pond_core::user_data::services::redacting_memory_repository::RedactingMemoryRepository::new(
+            Arc::new(SqliteMemoryRepository::new(db.system.clone())),
+            redactor.clone(),
+        ),
+    );
     let draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync> =
         Arc::new(SqliteDraftRepository::new(db.system.clone()));
     let sensor_storage: Arc<
@@ -1494,22 +1606,14 @@ async fn run_server(
         chat_provider_arc.clone() as Arc<dyn LlmProvider>
     )));
 
-    // Build InferencePool — concurrent LLM task submission with provider-aware
-    // concurrency limits. HTTP providers (Ollama/llamafile) get 3 concurrent
-    // slots; local GGUF gets 1 (serialized by Goose's model mutex anyway).
-    let inference_pool: Option<Arc<dyn pond_core::models::ports::inference_pool::InferencePool>> = {
-        use pond_core::models::ports::inference_pool::InferencePool as _;
-        let pool = inference_pool::TokioInferencePool::for_provider(
-            llm_provider.clone(),
-            &effective_chat_provider,
-        );
-        println!(
-            "  Inference Pool: concurrency={} (provider={})",
-            pool.concurrency(),
-            effective_chat_provider
-        );
-        Some(Arc::new(pool))
-    };
+    // AppState still carries an `inference_pool` slot (pond-api's InferencePool
+    // port), but the only implementation ever built for it, TokioInferencePool,
+    // had zero callers of `submit` — nothing on the serving path ever queued a
+    // task through it, so it did no work beyond printing a concurrency figure
+    // at startup. Removed with that print; leaving the field `None` costs
+    // nothing until a real consumer needs the port.
+    let inference_pool: Option<Arc<dyn pond_core::models::ports::inference_pool::InferencePool>> =
+        None;
 
     // Build AnswerReviewer for the HTTP path — adversarial post-inference quality gate.
     // Always constructed so the user can toggle it on/off at runtime via settings.
@@ -2303,6 +2407,7 @@ async fn run_server(
             draft_repo.clone(),
             device_control.clone(),
             Some(session_storage.clone()),
+            Some(model_repo.clone()),
             false, // voice_mode — server mode, not voice
         )
         .await
@@ -2345,25 +2450,84 @@ async fn run_server(
         tracing::info!("schedule executor initialized — agent-prompt schedules are now active");
     }
 
-    // Secret storage — file-based at $DATA_DIR/secrets.json (0o600 permissions).
-    // Initialized before MCP auto-connect so startup can resolve OAuth tokens.
+    // Secret storage — $DATA_DIR/secrets.json, encrypted with XChaCha20-Poly1305
+    // under $DATA_DIR/secrets/master.key (0600, 0700 directory, overridable with
+    // POND_SECRET_KEY_FILE). Initialized before MCP auto-connect so startup can
+    // resolve OAuth tokens.
     let secret_repo: Option<
         Arc<dyn pond_core::security::ports::secret::SecretRepository + Send + Sync>,
     > = {
-        match pond_infra::keyring_secret_repository::FileSecretRepository::new(&data_dir) {
+        match pond_infra::file_secret_repository::FileSecretRepository::new(&data_dir) {
             Ok(repo) => {
                 tracing::info!(
-                    "secret repository initialized at {}/secrets.json",
-                    data_dir.display()
+                    store = %data_dir.join("secrets.json").display(),
+                    key_file = %pond_infra::secret_crypto::key_path(&data_dir).display(),
+                    "secret repository initialized (encrypted at rest)"
                 );
                 Some(Arc::new(repo))
             }
             Err(e) => {
-                tracing::warn!("failed to initialize secret repository: {e}");
+                // A locked store is not the same failure as a broken one, and
+                // the difference decides what the operator should do next. The
+                // repository stays None either way: with no repository the
+                // secret routes answer 503 and nothing in this process can
+                // overwrite the ciphertext, which is still sitting there
+                // recoverable if the key turns up.
+                if let Some(locked) =
+                    e.downcast_ref::<pond_infra::secret_crypto::SecretStoreLocked>()
+                {
+                    tracing::error!("{locked}");
+                    tracing::error!(
+                        "no API key or connector token can be read or written until that key \
+                         is restored. If it is genuinely gone the secrets cannot be recovered \
+                         by anyone, including us: move {} aside, restart, then re-enter API \
+                         keys and re-authorise connectors.",
+                        locked.store_path.display()
+                    );
+                } else {
+                    tracing::warn!("failed to initialize secret repository: {e}");
+                }
                 None
             }
         }
     };
+
+    // Hand the SAME instance to the MCP tool servers. One instance per process
+    // is a requirement, not tidiness: `FileSecretRepository` caches
+    // secrets.json in memory and rewrites it whole on `set`, so a second
+    // instance would serve a stale cache and clobber this one's writes.
+    // `spawn_news_server` / `spawn_finance_server` only fire at chat time, so
+    // installing here (after the agent backend was built) is in time.
+    if let Some(repo) = &secret_repo {
+        pond_mcp_server::init_secret_deps(repo.clone());
+
+        // PAI-2 P2: move any API key an existing pond already had in its
+        // settings table. The fields are gone from `Settings`, so an unmigrated
+        // row is simply ignored by `apply_key` — to the user that looks like
+        // their key vanished.
+        match pond_infra::secret_migration::migrate_api_keys_to_secret_repository(
+            &settings_repo,
+            repo,
+        )
+        .await
+        {
+            Ok(report) => {
+                if !report.left_in_place.is_empty() {
+                    tracing::warn!(
+                        keys = ?report.left_in_place,
+                        "API-key migration could not complete for these settings rows; they were \
+                         left in place so the values are not lost. They are no longer read."
+                    );
+                }
+            }
+            Err(e) => tracing::warn!("API-key migration failed: {e}"),
+        }
+    } else {
+        tracing::warn!(
+            "no secret repository: third-party API keys are unavailable this run and the \
+             settings-to-secrets migration did not run"
+        );
+    }
 
     // Marketplace — curated registry of installable extensions.
     // Initialized before MCP auto-connect so startup can look up required_secrets.
@@ -2508,13 +2672,41 @@ async fn run_server(
 
     // Privacy/security boundary hook — audits into the unified event log (#108)
     // as `Auth` events, so a policy decision is correlatable with the rest of a
-    // session. Default-allow; nothing calls `audit` yet (see the adapter docs).
+    // session.
+    //
+    // This sink is a SEPARATE Arc from the shared `event_log` below, so it gets
+    // its own chokepoint-2 wrapper. Leaving it raw would have been a bypass by
+    // the one component whose entire job is the audit trail: P1 classifies
+    // these rows `Sensitive` precisely because they carry a `token:<client_id>`
+    // principal label and a remote address.
     let security_policy: Option<Arc<dyn pond_core::security::ports::policy::SecurityPolicy>> =
         Some(Arc::new(
             pond_infra::sqlite_security_policy::SqliteSecurityPolicy::new(Arc::new(
-                SqliteEventLog::new(db.logs.clone()),
+                pond_core::security::services::redacting_event_log::RedactingEventLog::new(
+                    Arc::new(SqliteEventLog::new(db.logs.clone())),
+                    redactor.clone(),
+                ),
             )),
         ));
+
+    // PAI-2 P1, second production call site: the draft MCP server is a
+    // process-wide singleton with no principal of its own. What it does get,
+    // per tool call, is the engine session id in the MCP request `_meta`. This
+    // authority is what turns that id into a speaker, reads
+    // `security_policy_mode` fresh, and records the decision. Installed here
+    // rather than in register_giap_extensions because it needs three
+    // repositories that registration does not carry, and after `security_policy`
+    // so draft decisions land in the same audit trail as identity assertions.
+    // The server is not spawned until the first turn, so this is in time.
+    pond_mcp_server::init_draft_authority(Some(Arc::new(
+        pond_core::security::services::draft_authority::RepoDraftAuthority::new(
+            settings_repo.clone(),
+            session_storage.clone(),
+            profile_repo.clone(),
+            security_policy.clone(),
+        ),
+    )
+        as Arc<dyn pond_core::security::ports::draft_authority::DraftAuthority>));
 
     // Start routing WARN+ tracing events into the SQLite event log.
     // _file_guard must live until run_server returns so the background file
@@ -2571,8 +2763,17 @@ async fn run_server(
         Arc::new(InProcessEventBus::new());
     // One shared event store: the bus→log bridge writes to it, and the activity
     // query API (#114) reads from it via AppState.
-    let event_log: Arc<dyn pond_core::security::ports::event_log::EventLog> =
-        Arc::new(SqliteEventLog::new(db.logs.clone()));
+    // Chokepoint 2: attributes are redacted on the way in, and a finding raises
+    // the event's sensitivity -- which excludes it from the audit MCP reads and
+    // shortens its retention. Both narrow. This is also the binding
+    // `set_egress_sink` reads a hundred lines below, so every outbound-call
+    // record goes through the redactor without egress knowing.
+    let event_log: Arc<dyn pond_core::security::ports::event_log::EventLog> = Arc::new(
+        pond_core::security::services::redacting_event_log::RedactingEventLog::new(
+            Arc::new(SqliteEventLog::new(db.logs.clone())),
+            redactor.clone(),
+        ),
+    );
     // Push-token store (#95) — built here, before `db` is moved into AppState.
     let push_token_repo: Arc<dyn pond_core::user_data::ports::push_token::PushTokenRepository> =
         Arc::new(pond_infra::sqlite_push_token::SqlitePushTokenRepository::new(db.system.clone()));
@@ -2617,14 +2818,37 @@ async fn run_server(
                 push_token_repo.clone(),
             ))
         };
+    // PAI-1 P9's delivery half, and the first production caller the rung has had.
+    //
+    // Until this line `send_to_profile` answered `AttributionUnavailable` for
+    // every member on every pond: the code was correct, tested, and unreachable.
+    // That is the shape PAI-1 P5 shipped in once and PAI-6 P1's clamp shipped in
+    // again, and it is invisible to `dead_code` because every symbol involved is
+    // `pub` in a library crate.
+    let device_attribution: Arc<
+        dyn pond_core::user_data::ports::device_attribution::DeviceAttribution,
+    > = Arc::new(
+        pond_infra::sqlite_device_attribution::SqliteDeviceAttribution::new(db.system.clone()),
+    );
+
+    // The concrete type is kept alongside the trait object on purpose.
+    // `send_to_profile` is NOT on `NotificationSender` and must not be: the port
+    // is `send` (one target) and `broadcast` (the household), and a third method
+    // meaning "resolve a member to their devices" would put PAI-1's attribution
+    // chain behind a trait every mock and stub in the workspace would have to
+    // answer for. PAI-7 invariant 4 -- addressed to a profile, never broadcast --
+    // is carried by `TargetedDelivery`, which has no variant meaning "everybody",
+    // so the refusal cannot be reached by picking the wrong enum arm.
+    let targeted_notification_sender = Arc::new(
+        pond_infra::broadcast_notification_sender::BroadcastNotificationSender::new(
+            notification_tx.clone(),
+            notification_queue.clone(),
+            Some(push_relay),
+        )
+        .with_device_attribution(device_attribution.clone()),
+    );
     let notification_sender: Arc<dyn pond_core::mcp::ports::notification::NotificationSender> =
-        Arc::new(
-            pond_infra::broadcast_notification_sender::BroadcastNotificationSender::new(
-                notification_tx.clone(),
-                notification_queue.clone(),
-                Some(push_relay),
-            ),
-        );
+        targeted_notification_sender.clone();
     // Let the `send_notification` MCP tool reach connected phones too (#99).
     pond_mcp_server::init_notification_sender(notification_sender.clone());
 
@@ -2678,6 +2902,162 @@ async fn run_server(
         });
     }
 
+    // ── PAI-7 P4: the proactive reviewer ─────────────────────────────────
+    //
+    // The loop `proactive_review.rs` was written for and has been waiting on.
+    // Everything it decides lives in pond-core: when a review may start, who it
+    // is for, what it may be told, what its answer becomes. What is here is a
+    // clock, four store reads, and the delivery.
+    //
+    // Two structural facts decide the shape:
+    //
+    // 1. **A review is its own parent turn.** `GooseOrchestrator::spawn` refuses
+    //    any spec whose parent session has no live entry in the
+    //    `TurnAuthorityRegistry`, which a background loop fails by construction.
+    //    So the loop publishes `review_authority` for the length of the run.
+    //    That is not a way around the check -- the registry entry carries the
+    //    cancellation token, so publishing is what makes invariant 3's
+    //    interruption cascade to the child at all.
+    // 2. **The orchestrator is read back out of the same `OnceLock` the
+    //    `delegate` tool uses.** A second `GooseOrchestrator` would compile and
+    //    then answer `None` to every authority lookup. There is exactly one, and
+    //    when Goose init failed there is none -- which means no review.
+    {
+        let review_settings = settings_repo.clone();
+        let review_storage = session_storage.clone();
+        let review_activity = last_user_activity.clone();
+        let review_sender = targeted_notification_sender.clone();
+        let review_proposals: Arc<dyn pond_core::user_data::ports::proposal::ProposalRepository> =
+            Arc::new(pond_infra::sqlite_proposal::SqliteProposalRepository::new(
+                db.system.clone(),
+            ));
+
+        // The observed-event ring, filled by a bus subscriber and drained by the
+        // reviewer. `brief_events` collapses repeats, so this only has to be big
+        // enough that a burst between two reviews does not lose the one event
+        // that mattered; it is sized off pond-core's own cap rather than a
+        // number here, so the two cannot drift.
+        let observed: Arc<
+            tokio::sync::Mutex<
+                std::collections::VecDeque<pond_core::user_data::domain::proposal::BusEventRef>,
+            >,
+        > = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new()));
+        {
+            let observed = observed.clone();
+            let mut events = event_bus.subscribe();
+            tokio::spawn(async move {
+                use futures::StreamExt;
+                use pond_core::user_data::services::proactive_review::{
+                    reviewable, MAX_BRIEF_EVENTS,
+                };
+                let ring_capacity = MAX_BRIEF_EVENTS * 16;
+                while let Some(bus_event) = events.next().await {
+                    // `reviewable` refuses the clock tick and the session
+                    // lifecycle. Doing that HERE rather than at review time is
+                    // what stops an idle overnight pond filling the ring with
+                    // its own heartbeat and evicting the evening's camera event.
+                    let Some(reference) = reviewable(&bus_event) else {
+                        continue;
+                    };
+                    let mut ring = observed.lock().await;
+                    ring.push_back(reference);
+                    while ring.len() > ring_capacity {
+                        ring.pop_front();
+                    }
+                }
+            });
+        }
+
+        tokio::spawn(run_proactive_reviewer(
+            review_settings,
+            review_storage,
+            review_activity,
+            review_proposals,
+            review_sender,
+            observed,
+        ));
+    }
+
+    // ── PAI-8 P1: the personal-context corpus gets a producer ────────────
+    //
+    // Everything in `pond-core/src/context/` landed on 2026-08-11 with nothing
+    // that could produce a `RawItem`, so `context_items` was empty on every
+    // pond by construction and `context_pipeline_is_not_wired_yet.rs` asserted
+    // it. This block is what that test was written to fail on.
+    //
+    // Three things decide the shape.
+    //
+    // 1. **The redactor is not optional.** `IngestPipeline::new` takes one by
+    //    value rather than as an `Option`, so there is no "no redactor wired"
+    //    fallback to lose invariant 3 through. This is also PAI-2 P3's third
+    //    chokepoint finally getting a call site -- the one the ledger recorded
+    //    as circularly blocked on PAI-8.
+    // 2. **The toggle is answered per event, from the settings the loop last
+    //    read**, not captured at boot. `BusIngest::absorb` reads it before it
+    //    reads any store, so on a default pond the whole cost of this feature
+    //    is a bool per bus event and no query.
+    // 3. **The bus is subscribed once more rather than sharing the reviewer's
+    //    ring.** They want different things: the reviewer wants a bounded
+    //    window of recent household facts to reason over, this wants every
+    //    event exactly once so nothing is silently dropped by a ring that
+    //    wrapped.
+    {
+        let context_repo: Arc<dyn pond_core::context::ports::ContextRepository> =
+            Arc::new(pond_infra::sqlite_context::SqliteContextRepository::new(
+                db.system.clone(),
+                redactor.clone(),
+            ));
+        let pipeline = Arc::new(
+            pond_core::context::ingest::IngestPipeline::new(context_repo.clone(), redactor.clone())
+                .with_embedder(embedding_provider.clone()),
+        );
+
+        // PAI-8 P2's read surface. Installed unconditionally, like the other
+        // `init_*_deps`: registration is what the toggle gates, so with the
+        // extension unregistered these handles are simply unused.
+        pond_mcp_server::context::init_context_deps(
+            context_repo.clone(),
+            embedding_provider.clone(),
+        );
+
+        let ingest = Arc::new(pond_core::context::bus_ingest::BusIngest::new(
+            context_repo,
+            pipeline,
+        ));
+        let ingest_settings = settings_repo.clone();
+        let mut events = event_bus.subscribe();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            while let Some(bus_event) = events.next().await {
+                // A settings read that fails skips the event rather than
+                // falling back to `Settings::default()`. The default is off, so
+                // both mean "do not ingest" today -- but a default is a value
+                // somebody can change, and a gate that launders an unreadable
+                // store through it would start storing the day that moved.
+                let Ok(settings) = ingest_settings.get().await else {
+                    continue;
+                };
+                match ingest
+                    .absorb(&settings, &bus_event, chrono::Utc::now())
+                    .await
+                {
+                    Ok(report) => {
+                        if !report.ingested.is_empty() {
+                            tracing::debug!(
+                                stored = report.ingested.len(),
+                                refused = report.refused,
+                                "[context] bus event ingested"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "[context] could not absorb a bus event");
+                    }
+                }
+            }
+        });
+    }
+
     // Egress tracker (#113): record every outbound HTTP call made by built-in
     // MCP tools into the same event store, so network egress is queryable via
     // `GET /api/v1/activity?category=network`.
@@ -2692,6 +3072,21 @@ async fn run_server(
             sched,
         ));
     }
+
+    // The other half of the event spine (PAI-7 P1 and P2): the pond's own
+    // clock, whether somebody is at it, and which household member that is.
+    // Spawned here, beside the two consumers, so the whole spine reads in one
+    // place. Both hold the bus weakly — see `run_time_ticker` — and both
+    // publish only; the rules engine skips these events because they have no
+    // device-shaped view, and the bridge above records them in the event log
+    // like any other bus traffic.
+    tokio::spawn(run_time_ticker(Arc::downgrade(&event_bus)));
+    tokio::spawn(run_session_activity_observer(
+        Arc::downgrade(&event_bus),
+        session_storage.clone(),
+        profile_repo.clone(),
+        last_user_activity.clone(),
+    ));
 
     // Matter bridge (#195): syncs commissioned fabric nodes into the device
     // registry and turns sensor attribute updates into BusEvent::Sensor, so
@@ -2898,7 +3293,6 @@ async fn run_server(
         event_log: Some(event_log.clone()),
         push_token_repo: Some(push_token_repo.clone()),
         face_recognition,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         // Long-lived per-device notification streams get their own, larger pool
         // so connected phones never starve interactive chat SSE (#99 audit).
@@ -2968,7 +3362,26 @@ async fn run_server(
                         .flatten()
                         .unwrap_or_else(|| provider.bundled_client_id.clone());
 
-                    match refresh_http_client
+                    // PAI-2 P6a: gate before the token leaves the machine. This
+                    // is a background loop, so a refusal skips THIS provider on
+                    // THIS tick and the loop keeps running -- killing the worker
+                    // would mean tightening network_mode once permanently
+                    // disabled refresh, even after the user loosened it again.
+                    let call = match pond_core::shared::services::egress::begin(
+                        &provider.token_url,
+                        "POST",
+                    ) {
+                        Ok(call) => call,
+                        Err(denied) => {
+                            tracing::warn!(
+                                provider = %provider.id,
+                                "OAuth auto-refresh skipped: {denied}"
+                            );
+                            continue;
+                        }
+                    };
+
+                    let refreshed = refresh_http_client
                         .post(&provider.token_url)
                         .form(&[
                             ("grant_type", "refresh_token"),
@@ -2976,8 +3389,10 @@ async fn run_server(
                             ("client_id", client_id.as_str()),
                         ])
                         .send()
-                        .await
-                    {
+                        .await;
+                    call.finish(refreshed.as_ref().ok().map(|r| r.status().as_u16()));
+
+                    match refreshed {
                         Ok(resp) if resp.status().is_success() => {
                             if let Ok(body) = resp.json::<serde_json::Value>().await {
                                 if let Some(at) = body["access_token"].as_str() {
@@ -3282,10 +3697,9 @@ async fn run_chat(
     };
 
     let data_dir = default_data_dir();
-    // Must run before any ONNX-dependent init (Piper TTS). `serve` and `setup`
-    // already call this; without it here ORT_DYLIB_PATH is never set and
-    // Piper::new() hangs indefinitely.
-    ensure_onnx_runtime();
+    // NOTE: `ensure_onnx_runtime()` used to be called here, before the database
+    // even existed. It moved below the settings load for the reason given at
+    // its new site. PAI-2 P6a.
     let db = Database::init(&data_dir).await?;
 
     // Install the audit MCP server's read handle so the giap-audit extension works
@@ -3309,6 +3723,22 @@ async fn run_chat(
     // Falls back to Settings::default() when the DB has no rows yet (first run).
     let settings_repo_chat = SqliteSettingsRepository::new(db.system.clone());
     let settings = settings_repo_chat.get().await.unwrap_or_default();
+
+    // PAI-2 P6a: install the egress gate on THIS path too. `set_network_mode`
+    // had exactly one call site, inside `run_server`, and the mode is a
+    // process-global that defaults to `Open` — so `network_mode = "offline"`
+    // was a silent no-op for the whole of `pond chat`, which is also the
+    // terminal voice loop. Every outbound call this process makes, gated or
+    // not, was evaluated against a setting nobody had read.
+    pond_core::shared::services::egress::set_network_mode(
+        pond_core::shared::services::egress::NetworkMode::parse(&settings.network_mode),
+    );
+
+    // Must run before any ONNX-dependent init (Piper TTS); without it
+    // ORT_DYLIB_PATH is never set and Piper::new() hangs indefinitely. It runs
+    // after the mode install above because it can download ~100 MB from
+    // github.com, and a download cannot be gated by a setting read afterwards.
+    ensure_onnx_runtime();
 
     // CLI args override settings; settings provide the defaults from the chat role.
     let settings_provider = settings.chat_provider.clone();
@@ -3455,9 +3885,18 @@ async fn run_chat(
     let settings_repo_arc: Arc<
         dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
     > = Arc::new(SqliteSettingsRepository::new(db.system.clone()));
+    // Chokepoint 1 again. This entry point hands `memory_repo` to
+    // `build_goose_backend`, which registers `giap-memory` -- so a CLI or voice
+    // session writes memories exactly like the server does, and leaving the
+    // repo raw here would be a hole in the chokepoint that nothing warns about.
     let memory_repo: Arc<
         dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync,
-    > = Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+    > = Arc::new(
+        pond_core::user_data::services::redacting_memory_repository::RedactingMemoryRepository::new(
+            Arc::new(SqliteMemoryRepository::new(db.system.clone())),
+            Arc::new(pond_infra::rule_redactor::RuleRedactor::new()),
+        ),
+    );
     let skill_repo: Arc<dyn pond_core::user_data::ports::skill::UserSkillRepository + Send + Sync> =
         Arc::new(SqliteSkillRepository::new(db.system.clone()));
     let recipe_repo: Arc<
@@ -3593,6 +4032,7 @@ async fn run_chat(
             draft_repo,
             Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
             Some(trim_storage), // powers the trimmer's summary splice
+            Some(chat_model_repo.clone()),
             input == "whisper", // voice_mode
         )
         .await;
@@ -4283,16 +4723,591 @@ fn has_display() -> bool {
 ///
 /// Returns `None` when there are no sessions or the read fails; callers treat
 /// that as "no observable out-of-process activity".
+///
+/// **Sessions the pond minted for itself do not count** (`human_activity`,
+/// PAI-7 P1). Every `AgentPrompt` schedule fire creates a `sched-*` row and
+/// bumps its `updated_at`, so without the filter a cron line running at 3am is
+/// indistinguishable here from the user returning — which both opens the
+/// never-on-startup gate on a pond nobody has touched and holds consolidation
+/// off as if somebody were typing.
 async fn newest_session_activity(
     storage: &dyn pond_core::user_data::ports::session_storage::SessionStorage,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    storage
-        .list_sessions()
-        .await
-        .ok()?
-        .into_iter()
-        .map(|s| s.updated_at)
-        .max()
+    let sessions = storage.list_sessions().await.ok()?;
+    pond_core::shared::domain::session_activity::human_activity(&sessions).newest_activity
+}
+
+// ── PAI-7 P1: clock and session-activity publishers on the event bus ────────
+//
+// Both publish and nothing consumes: the rules engine now skips these events
+// (they have no `trigger_view`) and the bus-to-event-log bridge records them.
+// Deciding anything about them is PAI-7 P4's, and that separation is the point
+// of the phase — an event nobody can trust is worse than no event.
+
+/// Publish one [`BusEvent::Time`] per local hour boundary.
+///
+/// **Cadence is computed from the wall clock each time**, not by ticking a
+/// fixed hour-long interval, so the tick lands on the hour rather than an hour
+/// after whenever the pond happened to boot. A machine that slept through
+/// three hours publishes one tick when it wakes rather than three: the tick is
+/// a heartbeat, and a backlog of "it is now 2am" is noise.
+///
+/// **The bus is held weakly.** This is the one task on the spine with no input
+/// stream of its own — the rules engine and the event-log bridge both end when
+/// the bus's senders drop. A strong `Arc` here would keep the bus, and so
+/// their streams, alive for exactly as long as this loop, which is what turns
+/// a background timer into something that outlives the shutdown it should have
+/// ended with.
+async fn run_time_ticker(bus: std::sync::Weak<dyn pond_core::shared::ports::event_bus::EventBus>) {
+    use chrono::Timelike;
+    use pond_core::shared::domain::time_tick::{secs_to_next_hour_from, TimeBoundary, TimeTick};
+    use pond_core::shared::ports::event_bus::BusEvent;
+
+    loop {
+        // The clock reading goes in whole. Splitting it into a minute and a
+        // second here is what let the two swap unnoticed.
+        let wait = secs_to_next_hour_from(&chrono::Local::now());
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+
+        // Upgrade per iteration and drop it again before the next sleep.
+        let Some(bus) = bus.upgrade() else {
+            tracing::debug!("time ticker: event bus dropped — stopping");
+            break;
+        };
+        let local = chrono::Local::now();
+        bus.publish(BusEvent::Time(TimeTick {
+            boundary: TimeBoundary::Hour,
+            at: chrono::Utc::now(),
+            local_hour: local.hour() as u8,
+        }));
+    }
+}
+
+/// Publish [`BusEvent::Session`] transitions — a conversation started, the
+/// pond went quiet, the user came back — and [`BusEvent::Presence`]
+/// transitions, which say *which household member* that was.
+///
+/// Reuses the consolidation scheduler's activity model wholesale:
+/// `saw_activity_since_start` for the never-at-startup guard,
+/// `combined_idle_for` so an out-of-process voice turn counts, and
+/// `INACTIVITY_THRESHOLD_SECS` as the threshold — for presence too, so the
+/// bus cannot say a member is still here after it has already said the pond
+/// went idle. One pond, one definition of "the user has gone quiet".
+///
+/// **One task, one read, two observers** (PAI-7 P2). A second polling loop
+/// would read the same table on its own schedule and the two could disagree
+/// about which conversations exist — which is the shape of defect
+/// `human_activity` was written as one function to prevent.
+///
+/// **What this loop decides, honestly.** The seed, the machine-session filter,
+/// the never-at-startup gate, the idle arithmetic, the presence baseline, the
+/// freshness window, which rows are worth an identity read, what an unreadable
+/// profile list means and what an unreadable identity means all live in
+/// pond-core, where a mutation to any of them fails a test.
+///
+/// This paragraph used to open "this loop decides nothing", and that was false
+/// in both halves — four of those decisions were expressed right here, and the
+/// freshness window was one of them: `presence_window` was a field this
+/// function filled in, so I could set it to twenty-four hours and `cargo check`
+/// plus the entire `pond-core` suite stayed green. `PresenceInputs`'s fields
+/// are private now and `for_poll` is the only way in, so this loop cannot name
+/// a window at all.
+///
+/// **What genuinely remains here is unguarded, and it is not nothing.**
+/// `POLL_SECS`, the two store reads, the `tracing` lines — and `idle_threshold`
+/// for [`PollClock`], which is still bound at this call site from
+/// `INACTIVITY_THRESHOLD_SECS`. That is the same gap on P1's session-lifecycle
+/// side; it is left as it is because `PollClock`'s two `Instant` fields sit
+/// next to each other, and a positional constructor to close it would trade a
+/// visible constant for two arguments that swap silently. Nothing tests this
+/// function: `crates/pond-server/tests` does not name it, and `ci.yml` runs
+/// `cargo check` for this crate and never `cargo test`.
+async fn run_session_activity_observer(
+    bus: std::sync::Weak<dyn pond_core::shared::ports::event_bus::EventBus>,
+    storage: Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>,
+    profiles: Arc<dyn pond_core::user_data::ports::profile::ProfileRepository + Send + Sync>,
+    last_user_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
+) {
+    use pond_core::shared::domain::session_activity::{
+        attribution_candidates, household_has_multiple_members, ActivityObserver, PollClock,
+        PresenceEvidence, PresenceInputs, PresenceObserver,
+    };
+    use pond_core::shared::ports::event_bus::BusEvent;
+    use pond_core::user_data::services::consolidation_schedule as sched;
+
+    const POLL_SECS: u64 = 60;
+    let idle_threshold = std::time::Duration::from_secs(sched::INACTIVITY_THRESHOLD_SECS);
+
+    // Baselines for the never-at-startup guard, captured before the first
+    // poll so the activity clock's boot value can never pass for activity.
+    let started_at = std::time::Instant::now();
+    let started_at_utc = chrono::Utc::now();
+
+    let mut observer = ActivityObserver::seeded_from(storage.list_sessions().await);
+    let mut presence = PresenceObserver::awaiting_baseline();
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
+
+        let Some(bus) = bus.upgrade() else {
+            tracing::debug!("session activity observer: event bus dropped — stopping");
+            break;
+        };
+
+        // One read serves all three halves: which conversations exist, the
+        // newest `updated_at` (the out-of-process activity source), and which
+        // rows carry an attribution to look up.
+        let sessions = match storage.list_sessions().await {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                tracing::debug!(error = %e, "session activity observer: session read failed");
+                continue;
+            }
+        };
+        let now = chrono::Utc::now();
+
+        let transitions = observer.poll(
+            &sessions,
+            PollClock {
+                started_at,
+                started_at_utc,
+                in_process_at: *last_user_activity.read().await,
+                now,
+                idle_threshold,
+            },
+        );
+        for transition in transitions {
+            tracing::debug!(
+                phase = transition.phase.as_str(),
+                session_id = transition.session_id.as_deref().unwrap_or("-"),
+                idle_secs = transition.idle_secs,
+                "session lifecycle"
+            );
+            bus.publish(BusEvent::Session(transition));
+        }
+
+        // ── Presence (PAI-7 P2) ──────────────────────────────────────────
+        //
+        // Which rows are worth a `get_session_identity` is pond-core's,
+        // because it is derived from the observer's own refusals rather than
+        // invented here: `attribution_candidates` drops the pond's own
+        // conversations, the ones nobody has spoken in inside the window, and
+        // the ones whose `sessions.profile_id` is NULL. It is read-avoidance
+        // and not a gate — the observer re-applies origin and freshness to
+        // whatever it is handed, through the same predicate — and it matters
+        // because `list_sessions` has no LIMIT and no time bound, so this used
+        // to be one point query per session the pond had EVER attributed,
+        // every sixty seconds, forever, on a Jetson.
+        let mut attributed = Vec::new();
+        let mut unreadable: Option<String> = None;
+        for session in attribution_candidates(&sessions, now) {
+            match storage.get_session_identity(&session.id).await {
+                Ok(identity) => attributed.push((session, identity)),
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        session_id = %session.id,
+                        "presence observer: identity read failed; skipping this poll"
+                    );
+                    unreadable = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+
+        let household = profiles.list().await;
+        if let Err(e) = &household {
+            tracing::debug!(
+                error = %e,
+                "presence observer: could not count household members"
+            );
+        }
+
+        // What an unreadable row means, and what an unreadable profile list
+        // means, are both pond-core's answers. This loop supplies the two
+        // `Result`s and logs them; it does not get to say what they imply.
+        let evidence: Vec<PresenceEvidence<'_>> = attributed
+            .iter()
+            .map(|(session, identity)| PresenceEvidence::of(session, identity))
+            .collect();
+        let read = match unreadable {
+            Some(e) => Err(e),
+            None => Ok(PresenceInputs::for_poll(
+                &evidence,
+                household_has_multiple_members(&household),
+                now,
+            )),
+        };
+        for transition in presence.observe_read(read) {
+            tracing::debug!(
+                profile_id = %transition.profile_id,
+                transition = transition.transition.as_str(),
+                source = transition.source.as_str(),
+                session_id = %transition.session_id,
+                "profile presence"
+            );
+            bus.publish(BusEvent::Presence(transition));
+        }
+    }
+}
+
+/// PAI-7 P4: think about what has happened, in idle time, and propose.
+///
+/// `proactive_review.rs` decides everything of consequence and this is the
+/// loop it was written for. What is decided *here* — and therefore what is
+/// unguarded, because `ci.yml` runs `cargo check` for this crate and never
+/// `cargo test` — is `POLL_SECS`, the store reads, and the failure direction
+/// of each of them. Those directions are the part worth reading:
+///
+/// - **A settings or session read that fails skips the tick.** Nothing is
+///   assumed about a pond that cannot be read.
+/// - **A proposal count that fails reads as the cap.** An unreadable count
+///   means no review, never an unlimited one.
+/// - **A decision read that fails skips the tick**, and this one is the least
+///   obvious. An empty ledger suppresses nothing, so treating the failure as
+///   "no decisions" would re-propose exactly the things a member has already
+///   said no to — the widening direction, reached by a plausible default.
+/// - **No orchestrator means no review.** When Goose init fell back to the mock
+///   agent there is nothing in the `OnceLock`, and the loop returns rather than
+///   running with a second one it made itself.
+///
+/// The ring is DRAINED when a review starts, so a brief says what has happened
+/// *since the last review* — which is what the brief claims when it is empty.
+/// A run that then fails loses those events; the alternative is re-reviewing
+/// the same evening forever, which is worse and much harder to notice.
+async fn run_proactive_reviewer(
+    settings_repo: Arc<dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync>,
+    storage: Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>,
+    last_user_activity: Arc<tokio::sync::RwLock<std::time::Instant>>,
+    proposals: Arc<dyn pond_core::user_data::ports::proposal::ProposalRepository>,
+    sender: Arc<pond_infra::broadcast_notification_sender::BroadcastNotificationSender>,
+    observed: Arc<
+        tokio::sync::Mutex<
+            std::collections::VecDeque<pond_core::user_data::domain::proposal::BusEventRef>,
+        >,
+    >,
+) {
+    use pond_core::mcp::ports::notification::Notification;
+    use pond_core::user_data::services::consolidation_schedule as sched;
+    use pond_core::user_data::services::proactive_review as review;
+
+    const POLL_SECS: u64 = 60;
+
+    // See the block in `run_server`: this is the SAME orchestrator and the SAME
+    // registry the `delegate` tool holds, because a second registry compiles and
+    // then refuses every spawn.
+    let Some(deps) = pond_mcp_server::installed_orchestrator_deps() else {
+        tracing::info!(
+            "proactive reviewer: no orchestrator was installed (mock agent?) — not starting"
+        );
+        return;
+    };
+    let orchestrator = deps.orchestrator();
+    let authorities = deps.authorities();
+
+    // Fallible rather than a lazy unwrap, and checked once at start rather than
+    // per tick: the recipe is text through a `deny_unknown_fields` parser, and a
+    // typo in it should stop the reviewer loudly instead of logging every minute.
+    let role = match review::proactive_reviewer_role() {
+        Ok(role) => role,
+        Err(e) => {
+            tracing::error!(error = %e, "proactive reviewer: shipped role does not parse");
+            return;
+        }
+    };
+
+    // Baselines for the never-at-startup guard, captured before the first poll.
+    let started_at = std::time::Instant::now();
+    let started_at_utc = chrono::Utc::now();
+    let idle_threshold = std::time::Duration::from_secs(sched::INACTIVITY_THRESHOLD_SECS);
+    let mut last_run: Option<std::time::Instant> = None;
+
+    tracing::info!(
+        "proactive reviewer active — off unless both `proactive_review_enabled` and \
+         `ext_orchestrator_enabled` are set"
+    );
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
+
+        let settings = match settings_repo.get().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "proactive reviewer: settings read failed");
+                continue;
+            }
+        };
+        let sessions = match storage.list_sessions().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "proactive reviewer: session read failed");
+                continue;
+            }
+        };
+        let now = chrono::Utc::now();
+
+        // Invariant 7's tidying pass. Correctness does not depend on it — every
+        // read filters expiry in SQL — but the terminal status is what the
+        // feedback ledger reads, so an unswept row teaches nothing.
+        if let Err(e) = proposals.expire_due(now).await {
+            tracing::debug!(error = %e, "proactive reviewer: expiry sweep failed");
+        }
+
+        // Invariant 4. `None` here is the whole household and an unidentified
+        // speaker both answering "not addressable", and the answer is no review.
+        //
+        // It is TRACED rather than skipped in silence, and that is a repair
+        // rather than a nicety: on a pond where nobody has been identified —
+        // which is every pond until PAI-1's identification routes get a caller —
+        // this is where the reviewer stops, on every tick, and the first probe
+        // of this loop produced no output at all. A feature that is switched on
+        // and says nothing is indistinguishable from one that is broken, and
+        // this programme has spent whole phases on that distinction.
+        let Some(audience) = review::audience_for_review(&sessions, now) else {
+            tracing::trace!(
+                sessions = sessions.len(),
+                "proactive reviewer: nobody to address — no member has been identified inside \
+                 the audience window, so there is no review to run"
+            );
+            continue;
+        };
+
+        let db_activity =
+            pond_core::shared::domain::session_activity::human_activity(&sessions).newest_activity;
+        let in_process_at = *last_user_activity.read().await;
+
+        // A rolling 24 hours, not a calendar day: the cap is about how often
+        // somebody is interrupted, and midnight is not a fact about that.
+        let proposals_today = proposals
+            .count_made_since(audience.profile_id(), now - chrono::Duration::days(1))
+            .await
+            .unwrap_or(review::MAX_PROPOSALS_PER_DAY);
+
+        let decision = review::should_review(&review::ReviewInputs::for_tick(
+            sched::GateInputs {
+                enabled: settings.proactive_review_enabled,
+                saw_activity_since_start: sched::saw_activity_since_start(
+                    started_at,
+                    in_process_at,
+                    started_at_utc,
+                    db_activity,
+                ),
+                idle_for: sched::combined_idle_for(in_process_at, db_activity, now),
+                idle_threshold,
+                since_last_run: last_run.map(|t| t.elapsed()),
+                interval_floor: sched::interval_floor_from_hours(
+                    settings.memory_consolidation_interval_hours,
+                ),
+            },
+            settings.ext_orchestrator_enabled,
+            proposals_today,
+            // The loop awaits its own run, so two can never overlap here. The
+            // input exists for a caller that does not have that property.
+            false,
+        ));
+        if let review::ReviewDecision::Skip(reason) = decision {
+            tracing::trace!(
+                reason = reason.as_str(),
+                "proactive reviewer: skipping tick"
+            );
+            continue;
+        }
+
+        // PAI-7 P7. A failed read skips the tick rather than proceeding with an
+        // empty ledger — see this function's docs for why that direction matters.
+        let decisions = match proposals
+            .decisions_since(audience.profile_id(), now - review::SUPPRESSION_WINDOW)
+            .await
+        {
+            Ok(decisions) => decisions,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "proactive reviewer: could not read prior decisions — skipping rather than \
+                     re-proposing what was already declined"
+                );
+                continue;
+            }
+        };
+        let ledger = review::FeedbackLedger::from_decisions(&decisions, now);
+
+        let events = {
+            let mut ring = observed.lock().await;
+            let drained: Vec<pond_core::user_data::domain::proposal::BusEventRef> =
+                ring.drain(..).collect();
+            review::brief_events(&audience, &drained)
+        };
+
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let session_id = review::review_session_id(&run_id);
+        let brief = review::review_brief(now, &events, &ledger);
+        let spec =
+            match review::plan_review(&role, &audience, &session_id, &brief, serde_json::json!({}))
+            {
+                Ok(spec) => spec,
+                Err(e) => {
+                    tracing::warn!(error = ?e, "proactive reviewer: delegation refused");
+                    continue;
+                }
+            };
+
+        tracing::info!(
+            member = %audience.profile_id(),
+            events = events.len(),
+            made_today = proposals_today,
+            "idle after user activity — starting a proactive review"
+        );
+
+        // The review becomes its own parent turn for the length of the run. The
+        // lease revokes on drop, so nothing can delegate from a review that has
+        // ended — the same property a user's finished turn has.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let lease = authorities.publish(
+            &session_id,
+            review::review_authority(&audience, &session_id),
+            cancel.clone(),
+        );
+
+        // Invariant 3's second half. On the Orin this is correctness rather than
+        // politeness: the review is holding the only GPU the household's next
+        // turn needs.
+        let watcher = {
+            let watcher_activity = last_user_activity.clone();
+            let watcher_storage = storage.clone();
+            let watcher_cancel = cancel.clone();
+            let run_started = std::time::Instant::now();
+            tokio::spawn(async move {
+                const TICK_MS: u64 = 500;
+                const DB_EVERY_N_TICKS: u32 = 4;
+                let run_started_utc = chrono::Utc::now();
+                let mut tick: u32 = 0;
+                let mut db_seen: Option<chrono::DateTime<chrono::Utc>> = None;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(TICK_MS)).await;
+                    if watcher_cancel.is_cancelled() {
+                        break;
+                    }
+                    tick = tick.wrapping_add(1);
+                    if tick % DB_EVERY_N_TICKS == 0 {
+                        // A transient read failure reads as `None`, which must
+                        // never be mistaken for activity.
+                        db_seen = newest_session_activity(watcher_storage.as_ref()).await;
+                    }
+                    if review::cancelled_by_activity(
+                        run_started,
+                        *watcher_activity.read().await,
+                        run_started_utc,
+                        db_seen,
+                    ) {
+                        tracing::info!("user activity resumed — cancelling the proactive review");
+                        watcher_cancel.cancel();
+                        break;
+                    }
+                }
+            })
+        };
+
+        let run = orchestrator.spawn(spec).await;
+        watcher.abort();
+        drop(lease);
+        // An attempt spends the interval budget whether or not it produced
+        // anything, for the reason the consolidation scheduler records: retrying
+        // after the next idle window reintroduces the repeated-expensive-attempt
+        // churn the gate exists to remove.
+        last_run = Some(std::time::Instant::now());
+
+        let run = match run {
+            Ok(run) => run,
+            Err(e) => {
+                tracing::warn!(error = %e, "proactive reviewer: the run did not start");
+                continue;
+            }
+        };
+
+        // `interpret_answer` reads `result_for_parent()`, so a cancelled or
+        // turn-exhausted run yields nothing rather than partial opinions.
+        let yielded = review::interpret_answer(
+            &run,
+            &audience,
+            chrono::Utc::now(),
+            &ledger,
+            proposals_today,
+        );
+        for refusal in &yielded.refusals {
+            tracing::debug!(refusal = ?refusal, "proactive reviewer: impulse refused");
+        }
+
+        // A run that produced words and yielded NOTHING is the failure this
+        // feature is most likely to have, and at DEBUG it is invisible.
+        //
+        // Measured on the Orin 2026-08-12: the loop fired correctly, resolved
+        // its audience, spawned a child that answered in 32 s, and every impulse
+        // was refused because a 2B model wrote a `type` field that
+        // `ReviewerImpulse` did not have. Zero proposals, one DEBUG line each,
+        // and a GPU spent per interval for nothing. On a household pond nobody
+        // would ever see the reason.
+        //
+        // That specific cause is FIXED -- `ReviewerImpulse` no longer carries
+        // `deny_unknown_fields`, because nothing in it is a capability and the
+        // attribute was refusing whole suggestions over a key that could not
+        // reach a decision. This warning stays regardless: it was never about
+        // that one schema, it is about the class. A reviewer that runs, costs a
+        // model turn and yields nothing is a defect whatever the reason, and
+        // DEBUG is where this one hid for two recorded runs.
+        //
+        // WARN, not INFO: refusing every impulse is a defect somewhere -- in the
+        // prompt, in the schema, or in the model -- and it is never the intended
+        // steady state. A run that legitimately has nothing to say returns an
+        // empty array and lands in neither branch.
+        if yielded.proposals.is_empty() && !yielded.refusals.is_empty() {
+            tracing::warn!(
+                refused = yielded.refusals.len(),
+                first = ?yielded.refusals.first(),
+                "proactive review produced nothing: every impulse was refused. The review ran and \
+                 cost a model turn, so this is a defect rather than a quiet day."
+            );
+        }
+
+        for proposal in &yielded.proposals {
+            if let Err(e) = proposals.save(proposal).await {
+                tracing::warn!(error = %e, "proactive reviewer: could not persist a proposal");
+                continue;
+            }
+            // PAI-7 P5's first production caller, and PAI-1 P9's rung earning
+            // its keep. `send_to_profile` resolves the member's paired devices
+            // and reaches NOBODY when there are none — it cannot fall back to a
+            // broadcast, because `TargetedDelivery` has no variant meaning "the
+            // household".
+            //
+            // `action_required` rather than `alert`: a proposal wants a decision,
+            // and P6's speech gate ships allowing `alert` only, so switching the
+            // pond's voice on does not also make it read out its suggestions.
+            let report = sender
+                .send_to_profile(
+                    audience.profile_id(),
+                    Notification {
+                        id: format!("proposal-{}", proposal.id()),
+                        target: String::new(),
+                        category: "action_required".to_string(),
+                        title: "A suggestion".to_string(),
+                        body: proposal.summary(),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        data: Some(serde_json::json!({
+                            "proposal_id": proposal.id(),
+                            "rationale": proposal.rationale(),
+                        })),
+                    },
+                )
+                .await;
+            tracing::info!(
+                proposal = %proposal.id(),
+                member = %audience.profile_id(),
+                queued = report.queued.len(),
+                failed = report.failed.len(),
+                "proposal made"
+            );
+        }
+    }
 }
 
 /// Run one consolidation pass in the configured mode, apply the accepted
@@ -4328,7 +5343,7 @@ async fn run_consolidation_pipeline(
     use pond_core::user_data::services::consolidation_schedule::MIN_MEMORIES_TO_CONSOLIDATE;
     use pond_core::user_data::services::memory_consolidation as consolidation;
 
-    let memories = match repo.search_scoreable(None).await {
+    let memories = match repo.search_scoreable(&ProfileScope::Household).await {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!("consolidation: failed to load memories: {e}");
@@ -4738,6 +5753,22 @@ fn download_and_extract_ort(
     let tgz = tmp_dir.join("ort.tgz");
 
     // ── Download ─────────────────────────────────────────────────────────
+    // PAI-2 P6a. This is a ~100 MB fetch from github.com and it was invisible
+    // to `egress_guard.rs`, which finds senders by looking for `reqwest`. A
+    // subprocess is a sender too. It is the only one in the tree
+    // (`Command::new("curl")` matches here and nowhere else), so the hole was
+    // one call, but it was the largest single outbound transfer the pond makes.
+    //
+    // `check_egress` and not `EgressCall::begin`: this fn is synchronous, and
+    // `EgressCall::finish` -> `record_egress` reaches `tokio::spawn`, which
+    // panics with no runtime on the thread. All three callers happen to be
+    // inside an async fn today, but nothing in the signature says so, and
+    // panicking inside a privacy check is the failure this module's own
+    // `append_event` doc warns about. A refusal is still recorded -- that path
+    // is runtime-safe -- so the audit trail keeps the half that matters.
+    pond_core::shared::services::egress::check_egress(url)
+        .map_err(|denied| anyhow::anyhow!("{denied}"))?;
+
     let status = Command::new("curl")
         .args([
             "-fSL",           // fail on HTTP errors, show errors, follow redirects
@@ -5610,6 +6641,11 @@ async fn build_goose_backend(
         dyn pond_core::user_data::ports::device_control::DeviceControlPort + Send + Sync,
     >,
     session_storage: Option<Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage>>,
+    // Model catalog, so `GooseAdapter` can reach `ModelRecord.context_length`
+    // — rung 3 of the context governor. Optional only so a caller with no
+    // catalog to hand still compiles; every caller in this file supplies one,
+    // because without it an Ollama model's window is guessed from its name.
+    model_repo: Option<Arc<dyn ModelRepository>>,
     voice_mode: bool,
 ) -> (
     Arc<dyn Agent>,
@@ -5784,6 +6820,13 @@ async fn build_goose_backend(
                 Some(provider) => adapter.with_embedding_provider(provider),
                 None => adapter,
             };
+            // The model catalog, which is the only rung of the context governor
+            // that can answer for an Ollama model. Without it the adapter falls
+            // back to a substring match on the model's name.
+            let adapter = match model_repo {
+                Some(repo) => adapter.with_model_repo(repo),
+                None => adapter,
+            };
             if voice_mode {
                 adapter.set_voice_mode(true);
             }
@@ -5798,6 +6841,33 @@ async fn build_goose_backend(
                 as Arc<
                     dyn pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl,
                 >));
+            // PAI-6 P5: the `delegate` tool's handles. Installed here for the
+            // same ordering reason as the toolkit's, and with one detail that
+            // decides whether the feature works at all: the registry passed
+            // here must be `adapter.turn_authorities()`, the SAME map the
+            // adapter publishes each turn's authority into. A freshly
+            // constructed registry compiles, and then answers `None` to every
+            // lookup — which the tool correctly reads as "no live turn" and
+            // refuses, so the failure would look like a working guard rather
+            // than like broken wiring.
+            //
+            // Installed unconditionally, like `init_audit_deps`: the toggle
+            // gates REGISTRATION (in `register_giap_extensions`), so with it off
+            // no server is ever spawned and these handles are simply unused.
+            {
+                let runner: Arc<dyn pond_adapters_goose::orchestrator::ChildRunner> =
+                    Arc::new(pond_adapters_goose::GooseChildRunner::new(adapter.clone()));
+                let orchestrator: Arc<dyn pond_core::shared::ports::orchestrator::Orchestrator> =
+                    Arc::new(pond_adapters_goose::GooseOrchestrator::new(
+                        runner,
+                        adapter.turn_authorities(),
+                    ));
+                pond_mcp_server::init_orchestrator_deps(pond_mcp_server::OrchestratorDeps::new(
+                    orchestrator,
+                    adapter.turn_authorities(),
+                    recipe_repo,
+                ));
+            }
             let agent: Arc<dyn Agent> = adapter;
             (agent, Some(ext_mgr), tool_caller, default_registry)
         }
@@ -5947,6 +7017,26 @@ fn category_to_provider(category: &str) -> String {
 async fn run_models(action: ModelAction) -> Result<()> {
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
+
+    // PAI-2 P6a follow-up: `pond models download` calls
+    // `model_download::download_file` twice and was the FOURTH downloading
+    // entry point, not the third. P6a gated the download and installed the mode
+    // on serve/chat/setup, but never here — so the gate it added was inert on
+    // this path and a stored `network_mode = "offline"` permitted a full model
+    // download. That is a privacy control failing OPEN, which is the polarity
+    // invariant 3 forbids. The guard's detector now looks for functions that
+    // DOWNLOAD rather than functions that call `ensure_onnx_runtime()`, which
+    // is what let the omission through.
+    pond_core::shared::services::egress::set_network_mode(
+        pond_core::shared::services::egress::NetworkMode::parse(
+            &SqliteSettingsRepository::new(db.system.clone())
+                .get()
+                .await
+                .unwrap_or_default()
+                .network_mode,
+        ),
+    );
+
     let repo = Arc::new(SqliteModelRepository::new(db.system.clone()));
 
     match action {
@@ -6203,6 +7293,22 @@ async fn stream_agent_response(
                      send \"continue\" to resume)\x1b[0m"
                 );
             }
+            // PAI-6 P6. On stderr with the other progress chatter, so piping
+            // stdout still yields exactly the assistant's answer. `detail` is a
+            // tool name or a GIAP-authored reason and is printed as it arrives;
+            // it never carries the child's own text.
+            AgentStreamEvent::SubagentProgress {
+                role,
+                status,
+                detail,
+                ..
+            } => {
+                eprint!("\r\x1b[K\x1b[2m  [{role}] {}", status.as_str());
+                if let Some(detail) = detail {
+                    eprint!(" {detail}");
+                }
+                eprintln!("\x1b[0m");
+            }
             AgentStreamEvent::Error { content } => {
                 eprintln!("\n  error: {content}");
                 std::process::exit(1);
@@ -6234,9 +7340,16 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let settings_repo: Arc<
         dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
     > = Arc::new(SqliteSettingsRepository::new(db.system.clone()));
+    // Chokepoint 1 again, for the same reason as the voice path: all three
+    // arms below reach `build_goose_backend`, so all three can write a memory.
     let memory_repo: Arc<
         dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync,
-    > = Arc::new(SqliteMemoryRepository::new(db.system.clone()));
+    > = Arc::new(
+        pond_core::user_data::services::redacting_memory_repository::RedactingMemoryRepository::new(
+            Arc::new(SqliteMemoryRepository::new(db.system.clone())),
+            Arc::new(pond_infra::rule_redactor::RuleRedactor::new()),
+        ),
+    );
     let skill_repo: Arc<dyn pond_core::user_data::ports::skill::UserSkillRepository + Send + Sync> =
         Arc::new(SqliteSkillRepository::new(db.system.clone()));
     let recipe_repo: Arc<
@@ -6253,8 +7366,26 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     > = Arc::new(SqliteDeviceRegistry::new(db.system.clone()));
     let draft_repo: Arc<dyn pond_core::user_data::ports::draft::DraftRepository + Send + Sync> =
         Arc::new(SqliteDraftRepository::new(db.system.clone()));
+    // The catalog the context governor's rung 3 reads. The CLI paths get one
+    // too: a `pond-server chat` turn budgets its history exactly the way a
+    // dashboard turn does, and giving only the server the real window would put
+    // the two back out of agreement — which is the whole defect PAI-3 removes.
+    let cli_model_repo: Arc<dyn ModelRepository + Send + Sync> =
+        Arc::new(SqliteModelRepository::new(db.system.clone()));
 
     let settings = settings_repo.get().await.unwrap_or_default();
+    // PAI-2 P6b: install the egress gate on THIS entry point too. `pond agent`
+    // has read the settings row since it was written, and ignored the one field
+    // on it that says whether the pond is allowed to talk to anybody. All three
+    // arms below reach `build_goose_backend`, which wires the LLM provider, the
+    // weather adapter and the whole MCP tool surface -- everything that phones
+    // out on a turn. Without this the process-global stays at its `Open`
+    // default and every gate those paths inherit evaluates against a mode
+    // nobody chose. P6a fixed the same defect for `run_chat` and `run_setup`
+    // and did not reach here.
+    pond_core::shared::services::egress::set_network_mode(
+        pond_core::shared::services::egress::NetworkMode::parse(&settings.network_mode),
+    );
     // Use the configured LLM server URL (llamafile default). GooseAdapter uses this to
     // route requests when chat_provider = "llamafile"; for ollama/local it uses its own logic.
     let llamafile_url = format!("http://127.0.0.1:{}", ports::llamafile_port());
@@ -6311,6 +7442,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 draft_repo,
                 Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
+                Some(cli_model_repo.clone()),
                 false,
             )
             .await;
@@ -6322,6 +7454,11 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 images: Vec::new(),
                 voice_mode: false,
                 canvas_mode: false,
+                // Local CLI on the device itself. Whoever ran it has shell
+                // access to the pond already, so a narrower scope would be
+                // theatre rather than a boundary.
+                profile_scope: ProfileScope::Household,
+                profile_context: None,
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -6347,6 +7484,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 draft_repo,
                 Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
+                Some(cli_model_repo.clone()),
                 false,
             )
             .await;
@@ -6386,6 +7524,9 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     images: Vec::new(),
                     voice_mode: false,
                     canvas_mode: false,
+                    // Same as the single-shot arm above.
+                    profile_scope: ProfileScope::Household,
+                    profile_context: None,
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");
@@ -6411,6 +7552,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 draft_repo,
                 Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
                 None, // session_storage — not needed for goose backend
+                Some(cli_model_repo.clone()),
                 false,
             )
             .await;
@@ -6729,11 +7871,18 @@ async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
 
     let data_dir = default_data_dir();
     let db = Database::init(&data_dir).await?;
-    let repo = SqliteMemoryRepository::new(db.system.clone());
+    // Chokepoint 1: `memories add` is a direct write path into the same store
+    // the server writes to, and it takes its content straight from argv --
+    // which is where a shell-history copy of a credential comes from.
+    let repo =
+        pond_core::user_data::services::redacting_memory_repository::RedactingMemoryRepository::new(
+            Arc::new(SqliteMemoryRepository::new(db.system.clone())),
+            Arc::new(pond_infra::rule_redactor::RuleRedactor::new()),
+        );
 
     match action {
         MemoryAction::List { limit } => {
-            let fragments = repo.search_recent(None, limit).await?;
+            let fragments = repo.search_recent(&ProfileScope::Household, limit).await?;
             if fragments.is_empty() {
                 println!("No memory fragments found.");
                 return Ok(());
@@ -7147,4 +8296,8 @@ mod tests {
             "tool_model should be synced from tool role assignment"
         );
     }
+
+    // The session-activity seed's guards moved to pond-core with the code
+    // (`shared/domain/session_activity.rs`), because CI only `cargo check`s
+    // this crate — a test that lives here never runs in CI at all.
 }

@@ -4,6 +4,7 @@ use futures::StreamExt;
 use pond_adapters_goose::GooseAdapter;
 use pond_core::shared::domain::agent::AgentRequest;
 use pond_core::shared::domain::agent::AgentStreamEvent;
+use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::ports::settings::SettingsRepository;
 use std::sync::Arc;
@@ -69,6 +70,12 @@ async fn live_action_loop_ollama_executes_tool_call() {
         images: Vec::new(),
         voice_mode: false,
         canvas_mode: false,
+        // PAI-1 P3/P6 made these required on AgentRequest and did not update
+        // the live-hardware tests, so this file stopped compiling and
+        // `cargo test -p pond-adapters-goose -- --ignored` has been failing at
+        // BUILD ever since. Household is what a test with no speaker means.
+        profile_scope: ProfileScope::Household,
+        profile_context: None,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();
@@ -136,6 +143,12 @@ async fn live_action_loop_llamafile_executes_tool_call() {
         images: Vec::new(),
         voice_mode: false,
         canvas_mode: false,
+        // PAI-1 P3/P6 made these required on AgentRequest and did not update
+        // the live-hardware tests, so this file stopped compiling and
+        // `cargo test -p pond-adapters-goose -- --ignored` has been failing at
+        // BUILD ever since. Household is what a test with no speaker means.
+        profile_scope: ProfileScope::Household,
+        profile_context: None,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();
@@ -199,6 +212,12 @@ async fn live_action_loop_local_executes_tool_call() {
         images: Vec::new(),
         voice_mode: false,
         canvas_mode: false,
+        // PAI-1 P3/P6 made these required on AgentRequest and did not update
+        // the live-hardware tests, so this file stopped compiling and
+        // `cargo test -p pond-adapters-goose -- --ignored` has been failing at
+        // BUILD ever since. Household is what a test with no speaker means.
+        profile_scope: ProfileScope::Household,
+        profile_context: None,
     };
 
     let mut stream = adapter.chat_stream(request).await.unwrap();

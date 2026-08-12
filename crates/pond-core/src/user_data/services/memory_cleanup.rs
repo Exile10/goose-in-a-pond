@@ -9,6 +9,7 @@
 use crate::user_data::domain::memory::{
     MemoryEventKind, MemoryFragment, MemoryLifecycle, MemoryTier,
 };
+use crate::user_data::domain::profile::ProfileScope;
 use crate::user_data::ports::memory_repository::MemoryRepository;
 use anyhow::Result;
 
@@ -85,7 +86,7 @@ pub async fn run_cleanup(
     base_half_life_days: f32,
     decay_beta: f32,
 ) -> Result<(usize, usize, usize)> {
-    let memories = repo.search_scoreable(None).await?;
+    let memories = repo.search_scoreable(&ProfileScope::Household).await?;
     let mut updates: Vec<(String, MemoryLifecycle)> = Vec::new();
     let mut event_kinds: Vec<(String, MemoryEventKind)> = Vec::new();
     let mut pruned = 0;

@@ -143,7 +143,21 @@ pub async fn ensure_espeak_ng_data(data_dir: &Path) {
     let url = format!("{}/piper_linux_x86_64.tar.gz", PIPER_GITHUB_BASE);
     println!("  downloading espeak-ng-data...");
 
-    let bytes = match reqwest::get(&url).await.and_then(|r| Ok(r)) {
+    // PAI-2 P6a: github.com is not a curated public suffix, so it classifies
+    // Sensitive and both restrictive modes refuse it. That is the intended
+    // polarity -- espeak-ng-data is a convenience fetch, and the caller already
+    // treats a failure as non-fatal.
+    let call = match pond_core::shared::services::egress::begin(&url, "GET") {
+        Ok(call) => call,
+        Err(denied) => {
+            tracing::warn!("espeak-ng-data download refused: {denied}");
+            return;
+        }
+    };
+    let sent = reqwest::get(&url).await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+
+    let bytes = match sent {
         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
             Ok(b) => b.to_vec(),
             Err(e) => {
@@ -357,10 +371,20 @@ pub async fn download_file(url: &str, dest: &Path, approx_size_mb: u64) -> Resul
             req = req.bearer_auth(tok);
         }
     }
-    let resp = req
-        .send()
-        .await
+    // PAI-2 P6a. Stated out loud rather than discovered: neither
+    // `huggingface.co` nor `github.com` is in `KNOWN_PUBLIC_SUFFIXES`, so both
+    // classify Sensitive, so `network_mode = "allowlist"` refuses every model
+    // download from here on. That is the correct polarity -- invariant 4 says
+    // the fail-Sensitive default stands and public suffixes are added
+    // deliberately, not to soften a refusal -- and it IS a behaviour change for
+    // anyone already on `allowlist`. The fix is an actionable message, which
+    // `EgressDenied` already renders (mode, host, and what to set), plus the
+    // URL for context so the operator knows which download stopped.
+    let call = pond_core::shared::services::egress::begin(url, "GET")
         .with_context(|| format!("Failed to fetch {url}"))?;
+    let sent = req.send().await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    let resp = sent.with_context(|| format!("Failed to fetch {url}"))?;
 
     if !resp.status().is_success() {
         // Surface the most common error (gated repo + missing token) in plain
@@ -680,11 +704,14 @@ async fn fetch_buffalo_l_zip(out_dir: &Path, embed_dest: &Path, detect_dest: &Pa
     );
 
     let client = reqwest::Client::builder().build()?;
-    let resp = client
-        .get(BUFFALO_L_ZIP_URL)
-        .send()
-        .await
+    // PAI-2 P6a: a `cfg`-gated sender is still a sender. This one only
+    // compiles under `face-onnx`, which is exactly why it is easy to miss --
+    // the egress guard scans source text, not the built binary.
+    let call = pond_core::shared::services::egress::begin(BUFFALO_L_ZIP_URL, "GET")
         .context("Failed to fetch buffalo_l.zip")?;
+    let sent = client.get(BUFFALO_L_ZIP_URL).send().await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    let resp = sent.context("Failed to fetch buffalo_l.zip")?;
     if !resp.status().is_success() {
         return Err(anyhow!(
             "Server returned {} for buffalo_l.zip",
@@ -892,5 +919,101 @@ mod tests {
             !dest.exists(),
             "partial file should not exist after connection failure"
         );
+    }
+
+    // ── PAI-2 P6a: the network-mode gate on the download path ────────────────
+    //
+    // `egress_guard.rs` checks that this FILE mentions a tracker symbol. This
+    // file has THREE senders (`download_file`, `ensure_espeak_ng_data`, and the
+    // `face-onnx`-gated `fetch_buffalo_l_zip`), so that check would go green on
+    // one of them while the other two still phoned out. This is the behavioural
+    // half for the one that matters: `download_file` is the path every model,
+    // voice and ONNX fetch in the product goes through.
+    //
+    // The other two are NOT covered behaviourally and this says so rather than
+    // implying otherwise. `ensure_espeak_ng_data` shells out to `brew` and has
+    // half a dozen environment-dependent early returns before it reaches the
+    // network, so a test of it would pass on this machine without ever touching
+    // the gate — a vacuous test wearing a coverage badge. `fetch_buffalo_l_zip`
+    // only compiles under `--features face-onnx`. Both are gated in source and
+    // reviewed; neither is proven here.
+
+    /// Restores the previous mode however the test exits, panic included.
+    ///
+    /// `network_mode` is a process-global `RwLock` shared with every other test
+    /// in this binary. Flipping it to `Offline` is safe here only because
+    /// `Offline` still permits loopback and every sibling test in this crate
+    /// that sends anything sends to 127.0.0.1 (wiremock, or the reserved port 1
+    /// above). A test that wanted `Allowlist` would refuse those and would need
+    /// a serialising lock instead.
+    struct ModeGuard(pond_core::shared::services::egress::NetworkMode);
+
+    impl ModeGuard {
+        fn set(mode: pond_core::shared::services::egress::NetworkMode) -> Self {
+            let previous = pond_core::shared::services::egress::network_mode();
+            pond_core::shared::services::egress::set_network_mode(mode);
+            Self(previous)
+        }
+    }
+
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            pond_core::shared::services::egress::set_network_mode(self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_refuses_a_download_and_says_which_setting_did_it() {
+        use pond_core::shared::services::egress::NetworkMode;
+
+        // A loopback server that WOULD serve the file, so the permitted half
+        // below is a real download and not an assertion about nothing.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ok.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".as_slice()))
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().unwrap();
+        let _mode = ModeGuard::set(NetworkMode::Offline);
+
+        // ── refused ──────────────────────────────────────────────────────────
+        // `.invalid` is reserved and never resolves (RFC 2606). If the gate
+        // stopped firing this would still fail, but with a DNS error — which is
+        // exactly what the two assertions below tell apart. An error message
+        // that does not name the setting is indistinguishable from the network
+        // being down, which is the defect P5 found in the weather route.
+        let err = download_file(
+            "https://cdn.invalid/model.bin",
+            &tmp.path().join("refused.bin"),
+            1,
+        )
+        .await
+        .expect_err("offline must refuse a non-loopback download");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("network_mode") && rendered.contains("offline"),
+            "the refusal must name the setting and its value, or the user \
+             cannot tell it from an outage: {rendered}"
+        );
+        assert!(
+            rendered.contains("cdn.invalid"),
+            "the refusal must name the host it refused: {rendered}"
+        );
+        assert!(
+            !tmp.path().join("refused.bin").exists(),
+            "a refused download must leave nothing on disk"
+        );
+
+        // ── still permitted ──────────────────────────────────────────────────
+        // The vacuity control. A gate that refused everything would satisfy the
+        // assertions above and take the pond off its own loopback model server.
+        let allowed = tmp.path().join("ok.bin");
+        download_file(&format!("{}/ok.bin", server.uri()), &allowed, 1)
+            .await
+            .expect("offline still permits loopback");
+        assert_eq!(std::fs::read(&allowed).unwrap(), b"payload");
     }
 }

@@ -690,6 +690,11 @@ fn generation_task(
     let _ = tx.blocking_send(Ok(ChatEvent::Usage(UsageStats {
         prompt_tokens: prompt_token_count as u32,
         completion_tokens: output_token_count,
+        // The oaicompat delta loop here reads `content` and `tool_calls` only —
+        // `reasoning_content` is documented as parsed and is not consumed. This
+        // engine feeds the quarantined PondAgent loop (Q2-05), so PAI-5 P2 left
+        // it alone rather than counting a channel nothing reads.
+        reasoning_tokens: None,
     })));
 }
 

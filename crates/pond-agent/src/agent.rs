@@ -22,6 +22,7 @@ use pond_core::models::domain::model_capabilities::ModelCapabilities;
 use pond_core::models::ports::agent::Agent;
 use pond_core::models::ports::inference::{InferenceOptions, InferenceProvider, ToolDefinition};
 use pond_core::models::ports::provider::UsageStats;
+use pond_core::models::services::context::context_governor::{ContextGovernor, ContextInputs};
 use pond_core::models::services::context_budget::{available_history_chars, CompactionProfile};
 use pond_core::models::services::history_manager::HistoryManager;
 use pond_core::models::services::prompt_builder;
@@ -372,11 +373,22 @@ impl Agent for PondAgent {
         //    Profile is keyed off the provider's effective context window; the
         //    history budget gets whatever is left after the system prompt and
         //    tool-schema overhead are accounted for.
-        let context_tokens = if settings.context_window_override > 0 {
-            (settings.context_window_override as usize).min(caps.context_window_tokens as usize)
-        } else {
-            caps.context_window_tokens as usize
-        };
+        // Precedence lives in pond-core's ContextGovernor so this loop cannot
+        // drift from the live path (PAI-3). Note this REPLACES a `min(override,
+        // caps)` rule: the governor lets the override win outright, because an
+        // override exists precisely for deployments where the capability number
+        // is wrong. Safe to change here — this crate is quarantined (Q2-05) and
+        // not activatable at runtime.
+        let context_tokens = ContextGovernor::resolve(&ContextInputs {
+            provider: &settings.chat_provider,
+            model: &settings.chat_model,
+            override_tokens: settings.context_window_override,
+            registry_pinned: None,
+            catalog_context_length: None,
+            engine_reported: None,
+            capability_window: Some(caps.context_window_tokens),
+        })
+        .tokens;
         let profile = CompactionProfile::from_context_window(context_tokens);
         let tool_schema_chars = tools_json_override.as_ref().map(|j| j.len()).unwrap_or(0);
         let history_budget =
@@ -632,6 +644,7 @@ impl Agent for PondAgent {
                         created_at: chrono::Utc::now(),
                         prompt_tokens: None,
                         completion_tokens: None,
+                        reasoning_tokens: None,
                     };
                     if let Err(e) = storage_ref
                         .add_message(session_id_persist.clone(), sm)
@@ -669,6 +682,7 @@ impl Agent for PondAgent {
 mod tests {
     use super::*;
     use pond_core::models::ports::inference::ChatEventStream;
+    use pond_core::user_data::domain::profile::ProfileScope;
     use pond_core::user_data::domain::session::{Session, SessionMessage};
     use pond_core::user_data::ports::device_registry::{Device, RegisterDeviceRequest};
     use pond_core::user_data::ports::session_storage::SessionStorageError;
@@ -790,6 +804,7 @@ mod tests {
                 yield Ok(pond_core::models::ports::inference::ChatEvent::Usage(UsageStats {
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    reasoning_tokens: None,
                 }));
             })
         }
@@ -826,6 +841,12 @@ mod tests {
                 images: vec![],
                 voice_mode: false,
                 canvas_mode: false,
+                // States what this fixture is, nothing more. This loop does not
+                // read either field -- it is quarantined (Q2-05) and its scope
+                // handling is unwritten, so Household here is a description of
+                // the fixture, not evidence the loop honours a scope.
+                profile_scope: ProfileScope::Household,
+                profile_context: None,
             })
             .await
             .unwrap();
@@ -844,6 +865,8 @@ mod tests {
                 images: vec![],
                 voice_mode: false,
                 canvas_mode: false,
+                profile_scope: ProfileScope::Household,
+                profile_context: None,
             })
             .await
             .unwrap();

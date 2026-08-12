@@ -15,6 +15,7 @@ use crate::user_data::domain::memory::{
     cosine_similarity, fact_defect, is_captured_request, names_user, normalise_fact_content,
     MemoryEventKind, MemoryFragment, MemorySegment,
 };
+use crate::user_data::domain::profile::ProfileScope;
 use crate::user_data::ports::memory_extractor::MemoryExtractor;
 use crate::user_data::ports::memory_repository::MemoryRepository;
 use crate::user_data::services::memory_relevance::{
@@ -60,7 +61,14 @@ impl MemoryExtractionService {
         user_message: &str,
         assistant_response: &str,
         session_id: Option<&str>,
+        scope: &ProfileScope,
     ) {
+        // A guest's words are not written down. This is the write half of guest
+        // degradation: the read half (no memory injection) would be pointless
+        // if the turn still deposited a fragment the household could recall.
+        if scope.excludes_everything() {
+            return;
+        }
         if user_message.len() < MIN_MESSAGE_LEN && assistant_response.len() < MIN_MESSAGE_LEN {
             return;
         }
@@ -81,7 +89,7 @@ impl MemoryExtractionService {
         // Fetch recent memories for dedup. Grows as this run stores facts, so
         // two near-identical facts in one turn cannot both land.
         let mut existing: Vec<String> = repo
-            .search_recent(None, DEDUP_RECENT_WINDOW)
+            .search_recent(&ProfileScope::Household, DEDUP_RECENT_WINDOW)
             .await
             .unwrap_or_default()
             .into_iter()
@@ -203,7 +211,7 @@ impl MemoryExtractionService {
             };
             if let Some(vector) = semantic_candidate {
                 if let Ok(neighbours) = repo
-                    .search_similar(vector, None, SEMANTIC_DEDUP_NEIGHBOURS)
+                    .search_similar(vector, &ProfileScope::Household, SEMANTIC_DEDUP_NEIGHBOURS)
                     .await
                 {
                     if let Some(dupe) = neighbours.iter().find(|n| {
@@ -230,13 +238,28 @@ impl MemoryExtractionService {
                 importance,
                 fact.corrects.clone(),
             );
+            // PAI-1: stamp the owner. Before this, every extracted memory was
+            // written with profile_id: None, which made `Owner(id)` reads select
+            // exactly the same rows as `Household` -- the scoping was real
+            // plumbing with nothing flowing through it.
+            fragment.profile_id = scope.owner_id().map(str::to_string);
             fragment.embedding = embedding;
 
             if let Err(e) = repo.add(fragment).await {
                 tracing::warn!("[memory-extraction] failed to store fact: {e}");
             } else {
                 stored += 1;
-                tracing::info!("[memory-extraction] stored: {content:?}");
+                // PAI-2 P3: the fact itself is not logged. This line is INFO,
+                // and INFO is what the on-disk log file under <data_dir>/logs
+                // keeps, so every extracted memory was landing in plaintext in
+                // a second place -- with none of the store's scoping, none of
+                // its retention, and none of chokepoint 1's redaction. The id
+                // correlates the line with the row; the row is the record.
+                tracing::info!(
+                    memory_id = %id,
+                    chars = content.chars().count(),
+                    "[memory-extraction] stored a fact"
+                );
                 existing.push(content.to_lowercase());
                 let _ = repo
                     .log_event(MemoryEventKind::Extracted, &id, session_id, None)
@@ -263,7 +286,7 @@ mod tests {
     const TURN_ASSISTANT: &str = "Noted — the pantry it is.";
 
     /// Extractor that always yields one fixed fact.
-    struct FixedExtractor(&'static str);
+    pub(super) struct FixedExtractor(pub(super) &'static str);
 
     #[async_trait]
     impl MemoryExtractor for FixedExtractor {
@@ -303,7 +326,14 @@ mod tests {
 
     async fn run_once(extractor: &dyn MemoryExtractor, repo: &MockMemoryRepository) {
         MemoryExtractionService::new(0)
-            .run(extractor, repo, TURN_USER, TURN_ASSISTANT, None)
+            .run(
+                extractor,
+                repo,
+                TURN_USER,
+                TURN_ASSISTANT,
+                None,
+                &ProfileScope::Household,
+            )
             .await;
     }
 
@@ -352,10 +382,14 @@ mod tests {
                 TURN_USER,
                 TURN_ASSISTANT,
                 None,
+                &ProfileScope::Household,
             )
             .await;
 
-        let stored = repo.search_recent(None, 10).await.unwrap();
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].embedding, Some(vec![1.0, 0.0, 0.0]));
     }
@@ -388,10 +422,14 @@ mod tests {
                 TURN_USER,
                 TURN_ASSISTANT,
                 None,
+                &ProfileScope::Household,
             )
             .await;
 
-        let stored = repo.search_recent(None, 10).await.unwrap();
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         assert_eq!(
             stored.len(),
             1,
@@ -426,10 +464,17 @@ mod tests {
                 TURN_USER,
                 TURN_ASSISTANT,
                 None,
+                &ProfileScope::Household,
             )
             .await;
 
-        assert_eq!(repo.search_recent(None, 10).await.unwrap().len(), 2);
+        assert_eq!(
+            repo.search_recent(&ProfileScope::Household, 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -445,10 +490,14 @@ mod tests {
                 TURN_USER,
                 TURN_ASSISTANT,
                 None,
+                &ProfileScope::Household,
             )
             .await;
 
-        let stored = repo.search_recent(None, 10).await.unwrap();
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         assert_eq!(stored.len(), 1);
         assert!(stored[0].embedding.is_none());
     }
@@ -465,10 +514,14 @@ mod tests {
                 TURN_USER,
                 TURN_ASSISTANT,
                 None,
+                &ProfileScope::Household,
             )
             .await;
 
-        let stored = repo.search_recent(None, 10).await.unwrap();
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         assert_eq!(stored.len(), 1);
         assert!(stored[0].embedding.is_none());
     }
@@ -485,7 +538,10 @@ mod tests {
             let repo = MockMemoryRepository::new();
             run_once(&FixedExtractor(junk), &repo).await;
             assert!(
-                repo.search_recent(None, 10).await.unwrap().is_empty(),
+                repo.search_recent(&ProfileScope::Household, 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
                 "stored junk: {junk:?}"
             );
         }
@@ -503,7 +559,10 @@ mod tests {
         )
         .await;
 
-        let stored = repo.search_recent(None, 10).await.unwrap();
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].segment, Some(MemorySegment::Context));
         assert_eq!(stored[0].tier, Some(MemoryTier::Short));
@@ -526,7 +585,10 @@ mod tests {
         )
         .await;
 
-        let stored = repo.search_recent(None, 10).await.unwrap();
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].segment, Some(MemorySegment::Project));
     }
@@ -553,7 +615,10 @@ mod tests {
         )
         .await;
 
-        let stored = repo.search_recent(None, 10).await.unwrap();
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].id, "existing");
     }
@@ -580,7 +645,13 @@ mod tests {
         ]);
 
         run_once(&extractor, &repo).await;
-        assert_eq!(repo.search_recent(None, 10).await.unwrap().len(), 1);
+        assert_eq!(
+            repo.search_recent(&ProfileScope::Household, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     // ── corrections survive dedup ───────────────────────────────────────
@@ -602,7 +673,10 @@ mod tests {
 
         run_once(&ScriptedExtractor(vec![correction]), &repo).await;
 
-        let mut rows = repo.search_recent(None, 10).await.unwrap();
+        let mut rows = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         rows.sort_by(|a, b| a.id.cmp(&b.id));
         rows.into_iter().map(|f| f.content).collect()
     }
@@ -705,10 +779,17 @@ mod tests {
                 TURN_USER,
                 TURN_ASSISTANT,
                 None,
+                &ProfileScope::Household,
             )
             .await;
 
-        assert_eq!(repo.search_recent(None, 10).await.unwrap().len(), 2);
+        assert_eq!(
+            repo.search_recent(&ProfileScope::Household, 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -732,6 +813,114 @@ mod tests {
         ]);
 
         run_once(&extractor, &repo).await;
-        assert_eq!(repo.search_recent(None, 10).await.unwrap().len(), 2);
+        assert_eq!(
+            repo.search_recent(&ProfileScope::Household, 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::tests::FixedExtractor;
+    use super::*;
+    use crate::user_data::mocks::mock_memory::MockMemoryRepository;
+
+    /// Before PAI-1 wired the write side, every extracted memory was stored
+    /// with `profile_id: None`. That made `Owner(id)` reads select exactly the
+    /// same rows as `Household` -- real plumbing with nothing flowing through
+    /// it. Nothing tested it, because the only fixtures that produced an owned
+    /// row set `profile_id` by hand, a state no production path could reach.
+    #[tokio::test]
+    async fn an_extracted_memory_is_stamped_with_its_owner() {
+        let repo = MockMemoryRepository::new();
+        let extractor = FixedExtractor("the boiler is a Vaillant ecoTEC");
+        let svc = MemoryExtractionService::new(0);
+
+        svc.run(
+            &extractor,
+            &repo,
+            "my boiler is a Vaillant ecoTEC and the code is F28",
+            "Noted, I will remember that about your boiler.",
+            Some("sess-1"),
+            &ProfileScope::Owner("jerry".to_string()),
+        )
+        .await;
+
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 50)
+            .await
+            .unwrap();
+        assert!(!stored.is_empty(), "extraction must have written something");
+        assert!(
+            stored
+                .iter()
+                .all(|f| f.profile_id.as_deref() == Some("jerry")),
+            "every extracted fragment must name its owner, got {:?}",
+            stored
+                .iter()
+                .map(|f| f.profile_id.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The write half of guest degradation. Suppressing memory *injection* for
+    /// a guest is pointless if the turn still deposits a fragment the whole
+    /// household can recall afterwards.
+    #[tokio::test]
+    async fn a_guest_turn_writes_nothing_at_all() {
+        let repo = MockMemoryRepository::new();
+        let extractor = FixedExtractor("the boiler is a Vaillant ecoTEC");
+        let svc = MemoryExtractionService::new(0);
+
+        svc.run(
+            &extractor,
+            &repo,
+            "my boiler is a Vaillant ecoTEC and the code is F28",
+            "Noted, I will remember that about your boiler.",
+            Some("sess-1"),
+            &ProfileScope::Guest,
+        )
+        .await;
+
+        assert!(
+            repo.search_recent(&ProfileScope::Household, 50)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a guest's words must not be written down"
+        );
+    }
+
+    /// Household stays unattributed, which is what makes it shared context and
+    /// what every pre-PAI-1 row already is.
+    #[tokio::test]
+    async fn a_household_turn_stays_unattributed() {
+        let repo = MockMemoryRepository::new();
+        let extractor = FixedExtractor("the boiler is a Vaillant ecoTEC");
+        let svc = MemoryExtractionService::new(0);
+
+        svc.run(
+            &extractor,
+            &repo,
+            "the spare key is under the third plant pot on the left",
+            "Understood, I will remember where the spare key is.",
+            Some("sess-1"),
+            &ProfileScope::Household,
+        )
+        .await;
+
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 50)
+            .await
+            .unwrap();
+        assert!(!stored.is_empty());
+        assert!(
+            stored.iter().all(|f| f.profile_id.is_none()),
+            "household context must stay unattributed so it survives a member's deletion"
+        );
     }
 }

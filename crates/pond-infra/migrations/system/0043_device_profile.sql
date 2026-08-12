@@ -1,0 +1,97 @@
+-- PAI-1 -- the device-to-profile rung.
+--
+-- `identity_resolution::resolve` has honoured `paired_device_profile` since
+-- 2026-08-04 and every caller has fed it `None`, because nothing in the schema
+-- linked a phone to the person holding it. PAI-7 section 3.4 assumes the chain
+-- profile -> paired devices -> push tokens exists; it did not. This is that
+-- chain's only missing link.
+--
+-- ── Why `devices` and not `push_tokens` ────────────────────────────────────
+--
+-- `push_tokens.device_id` is already a foreign key into `devices` with
+-- ON DELETE CASCADE, and the two-phase handshake writes a `devices` row on
+-- every successful pair (`SqliteHandshakeAdapter::verify_handshake`). So one
+-- column here gives the whole chain: profile -> devices -> push_tokens, with a
+-- single writable source of truth. Putting `profile_id` on `push_tokens` as
+-- well would create a second one that can disagree with the first, and the
+-- disagreement would be invisible until a notification reached the wrong
+-- person.
+--
+-- ── What NULL means, and what it must never mean ───────────────────────────
+--
+-- NULL is **unattributed**: "no household member has claimed this device". It
+-- is the normal case, not an error -- pairing happens before anyone says who
+-- they are, and a kitchen tablet is genuinely shared.
+--
+-- It is deliberately NOT the same classification `Household` gets on
+-- `memory_fragments`. PAI-1 invariant 4 says `Household` is a positive
+-- classification rather than a synonym for NULL, and an unattributed *memory*
+-- is shared household context by that deliberate classification. A device is
+-- not content, it is a destination, and the two failure modes are not
+-- symmetric: reading shared content discloses nothing new, while delivering a
+-- targeted message to an unclaimed screen in a shared room is exactly the
+-- disclosure PAI-1 exists to prevent. So:
+--
+--   * the delivery direction (`devices_for_profile`) matches `profile_id = ?`
+--     and therefore returns NO unattributed device. An unaddressable proposal
+--     is delivered to nobody, loudly, rather than to everybody, quietly.
+--     Reaching the shared tablet stays the broadcast path's job, which is
+--     honest about being a broadcast.
+--   * the identity direction (`paired_device_profile`) reads NULL as "I do not
+--     know", so the resolver falls through to its next rung exactly as it does
+--     today. That is a narrowing, and it is the pre-existing behaviour.
+--
+-- ── The delete rule ────────────────────────────────────────────────────────
+--
+-- ON DELETE SET NULL, declared inline. PAI-1 P2 hit the other half of this on
+-- `sessions.profile_id`: migration 0003 declared that column with a REFERENCES
+-- clause and NO action, which is harmless only while the column is never
+-- written, and 0037 had to add a BEFORE DELETE trigger because SQLite cannot
+-- add an action to an existing column in place. A column being added now has no
+-- such problem -- SQLite accepts a REFERENCES clause on ALTER TABLE ADD COLUMN
+-- provided the default is NULL, which it is -- so the action is declared where
+-- it belongs.
+--
+-- Verified with the sqlite3 CLI before writing this file: with
+-- `PRAGMA foreign_keys = ON` (which `Database::init` sets), attributing a
+-- device and then deleting the member leaves the device row present with
+-- `profile_id` NULL, leaves its push token intact, and reports zero rows from
+-- `pragma_foreign_key_check`. Removing a household member must not fail
+-- because they owned a phone, and must not leave that phone pointing at a
+-- ghost; both halves hold.
+--
+-- ── Against a database that already has rows ───────────────────────────────
+--
+-- Every existing `devices` and `pairing_codes` row gets NULL, which is the
+-- correct answer for all of them: no pond has ever captured who was pairing.
+-- Unattributed devices keep working unchanged -- they are still registered,
+-- still receive broadcasts, still heartbeat -- they simply are not any member's
+-- device, which is the truth. No backfill from `settings.primary_profile_id`:
+-- that would attribute every phone in the house to one person, which is the
+-- wrong-attribution failure this whole workstream exists to prevent.
+ALTER TABLE devices ADD COLUMN profile_id TEXT REFERENCES profiles(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_devices_profile ON devices(profile_id);
+
+-- The capture point is the pairing CODE, not the pairing request.
+--
+-- The obvious alternative is a `profile_id` on `VerifyRequest`: the client says
+-- who it is while pairing. That is the same shape as the live hole PAI-1 P4
+-- closed on `PUT /sessions/{id}/user`, which took a `profile_id` from the
+-- request body and bound it at `Explicit` strength with no ownership check at
+-- all. It would be worse here, because `PairedDevice` is the STRONGEST rung of
+-- `identity_resolution::resolve` and outranks both face and explicit -- so a
+-- client-asserted profile would not merely be unproven, it would outrank every
+-- proof the pond can actually make.
+--
+-- A pairing code is issued by the operator on the host: `handshake_pairing_code`
+-- and `handshake_issue_pairing_code` both refuse a non-loopback peer inside the
+-- handler. Binding the member there means the answer to "who is this device?"
+-- comes from somebody standing at the pond, and the pairing client cannot
+-- influence it. The code already has single-use, expiry and hash-only-at-rest
+-- semantics; the attribution inherits all three.
+--
+-- ON DELETE SET NULL for the same reason as above: deleting a member while an
+-- unconsumed code is outstanding must not fail, and the code must not survive
+-- pointing at a ghost. It degrades to an ordinary unattributed code.
+ALTER TABLE pairing_codes ADD COLUMN profile_id TEXT REFERENCES profiles(id) ON DELETE SET NULL;

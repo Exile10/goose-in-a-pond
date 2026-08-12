@@ -551,6 +551,40 @@ doctor() {
     fi
   fi
 
+  # 13. secret store encryption (PAI-2 P4)
+  #
+  # This is the only place the product tells an operator that their API keys
+  # and connector tokens are gone. The server logs it at ERROR on startup, but
+  # nobody reads a log they have no reason to open.
+  local sec_file key_file km
+  sec_file="$D_DATA_DIR/secrets.json"
+  key_file="${POND_SECRET_KEY_FILE:-$D_DATA_DIR/secrets/master.key}"
+  if [ ! -f "$sec_file" ]; then
+    info "no secret store yet (no API keys or connector tokens saved)"
+  elif ! grep -q 'giap-secret-envelope-v1' "$sec_file" 2>/dev/null; then
+    bad "secrets.json is PLAINTEXT — API keys and OAuth tokens are readable in the file"
+    note "a server built after PAI-2 P4 encrypts it on the next start; this pond is on an older binary"
+    DOC_FAIL=$((DOC_FAIL+1))
+  elif [ ! -f "$key_file" ]; then
+    bad "secrets.json is encrypted but its key is MISSING at $key_file"
+    note "every API key and connector token in it is unrecoverable — there is no passphrase"
+    note "to start over: move $sec_file aside, restart, re-enter keys, re-authorise connectors"
+    DOC_FAIL=$((DOC_FAIL+1))
+  else
+    km="$(stat -f '%Lp' "$key_file" 2>/dev/null || stat -c '%a' "$key_file" 2>/dev/null || echo '?')"
+    if [ "$km" = "600" ]; then
+      ok "secret store encrypted; key present at $key_file (0600)"
+    else
+      warn "secret store key at $key_file has mode $km, expected 600"
+      DOC_WARN=$((DOC_WARN+1))
+    fi
+    case "$key_file" in
+      "$D_DATA_DIR"/*)
+        note "the key sits inside the data directory — copying the directory copies both halves"
+        note "set POND_SECRET_KEY_FILE to a separate mount if device theft is the threat you care about" ;;
+    esac
+  fi
+
   printf '\n  %sVerdict: %s FAIL · %s WARN · %s UNKNOWN%s\n' \
     "$C_B" "$DOC_FAIL" "$DOC_WARN" "$DOC_UNK" "$C_RST"
   [ "$DOC_UNK" -gt 0 ] && note "UNKNOWN is never counted as OK — absence of evidence is not health"

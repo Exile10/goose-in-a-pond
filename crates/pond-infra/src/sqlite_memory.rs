@@ -11,6 +11,7 @@ use pond_core::user_data::domain::memory::{
     cosine_similarity, MemoryEvent, MemoryEventKind, MemoryFragment, MemoryLifecycle,
     MemorySegment, MemoryTier,
 };
+use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use serde_json;
 use sqlx::{Pool, Sqlite};
@@ -104,6 +105,35 @@ fn row_to_fragment(row: FragmentRow) -> MemoryFragment {
     }
 }
 
+/// SQL predicate and optional bind value for a [`ProfileScope`].
+///
+/// Every scoped read funnels through this so the three variants cannot drift
+/// apart across five query builders — which is exactly what happened to the old
+/// `Option<&str>` filter, duplicated as a `match` in each method.
+///
+/// The returned fragment is always appended to an existing `WHERE`, so it
+/// begins with `AND` or is empty.
+///
+/// - `Owner(id)` — the person's own rows **plus unattributed ones**. A row with
+///   `profile_id IS NULL` predates per-profile attribution or is genuinely
+///   shared; hiding it would make the assistant forget household facts the
+///   moment identity landed.
+/// - `Household` — no predicate at all. Byte-identical to the pre-PAI-1 `None`
+///   branch, which is what makes phase P1 a behaviour-preserving refactor.
+/// - `Guest` — matches nothing. Callers short-circuit before running the query,
+///   but the predicate is correct on its own so a missed short-circuit fails
+///   closed rather than leaking the household's memory.
+fn scope_sql(scope: &ProfileScope) -> (&'static str, Option<&str>) {
+    match scope {
+        ProfileScope::Owner(id) => (
+            "AND (profile_id = ? OR profile_id IS NULL)",
+            Some(id.as_str()),
+        ),
+        ProfileScope::Household => ("", None),
+        ProfileScope::Guest => ("AND 1 = 0", None),
+    }
+}
+
 /// All columns selected by all queries.
 const SELECT_ALL: &str = "\
     id, profile_id, session_id, content, embedding, source, tags, created_at, \
@@ -189,60 +219,43 @@ impl MemoryRepository for SqliteMemoryRepository {
 
     async fn search_recent(
         &self,
-        profile_id: Option<&str>,
+        scope: &ProfileScope,
         limit: usize,
     ) -> Result<Vec<MemoryFragment>> {
-        let query = match profile_id {
-            Some(_) => format!(
-                "SELECT {SELECT_ALL} FROM memory_fragments \
-                 WHERE profile_id = ? AND (lifecycle IS NULL OR lifecycle = 'active') \
-                 ORDER BY created_at DESC LIMIT ?"
-            ),
-            None => format!(
-                "SELECT {SELECT_ALL} FROM memory_fragments \
-                 WHERE (lifecycle IS NULL OR lifecycle = 'active') \
-                 ORDER BY created_at DESC LIMIT ?"
-            ),
-        };
-
-        let rows: Vec<FragmentRow> = match profile_id {
-            Some(pid) => {
-                sqlx::query_as(&query)
-                    .bind(pid)
-                    .bind(limit as i64)
-                    .fetch_all(&self.pool)
-                    .await?
-            }
-            None => {
-                sqlx::query_as(&query)
-                    .bind(limit as i64)
-                    .fetch_all(&self.pool)
-                    .await?
-            }
-        };
+        if scope.excludes_everything() {
+            return Ok(vec![]);
+        }
+        let (filter, bind) = scope_sql(scope);
+        let query = format!(
+            "SELECT {SELECT_ALL} FROM memory_fragments \
+             WHERE (lifecycle IS NULL OR lifecycle = 'active') {filter} \
+             ORDER BY created_at DESC LIMIT ?"
+        );
+        let mut q = sqlx::query_as::<_, FragmentRow>(&query);
+        if let Some(pid) = bind {
+            q = q.bind(pid);
+        }
+        let rows: Vec<FragmentRow> = q.bind(limit as i64).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(row_to_fragment).collect())
     }
 
     async fn search_similar(
         &self,
         query_embedding: &[f32],
-        profile_id: Option<&str>,
+        scope: &ProfileScope,
         limit: usize,
     ) -> Result<Vec<MemoryFragment>> {
-        let query = match profile_id {
-            Some(_) => format!(
-                "SELECT {SELECT_ALL} FROM memory_fragments \
-                 WHERE embedding IS NOT NULL AND profile_id = ? \
-                 AND (lifecycle IS NULL OR lifecycle = 'active')"
-            ),
-            None => format!(
-                "SELECT {SELECT_ALL} FROM memory_fragments \
-                 WHERE embedding IS NOT NULL \
-                 AND (lifecycle IS NULL OR lifecycle = 'active')"
-            ),
-        };
+        if scope.excludes_everything() {
+            return Ok(vec![]);
+        }
+        let (filter, bind) = scope_sql(scope);
+        let query = format!(
+            "SELECT {SELECT_ALL} FROM memory_fragments \
+             WHERE embedding IS NOT NULL \
+             AND (lifecycle IS NULL OR lifecycle = 'active') {filter}"
+        );
 
-        let rows: Vec<FragmentRow> = match profile_id {
+        let rows: Vec<FragmentRow> = match bind {
             Some(pid) => {
                 sqlx::query_as(&query)
                     .bind(pid)
@@ -253,7 +266,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         };
 
         if rows.is_empty() {
-            return self.search_recent(profile_id, limit).await;
+            return self.search_recent(scope, limit).await;
         }
 
         let mut scored: Vec<(f32, MemoryFragment)> = rows
@@ -269,6 +282,17 @@ impl MemoryRepository for SqliteMemoryRepository {
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
         Ok(scored.into_iter().map(|(_, f)| f).collect())
+    }
+
+    async fn count_for_profile(&self, profile_id: &str) -> Result<u64> {
+        // Deliberately no `OR profile_id IS NULL`. See the port doc: those rows
+        // are shared household context and they outlive the member.
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM memory_fragments WHERE profile_id = ?")
+                .bind(profile_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count.max(0) as u64)
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
@@ -307,10 +331,10 @@ impl MemoryRepository for SqliteMemoryRepository {
     async fn search_by_content(
         &self,
         keywords: &[String],
-        profile_id: Option<&str>,
+        scope: &ProfileScope,
         limit: usize,
     ) -> Result<Vec<MemoryFragment>> {
-        if keywords.is_empty() {
+        if keywords.is_empty() || scope.excludes_everything() {
             return Ok(vec![]);
         }
 
@@ -322,11 +346,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             .collect();
         let likes_sql = like_clauses.join(" OR ");
 
-        let profile_filter = if profile_id.is_some() {
-            "AND profile_id = ?"
-        } else {
-            ""
-        };
+        let (profile_filter, profile_bind) = scope_sql(scope);
 
         let sql = format!(
             "SELECT {SELECT_ALL} FROM memory_fragments \
@@ -344,7 +364,7 @@ impl MemoryRepository for SqliteMemoryRepository {
             query = query.bind(format!("%{}%", kw.to_lowercase()));
         }
 
-        if let Some(pid) = profile_id {
+        if let Some(pid) = profile_bind {
             query = query.bind(pid);
         }
 
@@ -382,61 +402,41 @@ impl MemoryRepository for SqliteMemoryRepository {
     async fn search_by_segment(
         &self,
         segment: MemorySegment,
-        profile_id: Option<&str>,
+        scope: &ProfileScope,
         limit: usize,
     ) -> Result<Vec<MemoryFragment>> {
-        let query = match profile_id {
-            Some(_) => format!(
-                "SELECT {SELECT_ALL} FROM memory_fragments \
-                 WHERE segment = ? AND profile_id = ? \
-                 AND (lifecycle IS NULL OR lifecycle = 'active') \
-                 ORDER BY created_at DESC LIMIT ?"
-            ),
-            None => format!(
-                "SELECT {SELECT_ALL} FROM memory_fragments \
-                 WHERE segment = ? AND (lifecycle IS NULL OR lifecycle = 'active') \
-                 ORDER BY created_at DESC LIMIT ?"
-            ),
-        };
+        if scope.excludes_everything() {
+            return Ok(vec![]);
+        }
+        let (filter, bind) = scope_sql(scope);
+        let query = format!(
+            "SELECT {SELECT_ALL} FROM memory_fragments \
+             WHERE segment = ? AND (lifecycle IS NULL OR lifecycle = 'active') {filter} \
+             ORDER BY created_at DESC LIMIT ?"
+        );
 
         let seg = segment_to_str(&segment);
-        let rows: Vec<FragmentRow> = match profile_id {
-            Some(pid) => {
-                sqlx::query_as(&query)
-                    .bind(seg)
-                    .bind(pid)
-                    .bind(limit as i64)
-                    .fetch_all(&self.pool)
-                    .await?
-            }
-            None => {
-                sqlx::query_as(&query)
-                    .bind(seg)
-                    .bind(limit as i64)
-                    .fetch_all(&self.pool)
-                    .await?
-            }
-        };
+        let mut q = sqlx::query_as::<_, FragmentRow>(&query).bind(seg);
+        if let Some(pid) = bind {
+            q = q.bind(pid);
+        }
+        let rows: Vec<FragmentRow> = q.bind(limit as i64).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(row_to_fragment).collect())
     }
 
-    async fn search_scoreable(&self, profile_id: Option<&str>) -> Result<Vec<MemoryFragment>> {
-        let query = match profile_id {
-            Some(_) => format!(
-                "SELECT {SELECT_ALL} FROM memory_fragments \
-                 WHERE (lifecycle IS NULL OR lifecycle = 'active') \
-                 AND importance IS NOT NULL AND profile_id = ? \
-                 ORDER BY created_at DESC LIMIT 1000"
-            ),
-            None => format!(
-                "SELECT {SELECT_ALL} FROM memory_fragments \
-                 WHERE (lifecycle IS NULL OR lifecycle = 'active') \
-                 AND importance IS NOT NULL \
-                 ORDER BY created_at DESC LIMIT 1000"
-            ),
-        };
+    async fn search_scoreable(&self, scope: &ProfileScope) -> Result<Vec<MemoryFragment>> {
+        if scope.excludes_everything() {
+            return Ok(vec![]);
+        }
+        let (filter, bind) = scope_sql(scope);
+        let query = format!(
+            "SELECT {SELECT_ALL} FROM memory_fragments \
+             WHERE (lifecycle IS NULL OR lifecycle = 'active') \
+             AND importance IS NOT NULL {filter} \
+             ORDER BY created_at DESC LIMIT 1000"
+        );
 
-        let rows: Vec<FragmentRow> = match profile_id {
+        let rows: Vec<FragmentRow> = match bind {
             Some(pid) => {
                 sqlx::query_as(&query)
                     .bind(pid)
@@ -602,9 +602,135 @@ mod tests {
         let frag =
             MemoryFragment::from_chat("f1".to_string(), None, None, "Hello from chat".to_string());
         repo.add(frag).await.unwrap();
-        let results = repo.search_recent(None, 10).await.unwrap();
+        let results = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "Hello from chat");
+    }
+
+    // ── PAI-1: ProfileScope semantics against real SQL ───────────────────
+    //
+    // These are the tests that make ProfileScope more than a type. Each asserts
+    // one of the three variants against a fixture holding rows owned by two
+    // different people plus one unattributed row.
+
+    async fn repo_with_two_owners_and_a_shared_row() -> (SqliteMemoryRepository, tempfile::TempDir)
+    {
+        let (repo, tmp) = make_repo().await;
+        // memory_fragments.profile_id REFERENCES profiles(id) ON DELETE CASCADE
+        // (migration 0005), so a fragment cannot be attributed to a profile that
+        // does not exist. Found by this test failing with SQLite error 787; the
+        // design doc had not recorded the constraint, and it means PAI-1's
+        // cascade-delete phase is already half built.
+        for id in ["alice", "bob"] {
+            sqlx::query("INSERT INTO profiles (id, display_name, avatar_emoji) VALUES (?, ?, ?)")
+                .bind(id)
+                .bind(id)
+                .bind("duck")
+                .execute(&repo.pool)
+                .await
+                .unwrap();
+        }
+        repo.add(MemoryFragment::from_chat(
+            "a".into(),
+            Some("alice".into()),
+            None,
+            "alice likes tea".into(),
+        ))
+        .await
+        .unwrap();
+        repo.add(MemoryFragment::from_chat(
+            "b".into(),
+            Some("bob".into()),
+            None,
+            "bob likes coffee".into(),
+        ))
+        .await
+        .unwrap();
+        repo.add(MemoryFragment::from_chat(
+            "s".into(),
+            None,
+            None,
+            "the bins go out on tuesday".into(),
+        ))
+        .await
+        .unwrap();
+        (repo, tmp)
+    }
+
+    /// The whole point of the workstream: alice must not see bob's memories.
+    #[tokio::test]
+    async fn owner_sees_their_own_rows_and_shared_ones_but_never_another_persons() {
+        let (repo, _tmp) = repo_with_two_owners_and_a_shared_row().await;
+        let rows = repo
+            .search_recent(&ProfileScope::Owner("alice".into()), 10)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"a"), "alice must see her own row");
+        assert!(
+            ids.contains(&"s"),
+            "alice must see unattributed household context"
+        );
+        assert!(!ids.contains(&"b"), "alice must NOT see bob's row");
+    }
+
+    /// Household is the migration-safe scope: identical to the pre-PAI-1
+    /// unfiltered behaviour, which is what makes phase P1 a no-op refactor.
+    #[tokio::test]
+    async fn household_sees_everything() {
+        let (repo, _tmp) = repo_with_two_owners_and_a_shared_row().await;
+        let rows = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    /// An unidentified speaker gets nothing at all. Asserted across every
+    /// scoped read, because one unguarded method is all it takes.
+    #[tokio::test]
+    async fn guest_sees_nothing_through_any_read() {
+        let (repo, _tmp) = repo_with_two_owners_and_a_shared_row().await;
+        let g = ProfileScope::Guest;
+        assert!(repo.search_recent(&g, 10).await.unwrap().is_empty());
+        assert!(repo
+            .search_similar(&[0.0f32; 4], &g, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(repo
+            .search_by_content(&["tea".to_string()], &g, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(repo
+            .search_by_segment(MemorySegment::Identity, &g, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(repo.search_scoreable(&g).await.unwrap().is_empty());
+    }
+
+    /// Keyword search must honour the scope too -- it builds its SQL
+    /// separately, which is exactly where a filter gets forgotten.
+    #[tokio::test]
+    async fn keyword_search_is_scoped_like_the_others() {
+        let (repo, _tmp) = repo_with_two_owners_and_a_shared_row().await;
+        let hits = repo
+            .search_by_content(
+                &["coffee".to_string()],
+                &ProfileScope::Owner("alice".into()),
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "alice searching for 'coffee' must not surface bob's memory"
+        );
     }
 
     #[tokio::test]
@@ -613,7 +739,11 @@ mod tests {
         let frag = MemoryFragment::from_chat("del1".to_string(), None, None, "bye".to_string());
         repo.add(frag).await.unwrap();
         repo.delete("del1").await.unwrap();
-        assert!(repo.search_recent(None, 10).await.unwrap().is_empty());
+        assert!(repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -623,7 +753,10 @@ mod tests {
             MemoryFragment::from_chat("f2".to_string(), None, None, "no embedding".to_string());
         repo.add(frag).await.unwrap();
         let query = vec![0.0f32; 4];
-        let results = repo.search_similar(&query, None, 10).await.unwrap();
+        let results = repo
+            .search_similar(&query, &ProfileScope::Household, 10)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -643,7 +776,10 @@ mod tests {
         repo.add(low).await.unwrap();
 
         let query = vec![1.0f32, 0.0, 0.0, 0.0];
-        let results = repo.search_similar(&query, None, 2).await.unwrap();
+        let results = repo
+            .search_similar(&query, &ProfileScope::Household, 2)
+            .await
+            .unwrap();
         assert_eq!(results[0].id, "high");
         assert_eq!(results[1].id, "low");
     }
@@ -660,7 +796,10 @@ mod tests {
             None,
         );
         repo.add(frag).await.unwrap();
-        let results = repo.search_recent(None, 10).await.unwrap();
+        let results = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].segment, Some(MemorySegment::Preference));
         assert!((results[0].importance.unwrap() - 0.75).abs() < 0.01);
@@ -682,7 +821,10 @@ mod tests {
         repo.add(frag).await.unwrap();
         repo.record_access("acc1").await.unwrap();
         repo.record_access("acc1").await.unwrap();
-        let results = repo.search_recent(None, 10).await.unwrap();
+        let results = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         assert_eq!(results[0].access_count, 2);
         assert!(results[0].last_accessed_at.is_some());
     }
@@ -703,7 +845,10 @@ mod tests {
             .await
             .unwrap();
         // Archived memories should not appear in search_recent
-        let results = repo.search_recent(None, 10).await.unwrap();
+        let results = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -743,7 +888,7 @@ mod tests {
 
         // Search for "cats" — should find cat1
         let results = repo
-            .search_by_content(&["cats".to_string()], None, 10)
+            .search_by_content(&["cats".to_string()], &ProfileScope::Household, 10)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -751,7 +896,7 @@ mod tests {
 
         // Search for "dog" — should find dog1
         let results = repo
-            .search_by_content(&["dog".to_string()], None, 10)
+            .search_by_content(&["dog".to_string()], &ProfileScope::Household, 10)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -759,13 +904,20 @@ mod tests {
 
         // Search for "cats" + "dog" — should find both
         let results = repo
-            .search_by_content(&["cats".to_string(), "dog".to_string()], None, 10)
+            .search_by_content(
+                &["cats".to_string(), "dog".to_string()],
+                &ProfileScope::Household,
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
 
         // Empty keywords — no results
-        let results = repo.search_by_content(&[], None, 10).await.unwrap();
+        let results = repo
+            .search_by_content(&[], &ProfileScope::Household, 10)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -814,12 +966,15 @@ mod tests {
             .unwrap();
 
         assert!(repo.search_unembedded(10).await.unwrap().is_empty());
-        let stored = repo.search_recent(None, 10).await.unwrap();
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         assert_eq!(stored[0].embedding, Some(vec![1.0, 0.0, 0.0, 0.0]));
 
         // Now it participates in cosine ranking rather than being ignored.
         let hits = repo
-            .search_similar(&[1.0, 0.0, 0.0, 0.0], None, 5)
+            .search_similar(&[1.0, 0.0, 0.0, 0.0], &ProfileScope::Household, 5)
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -866,7 +1021,7 @@ mod tests {
         .unwrap();
 
         let identities = repo
-            .search_by_segment(MemorySegment::Identity, None, 10)
+            .search_by_segment(MemorySegment::Identity, &ProfileScope::Household, 10)
             .await
             .unwrap();
         assert_eq!(identities.len(), 1);
@@ -904,5 +1059,79 @@ mod tests {
             .find(|e| e.event_kind == MemoryEventKind::Extracted)
             .unwrap();
         assert_eq!(extracted.session_id.as_deref(), Some("sess-1"));
+    }
+
+    // ── Legacy-row semantics (PAI-1 P8) ──────────────────────────────────
+
+    /// P8 as designed called for a backfill migration. It is not needed: the
+    /// semantics it wanted are already what `scope_sql` does, and writing an
+    /// UPDATE would only stamp a value into rows whose meaning is already
+    /// correct without one.
+    ///
+    /// The rule is that a `profile_id IS NULL` row is **shared household
+    /// context**, not "unclassified, attribute it to somebody". So an owner
+    /// reads it, and nobody owns it.
+    #[tokio::test]
+    async fn a_legacy_unattributed_row_is_shared_not_owned() {
+        let (repo, _tmp) = repo_with_two_owners_and_a_shared_row().await;
+
+        // Both members see the shared row...
+        for who in ["alice", "bob"] {
+            let seen = repo
+                .search_recent(&ProfileScope::Owner(who.to_string()), 50)
+                .await
+                .unwrap();
+            assert!(
+                seen.iter().any(|f| f.profile_id.is_none()),
+                "{who} should see the unattributed household row"
+            );
+        }
+
+        // ...and neither of them owns it. This is what makes deleting a member
+        // safe: the count reported to the user, and the CASCADE that follows,
+        // both leave shared context alone.
+        for who in ["alice", "bob"] {
+            let owned = repo.count_for_profile(who).await.unwrap();
+            let all = repo
+                .search_recent(&ProfileScope::Household, 50)
+                .await
+                .unwrap();
+            // Exact, not `<`. A count that wrongly included the shared row
+            // would be 2 of 3 and still satisfy a `<` check, so the weaker
+            // assertion could not detect the bug it names.
+            assert_eq!(
+                owned, 1,
+                "{who} owns exactly their own row -- not the shared one, which survives them"
+            );
+            assert_eq!(all.len(), 3, "fixture: two owned rows and one shared");
+        }
+    }
+
+    /// The count that member deletion reports must exclude shared rows, or the
+    /// number shown at the one moment it matters most is a lie.
+    #[tokio::test]
+    async fn the_per_member_count_excludes_shared_rows() {
+        let (repo, _tmp) = repo_with_two_owners_and_a_shared_row().await;
+
+        let a = repo.count_for_profile("alice").await.unwrap();
+        let b = repo.count_for_profile("bob").await.unwrap();
+        let everything = repo
+            .search_recent(&ProfileScope::Household, 100)
+            .await
+            .unwrap()
+            .len() as u64;
+
+        assert!(a >= 1 && b >= 1, "each member should own at least one row");
+        assert!(
+            a + b < everything,
+            "owned counts ({a} + {b}) must not account for every row ({everything}) -- \
+             the difference is the shared context that survives a deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn counting_a_member_who_owns_nothing_is_zero_not_an_error() {
+        let (repo, _tmp) = repo_with_two_owners_and_a_shared_row().await;
+        assert_eq!(repo.count_for_profile("nobody-at-all").await.unwrap(), 0);
     }
 }

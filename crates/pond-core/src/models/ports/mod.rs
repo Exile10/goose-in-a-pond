@@ -10,6 +10,7 @@ pub mod model_scheduler;
 pub mod model_storage;
 pub mod provider;
 pub mod speech_energy;
+pub mod token_counter;
 pub mod voice_input;
 pub mod voice_output;
 pub mod wake_word;

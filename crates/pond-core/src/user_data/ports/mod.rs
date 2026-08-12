@@ -1,4 +1,5 @@
 pub mod camera_storage;
+pub mod device_attribution;
 pub mod device_commissioning;
 pub mod device_control;
 pub mod device_controller;
@@ -14,6 +15,7 @@ pub mod onboarding;
 pub mod profile;
 pub mod prompt_extra;
 pub mod prompt_template;
+pub mod proposal;
 pub mod push_token;
 pub mod recipe;
 pub mod schedule_execution;

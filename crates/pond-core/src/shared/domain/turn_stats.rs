@@ -23,6 +23,47 @@ pub struct TurnStats {
     pub prompt_tokens: u32,
     /// Generated tokens, summed across the turn's inferences.
     pub completion_tokens: u32,
+    /// Tokens spent on reasoning the user never sees, summed across the turn.
+    ///
+    /// GIAP-derived: counted from the structured thinking channel with the
+    /// [`TokenCounter`](crate::models::ports::token_counter::TokenCounter) port,
+    /// because no provider reports it. See `UsageStats::reasoning_tokens` for
+    /// why it is *not* subtracted from `completion_tokens`, and why `None`
+    /// ("nobody counted") is deliberately distinct from `Some(0)` ("no
+    /// reasoning this turn").
+    ///
+    /// Deliberately excluded from `finalize_rates`: `decode_tok_per_sec` is a
+    /// rate over what the provider reported, and mixing a GIAP-derived count
+    /// into a provider-reported rate would make the throughput number a
+    /// different quantity depending on which model answered.
+    pub reasoning_tokens: Option<u32>,
+
+    /// Attempts BEYOND the first that this turn needed -- 0 for an ordinary
+    /// turn, 1 when the model produced only reasoning, ended, and had to be
+    /// steered back with `EMPTY_TURN_STEER`.
+    ///
+    /// Counted because it is the hidden half of what thinking costs. A silent
+    /// turn is not a slow turn: it is the whole turn again, prefill included,
+    /// and gemma-4-E2B does it reliably for certain phrasings. Until this
+    /// existed the only visible symptom was that the pond felt slow, with the
+    /// reason buried in a DEBUG line nobody roots their log at.
+    ///
+    /// `#[serde(default)]` because this type rides `AgentStreamEvent::Done`,
+    /// which crosses a PROCESS boundary: `pond-server chat --json-events` emits
+    /// it as NDJSON and the desktop's voice child consumes it. Without the
+    /// attribute a new consumer refuses every event an older binary produced,
+    /// and the pair is version-skewed for exactly as long as it takes someone
+    /// to rebuild both halves. Two existing tests failed on this the moment the
+    /// field was added, which is the only reason it was noticed.
+    ///
+    /// Defaulting to 0 does not fabricate a measurement the way a
+    /// `reasoning_tokens` default would. Nothing deserialized ever reaches
+    /// `turn_metrics`: that row is built from the in-process `TurnStats` the
+    /// adapter itself constructed, and a turn with no stats at all writes NULL
+    /// through `TurnMetrics::reengagements`, which stays an `Option` precisely
+    /// so the unmeasured case survives the database.
+    #[serde(default)]
+    pub reengagements: u32,
     pub prefill_tok_per_sec: Option<f32>,
     pub decode_tok_per_sec: Option<f32>,
     /// Prompt tokens of the final inference (same basis as `prompt_tokens`),
@@ -104,6 +145,85 @@ mod tests {
         assert_eq!(s.context_pct(), Some(50.0));
         let empty = TurnStats::default();
         assert_eq!(empty.context_pct(), None);
+    }
+
+    /// PAI-5 P2. Reasoning is reported ALONGSIDE the provider's completion
+    /// count, never folded into it — the provider's output count probably
+    /// already includes the reasoning decode and nobody has measured which way,
+    /// so subtracting would corrupt the one number the engine actually
+    /// reported. `finalize_rates` must therefore give the same decode rate
+    /// whether or not reasoning was counted.
+    #[test]
+    fn reasoning_does_not_move_the_completion_count_or_the_decode_rate() {
+        let base = TurnStats {
+            decode_ms: Some(4000),
+            completion_tokens: 88,
+            ..Default::default()
+        };
+        let mut without = base.clone();
+        let mut with = TurnStats {
+            reasoning_tokens: Some(500),
+            ..base
+        };
+        without.finalize_rates();
+        with.finalize_rates();
+        assert_eq!(with.completion_tokens, without.completion_tokens);
+        assert_eq!(with.decode_tok_per_sec, without.decode_tok_per_sec);
+        assert_eq!(with.reasoning_tokens, Some(500));
+    }
+
+    /// "Nobody counted" and "counted, and it was zero" are different facts.
+    /// PAI-5 P5 derives `output_reserve_tokens` from this data and must not
+    /// read an unmeasured turn as a turn that did no thinking.
+    #[test]
+    fn unmeasured_reasoning_is_not_zero_reasoning() {
+        let unmeasured: TurnStats = serde_json::from_str(
+            r#"{"prompt_tokens":1,"completion_tokens":1,"inference_count":1}"#,
+        )
+        .unwrap();
+        assert_eq!(unmeasured.reasoning_tokens, None);
+        let measured: TurnStats = serde_json::from_str(
+            r#"{"prompt_tokens":1,"completion_tokens":1,"inference_count":1,"reasoning_tokens":0}"#,
+        )
+        .unwrap();
+        assert_eq!(measured.reasoning_tokens, Some(0));
+    }
+
+    /// A payload from a binary that predates the field must still parse.
+    ///
+    /// This is not hypothetical tidiness. `AgentStreamEvent::Done` carries this
+    /// struct as NDJSON out of `pond-server chat --json-events`, and the
+    /// desktop's voice child is a SEPARATE process that can be older or newer
+    /// than the server that spawned it. When `reengagements` was first added
+    /// without `#[serde(default)]` it was a required field, and every event an
+    /// older binary produced became a parse error — a silently dead voice
+    /// stream, not a compile error.
+    ///
+    /// The counterpart assertion matters as much: a NEW payload that says 0
+    /// must still read as 0, so the default cannot be hiding a producer that
+    /// stopped sending the field.
+    #[test]
+    fn a_payload_without_the_re_engagement_count_still_parses() {
+        let old: TurnStats = serde_json::from_str(
+            r#"{"prompt_tokens":10,"completion_tokens":2,"inference_count":1}"#,
+        )
+        .expect("an event from a binary that predates the field must still deserialize");
+        assert_eq!(old.reengagements, 0);
+
+        let ordinary: TurnStats = serde_json::from_str(
+            r#"{"prompt_tokens":10,"completion_tokens":2,"inference_count":1,"reengagements":0}"#,
+        )
+        .unwrap();
+        assert_eq!(ordinary.reengagements, 0);
+
+        let steered: TurnStats = serde_json::from_str(
+            r#"{"prompt_tokens":10,"completion_tokens":2,"inference_count":1,"reengagements":2}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            steered.reengagements, 2,
+            "the default is swallowing a value that was actually sent"
+        );
     }
 
     #[test]

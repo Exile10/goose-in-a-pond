@@ -5,3 +5,4 @@ pub mod in_process_event_bus;
 pub mod print_output;
 pub mod session_summary;
 pub mod stdin_input;
+pub mod turn_authority;

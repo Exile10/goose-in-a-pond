@@ -8,12 +8,21 @@
 //! Authorization is still a hook, not a gate: [`SecurityPolicy::allow`] returns
 //! `Ok(true)` for everything because no rules exist yet.
 //!
-//! **Nothing calls [`SecurityPolicy::audit`] in production yet.** Every call
-//! site today is a test; the adapter is wired into `AppState` as the extension
-//! point real authorization will use. Auth events that *are* recorded live
-//! (device paired, pairing verify failed) come from the pairing path (#189),
-//! not from here. Do not read the presence of this adapter as evidence that
-//! cross-boundary calls are being audited.
+//! *Corrected 2026-08-06 (PAI-2 P8a).* This block used to say nothing called
+//! [`SecurityPolicy::audit`] in production. That stopped being true when PAI-2
+//! P1 landed the identity-assertion rule: `PUT /api/v1/sessions/{id}/user`
+//! (`evaluate_identity_assertion` in `pond-api`) audits every decision through
+//! this adapter, and `RepoDraftAuthority` audits every draft approve/reject.
+//! Those two are still the only production call sites — the rest of the
+//! cross-boundary surface is unaudited, so do not read the presence of this
+//! adapter as evidence that everything is being recorded. Auth events for
+//! pairing (device paired, verify failed) come from the pairing path (#189),
+//! not from here.
+//!
+//! `GET /api/v1/security/policy-report` reads these events back, grouped on the
+//! `verdict` attribute. That is the reason [`AUDIT_ACTION`] and the attribute
+//! keys live in `pond-core` rather than here: writer and reader now share them,
+//! and two private copies would have drifted into a report that answers zero.
 //!
 //! Only the event-log port is composed in. The [`Handshake`] port was
 //! considered (it could feed token validation into `allow`), but with
@@ -30,10 +39,9 @@ use async_trait::async_trait;
 
 use pond_core::security::domain::event::{Event, EventCategory, PrivacySensitivity};
 use pond_core::security::ports::event_log::EventLog;
-use pond_core::security::ports::policy::{Principal, PrincipalKind, SecurityPolicy};
-
-/// `action` recorded for the audit events this adapter appends.
-const AUDIT_ACTION: &str = "security.audit";
+use pond_core::security::ports::policy::{
+    audit_attrs, PolicyDecision, Principal, PrincipalKind, SecurityPolicy, AUDIT_ACTION,
+};
 
 /// [`SecurityPolicy`] that allows every access and records audits as `Auth`
 /// events in the unified event log.
@@ -64,18 +72,35 @@ impl SecurityPolicy for SqliteSecurityPolicy {
         Ok(true)
     }
 
-    async fn audit(&self, principal: &Principal, action: &str, scope: &str, ok: bool) {
+    async fn audit(
+        &self,
+        principal: &Principal,
+        action: &str,
+        scope: &str,
+        decision: &PolicyDecision,
+    ) {
         // Sensitive, not Internal: `remote_addr` and `token:<client_id>`
         // identify a specific device, so retention and export policy must treat
         // these as personal data.
+        //
+        // `verdict` is the field the policy report groups on. `ok` is kept
+        // beside it rather than replaced by it -- they are different questions,
+        // and under `audit` mode `ok` is `true` for every would-deny.
         let mut event = Event::new(EventCategory::Auth, AUDIT_ACTION)
-            .attr("principal", principal_label(principal))
-            .attr("action", action)
-            .attr("scope", scope)
-            .attr("ok", ok)
+            .attr(audit_attrs::PRINCIPAL, principal_label(principal))
+            .attr(audit_attrs::ACTION, action)
+            .attr(audit_attrs::SCOPE, scope)
+            .attr(audit_attrs::OK, decision.allowed)
+            .attr(audit_attrs::VERDICT, decision.verdict())
+            .attr(audit_attrs::MODE, decision.mode.as_str())
             .sensitivity(PrivacySensitivity::Sensitive);
+        if let Some(reason) = decision.denied_reason {
+            // Absent rather than blank when there was nothing to refuse: an
+            // empty string reads as "a reason we failed to record".
+            event = event.attr(audit_attrs::REASON, reason);
+        }
         if let Some(addr) = &principal.remote_addr {
-            event = event.attr("remote_addr", addr.as_str());
+            event = event.attr(audit_attrs::REMOTE_ADDR, addr.as_str());
         }
 
         // Auditing must never fail the caller; log and swallow any error.
@@ -91,8 +116,12 @@ mod tests {
     use crate::db::Database;
     use crate::sqlite_event_log::SqliteEventLog;
     use pond_core::security::domain::event::EventQuery;
-    use pond_core::security::ports::policy::scopes;
+    use pond_core::security::ports::policy::{scopes, PolicyMode, REASON_UNPROVEN_IDENTITY};
     use tempfile::tempdir;
+
+    fn permit() -> PolicyDecision {
+        PolicyDecision::permit(PolicyMode::Audit)
+    }
 
     async fn make_policy() -> (SqliteSecurityPolicy, Arc<dyn EventLog>, tempfile::TempDir) {
         let tmp = tempdir().unwrap();
@@ -122,7 +151,9 @@ mod tests {
         let (policy, event_log, _tmp) = make_policy().await;
         let principal = Principal::token("abc").with_remote_addr("10.0.0.2:5000");
 
-        policy.audit(&principal, "read", scopes::MEMORY, true).await;
+        policy
+            .audit(&principal, "read", scopes::MEMORY, &permit())
+            .await;
 
         let events = event_log.query(EventQuery::default()).await.unwrap();
         assert_eq!(events.len(), 1);
@@ -133,9 +164,81 @@ mod tests {
         assert_eq!(ev.attributes.get("action"), Some(&"read".into()));
         assert_eq!(ev.attributes.get("scope"), Some(&scopes::MEMORY.into()));
         assert_eq!(ev.attributes.get("ok"), Some(&true.into()));
+        assert_eq!(ev.attributes.get("verdict"), Some(&"allow".into()));
+        assert_eq!(ev.attributes.get("mode"), Some(&"audit".into()));
+        assert!(
+            !ev.attributes.contains_key("reason"),
+            "a permit has no reason; a blank one reads as a lost field"
+        );
         assert_eq!(
             ev.attributes.get("remote_addr"),
             Some(&"10.0.0.2:5000".into())
+        );
+    }
+
+    /// The whole reason the signature takes a decision rather than a bool. Both
+    /// of these events carry `ok = true`; only `verdict` tells them apart, and
+    /// only one of them is a call `enforce` would have blocked.
+    #[tokio::test]
+    async fn a_would_deny_is_distinguishable_from_an_allow_in_the_stored_event() {
+        let (policy, event_log, _tmp) = make_policy().await;
+        let principal = Principal::token("phone");
+
+        policy
+            .audit(&principal, "identify_session", scopes::SESSION, &permit())
+            .await;
+        policy
+            .audit(
+                &principal,
+                "identify_session",
+                scopes::SESSION,
+                &PolicyDecision::refuse(PolicyMode::Audit, REASON_UNPROVEN_IDENTITY),
+            )
+            .await;
+
+        let events = event_log.query(EventQuery::default()).await.unwrap();
+        assert_eq!(events.len(), 2);
+        let mut verdicts: Vec<_> = events
+            .iter()
+            .map(|e| e.attributes.get("verdict").cloned().unwrap())
+            .collect();
+        verdicts.sort_by_key(|v| format!("{v:?}"));
+        assert_eq!(verdicts, vec!["allow".into(), "would_deny".into()]);
+        assert!(
+            events
+                .iter()
+                .all(|e| e.attributes.get("ok") == Some(&true.into())),
+            "audit mode blocks nothing, so `ok` cannot be the discriminator"
+        );
+        let refused = events
+            .iter()
+            .find(|e| e.attributes.get("verdict") == Some(&"would_deny".into()))
+            .unwrap();
+        assert_eq!(
+            refused.attributes.get("reason"),
+            Some(&REASON_UNPROVEN_IDENTITY.into())
+        );
+    }
+
+    /// An action string is a plain verb. The verdict used to ride it as a
+    /// `:{verdict}` suffix; anything reading the report must read the attribute,
+    /// so the string must not carry it back in.
+    #[tokio::test]
+    async fn the_action_string_does_not_carry_the_verdict() {
+        let (policy, event_log, _tmp) = make_policy().await;
+        policy
+            .audit(
+                &Principal::token("phone"),
+                "identify_session",
+                scopes::SESSION,
+                &PolicyDecision::refuse(PolicyMode::Audit, REASON_UNPROVEN_IDENTITY),
+            )
+            .await;
+
+        let events = event_log.query(EventQuery::default()).await.unwrap();
+        assert_eq!(
+            events[0].attributes.get("action"),
+            Some(&"identify_session".into())
         );
     }
 
@@ -152,7 +255,7 @@ mod tests {
                 &Principal::token("abc").with_remote_addr("10.0.0.2:5000"),
                 "read",
                 scopes::MEMORY,
-                true,
+                &permit(),
             )
             .await;
 
@@ -179,7 +282,7 @@ mod tests {
         let operational = SqliteOperationalLog::new(db.logs.clone());
 
         policy
-            .audit(&Principal::token("abc"), "read", scopes::MEMORY, true)
+            .audit(&Principal::token("abc"), "read", scopes::MEMORY, &permit())
             .await;
 
         let rows = operational.list(50, None).await.unwrap();
@@ -197,7 +300,7 @@ mod tests {
         let (policy, event_log, _tmp) = make_policy().await;
 
         policy
-            .audit(&Principal::loopback(), "read", scopes::MEMORY, true)
+            .audit(&Principal::loopback(), "read", scopes::MEMORY, &permit())
             .await;
 
         let events = event_log.query(EventQuery::default()).await.unwrap();

@@ -68,6 +68,20 @@ fn build_settings(store: &HashMap<String, String>) -> Settings {
             s.mic_enabled = b;
         }
     }
+    // The two compaction switches, for the same reason as `mic_enabled` above:
+    // both default to true, so a mock that dropped them would make every test of
+    // "does turning compaction off actually turn it off" pass while the feature
+    // ran anyway. Added by PAI-4 P7, whose manual endpoint reads both.
+    if let Some(v) = store.get("hybrid_compaction_enabled") {
+        if let Ok(b) = v.parse() {
+            s.hybrid_compaction_enabled = b;
+        }
+    }
+    if let Some(v) = store.get("context_monitor_enabled") {
+        if let Ok(b) = v.parse() {
+            s.context_monitor_enabled = b;
+        }
+    }
     if let Some(v) = store.get("voice_wake_word") {
         s.voice_wake_word = v.clone();
     }
@@ -106,6 +120,12 @@ fn build_settings(store: &HashMap<String, String>) -> Settings {
     if let Some(v) = store.get("prompt_addendum") {
         s.prompt_addendum = v.clone();
     }
+    // Egress gate (PAI-2 P5). Same reason mic_enabled is here: a mock that
+    // silently returns the default makes "does the network restriction stick"
+    // pass without the value ever having been stored.
+    if let Some(v) = store.get("network_mode") {
+        s.network_mode = v.clone();
+    }
     s
 }
 
@@ -132,6 +152,14 @@ impl SettingsRepository for MockSettingsRepository {
         );
         store.insert("llm_provider".into(), settings.llm_provider.clone());
         store.insert("mic_enabled".into(), settings.mic_enabled.to_string());
+        store.insert(
+            "hybrid_compaction_enabled".into(),
+            settings.hybrid_compaction_enabled.to_string(),
+        );
+        store.insert(
+            "context_monitor_enabled".into(),
+            settings.context_monitor_enabled.to_string(),
+        );
         store.insert("voice_wake_word".into(), settings.voice_wake_word.clone());
         store.insert("voice_tts_voice".into(), settings.voice_tts_voice.clone());
         store.insert(
@@ -164,6 +192,7 @@ impl SettingsRepository for MockSettingsRepository {
                 .to_string(),
         );
         store.insert("prompt_addendum".into(), settings.prompt_addendum.clone());
+        store.insert("network_mode".into(), settings.network_mode.clone());
         Ok(())
     }
 
@@ -173,6 +202,11 @@ impl SettingsRepository for MockSettingsRepository {
 
     async fn set_key(&self, key: &str, value: String) -> Result<()> {
         self.store.write().await.insert(key.to_string(), value);
+        Ok(())
+    }
+
+    async fn delete_key(&self, key: &str) -> Result<()> {
+        self.store.write().await.remove(key);
         Ok(())
     }
 

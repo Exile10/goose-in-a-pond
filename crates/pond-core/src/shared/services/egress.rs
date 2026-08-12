@@ -69,6 +69,243 @@ fn egress_sink() -> Option<Arc<dyn EventLog>> {
     EGRESS_SINK.get().cloned()
 }
 
+// -- Network mode (PAI-2 P5) --------------------------------------------------
+
+/// How hard egress is gated. Parsed from `settings.network_mode`.
+///
+/// The tiers reuse [`classify_host`] rather than inventing a second notion of
+/// "allowed": `Allowlist` refuses exactly what is already classified
+/// `Sensitive`, and `Offline` permits only what is already `Internal`. That is
+/// deliberate -- one classification, one place to audit, and the fail-Sensitive
+/// default does the work in both directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkMode {
+    /// Record every outbound call, refuse none. What every install has today.
+    Open,
+    /// Refuse hosts that classify as `Sensitive`.
+    Allowlist,
+    /// Refuse everything that is not loopback.
+    Offline,
+}
+
+impl NetworkMode {
+    /// Parse, defaulting to [`NetworkMode::Open`] for anything unrecognised.
+    ///
+    /// This does NOT follow `PolicyMode::parse`, and the difference is the
+    /// point. `PolicyMode` has a tier (`audit`) that is wrong in neither
+    /// direction, so an unreadable value can land there safely. This setting has
+    /// no such tier: its middle value refuses real traffic, so absorbing a typo
+    /// into `allowlist` would take a home assistant off the internet with no
+    /// diagnostic anyone could act on. The narrowing happens at the edge
+    /// instead -- `PUT /api/v1/settings` refuses an unrecognised `network_mode`
+    /// with 422 -- so a typo cannot reach the store through the supported path,
+    /// and one that arrives some other way is loud rather than quietly
+    /// restrictive.
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "allowlist" => Self::Allowlist,
+            "offline" => Self::Offline,
+            "open" => Self::Open,
+            other => {
+                tracing::warn!(
+                    target: "giap::trace",
+                    value = %other,
+                    "unrecognised network_mode; falling back to \"open\""
+                );
+                Self::Open
+            }
+        }
+    }
+
+    /// The stored spelling, for log lines and event attributes.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Allowlist => "allowlist",
+            Self::Offline => "offline",
+        }
+    }
+}
+
+static NETWORK_MODE: RwLock<NetworkMode> = RwLock::new(NetworkMode::Open);
+
+/// Install the network mode. Called at startup and again on every
+/// `PUT /api/v1/settings` that changes it -- a privacy control the user has to
+/// restart the pond to apply is not one.
+pub fn set_network_mode(mode: NetworkMode) {
+    if let Ok(mut guard) = NETWORK_MODE.write() {
+        *guard = mode;
+    }
+}
+
+/// The network mode currently in force.
+pub fn network_mode() -> NetworkMode {
+    NETWORK_MODE.read().map(|g| *g).unwrap_or(NetworkMode::Open)
+}
+
+/// An outbound call the network mode refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressDenied {
+    /// The destination host, as [`extract_host`] saw it.
+    pub host: String,
+    /// The mode that refused it.
+    pub mode: NetworkMode,
+    /// Why, in words the user can act on.
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for EgressDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "network_mode = \"{}\" refused an outbound request to {}: {}",
+            self.mode.as_str(),
+            self.host,
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for EgressDenied {}
+
+/// The gate itself: pure and total, so every mode x classification cell is
+/// testable with no client, no sink and no runtime.
+///
+/// Note the polarity. A URL whose host cannot be parsed becomes `"unknown"`,
+/// which [`classify_host`] calls `Sensitive`, which both restrictive modes
+/// refuse. Failure narrows.
+pub fn egress_verdict(host: &str, mode: NetworkMode) -> Result<(), &'static str> {
+    let sensitivity = classify_host(host);
+    match mode {
+        NetworkMode::Open => Ok(()),
+        NetworkMode::Allowlist => {
+            if sensitivity == PrivacySensitivity::Sensitive {
+                Err("host is not a loopback or curated public API; \
+                     set network_mode to \"open\" to permit it")
+            } else {
+                Ok(())
+            }
+        }
+        NetworkMode::Offline => {
+            if sensitivity == PrivacySensitivity::Internal {
+                Ok(())
+            } else {
+                Err("network_mode is \"offline\"; only loopback destinations are permitted")
+            }
+        }
+    }
+}
+
+/// Check one outbound URL against the network mode BEFORE the request is made.
+///
+/// A refusal is recorded as an `egress.denied` event carrying the same host /
+/// tool / session attribution a permitted call gets, because an unexplained
+/// refusal is worse than no refusal (PAI-2 invariant 1). The event keeps the
+/// host's own sensitivity, so a refused `Sensitive` destination is still
+/// visible as one in the activity feed.
+pub fn check_egress(url: &str) -> Result<(), EgressDenied> {
+    let mode = network_mode();
+    let host = extract_host(url);
+    match egress_verdict(host, mode) {
+        Ok(()) => Ok(()),
+        Err(reason) => {
+            let denied = EgressDenied {
+                host: host.to_string(),
+                mode,
+                reason,
+            };
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "egress_denied",
+                host = %denied.host,
+                mode = %mode.as_str(),
+                "{denied}"
+            );
+            append_event(denied_event(
+                &denied,
+                &current_tool(),
+                &current_session_id(),
+            ));
+            Err(denied)
+        }
+    }
+}
+
+/// Build the `Network` event describing one refusal. Takes the tool and session
+/// as arguments rather than reading the process-globals itself, for the same
+/// two reasons [`egress_event`] does: it stays pure and total, and a test of it
+/// does not have to write a process-global that another test in the same binary
+/// is concurrently reading.
+pub fn denied_event(denied: &EgressDenied, tool: &str, session_id: &str) -> Event {
+    let mut event = Event::new(EventCategory::Network, "egress.denied")
+        .attr("host", denied.host.as_str())
+        .attr("network_mode", denied.mode.as_str())
+        .attr("reason", denied.reason)
+        .sensitivity(classify_host(&denied.host));
+    if !tool.is_empty() {
+        event = event.attr("tool", tool);
+    }
+    if !session_id.is_empty() {
+        event = event.session(session_id);
+    }
+    event
+}
+
+/// Append fire-and-forget, and only when a runtime is actually running.
+///
+/// [`record_egress`] reaches `tokio::spawn` directly because it always runs
+/// after an awaited request. The gate cannot: it runs BEFORE the request and is
+/// callable from a synchronous caller, where `spawn` panics. Losing an audit
+/// line is bad; panicking inside a privacy check is worse.
+fn append_event(event: Event) {
+    let Some(sink) = egress_sink() else {
+        return;
+    };
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!(
+            target: "giap::trace",
+            "no tokio runtime on this thread; egress event not persisted"
+        );
+        return;
+    };
+    handle.spawn(async move {
+        if let Err(e) = sink.append(event).await {
+            tracing::warn!(target: "giap::trace", error = %e, "failed to record egress event");
+        }
+    });
+}
+
+/// One gated outbound call: the gate, then the timer, then the record.
+///
+/// New outbound adapters use this instead of copying `traced_send`. Building it
+/// IS the gate -- an `Err` means the request must not be made -- and dropping it
+/// without [`EgressCall::finish`] records nothing, which is why `finish`
+/// consumes `self`.
+#[must_use = "an EgressCall that is never finished records no egress"]
+pub struct EgressCall {
+    url: String,
+    method: &'static str,
+    started: std::time::Instant,
+}
+
+/// Open a gated outbound call to `url`. See [`EgressCall`].
+pub fn begin(url: &str, method: &'static str) -> Result<EgressCall, EgressDenied> {
+    check_egress(url)?;
+    Ok(EgressCall {
+        url: url.to_string(),
+        method,
+        started: std::time::Instant::now(),
+    })
+}
+
+impl EgressCall {
+    /// Record the completed call. `None` means the request never got a status.
+    pub fn finish(self, status: Option<u16>) {
+        let latency_ms = self.started.elapsed().as_millis() as u64;
+        record_egress(&self.url, self.method, status, latency_ms);
+    }
+}
+
 // ── Recording ──────────────────────────────────────────────────────────────--
 
 /// Record one outbound HTTP call (any caller, any built-in tool). Reads the
@@ -180,6 +417,139 @@ pub fn extract_host(url: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Network mode (PAI-2 P5) ─────────────────────────────────────────────
+
+    #[test]
+    fn network_mode_matrix_covers_every_mode_and_classification() {
+        // (host, expected classification) -- real hosts, so a change to
+        // KNOWN_PUBLIC_SUFFIXES moves this test rather than sliding past it.
+        let internal = "127.0.0.1";
+        let public = "en.wikipedia.org";
+        let sensitive = "tracker.example.com";
+        assert_eq!(classify_host(internal), PrivacySensitivity::Internal);
+        assert_eq!(classify_host(public), PrivacySensitivity::Public);
+        assert_eq!(classify_host(sensitive), PrivacySensitivity::Sensitive);
+
+        // Open refuses nothing.
+        for h in [internal, public, sensitive] {
+            assert!(
+                egress_verdict(h, NetworkMode::Open).is_ok(),
+                "open must permit {h}"
+            );
+        }
+
+        // Allowlist refuses exactly what classifies Sensitive.
+        assert!(
+            egress_verdict(internal, NetworkMode::Allowlist).is_ok(),
+            "allowlist must permit loopback"
+        );
+        assert!(
+            egress_verdict(public, NetworkMode::Allowlist).is_ok(),
+            "allowlist must permit a curated public API"
+        );
+        assert!(
+            egress_verdict(sensitive, NetworkMode::Allowlist).is_err(),
+            "allowlist must refuse a Sensitive host"
+        );
+
+        // Offline permits only loopback -- including the public APIs.
+        assert!(
+            egress_verdict(internal, NetworkMode::Offline).is_ok(),
+            "offline must permit loopback"
+        );
+        assert!(
+            egress_verdict(public, NetworkMode::Offline).is_err(),
+            "offline must refuse even a curated public API"
+        );
+        assert!(
+            egress_verdict(sensitive, NetworkMode::Offline).is_err(),
+            "offline must refuse a Sensitive host"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_url_is_refused_by_both_restrictive_modes() {
+        // extract_host gives up and says "unknown", which classifies Sensitive.
+        let host = extract_host("not a url");
+        assert_eq!(host, "unknown");
+        assert!(
+            egress_verdict(host, NetworkMode::Allowlist).is_err(),
+            "an unparseable host must not be permitted under allowlist"
+        );
+        assert!(
+            egress_verdict(host, NetworkMode::Offline).is_err(),
+            "an unparseable host must not be permitted under offline"
+        );
+
+        // Bracketed IPv6 is a known extract_host limitation: it splits on ':'
+        // and yields "[". Failure narrows -- the call is refused, not permitted.
+        // If extract_host is ever taught IPv6, this assertion flips to is_ok
+        // and that is a deliberate change, not a silent one.
+        let v6 = extract_host("http://[::1]:8080/health");
+        assert!(
+            egress_verdict(v6, NetworkMode::Offline).is_err(),
+            "bracketed IPv6 loopback is not recognised today; it must fail CLOSED"
+        );
+    }
+
+    #[test]
+    fn unrecognised_network_mode_parses_as_open_not_as_a_restriction() {
+        assert_eq!(NetworkMode::parse("open"), NetworkMode::Open);
+        assert_eq!(NetworkMode::parse("allowlist"), NetworkMode::Allowlist);
+        assert_eq!(NetworkMode::parse("offline"), NetworkMode::Offline);
+        assert_eq!(NetworkMode::parse("  OFFLINE "), NetworkMode::Offline);
+
+        // The whole point: unrecognised widens, and the 422 at PUT /settings is
+        // what stops an unrecognised value ever being stored. Absorbing a typo
+        // into `allowlist` would break a working pond with no diagnostic.
+        assert_eq!(
+            NetworkMode::parse("offlien"),
+            NetworkMode::Open,
+            "a typo must not silently restrict the network"
+        );
+        assert_eq!(NetworkMode::parse(""), NetworkMode::Open);
+
+        // Round-trip, so as_str and parse cannot drift.
+        for m in [
+            NetworkMode::Open,
+            NetworkMode::Allowlist,
+            NetworkMode::Offline,
+        ] {
+            assert_eq!(NetworkMode::parse(m.as_str()), m);
+        }
+    }
+
+    #[test]
+    fn a_refused_call_is_recorded_with_its_reason() {
+        let denied = EgressDenied {
+            host: "tracker.example.com".to_string(),
+            mode: NetworkMode::Offline,
+            reason: "network_mode is \"offline\"; only loopback destinations are permitted",
+        };
+        let ev = denied_event(&denied, "search_web", "sess-denied");
+
+        assert_eq!(ev.category, EventCategory::Network);
+        assert_eq!(ev.action, "egress.denied");
+        assert_eq!(
+            ev.attributes.get("host"),
+            Some(&"tracker.example.com".into())
+        );
+        assert_eq!(ev.attributes.get("network_mode"), Some(&"offline".into()));
+        assert_eq!(ev.attributes.get("reason"), Some(&denied.reason.into()));
+        assert_eq!(ev.attributes.get("tool"), Some(&"search_web".into()));
+        assert_eq!(ev.session_id.as_deref(), Some("sess-denied"));
+        // A refused Sensitive destination is still Sensitive. Recording it as
+        // Internal because "it never happened" would hide it from the retention
+        // rules that exist for exactly this class of event.
+        assert_eq!(ev.privacy_sensitivity, PrivacySensitivity::Sensitive);
+        // The message a user actually sees has to name the setting and the host.
+        let rendered = denied.to_string();
+        assert!(
+            rendered.contains("network_mode") && rendered.contains("tracker.example.com"),
+            "a refusal must be actionable, got: {rendered}"
+        );
+    }
 
     #[test]
     fn extracts_host_from_url() {

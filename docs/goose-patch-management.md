@@ -23,6 +23,7 @@ history, carrying:
 | GIAP featured Gemma models | Extra `FEATURED_MODELS` entries for the Gemma 4 family GIAP ships on-device: E1B, E2B (+mmproj), 12B-A4B (+mmproj), 27B (+mmproj). Upstream only features E4B and 26B-A4B. Featured status gives these models `ToolCallingMode::ForceNative` defaults and vision wiring. | `crates/goose-local-inference/src/local_model_registry.rs` |
 | llama.cpp ProviderStats parity | The llama.cpp backend fills `ProviderStats` (TTFT, `model_load_ms`, `elapsed_ms`, `output_tokens`) like the MLX backend already does, plus two new optional fields: `prefill_ms` and `effective_context_tokens`. Additive/serde-default; PR upstream. Commit `961f1b0a5`. | `crates/goose-provider-types/src/conversation/token_usage.rs`, `crates/goose-local-inference/src/lib.rs`, `crates/goose-local-inference/src/llamacpp/*` |
 | thinking-only turns count as empty | `provider_produced_content` treated a `Thinking`/`RedactedThinking` block as content, so a turn that emitted only reasoning — no text, no tool call — was not an empty turn and never reached the existing `MAX_EMPTY_TURN_RETRIES` path. The user got total silence. Small local models hit this reliably: gemma-4-E2B closes its thinking block and emits `end_of_turn` for certain phrasings (measured 5/5 on one query, gemma-4-E2B Q4_K_M). Two match arms now return `false`; safe because the flag accumulates over the chunk loop (thinking-then-text still sets it via the `Text` arm, thinking-then-tool-call is covered by `no_tools_called`). Verified: silent turn -> visible "empty response" message. Also makes the retry budget overridable via `GOOSE_MAX_EMPTY_TURN_RETRIES` (default unchanged at 3): the built-in retry re-sends an *unchanged* conversation, which a deterministic provider answers identically, so a host that varies the prompt itself sets this to `0` and owns recovery. GIAP does exactly that — see `EMPTY_TURN_STEER` in `goose_agent.rs`, which recovered a reliably-silent query into a real 3-tool answer 4/4. When the budget is 0 the `EMPTY_TURN_MESSAGE` is yielded but NOT persisted: it is a signal that the turn failed, not an answer, and persisting it left a junk assistant turn that the host's next attempt then read as context (and which moved the KV prefix). Upstream behaviour is unchanged for any budget > 0. Upstreamable — not GIAP-specific. | `crates/goose/src/agents/agent.rs` |
+| session-scoped agent goal | `Agent::goal` is a single slot and an `Agent` is shared: a host serving several conversations concurrently holds one `Arc<Agent>`, so `set_goal` is process-wide mutable state and one conversation's goal is injected into another conversation's turn as a user message. For a multi-user host that is one person's request text appearing in another person's turn. GIAP bounds concurrent chat streams with `Semaphore::new(4)` and drives all four from one retained agent, so wiring the existing goal-completeness check at all required this first. Adds `session_goals` keyed by `SessionConfig::id` (already per-reply, so it cannot race), plus `set_session_goal` / `get_session_goal`; the completeness check prefers the session goal and falls back to the process-wide one, so `set_goal` is unchanged for existing callers and `None` changes nothing. Cleared alongside `set_goal(None)` on turn exit so the map does not accumulate dead sessions. Deliberately NOT a field on `SessionConfig` — cleaner conceptually, but a required field on a public struct with 38 construction sites is a rebase burden not worth it for an additive property. Upstreamable. Commit `9cf946903`. | `crates/goose/src/agents/agent.rs`, `crates/goose/tests/agent.rs` |
 | llama.cpp prompt-session KV cache | Retains one generation context per loaded model and reuses the shared prompt prefix across turns (partial KV removal to the divergence point); small non-matching prompts run in a throwaway "sacrificial" context so side calls never clobber an expensive chat prefix. Also fixes model-slot identity (cache keyed by canonicalized file PATH, not the caller's model-name spelling — several spellings of one GGUF used to evict each other with a silent full reload per generation) and holds the global runtime through a strong Arc. Adds `ProviderStats.reused_prefix_tokens`. Measured: reuse-turn TTFT 12.4s -> 0.65s, prefill 11.6s -> 66ms (M-series, ~7K-token prompt). PR upstream planned. Commit `bfd2e854b`. | `crates/goose-local-inference/src/lib.rs`, `crates/goose-local-inference/src/llamacpp/*`, `crates/goose-provider-types/src/conversation/token_usage.rs` |
 
 ### Patches subsumed by upstream (dropped in the 2026-07 sync)
@@ -135,6 +136,78 @@ After the parent commit lands, team members must run:
 ```bash
 git submodule update --init --recursive
 ```
+
+---
+
+## Proposed patch — `Auto` mode must still honour `NeverAllow`
+
+**Status: NOT APPLIED.** Written up here rather than committed to the submodule
+because CI clones the fork branch tip directly (see `ci.yml`), so a submodule
+change that exists only in a working tree makes the local build pass and every
+other build fail. It needs staging on the fork and a pointer bump, exactly as
+"Adding a New GIAP Patch" below describes.
+
+**What it buys.** GIAP narrows the tool surface per session — a Guest turn does
+not get the memory tools, a dormant extension group does not get its schemas.
+Today that narrowing is *schema-only*: `provider_shim.rs :: enforce_tools`
+filters the `&[Tool]` slice handed to the provider, but Goose keeps every
+extension loaded agent-wide, `Agent::reply` collects every `ToolRequest`
+regardless of whether its schema was published, and dispatch happens
+before the adapter ever sees the event. So a model that names a withheld tool
+anyway still runs it. `goose_agent.rs` now tracks those calls in
+`suppressed_tool_ids` and drops both the call event and its result — which
+closes the disclosure (a Guest turn's withheld `recall_memories` used to stream
+the household's memories back as `ToolResult { tool: "" }`) — but the tool has
+still executed by then.
+
+**Why the obvious levers do not work.**
+
+- `ToolInspectionManager` is the seam Goose provides for exactly this, and it is
+  unreachable: `Agent::tool_inspection_manager` is `pub(super)` and inspectors
+  are only added inside the private `Agent::create_tool_inspection_manager`.
+- Writing `PermissionLevel::NeverAllow` through `PermissionManager` — which GIAP
+  already passes into `AgentConfig` — looks like it should work and does not.
+  `permission_inspector.rs` matches on the mode first:
+
+  ```rust
+  let action = match goose_mode {
+      GooseMode::Chat => continue,
+      GooseMode::Auto => InspectionAction::Allow,   // <- returns before the check below
+      GooseMode::Approve | GooseMode::SmartApprove => {
+          if let Some(level) = permission_manager.get_user_permission(tool_name) {
+              match level {
+                  PermissionLevel::NeverAllow => InspectionAction::Deny,
+                  ...
+  ```
+
+  GIAP hardcodes `GooseMode::Auto`, so the `NeverAllow` arm is unreachable, and
+  moving off `Auto` would turn on approval prompts for every tool call — a
+  different product.
+
+**The patch.** Honour an explicit `NeverAllow` in `Auto` mode too. "Auto" means
+*do not ask me*, not *ignore the denies I configured*; a deny the user set and
+the agent ignores is the worse reading of the flag, and this is upstreamable
+rather than GIAP-specific.
+
+```rust
+GooseMode::Auto => match permission_manager.get_user_permission(tool_name) {
+    Some(PermissionLevel::NeverAllow) => InspectionAction::Deny,
+    _ => InspectionAction::Allow,
+},
+```
+
+`crates/goose/src/permission/permission_inspector.rs`. The existing
+`#[test_case(GooseMode::Auto, false, None, InspectionAction::Allow; "auto_allows")]`
+still passes (no stored permission); add a case asserting `Auto` + `NeverAllow`
+denies.
+
+**GIAP side, once it lands.** On each turn, write `NeverAllow` for the tools
+outside the session's allow-set and `AlwaysAllow` (or clear) for those inside,
+before `Agent::reply`. Note `PermissionManager` is process-global and keyed by
+tool name, not by session, so with concurrent sessions of differing scope the
+last writer wins — either serialise the write with the turn or upstream a
+session-scoped variant. Until that is settled, `suppressed_tool_ids` in
+`goose_agent.rs` is the containment, and it is a disclosure gate only.
 
 ---
 

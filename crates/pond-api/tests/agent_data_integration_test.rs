@@ -22,18 +22,22 @@ use axum::http::{Method, Request, StatusCode};
 use pond_api::{build_router, AppState};
 use pond_core::shared::mocks::mock_agent::MockAgent;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
+use pond_core::user_data::domain::session::{IdentificationSource, SessionIdentity};
 use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
 use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
 use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
 use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
 use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry, RegisterDeviceRequest};
 use pond_core::user_data::ports::onboarding::OnboardingRepository;
+use pond_core::user_data::ports::session_storage::SessionStorage;
 use pond_infra::db::Database;
 use pond_infra::mock_handshake::MockHandshake;
+use pond_infra::sqlite_profile::SqliteProfileRepository;
 use pond_infra::sqlite_prompt_extra::SqlitePromptExtraRepository;
 use pond_infra::sqlite_prompt_template::SqlitePromptTemplateRepository;
 use pond_infra::sqlite_recipe::SqliteRecipeRepository;
 use pond_infra::sqlite_session_storage::SqliteSessionStorage;
+use pond_infra::sqlite_settings::SqliteSettingsRepository;
 use pond_infra::sqlite_skill::SqliteSkillRepository;
 use tower::ServiceExt;
 
@@ -51,6 +55,13 @@ impl OnboardingRepository for CompletedOnboarding {
     }
     async fn reset(&self) -> anyhow::Result<()> {
         Ok(())
+    }
+    // PAI-2 P7 made this a required trait method rather than a defaulted one:
+    // a default would have to answer from `get_current_step`, and a stub that
+    // answers "not onboarded" makes every onboarding write route public
+    // wherever it is used. The name of this stub is the answer.
+    async fn is_complete(&self) -> anyhow::Result<bool> {
+        Ok(true)
     }
 }
 
@@ -116,9 +127,26 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
     make_app_with_dispatcher(None).await
 }
 
+/// Same app, plus a handle on session storage.
+///
+/// Sessions have no create endpoint -- they are born from a chat turn -- so a
+/// test about session attribution has to seed one through the port. Profiles
+/// do have one, and these tests use it, so the foreign key is exercised the
+/// way production exercises it.
+async fn make_app_with_sessions() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempDir) {
+    make_app_full(None).await
+}
+
 async fn make_app_with_dispatcher(
     tool_dispatcher: Option<Arc<dyn pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher>>,
 ) -> (axum::Router, tempfile::TempDir) {
+    let (router, _storage, tmp) = make_app_full(tool_dispatcher).await;
+    (router, tmp)
+}
+
+async fn make_app_full(
+    tool_dispatcher: Option<Arc<dyn pond_core::mcp::ports::tools::tool_dispatcher::ToolDispatcher>>,
+) -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
     let pool = db.system.clone();
@@ -127,20 +155,27 @@ async fn make_app_with_dispatcher(
     let mock_hs = MockHandshake::new();
     mock_hs.add_valid_token("test-token".to_string()).await;
 
+    let session_storage = Arc::new(SqliteSessionStorage::new(pool.clone()));
+
     let state = Arc::new(AppState {
         db: db,
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
         whisper_url: "http://127.0.0.1:9000".into(),
         transcribe_audio: None,
-        session_storage: Arc::new(SqliteSessionStorage::new(pool.clone())),
+        session_storage: session_storage.clone(),
         http_client: reqwest::Client::new(),
         agent: Arc::new(MockAgent::new()),
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".into(),
         tts: None,
-        settings_repo: Arc::new(MockSettingsRepository::new()),
-        profile_repo: Arc::new(MockProfileRepository::new()),
+        // Real repository, not the mock: these tests assert that deleting the
+        // primary member clears the settings row that names them, and an
+        // in-memory settings store cannot show that.
+        settings_repo: Arc::new(SqliteSettingsRepository::new(pool.clone())),
+        // Real repository, not the mock: `sessions.profile_id` is a foreign key
+        // into `profiles`, and an in-memory profile store cannot satisfy it.
+        profile_repo: Arc::new(SqliteProfileRepository::new(pool.clone())),
         device_registry: Arc::new(NoDevices),
         commissioner: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
@@ -176,7 +211,6 @@ async fn make_app_with_dispatcher(
         notification_tx: tokio::sync::broadcast::channel(16).0,
         notification_queue: None,
         notification_sender: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
@@ -203,6 +237,7 @@ async fn make_app_with_dispatcher(
 
     (
         build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
+        session_storage,
         tmp,
     )
 }
@@ -399,7 +434,6 @@ async fn prompt_template_delete_system_returns_403() {
         notification_tx: tokio::sync::broadcast::channel(16).0,
         notification_queue: None,
         notification_sender: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
@@ -875,7 +909,6 @@ async fn returns_501_when_repos_not_configured() {
         notification_tx: tokio::sync::broadcast::channel(16).0,
         notification_queue: None,
         notification_sender: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
@@ -973,4 +1006,592 @@ async fn invoke_tool_400_when_tool_missing() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── Session identity (PAI-1 P2) ──────────────────────────────────────────────
+//
+// These go through the router, not the repository, because the thing P2
+// replaced was an in-memory map that the repository layer never saw. A test
+// below the HTTP boundary would have passed against the old code too.
+
+/// Create a household member through the API and return their generated id.
+async fn seed_profile(app: &axum::Router, display_name: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/api/v1/profiles",
+            serde_json::json!({ "display_name": display_name }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "profile create failed");
+    body_json(resp).await["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn session_user_reads_nobody_for_a_session_never_identified() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+
+    let resp = app
+        .oneshot(get("/api/v1/sessions/sess-1/user"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["profile_id"], serde_json::Value::Null);
+    assert_eq!(body["identification_source"], "unknown");
+}
+
+/// The old handler answered from a process-local map, so a restart erased the
+/// binding. This asserts the replacement is actually durable: a second router
+/// over the same database sees what the first one wrote.
+#[tokio::test]
+async fn a_binding_survives_the_process_that_made_it() {
+    let (app, storage, tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+    let jerry = seed_profile(&app, "Jerry").await;
+    storage
+        .set_session_identity(
+            "sess-1",
+            &SessionIdentity {
+                profile_id: Some(jerry.clone()),
+                source: IdentificationSource::Explicit,
+                confidence: None,
+            },
+        )
+        .await
+        .unwrap();
+    drop(storage);
+
+    // A fresh app over the same data dir stands in for a restart.
+    let db = Database::init(tmp.path()).await.unwrap();
+    let reopened = SqliteSessionStorage::new(db.system.clone());
+    let identity = reopened.get_session_identity("sess-1").await.unwrap();
+    assert_eq!(identity.profile_id.as_deref(), Some(jerry.as_str()));
+    assert_eq!(identity.source, IdentificationSource::Explicit);
+}
+
+#[tokio::test]
+async fn clearing_a_binding_releases_it_and_reports_whether_there_was_one() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+    let jerry = seed_profile(&app, "Jerry").await;
+    storage
+        .set_session_identity(
+            "sess-1",
+            &SessionIdentity {
+                profile_id: Some(jerry),
+                source: IdentificationSource::Face,
+                confidence: Some(0.8),
+            },
+        )
+        .await
+        .unwrap();
+
+    let body = body_json(
+        app.clone()
+            .oneshot(delete("/api/v1/sessions/sess-1/user"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["cleared"], true);
+
+    let body = body_json(
+        app.clone()
+            .oneshot(get("/api/v1/sessions/sess-1/user"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["profile_id"], serde_json::Value::Null);
+    assert_eq!(body["identification_source"], "unknown");
+
+    // Idempotent in effect, honest in its report.
+    let body = body_json(
+        app.oneshot(delete("/api/v1/sessions/sess-1/user"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["cleared"], false);
+}
+
+/// The old map accepted any session id, because it was a `HashMap`. Writing to
+/// a row that does not exist has to be an error, not a silent success -- an
+/// attribution accepted and then discarded is the exact failure PAI-1 exists to
+/// end.
+#[tokio::test]
+async fn clearing_a_binding_on_an_unknown_session_is_404() {
+    let (app, _storage, _tmp) = make_app_with_sessions().await;
+    let resp = app
+        .oneshot(delete("/api/v1/sessions/no-such-session/user"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Reading is deliberately more forgiving than writing: "whose session is
+/// this" has a correct answer for a session that does not exist.
+#[tokio::test]
+async fn reading_the_user_of_an_unknown_session_is_ok_and_says_nobody() {
+    let (app, _storage, _tmp) = make_app_with_sessions().await;
+    let resp = app
+        .oneshot(get("/api/v1/sessions/no-such-session/user"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["profile_id"], serde_json::Value::Null);
+}
+
+/// `Explicit` had no producer before this route existed, so the resolution
+/// chain could only ever reach its face rung.
+#[tokio::test]
+async fn a_member_can_say_who_they_are_and_it_sticks() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+    let jerry = seed_profile(&app, "Jerry").await;
+
+    let body = body_json(
+        app.clone()
+            .oneshot(put(
+                "/api/v1/sessions/sess-1/user",
+                serde_json::json!({ "profile_id": jerry }),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["bound"], true);
+    assert_eq!(body["identification_source"], "explicit");
+
+    let identity = storage.get_session_identity("sess-1").await.unwrap();
+    assert_eq!(identity.profile_id.as_deref(), Some(jerry.as_str()));
+    assert_eq!(identity.source, IdentificationSource::Explicit);
+    assert_eq!(
+        identity.confidence, None,
+        "an explicit claim is not a confidence score"
+    );
+}
+
+/// The strength rule, over HTTP. Somebody typing a name must not displace a
+/// device that proved who it was.
+#[tokio::test]
+async fn saying_who_you_are_cannot_displace_a_paired_device() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+    let jerry = seed_profile(&app, "Jerry").await;
+    let liz = seed_profile(&app, "Liz").await;
+
+    storage
+        .set_session_identity(
+            "sess-1",
+            &SessionIdentity {
+                profile_id: Some(jerry.clone()),
+                source: IdentificationSource::PairedDevice,
+                confidence: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let body = body_json(
+        app.oneshot(put(
+            "/api/v1/sessions/sess-1/user",
+            serde_json::json!({ "profile_id": liz }),
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(body["bound"], false);
+
+    let identity = storage.get_session_identity("sess-1").await.unwrap();
+    assert_eq!(
+        identity.profile_id.as_deref(),
+        Some(jerry.as_str()),
+        "the paired-device binding must survive"
+    );
+    assert_eq!(identity.source, IdentificationSource::PairedDevice);
+}
+
+#[tokio::test]
+async fn identifying_a_session_that_does_not_exist_is_404() {
+    let (app, _storage, _tmp) = make_app_with_sessions().await;
+    let resp = app
+        .oneshot(put(
+            "/api/v1/sessions/no-such-session/user",
+            serde_json::json!({ "profile_id": "whoever" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn an_empty_profile_id_is_rejected() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+    let resp = app
+        .oneshot(put(
+            "/api/v1/sessions/sess-1/user",
+            serde_json::json!({ "profile_id": "  " }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── Member deletion (PAI-1 P7) ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn deleting_a_member_reports_what_went_and_what_stayed() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+    let jerry = seed_profile(&app, "Jerry").await;
+    storage
+        .set_session_identity(
+            "sess-1",
+            &SessionIdentity {
+                profile_id: Some(jerry.clone()),
+                source: IdentificationSource::Explicit,
+                confidence: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let body = body_json(
+        app.clone()
+            .oneshot(delete(&format!("/api/v1/profiles/{jerry}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(body["profile_id"], jerry);
+    assert_eq!(body["display_name"], "Jerry");
+    // Sessions are RELEASED, never deleted -- a conversation is not solely the
+    // speaker's. Reporting it under "deleted" would misdescribe what happened.
+    assert_eq!(body["released"]["sessions"], 1);
+    // Deliberately no equality assertion here: this fixture wires
+    // MockMemoryRepository, which does not override `count_for_profile`, so it
+    // returns the port default of 0 whatever the state. Asserting 0 would pass
+    // against a repository that cannot answer. The real count is covered in
+    // pond-infra, against SQL.
+    assert!(body["deleted"]["memories"].is_number());
+
+    // and the session itself survived, unattributed
+    let identity = storage.get_session_identity("sess-1").await.unwrap();
+    assert_eq!(identity.profile_id, None);
+    assert!(storage.get_session("sess-1").await.is_ok());
+}
+
+/// This used to return 204 for an id that never existed, which made "did I
+/// delete the right person" unanswerable.
+#[tokio::test]
+async fn deleting_a_member_who_does_not_exist_is_404() {
+    let (app, _storage, _tmp) = make_app_with_sessions().await;
+    let resp = app
+        .oneshot(delete("/api/v1/profiles/nobody"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// `settings.primary_profile_id` is a key-value row, not a foreign key, so no
+/// cascade can reach it. Deleting the primary member used to leave an id
+/// pointing at nobody -- and the single production reader silently got `None`
+/// from the lookup, so nothing ever surfaced the dangling reference.
+#[tokio::test]
+async fn deleting_the_primary_member_clears_the_setting_that_named_them() {
+    let (app, _storage, _tmp) = make_app_with_sessions().await;
+    let jerry = seed_profile(&app, "Jerry").await;
+
+    let resp = app
+        .clone()
+        .oneshot(put(
+            "/api/v1/settings",
+            serde_json::json!({ "primary_profile_id": jerry }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "settings write failed");
+
+    let body = body_json(
+        app.clone()
+            .oneshot(delete(&format!("/api/v1/profiles/{jerry}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["cleared_primary_profile"], true);
+
+    let settings = body_json(app.oneshot(get("/api/v1/settings")).await.unwrap()).await;
+    let dangling = settings["primary_profile_id"].as_str().unwrap_or("");
+    assert!(
+        dangling.is_empty(),
+        "primary_profile_id still names a deleted member: {dangling}"
+    );
+}
+
+/// The counterpart: deleting a NON-primary member must leave the setting alone.
+#[tokio::test]
+async fn deleting_someone_else_does_not_touch_the_primary_setting() {
+    let (app, _storage, _tmp) = make_app_with_sessions().await;
+    let jerry = seed_profile(&app, "Jerry").await;
+    let liz = seed_profile(&app, "Liz").await;
+
+    app.clone()
+        .oneshot(put(
+            "/api/v1/settings",
+            serde_json::json!({ "primary_profile_id": jerry }),
+        ))
+        .await
+        .unwrap();
+
+    let body = body_json(
+        app.clone()
+            .oneshot(delete(&format!("/api/v1/profiles/{liz}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(body["cleared_primary_profile"], false);
+
+    let settings = body_json(app.oneshot(get("/api/v1/settings")).await.unwrap()).await;
+    assert_eq!(settings["primary_profile_id"], jerry);
+}
+
+// ── Profile context follows the speaker (PAI-1 P6) ───────────────────────────
+
+/// Before P6 the built prompt was bound as `_system_prompt` and the adapter
+/// passed `None`, so nothing profile-derived reached the model on either engine
+/// path. These assert the resolution that now feeds it.
+#[tokio::test]
+async fn profile_context_follows_the_identified_member_not_the_primary() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage.create_session("sess-1".to_string()).await.unwrap();
+
+    let jerry = seed_profile(&app, "Jerry").await;
+    let liz = seed_profile(&app, "Liz").await;
+    for (id, name) in [(&jerry, "Jay"), (&liz, "Lizzie")] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/api/v1/profiles/{id}"))
+                    .header("Authorization", "Bearer test-token")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(
+                            &serde_json::json!({ "preferences": { "preferred_name": name } }),
+                        )
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "preference write failed");
+    }
+
+    // Jerry is primary, but Liz is the one talking.
+    app.clone()
+        .oneshot(put(
+            "/api/v1/settings",
+            serde_json::json!({ "primary_profile_id": jerry }),
+        ))
+        .await
+        .unwrap();
+    app.clone()
+        .oneshot(put(
+            "/api/v1/sessions/sess-1/user",
+            serde_json::json!({ "profile_id": liz }),
+        ))
+        .await
+        .unwrap();
+
+    // The session resolves to Liz, which is what the prompt will be built from.
+    let body = body_json(
+        app.oneshot(get("/api/v1/sessions/sess-1/user"))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        body["profile_id"], liz,
+        "the session must resolve to the member who identified, not the primary one"
+    );
+    assert_ne!(body["profile_id"], jerry);
+}
+
+// ── PAI-1 P4 / PAI-2 P1: the identity-assertion policy ──────────────────────
+
+/// The default is `audit`, and audit must never block. Every other test in this
+/// file binds a session without a token and would fail if it did.
+#[tokio::test]
+async fn identifying_a_session_is_permitted_in_the_default_audit_mode() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage
+        .create_session("sess-audit".to_string())
+        .await
+        .unwrap();
+    let profile_id = seed_profile(&app, "Liz").await;
+
+    let resp = app
+        .oneshot(put(
+            "/api/v1/sessions/sess-audit/user",
+            serde_json::json!({ "profile_id": profile_id }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "audit mode must record and proceed, never block"
+    );
+    assert_eq!(body_json(resp).await["bound"], true);
+}
+
+/// The gate actually bites. Without this the policy is a check nobody has ever
+/// seen fire, which is indistinguishable from one that cannot.
+///
+/// Nothing links a paired device to a member, so no remote caller can prove the
+/// identity it asserts -- which is exactly why the shipped default is `audit`
+/// and not this.
+#[tokio::test]
+async fn identifying_a_session_is_refused_in_enforce_mode() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage
+        .create_session("sess-enforce".to_string())
+        .await
+        .unwrap();
+    let profile_id = seed_profile(&app, "Liz").await;
+
+    let flip = app
+        .clone()
+        .oneshot(put(
+            "/api/v1/settings",
+            serde_json::json!({ "security_policy_mode": "enforce" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(flip.status(), StatusCode::OK, "could not flip the mode");
+
+    let resp = app
+        .oneshot(put(
+            "/api/v1/sessions/sess-enforce/user",
+            serde_json::json!({ "profile_id": profile_id }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "enforce mode must refuse an identity the caller cannot prove"
+    );
+
+    // And the refusal is real, not cosmetic: the session stayed unattributed.
+    let after = storage
+        .get_session_identity("sess-enforce")
+        .await
+        .expect("identity read failed");
+    assert_eq!(
+        after.profile_id, None,
+        "the binding was written despite the refusal"
+    );
+}
+
+// ── PAI-1 P4 / PAI-2 P1: the policy's first production call site ────────────
+//
+// `PUT /sessions/{id}/user` took a profile_id from the request BODY and bound
+// it at Explicit strength with no ownership check, so any paired device could
+// declare itself any household member and have that member's memories injected
+// into every later turn.
+//
+// These go through the router because the check lives between the auth
+// middleware (which supplies the Principal) and the handler. A test below HTTP
+// would have no principal at all and would prove nothing about either.
+
+/// The gate bites. Without this test the check is a rule nobody has watched
+/// fire — and a `SecurityPolicy` that has never denied anything is exactly the
+/// shape of the inert `Ok(true)` this phase exists to replace.
+#[tokio::test]
+async fn enforce_mode_refuses_an_identity_the_caller_cannot_prove() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage
+        .create_session("sess-policy".to_string())
+        .await
+        .unwrap();
+    let liz = seed_profile(&app, "Liz").await;
+
+    let resp = app
+        .clone()
+        .oneshot(put(
+            "/api/v1/settings",
+            serde_json::json!({ "security_policy_mode": "enforce" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "could not switch to enforce");
+
+    // The caller holds a valid token and has proved no membership, which is
+    // every remote caller today: nothing links a device to a member.
+    let resp = app
+        .clone()
+        .oneshot(put(
+            "/api/v1/sessions/sess-policy/user",
+            serde_json::json!({ "profile_id": liz }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // ...and the refusal is real, not cosmetic: nobody was bound.
+    let resp = app
+        .oneshot(get("/api/v1/sessions/sess-policy/user"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["profile_id"], serde_json::Value::Null);
+}
+
+/// The shipped default. The SAME assertion the test above refuses must succeed
+/// here, or `audit` is silently enforcing and the rollout plan is a fiction.
+#[tokio::test]
+async fn audit_mode_allows_the_very_assertion_enforce_refuses() {
+    let (app, storage, _tmp) = make_app_with_sessions().await;
+    storage
+        .create_session("sess-audit".to_string())
+        .await
+        .unwrap();
+    let liz = seed_profile(&app, "Liz").await;
+
+    // No mode is set, so this is the default the product ships with.
+    let resp = app
+        .clone()
+        .oneshot(put(
+            "/api/v1/sessions/sess-audit/user",
+            serde_json::json!({ "profile_id": liz }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "audit mode must not block -- that is the whole point of landing in it"
+    );
+
+    // Assert the positive case too. "Not a 403" would also hold if the handler
+    // had stopped binding anything at all.
+    let resp = app
+        .oneshot(get("/api/v1/sessions/sess-audit/user"))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["profile_id"], liz);
 }

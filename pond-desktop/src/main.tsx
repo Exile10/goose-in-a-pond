@@ -15,6 +15,13 @@ import { AppContextProvider } from "./state/AppContext";
 import { ConfirmProvider } from "./components/shared";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { App } from "./App";
+// One-time lift of member preferences out of this browser's localStorage. The
+// wizard used to save them there while the server read them from SQLite, so
+// anyone who already onboarded has a preferred name and birthday the assistant
+// has never seen. Fire-and-forget: it never throws and never blocks render.
+import { migrateLocalProfileToServer } from "./api/migrateLocalProfile";
+
+void migrateLocalProfileToServer();
 
 function Root() {
   const [ready, setReady] = useState(false);

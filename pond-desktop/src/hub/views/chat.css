@@ -537,6 +537,103 @@
   cursor: default;
 }
 
+/* PAI-4 P7b — context-window pressure note + manual compaction control.
+   Deliberately quieter than an alert: a filling window is normal, and the
+   refusal note that usually follows the button is information, not a failure. */
+.ctx-pressure {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+  padding-left: 2px;
+}
+.ctx-pressure__note {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--mut, #94A3B8);
+}
+.ctx-pressure__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--bd, rgba(124, 58, 237, 0.3));
+  background: transparent;
+  color: var(--acc, #7C3AED);
+  cursor: pointer;
+}
+.ctx-pressure__btn:hover:not(:disabled) {
+  background: rgba(124, 58, 237, 0.08);
+}
+.ctx-pressure__btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.ctx-pressure__result {
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--mut, #94A3B8);
+}
+
+/* PAI-6 P6 — the delegation tree. Rendered WHILE a turn streams, because the
+   turn it belongs to is blocked inside one `delegate` tool call for the whole
+   of its child's run; this is what stops that looking like a hung spinner.
+   Quiet on purpose: it is a note about somebody else's work, not the answer. */
+.subagent-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 4px 0 6px;
+  padding-left: 2px;
+}
+.subagent-tree__run {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.subagent-tree__head {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--mut, #94A3B8);
+}
+.subagent-tree__role {
+  font-weight: 600;
+  color: var(--acc, #7C3AED);
+}
+.subagent-tree__tools {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.subagent-tree__tool {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--mut, #94A3B8);
+  border: 1px solid var(--bd, rgba(148, 163, 184, 0.3));
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+.subagent-tree__detail {
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  color: var(--mut, #94A3B8);
+}
+
 /* Per-turn inference stats footer */
 .turn-stats-footer {
   display: flex;

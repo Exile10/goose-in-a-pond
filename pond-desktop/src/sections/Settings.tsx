@@ -199,8 +199,8 @@ function IdentityTab({
           during onboarding. */}
       <Section title="Location & Weather">
         <Row label="Enable weather" hint="Allow the assistant to fetch current weather for your location">
-          <Switch isSelected={s.weather_enabled ?? false} onChange={(v) => patch("weather_enabled", v)}>
-            <Switch.Control><Switch.Thumb /></Switch.Control>
+          <Switch aria-label="Enable weather" isSelected={s.weather_enabled ?? false} onChange={(v) => patch("weather_enabled", v)}>
+            <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content>
           </Switch>
         </Row>
         <Row label="Location name" hint="Human-readable name (e.g. Nairobi, Kenya)">
@@ -409,13 +409,27 @@ function ModelsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k:
       <Section title="Response style">
         <Row label={`Creativity: ${temp.toFixed(1)}`} hint="Higher = more varied answers, lower = more consistent"><input type="range" min={0} max={2} step={0.1} value={temp} onChange={(e) => patch("llm_temperature", Number(e.target.value))} className="range-full" /></Row>
         <Row label="Response length"><select className="native-select" value={s.llm_max_tokens ?? 1024} onChange={(e) => patch("llm_max_tokens", Number(e.target.value))}>{maxTokenOpts.map((n) => <option key={n} value={n}>{n.toLocaleString()} tokens</option>)}</select></Row>
+        {/* Thinking was behind the developer pill, and `thinking_mode` defaults
+            to "auto" -- which resolves to ON for every model whose name implies
+            it. So a household ran a reasoning model, paid 76-156 reasoning
+            tokens a turn at ~46 tok/s, saw none of it because `show_thinking`
+            ships false, and had no way to stop it. "Thinking cannot be turned
+            off" was literally true from this panel.
+
+            Changing the mode rewrites the system prompt, which moves the KV
+            prefix and costs one full re-prefill on the next turn -- a second
+            reason it belongs where somebody can see it and decide once, rather
+            than being toggled blind. The developer diagnostics it used to sit
+            with (turn stats, answer review) stay behind the pill. */}
+        <Row label="Thinking mode" hint="Auto lets the model reason when its name implies it can. Reasoning costs tokens you never see unless you switch the steps on below, and it is the slowest part of a reply on-device."><select className="native-select" aria-label="Thinking mode" value={s.thinking_mode ?? "auto"} onChange={(e) => patch("thinking_mode", e.target.value)}><option value="auto">Auto</option><option value="on">Always on</option><option value="off">Off</option></select></Row>
+        <Row label="Thinking length" hint="How long the model may think before answering. Brief keeps on-device replies fast."><select className="native-select" value={s.reasoning_effort ?? "brief"} onChange={(e) => patch("reasoning_effort", e.target.value)}><option value="brief">Brief</option><option value="balanced">Balanced</option><option value="thorough">Thorough</option></select></Row>
+        <Row label="Show thinking steps"><Switch aria-label="Show thinking steps" isSelected={s.show_thinking ?? false} onChange={(v) => patch("show_thinking", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
       </Section>
       {devMode && (
         <>
           <Section title="Response quality">
-            <Row label="Thinking mode"><select className="native-select" value={s.thinking_mode ?? "auto"} onChange={(e) => patch("thinking_mode", e.target.value)}><option value="auto">Auto</option><option value="on">Always on</option><option value="off">Off</option></select></Row>
-            <Row label="Show thinking steps"><Switch isSelected={s.show_thinking ?? false} onChange={(v) => patch("show_thinking", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-            <Row label="Show turn stats" hint="Display inference timing and context usage below each response"><Switch isSelected={s.show_turn_stats ?? false} onChange={(v) => patch("show_turn_stats", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+            <Row label="Keep thinking steps" hint="Save the model's reasoning so it is still there after a reload. Off by default: this is unreviewed working-out, not the answer."><Switch aria-label="Keep thinking steps" isSelected={s.persist_thinking ?? false} onChange={(v) => patch("persist_thinking", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+            <Row label="Show turn stats" hint="Display inference timing and context usage below each response"><Switch aria-label="Show turn stats" isSelected={s.show_turn_stats ?? false} onChange={(v) => patch("show_turn_stats", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
             <Row label="Answer review"><select className="native-select" value={s.review_mode ?? "off"} onChange={(e) => patch("review_mode", e.target.value)}><option value="off">Off</option><option value="auto">Auto</option><option value="on">Always on</option></select></Row>
             <Row label="Review rounds"><select className="native-select" value={s.review_max_rounds ?? 1} onChange={(e) => patch("review_max_rounds", Number(e.target.value))}><option value={1}>1 round</option><option value={2}>2 rounds</option><option value={3}>3 rounds</option></select></Row>
             <Row label="Review quality bar"><select className="native-select" value={s.review_pass_threshold ?? 3} onChange={(e) => patch("review_pass_threshold", Number(e.target.value))}><option value={2}>2 – Lenient</option><option value={3}>3 – Balanced</option><option value={4}>4 – Strict</option><option value={5}>5 – Very strict</option></select></Row>
@@ -466,7 +480,7 @@ function PromptsTab({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof S
       </Section>
       <Section title="Custom System Prompt">
         <Row label="Enable custom prompt">
-          <Switch isSelected={customEnabled} onChange={(v) => { setCustomEnabled(v); if (!v) patch("custom_system_prompt", null); }}><Switch.Control><Switch.Thumb /></Switch.Control></Switch>
+          <Switch aria-label="Enable custom prompt" isSelected={customEnabled} onChange={(v) => { setCustomEnabled(v); if (!v) patch("custom_system_prompt", null); }}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch>
         </Row>
         <Row label="System prompt" hint="Replaces the built-in system prompt entirely">
           <div className="pos-relative">
@@ -505,23 +519,22 @@ function AgentTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
       </Section>
       {devMode && (
         <Section title="Performance">
-          <Row label="Fast path" hint="Skip redundant processing steps for simple queries"><Switch isSelected={s.fast_path_enabled ?? true} onChange={(v) => patch("fast_path_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
           <Row label="Max turns" hint="Tool-calling steps allowed per request (0 = unlimited; the idle timeout still applies)"><input type="number" role="spinbutton" className="native-input" min={0} max={500} value={s.agent_max_turns ?? 50} onChange={(e) => patch("agent_max_turns", Number(e.target.value))} /></Row>
           <Row label="Idle timeout" hint="Abort a turn only after this many seconds with no output (0 disables)"><div className="settings-inline-row"><input type="number" role="spinbutton" className="native-input native-input--w100" min={0} max={3600} value={s.agent_timeout_secs ?? 300} onChange={(e) => patch("agent_timeout_secs", Number(e.target.value))} /><span className="muted-12">seconds</span></div></Row>
-          <Row label="Tool output compaction"><Switch isSelected={s.tool_output_compaction ?? true} onChange={(v) => patch("tool_output_compaction", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-          <Row label="Prompt cache reuse"><Switch isSelected={s.prefix_cache_prompt ?? true} onChange={(v) => patch("prefix_cache_prompt", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+          <Row label="Tool output compaction"><Switch aria-label="Tool output compaction" isSelected={s.tool_output_compaction ?? true} onChange={(v) => patch("tool_output_compaction", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+          <Row label="Prompt cache reuse"><Switch aria-label="Prompt cache reuse" isSelected={s.prefix_cache_prompt ?? true} onChange={(v) => patch("prefix_cache_prompt", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
         </Section>
       )}
       <Section title="Memory">
-        <Row label="Remember context"><Switch isSelected={memInject} onChange={(v) => patch("agent_memory_inject", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+        <Row label="Remember context"><Switch aria-label="Remember context" isSelected={memInject} onChange={(v) => patch("agent_memory_inject", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
         <Row label="How much to recall"><input type="number" role="spinbutton" className="native-input" disabled={!memInject} min={1} max={20} value={s.agent_memory_limit ?? 5} onChange={(e) => patch("agent_memory_limit", Number(e.target.value))} /></Row>
-        <Row label="Auto-extract memories"><Switch isSelected={s.memory_extraction_enabled ?? true} onChange={(v) => patch("memory_extraction_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-        <Row label="Memory cleanup"><Switch isSelected={s.memory_cleanup_enabled ?? true} onChange={(v) => patch("memory_cleanup_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-        <Row label="Auto-consolidation"><Switch isSelected={s.memory_consolidation_enabled ?? false} onChange={(v) => patch("memory_consolidation_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+        <Row label="Auto-extract memories"><Switch aria-label="Auto-extract memories" isSelected={s.memory_extraction_enabled ?? true} onChange={(v) => patch("memory_extraction_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+        <Row label="Memory cleanup"><Switch aria-label="Memory cleanup" isSelected={s.memory_cleanup_enabled ?? true} onChange={(v) => patch("memory_cleanup_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+        <Row label="Auto-consolidation"><Switch aria-label="Auto-consolidation" isSelected={s.memory_consolidation_enabled ?? false} onChange={(v) => patch("memory_consolidation_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
         {devMode && (
           <>
             <Row label="Consolidation mode"><select className="native-select" value={s.memory_consolidation_mode ?? "single"} onChange={(e) => patch("memory_consolidation_mode", e.target.value)}><option value="single">Single-pass (fast)</option><option value="adversarial">Adversarial (3-stage)</option></select></Row>
-            <Row label="Memory graph"><Switch isSelected={s.memory_graph_enabled ?? false} onChange={(v) => patch("memory_graph_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+            <Row label="Memory graph"><Switch aria-label="Memory graph" isSelected={s.memory_graph_enabled ?? false} onChange={(v) => patch("memory_graph_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
           </>
         )}
       </Section>
@@ -558,9 +571,8 @@ function DataTab({ s, patch, serverUrl, onServerUrlChange, devMode }: { s: Parti
       {devMode && (
         <>
           <Section title="Telemetry">
-            <Row label="Usage telemetry"><Switch isSelected={s.telemetry_enabled ?? true} onChange={(v) => patch("telemetry_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-            <Row label="Context monitoring"><Switch isSelected={s.context_monitor_enabled ?? true} onChange={(v) => patch("context_monitor_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-            <Row label="Compact encoding"><Switch isSelected={s.compact_encoding ?? true} onChange={(v) => patch("compact_encoding", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+            <Row label="Usage telemetry"><Switch aria-label="Usage telemetry" isSelected={s.telemetry_enabled ?? true} onChange={(v) => patch("telemetry_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+            <Row label="Context monitoring"><Switch aria-label="Context monitoring" isSelected={s.context_monitor_enabled ?? true} onChange={(v) => patch("context_monitor_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
           </Section>
           <Section title="Cloud cost comparison">
             <Row label="Input price"><div className="settings-inline-row"><span className="muted-12">$</span><input type="number" role="spinbutton" step={0.1} className="native-input native-input--w100" min={0} value={s.cloud_input_price_per_million ?? 2.5} onChange={(e) => patch("cloud_input_price_per_million", Number(e.target.value))} /><span className="muted-12">/ 1M tokens</span></div></Row>
@@ -577,6 +589,89 @@ function DataTab({ s, patch, serverUrl, onServerUrlChange, devMode }: { s: Parti
   );
 }
 
+/**
+ * PAI-7 P4 and P6 — the five settings that decide whether the assistant
+ * addresses somebody who did not address it.
+ *
+ * Until this section existed all five were reachable only by `curl`, and one of
+ * them decides whether the pond talks to you unasked. A household cannot
+ * consent to a feature it cannot see.
+ *
+ * **Quiet hours come first because the server checks them first.**
+ * `decide_unprompted_speech` refuses inside the window before it looks at
+ * consent, presence or category, so no combination of the rows below produces
+ * speech in it. Putting the switch above the window would teach the opposite of
+ * what the code does — that consent is the outer decision and quiet hours a
+ * detail inside it.
+ *
+ * Both switches are read `=== true` for the reason given on the delegation row
+ * above: a key the server has not sent, or a settings read that failed, has to
+ * mean off.
+ *
+ * **Not dev-mode gated, deliberately.** Hiding the control for "may it speak to
+ * you unasked" behind the developer pill is the same as leaving it headless.
+ *
+ * One shape here differs from the rows above and it is not a style choice. The
+ * switches wrap their control in `Switch.Content`, which is HeroUI's
+ * `SwitchButton` and the only part of the compound that renders the
+ * `<input role="switch">`. A `<Switch>` whose children are only
+ * `Switch.Control` / `Switch.Thumb` renders two spans: no input, no accessible
+ * name, no click target, no `onChange`. The tripwire in `Settings.test.tsx`
+ * pins which rows on this panel are operable at all, and is written to fail the
+ * day the older ones are repaired.
+ */
+function UnpromptedSection({ s, patch }: { s: Partial<SettingsType>; patch: (k: keyof SettingsType, v: unknown) => void }) {
+  return (
+    <Section title="Speaking and acting unprompted">
+      <p className="row__hint row__hint--mb">
+        Both switches here ship off. Quiet hours are checked first and on their own:
+        inside that window the assistant stays silent whatever the switches say.
+      </p>
+      {/* Plain text inputs rather than <input type="time">. Both bounds are free
+          text in a key-value settings table, and a value the server cannot parse
+          means SILENCE, not "no quiet hours". A time picker renders such a value
+          as blank, which reads as "not set" — the opposite of what it does. */}
+      <Row label="Quiet hours start" hint="Local 24-hour HH:MM. Between this and the end time the assistant never speaks unprompted, whatever else is set here.">
+        <input
+          className="native-input"
+          aria-label="Quiet hours start"
+          value={s.quiet_hours_start ?? "22:00"}
+          onChange={(e) => patch("quiet_hours_start", e.target.value)}
+          placeholder="22:00"
+        />
+      </Row>
+      <Row label="Quiet hours end" hint="The window runs past midnight when this is earlier than the start. Both the same means silent all day, and a time the server cannot read also means silence.">
+        <input
+          className="native-input"
+          aria-label="Quiet hours end"
+          value={s.quiet_hours_end ?? "07:00"}
+          onChange={(e) => patch("quiet_hours_end", e.target.value)}
+          placeholder="07:00"
+        />
+      </Row>
+      <Row label="Speak without being spoken to" hint="Ships off. Lets the assistant read a notification aloud on its own — outside quiet hours, never while it is already answering, and only to a household member it has heard from recently.">
+        <Switch aria-label="Speak without being spoken to" isSelected={s.unprompted_speech_enabled === true} onChange={(v) => patch("unprompted_speech_enabled", v)}>
+          <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content>
+        </Switch>
+      </Row>
+      <Row label="Categories it may speak" hint="Comma-separated. Defaults to alert alone, which leaves out the info notification every scheduled task produces. An entry it does not recognise matches nothing.">
+        <input
+          className="native-input"
+          aria-label="Categories it may speak"
+          value={s.unprompted_speech_categories ?? "alert"}
+          onChange={(e) => patch("unprompted_speech_categories", e.target.value)}
+          placeholder="alert"
+        />
+      </Row>
+      <Row label="Review the house unasked" hint="Ships off. Lets the assistant think about what has happened while nobody is using the pond and propose things for you to approve; it never acts on its own. Needs delegation above, waits for 15 minutes of quiet, and stops as soon as somebody uses the pond.">
+        <Switch aria-label="Review the house unasked" isSelected={s.proactive_review_enabled === true} onChange={(v) => patch("proactive_review_enabled", v)}>
+          <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content>
+        </Switch>
+      </Row>
+    </Section>
+  );
+}
+
 function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: keyof SettingsType, v: unknown) => void; devMode: boolean }) {
   const [extensions, setExtensions] = useState<Extension[]>([]);
   const [loading, setLoading]       = useState(true);
@@ -586,12 +681,39 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
   const [addKind, setAddKind]       = useState<"stdio" | "sse">("stdio");
   const [addCmd, setAddCmd]         = useState("");
   const [adding, setAdding]         = useState(false);
+  // API keys live in the secret store, which returns key NAMES only -- there is
+  // no way to read a value back, by design. So the row shows whether a key is
+  // configured, accepts a replacement, and can clear it. It never renders one.
+  const [secretKeys, setSecretKeys]   = useState<string[]>([]);
+  const [secretDraft, setSecretDraft] = useState<Record<string, string>>({});
+  const [secretBusy, setSecretBusy]   = useState<string | null>(null);
+
+  function loadSecrets() {
+    api.listSecretKeys().then(setSecretKeys).catch(() => setSecretKeys([]));
+  }
+
+  async function saveSecret(key: string) {
+    const value = (secretDraft[key] ?? "").trim();
+    if (!value) return;
+    setSecretBusy(key);
+    try {
+      await api.setSecret(key, value);
+      setSecretDraft((d) => ({ ...d, [key]: "" }));
+      loadSecrets();
+    } catch (e) { setError(String(e)); } finally { setSecretBusy(null); }
+  }
+
+  async function clearSecret(key: string) {
+    setSecretBusy(key);
+    try { await api.deleteSecret(key); loadSecrets(); }
+    catch (e) { setError(String(e)); } finally { setSecretBusy(null); }
+  }
 
   function load() {
     setLoading(true);
     api.listExtensions().then((r) => setExtensions(r.extensions)).catch((e) => setError(String(e))).finally(() => setLoading(false));
   }
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); loadSecrets(); }, []);
 
   async function toggle(name: string, enabled: boolean) {
     try { await api.toggleExtension(name, enabled); setExtensions((prev) => prev.map((e) => e.name === name ? { ...e, enabled } : e)); } catch (e) { setError(String(e)); }
@@ -620,11 +742,14 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
     ["Sensors","Read stored IoT sensor data: latest reading, history, and list sensors","ext_sensor_enabled"],
   ] as const;
 
+  // The second element is the SECRET-STORE key name, not a Settings field: the
+  // SCREAMING_SNAKE env-var spelling the repository already uses
+  // (BRAVE_API_KEY, SPOTIFY_ACCESS_TOKEN) and which secret_migration writes.
   const API_KEYS = [
-    ["Guardian (news)","api_key_guardian","Enables the Guardian news source for the News tools"],
-    ["GNews","api_key_gnews","Enables GNews headline search for the News tools"],
-    ["Finnhub (stocks)","api_key_finnhub","Enables stock quotes in the Finance tools"],
-    ["CoinGecko (crypto)","api_key_coingecko","Enables crypto prices in the Finance tools"],
+    ["Guardian (news)","GUARDIAN_API_KEY","Enables the Guardian news source for the News tools"],
+    ["GNews","GNEWS_API_KEY","Enables GNews headline search for the News tools"],
+    ["Finnhub (stocks)","FINNHUB_API_KEY","Enables stock quotes in the Finance tools"],
+    ["CoinGecko (crypto)","COINGECKO_API_KEY","Enables crypto prices in the Finance tools"],
   ] as const;
 
   return (
@@ -632,14 +757,25 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
       <Section title="Built-in Tool Modules">
         {EXT_TOOLS.map(([label, hint, key]) => (
           <Row key={key} label={label} hint={hint}>
-            <Switch isSelected={(s as Record<string, unknown>)[key] !== false} onChange={(v) => patch(key as keyof SettingsType, v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch>
+            <Switch aria-label={label} isSelected={(s as Record<string, unknown>)[key] !== false} onChange={(v) => patch(key as keyof SettingsType, v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch>
           </Row>
         ))}
+        {/*
+          Deliberately NOT in EXT_TOOLS above. That map renders `!== false`, so a
+          key the server has not sent yet reads as ON while settings are still
+          loading — harmless for a module that defaults on, wrong in the widening
+          direction for the only one that defaults off. This row is `=== true`:
+          absent means off, unreadable means off.
+        */}
+        <Row label="Delegation to saved roles" hint="Let the assistant hand work to a saved agent role that runs on its own. Off by default: a delegated agent acts without asking.">
+          <Switch aria-label="Delegation to saved roles" isSelected={s.ext_orchestrator_enabled === true} onChange={(v) => patch("ext_orchestrator_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch>
+        </Row>
       </Section>
+      <UnpromptedSection s={s} patch={patch} />
       <Section title="Vision / Cameras">
         <Row label="Enable vision" hint="On-device camera event detection (motion, objects) via the vision MCP server">
-          <Switch isSelected={s.vision_enabled ?? false} onChange={(v) => patch("vision_enabled", v)}>
-            <Switch.Control><Switch.Thumb /></Switch.Control>
+          <Switch aria-label="Enable vision" isSelected={s.vision_enabled ?? false} onChange={(v) => patch("vision_enabled", v)}>
+            <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content>
           </Switch>
         </Row>
         <Row label="Camera URL" hint="RTSP/HTTP stream or device path">
@@ -656,11 +792,30 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
         </Row>
       </Section>
       <Section title="API Keys / Integrations">
-        {API_KEYS.map(([label, key, hint]) => (
-          <Row key={key} label={label} hint={hint}>
-            <input type="password" autoComplete="off" className="native-input" value={String((s as Record<string, unknown>)[key] ?? "")} onChange={(e) => patch(key as keyof SettingsType, e.target.value === "" ? null : e.target.value)} placeholder="Paste key" />
-          </Row>
-        ))}
+        {API_KEYS.map(([label, key, hint]) => {
+          const configured = secretKeys.includes(key);
+          const draft = secretDraft[key] ?? "";
+          return (
+            <Row key={key} label={label} hint={hint}>
+              <div className="settings-inline-row">
+                <span className="muted-12">{configured ? "Configured" : "Not set"}</span>
+                <input
+                  type="password"
+                  autoComplete="off"
+                  className="native-input"
+                  aria-label={`${label} API key`}
+                  value={draft}
+                  onChange={(e) => setSecretDraft((d) => ({ ...d, [key]: e.target.value }))}
+                  placeholder={configured ? "Paste a new key to replace" : "Paste key"}
+                />
+                <Button variant="outline" isDisabled={secretBusy === key || !draft.trim()} onPress={() => saveSecret(key)}>Save</Button>
+                {configured && (
+                  <Button variant="outline" aria-label={`Clear ${label} API key`} isDisabled={secretBusy === key} onPress={() => clearSecret(key)}><Trash2 size={14} /></Button>
+                )}
+              </div>
+            </Row>
+          );
+        })}
         <Row label="SearXNG URL" hint="Self-hosted SearXNG instance for private web search (Discovery tools)">
           <input className="native-input" value={s.searxng_url ?? ""} onChange={(e) => patch("searxng_url", e.target.value === "" ? null : e.target.value)} placeholder="http://localhost:8888" />
         </Row>
@@ -668,13 +823,12 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
       {devMode && (
         <>
           <Section title="Tool behaviour">
-            <Row label="Tool result cache"><Switch isSelected={s.tool_cache_enabled ?? true} onChange={(v) => patch("tool_cache_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-            <Row label="Tool call validation"><Switch isSelected={s.tool_call_validation ?? true} onChange={(v) => patch("tool_call_validation", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-            <Row label="Tool request detection"><Switch isSelected={s.tool_request_detection ?? true} onChange={(v) => patch("tool_request_detection", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
-            <Row label="Multi-tool"><Switch isSelected={s.multi_tool_enabled ?? false} onChange={(v) => patch("multi_tool_enabled", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+            <Row label="Tool call validation"><Switch aria-label="Tool call validation" isSelected={s.tool_call_validation ?? true} onChange={(v) => patch("tool_call_validation", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+            <Row label="Tool request detection"><Switch aria-label="Tool request detection" isSelected={s.tool_request_detection ?? true} onChange={(v) => patch("tool_request_detection", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
+            <Row label="Multi-tool"><Switch aria-label="Multi-tool" isSelected={s.multi_tool_enabled ?? false} onChange={(v) => patch("multi_tool_enabled", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
           </Section>
           <Section title="Scheduling">
-            <Row label="Result notifications"><Switch isSelected={s.schedule_result_notify ?? true} onChange={(v) => patch("schedule_result_notify", v)}><Switch.Control><Switch.Thumb /></Switch.Control></Switch></Row>
+            <Row label="Result notifications"><Switch aria-label="Result notifications" isSelected={s.schedule_result_notify ?? true} onChange={(v) => patch("schedule_result_notify", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
             <Row label="Max concurrent"><input type="number" role="spinbutton" className="native-input native-input--w80" min={1} max={10} value={s.schedule_max_concurrent ?? 2} onChange={(e) => patch("schedule_max_concurrent", Number(e.target.value))} /></Row>
             <Row label="History per task"><input type="number" role="spinbutton" className="native-input native-input--w80" min={5} max={500} value={s.schedule_max_runs_per_task ?? 50} onChange={(e) => patch("schedule_max_runs_per_task", Number(e.target.value))} /></Row>
           </Section>
@@ -700,7 +854,7 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
         <div className="ext-list">
           {extensions.map((ext) => (
             <div key={ext.name} className="ext-row">
-              <Switch isSelected={ext.enabled} onChange={() => toggle(ext.name, !ext.enabled)} aria-label={`Toggle ${ext.name}`}><Switch.Control><Switch.Thumb /></Switch.Control></Switch>
+              <Switch isSelected={ext.enabled} onChange={() => toggle(ext.name, !ext.enabled)} aria-label={`Toggle ${ext.name}`}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch>
               <div className="ext-row__body">
                 <div className="ext-row__title-row">
                   <span className="ext-row__name">{ext.name}</span>

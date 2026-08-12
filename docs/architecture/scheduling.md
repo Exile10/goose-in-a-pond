@@ -1,14 +1,14 @@
 # Scheduling System
 
-Cron-based automation engine that executes LLM prompts or webhooks on recurring schedules.
+Automation engine that executes LLM prompts or webhooks on recurring cron schedules, and fires sensor rules on matching EventBus traffic.
 
 ## Architecture
 
 ```
                 ┌─────────────────────┐
-                │  MCP Tools (7)      │ create, list, delete,
+                │  MCP Tools (12)     │ create, list, delete,
                 │  REST API (8 routes)│ pause, resume, run-now,
-                └────────┬────────────┘ get-runs, upcoming
+                └────────┬────────────┘ get-runs, update, rules, clock
                          │
               ┌──────────▼──────────┐
               │   SchedulerPort     │  pond-core port trait
@@ -35,7 +35,8 @@ Cron-based automation engine that executes LLM prompts or webhooks on recurring 
 
 ## Domain Types (`pond-core/src/user_data/domain/schedule.rs`)
 
-- **`TaskKind`** — `AgentPrompt { prompt }` (sends to LLM) or `Webhook { webhook_url }` (HTTP POST)
+- **`TaskKind`** — `AgentPrompt { prompt }` (sends to LLM), `Webhook { webhook_url }` (HTTP POST), or `SensorTrigger(SensorTriggerSpec)` (#92 — fires on matching EventBus traffic rather than a cron cadence; `TaskKind::is_event_triggered()` tells the scheduler to skip cron registration, and the rules engine invokes it through `run_now`)
+- **`SensorTriggerSpec`** — `source`, `condition` (numeric comparison plus a local-time window that wraps midnight and fails closed on malformed input), `actions`, `cooldown_secs` (default 60). Actions are `AgentPrompt`, `DevicePower { device_id, on }` and `Notify { title, body }`
 - **`Schedule`** — id, label, cron (6-field), timezone (IANA), kind, paused, currently_running, last_run, next_run, created_at
 - **`ScheduleRun`** — id, schedule_id, status (Running/Completed/Failed), result, error, started_at, finished_at, duration_ms
 - **`ScheduleResultEvent`** — broadcast event for SSE delivery to desktop
@@ -91,6 +92,13 @@ The tool classifier routes "schedule to get weather at 10am every morning" → `
 | `resume_schedule` | Resume paused schedule |
 | `run_schedule_now` | Trigger immediate execution |
 | `get_schedule_runs` | Execution history with status + result |
+| `update_schedule` | Modify an existing schedule in place |
+| `create_sensor_rule` | Create an event-triggered rule (source, condition, actions, cooldown) |
+| `list_sensor_rules` | List sensor rules |
+| `delete_sensor_rule` | Delete a sensor rule by ID |
+| `world_clock` | Current time in a given timezone |
+
+Sensor rules have no dedicated REST surface today — they are created by POSTing a `SensorTrigger` kind to `/api/v1/schedules`, so the MCP tools above are the practical interface.
 
 ## REST API
 

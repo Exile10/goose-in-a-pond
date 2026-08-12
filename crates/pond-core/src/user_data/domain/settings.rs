@@ -23,6 +23,45 @@ pub const TOOL_SELECTION_MODE_ALL: &str = "all";
 /// session, chosen once at session start (Phase D2).
 pub const TOOL_SELECTION_MODE_RELEVANT: &str = "relevant";
 
+/// `security_policy_mode`: no evaluation, no audit trail. Debugging only.
+pub const SECURITY_POLICY_MODE_OFF: &str = "off";
+/// `security_policy_mode`: evaluate and record every decision, block none.
+pub const SECURITY_POLICY_MODE_AUDIT: &str = "audit";
+/// `security_policy_mode`: denials bite.
+pub const SECURITY_POLICY_MODE_ENFORCE: &str = "enforce";
+
+/// The accepted values of `security_policy_mode`, for validation and for the
+/// error message a rejected write gets back.
+pub const SECURITY_POLICY_MODES: &[&str] = &[
+    SECURITY_POLICY_MODE_OFF,
+    SECURITY_POLICY_MODE_AUDIT,
+    SECURITY_POLICY_MODE_ENFORCE,
+];
+
+/// `network_mode`: record every outbound call, refuse none.
+pub const NETWORK_MODE_OPEN: &str = "open";
+/// `network_mode`: refuse hosts that classify as privacy-`Sensitive`.
+pub const NETWORK_MODE_ALLOWLIST: &str = "allowlist";
+/// `network_mode`: refuse everything that is not loopback.
+pub const NETWORK_MODE_OFFLINE: &str = "offline";
+
+/// The accepted values of `network_mode`, for validation and for the error
+/// message a rejected write gets back.
+pub const NETWORK_MODES: &[&str] = &[
+    NETWORK_MODE_OPEN,
+    NETWORK_MODE_ALLOWLIST,
+    NETWORK_MODE_OFFLINE,
+];
+
+/// The accepted values of `reasoning_effort`, for validation and for the error
+/// message a rejected write gets back.
+///
+/// The behaviour behind each value lives in
+/// `models::services::context::context_budget::ReasoningEffort`, and a test
+/// there (`reasoning_effort_strings_agree_with_settings`) fails if either side
+/// grows a value alone.
+pub const REASONING_EFFORTS: &[&str] = &["brief", "balanced", "thorough"];
+
 /// One factory default that CHANGED after installs already existed.
 ///
 /// Settings are a flat key-value table and a default only applies when the key
@@ -149,12 +188,6 @@ pub struct Settings {
     /// Example: "Always respond in French." or "Mention upcoming schedules proactively."
     #[serde(default = "Settings::default_prompt_addendum")]
     pub prompt_addendum: String,
-
-    // ── Fast path ──────────────────────────────────────────────────────────
-    /// When true, trivial messages (greetings, farewells, thanks, acknowledgments)
-    /// are answered deterministically in <10ms without invoking the LLM.
-    #[serde(default = "Settings::default_fast_path_enabled")]
-    pub fast_path_enabled: bool,
 
     // ── Model roles ────────────────────────────────────────────────────────
     /// Provider for the Chat role (fast, conversational). Default = llm_provider.
@@ -383,6 +416,48 @@ pub struct Settings {
     #[serde(default)]
     pub show_thinking: bool,
 
+    /// How much room the model is told it may spend thinking: "brief" |
+    /// "balanced" | "thorough" (default "brief").
+    ///
+    /// A preference, not a token count. The number it becomes is derived from
+    /// the active compaction profile's output reserve — see
+    /// `context_budget::reasoning_budget_tokens` — because the right value is a
+    /// function of the window and the device, not of what somebody typed.
+    ///
+    /// `brief` by default because the shipped target is a Jetson Orin Nano,
+    /// where reasoning tokens are decode tokens and decode is
+    /// memory-bandwidth-bound: every thinking token is silence before the
+    /// answer starts. `thorough` is the right choice on an HTTP provider.
+    ///
+    /// Orthogonal to `thinking_mode`: this says how LONG, that says WHETHER.
+    /// `thinking_mode = "off"` removes the whole section, budget and all.
+    #[serde(default = "Settings::default_reasoning_effort")]
+    pub reasoning_effort: String,
+
+    /// Whether the reasoning TEXT a turn produced is written to
+    /// `session_thinking` and replayed into the thinking panel on reload.
+    /// **False by default.**
+    ///
+    /// Orthogonal to both neighbours above: `thinking_mode` says whether the
+    /// model thinks, `show_thinking` says whether the live stream shows it, and
+    /// this says whether it SURVIVES the stream. Showing something once and
+    /// keeping it forever are different consents, and a pond that conflates
+    /// them has decided on the user's behalf.
+    ///
+    /// Off by default because this is the least reviewed text the model
+    /// produces -- the passage where it tries the wrong answer, names a
+    /// household member it then decides not to mention, or reasons about
+    /// something the user only implied. It is also the passage nothing else
+    /// prunes: `retention_session_messages_keep` bounds the transcript, and
+    /// these rows ride the transcript's CASCADE rather than a policy of their
+    /// own. Opt-in is the only defensible polarity for it.
+    ///
+    /// Turning it OFF stops new writes; it does not erase what is already
+    /// there. `DELETE /api/v1/sessions/{id}` still cascades, which is the
+    /// erasure path that exists today.
+    #[serde(default)]
+    pub persist_thinking: bool,
+
     // ── Answer Review ──────────────────────────────────────────────────────
     /// Review mode: "off" (default) | "on" | "auto"
     /// "off": no review — answers stream directly to the user
@@ -428,6 +503,32 @@ pub struct Settings {
     /// startup; a new turn cancels an in-flight refresh).
     #[serde(default = "Settings::default_summary_idle_secs")]
     pub summary_idle_secs: u32,
+
+    /// Gap after which reopening a session counts as a *resume*, and its
+    /// history is reshaped before the first turn back rather than during it.
+    ///
+    /// PAI-4 P4. The gate is
+    /// `models::services::context::resume_compaction::should_run`; this is only
+    /// the threshold it reads. Too small is the dangerous direction — a pause
+    /// inside a live conversation would be read as a resume and recompact
+    /// between every pair of turns — so `resume_compaction::MIN_RESUME_IDLE_SECS`
+    /// floors whatever is stored here.
+    #[serde(default = "Settings::default_resume_compaction_idle_secs")]
+    pub resume_compaction_idle_secs: u32,
+
+    /// Days of history the in-turn trimmer keeps *verbatim* before age
+    /// weighting is allowed to degrade it harder than the flat caps do.
+    ///
+    /// PAI-4 P3. `0` disables age weighting entirely, and is the only way to;
+    /// there is no separate boolean that could fall out of step with the
+    /// number. The rung it controls
+    /// (`turn_trimmer::AGED_TOOL_RESULT_MAX_CHARS`) fires only when a
+    /// conversation is already over budget, so a *large* value costs nothing
+    /// beyond today's behaviour. Small is the damaging direction — a horizon
+    /// inside the span of a live conversation would hard-truncate tool results
+    /// the model is still reasoning about.
+    #[serde(default = "Settings::default_compaction_verbatim_days")]
+    pub compaction_verbatim_days: u32,
 
     // ── Agent behaviour ────────────────────────────────────────────────────────
     /// Agent backend engine: "goose" (default, full-featured) | "pond" (independent, KV-cache reuse).
@@ -490,6 +591,46 @@ pub struct Settings {
     /// operator opts in.
     #[serde(default = "Settings::default_tool_selection_mode")]
     pub tool_selection_mode: String,
+
+    /// How hard the `SecurityPolicy` bites: `"off" | "audit" | "enforce"`.
+    ///
+    /// Defaults to `"audit"`, and that default is the whole design. A rules
+    /// matrix written from first principles is wrong in ways only real traffic
+    /// reveals, and an authorisation regression in a home assistant does not
+    /// look like a 403 — it looks like the lights not turning on. So every
+    /// decision is evaluated and recorded, and none of them block, until the
+    /// audit log says what `enforce` would actually have broken.
+    ///
+    /// - `off` — no evaluation, no audit entries. For debugging only.
+    /// - `audit` — evaluate, record the verdict, never block.
+    /// - `enforce` — denials bite.
+    ///
+    /// Flipping the default to `enforce` is PAI-2 P8 and is gated on a release
+    /// spent in `audit` with telemetry to read.
+    #[serde(default = "Settings::default_security_policy_mode")]
+    pub security_policy_mode: String,
+
+    /// How hard outbound HTTP is gated: `"open" | "allowlist" | "offline"`.
+    ///
+    /// - `open` - every outbound call is recorded, none is refused.
+    /// - `allowlist` - refuse hosts that classify as privacy-`Sensitive`,
+    ///   which is every host that is neither loopback nor on the curated
+    ///   public-API list in `shared::services::egress`.
+    /// - `offline` - refuse everything except loopback, which turns "prove it
+    ///   is not phoning home" into one setting rather than a packet capture.
+    ///
+    /// Defaults to `open` because that is what every existing install already
+    /// does; nothing was gated before this landed, so any other default would
+    /// break a working pond on upgrade. That makes this a scope-WIDENING
+    /// default only in the sense that it preserves the status quo -- the
+    /// narrowing this phase owes is at the edge: `PUT /settings` refuses an
+    /// unrecognised value rather than absorbing it.
+    ///
+    /// Read `docs/architecture/pai/02-privacy-and-security-guardrails.md` 3.5
+    /// before widening the curated list: the fail-`Sensitive` default is what
+    /// makes `allowlist` mean anything.
+    #[serde(default = "Settings::default_network_mode")]
+    pub network_mode: String,
 
     /// When true, recent memory fragments are injected into the system prompt each turn
     #[serde(default = "Settings::default_agent_memory_inject")]
@@ -596,6 +737,34 @@ pub struct Settings {
     #[serde(default = "Settings::default_context_monitor_enabled")]
     pub context_monitor_enabled: bool,
 
+    /// Ask the model, once it stops calling tools, whether the request has
+    /// actually been met — and let it keep working if not. Default true.
+    ///
+    /// Without this the agent loop ends when the model stops asking for tools,
+    /// which is not the same as the question being answered. Measured on a Mac
+    /// 2026-08-12 with "how old are each of the former Kenyan Presidents?":
+    /// gemma-4-E4B went from 4 tool calls and "I was unable to find a list of
+    /// the ages" to 7 tool calls and the actual ages. On "what time is it in
+    /// the first 10 states alphabetically?" it went from a flat refusal to a
+    /// per-state table, having finally found `world_clock`.
+    ///
+    /// **It costs roughly twice the inferences per turn**, because the check
+    /// re-arms every time the model does more work — 3 nudges on one measured
+    /// turn, not 1. That is the mechanism rather than a defect: capping it at
+    /// one check would have stopped the Kenyan-presidents turn around its
+    /// fourth tool call, back at "unable to find".
+    ///
+    /// A setting and NOT a `ModelClass` tier, though that enum is precisely
+    /// "how expensive an extra model call is on this box". Its only cheap tier
+    /// is `Large`, which means *served from another box*, so gating on it would
+    /// switch this off for every on-device pond — exactly where it was measured
+    /// to help most. The axis that actually predicted benefit was model
+    /// capability (E4B gained, E2B barely), and GIAP has no honest signal for
+    /// that, so this is the household's call rather than a heuristic pretending
+    /// to be one.
+    #[serde(default = "Settings::default_goal_check_enabled")]
+    pub goal_check_enabled: bool,
+
     // ── Cost comparison ──────────────────────────────────────────────────────
     /// Cloud API input token price per million (for savings calculation). Default 2.50 (GPT-4o).
     #[serde(default = "Settings::default_cloud_input_price_per_million")]
@@ -605,24 +774,11 @@ pub struct Settings {
     #[serde(default = "Settings::default_cloud_output_price_per_million")]
     pub cloud_output_price_per_million: f64,
 
-    // ── Tool cache ──────────────────────────────────────────────────────────
-    /// When true, deterministic tool results (weather, Wikipedia, devices, schedules)
-    /// are cached in memory with per-tool TTLs to avoid redundant API calls.
-    #[serde(default = "Settings::default_tool_cache_enabled")]
-    pub tool_cache_enabled: bool,
-
     // ── Telemetry ─────────────────────────────────────────────────────────
     /// When true, per-turn telemetry metrics (TTFT, token counts, tool latency,
     /// context utilization) are recorded for each chat turn.
     #[serde(default = "Settings::default_telemetry_enabled")]
     pub telemetry_enabled: bool,
-
-    // ── Compact encoding ────────────────────────────────────────────────────
-    /// When true, structured data injected into LLM prompts (memories, tool
-    /// results) uses a compact TOON-style encoding that reduces token count
-    /// by 30-60%. Default: true.
-    #[serde(default = "Settings::default_compact_encoding")]
-    pub compact_encoding: bool,
 
     // ── Experimental ────────────────────────────────────────────────────────
     /// When true, the ToolAgent detects multiple tool intents per message
@@ -644,26 +800,33 @@ pub struct Settings {
     #[serde(default = "Settings::default_tool_request_detection")]
     pub tool_request_detection: bool,
 
-    // ── API keys ─────────────────────────────────────────────────────────
-    // Optional API keys for external data services. Tools degrade gracefully
-    // (fewer sources, rate-limited fallbacks) when keys are absent.
-    /// The Guardian Open Platform API key.
-    #[serde(default)]
-    pub api_key_guardian: Option<String>,
-
-    /// GNews API key.
-    #[serde(default)]
-    pub api_key_gnews: Option<String>,
-
-    /// Finnhub stock/market data API key.
-    #[serde(default)]
-    pub api_key_finnhub: Option<String>,
-
-    /// CoinGecko crypto API key (optional — demo tier works without one).
-    #[serde(default)]
-    pub api_key_coingecko: Option<String>,
-
+    // ── API keys: NOT HERE, deliberately (PAI-2 P2) ──────────────────────
+    //
+    // `api_key_guardian`, `api_key_gnews`, `api_key_finnhub` and
+    // `api_key_coingecko` used to live on this struct. `GET /api/v1/settings`
+    // does `serde_json::to_value(settings)`, so every configured key was in the
+    // response body, and at the time this moved `PUT /settings` was on
+    // `PUBLIC_ROUTES` for onboarding, so a caller with no token could write one
+    // and (before PAI-2 P0) read it straight back. Even once that write path is
+    // closed, a credential on this struct is a credential in a REST response
+    // body and a plaintext row in `pond_system.db`.
+    //
+    // Credential material now lives in `SecretRepository`
+    // (`pond-core/src/security/ports/secret.rs`), which returns key NAMES and
+    // existence only, behind the protected `/api/v1/secrets` routes. The secret
+    // names are `GUARDIAN_API_KEY`, `GNEWS_API_KEY`, `FINNHUB_API_KEY` and
+    // `COINGECKO_API_KEY`; `pond_infra::secret_migration` moves whatever an
+    // existing pond had in its settings table across on first start.
+    //
+    // `no_settings_field_is_secret_shaped` fails the build if anyone adds one
+    // back. Do not silence it with `skip_serializing_if` —
+    // `every_declared_settings_field_is_serialized` fails on that too.
     /// Self-hosted SearXNG instance URL for web/news search.
+    ///
+    /// Stays on `Settings`: it is an endpoint the user needs to see and edit,
+    /// not a credential. If a deployment ever needs `user:pass@host` in this
+    /// URL it belongs in the secret store instead, and this comment is where
+    /// that decision gets revisited.
     #[serde(default)]
     pub searxng_url: Option<String>,
 
@@ -719,6 +882,145 @@ pub struct Settings {
     /// Enable the sensor tools module (query stored IoT sensor readings).
     #[serde(default = "Settings::default_ext_enabled")]
     pub ext_sensor_enabled: bool,
+
+    /// Enable the orchestration tools module — the `delegate` tool, which runs a
+    /// saved role as a child agent (PAI-6 P5).
+    ///
+    /// **Its own default fn, and the only extension toggle that is OFF.** Every
+    /// other `ext_*` field reuses [`Settings::default_ext_enabled`], which
+    /// returns `true`; reusing it here would ship autonomous multi-turn agents,
+    /// running under `GooseMode::Auto` with no approval path, switched on for
+    /// every existing install on the next upgrade. Nobody asked for that by
+    /// upgrading.
+    ///
+    /// The direction is also the safe one for a read failure: a settings load
+    /// that fails falls back to [`Settings::default`], and a `settings` row that
+    /// is absent leaves this field at its default, so both mean OFF.
+    #[serde(default = "Settings::default_ext_orchestrator_enabled")]
+    pub ext_orchestrator_enabled: bool,
+
+    /// May the pond speak without having been spoken to (PAI-7 P6)?
+    ///
+    /// **Its own default fn, returning `false`, for the same reason
+    /// [`Settings::default_ext_orchestrator_enabled`] has one.** Every
+    /// `voice_output.speak()` in this tree today is downstream of a user
+    /// utterance or an explicit `/tts` request. An assistant that starts talking
+    /// on its own after an upgrade is a bad surprise in a way that a new button
+    /// is not, and nobody asked for it by upgrading.
+    ///
+    /// The direction is also the safe one for a failed read: an unreadable
+    /// settings row leaves this at its default, and the gate refuses outright on
+    /// a read it could not perform. Both mean silence.
+    #[serde(default = "Settings::default_unprompted_speech_enabled")]
+    pub unprompted_speech_enabled: bool,
+
+    /// Start of the nightly window in which the pond never speaks unprompted,
+    /// local `"HH:MM"` (PAI-7 P6, invariant 6 -- quiet hours are ABSOLUTE).
+    ///
+    /// Introduced here rather than earlier on purpose: `TimeBoundary` records
+    /// that quiet hours "do not exist … P6 introduces them together with the
+    /// speech gating that gives them meaning", and a window nothing consults is
+    /// a setting that lies.
+    ///
+    /// Wraps midnight when start > end, which is the normal case and the one
+    /// `22:00`/`07:00` takes. Malformed bounds mean silence, never "no quiet
+    /// hours" -- see `chat::quiet_hours_cover`.
+    #[serde(default = "Settings::default_quiet_hours_start")]
+    pub quiet_hours_start: String,
+
+    /// End of the quiet-hours window, local `"HH:MM"`. See
+    /// [`Settings::quiet_hours_start`].
+    #[serde(default = "Settings::default_quiet_hours_end")]
+    pub quiet_hours_end: String,
+
+    /// Which notification categories may be SPOKEN unprompted, comma-separated
+    /// (PAI-7 3.4's category gating, over `Notification.category`).
+    ///
+    /// Defaults to `"alert"` alone -- the narrowest value that leaves the
+    /// feature worth switching on. `info` is the category the schedule bridge
+    /// uses for every completed task, so a default including it would turn "let
+    /// the pond speak" into "the pond reads out every cron line".
+    ///
+    /// A comma-separated string rather than a `Vec` because the store is a flat
+    /// key-value table and the adapter writes one row per field; an unknown or
+    /// blank entry is not a category and is dropped, so a typo silences that
+    /// category rather than opening the rest.
+    #[serde(default = "Settings::default_unprompted_speech_categories")]
+    pub unprompted_speech_categories: String,
+
+    /// May the pond reason about what has happened, unasked (PAI-7 P4)?
+    ///
+    /// **A second toggle rather than a reuse of
+    /// [`Settings::ext_orchestrator_enabled`], because they are different
+    /// questions.** That one asks whether a model may hand work to a subagent
+    /// during a turn the user started. This one asks whether the pond may start
+    /// a turn of its own. Somebody who switches delegation on has said the
+    /// first, and folding the second into it would have the pond begin forming
+    /// opinions about their house as a side effect.
+    ///
+    /// The reviewer needs BOTH: `should_review` refuses on the orchestrator
+    /// toggle first, because with it off there is no `delegate` machinery to
+    /// run a child at all, and then on this one through
+    /// [`GateInputs::enabled`](crate::user_data::services::consolidation_schedule::GateInputs).
+    ///
+    /// Its own default fn returning `false`, for the third time in this
+    /// workstream and for the same reason each time: nobody asked for it by
+    /// upgrading. On the target hardware there is a second cost — a review
+    /// holds the only GPU the household's next turn needs.
+    ///
+    /// [`GateInputs::enabled`]: crate::user_data::services::consolidation_schedule::GateInputs
+    #[serde(default = "Settings::default_proactive_review_enabled")]
+    pub proactive_review_enabled: bool,
+
+    /// May the pond turn what its own sensors and cameras report into personal
+    /// context items (PAI-8's on-pond producer)?
+    ///
+    /// This is not the same question as "is the camera on". The camera already
+    /// records events, and the sensor already records readings; both live in
+    /// their own tables under their own retention. This toggle asks whether a
+    /// household member's [`ContextSource`] may turn those events into a durable,
+    /// per-member corpus that is read back into a model's prompt. That is a
+    /// second copy, under a second owner, with a second retention window, and it
+    /// is the copy the assistant quotes.
+    ///
+    /// Its own `default_*` fn returning `false`, which is now the fourth time in
+    /// this programme and the reason has not changed: nobody asked for it by
+    /// upgrading, and reusing a shared `true`-returning default is precisely how
+    /// `ext_orchestrator_enabled` would have shipped delegation on for every
+    /// install. There is a second cost specific to this one — the corpus grows
+    /// on a Jetson with an 8 GB budget, and the growth is proportional to how
+    /// many devices a member follows.
+    ///
+    /// Off means the producer refuses every event with
+    /// [`NotIngested::Disabled`], including through the batch entry point. It
+    /// does NOT disable retrieval: a pond that ingested while it was on and then
+    /// switched off keeps and can still recall what it has, which is the honest
+    /// behaviour for a store the user can also empty by disconnecting the source.
+    ///
+    /// [`ContextSource`]: crate::context::domain::ContextSource
+    /// [`NotIngested::Disabled`]: crate::context::producer::NotIngested::Disabled
+    #[serde(default = "Settings::default_context_ingest_enabled")]
+    pub context_ingest_enabled: bool,
+
+    /// May the model READ the household's personal-context corpus (PAI-8 P2)?
+    ///
+    /// Separate from [`Settings::context_ingest_enabled`], which decides whether
+    /// anything is STORED, and off for a different reason. Ingest off means an
+    /// empty corpus; this off means the corpus exists and `search_context` and
+    /// `get_recent_context` are not in the model's tool set.
+    ///
+    /// **That second thing is not free, which is why it has its own switch.**
+    /// Every registered tool's schema goes into every turn's prompt, and on the
+    /// target hardware tool schemas are already about 88% of a 4 096-token
+    /// window. Two tools that can only ever answer "nothing found" -- which is
+    /// every pond until somebody connects a source -- would be a per-turn cost
+    /// forever, paid on the device least able to afford it.
+    ///
+    /// Its own named default fn returning `false`, for the reason the other
+    /// off-by-default switches in this file have one: nobody asked for it by
+    /// upgrading.
+    #[serde(default = "Settings::default_ext_context_enabled")]
+    pub ext_context_enabled: bool,
 }
 
 impl Default for Settings {
@@ -733,7 +1035,6 @@ impl Default for Settings {
             prompt_style: Self::default_prompt_style(),
             custom_system_prompt: None,
             prompt_addendum: Self::default_prompt_addendum(),
-            fast_path_enabled: Self::default_fast_path_enabled(),
             chat_provider: Self::default_llm_provider(),
             chat_model: Self::default_active_llm_model(),
             tool_model: None,
@@ -777,6 +1078,8 @@ impl Default for Settings {
             retention_sensitive_days: Self::default_sensitive_days(),
             thinking_mode: Self::default_thinking_mode(),
             show_thinking: false,
+            reasoning_effort: Self::default_reasoning_effort(),
+            persist_thinking: false,
             review_mode: Self::default_review_mode(),
             review_max_rounds: Self::default_review_max_rounds(),
             review_pass_threshold: Self::default_review_pass_threshold(),
@@ -784,6 +1087,8 @@ impl Default for Settings {
             show_turn_stats: false,
             hybrid_compaction_enabled: Self::default_hybrid_compaction_enabled(),
             summary_idle_secs: Self::default_summary_idle_secs(),
+            resume_compaction_idle_secs: Self::default_resume_compaction_idle_secs(),
+            compaction_verbatim_days: Self::default_compaction_verbatim_days(),
             agent_backend: Self::default_agent_backend(),
             agent_goose_mode: Self::default_agent_goose_mode(),
             agent_max_turns: Self::default_agent_max_turns(),
@@ -791,6 +1096,8 @@ impl Default for Settings {
             agent_timeout_secs: Self::default_agent_timeout_secs(),
             prefix_cache_prompt: Self::default_prefix_cache_prompt(),
             tool_selection_mode: Self::default_tool_selection_mode(),
+            security_policy_mode: Self::default_security_policy_mode(),
+            network_mode: Self::default_network_mode(),
             agent_memory_inject: Self::default_agent_memory_inject(),
             agent_memory_limit: Self::default_agent_memory_limit(),
             tool_output_compaction: Self::default_tool_output_compaction(),
@@ -813,18 +1120,13 @@ impl Default for Settings {
             schedule_max_concurrent: Self::default_schedule_max_concurrent(),
             schedule_max_runs_per_task: Self::default_schedule_max_runs_per_task(),
             context_monitor_enabled: Self::default_context_monitor_enabled(),
+            goal_check_enabled: Self::default_goal_check_enabled(),
             cloud_input_price_per_million: Self::default_cloud_input_price_per_million(),
             cloud_output_price_per_million: Self::default_cloud_output_price_per_million(),
-            tool_cache_enabled: Self::default_tool_cache_enabled(),
             telemetry_enabled: Self::default_telemetry_enabled(),
-            compact_encoding: Self::default_compact_encoding(),
             multi_tool_enabled: false,
             tool_call_validation: Self::default_tool_call_validation(),
             tool_request_detection: Self::default_tool_request_detection(),
-            api_key_guardian: None,
-            api_key_gnews: None,
-            api_key_finnhub: None,
-            api_key_coingecko: None,
             searxng_url: None,
             ext_memory_enabled: true,
             ext_schedule_enabled: true,
@@ -838,14 +1140,30 @@ impl Default for Settings {
             ext_finance_enabled: true,
             ext_discovery_enabled: true,
             ext_sensor_enabled: true,
+            // The one `false` in this block, and it must stay a literal `false`
+            // rather than `Self::default_ext_enabled()`. See the field.
+            ext_orchestrator_enabled: false,
+            // PAI-7 P6. Off, and quiet hours already set, so switching speech
+            // on later does not also have to remember to set a window.
+            unprompted_speech_enabled: false,
+            quiet_hours_start: Self::default_quiet_hours_start(),
+            quiet_hours_end: Self::default_quiet_hours_end(),
+            unprompted_speech_categories: Self::default_unprompted_speech_categories(),
+            // PAI-7 P4. Off, like the two above it and for the same reason.
+            proactive_review_enabled: false,
+            // PAI-8's on-pond producer. Off, and it must stay a literal `false`
+            // here as well as in its `default_*` fn: `serde` reads one of the
+            // two and `Settings::default()` the other, so a pond can be built
+            // through either door.
+            context_ingest_enabled: false,
+            // PAI-8 P2. Off, like the ingest toggle above it, and for a prompt
+            // budget reason as well as a consent one -- see the field.
+            ext_context_enabled: false,
         }
     }
 }
 
 impl Settings {
-    fn default_fast_path_enabled() -> bool {
-        true
-    }
     fn default_prompt_style() -> String {
         "balanced".to_string()
     }
@@ -977,6 +1295,11 @@ impl Settings {
     fn default_thinking_mode() -> String {
         "auto".to_string()
     }
+    fn default_reasoning_effort() -> String {
+        // Brief: the shipped target is an Orin Nano and thinking tokens are
+        // decode tokens. See the field docs.
+        "brief".to_string()
+    }
     fn default_review_mode() -> String {
         "off".to_string()
     }
@@ -988,6 +1311,20 @@ impl Settings {
     }
     fn default_summary_idle_secs() -> u32 {
         120
+    }
+
+    /// 30 minutes — the single source is the constant the gate itself uses, so
+    /// the setting's default and the code's default cannot drift apart. See
+    /// `resume_compaction::RESUME_IDLE_THRESHOLD_SECS` for why that number.
+    fn default_resume_compaction_idle_secs() -> u32 {
+        crate::models::services::context::resume_compaction::RESUME_IDLE_THRESHOLD_SECS
+    }
+
+    /// Three days — the single source is the constant the trimmer itself uses,
+    /// for the same reason `default_resume_compaction_idle_secs` reads its
+    /// gate's constant: the setting's default and the code's cannot drift.
+    fn default_compaction_verbatim_days() -> u32 {
+        crate::models::services::context::turn_trimmer::DEFAULT_VERBATIM_DAYS
     }
 
     /// True since the C1-C3 work landed: the engine session is now hydrated
@@ -1068,6 +1405,15 @@ impl Settings {
         // "all" so this first landing changes nothing for existing installs.
         TOOL_SELECTION_MODE_ALL.to_string()
     }
+    fn default_security_policy_mode() -> String {
+        // Audit, never enforce, on a first landing. See the field docs.
+        SECURITY_POLICY_MODE_AUDIT.to_string()
+    }
+    fn default_network_mode() -> String {
+        // Open: nothing was gated before this landed, so anything stricter
+        // breaks a working pond on upgrade. See the field docs.
+        NETWORK_MODE_OPEN.to_string()
+    }
     fn default_prefix_cache_prompt() -> bool {
         true
     }
@@ -1128,6 +1474,9 @@ impl Settings {
     fn default_schedule_max_runs_per_task() -> u32 {
         50
     }
+    fn default_goal_check_enabled() -> bool {
+        true
+    }
     fn default_context_monitor_enabled() -> bool {
         true
     }
@@ -1137,13 +1486,7 @@ impl Settings {
     fn default_cloud_output_price_per_million() -> f64 {
         10.00
     }
-    fn default_tool_cache_enabled() -> bool {
-        true
-    }
     fn default_telemetry_enabled() -> bool {
-        true
-    }
-    fn default_compact_encoding() -> bool {
         true
     }
     fn default_tool_call_validation() -> bool {
@@ -1154,6 +1497,69 @@ impl Settings {
     }
     fn default_ext_enabled() -> bool {
         true
+    }
+
+    /// PAI-6 P5. Deliberately NOT [`Self::default_ext_enabled`].
+    ///
+    /// A separate function rather than a `#[serde(default)]` (which would also
+    /// give `false`) so that the divergence is a named thing a reader trips over
+    /// while adding the next toggle, and so that
+    /// `the_orchestrator_toggle_defaults_off_by_its_own_route` has a symbol to
+    /// assert on rather than only a value.
+    fn default_ext_orchestrator_enabled() -> bool {
+        false
+    }
+
+    /// PAI-7 P6. Deliberately NOT a bare `#[serde(default)]`, for the reason
+    /// [`Self::default_ext_orchestrator_enabled`] is not one either: a named
+    /// function is a symbol
+    /// `the_unprompted_speech_toggle_defaults_off_by_its_own_route` can assert
+    /// on, so flipping this on becomes an edit to a failing test rather than a
+    /// one-character change nothing notices.
+    fn default_unprompted_speech_enabled() -> bool {
+        false
+    }
+
+    /// 22:00 local. Quiet hours exist on a fresh install rather than having to
+    /// be discovered: the field that decides whether the pond speaks at all is
+    /// the one that is off, and a household that switches speech on should not
+    /// have to also remember to switch silence on.
+    fn default_quiet_hours_start() -> String {
+        "22:00".to_string()
+    }
+
+    /// 07:00 local.
+    fn default_quiet_hours_end() -> String {
+        "07:00".to_string()
+    }
+
+    /// `alert` only. See the field: `info` carries every completed scheduled
+    /// task, so including it by default would turn this feature into the pond
+    /// reading out its own cron log.
+    fn default_unprompted_speech_categories() -> String {
+        "alert".to_string()
+    }
+
+    /// PAI-7 P4. A named function for the third time, and by now the pattern is
+    /// the point: every switch in this workstream that lets the pond act on its
+    /// own has a symbol a test can assert is `false`, so turning one on is an
+    /// edit to a failing test rather than a character somebody changed.
+    fn default_proactive_review_enabled() -> bool {
+        false
+    }
+
+    /// PAI-8's on-pond producer. A named function for the fourth time, for the
+    /// reason the third one records: turning one of these on must be an edit to
+    /// a failing test, not a character somebody changed.
+    fn default_context_ingest_enabled() -> bool {
+        false
+    }
+
+    /// PAI-8 P2. See the field: off for a prompt-budget reason as well as a
+    /// consent one, which is why it is separate from the ingest toggle rather
+    /// than folded into it.
+    fn default_ext_context_enabled() -> bool {
+        false
     }
 }
 
@@ -1447,13 +1853,25 @@ mod tests {
     }
 
     #[test]
-    fn new_api_key_fields_default_to_none() {
+    fn searxng_url_defaults_to_none() {
         let s: Settings = serde_json::from_str("{}").unwrap();
-        assert!(s.api_key_guardian.is_none());
-        assert!(s.api_key_gnews.is_none());
-        assert!(s.api_key_finnhub.is_none());
-        assert!(s.api_key_coingecko.is_none());
         assert!(s.searxng_url.is_none());
+    }
+
+    /// An old client (or a stale phone build) still sends `api_key_guardian`.
+    /// That must be ignored, not rejected: the field is gone, and a 422 here
+    /// would break every settings save from a client that has not been updated.
+    #[test]
+    fn a_legacy_api_key_field_is_ignored_not_fatal() {
+        let json = r#"{"api_key_guardian": "legacy-key", "searxng_url": "http://localhost:8888"}"#;
+        let s: Settings =
+            serde_json::from_str(json).expect("unknown fields must not fail the save");
+        assert_eq!(s.searxng_url, Some("http://localhost:8888".to_string()));
+        let round_tripped = serde_json::to_value(&s).unwrap();
+        assert!(
+            round_tripped.get("api_key_guardian").is_none(),
+            "a legacy key must not survive a deserialize/serialize round trip"
+        );
     }
 
     #[test]
@@ -1462,19 +1880,6 @@ mod tests {
         assert!(s.ext_news_enabled);
         assert!(s.ext_finance_enabled);
         assert!(s.ext_discovery_enabled);
-    }
-
-    #[test]
-    fn api_keys_deserialize_when_present() {
-        let json =
-            r#"{"api_key_guardian": "test-guardian-key", "searxng_url": "http://localhost:8888"}"#;
-        let s: Settings = serde_json::from_str(json).unwrap();
-        assert_eq!(s.api_key_guardian, Some("test-guardian-key".to_string()));
-        assert_eq!(s.searxng_url, Some("http://localhost:8888".to_string()));
-        // Others still None
-        assert!(s.api_key_gnews.is_none());
-        assert!(s.api_key_finnhub.is_none());
-        assert!(s.api_key_coingecko.is_none());
     }
 
     #[test]
@@ -1524,8 +1929,8 @@ mod tests {
         // Other new toggles keep their defaults
         assert!(s.ext_finance_enabled);
         assert!(s.ext_discovery_enabled);
-        // API keys still None
-        assert!(s.api_key_guardian.is_none());
+        // searxng_url still None
+        assert!(s.searxng_url.is_none());
     }
 
     /// #105: voice requests get the tighter turn cap; text keeps the full budget.
@@ -1613,6 +2018,170 @@ mod tests {
         assert_eq!(s.effective_max_turns(true), s.agent_max_turns);
     }
 
+    /// The source of this file, so the structural guards below can compare what
+    /// is DECLARED against what is SERIALIZED. `include_str!` resolves relative
+    /// to this file, so this is this file. It is textual inclusion into a string
+    /// literal, so there is no module recursion.
+    const SETTINGS_SOURCE: &str = include_str!("settings.rs");
+
+    /// Words that mark a field name as carrying credential material.
+    ///
+    /// Matched against `_`-separated SEGMENTS, not as a suffix. The shape that
+    /// actually leaked was `api_key_guardian`, which ends in neither `_key` nor
+    /// `_token`; a suffix test would have missed all four.
+    const SECRET_WORDS: &[&str] = &[
+        "key",
+        "keys",
+        "token",
+        "tokens",
+        "secret",
+        "secrets",
+        "password",
+        "passwords",
+        "credential",
+        "credentials",
+        "apikey",
+        "passphrase",
+    ];
+
+    fn is_secret_shaped(field: &str) -> bool {
+        field.split('_').any(|seg| SECRET_WORDS.contains(&seg))
+    }
+
+    /// Serialized keys whose NAME is secret-shaped but whose VALUE is not
+    /// credential material. Every entry is a deliberate exemption and should be
+    /// argued in review; the list is meant to stay very short.
+    const NOT_ACTUALLY_SECRET: &[&str] = &[
+        // A token BUDGET (a `u32`), not a bearer token.
+        "llm_max_tokens",
+    ];
+
+    /// PAI-2 P2, section 3.2 item 2.
+    ///
+    /// `GET /api/v1/settings` serialises this whole struct, so a secret-shaped
+    /// field on `Settings` is a secret in a REST response body. Four
+    /// `api_key_*` fields were exactly that. This test is what stops the next
+    /// person adding a fifth.
+    #[test]
+    fn no_settings_field_is_secret_shaped() {
+        // Positive control FIRST: prove the detector detects. A guard whose
+        // predicate silently matches nothing passes for the wrong reason, and
+        // this programme has four recorded instances of exactly that.
+        assert!(
+            is_secret_shaped("api_key_guardian"),
+            "the detector must flag the shape that actually leaked"
+        );
+        assert!(is_secret_shaped("gmail_refresh_token"));
+        assert!(is_secret_shaped("db_password"));
+        assert!(is_secret_shaped("client_secret"));
+        assert!(!is_secret_shaped("home_name"));
+        assert!(!is_secret_shaped("voice_wake_word"));
+        assert!(!is_secret_shaped("searxng_url"));
+
+        let value = serde_json::to_value(Settings::default()).expect("serialize Settings");
+        let keys: Vec<String> = value
+            .as_object()
+            .expect("Settings serializes to a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+
+        // No stale exemptions, and no useless ones.
+        for exempt in NOT_ACTUALLY_SECRET {
+            assert!(
+                keys.iter().any(|k| k == exempt),
+                "exempt field `{exempt}` is not a real Settings field (stale entry — remove it)"
+            );
+            assert!(
+                is_secret_shaped(exempt),
+                "field `{exempt}` is not secret-shaped, so exempting it is noise — remove it"
+            );
+        }
+
+        let offenders: Vec<&String> = keys
+            .iter()
+            .filter(|k| is_secret_shaped(k) && !NOT_ACTUALLY_SECRET.contains(&k.as_str()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "secret-shaped Settings field(s) {offenders:?}. GET /api/v1/settings serialises this \
+             struct wholesale, so the value would be returned in a REST response body, and it \
+             would sit in plaintext in pond_system.db. Put credential material in \
+             SecretRepository (security/ports/secret.rs) and expose it through /api/v1/secrets, \
+             which returns key names only. If the value is genuinely not a credential, add it to \
+             NOT_ACTUALLY_SECRET with a reason."
+        );
+    }
+
+    /// Field names declared on `pub struct Settings`, parsed from source.
+    fn declared_field_names() -> Vec<String> {
+        let start = SETTINGS_SOURCE.find("pub struct Settings {").expect(
+            "could not find `pub struct Settings {` — this parser is broken, not the struct",
+        );
+        let body = &SETTINGS_SOURCE[start..];
+        let end = body
+            .find("\n}")
+            .expect("could not find the end of the Settings struct");
+        body[..end]
+            .lines()
+            .filter_map(|line| {
+                let name = line.trim().strip_prefix("pub ")?.split(':').next()?.trim();
+                (!name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+                .then(|| name.to_string())
+            })
+            .collect()
+    }
+
+    /// Closes the hole in every other guard in this file.
+    ///
+    /// `no_settings_field_is_secret_shaped` and
+    /// `every_settings_field_is_dispositioned` both enumerate the SERIALIZED
+    /// keys of `Settings::default()`. A field carrying
+    /// `#[serde(skip_serializing_if = "Option::is_none")]` is absent from that
+    /// enumeration whenever it is `None` — which is exactly what
+    /// `Settings::default()` is. So a future `api_key_*` field with that
+    /// attribute would pass both guards and still be serialised, in plaintext,
+    /// the moment a user configured it. Comparing declarations against
+    /// serialized keys is what makes the other two mean what they say.
+    #[test]
+    fn every_declared_settings_field_is_serialized() {
+        let declared = declared_field_names();
+        // The parser must not silently match nothing.
+        assert!(
+            declared.len() > 90,
+            "source parse found only {} fields — the parser is broken",
+            declared.len()
+        );
+
+        let value = serde_json::to_value(Settings::default()).expect("serialize Settings");
+        let serialized: std::collections::BTreeSet<String> = value
+            .as_object()
+            .expect("Settings serializes to a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+
+        let missing: Vec<&String> = declared
+            .iter()
+            .filter(|d| !serialized.contains(*d))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "declared but not serialized {missing:?}. A `skip_serializing`, `skip_serializing_if` \
+             or `rename` on one of these hides it from no_settings_field_is_secret_shaped and \
+             from every_settings_field_is_dispositioned, which are the only things standing \
+             between a new credential field and GET /api/v1/settings."
+        );
+        assert_eq!(
+            declared.len(),
+            serialized.len(),
+            "serialized keys {serialized:?} do not match declared fields {declared:?}"
+        );
+    }
+
     /// Completeness / disposition guard (Phase 4 — "Consistent").
     ///
     /// Every field serialized from `Settings` MUST be classified as either
@@ -1630,11 +2199,57 @@ mod tests {
     fn every_settings_field_is_dispositioned() {
         // Advanced retention knobs, tuned via backend/config — intentionally no UI.
         const HEADLESS_BY_DESIGN: &[&str] = &[
+            // No control in the desktop app yet. HEADLESS_BY_DESIGN rather than
+            // UI_WIRED for the reason the note above gives: this list asserts
+            // whether a control EXISTS, and claiming one that does not is how
+            // twenty-two switches came to render without being operable.
+            "goal_check_enabled",
+            // The privacy policy's rollout lever (PAI-2 P1). An operator knob
+            // while the matrix is being validated against real households; it
+            // gets a UI only if it survives to `enforce` (PAI-2 P8), and giving
+            // it one now would invite flipping a half-validated matrix on.
+            "security_policy_mode",
+            // The egress gate's rollout lever (PAI-2 P5). Headless because
+            // while any real-egress call site was still ungated (see
+            // crates/pond-core/tests/egress_guard.rs), a UI switch labelled
+            // "offline" would have promised more than the code delivered. The
+            // condition for giving it a control was "when UNGATED_SENDERS is
+            // empty".
+            //
+            // THAT CONDITION IS NOW MET. PAI-2 P6b gated the last file,
+            // `pond-api/src/routes.rs`; `UNGATED_SENDERS` is empty and
+            // `MAX_UNGATED` is 0. This stays HEADLESS_BY_DESIGN only because
+            // shipping the control is a `Settings.tsx` + `types.ts` change that
+            // belongs to whoever owns those files, not because the reason still
+            // holds. Reclassifying it here without that UI would be worse than
+            // leaving it: the completeness test checks the CLASSIFICATION, not
+            // whether a control exists, so a premature UI_WIRED would assert
+            // something untrue and silence the only guard on it. The follow-up
+            // is a three-value control (open / allowlist / offline) on the
+            // Privacy section, and it is the last thing PAI-2 P6 owes.
+            //
+            // Read UNGATED_SENDERS rather than this comment for the current
+            // count -- a number written in prose is the thing that goes stale.
+            "network_mode",
             // Hybrid-compaction rollout flags: operator knobs for the
             // deterministic-trim + idle-summary pipeline; flipped via the
             // settings API during on-device burn-in, no UI control planned.
             "hybrid_compaction_enabled",
             "summary_idle_secs",
+            // PAI-4 P4's threshold. Headless for the same reason its two
+            // neighbours are: it tunes when the pipeline reshapes history, not
+            // what the household can see or decide. A control would also be a
+            // trap — the damaging direction is *shorter*, and a slider inviting
+            // "compact more often" would invite exactly that.
+            "resume_compaction_idle_secs",
+            // PAI-4 P3's verbatim horizon. Headless with its neighbours, and
+            // for a sharper version of the same reason: the damaging direction
+            // is *shorter*, and the only honest UI label for it ("how many days
+            // of history stay full-fidelity") describes a rung that fires only
+            // under budget pressure a household cannot see. Exposing a number
+            // whose effect is invisible most of the time invites tuning by
+            // superstition.
+            "compaction_verbatim_days",
             "retention_events_days",
             "retention_events_by_category",
             "retention_sensitive_days",
@@ -1649,6 +2264,18 @@ mod tests {
             // Devices tab grows a Matter section.
             "matter_enabled",
             "matter_ws_url",
+            // PAI-8's on-pond producer, headless for the same reason and owing
+            // a UI for a sharper one: this switch decides whether what the
+            // household's cameras and sensors saw is copied into a per-member
+            // corpus the assistant quotes back. It is off, so nothing is
+            // reachable without an API call -- but "which of my devices feed my
+            // context" is a question a person should be able to answer in the
+            // app, and the source list that answers it has no UI either. The
+            // control belongs on the Privacy section next to `network_mode`,
+            // and shipping it is a `Settings.tsx` + `types.ts` change owned by
+            // whoever owns those files.
+            "context_ingest_enabled",
+            "ext_context_enabled",
         ];
         // Everything else is surfaced in the desktop UI (Settings tabs / hub
         // views / onboarding) and mirrored in the TS Settings type.
@@ -1663,10 +2290,6 @@ mod tests {
             "agent_memory_inject",
             "agent_memory_limit",
             "agent_timeout_secs",
-            "api_key_coingecko",
-            "api_key_finnhub",
-            "api_key_gnews",
-            "api_key_guardian",
             "assistant_name",
             "assistant_personality",
             "cameras_enabled",
@@ -1675,7 +2298,6 @@ mod tests {
             "cloud_fallback_enabled",
             "cloud_input_price_per_million",
             "cloud_output_price_per_million",
-            "compact_encoding",
             "context_monitor_enabled",
             "context_window_override",
             "custom_system_prompt",
@@ -1687,12 +2309,12 @@ mod tests {
             "ext_knowledge_enabled",
             "ext_memory_enabled",
             "ext_news_enabled",
+            "ext_orchestrator_enabled",
             "ext_schedule_enabled",
             "ext_sensor_enabled",
             "ext_system_enabled",
             "ext_vision_enabled",
             "ext_weather_enabled",
-            "fast_path_enabled",
             "home_name",
             "llm_max_tokens",
             "llm_provider",
@@ -1713,10 +2335,25 @@ mod tests {
             "memory_prune_threshold",
             "mic_enabled",
             "multi_tool_enabled",
+            "persist_thinking",
             "prefix_cache_prompt",
             "primary_profile_id",
             "prompt_addendum",
             "prompt_style",
+            // PAI-7 P4 and P6's five. They were HEADLESS_BY_DESIGN for a day
+            // with a note saying they owed a UI more than the tuning knobs did,
+            // because `unprompted_speech_enabled` decides whether the assistant
+            // talks to you unasked and a household cannot consent to a feature
+            // it cannot see. They have one now, under "Speaking and acting
+            // unprompted" in `Settings.tsx`, with the quiet-hours bounds as
+            // free text rather than a time picker -- a value the server cannot
+            // parse means silence, and a picker renders such a value as blank,
+            // which reads as "not set".
+            "proactive_review_enabled",
+            "quiet_hours_end",
+            "quiet_hours_start",
+            "unprompted_speech_categories",
+            "unprompted_speech_enabled",
             "retention_event_log_days",
             "retention_sensor_days",
             "retention_session_messages_keep",
@@ -1726,13 +2363,13 @@ mod tests {
             "schedule_max_concurrent",
             "schedule_max_runs_per_task",
             "schedule_result_notify",
+            "reasoning_effort",
             "searxng_url",
             "show_thinking",
             "show_turn_stats",
             "telemetry_enabled",
             "thinking_mode",
             "timezone",
-            "tool_cache_enabled",
             "tool_call_validation",
             "tool_model",
             "tool_output_compaction",
@@ -1795,6 +2432,176 @@ mod tests {
             "settings field count mismatch: {} serialized vs {} classified",
             keys.len(),
             UI_WIRED.len() + HEADLESS_BY_DESIGN.len()
+        );
+    }
+
+    /// PAI-6 P5. `ext_orchestrator_enabled` is the one extension toggle that
+    /// defaults OFF, and there are three separate places it could silently
+    /// become `true`, so all three are asserted.
+    ///
+    /// The third is the one that matters: every other `ext_*` field reuses
+    /// [`Settings::default_ext_enabled`], which returns `true`. Writing
+    /// `#[serde(default = "Settings::default_ext_enabled")]` on this field —
+    /// the obvious copy-paste — compiles, passes the disposition test above,
+    /// passes the settings roundtrip in `pond-infra`, and turns delegation on
+    /// for every install that upgrades into it.
+    #[test]
+    fn the_orchestrator_toggle_defaults_off_by_its_own_route() {
+        assert!(
+            !Settings::default().ext_orchestrator_enabled,
+            "the struct default is what a FAILED settings read produces via \
+             unwrap_or_default(); on failure, access narrows"
+        );
+
+        let from_nothing: Settings =
+            serde_json::from_str("{}").expect("every Settings field has a serde default");
+        assert!(
+            !from_nothing.ext_orchestrator_enabled,
+            "the serde default is what a settings payload written before this field existed \
+             deserializes to -- i.e. every pond that upgrades into this release"
+        );
+
+        assert!(
+            Settings::default_ext_enabled(),
+            "vacuity control: the shared extension default really does return true, so \
+             `default_ext_orchestrator_enabled` diverging from it is a decision and not a \
+             coincidence"
+        );
+        assert!(!Settings::default_ext_orchestrator_enabled());
+    }
+
+    /// PAI-7 P6, and the same three routes as the orchestrator toggle above,
+    /// because this one has the same shape: a `bool` that must be `false` on
+    /// every pond that upgrades into the release containing it.
+    ///
+    /// The difference is what "on" costs. A delegation toggle switched on
+    /// wrongly runs an agent nobody asked for; a speech toggle switched on
+    /// wrongly means a machine starts talking in somebody's house.
+    #[test]
+    fn the_unprompted_speech_toggle_defaults_off_by_its_own_route() {
+        assert!(
+            !Settings::default().unprompted_speech_enabled,
+            "the struct default is what a FAILED settings read produces via \
+             unwrap_or_default(); on failure the pond stays quiet"
+        );
+
+        let from_nothing: Settings =
+            serde_json::from_str("{}").expect("every Settings field has a serde default");
+        assert!(
+            !from_nothing.unprompted_speech_enabled,
+            "the serde default is what a settings payload written before this field existed \
+             deserializes to -- i.e. every pond that upgrades into this release"
+        );
+        assert!(!Settings::default_unprompted_speech_enabled());
+
+        // Vacuity control: the deserialization above really did produce a
+        // populated Settings rather than something that answers `false` to
+        // everything. Without this, the assertion holds against a struct whose
+        // every bool is false for the wrong reason.
+        assert_eq!(
+            from_nothing.quiet_hours_start,
+            Settings::default_quiet_hours_start(),
+            "an empty payload must fill every other field from its default too"
+        );
+        assert!(
+            from_nothing.tool_call_validation,
+            "vacuity control: a serde default that is genuinely `true` survives the same \
+             empty payload, so `unprompted_speech_enabled` being false is a decision"
+        );
+    }
+
+    /// PAI-8's on-pond producer, and the same three routes for the fourth time.
+    ///
+    /// What "on" costs here is different again from its two neighbours: not an
+    /// agent nobody asked for and not a machine talking, but a second durable
+    /// copy of everything the household's cameras and sensors saw, owned by one
+    /// named member and quoted back into a model's prompt. A pond that upgrades
+    /// into this release must not start making that copy.
+    #[test]
+    fn the_context_ingest_toggle_defaults_off_by_its_own_route() {
+        assert!(
+            !Settings::default().context_ingest_enabled,
+            "the struct default is what a FAILED settings read produces via \
+             unwrap_or_default(); on failure the pond copies nothing"
+        );
+
+        let from_nothing: Settings =
+            serde_json::from_str("{}").expect("every Settings field has a serde default");
+        assert!(
+            !from_nothing.context_ingest_enabled,
+            "the serde default is what a settings payload written before this field existed \
+             deserializes to -- i.e. every pond that upgrades into this release"
+        );
+        assert!(!Settings::default_context_ingest_enabled());
+
+        // Vacuity controls: the empty payload really did populate the struct,
+        // and a serde default that is genuinely `true` survives it. Without
+        // these, "false" holds against a value that is false for every field.
+        assert_eq!(
+            from_nothing.quiet_hours_start,
+            Settings::default_quiet_hours_start()
+        );
+        assert!(
+            from_nothing.tool_call_validation,
+            "vacuity control: a `true` serde default survives the same empty payload, so \
+             `context_ingest_enabled` being false is a decision"
+        );
+    }
+
+    /// Quiet hours ship SET rather than empty, and the categories ship at their
+    /// narrowest. Both are what a household gets the moment somebody enables
+    /// speech, and neither is something they will be prompted to choose.
+    #[test]
+    fn a_fresh_pond_already_has_a_quiet_window_and_the_narrowest_category() {
+        let s = Settings::default();
+        assert_eq!(s.quiet_hours_start, "22:00");
+        assert_eq!(s.quiet_hours_end, "07:00");
+        assert_eq!(
+            s.unprompted_speech_categories, "alert",
+            "`info` carries every completed scheduled task, so a default including it turns \
+             this feature into the pond reading out its own cron log"
+        );
+    }
+
+    /// The other direction, and the one that survives a field being added
+    /// tomorrow: derive the set of extension toggles that default off from the
+    /// serialized struct rather than from a list written today.
+    ///
+    /// It fails if one of them flips ON (the set shrinks), and it fails if a NEW
+    /// `ext_*` toggle arrives defaulting off (the set grows) — which is a
+    /// decision that should be made deliberately rather than inherited.
+    ///
+    /// **It has fired once, and worked.** It was
+    /// `exactly_one_extension_toggle_ships_switched_off` until PAI-8 P2 added
+    /// `ext_context_enabled`, and updating it was the deliberate decision it
+    /// exists to force. The two are off for related but distinct reasons, worth
+    /// keeping separate because a later reader will be tempted to collapse them:
+    ///
+    /// - `ext_orchestrator_enabled` — turning it on means an autonomous
+    ///   multi-turn agent running under `GooseMode::Auto` on the household's own
+    ///   hardware. A consent question.
+    /// - `ext_context_enabled` — turning it on puts two tool schemas into every
+    ///   turn's prompt, and until somebody connects a source they can only
+    ///   answer "nothing found". A consent question AND a prompt-budget one, on
+    ///   a device where tool schemas are already ~88% of a 4 096-token window.
+    #[test]
+    fn only_the_deliberate_extension_toggles_ship_switched_off() {
+        let value = serde_json::to_value(Settings::default()).expect("serialize Settings");
+        let off: Vec<&str> = value
+            .as_object()
+            .expect("Settings serializes to a JSON object")
+            .iter()
+            .filter(|(k, v)| k.starts_with("ext_") && *v == &serde_json::Value::Bool(false))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(
+            off,
+            vec!["ext_context_enabled", "ext_orchestrator_enabled"],
+            "the set of extension toggles that ship OFF changed. Adding one is a deliberate \
+             decision and belongs in this test's doc comment with its reason; losing \
+             `ext_orchestrator_enabled` means delegation is now on by default on every install, \
+             and losing `ext_context_enabled` means two personal-context tools are in every \
+             turn's prompt on every install"
         );
     }
 }

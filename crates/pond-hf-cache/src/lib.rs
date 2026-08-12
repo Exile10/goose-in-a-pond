@@ -527,6 +527,7 @@ where
 }
 
 /// Result of a manually-followed HEAD chain.
+#[derive(Debug)]
 struct HeadResult {
     final_url: String,
     headers: reqwest::header::HeaderMap,
@@ -559,10 +560,15 @@ async fn head_with_redirects(
                 }
             }
         }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("HEAD {current}"))?;
+        // PAI-2 P6a: gate PER HOP, not once on the entry URL. Redirects are
+        // followed by hand here precisely because the host changes mid-chain --
+        // that is the whole reason `should_send_auth_on_redirect` exists two
+        // lines up -- so a one-shot check on `url` would wave through exactly
+        // the case that matters: huggingface.co redirecting to a third party.
+        let call = pond_core::shared::services::egress::begin(&current, "HEAD")?;
+        let sent = req.send().await;
+        call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+        let resp = sent.with_context(|| format!("HEAD {current}"))?;
 
         let status = resp.status();
         if status.is_redirection() {
@@ -612,7 +618,14 @@ async fn get_with_redirects(
         if let Some(r) = range {
             req = req.header(reqwest::header::RANGE, r);
         }
-        let resp = req.send().await.with_context(|| format!("GET {current}"))?;
+        // PAI-2 P6a: per hop, for the same reason as the HEAD loop above. This
+        // is the second of the two sites in this file; gating only one would
+        // still satisfy the file-level egress guard, which is why there is a
+        // behavioural test for each.
+        let call = pond_core::shared::services::egress::begin(&current, "GET")?;
+        let sent = req.send().await;
+        call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+        let resp = sent.with_context(|| format!("GET {current}"))?;
         let status = resp.status();
         if status.is_redirection() {
             let loc = resp
@@ -922,6 +935,129 @@ mod tests {
         assert_eq!(
             fetch.blob_path("deadbeef"),
             folder.join("blobs").join("deadbeef")
+        );
+    }
+
+    // ── PAI-2 P6a: the network-mode gate, per redirect hop ──────────────────
+    //
+    // These are behavioural, not symbol-presence: `egress_guard.rs` checks that
+    // this FILE mentions a tracker symbol, which one gated hop would satisfy
+    // while the other still phoned out. There is one test per site.
+    //
+    // `network_mode` is a process-global `RwLock`. All three tests below want
+    // the same value and put it back, and nothing else in this binary reads it,
+    // so they do not need the `ENV_LOCK` treatment. A test that wanted a
+    // DIFFERENT mode would.
+
+    use pond_core::shared::services::egress::{network_mode, set_network_mode, NetworkMode};
+    use wiremock::matchers::{method as wm_method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Restores `NetworkMode::Open` however the test exits, including a panic
+    /// inside an assertion -- otherwise one failing test takes the rest of the
+    /// binary offline and the report blames the wrong thing.
+    struct ModeGuard(NetworkMode);
+
+    impl ModeGuard {
+        fn set(mode: NetworkMode) -> Self {
+            let previous = network_mode();
+            set_network_mode(mode);
+            Self(previous)
+        }
+    }
+
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            set_network_mode(self.0);
+        }
+    }
+
+    /// A loopback server that 302s to `location`.
+    async fn redirector(location: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/start"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", location))
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/start"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", location))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn head_redirect_to_a_non_loopback_host_is_refused_at_the_hop() {
+        // `.invalid` is reserved and never resolves (RFC 2606), so if the gate
+        // ever stopped firing this would fail with a DNS error instead -- which
+        // is exactly what the message assertions below distinguish.
+        let server = redirector("https://cdn.invalid/blob").await;
+        let _mode = ModeGuard::set(NetworkMode::Allowlist);
+
+        let client = build_redirect_aware_client(None).expect("client builds");
+        let err = head_with_redirects(&client, &format!("{}/start", server.uri()), None)
+            .await
+            .expect_err("the second hop leaves loopback and must be refused");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("cdn.invalid"),
+            "the refusal must name the host it refused: {rendered}"
+        );
+        assert!(
+            rendered.contains("network_mode") && rendered.contains("allowlist"),
+            "the refusal must name the setting and its value, or it is \
+             indistinguishable from the network being down: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_redirect_to_a_non_loopback_host_is_refused_at_the_hop() {
+        let server = redirector("https://cdn.invalid/blob").await;
+        let _mode = ModeGuard::set(NetworkMode::Allowlist);
+
+        let client = build_redirect_aware_client(None).expect("client builds");
+        let err = get_with_redirects(&client, &format!("{}/start", server.uri()), None, None)
+            .await
+            .expect_err("the second hop leaves loopback and must be refused");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("cdn.invalid"),
+            "the refusal must name the host it refused: {rendered}"
+        );
+        assert!(
+            rendered.contains("network_mode") && rendered.contains("allowlist"),
+            "the refusal must name the setting and its value: {rendered}"
+        );
+    }
+
+    /// The vacuity control. A gate that refused every hop would make both tests
+    /// above pass for the wrong reason, and would also break redirect following
+    /// outright. This asserts a permitted chain still completes end to end.
+    #[tokio::test]
+    async fn a_permitted_redirect_chain_still_completes() {
+        let destination = MockServer::start().await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/blob"))
+            .respond_with(ResponseTemplate::new(200).insert_header("etag", "\"deadbeef\""))
+            .mount(&destination)
+            .await;
+        let hop = format!("{}/blob", destination.uri());
+        let server = redirector(&hop).await;
+        let _mode = ModeGuard::set(NetworkMode::Allowlist);
+
+        let client = build_redirect_aware_client(None).expect("client builds");
+        let head = head_with_redirects(&client, &format!("{}/start", server.uri()), None)
+            .await
+            .expect("loopback to loopback is permitted under allowlist");
+
+        assert_eq!(head.final_url, hop);
+        assert_eq!(
+            head.headers().get("etag").and_then(|v| v.to_str().ok()),
+            Some("\"deadbeef\"")
         );
     }
 }

@@ -8,6 +8,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **No emojis in UI or code.** Use `lucide-react` icons for functional icons and the official logo for brand — never emojis (a lint guard, `no-emoji.test.ts`, scans source *including comments*).
 - **Trust the model for tool use / thinking** — no keyword pre-classification, no separate ToolCaller model in the main loop. The main LLM calls MCP tools natively.
 
+### Personal Agentic Intelligence (P.A.I.) — mandatory recursive check
+
+**Any work touching PAI-1 through PAI-8 starts by reading [`docs/architecture/pai/00-checklist.md`](docs/architecture/pai/00-checklist.md) and ends by updating it.** No exceptions, every session, however small the change.
+
+The eight capabilities — proactivity, thinking, multi-agent orchestration, hard profile boundaries, large context, smart compaction, personal context streaming, privacy guardrails — are **equally weighted and mutually interdependent**. A change that satisfies one in isolation is not done. The checklist's section 2.2 is the interdependency test; run it against all eight, not just the one being worked on.
+
+Two rules that cause the most damage when skipped:
+
+- **Re-verify before you trust.** Every current-state claim in the PAI documents is stamped with the date it was verified. Line numbers rot. Grep for the symbol, not the `file:line` — and fix the document in the same change when a claim has gone stale.
+- **Prerequisites must be LANDED, not merely DESIGNED.** [`docs/architecture/personal-agentic-intelligence.md`](docs/architecture/personal-agentic-intelligence.md) holds the dependency graph, the status ledger and the seven cross-cutting invariants. It decides what is eligible to be worked on.
+
 ---
 
 ## What GIAP is
@@ -66,9 +77,28 @@ cargo test  -p <crate> -- --ignored                 # the ~28 LIVE-HARDWARE test
 cargo check -p pond-server -p pond-adapters-goose   # PRODUCTION-binary compile gate (pulls goose submodule; slow cold)
 ```
 
-- The **"fast crates"** are every crate that does **not** pull the Goose submodule or heavy native libs (goose, llama-cpp-2, candle, onnxruntime). The exact list is in `ci.yml`; `pond-server`, `pond-adapters-goose`, `pond-adapters-local-inference`, `pond-adapters-face-onnx`, and `pond-agent` are excluded from the fast lint/test pass and covered only by the `cargo check` gate.
+- The **"fast crates"** are every crate that does **not** pull the Goose submodule or heavy native libs (goose, llama-cpp-2, candle, onnxruntime). The exact list is in `ci.yml`; `pond-server`, `pond-adapters-goose`, `pond-adapters-local-inference`, `pond-adapters-face-onnx`, `pond-agent`, and `pond-inference` are excluded from the fast lint/test pass and covered only by `cargo check` gates. The list is also the enforcement of the hexagonal invariant: if a crate in it grows a `goose` dependency, the split it names has quietly stopped existing. `pond-api` carried one for a single `Recipe::from_content` call, and `pond-inference` was in the list while building llama.cpp — both fixed 2026-08-06.
 - `SQLX_OFFLINE=true` is required to build offline. Note: session/settings storage uses **runtime `sqlx::query`** (not the `query!` macro), so there is **no `.sqlx/` dir** and `cargo sqlx prepare` is not needed. Settings persist as a **flat key-value table** (`settings(key,value,updated_at)`), one row per field — new fields are new rows, no migration; the API serializes the `Settings` struct directly (no DTO). A completeness test (`every_settings_field_is_dispositioned`) fails the build if a new `Settings` field is not classified UI-wired or headless.
 - CI overrides `RUSTFLAGS=""` — see the target-cpu landmine under *Goose Submodule*.
+- **Clean up build artifacts when you finish a testing session.** This workspace builds the Goose
+  submodule, llama.cpp, ONNX Runtime and candle, and `target/` reaches tens of gigabytes on a
+  laptop that also holds the models. `target/debug/incremental` is the worst of it and the least
+  valuable — it is a per-crate rebuild cache, not a dependency cache, so deleting it costs one
+  recompile of the workspace crates and nothing else:
+
+  ```bash
+  rm -rf target/debug/incremental     # the usual culprit; recovers the most, costs the least
+  cargo clean -p pond-api -p pond-core     # a specific crate's artifacts
+  cargo clean                              # everything, including the slow submodule build
+  ```
+
+  Prefer the first. Reach for a full `cargo clean` only when you are done for the day, because
+  rebuilding `pond-adapters-goose` and the submodule from cold is minutes, not seconds.
+
+  **This is not housekeeping, it is a failure mode.** A run in the PAI programme died on
+  `ld: write() failed, errno=28` with `target/debug/incremental` at 112 GB; deleting it recovered
+  84 GB. A full disk presents as a LINKER fault, not as a disk fault, so it reads like a miscompile
+  and gets debugged as one. Check `du -sh target` before diagnosing a strange link error.
 
 ### Run the server
 ```bash
@@ -94,6 +124,102 @@ npm run tauri build    # native desktop app bundle
 ```
 - E2E mocks use origin-agnostic `**/api/**` globs and pin the API base via `window.__GIAP_SERVER_URL__` in `tests/e2e/helpers/api-mocks.ts` (`mockAllApiRoutes`). `page.route` is **last-registered-wins** — register catch-alls before specific routes.
 - In a plain browser the app defaults its API base to `window.location.origin` (so the single-executable dashboard works same-origin over the LAN); the Tauri shell injects `window.__GIAP_SERVER_URL__` for a local server. See `defaultServerUrl()` in `PondApiClient.ts`.
+
+### Live testing — required before claiming anything works
+
+**Green unit tests are not evidence that the pond starts.** Every test in the Rust
+workspace runs against a database built by applying every migration to an empty file,
+in one process, with the adapter under test constructed by hand. None of that
+exercises startup ordering, migration application against a database that already has
+rows, route registration, the auth middleware, or the wiring in `main.rs` — which is
+where several real defects have been.
+
+```bash
+scripts/live-test.sh                 # build, start on a scratch data dir, assert, dig logs
+scripts/live-test.sh --ui            # also build the web UI and drive it with Playwright
+scripts/live-test.sh --no-build      # reuse the existing binary
+scripts/live-test.sh --keep          # leave the server up to poke at by hand
+```
+
+Run it for **any change touching a migration, a route, a handler, or startup wiring**.
+It does six things, and each exists because the alternative missed something real:
+
+1. **Builds with `RUSTFLAGS=""`**, matching `ci.yml`. See the target-cpu landmine below.
+2. **Starts against a scratch `POND_DATA_DIR`**, so a test run can never touch a real
+   pond, and reads the port back from `.runtime_api_port` rather than assuming 4000.
+3. **Asserts over real HTTP** (`scripts/live_checks.py`) — including the failure cases.
+   A handler that compiles and a handler that returns the right status for a missing
+   row are different claims.
+4. **Restarts against the same directory**, which now has rows. A migration that only
+   works on an empty database works exactly once, and every install after the first is
+   an upgrade.
+5. **Re-runs the auth checks on a second server with the loopback bypass OFF.** This is
+   not fussiness: with `POND_DEV_ALLOW_LOOPBACK` set, every auth assertion passes
+   regardless of what the allowlist does.
+6. **Digs the logs**, for more than your own feature. `WARN` and `ERROR` lines that were
+   already there are still findings.
+
+**Two rules for writing live checks.**
+
+- **Assert the status code before any body predicate.** A check written as
+  `body.get("profile_id") is None` passes against an error payload, where every lookup
+  returns `None` — so it reports the opposite of the truth. `expect()` in
+  `live_checks.py` enforces the ordering; use it.
+- **Ask whether production could ever produce your fixture.** A test whose *fixture* is
+  unreachable tests a system that does not exist. `ProfileScope::Owner` was a no-op in
+  production for a whole phase because every fixture that produced an owned row set
+  `profile_id` by hand, which no code path did.
+
+### Live UI testing (Playwright against a real server)
+
+`npx playwright test` runs `tests/e2e/`, which mocks **every** API call with
+`page.route()` against the Vite dev server. That is the right shape for component
+behaviour and it **cannot catch an API contract change** — the mock keeps returning the
+old shape long after the server stopped producing it.
+
+`tests/e2e-live/` mocks nothing. It drives the dashboard the server actually serves,
+talking to the server that actually built it:
+
+```bash
+cd pond-desktop && npm ci && npm run build          # or the server serves the placeholder
+POND_LIVE_URL=http://127.0.0.1:4000 npx playwright test --config=playwright.live.config.ts
+```
+
+`scripts/live-test.sh --ui` does all of that in one command. The live config has no
+`webServer` block on purpose — the server is owned by the script, which also does the
+restart and no-bypass passes that Playwright should not be driving. `retries: 0`, also
+on purpose: a live test that passes on the second attempt is telling you something
+about startup ordering, and retrying hides it.
+
+**The first thing it asserts is that the page is not the placeholder.** `build.rs` emits
+a stub carrying `data-giap-placeholder` when `pond-desktop/dist` was never built, and a
+binary shipping it looks like a working server until somebody opens a browser.
+
+**Know what has no UI before writing a UI test for it.** PAI-1's identity work is
+API-only: `pond-desktop/src` calls exactly one profile route, `GET /api/v1/profiles`.
+There is no household-member removal, no session-identity binding, and no wake-on-face
+control in the shipped app. A Playwright test of that feature would exercise nothing —
+grep `pond-desktop/src` for the routes first, and if nothing calls them, say so in the
+report instead of writing a test that passes vacuously.
+
+### macOS specifics
+
+Both scripts run on macOS and Linux. On a Mac:
+
+- `libasound2-dev` is a Linux-only concern. If a build fails on `alsa-sys` there, that
+  is the Linux path; on macOS `cpal` uses CoreAudio and needs nothing installed.
+- `TMPDIR` is not `/tmp` — the script honours it, so scratch data lands in the real
+  per-user temp dir. Anything hardcoding `/tmp` will silently diverge.
+- Chromium for Playwright installs per-user via `npx playwright install chromium`;
+  there is no system-wide `PLAYWRIGHT_BROWSERS_PATH` unless you set one.
+- `pkill -f pond-server` matches your own shell's command line on macOS more eagerly
+  than on Linux. The script tracks PIDs instead; do the same by hand.
+- **Check nothing else is already on port 4000 before a live run**:
+  `lsof -nP -iTCP:4000-4009 -sTCP:LISTEN`. A `serve --native` left running has no
+  `POND_DATA_DIR`, so it is on the *real* data directory. `live-test.sh` now reads
+  `.runtime_api_port`, fails hard when it is absent, and refuses to drive a listener
+  whose pid it did not start — it previously assumed 4000 and wrote `user_name=LiveTest`
+  and `chat_model=mock` into a real pond.
 
 ### Single-executable / Jetson build
 `pond-server` embeds `pond-desktop/dist` at compile time (`crates/pond-api/build.rs` + `routes.rs` via `include_dir`), so a release build is a **single self-contained executable** (build the UI first, or you get the `build.rs` placeholder). Build scripts:
@@ -143,7 +269,7 @@ All chat history is written to and read from `pond_system.db`. Goose maintains i
 
 ### MCP dispatch
 
-`GooseAdapter` dispatches the 14 `giap-*` builtin MCP extensions (57 tools when every toggle is on; `giap-draft` is always-on and `giap-device-control` rides the `ext_device_enabled` toggle) via Goose's own extension manager (`giap_registration.rs`). `crates/pond-mcp-server/src/dispatcher.rs` (`McpToolDispatcher`, the `PREFIX_*` consts) is the **PondAgent** direct-dispatch path, which is quarantined (Q2-05) — so audit/vision tools that need deps installed by pond-server (`init_audit_deps`) are dispatched by Goose, not this dispatcher.
+`GooseAdapter` dispatches the 17 `giap-*` builtin MCP extensions (64 tools when every toggle is on; `giap-draft` and `giap-toolkit` are always-on, `giap-device-control` rides the `ext_device_enabled` toggle, and **two** extensions ship with their toggle **off** — `giap-orchestrator` and, since PAI-8 P2, `giap-context`, the second for a prompt-budget reason as well as a consent one: two tool schemas in every turn cost real tokens on a 4 096-token window and can only answer "nothing found" until somebody connects a source) via Goose's own extension manager (`giap_registration.rs`). Count them with `grep -c 'register_builtin_extension(' giap_registration.rs`, which is the whole answer: **do not subtract anything**. The import is `use goose::builtin_extension::register_builtin_extension;` — no open paren, so the grep never counted it, and the old "minus the import" instruction here turned the right number into 14, which is the exact wrong number this programme has recorded twice. Two call sites pass a const rather than a string literal (`TOOLKIT_EXTENSION`, `ORCHESTRATOR_EXTENSION`), so grepping for `"giap-*"` string literals undercounts by two. `crates/pond-core/tests/registration_matches_the_catalog.rs` ties this sentence, the registration list and `tool_group.rs :: TOOL_GROUPS` to each other, and fails if any two disagree. `crates/pond-mcp-server/src/dispatcher.rs` (`McpToolDispatcher`, the `PREFIX_*` consts) is a **second, live** dispatch path — not a PondAgent-only one. It is bound into `AppState` unconditionally by `main.rs` and served by `POST /api/v1/tools/invoke` and `POST /api/v1/mcp/tools/call`, which run a tool with no chat turn and therefore no engine session in `_meta`. With no session there is no caller, and a policy check against an unknown caller is *permitted* under `PolicyMode::Audit`, not refused. So that path is deny-by-default: `routes.rs :: DIRECT_DISPATCH_ALLOWLIST` names the only tools reachable through it (device actuation for the Hub, read-only weather for MCP Apps). Adding a name there grants it to any paired client and to any sandboxed MCP App iframe — anything that decides, executes, or reads household memory belongs on the Goose path instead. Its registration list has also drifted from `giap_registration.rs`: audit, vision, sensors and toolkit are absent here, and audit/vision need deps installed by pond-server (`init_audit_deps`) that only the Goose path supplies.
 
 ---
 
@@ -165,9 +291,13 @@ Do not remove either guard without a dedicated stabilisation milestone. The code
 See `docs/goose-patch-management.md` for the patch set carried on top of upstream (`aaif-goose/goose`) and the upstream-rebase procedure.
 
 The submodule is pinned to `jarida-io/Goose:main` (upstream main synced
-2026-07-25 + the GIAP patch set: ollama tool-less retry, extra featured Gemma 4
-models; the old native_tool_calling/use_jinja patches are subsumed by upstream's
-`ToolCallingMode`/`ChatTemplate`). Upstream declares `rmcp = "^1.4"`; the
+2026-07-25 + the GIAP patch set, which is **six** patches as of 2026-08-12:
+ollama tool-less retry, extra featured Gemma 4 models, llama.cpp `ProviderStats`
+parity, thinking-only turns count as empty, llama.cpp prompt-session KV cache,
+session-scoped agent goal —
+`docs/goose-patch-management.md` is the authoritative table, and this line said
+"two" until PAI-6 P2 counted the rows. The old native_tool_calling/use_jinja
+patches are subsumed by upstream's `ToolCallingMode`/`ChatTemplate`). Upstream declares `rmcp = "^1.4"`; the
 workspace still forces `rmcp = "=1.5.0"`. CI clones the fork branch tip
 directly, bypassing the stored submodule SHA — a BREAKING sync must be staged on
 a side branch and fast-forwarded into fork `main` together with the parent-side

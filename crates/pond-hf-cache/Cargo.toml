@@ -10,6 +10,11 @@ name = "pond_hf_cache"
 path = "src/lib.rs"
 
 [dependencies]
+# PAI-2 P6a. This crate downloads model blobs from huggingface.co and follows
+# redirects to CDN hosts by hand, so it must consult the network-mode gate like
+# every other sender. The direction is inward and there is no cycle: pond-core
+# depends only on pond-voice + serde/tokio/tracing and never reaches back here.
+pond-core = { workspace = true }
 anyhow = { workspace = true }
 fs2 = { workspace = true }
 reqwest = { workspace = true }

@@ -265,15 +265,22 @@ async fn download_to(url: &str, dir: &Path, dest: &Path) -> anyhow::Result<u64> 
     tokio::fs::create_dir_all(dir).await?;
     let part = dest.with_extension("part");
 
-    let resp = reqwest::Client::builder()
+    // PAI-2 P6a: one gate for the whole encoder fetch. This is the single
+    // choke point -- every caller reaches the network through here -- and it
+    // runs inside a spawned task, so `record_egress`'s `tokio::spawn` has a
+    // runtime. The caller already logs a failed download as a warning and
+    // leaves the model text-only, so a refusal degrades rather than breaks.
+    let call = pond_core::shared::services::egress::begin(url, "GET")?;
+    let sent = reqwest::Client::builder()
         // A ~1 GB transfer on a slow home link must not trip a default timeout;
         // the read timeout below is what catches a genuinely dead connection.
         .read_timeout(std::time::Duration::from_secs(120))
         .build()?
         .get(url)
         .send()
-        .await?
-        .error_for_status()?;
+        .await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    let resp = sent?.error_for_status()?;
 
     let mut file = tokio::fs::File::create(&part).await?;
     let mut written = 0u64;
