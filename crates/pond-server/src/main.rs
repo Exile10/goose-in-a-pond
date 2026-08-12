@@ -2701,7 +2701,19 @@ async fn run_server(
         matter_bridge_parts
     {
         let registry = device_registry.clone();
-        let bus = event_bus.clone();
+        // The bridge holds only a bus handle, so persistence is attached to the
+        // handle (#90): the decorator records each BusEvent::Sensor before
+        // forwarding it, giving Matter readings the same persist-before-publish
+        // ordering record_sensor gets by writing inline (#91). Without this
+        // nothing writes adapter-sourced readings and giap-sensors can never
+        // answer a question about a real device. AppState keeps the plain bus,
+        // since record_sensor already persists and would otherwise double-write.
+        let bus: Arc<dyn pond_core::shared::ports::event_bus::EventBus> = Arc::new(
+            pond_core::shared::services::sensor_persisting_event_bus::SensorPersistingEventBus::new(
+                event_bus.clone(),
+                sensor_storage.clone(),
+            ),
+        );
         let matter_url = settings.matter_ws_url.trim().to_string();
         // Supervised: on connection loss it reconnects with backoff and swaps
         // the fresh client into the control's handle (#195), so a matter-server
