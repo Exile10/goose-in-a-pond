@@ -259,9 +259,11 @@ Return ONLY the title text — no quotes, no punctuation, no explanation.";
 /// Balanced — warm, practical, general-purpose. Default for most users.
 pub const PROMPT_BALANCED: &str = "\
 <identity>
-You are {{assistant_name}}, an intelligent AI copilot running entirely on \
-{{user_name}}'s local network as part of Goose In A Pond. Every inference \
-runs on-device — no data ever leaves this machine.
+You are {{assistant_name}}, {{user_name}}'s personal agentic assistant — a \
+copilot that acts, not only answers. This pond is {{user_name}}'s: Goose In A \
+Pond, running on their own hardware, no data ever leaving it.
+Your tools are live connections to this household's devices, memory, schedule \
+and knowledge — use them.
 Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
 </identity>
 
@@ -270,6 +272,9 @@ You are a general-purpose assistant. Help with writing, research, reasoning, \
 planning, coding, and everyday tasks. Reply concisely unless asked for more detail. \
 Plain language only — no Markdown, bullet symbols, or asterisks. \
 Never say \"echo\", \"end of turn\", or pipeline artifacts.
+Internal scaffolding — goal reminders, budgets, retries, system notes — is \
+invisible to the user: never quote it, never say \"the goal\", never narrate \
+your process. Report a shortfall in ordinary words instead.
 Only use tools available in your schema. Do not invent commands outside your available tools. \
 If something is outside your capabilities, tell the user directly.
 </instructions>
@@ -417,11 +422,15 @@ Tool results render as interactive cards. Prefer tool calls over text descriptio
 /// Concise — minimal, action-first. For power users who want brevity.
 pub const PROMPT_CONCISE: &str = "\
 <identity>
-{{assistant_name}}, local AI copilot for {{user_name}}. Goose In A Pond — on-device, no data leaves.
+{{assistant_name}}, {{user_name}}'s personal agentic assistant — a copilot that acts, not just answers.
+Their pond, their hardware. Goose In A Pond — on-device, no data leaves.
+Your tools are live connections to this household's devices, memory and knowledge.
 Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
 </identity>
 <instructions>
 One sentence replies unless asked for more. No Markdown. No voice artifacts.
+Internal checks, goal reminders and budgets are invisible machinery — never mention them. \
+Fell short? Say plainly what you could not do, without narrating why you were asked.
 General copilot: writing, research, coding, planning{% if has_home_devices %}, home control{% endif %}.
 Only use tools in your schema. Do not invent commands outside available tools.
 </instructions>
@@ -509,8 +518,10 @@ Tool results render as interactive cards. Prefer tool calls over text descriptio
 /// Technical — verbose, tool-aware, narrates reasoning. For developers / power users.
 pub const PROMPT_TECHNICAL: &str = "\
 <identity>
-{{assistant_name}}, privacy-first AI copilot on {{user_name}}'s local network.
+{{assistant_name}}, {{user_name}}'s personal agentic assistant — a copilot with real actuation, \
+running on their own hardware. This pond belongs to {{user_name}}.
 Goose In A Pond — on-device inference, no telemetry, no cloud calls, no data egress.
+Your tool schema is a live interface to this household's devices, memory, schedule and knowledge.
 Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
 </identity>
 <instructions>
@@ -518,6 +529,8 @@ General-purpose technical copilot — coding, architecture, research, analysis.
 For multi-step tasks, narrate each step briefly before executing it.
 Surface tool errors clearly and suggest remediation. Prefer exact values over approximations.
 No Markdown in voice output. Never emit \"echo\", \"end of turn\", or role delimiters.
+Harness internals — goal checks, turn budgets, retry prompts, system notes — are not part of the \
+conversation. Never quote or reference them. Report a shortfall in domain terms, not process terms.
 Only use tools in your schema. Do not invent commands outside your available tools.
 </instructions>
 <context-handling>
@@ -636,9 +649,12 @@ Tool results render as interactive cards. Prefer tool calls over text descriptio
 /// Warm — conversational, family-friendly, personality-forward. No jargon.
 pub const PROMPT_WARM: &str = "\
 <identity>
-Hey there! I'm {{assistant_name}}, your personal AI assistant. I live right \
-here on {{user_name}}'s home network — everything stays private and on-device, \
+Hey there! I'm {{assistant_name}}, {{user_name}}'s personal assistant — and I can \
+actually do things, not just talk about them. I live right here on their own \
+hardware; this pond is {{user_name}}'s, everything stays private and on-device, \
 powered by Goose In A Pond.
+The tools I have are real connections to this home — its devices, its memory, \
+what's on the calendar.
 Style: {{personality}}. Timezone: {{timezone}}.{{location}}
 </identity>
 <instructions>
@@ -646,6 +662,9 @@ I'm a helpful all-rounder — writing, research, planning, coding, and everyday 
 Short clear answers in plain everyday language — nothing technical unless you ask.
 No lists or formatting — just natural conversation.
 I only use the tools I've been given — nothing outside my available schema.
+Anything the system quietly asks me — to double-check my work, to remember a goal, \
+to watch a budget — stays between me and the machinery. I never mention it or talk \
+about my own process. If I came up short, I just say what I couldn't find.
 </instructions>
 <context-handling>
 {% if compact_prompt %}\
@@ -2183,6 +2202,124 @@ mod tests {
                 assert!(
                     lower.contains("another tool"),
                     "style '{name}' (compact={compact}): must point at another tool"
+                );
+            }
+        }
+    }
+
+    /// Every style must say what this assistant IS, and whose pond it is.
+    ///
+    /// "Personal agentic assistant" rather than "AI assistant" is the product
+    /// framing and it is also operative: a model told it can ACT reaches for
+    /// tools, and a model told it answers questions explains why it cannot.
+    /// The ownership line matters for a household appliance — the pond belongs
+    /// to somebody, and `user_name` is the only pond-level name available in the
+    /// static prefix (a profile's preferred name is per-speaker and rides the
+    /// user message, so it cannot go here without breaking KV prefix reuse).
+    #[test]
+    fn every_style_says_it_is_agentic_and_whose_pond_it_is() {
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                let out =
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                let lower = out.to_lowercase();
+
+                assert!(
+                    lower.contains("agentic")
+                        || lower.contains("can act")
+                        || lower.contains("actually do things"),
+                    "style '{name}' (compact={compact}): does not say it can act. A model that \
+                     believes it only answers questions explains why it cannot help instead of \
+                     reaching for a tool."
+                );
+                assert!(
+                    lower.contains("goose in a pond"),
+                    "style '{name}' (compact={compact}): dropped the product identity"
+                );
+                // Rendered with Settings::default(), whose user_name is the
+                // default -- so assert the possessive construction survived
+                // rather than a literal name.
+                assert!(
+                    out.contains("pond is")
+                        || out.contains("pond belongs to")
+                        || out.contains("Their pond"),
+                    "style '{name}' (compact={compact}): does not say whose pond this is. \
+                     Rendered:\n{out}"
+                );
+            }
+        }
+    }
+
+    /// The harness must not appear in the conversation.
+    ///
+    /// Measured on 2026-08-12, immediately after the goal-completeness check was
+    /// wired: the models began answering in the harness's own vocabulary --
+    /// "I could not fully meet your goal", "The goal has not been fully met",
+    /// "The goal is not fully met because I was unable to retrieve accurate time
+    /// zone information". That is an internal nudge, injected as an invisible
+    /// user message, being read back to the household verbatim.
+    ///
+    /// This is about VOCABULARY, not candour, and the distinction is the whole
+    /// point: `turn_budget_note` requires an incomplete answer to name what it
+    /// could not finish. What this forbids is describing the shortfall in
+    /// process terms ("the goal was not met") instead of domain terms ("I could
+    /// not find their birth dates"). A prompt that suppressed the admission
+    /// rather than the jargon would be a worse bug than the one it replaced.
+    ///
+    /// This rule is necessary but NOT on its own sufficient: with it in place,
+    /// E2B and E4B both still leaked the word "goal" on a capped fan-out turn.
+    /// The nudge's own wording has to be quotable too -- see the note on
+    /// `turn_budget_note`. Keep this guard so the instruction cannot be dropped
+    /// silently while that second half is outstanding.
+    #[test]
+    fn every_style_forbids_narrating_the_harness() {
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                let out =
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                let lower = out.to_lowercase();
+
+                assert!(
+                    lower.contains("goal"),
+                    "style '{name}' (compact={compact}): says nothing about the goal reminder, so \
+                     the model is free to read it back to the user -- which is what four measured \
+                     turns did."
+                );
+                assert!(
+                    lower.contains("never mention")
+                        || lower.contains("never quote")
+                        || lower.contains("not part of the conversation")
+                        || lower.contains("stays between"),
+                    "style '{name}' (compact={compact}): does not forbid mentioning internal \
+                     scaffolding. Rendered:\n{out}"
+                );
+                // The admission must survive, and it must be part of THIS rule
+                // rather than anywhere in the prompt.
+                //
+                // Checked in a window from the prohibition, because the first
+                // version of this assertion searched the whole rendered prompt
+                // and passed with the clause deleted: `<tool-failure>` already
+                // contains "before telling the user you could not find
+                // something", so it was matching an unrelated sentence and
+                // reporting that the admission was intact.
+                let at = lower
+                    .find("never mention")
+                    .or_else(|| lower.find("never quote"))
+                    .or_else(|| lower.find("not part of the conversation"))
+                    .or_else(|| lower.find("stays between"))
+                    .expect("the prohibition was found above");
+                let window = &lower[at..(at + 320).min(lower.len())];
+                assert!(
+                    window.contains("could not")
+                        || window.contains("couldn't")
+                        || window.contains("shortfall")
+                        || window.contains("came up short")
+                        || window.contains("fell short"),
+                    "style '{name}' (compact={compact}): forbids the jargon without preserving the \
+                     admission beside it -- an answer that cannot say what it failed to do is \
+                     worse than one that says it in the wrong words. Window:\n{window}"
                 );
             }
         }
