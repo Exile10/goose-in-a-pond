@@ -233,9 +233,16 @@ mkdir -p "$DATA_DIR/models/gguf"
 #            into `hf_cache`, so this can be a blob whose basename is a SHA.
 #            Linking under that name would give the scratch pond a model no
 #            registry can resolve, so the link is always named for the ENTRY.
+#
+# The glob is written on the FULL PATH, not on a bare filename joined to the
+# directory afterwards. A pattern only expands against the current directory,
+# and this script `cd`s to the repo root at startup -- so `"$MODEL"-*.gguf`
+# matched nothing there, stayed literal, and every candidate was tested as a
+# path with an asterisk in it. The failure looked exactly like a missing model
+# while the model was in the list the error message printed.
 ENTRY=""
-for candidate in "$MODEL.gguf" "$MODEL"-*.gguf; do
-  if [ -e "$REAL_MODELS/gguf/$candidate" ]; then ENTRY="$candidate"; break; fi
+for path in "$REAL_MODELS/gguf/$MODEL.gguf" "$REAL_MODELS/gguf/$MODEL"-*.gguf; do
+  if [ -e "$path" ]; then ENTRY="$(basename "$path")"; break; fi
 done
 if [ -z "$ENTRY" ]; then
   echo "FATAL: could not resolve $MODEL to a file under $REAL_MODELS/gguf" >&2
