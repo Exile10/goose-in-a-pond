@@ -456,6 +456,56 @@ Once occupancy is measured rather than estimated, `ContextHealth.should_compact`
 
 ---
 
+## 4b. Loop termination (2026-08-12)
+
+The governor decides how much context a turn may use. It says nothing about when a turn should
+END — and until this date, nothing did.
+
+**The finding.** GIAP's adapter never decides a turn is over; it notices goose stopped
+(`goose_agent.rs`, `break 'engine`). Goose stops when the model stops emitting tool calls. Eighteen
+enumerated exit paths, and not one reads the user's request after the turn starts. `produced_visible`
+is the only completion-ish predicate and it is a one-bit "did any byte reach the client" flag.
+
+Measured on a Mac, gemma-4-E2B, *"what time is it in the first 10 states of the USA
+alphabetically?"*: **zero** tool calls, and an answer asserting one time for all ten states — its own
+local clock (Nairobi, 15:12, against a 12:12Z log line). Every layer reported success.
+
+**The mechanism existed and was unwired.** `Agent::reply` re-prompts "check whether the goal has been
+fully met; if not, continue working toward it" on a turn that finishes without a tool call. It is
+guarded on a goal being set, and `set_goal(` had no callers in this workspace.
+
+**Why wiring it was a PAI-1 question first.** `Agent::goal` is a single slot on an agent shared by
+four concurrent chat streams (`AppState::sse_semaphore`, `Semaphore::new(4)`). The process-wide
+setter would inject one household member's request text into another member's turn as a user message.
+Fork patch six adds `set_session_goal`, keyed on `SessionConfig::id`, which is already per-reply.
+This is the general shape worth remembering: **a completeness fix that reaches for shared mutable
+state on a shared agent is a boundary crossing**, and the check that would have caught it is asking
+who else holds that `Arc`.
+
+**What it buys and what it costs.** gemma-4-E4B went from "I was unable to find a list of the ages"
+to the actual ages of the former Kenyan Presidents (4 -> 7 tool calls), and from a flat refusal to a
+per-state time table having finally found `world_clock` — a tool that existed all along, which the
+model's own refusal had claimed did not. Cost is ~2x inferences per turn, because the check re-arms
+each time the model does more work: 3 nudges on one turn, not 1. Capping it at one check would have
+stopped the seven-call turn around its fourth, back at failure. `goal_check_enabled` defaults true.
+
+**Not a `ModelClass` tier**, despite that enum being exactly "how expensive an extra model call is on
+this box". Its only cheap tier is `Large`, which means *served from another box*, so gating on it
+disables this for every on-device pond — where it was measured to help most. Window size is not
+capability: E2B and E4B at one window are one tier and behave completely differently.
+
+**The prompt was independently sanctioning partial answers.** `turn_budget_note`'s capped branch —
+taken by every default install, since `agent_max_turns` is 50 and only `0` is uncapped — read "Pace
+yourself: if you are running out of steps, stop gathering and answer with what you have", while the
+uncapped branch demanded completion. The defaults were inverted. It now asks for as many steps as the
+task needs and, if the limit is genuinely reached, for the model to name what it could not finish and
+never present a partial answer as a complete one.
+
+**Not verified on the Orin.** The 2x will cost far more there — E4B's seven-call turn took 326 s on a
+Mac — so the default may not survive contact with the device.
+
+---
+
 ## 5. Invariants
 
 1. The preamble is the KV prefix. Growing the window must not grow it.
