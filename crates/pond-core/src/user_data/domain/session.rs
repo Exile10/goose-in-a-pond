@@ -25,6 +25,11 @@ pub struct SessionMessage {
     /// reasoning through); it is not the same as `Some(0)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u32>,
+    /// Training-feedback signal from the chat UI's like/dislike controls.
+    /// `None` = no vote, `Some(true)` = liked (keep as training data),
+    /// `Some(false)` = disliked (excluded from training data).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub liked: Option<bool>,
 }
 
 impl SessionMessage {
@@ -37,6 +42,7 @@ impl SessionMessage {
             prompt_tokens: None,
             completion_tokens: None,
             reasoning_tokens: None,
+            liked: None,
         }
     }
 

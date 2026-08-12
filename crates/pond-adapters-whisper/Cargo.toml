@@ -24,13 +24,13 @@ metal = ["whisper-rs/metal"]
 
 [dependencies]
 pond-voice = { path = "../pond-voice" }
+pond-audio = { path = "../pond-audio" }
 pond-core = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-cpal = "0.15"
 # Audio feedback (wake-word confirmation ping)
 rodio = "0.19"
 # In-process whisper.cpp bindings.

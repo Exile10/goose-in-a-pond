@@ -109,7 +109,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(MockDeviceRegistry),
-        commissioner: None,
+        matter: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
@@ -517,7 +517,7 @@ async fn make_app_with_agent(
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(MockDeviceRegistry),
-        commissioner: None,
+        matter: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
@@ -756,4 +756,93 @@ async fn chat_stream_emits_turn_stats_event() {
     assert_eq!(payload["context_limit_tokens"], 3072);
     assert_eq!(payload["decode_tok_per_sec"], 22.0);
     assert_eq!(payload["inference_count"], 1);
+}
+
+/// Truncating a conversation tells the ENGINE, not only the database.
+///
+/// `pond_system.db` is authoritative for the UI, but it is not what the model
+/// reads: the live engine session holds its own copy of the turns. Deleting
+/// rows without telling the engine leaves the model being shown the exact
+/// messages the user just removed — an edit gets re-answered with the old
+/// answer still in context, a regenerate is asked to regenerate something it
+/// can still see, and the two stores stay divergent for the life of the
+/// process. Nothing surfaces that; the user just sees an assistant that appears
+/// not to have noticed.
+///
+/// Asserted through `MockAgent::forgotten_sessions` rather than by calling the
+/// method, because `Agent::forget_session` has an empty default body — a test
+/// that merely exercised the path would pass against the no-op just as happily.
+#[tokio::test]
+async fn truncating_a_session_also_makes_the_engine_forget_it() {
+    let agent = Arc::new(MockAgent::new());
+    let (app, _tmp) = make_app_with_agent(agent.clone()).await;
+
+    // One real turn, so there is something to truncate.
+    let stream = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/chat/stream")
+                .header("Authorization", "Bearer test-token")
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"message": "hello", "session_id": "sess-trunc"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+    let _ = axum::body::to_bytes(stream.into_body(), usize::MAX)
+        .await
+        .unwrap();
+
+    let messages = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/sessions/sess-trunc/messages")
+                .header("Authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(messages.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(messages.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let first_id = body["messages"][0]["id"].as_str().expect("a message id");
+
+    assert!(
+        agent.forgotten_sessions().is_empty(),
+        "nothing has been truncated yet"
+    );
+
+    let deleted = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/sessions/sess-trunc/messages/{first_id}"))
+                .header("Authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Status before any other claim: an error payload would satisfy a body
+    // predicate just as well as a success.
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+    assert_eq!(
+        agent.forgotten_sessions(),
+        vec!["sess-trunc".to_string()],
+        "the rows were deleted but the engine still holds them, so the model \
+         keeps seeing the turns the user removed"
+    );
 }

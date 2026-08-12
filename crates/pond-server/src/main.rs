@@ -1004,6 +1004,8 @@ async fn run_server(
     native: bool,
     drain_handle: tracing_setup::LogDrainHandle,
 ) -> Result<()> {
+    use pond_core::user_data::ports::matter_runtime::MatterRuntimePort;
+
     println!("  ╔═══════════════════════════════════════╗");
     println!(
         "  ║   🦆  Goose In A Pond  v{}         ║",
@@ -1112,6 +1114,18 @@ async fn run_server(
     // Apply the microphone privacy setting before anything can open a device.
     pond_core::models::domain::mic_gate::set_mic_enabled(settings.mic_enabled);
 
+    // Single shared microphone owner (see `pond_audio`). This process only
+    // ever transcribes already-recorded audio via the HTTP `/transcribe`
+    // route below — it never opens the device — but `WhisperRsInput::new`
+    // still requires a handle so there is exactly one code path for every
+    // caller, live capture or not.
+    let (mic_handle, _mic_owner_join) = pond_audio::spawn(
+        Box::new(pond_audio::CpalCapture::new()),
+        pond_audio::CAPTURE_RATE_HZ,
+        15_000,
+        settings.mic_enabled,
+    );
+
     // One resolution for both voice models, shared with the `chat` path.
     let voice_models = voice_models::resolve_voice_models(
         &settings,
@@ -1167,7 +1181,7 @@ async fn run_server(
     // depending on pond-adapters-whisper.
     let transcribe_audio: Option<Arc<dyn Fn(Vec<u8>) -> anyhow::Result<String> + Send + Sync>> =
         whisper_model_path.as_ref().and_then(|p| {
-            match WhisperRsInput::new(p.clone()) {
+            match WhisperRsInput::new(p.clone(), mic_handle.clone()) {
                 Ok(w) => {
                     let w = Arc::new(w);
                     Some(Arc::new(move |wav_bytes: Vec<u8>| {
@@ -1700,7 +1714,7 @@ async fn run_server(
 
     // Install the sensor MCP server's storage handle — `spawn_sensor_server`
     // only fires at chat time.
-    pond_mcp_server::init_sensor_deps(sensor_storage.clone());
+    pond_mcp_server::init_sensor_deps(sensor_storage.clone(), device_registry.clone());
 
     // Spawn background memory decay/cleanup task
     if settings.memory_cleanup_enabled {
@@ -2260,96 +2274,71 @@ async fn run_server(
     #[cfg(not(feature = "pond-agent"))]
     let pond_agent_active = false;
 
-    // Device actuation backend (#195): the Matter controller when configured
-    // and reachable, else the logging stub. The bridge halves (event stream +
-    // node cache) are spawned further down where the EventBus exists.
-    // Holds the controller GIAP started, if any. Kept until shutdown, where it
-    // is killed explicitly: kill_on_drop alone is not enough because a signal
-    // (Ctrl-C / SIGTERM) terminates the process without unwinding, so the
-    // destructor never runs and the controller would orphan.
-    #[cfg(feature = "goose-agent")]
-    let mut matter_server_child: Option<tokio::process::Child>;
+    // Event bus (#91/#109), created here because the Matter runtime below
+    // publishes sensor updates onto it. Its durable log bridge is wired further
+    // down, once the logs DB handle is in scope.
+    let event_bus: Arc<dyn pond_core::shared::ports::event_bus::EventBus> =
+        Arc::new(InProcessEventBus::new());
 
-    // Matter commissioning, available only once a controller is connected.
-    // `None` means "Matter is off", which the API turns into a clear 503 rather
-    // than a confusing failure when someone submits a setup code.
-    type Commissioner =
-        Option<Arc<dyn pond_core::user_data::ports::device_commissioning::DeviceCommissioningPort>>;
-    #[cfg(feature = "goose-agent")]
-    let mut matter_commissioner: Commissioner = None;
-    #[cfg(not(feature = "goose-agent"))]
-    let matter_commissioner: Commissioner = None;
+    // Device actuation backend (#195): Matter when it is switched on and a
+    // controller is reachable, else the logging stub.
+    //
+    // Which of the two is live is the runtime's decision and can change at any
+    // moment, because `matter_enabled` is a user-facing toggle rather than a
+    // boot-time constant. `device_control` is therefore a facade — one `Arc`
+    // that the agent, the MCP server, and the tool wiring hold for the life of
+    // the process while the backend behind it is swapped underneath.
+    //
+    // The runtime also owns the bridge (fabric node sync plus sensor attribute
+    // updates onto the EventBus) and the controller process, so both come and
+    // go with the toggle rather than with the process.
+    type MatterRuntimeHandle =
+        Option<Arc<dyn pond_core::user_data::ports::matter_runtime::MatterRuntimePort>>;
+    type DeviceControl = Arc<dyn pond_core::user_data::ports::device_control::DeviceControlPort>;
 
     #[cfg(feature = "goose-agent")]
-    let (device_control, matter_bridge_parts): (
-        Arc<dyn pond_core::user_data::ports::device_control::DeviceControlPort>,
-        Option<(
-            Arc<pond_adapters_matter::MatterClient>,
-            tokio::sync::mpsc::Receiver<pond_adapters_matter::MatterEvent>,
-            pond_adapters_matter::NodeCache,
-            pond_adapters_matter::SharedMatterClient,
-        )>,
-    ) = if settings.matter_enabled && !settings.matter_ws_url.trim().is_empty() {
-        // Auto-setup: install + start a controller when the URL is loopback and
-        // nothing is serving it yet. A remote URL is someone else's server, and
-        // an already-live port is reused as-is.
-        matter_server_child =
-            match pond_adapters_matter::local_port_from_ws_url(settings.matter_ws_url.trim()) {
-                Some(port) => {
-                    match pond_adapters_matter::ensure_matter_server(
-                        &data_dir,
-                        port,
-                        std::time::Duration::from_secs(120),
-                    )
-                    .await
-                    {
-                        Ok(child) => child,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Matter controller auto-setup failed");
-                            None
-                        }
-                    }
-                }
-                None => None,
-            };
-
-        match pond_adapters_matter::MatterClient::connect(settings.matter_ws_url.trim()).await {
-            Ok((client, events)) => {
-                let cache: pond_adapters_matter::NodeCache =
-                    Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-                tracing::info!(url = %settings.matter_ws_url, "Matter controller connected");
-                // Same connection commissions new devices onto the fabric.
-                matter_commissioner = Some(Arc::new(
-                    pond_adapters_matter::MatterCommissioner::new(client.clone()),
-                ));
-                let control = Arc::new(pond_adapters_matter::MatterDeviceControl::new(
-                    client.clone(),
-                    cache.clone(),
-                ));
-                // The supervisor swaps this handle on reconnect so the control
-                // keeps working across a matter-server restart (#195).
-                let client_handle = control.client_handle();
-                (control, Some((client, events, cache, client_handle)))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Matter controller unreachable; device control falls back to the logging stub"
-                );
-                (
-                    Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
-                    None,
-                )
-            }
-        }
-    } else {
-        // Matter disabled: nothing to install, nothing to start.
-        matter_server_child = None;
-        (
-            Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
-            None,
-        )
+    let (matter_runtime, device_control): (MatterRuntimeHandle, DeviceControl) = {
+        // The bridge holds only a bus handle, so persistence is attached to the
+        // handle (#90): the decorator records each BusEvent::Sensor before
+        // forwarding it, giving Matter readings the same persist-before-publish
+        // ordering `record_sensor` gets by writing inline (#91). Without it
+        // nothing writes adapter-sourced readings, and `giap-sensors` answers
+        // every question about a real Matter device with "none recorded" — a
+        // device that is visibly in the device list and cannot be asked
+        // anything, which reads as broken rather than as unimplemented.
+        //
+        // `AppState` keeps the PLAIN bus: `record_sensor` already persists
+        // inline, and giving it the decorator too would double-write every
+        // reading that arrives over the REST route.
+        let matter_bus: Arc<dyn pond_core::shared::ports::event_bus::EventBus> = Arc::new(
+            pond_core::shared::services::sensor_persisting_event_bus::SensorPersistingEventBus::new(
+                event_bus.clone(),
+                sensor_storage.clone(),
+            ),
+        );
+        let runtime = pond_adapters_matter::MatterRuntime::new(
+            data_dir.clone(),
+            device_registry.clone(),
+            matter_bus,
+        );
+        let control = runtime.device_control(Arc::new(
+            pond_infra::logging_device_control::LoggingDeviceControl::new(),
+        ));
+        // Converge to the persisted setting. Returns immediately by design: a
+        // first enable installs and starts a controller, and serving must not
+        // wait minutes on that. The Devices tab shows the progress.
+        runtime.apply(
+            settings.matter_enabled,
+            settings.matter_ws_url.trim().to_string(),
+        );
+        (Some(runtime as Arc<dyn MatterRuntimePort>), control)
     };
+
+    #[cfg(not(feature = "goose-agent"))]
+    let (matter_runtime, device_control): (MatterRuntimeHandle, DeviceControl) = (
+        None,
+        Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
+    );
 
     let (agent, extension_manager, _tool_caller, tool_registry) = if pond_agent_active {
         // Build PondAgent directly — no Goose, no llama backend conflict.
@@ -2780,12 +2769,11 @@ async fn run_server(
         device_control.clone(),
     )));
 
-    // Event bus + durable event log (#91/#109). The bus is shared with AppState
-    // for publishing on ingest; a background bridge subscribes to it and appends
-    // every bus event (sensor/camera/device) into the unified `events` table, so
-    // events written in normal operation are queryable from pond_logs.db.
-    let event_bus: Arc<dyn pond_core::shared::ports::event_bus::EventBus> =
-        Arc::new(InProcessEventBus::new());
+    // Durable event log (#91/#109). The bus (created above, with the Matter
+    // runtime) is shared with AppState for publishing on ingest; a background
+    // bridge subscribes to it and appends every bus event (sensor/camera/device)
+    // into the unified `events` table, so events written in normal operation are
+    // queryable from pond_logs.db.
     // One shared event store: the bus→log bridge writes to it, and the activity
     // query API (#114) reads from it via AppState.
     // Chokepoint 2: attributes are redacted on the way in, and a finding raises
@@ -3113,30 +3101,6 @@ async fn run_server(
         last_user_activity.clone(),
     ));
 
-    // Matter bridge (#195): syncs commissioned fabric nodes into the device
-    // registry and turns sensor attribute updates into BusEvent::Sensor, so
-    // #92 rules and the activity feed react to Matter sensors natively.
-    #[cfg(feature = "goose-agent")]
-    if let Some((matter_client, matter_events, matter_cache, matter_client_handle)) =
-        matter_bridge_parts
-    {
-        let registry = device_registry.clone();
-        let bus = event_bus.clone();
-        let matter_url = settings.matter_ws_url.trim().to_string();
-        // Supervised: on connection loss it reconnects with backoff and swaps
-        // the fresh client into the control's handle (#195), so a matter-server
-        // restart no longer needs a pond-server restart. Never returns.
-        tokio::spawn(pond_adapters_matter::run_matter_supervisor(
-            matter_url,
-            matter_client_handle,
-            matter_client,
-            matter_events,
-            matter_cache,
-            registry,
-            bus,
-        ));
-    }
-
     // Vision pipeline (#130): camera frames → on-device motion detection →
     // camera_events + EventBus, so #92 rules and the activity feed react to
     // what the camera sees. Opt-in (`vision_enabled` + a camera URL) because
@@ -3276,7 +3240,7 @@ async fn run_server(
         tts,
         settings_repo,
         profile_repo,
-        commissioner: matter_commissioner,
+        matter: matter_runtime.clone(),
         device_registry,
         memory_repo,
         embedding_provider,
@@ -3540,13 +3504,11 @@ async fn run_server(
     }
 
     // Stop the matter-server GIAP started, if any. kill_on_drop does not fire on
-    // the signal path (the process exits without unwinding), so kill it here —
-    // otherwise the controller orphans and survives the Pond, including under
-    // `systemctl stop`.
-    #[cfg(feature = "goose-agent")]
-    if let Some(mut child) = matter_server_child.take() {
-        tracing::info!("stopping matter-server controller");
-        let _ = child.start_kill();
+    // the signal path (the process exits without unwinding), so the runtime is
+    // asked to kill it here — otherwise the controller orphans and survives the
+    // Pond, including under `systemctl stop`.
+    if let Some(matter) = &matter_runtime {
+        matter.shutdown().await;
     }
 
     Ok(())
@@ -3746,7 +3708,10 @@ async fn run_chat(
     // "spawn_sensor_server called before init_sensor_deps" and then failed to
     // load giap-sensors — the extension was simply missing from voice, with
     // an error on the console saying so.
-    pond_mcp_server::init_sensor_deps(Arc::new(SqliteSensorStorage::new(db.logs.clone())));
+    pond_mcp_server::init_sensor_deps(
+        Arc::new(SqliteSensorStorage::new(db.logs.clone())),
+        Arc::new(SqliteDeviceRegistry::new(db.system.clone())),
+    );
 
     // Load settings and model registry early — drives provider, model, TTS, and wake word.
     // Falls back to Settings::default() when the DB has no rows yet (first run).
@@ -3778,6 +3743,25 @@ async fn run_chat(
 
     // Apply the microphone privacy setting before anything can open a device.
     pond_core::models::domain::mic_gate::set_mic_enabled(settings.mic_enabled);
+
+    // Single shared microphone owner (see `pond_audio`). Before this, the
+    // wake-word detector, the VAD follow-up capture, and the "record until
+    // silence" one-breath capture each opened their own `cpal` stream — live
+    // simultaneously by design (the wake listener races the reply for
+    // barge-in), which could race the very next turn's capture for the same
+    // device. Every capture path in this session goes through this one
+    // handle instead, so opens/closes are serialized on one owner thread.
+    //
+    // Sized to the wake-word detector's own history requirement —
+    // `window_ms.max(lookback_ms) + post_trigger_ms` from
+    // `KeywordDetectorConfig::default()` (~13.4s) — with headroom; see the
+    // sizing rule on `pond_audio::spawn`.
+    let (mic_handle, _mic_owner_join) = pond_audio::spawn(
+        Box::new(pond_audio::CpalCapture::new()),
+        pond_audio::CAPTURE_RATE_HZ,
+        15_000,
+        settings.mic_enabled,
+    );
 
     // One resolution for both voice models, accepting every on-disk shape the
     // settings fields have carried. See `voice_models` for why there are three.
@@ -4152,6 +4136,22 @@ async fn run_chat(
             .with_stdout_diagnostics(false);
     }
 
+    // Live mic-level reporting for the voice-mode UI orb (wait + recording
+    // states). Only meaningful under --json-events — the desktop shell is the
+    // only consumer of this NDJSON contract.
+    let audio_level_sink: Option<Arc<pond_adapters_whisper::ThrottledAudioLevelSink>> =
+        if json_events {
+            Some(Arc::new(
+                pond_adapters_whisper::ThrottledAudioLevelSink::new(Box::new(|rms: f32| {
+                    write_ndjson_line(
+                        &pond_core::shared::domain::agent::WorkflowEvent::AudioLevel { rms },
+                    );
+                })),
+            ))
+        } else {
+            None
+        };
+
     // ── Wire LLM provider (no-goose-agent fallback only) ────────────────────────
     // When GooseAdapter is active it selects the provider internally via the DB.
     // This block runs only in builds without the goose-agent feature.
@@ -4235,8 +4235,14 @@ async fn run_chat(
     // KWS subprocess needed any more.
     let whisper_backend: Option<Arc<WhisperRsInput>> = if input == "whisper" {
         match &whisper_model_path {
-            Some(p) => match WhisperRsInput::new(p.clone()) {
-                Ok(w) => Some(Arc::new(w)),
+            Some(p) => match WhisperRsInput::new(p.clone(), mic_handle.clone()) {
+                Ok(w) => {
+                    let w = match &audio_level_sink {
+                        Some(sink) => w.with_audio_level_sink(sink.clone()),
+                        None => w,
+                    };
+                    Some(Arc::new(w))
+                }
                 Err(e) => {
                     // Whisper was explicitly requested but failed to load. Under
                     // --json-events, out! is a no-op, so a bare warning would leave
@@ -4324,17 +4330,31 @@ async fn run_chat(
             ..KeywordDetectorConfig::default()
         };
 
-        let detector = Arc::new(
-            WhisperKeywordDetector::new(backend.clone() as Arc<dyn WhisperBackend>, trigger)
-                .with_transcriptions(transcriptions)
-                .with_config(kws_config),
-        );
+        let mut detector_builder = WhisperKeywordDetector::new(
+            backend.clone() as Arc<dyn WhisperBackend>,
+            trigger,
+            mic_handle.clone(),
+        )
+        .with_transcriptions(transcriptions)
+        .with_config(kws_config);
+        if let Some(sink) = &audio_level_sink {
+            detector_builder = detector_builder.with_audio_level_sink(sink.clone());
+        }
+        let detector = Arc::new(detector_builder);
         // The detector captures audio from before it fired, so the wake word
         // is inside the command clip. Hand the transcriber the detector's own
         // resolved trigger list so it strips exactly what matched.
         backend.set_wake_words(detector.triggers());
         chat_service = chat_service.with_wake_word_detector(detector);
     };
+
+    // ── Wire barge-in energy ──
+    // `MicEnergy` reads live RMS off the same shared mic owner every other
+    // capture path here uses. Without this, `ChatService::new`'s default
+    // `NoEnergy` is inert and barge-in-by-speaking silently never fires — the
+    // wake word was the only way to interrupt a reply.
+    chat_service =
+        chat_service.with_speech_energy(Arc::new(pond_audio::MicEnergy::new(&mic_handle)));
 
     // ── Wire TTS output ──
     // The text/print fallback (no piper): in --json-events mode this MUST NOT
@@ -4440,6 +4460,10 @@ async fn run_chat(
                                         Some(d) => out.with_espeak_data(d),
                                         None => out,
                                     };
+                                    let out = match &audio_level_sink {
+                                        Some(sink) => out.with_audio_level_sink(sink.clone()),
+                                        None => out,
+                                    };
                                     out!(
                                         "  Speak    {}",
                                         model_path
@@ -4527,12 +4551,14 @@ async fn run_chat(
             write_ndjson_line(&WorkflowEvent::Exit {
                 reason: "error".to_string(),
             });
+            mic_handle.shutdown();
             return Err(e);
         }
     } else {
         chat_service.run_loop().await?;
     }
 
+    mic_handle.shutdown();
     Ok(())
 }
 
@@ -5977,7 +6003,16 @@ async fn run_calibrate(
         settings.voice_wake_word = phrase.clone();
     }
 
-    let whisper = WhisperRsInput::new(whisper_model_path.clone())
+    // A self-contained mic owner for this one-shot calibration run — it never
+    // runs concurrently with the wake-word detector, so it does not share a
+    // handle with `run_chat`/`run_server`.
+    let (mic_handle, _mic_owner_join) = pond_audio::spawn(
+        Box::new(pond_audio::CpalCapture::new()),
+        pond_audio::CAPTURE_RATE_HZ,
+        15_000,
+        true,
+    );
+    let whisper = WhisperRsInput::new(whisper_model_path.clone(), mic_handle.clone())
         .with_context(|| format!("loading whisper model: {}", whisper_model_path.display()))?;
     let mut collected = 0usize;
     let mut attempt = 0usize;
@@ -6067,6 +6102,7 @@ async fn run_calibrate(
     println!("  Run `pond-server chat --input whisper` to test it.");
     println!();
 
+    mic_handle.shutdown();
     Ok(())
 }
 
@@ -7112,8 +7148,29 @@ async fn sync_assignments_to_settings(
                     .await;
             }
             "tts" => {
+                // The TTS engine gate elsewhere checks active_tts_model.starts_with("piper")
+                // — a bare catalog slug (e.g. "en-lessac-medium") never satisfies that, so
+                // it must be stored prefixed for piper voices.
+                //
+                // Idempotent, because this value round-trips: it is written to
+                // `active_tts_model` here and read back into a role assignment
+                // elsewhere, so a bare `format!` compounds a prefix once per
+                // settings-write/boot cycle — `piper-piper-en-lessac-medium`,
+                // then `piper-piper-piper-...`. The gate that reads it only
+                // checks `starts_with("piper")`, so nothing fails loudly; the
+                // voice filename in the same block just stops matching a real
+                // model, and TTS goes quiet for a reason nobody can see.
+                let stored_active_model = if category == "tts_piper" {
+                    if model_name.starts_with("piper-") {
+                        model_name.to_string()
+                    } else {
+                        format!("piper-{model_name}")
+                    }
+                } else {
+                    model_name.to_string()
+                };
                 let _ = settings_repo
-                    .set_key("active_tts_model", model_name.to_string())
+                    .set_key("active_tts_model", stored_active_model)
                     .await;
                 // For piper models also sync voice_tts_voice to the .onnx filename.
                 if category == "tts_piper" {

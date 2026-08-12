@@ -21,10 +21,19 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::process::{Child, Command};
+use tokio::sync::Mutex;
+
+/// The controller GIAP started, if any. Shared rather than owned outright
+/// because two places have to agree on which process is current: the reconciler
+/// kills it on teardown, and the reconnect supervisor replaces it when it finds
+/// the process dead. `None` means GIAP did not start one — the user runs their
+/// own controller, or Matter is off.
+pub type SharedServerChild = Arc<Mutex<Option<Child>>>;
 
 /// Pinned: an unpinned install would let an upstream release change what runs
 /// on the user's home network without review.
@@ -90,7 +99,12 @@ pub async fn is_running(port: u16) -> bool {
 /// First interpreter on PATH meeting [`MIN_PYTHON`].
 async fn find_python() -> Result<PathBuf> {
     for candidate in PYTHON_CANDIDATES {
-        let Ok(out) = Command::new(candidate).arg("--version").output().await else {
+        let Ok(out) = Command::new(candidate)
+            .arg("--version")
+            .kill_on_drop(true)
+            .output()
+            .await
+        else {
             continue;
         };
         // Older interpreters print the version on stderr.
@@ -120,6 +134,7 @@ async fn ensure_installed(data_dir: &Path) -> Result<()> {
     if py.exists() {
         if let Ok(out) = Command::new(&py)
             .args(["-c", "import matter_server"])
+            .kill_on_drop(true)
             .output()
             .await
         {
@@ -139,6 +154,14 @@ async fn ensure_installed(data_dir: &Path) -> Result<()> {
         .arg("-m")
         .arg("venv")
         .arg(&venv)
+        // `kill_on_drop` because this future is cancellable: the reconciler
+        // races `connect()` against a settings change, so toggling Matter off
+        // mid-install drops us here. Without it the child keeps running after
+        // the runtime has reported `Disabled`, keeps writing into the venv,
+        // and survives process exit -- `shutdown()` never sees it. Re-enabling
+        // before it finishes then finds a half-written venv and starts a
+        // second install into it.
+        .kill_on_drop(true)
         .status()
         .await
         .context("running python -m venv")?;
@@ -150,6 +173,10 @@ async fn ensure_installed(data_dir: &Path) -> Result<()> {
     let status = Command::new(&py)
         .args(["-m", "pip", "install", "--disable-pip-version-check"])
         .arg(MATTER_SERVER_SPEC)
+        // Same reasoning as the venv step above, and this is the one that
+        // matters: pip is the multi-minute part, so it is where a cancellation
+        // almost always lands.
+        .kill_on_drop(true)
         .status()
         .await
         .context("running pip install")?;
@@ -219,9 +246,103 @@ pub async fn ensure_running(
     ))
 }
 
+/// What a revival attempt actually did, so the caller can tell "the controller
+/// was dead and is back" from "the controller is fine, the fault is elsewhere".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revival {
+    /// The URL points at another host: someone else's controller, which GIAP
+    /// must never install for or spawn.
+    NotLocal,
+    /// A controller was already listening; nothing was installed or spawned.
+    Reused,
+    /// The controller was gone and a fresh one is now accepting connections.
+    Restarted,
+}
+
+/// Re-run [`ensure_running`] for a controller GIAP manages itself, parking any
+/// freshly spawned child in `child` so teardown still kills the process that is
+/// actually running.
+///
+/// The reconnect supervisor calls this once reconnecting alone has stopped
+/// working: a controller whose process has exited will never answer a
+/// reconnect, no matter how long the loop runs. Idempotent by construction —
+/// [`ensure_running`] reuses a live port — so it is safe to call repeatedly,
+/// and it never puts a second controller onto a fabric that already has one.
+pub async fn revive_local_controller(
+    data_dir: &Path,
+    url: &str,
+    child: &SharedServerChild,
+    ready_timeout: Duration,
+) -> Result<Revival> {
+    let Some(port) = local_port_from_ws_url(url) else {
+        return Ok(Revival::NotLocal);
+    };
+
+    match ensure_running(data_dir, port, ready_timeout).await? {
+        // Storing the new handle drops the dead one, which is harmless:
+        // `kill_on_drop` against an already-exited process is a no-op, and
+        // teardown now kills the controller that is really running.
+        Some(fresh) => {
+            *child.lock().await = Some(fresh);
+            Ok(Revival::Restarted)
+        }
+        // Something is serving the port — leave the stored handle alone rather
+        // than claiming ownership of a process GIAP did not start.
+        None => Ok(Revival::Reused),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A remote controller is another machine's process. Revival runs on every
+    /// failing URL, so this is the guard that stops GIAP installing a Python
+    /// stack and spawning a controller for a server it does not own.
+    #[tokio::test]
+    async fn revival_never_touches_a_remote_controller() {
+        let child: SharedServerChild = Arc::new(Mutex::new(None));
+
+        let outcome = revive_local_controller(
+            // Unreachable on purpose: nothing here may be read or written.
+            Path::new("/nonexistent"),
+            "ws://192.168.1.50:5580/ws",
+            &child,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, Revival::NotLocal);
+        assert!(child.lock().await.is_none(), "no child for a remote server");
+    }
+
+    /// A controller that is still listening is reused, never restarted. The
+    /// supervisor retries revival for as long as reconnects keep failing, and a
+    /// second controller on a live fabric would be worse than the outage it was
+    /// trying to fix.
+    #[tokio::test]
+    async fn revival_reuses_a_controller_that_is_still_listening() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let child: SharedServerChild = Arc::new(Mutex::new(None));
+
+        let outcome = revive_local_controller(
+            // The port answers, so setup returns before the data dir is used.
+            Path::new("/nonexistent"),
+            &format!("ws://127.0.0.1:{port}/ws"),
+            &child,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, Revival::Reused);
+        assert!(
+            child.lock().await.is_none(),
+            "reusing a live controller must not claim ownership of it"
+        );
+    }
 
     #[test]
     fn parses_python_versions_and_gates_on_3_12() {

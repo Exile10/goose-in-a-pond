@@ -22,6 +22,7 @@ import {
   type LlamafileRelease,
   type LogEntry,
   type MarketplaceExtension,
+  type MatterStatus,
   type MemoryFragment,
   type MeshPeer,
   type MeshSelf,
@@ -74,6 +75,10 @@ export function defaultServerUrl(): string {
   }
   return "http://127.0.0.1:4000";
 }
+
+/** Commissioning budget, kept just above the server's own 180s pairing timeout
+ *  so the server's error is what surfaces, not a client-side abort. */
+const COMMISSION_TIMEOUT_MS = 190_000;
 
 export class PondApiClient {
   private readonly base: string;
@@ -193,8 +198,10 @@ export class PondApiClient {
 
   // ── Internal helpers ───────────────────────────────────────
 
-  private headers(extra?: Record<string, string>): Record<string, string> {
-    const h: Record<string, string> = { "Content-Type": "application/json", ...extra };
+  private headers(method: string, extra?: Record<string, string>): Record<string, string> {
+    // Content-Type on a bodyless GET forces an unnecessary CORS preflight on
+    // every read call — omit it there; POST/PUT/PATCH bodies still need it.
+    const h: Record<string, string> = method === "GET" ? { ...extra } : { "Content-Type": "application/json", ...extra };
     if (this.token) h["Authorization"] = `Bearer ${this.token}`;
     return h;
   }
@@ -206,7 +213,7 @@ export class PondApiClient {
     try {
       const res = await fetch(`${this.base}${path}`, {
         method,
-        headers: this.headers(),
+        headers: this.headers(method),
         body: body !== undefined ? JSON.stringify(body) : undefined,
         signal: controller.signal,
       });
@@ -289,7 +296,7 @@ export class PondApiClient {
     await this.ensureTokenFresh();
     const res = await fetch(`${this.base}/api/v1/tts`, {
       method: "POST",
-      headers: this.headers(),
+      headers: this.headers("POST"),
       body: JSON.stringify({ text }),
     });
     if (!res.ok) {
@@ -370,12 +377,28 @@ export class PondApiClient {
   }
 
   /** Commission a Matter device onto the fabric with its setup code, optionally
-   *  naming it (written to the device and used as its GIAP name). */
+   *  naming it (written to the device and used as its GIAP name).
+   *
+   *  Given its own timeout: pairing involves discovery, attestation, and fabric
+   *  join, for which the server allows 180s. On the default 30s a real
+   *  commission aborted here as "Request timed out" while it went on to succeed
+   *  on the Pond. */
   commissionDevice(
     code: string,
     name?: string,
   ): Promise<{ id: string; name: string; node_id: number }> {
-    return this.post("/api/v1/devices/commission", name ? { code, name } : { code });
+    return this.request(
+      "POST",
+      "/api/v1/devices/commission",
+      name ? { code, name } : { code },
+      COMMISSION_TIMEOUT_MS,
+    );
+  }
+
+  /** What the Matter integration is actually doing. Polled by the Devices tab
+   *  while the controller starts up, which the settings save does not wait for. */
+  getMatterStatus(): Promise<MatterStatus> {
+    return this.get<MatterStatus>("/api/v1/matter/status");
   }
 
   unregisterDevice(id: string): Promise<void> {
@@ -594,7 +617,7 @@ export class PondApiClient {
   async *streamConsolidation(): AsyncGenerator<import("./types").ConsolidationEvent> {
     const res = await fetch(`${this.base}/api/v1/memory/consolidate`, {
       method: "POST",
-      headers: this.headers(),
+      headers: this.headers("POST"),
     });
     if (!res.ok || !res.body) return;
     const reader = res.body.getReader();
@@ -862,9 +885,12 @@ export class PondApiClient {
     );
   }
 
-  getSessionMessages(sessionId: string): Promise<SessionMessage[]> {
+  /** `limit` with no `offset`: server returns the N most recent messages
+   *  (newest-aware), not an old-first page — see get_session_messages. */
+  getSessionMessages(sessionId: string, limit?: number): Promise<SessionMessage[]> {
+    const qs = limit != null ? `?limit=${encodeURIComponent(String(limit))}` : "";
     return this.get<{ messages: Array<Record<string, unknown>> } | Array<Record<string, unknown>>>(
-      `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages${qs}`,
     ).then((r) => {
       const raw = Array.isArray(r) ? r : (r as { messages: Array<Record<string, unknown>> }).messages ?? [];
       return raw.map((m): SessionMessage => ({
@@ -876,6 +902,7 @@ export class PondApiClient {
         tool_calls: m.tool_calls as SessionMessageToolCall[] | undefined,
         tool_call_id: m.tool_call_id as string | undefined,
         images: m.images as SessionMessage["images"],
+        liked: m.liked as boolean | null | undefined,
       }));
     });
   }
@@ -900,6 +927,23 @@ export class PondApiClient {
    */
   compactSession(sessionId: string): Promise<CompactionReport> {
     return this.post(`/api/v1/sessions/${encodeURIComponent(sessionId)}/compact`);
+  }
+
+  /** Delete a message and every later message in the same session — the
+   *  primitive behind "edit" and "refresh" on a user message. */
+  deleteMessagesFrom(sessionId: string, messageId: string): Promise<void> {
+    return this.del(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}`,
+    );
+  }
+
+  /** Set (`true`/`false`) or clear (`null`) the like/dislike training-feedback
+   *  flag on one message. */
+  setMessageFeedback(sessionId: string, messageId: string, liked: boolean | null): Promise<void> {
+    return this.put(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}/feedback`,
+      { liked },
+    );
   }
 
   // ── Prompts ───────────────────────────────────────────────

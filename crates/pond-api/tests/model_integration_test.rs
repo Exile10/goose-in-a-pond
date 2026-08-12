@@ -134,7 +134,7 @@ async fn make_app_with_settings_repo() -> (
         settings_repo: settings_repo.clone(),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(MockDeviceRegistry),
-        commissioner: None,
+        matter: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),

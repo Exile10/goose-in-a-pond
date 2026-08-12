@@ -25,7 +25,7 @@
 //! discard: that would leave the OS microphone indicator lit, and a user who
 //! sees that indicator is right not to believe the setting.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -57,8 +57,19 @@ impl MicState {
 pub enum MicCommand {
     /// Open the device and begin filling the ring.
     Open,
-    /// Stop capturing and release the device.
+    /// Stop capturing and release the device, unconditionally.
     Close,
+    /// Stop capturing, but only if `generation` is still the current one.
+    ///
+    /// The mic has one device and many users, several of which run on detached
+    /// threads: a cancelled wake-word detector, for instance, releases the mic
+    /// from a blocking thread that the orchestrator has already stopped waiting
+    /// on, and by then the follow-up capture has usually opened the same
+    /// handle. An unconditional `Close` from that thread closes the device out
+    /// from under the capture, which presents as a conversation that hears
+    /// nothing after the wake word — the failure that is hardest to attribute,
+    /// because the component that caused it is already gone.
+    CloseIfGeneration(u64),
     /// Apply the privacy setting. `false` closes an open device immediately.
     SetEnabled(bool),
     /// Drop buffered audio without closing — used at turn boundaries so stale
@@ -78,6 +89,13 @@ pub struct MicShared {
     /// cheaply tell whether anything happened since it last looked.
     tick: Mutex<u64>,
     enabled: AtomicBool,
+    /// Which capture "owns" the device right now.
+    ///
+    /// The mic is single-owner but the handle is shared, and its users run on
+    /// detached threads that can outlive their own cancellation. Without a
+    /// generation, a `Close` sent by a component that has already given up
+    /// lands on whoever opened next — see `close_session`.
+    generation: AtomicU64,
 }
 
 impl MicShared {
@@ -87,11 +105,17 @@ impl MicShared {
             state: Mutex::new(MicState::Closed),
             tick: Mutex::new(0),
             enabled: AtomicBool::new(enabled),
+            generation: AtomicU64::new(0),
         }
     }
 
     pub fn state(&self) -> MicState {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The generation of the capture that currently owns the device.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     pub(crate) fn set_state(&self, s: MicState) {
@@ -209,6 +233,24 @@ impl MicHandle {
     pub fn close(&self) {
         let _ = self.tx.send(MicCommand::Close);
     }
+
+    /// Claim the device and get a token identifying this capture.
+    ///
+    /// Pair with [`close_session`](Self::close_session) so a component that is
+    /// cancelled cannot release a device somebody else has since claimed.
+    pub fn open_session(&self) -> u64 {
+        let generation = self.shared.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.tx.send(MicCommand::Open);
+        generation
+    }
+
+    /// Release the device only if `generation` still owns it.
+    ///
+    /// A no-op when somebody else has claimed it since, which is exactly the
+    /// case an unconditional `close()` gets wrong.
+    pub fn close_session(&self, generation: u64) {
+        let _ = self.tx.send(MicCommand::CloseIfGeneration(generation));
+    }
     pub fn set_enabled(&self, v: bool) {
         let _ = self.tx.send(MicCommand::SetEnabled(v));
     }
@@ -298,6 +340,19 @@ pub fn run(mut device: Box<dyn CaptureDevice>, shared: Arc<MicShared>, rx: Recei
                 apply(&mut device, want_open);
             }
             MicCommand::Close => {
+                want_open = false;
+                apply(&mut device, want_open);
+            }
+            MicCommand::CloseIfGeneration(generation) => {
+                let current = shared.generation();
+                if current != generation {
+                    tracing::debug!(
+                        stale = generation,
+                        current,
+                        "mic: ignoring a close from a capture that no longer owns the device"
+                    );
+                    continue;
+                }
                 want_open = false;
                 apply(&mut device, want_open);
             }
@@ -606,5 +661,43 @@ mod tests {
             "nothing opened it, so this must time out"
         );
         assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// A capture that has lost the device cannot release it.
+    ///
+    /// The mic has one device and several users, and some of them run on
+    /// detached threads that outlive their own cancellation: the wake-word
+    /// detector releases the mic from a blocking thread the orchestrator has
+    /// already stopped waiting on, by which time the follow-up conversational
+    /// capture has usually opened the same handle. An unconditional `close()`
+    /// there shuts the device under the capture, and the symptom -- a
+    /// conversation that hears nothing after the wake word -- points at a
+    /// component that has already exited.
+    #[test]
+    fn a_stale_owner_cannot_close_a_device_somebody_else_claimed() {
+        let h = Harness::new(true, None);
+
+        // The detector claims the device...
+        let detector = h.handle.open_session();
+        h.settle(|s| matches!(s, MicState::Open));
+
+        // ...is cancelled, and the follow-up capture claims it before the
+        // detector's thread gets around to releasing.
+        let capture = h.handle.open_session();
+        assert_ne!(detector, capture, "each claim needs its own generation");
+        h.settle(|s| matches!(s, MicState::Open));
+
+        // The detector's late release must do nothing.
+        h.handle.close_session(detector);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            matches!(h.handle.state(), MicState::Open),
+            "a cancelled capture closed the device out from under its successor"
+        );
+
+        // ...while the current owner's release still works, so the guard is not
+        // simply ignoring every close.
+        h.handle.close_session(capture);
+        h.settle(|s| matches!(s, MicState::Closed));
     }
 }

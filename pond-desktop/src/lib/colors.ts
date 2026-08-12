@@ -3,7 +3,7 @@
  *
  * These hex values mirror the CSS custom properties in design-tokens.css.
  * Use CSS variables (var(--color-*)) in DOM/JSX wherever possible.
- * Import these hex constants ONLY for canvas-based drawing (VoiceOrb, AudioWaves)
+ * Import these hex constants ONLY for canvas-based drawing (AudioWaves)
  * where CSS variables cannot be used as fillStyle values.
  */
 
@@ -14,7 +14,7 @@ import type { VoiceState } from "../state/reducer";
 export const ORB_STATE_COLORS: Record<VoiceState, string> = {
   idle:      "#8E8E93",
   wait:      "#8C4BFF",
-  recording: "#8C4BFF",
+  recording: "#3B9EFF",
   thinking:  "#FF9500",
   speaking:  "#34C759",
   error:     "#FF3B30",

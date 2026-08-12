@@ -122,7 +122,7 @@ async fn make_app() -> Harness {
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: profiles.clone(),
         device_registry: Arc::new(NoDevices),
-        commissioner: None,
+        matter: None,
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
