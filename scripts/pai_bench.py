@@ -442,28 +442,51 @@ def probe_context_streaming(liz_id):
 # ── PAI-6: will it hand work to a subagent ─────────────────────────────────
 
 def probe_orchestration():
+    """Two doors reach the orchestrator, and only one is a tool.
+
+    `delegate` lives in the `giap-orchestrator` extension, which
+    `register_giap_extensions` registers only when `ext_orchestrator_enabled`
+    was true AT STARTUP. The runner arms it and restarts for exactly that
+    reason, so an unregistered extension here is a FAILURE of the arming, not a
+    reason to skip.
+
+    The other door is `Orchestrator::spawn`, which `init_orchestrator_deps`
+    installs unconditionally and PAI-7's reviewer calls directly. So a pond with
+    the extension off still has a working orchestrator -- it simply has no tool
+    for the model to reach it with. Worth knowing before concluding from a SKIP
+    here that delegation is broken.
+    """
     print("\n-- PAI-6 (multi-agent orchestration) --")
-    ok, _ = settings({"ext_orchestrator_enabled": True})
-    if not ok:
-        record(6, "a delegation runs a child agent", "SKIP", "could not enable the orchestrator")
-        return
-    # Registration happens at startup, so the extension is NOT registered in
-    # this process even with the toggle now on. Say so rather than driving a
-    # prompt that cannot possibly delegate and calling the silence a result.
     lt = logtext()
     if "giap-orchestrator" not in lt:
-        record(6, "a delegation runs a child agent", "SKIP",
-               "the extension registers at startup and the toggle ships off; "
-               "restart with it on to exercise this")
+        record(6, "the delegate tool is registered", "FAIL",
+               "the runner armed ext_orchestrator_enabled and restarted, and the extension "
+               "still did not register -- check register_giap_extensions")
         return
-    _, st = chat("Delegate a short research task to a saved role and report back.",
-                 "bench-delegate")
+    record(6, "the delegate tool is registered", "PASS")
+
+    before = lt.count("child")
+    _, st = chat("Use your delegation tool to hand a short research task to a saved "
+                 "agent role, then tell me what it said.", "bench-delegate", timeout=900)
+    if st.get("error"):
+        record(6, "a delegation runs a child agent", "FAIL", st["error"])
+        return
     lt = logtext()
-    if "child" in lt.lower() and ("spawn" in lt.lower() or "delegate" in lt.lower()):
+
+    # A child actually ran, rather than the model merely talking about it.
+    spawned = ("child_stream_step" in lt or "spawn" in lt.lower()
+               or lt.count("child") > before + 2)
+    if spawned:
+        METRICS.setdefault("6", {})["delegated"] = True
         record(6, "a delegation runs a child agent", "PASS")
     else:
+        # Not a defect, and not a pass either. A 2B model choosing not to call a
+        # tool is a model fact; reporting it as either would be a lie about the
+        # capability.
+        METRICS.setdefault("6", {})["delegated"] = False
         record(6, "a delegation runs a child agent", "SKIP",
-               "the model did not choose to delegate; that is a model decision, not a defect")
+               "the tool was offered and the model did not call it -- a model decision. "
+               "PAI-7's reviewer exercises the same orchestrator without a tool (--slow)")
 
 
 # ── PAI-7: will it think unprompted ────────────────────────────────────────
