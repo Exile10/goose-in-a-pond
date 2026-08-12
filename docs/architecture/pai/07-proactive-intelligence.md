@@ -617,9 +617,25 @@ feeds `suggestion_text` and asserts the refusal. Mutation-tested: restoring the 
 first with the device's own error text, and adding `#[serde(default)]` to `suggestion` fails the
 second.
 
-**Not yet re-verified on the device.** The cause is fixed and the fix is guarded; whether the pond now
-produces a proposal is a question only `scripts/pai-bench.sh --slow` on the Orin can answer, and until
-it does, PAI-7's row stays NOT VERIFIED.
+**Re-verified on the device 2026-08-12, and it is still failing — differently.** The reviewer now
+reaches impulse interpretation, which it had never done: the `deny_unknown_fields` cause is confirmed
+cleared. The refusal is now `missing field \`trigger_kind\``. A 2B model omits a required field.
+
+This is the schema behaving correctly and the model failing to meet it, which is a different problem
+with a different owner. **Do not relax `trigger_kind` to make this pass.** It is the bus-event family
+the proposal is about; it feeds `ProposalShape`, which is what the feedback ledger suppresses on. A
+defaulted or guessed trigger produces proposals bound to the wrong event AND corrupts the record of
+what the member already declined — strictly worse than yielding nothing, because it is wrong in a way
+that persists and compounds.
+
+The design option worth taking instead: the brief already presents recent events as a numbered list,
+so the answer space can be **an index into it** rather than a taxonomy string the model has to
+reproduce from memory. "Which event number is this about?" is a far easier target for a small model
+and is unambiguous where a free-text `kind` is not. That is a change to `review_brief`, the recipe and
+`ReviewerImpulse` together — and it is really the model-floor question, so it is recorded here rather
+than taken unilaterally.
+
+PAI-7's row stays NOT VERIFIED. Three runs, three distinct causes, and the yield is still zero.
 
 **What is still owed:** the offline-device delivery path. It could not be observed in this run for
 the honest reason that no proposal was produced to deliver. `ci.yml` runs `cargo check -p pond-server` and never `cargo test -p pond-server`, so
