@@ -737,6 +737,34 @@ pub struct Settings {
     #[serde(default = "Settings::default_context_monitor_enabled")]
     pub context_monitor_enabled: bool,
 
+    /// Ask the model, once it stops calling tools, whether the request has
+    /// actually been met — and let it keep working if not. Default true.
+    ///
+    /// Without this the agent loop ends when the model stops asking for tools,
+    /// which is not the same as the question being answered. Measured on a Mac
+    /// 2026-08-12 with "how old are each of the former Kenyan Presidents?":
+    /// gemma-4-E4B went from 4 tool calls and "I was unable to find a list of
+    /// the ages" to 7 tool calls and the actual ages. On "what time is it in
+    /// the first 10 states alphabetically?" it went from a flat refusal to a
+    /// per-state table, having finally found `world_clock`.
+    ///
+    /// **It costs roughly twice the inferences per turn**, because the check
+    /// re-arms every time the model does more work — 3 nudges on one measured
+    /// turn, not 1. That is the mechanism rather than a defect: capping it at
+    /// one check would have stopped the Kenyan-presidents turn around its
+    /// fourth tool call, back at "unable to find".
+    ///
+    /// A setting and NOT a `ModelClass` tier, though that enum is precisely
+    /// "how expensive an extra model call is on this box". Its only cheap tier
+    /// is `Large`, which means *served from another box*, so gating on it would
+    /// switch this off for every on-device pond — exactly where it was measured
+    /// to help most. The axis that actually predicted benefit was model
+    /// capability (E4B gained, E2B barely), and GIAP has no honest signal for
+    /// that, so this is the household's call rather than a heuristic pretending
+    /// to be one.
+    #[serde(default = "Settings::default_goal_check_enabled")]
+    pub goal_check_enabled: bool,
+
     // ── Cost comparison ──────────────────────────────────────────────────────
     /// Cloud API input token price per million (for savings calculation). Default 2.50 (GPT-4o).
     #[serde(default = "Settings::default_cloud_input_price_per_million")]
@@ -1092,6 +1120,7 @@ impl Default for Settings {
             schedule_max_concurrent: Self::default_schedule_max_concurrent(),
             schedule_max_runs_per_task: Self::default_schedule_max_runs_per_task(),
             context_monitor_enabled: Self::default_context_monitor_enabled(),
+            goal_check_enabled: Self::default_goal_check_enabled(),
             cloud_input_price_per_million: Self::default_cloud_input_price_per_million(),
             cloud_output_price_per_million: Self::default_cloud_output_price_per_million(),
             telemetry_enabled: Self::default_telemetry_enabled(),
@@ -1444,6 +1473,9 @@ impl Settings {
     }
     fn default_schedule_max_runs_per_task() -> u32 {
         50
+    }
+    fn default_goal_check_enabled() -> bool {
+        true
     }
     fn default_context_monitor_enabled() -> bool {
         true
@@ -2167,6 +2199,11 @@ mod tests {
     fn every_settings_field_is_dispositioned() {
         // Advanced retention knobs, tuned via backend/config — intentionally no UI.
         const HEADLESS_BY_DESIGN: &[&str] = &[
+            // No control in the desktop app yet. HEADLESS_BY_DESIGN rather than
+            // UI_WIRED for the reason the note above gives: this list asserts
+            // whether a control EXISTS, and claiming one that does not is how
+            // twenty-two switches came to render without being operable.
+            "goal_check_enabled",
             // The privacy policy's rollout lever (PAI-2 P1). An operator knob
             // while the matrix is being validated against real households; it
             // gets a UI only if it survives to `enforce` (PAI-2 P8), and giving

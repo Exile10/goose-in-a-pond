@@ -291,9 +291,10 @@ Do not remove either guard without a dedicated stabilisation milestone. The code
 See `docs/goose-patch-management.md` for the patch set carried on top of upstream (`aaif-goose/goose`) and the upstream-rebase procedure.
 
 The submodule is pinned to `jarida-io/Goose:main` (upstream main synced
-2026-07-25 + the GIAP patch set, which is **five** patches as of 2026-08-07:
+2026-07-25 + the GIAP patch set, which is **six** patches as of 2026-08-12:
 ollama tool-less retry, extra featured Gemma 4 models, llama.cpp `ProviderStats`
-parity, thinking-only turns count as empty, llama.cpp prompt-session KV cache —
+parity, thinking-only turns count as empty, llama.cpp prompt-session KV cache,
+session-scoped agent goal —
 `docs/goose-patch-management.md` is the authoritative table, and this line said
 "two" until PAI-6 P2 counted the rows. The old native_tool_calling/use_jinja
 patches are subsumed by upstream's `ToolCallingMode`/`ChatTemplate`). Upstream declares `rmcp = "^1.4"`; the

@@ -413,6 +413,14 @@ impl SettingsRepository for SqliteSettingsRepository {
             "schedule_max_runs_per_task",
             settings.schedule_max_runs_per_task.to_string()
         );
+        upsert!(
+            "goal_check_enabled",
+            if settings.goal_check_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
         // Monitoring & cost
         upsert!(
             "context_monitor_enabled",
@@ -965,6 +973,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
                 s.schedule_max_runs_per_task = v;
             }
         }
+        "goal_check_enabled" => s.goal_check_enabled = value == "true",
         // Monitoring & cost
         "context_monitor_enabled" => s.context_monitor_enabled = value == "true",
         "cloud_input_price_per_million" => {
