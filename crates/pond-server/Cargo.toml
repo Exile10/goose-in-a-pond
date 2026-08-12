@@ -47,11 +47,20 @@ face-onnx = ["dep:pond-adapters-face-onnx"]
 # face-onnx (ORT_DYLIB_PATH). Off = events stay plain "motion".
 # cargo run -p pond-server --features vision-onnx -- serve
 vision-onnx = ["dep:pond-adapters-vision-onnx"]
+# Enable the private mesh transport (#132 Milestone 2): real libp2p
+# MeshTransport, gated behind settings.mesh_enabled at runtime. Kept optional
+# — full-feature libp2p (kad+gossipsub+relay+dcutr) is a materially heavier
+# compile than the rest of the default build.
+# cargo run -p pond-server --features mesh -- serve
+mesh = ["dep:pond-adapters-mesh-libp2p", "dep:pond-mesh-protocol"]
 # `legacy-subprocess` is gone (2026-08). It kept the whisper-server and piper
 # subprocess paths compilable as "a one-release escape valve while the
 # in-process backends bed in" — several releases ago. It was default-off, never
 # built by CI, and its modules (whisper_process, piper_process, piper_http) are
 # deleted. The in-process backends are the only path now.
+#
+# This branch predates that removal and carried the feature back; taking its
+# side would have declared a feature whose modules no longer exist.
 
 [dependencies]
 # Advisory file locking for the single-voice-session guard (voice_lock.rs).
@@ -69,6 +78,9 @@ pond-adapters-local-inference = { workspace = true, optional = true }
 pond-adapters-face-onnx       = { workspace = true, optional = true }
 # Optional: only compiled when --features vision-onnx is passed.
 pond-adapters-vision-onnx     = { workspace = true, optional = true }
+# Optional: only compiled when --features mesh is passed.
+pond-adapters-mesh-libp2p     = { workspace = true, optional = true }
+pond-mesh-protocol            = { workspace = true, optional = true }
 # `test-mocks` is required at the NORMAL dependency level (not dev-deps) because
 # `main.rs` falls back to `MockAgent` in non-test code paths (the `--agent mock`
 # fallback and the `cfg(not(feature = "goose-agent"))` voice-mode wiring).

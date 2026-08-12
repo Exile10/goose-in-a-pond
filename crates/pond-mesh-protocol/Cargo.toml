@@ -1,0 +1,17 @@
+[package]
+name = "pond-mesh-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+pond-core = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+prost = { workspace = true }
+rand_core = { version = "0.6", features = ["getrandom"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

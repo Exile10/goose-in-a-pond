@@ -299,6 +299,21 @@ export interface Device {
   metadata?: Record<string, unknown>;
 }
 
+// ── Mesh (#132) ───────────────────────────────────────────────
+// Mirrors 'pond_core::mesh::domain' + the /api/v1/mesh/* routes.
+export interface MeshPeer {
+  peer_id: string;
+  trust_scope: "self_owned" | "circle";
+  connected: boolean;
+  credit_balance_millisats: number;
+}
+
+export interface MeshSelf {
+  mesh_enabled: boolean;
+  peer_id?: string;
+  invite_url?: string;
+}
+
 // ── Schedules ─────────────────────────────────────────────────
 export interface Schedule {
   id: string;

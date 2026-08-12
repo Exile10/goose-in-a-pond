@@ -17,6 +17,8 @@ use axum::{
     Router,
 };
 use pond_core::mcp::ports::extension_manager::ExtensionInfo;
+use pond_core::mesh::domain::peer_id::PeerId as MeshPeerId;
+use pond_core::mesh::domain::trust_scope::TrustScope;
 use pond_core::models::domain::message::ChatMessage;
 use pond_core::models::ports::provider::LlmProvider;
 use pond_core::models::services::context::context_budget::CompactionProfile;
@@ -170,6 +172,13 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/devices/{id}/push-token",
             post(register_push_token).delete(delete_push_token),
         )
+        // Private mesh (#132) — trust-circle peers + self invite.
+        .route("/mesh/peers", get(list_mesh_peers).post(add_mesh_peer))
+        .route(
+            "/mesh/peers/{peer_id}",
+            axum::routing::delete(remove_mesh_peer),
+        )
+        .route("/mesh/self", get(get_mesh_self))
         .route("/settings", get(get_settings))
         .route("/weather", get(get_weather))
         .route("/models", get(list_models))
@@ -3470,6 +3479,181 @@ async fn update_device(
         "last_seen":     device.last_seen,
         "is_online":     device.is_online,
         "room":          device.room,
+    })))
+}
+
+// ── Private mesh (#132) ──────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct AddMeshPeerRequest {
+    peer_id: String,
+    trust_scope: String,
+    /// Dial hint for a best-effort connect right after trust is recorded.
+    /// Not persisted by `PeerDirectory` — future reconnects rely on
+    /// Kademlia rendezvous or the user re-sharing an invite.
+    #[serde(default)]
+    address: Option<String>,
+}
+
+fn trust_scope_from_str(s: &str) -> Result<TrustScope, (StatusCode, Json<Value>)> {
+    match s {
+        "self_owned" => Ok(TrustScope::SelfOwned),
+        "circle" => Ok(TrustScope::Circle),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("unknown trust_scope: '{other}'")})),
+        )),
+    }
+}
+
+fn trust_scope_to_str(scope: TrustScope) -> &'static str {
+    match scope {
+        TrustScope::SelfOwned => "self_owned",
+        TrustScope::Circle => "circle",
+    }
+}
+
+fn parse_mesh_peer_id(s: &str) -> Result<MeshPeerId, (StatusCode, Json<Value>)> {
+    s.parse().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid peer_id"})),
+        )
+    })
+}
+
+fn mesh_internal_error(e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": e.to_string()})),
+    )
+}
+
+/// `GET /api/v1/mesh/peers` — trusted peers, enriched with live connection
+/// status (from `mesh_transport` if configured) and credit balance.
+async fn list_mesh_peers(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let peers = state
+        .peer_directory
+        .list_trusted_peers(None)
+        .await
+        .map_err(mesh_internal_error)?;
+
+    let connected: std::collections::HashSet<MeshPeerId> = match &state.mesh_transport {
+        Some(transport) => transport
+            .connected_peers()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        None => std::collections::HashSet::new(),
+    };
+
+    let mut list = Vec::with_capacity(peers.len());
+    for peer in peers {
+        let scope = state
+            .peer_directory
+            .trust_scope_of(peer)
+            .await
+            .map_err(mesh_internal_error)?
+            .unwrap_or(TrustScope::Circle);
+        let balance = state
+            .credit_ledger
+            .balance(peer)
+            .await
+            .map_err(mesh_internal_error)?;
+        list.push(json!({
+            "peer_id": peer.to_string(),
+            "trust_scope": trust_scope_to_str(scope),
+            "connected": connected.contains(&peer),
+            "credit_balance_millisats": balance.value(),
+        }));
+    }
+
+    Ok(Json(json!({ "peers": list })))
+}
+
+/// `POST /api/v1/mesh/peers` — trust a peer, then (best-effort, if an
+/// address is given and the mesh transport is running) try to connect.
+/// Trust is recorded even if the connect attempt fails — `PeerDirectory`
+/// and `MeshTransport` are separate concerns.
+async fn add_mesh_peer(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<AddMeshPeerRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {e}")})),
+        )
+    })?;
+    let peer = parse_mesh_peer_id(&req.peer_id)?;
+    let scope = trust_scope_from_str(&req.trust_scope)?;
+
+    state
+        .peer_directory
+        .add_trusted_peer(peer, scope)
+        .await
+        .map_err(mesh_internal_error)?;
+
+    if let (Some(address), Some(transport)) = (&req.address, &state.mesh_transport) {
+        if let Err(err) = transport.connect(peer, address.clone()).await {
+            tracing::warn!("mesh: connect to newly-trusted peer {peer} failed: {err}");
+        }
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "peer_id": peer.to_string(),
+            "trust_scope": trust_scope_to_str(scope),
+        })),
+    ))
+}
+
+/// `DELETE /api/v1/mesh/peers/{peer_id}` — revoke trust.
+async fn remove_mesh_peer(
+    State(state): State<Arc<AppState>>,
+    Path(peer_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    let peer = parse_mesh_peer_id(&peer_id)?;
+    state
+        .peer_directory
+        .remove_trusted_peer(peer)
+        .await
+        .map_err(mesh_internal_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/v1/mesh/self` — this Pond's own mesh identity + invite link.
+/// Soft-disabled like weather: 200 with `mesh_enabled: false` when
+/// `mesh_transport` isn't configured, not an error — the UI renders an
+/// "enable mesh" prompt instead of an error state.
+async fn get_mesh_self(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(transport) = &state.mesh_transport else {
+        return Ok(Json(json!({ "mesh_enabled": false })));
+    };
+    let peer_id = transport.local_peer_id();
+    let address = transport
+        .listen_addresses()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .next();
+    let invite_url = match &address {
+        Some(address) => format!(
+            "pond-mesh://invite?peer={peer_id}&addr={}",
+            urlencoding::encode(address)
+        ),
+        None => format!("pond-mesh://invite?peer={peer_id}"),
+    };
+    Ok(Json(json!({
+        "mesh_enabled": true,
+        "peer_id": peer_id.to_string(),
+        "invite_url": invite_url,
     })))
 }
 
