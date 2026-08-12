@@ -191,6 +191,69 @@ mod tests {
         assert!(latest.is_some());
     }
 
+    /// A reading at a fixed offset from an epoch, so history ordering and time
+    /// windows are deterministic.
+    fn reading_at(value: f64, hours: i64) -> SensorReading {
+        SensorReading {
+            device_id: "room1".to_string(),
+            sensor_type: "temperature".to_string(),
+            value,
+            unit: "C".to_string(),
+            recorded_at: DateTime::from_timestamp(1_800_000_000 + hours * 3600, 0).unwrap(),
+        }
+    }
+
+    async fn seeded(values: &[(f64, i64)]) -> MockSensorStorage {
+        let storage = MockSensorStorage::new();
+        for (value, hours) in values {
+            storage.record(reading_at(*value, *hours)).await.unwrap();
+        }
+        storage
+    }
+
+    // The three tests below exercise the port's *default* implementations,
+    // which every store that does not override them relies on.
+
+    #[tokio::test]
+    async fn aggregate_over_empty_window_is_all_none() {
+        let storage = seeded(&[]).await;
+        let agg = storage
+            .aggregate("room1", "temperature", None, None)
+            .await
+            .unwrap();
+        assert_eq!(agg.count, 0);
+        assert_eq!(agg.min, None);
+        assert_eq!(agg.max, None);
+        assert_eq!(agg.avg, None);
+        assert_eq!(agg.unit, None);
+    }
+
+    #[tokio::test]
+    async fn aggregate_matches_manual_fold() {
+        let storage = seeded(&[(10.0, 0), (20.0, 1), (30.0, 2)]).await;
+        let agg = storage
+            .aggregate("room1", "temperature", None, None)
+            .await
+            .unwrap();
+        assert_eq!(agg.count, 3);
+        assert_eq!(agg.min, Some(10.0));
+        assert_eq!(agg.max, Some(30.0));
+        assert_eq!(agg.avg, Some(20.0));
+        assert_eq!(agg.unit.as_deref(), Some("C"));
+    }
+
+    #[tokio::test]
+    async fn get_history_limited_truncates_to_newest() {
+        let storage = seeded(&[(10.0, 0), (20.0, 1), (30.0, 2)]).await;
+        let rows = storage
+            .get_history_limited("room1", "temperature", None, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].value, 30.0);
+        assert_eq!(rows[1].value, 20.0);
+    }
+
     #[tokio::test]
     async fn camera_record_and_acknowledge() {
         let storage = MockCameraStorage::new();

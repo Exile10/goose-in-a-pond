@@ -2286,10 +2286,28 @@ async fn run_server(
 
     #[cfg(feature = "goose-agent")]
     let (matter_runtime, device_control): (MatterRuntimeHandle, DeviceControl) = {
+        // The bridge holds only a bus handle, so persistence is attached to the
+        // handle (#90): the decorator records each BusEvent::Sensor before
+        // forwarding it, giving Matter readings the same persist-before-publish
+        // ordering `record_sensor` gets by writing inline (#91). Without it
+        // nothing writes adapter-sourced readings, and `giap-sensors` answers
+        // every question about a real Matter device with "none recorded" — a
+        // device that is visibly in the device list and cannot be asked
+        // anything, which reads as broken rather than as unimplemented.
+        //
+        // `AppState` keeps the PLAIN bus: `record_sensor` already persists
+        // inline, and giving it the decorator too would double-write every
+        // reading that arrives over the REST route.
+        let matter_bus: Arc<dyn pond_core::shared::ports::event_bus::EventBus> = Arc::new(
+            pond_core::shared::services::sensor_persisting_event_bus::SensorPersistingEventBus::new(
+                event_bus.clone(),
+                sensor_storage.clone(),
+            ),
+        );
         let runtime = pond_adapters_matter::MatterRuntime::new(
             data_dir.clone(),
             device_registry.clone(),
-            event_bus.clone(),
+            matter_bus,
         );
         let control = runtime.device_control(Arc::new(
             pond_infra::logging_device_control::LoggingDeviceControl::new(),
