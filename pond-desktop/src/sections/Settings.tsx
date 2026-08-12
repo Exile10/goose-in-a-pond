@@ -409,13 +409,25 @@ function ModelsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k:
       <Section title="Response style">
         <Row label={`Creativity: ${temp.toFixed(1)}`} hint="Higher = more varied answers, lower = more consistent"><input type="range" min={0} max={2} step={0.1} value={temp} onChange={(e) => patch("llm_temperature", Number(e.target.value))} className="range-full" /></Row>
         <Row label="Response length"><select className="native-select" value={s.llm_max_tokens ?? 1024} onChange={(e) => patch("llm_max_tokens", Number(e.target.value))}>{maxTokenOpts.map((n) => <option key={n} value={n}>{n.toLocaleString()} tokens</option>)}</select></Row>
+        {/* Thinking was behind the developer pill, and `thinking_mode` defaults
+            to "auto" -- which resolves to ON for every model whose name implies
+            it. So a household ran a reasoning model, paid 76-156 reasoning
+            tokens a turn at ~46 tok/s, saw none of it because `show_thinking`
+            ships false, and had no way to stop it. "Thinking cannot be turned
+            off" was literally true from this panel.
+
+            Changing the mode rewrites the system prompt, which moves the KV
+            prefix and costs one full re-prefill on the next turn -- a second
+            reason it belongs where somebody can see it and decide once, rather
+            than being toggled blind. The developer diagnostics it used to sit
+            with (turn stats, answer review) stay behind the pill. */}
+        <Row label="Thinking mode" hint="Auto lets the model reason when its name implies it can. Reasoning costs tokens you never see unless you switch the steps on below, and it is the slowest part of a reply on-device."><select className="native-select" aria-label="Thinking mode" value={s.thinking_mode ?? "auto"} onChange={(e) => patch("thinking_mode", e.target.value)}><option value="auto">Auto</option><option value="on">Always on</option><option value="off">Off</option></select></Row>
+        <Row label="Thinking length" hint="How long the model may think before answering. Brief keeps on-device replies fast."><select className="native-select" value={s.reasoning_effort ?? "brief"} onChange={(e) => patch("reasoning_effort", e.target.value)}><option value="brief">Brief</option><option value="balanced">Balanced</option><option value="thorough">Thorough</option></select></Row>
+        <Row label="Show thinking steps"><Switch aria-label="Show thinking steps" isSelected={s.show_thinking ?? false} onChange={(v) => patch("show_thinking", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
       </Section>
       {devMode && (
         <>
           <Section title="Response quality">
-            <Row label="Thinking mode"><select className="native-select" value={s.thinking_mode ?? "auto"} onChange={(e) => patch("thinking_mode", e.target.value)}><option value="auto">Auto</option><option value="on">Always on</option><option value="off">Off</option></select></Row>
-            <Row label="Thinking length" hint="How long the model may think before answering. Brief keeps on-device replies fast."><select className="native-select" value={s.reasoning_effort ?? "brief"} onChange={(e) => patch("reasoning_effort", e.target.value)}><option value="brief">Brief</option><option value="balanced">Balanced</option><option value="thorough">Thorough</option></select></Row>
-            <Row label="Show thinking steps"><Switch aria-label="Show thinking steps" isSelected={s.show_thinking ?? false} onChange={(v) => patch("show_thinking", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
             <Row label="Keep thinking steps" hint="Save the model's reasoning so it is still there after a reload. Off by default: this is unreviewed working-out, not the answer."><Switch aria-label="Keep thinking steps" isSelected={s.persist_thinking ?? false} onChange={(v) => patch("persist_thinking", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
             <Row label="Show turn stats" hint="Display inference timing and context usage below each response"><Switch aria-label="Show turn stats" isSelected={s.show_turn_stats ?? false} onChange={(v) => patch("show_turn_stats", v)}><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content></Switch></Row>
             <Row label="Answer review"><select className="native-select" value={s.review_mode ?? "off"} onChange={(e) => patch("review_mode", e.target.value)}><option value="off">Off</option><option value="auto">Auto</option><option value="on">Always on</option></select></Row>
