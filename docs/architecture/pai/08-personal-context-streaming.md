@@ -304,6 +304,14 @@ anything constructs a pipeline. The dependency runs one way.
   and starts being an assistant.
 - **DEFERRED** Telegram and WhatsApp bridges; write-back of any kind.
 
+**A retrieval surface spanning this corpus, memories and conversation summaries is designed in
+[`docs/architecture/personal-context-index.md`](../personal-context-index.md)** (2026-08-12, nothing
+landed). It also records a correction to P2 above: the phase text claims `context_items` are "a second
+corpus in `<system-context>` with its own budget", and **there is no prompt path for context items at
+all** — the only production consumer of `ContextItem` is the `giap-context` MCP server, and its
+toggle ships off. What landed is the store, the pipeline and the read-only tools; the retrieval
+surface did not.
+
 ---
 
 ## 5. Invariants

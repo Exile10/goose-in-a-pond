@@ -1,0 +1,285 @@
+# Personal-context index — design and handoff
+
+**Status: DESIGNED, nothing landed. Written 2026-08-12.**
+
+A single semantic retrieval surface over the three things this pond knows about a household —
+extracted **memories**, ingested **context items**, and conversation **summaries** — so the agent can
+find what is relevant instead of being handed a fixed slice of it.
+
+Spans PAI-3 (retrieval), PAI-4 (summaries), PAI-8 (context). Kept in its own document because it
+belongs to none of them alone; each phase should be stamped into the PAI ledger as it lands.
+
+---
+
+## 0. Read this before believing anything below
+
+Every current-state claim here was verified on **2026-08-12** by reading the tree, and is cited by
+symbol as well as `file:line`. **Grep the symbol.** Line numbers rot, and this programme has a
+recorded history of plans built on stale ones.
+
+Two claims in the existing docs were found to be **wrong** while writing this, which is the reason
+for the warning:
+
+* PAI-8 P2's phase text says `context_items` are "a second corpus in `<system-context>` with its own
+  budget". **There is no prompt path for context items at all.** The only production consumer of
+  `ContextItem` is `crates/pond-mcp-server/src/context.rs` — the MCP tools — and
+  `ext_context_enabled` ships `false`, so on a default pond the corpus is unreachable by the model.
+* The on-device-intelligence skill said image input was "one dropped parameter from working". It is
+  wired: `attach_images` (`goose_agent.rs`), and `image_part_count` beside it.
+
+---
+
+## 1. Verified state
+
+### 1.1 The blocker that gates everything
+
+`FastembedEmbeddingProvider` (`crates/pond-infra/src/fastembed_embedding.rs`) is the **only**
+production `EmbeddingProvider`. `Settings::embedding_provider` accepts `"fastembed"` or `"none"` and
+defaults to `"fastembed"`.
+
+On the Orin it does not work. Measured twice on 2026-08-12:
+
+```
+WARN embedding provider failed to init: embedding provider init timed out
+     after 30 s — ONNX Runtime may be version-incompatible (need ORT 1.24.2)
+```
+
+Retrieval falls back to keyword (`search_recent`, taken when the semantic path finds no embedded
+rows). **Consequence: "semantic memory injection" — recorded as landed under PAI-3 Phase A
+(`e0c5d905`) — has never run on the hardware GIAP ships to.** True on a Mac, keyword matching on the
+pond. This is a live defect independent of this plan, and it makes every phase below inert until
+fixed.
+
+### 1.2 The three corpora, as they actually are
+
+| | `ContextItem` | `MemoryFragment` | `sessions.rolling_summary` |
+|---|---|---|---|
+| Owner | `profile_id: String` | `profile_id: Option<String>` | session's, nullable |
+| Redacted before store | **yes** — `from_parts` takes a `&dyn Redactor`, no second constructor | **no** | no |
+| Sensitivity | `PrivacySensitivity`, floor-enforced, `Secret` unreachable | **none** | none |
+| Redaction record | `findings: Vec<RedactionKind>` | — | — |
+| Vector field | `embedding: Option<Vec<f32>>` — **nothing populates it** | `embedding: Option<Vec<f32>>`, `#[serde(skip)]` | — |
+| Mutability | re-sync by `external_id` | supersede via consolidation | **overwritten in place** |
+| Deletion | source disconnect deletes items | decay/prune | with the session |
+| Consolidation | none, and it would be a bug | **already built** | n/a |
+
+`MemoryFragment.profile_id: None` means **shared household context, deliberately, and it outlives the
+member** — stated at `sqlite_memory.rs :: count_for_profile` ("Deliberately no `OR profile_id IS
+NULL`. See the port doc: those rows are shared household context and they outlive the member.").
+That is a policy decision already taken; do not re-litigate it, but note it makes "may this caller
+see this row" answerable for context items and *not* for memories.
+
+Memory consolidation already exists and is well thought through: `MemoryLifecycle`
+(`Active | Archived | Merged`), `superseded_by`, `MemoryTier` (`Short | Long | Permanent`),
+`decay_rate`, `access_count`, `last_accessed_at`, a `MemoryEdge` DAG with `EdgeRelation`, and
+`corrects` — which exists specifically "so consolidation never accidentally reverts the fix". Reuse
+it; do not build a second one.
+
+**Context items must never be consolidated.** They mirror an external system keyed by `external_id`.
+Merging two would destroy the idempotency key and the next sync would recreate them — consolidation
+fighting the connector forever. Context is a mirror; memory is a workspace.
+
+### 1.3 Summaries already exist and are already curated
+
+`sessions.rolling_summary` + `rolling_summary_through_id` + `rolling_summary_updated_at`, added by
+`migrations/system/0030_session_rolling_summary.sql`. Refreshed by `SessionSummaryService` on an idle
+path that is cancelled by a new turn and that no turn waits on. Used for exactly one thing today:
+splicing into **that same session's** history for compaction.
+
+So every conversation has a curated summary that is unreachable from any other session. "What did we
+decide about the trip?" three weeks later has an answer sitting in the database with no path to it.
+Indexing them costs one embedding per refresh and no new inference.
+
+Unverified and worth checking first: the *re*-summarisation path is `ModelClass::Large`-only and its
+own field doc says "PAI-4 P2 builds it; nothing implements it yet", so confirm what actually populates
+`rolling_summary` **on the Orin** before relying on these existing there.
+
+### 1.4 No vector extension, and that is fine
+
+No `sqlite-vec`, `sqlite-vss`, `vectorlite`, `usearch`, `hnsw` anywhere in the dependency tree, and
+nothing calls `load_extension`. Similarity is brute-force cosine in Rust, in three separate copies:
+`sqlite_memory.rs :: cosine_similarity`, `sqlite_context.rs :: cosine`,
+`sqlite_face_recognition.rs :: cosine_similarity`.
+
+At household scale (thousands of rows) brute force over 384-dim f32 is sub-millisecond and
+irrelevant beside a flat ~30 tok/s decode. **Do not add a compiled extension**: it buys nothing here
+and adds a native dependency to a build already fighting ONNX Runtime, llama.cpp, candle and
+aarch64 cross-compilation. The bottleneck is the embedder.
+
+### 1.5 WAL, and why it shapes the design
+
+`db.rs` sets `journal_mode = WAL` and **asserts** it on both pools. SQLite cross-database
+transactions are **not atomic in WAL mode**, so a context item and its vector in a second file
+cannot be deleted atomically. Everything in §2 about "no text in the index" follows from this one
+fact.
+
+### 1.6 What the ingest producer already refuses, and why it is right
+
+`crates/pond-core/src/context/producer.rs` states the rule this plan should not weaken:
+**keep transitions, drop samples.**
+
+* `DISCRETE_SENSOR_TYPES` = `motion`, `occupancy`, `contact` (+ bridge aliases). Everything else is
+  dropped. An unrecognised signal produces nothing until somebody adds it — the narrowing direction.
+* Continuous readings are refused because the pond **already** stores them in `sensor_readings` under
+  `retention_sensor_days` with min/max/avg behind the `giap-sensor` tools. Copying the series in
+  "buys nothing and costs the budget twice", and at 2 880 rows/day/sensor would drown the corpus.
+* The rule is about the **signal, never the value**, and that is not laziness: `pond-adapters-matter`
+  maps Matter `BooleanState` with `true = closed`, so a producer keeping non-zero readings would file
+  "the door is shut" as news and drop "the door opened".
+* Voice is refused **by type**: `NotIngested::VoiceIsCuratedByMemoryExtraction`.
+
+### 1.7 On-device numbers to design against (Orin, 2026-08-12)
+
+| Quantity | Value |
+|---|---|
+| Cold turn prompt | 7 568 tokens |
+| Tool schemas | ~88% of the preamble |
+| Per tool round-trip | ~670 tokens |
+| Prefill | 674–976 tok/s, falling with depth |
+| Decode | flat ~30 tok/s at every depth |
+| `LOCAL_PROMPT_CLAMP` | 8 192 (prompt-side, all local providers) |
+| Compact static prefix cap | 2 400 chars ≈ 600 tokens (`v2_compact_static_prefix_within_token_budget`) |
+| E2B / E4B KV | 18 / 56 KiB per token |
+
+Existing backfill precedent: `main.rs`, batched with a pause between batches, carrying the note "on a
+Jetson this competes with inference for CPU". Respect that.
+
+### 1.8 Media
+
+Image input is wired (`attach_images`), `E2B` declares a vision encoder
+(`vision_encoder.rs :: featured_mmproj_for_stem`, asserted by test), and `SourceKind::Camera` exists.
+**But `find ~/.local/share/goose-in-a-pond/mmproj -type f` on the nano returns nothing** — no encoder
+bytes at all, worse than the "truncated file" previously recorded. `mmproj_ready` is false there, and
+`chat_stream` **errors** on an image request rather than degrading. One file to re-fetch.
+
+---
+
+## 2. Decisions already taken
+
+Taken deliberately, with the reason. Changing one is allowed; changing it silently is not.
+
+| Decision | Reason |
+|---|---|
+| **One index, separate stores** | An index is rebuildable; a merged store cannot be unmerged. The three corpora have genuinely different lifecycles and guarantees |
+| **Its own database, `pond_vectors.db`** | Derived data, rebuildable, keeps any future native extension out of the authoritative DB's blast radius, and never syncs to a phone |
+| **`ATTACH` for reads, separate writes** | Gives real `JOIN`s so scope and sensitivity are filtered against live rows — no denormalised copies to go stale. Only cross-file *transactions* lose atomicity in WAL; queries are fine |
+| **The index holds NO text** | Under WAL a delete cannot be atomic across files, so an orphan is inevitable. With no text an orphan is harmless noise that resolves to nothing and drops out. With a snippet it is deleted data that survived a deletion promise |
+| **`model_id` column** | A vector from a different embedder still scores plausibly and is wrong. Mismatch must be detectable, not silent |
+| **`corpus` tag** (`memory`/`context`/`summary`) | Lets them share retrieval without sharing guarantees, and lets retrieval label provenance |
+| **No queue — staleness is a `LEFT JOIN`** | Crash-safe, restartable, self-healing, and the file can be deleted and rebuilt. A durable queue fails silently: a dropped entry is an item never searchable with nothing to notice |
+| **Backfill deferred to idle, not startup** | A household's first turn after an upgrade must not be slow because the pond is indexing |
+| **No faces in this index** (Jerry, 2026-08-12) | Biometrics have their own consent and deletion story; "delete my face data" must not be a query against a table holding calendar vectors |
+| **Tool surface before passive prompt tier** | A tool costs nothing on turns that do not use it; a prompt block costs tokens on every turn |
+| **Summaries: upsert + re-embed, labelled, memory wins ties** | A rolling summary is overwritten in place, so an append leaves a vector describing an older conversation. It is a model's compression, not a claim, so it must be labelled and must not outrank the precise version of the same thing |
+| **Media: eager for deliberate shares, lazy for libraries** | You cannot lazily caption a poster you do not know is a poster; but a library sync is hours-to-days of GPU and must stay on-demand |
+| **Derived facts cascade, approved actions do not** | Delete a photo and its caption goes. A reminder the member *approved* is their own commitment, not provenance-bound data |
+
+### Open decisions
+
+1. **Embedding dimension — a one-way door.** Changing it invalidates every stored vector. Depends on
+   which GGUF embedding models actually initialise on the Orin, so decide it *with* blocker 0a.
+2. **Mail: subjects only, or bodies too?** Recommendation is subjects + sender + date. Bodies change
+   the volume and the exposure enough to be their own phase.
+3. **Does a Guest see shared household memories?** `profile_id: None` is household-visible by the
+   port's own rule; whether that reaches a `Guest` session is a privacy call, not a technical one.
+   Context items already answer it: a Guest sees none.
+
+---
+
+## 3. What to stream in
+
+| Source | Content | Rate | Status |
+|---|---|---|---|
+| Sensor | state transitions only | few/day | **landed** |
+| Camera | classified events above a confidence floor | few/day | **landed** |
+| Voice | nothing — refused by type | — | **landed as a refusal** |
+| Media (deliberate share) | poster/receipt/screenshot + extracted intent | few/day | new |
+| Calendar | title, time, place, participants | ~10s/week | connector phase |
+| Mobile (GOTG) | place arrivals/departures, **not** a GPS track | transitions | connector phase |
+| Mail | subject + sender + date | 100s/week | connector phase |
+| Files | title + summary, not contents | bounded | connector phase |
+| Chat | nothing by default; per-channel opt-in | — | connector phase |
+
+**Deliberately excluded**: raw transcripts, mail bodies, GPS tracks, continuous series of any kind,
+group chat by default, and anything principally about a non-member.
+
+**The test before adding a source:** would a member recognise this row as *something that happened*,
+six months from now? Transitions pass. Samples do not. Conversation does not — that is memory's job.
+
+This test also predicts volume, which is what actually kills a corpus on this hardware. A few items a
+day per source keeps a household in the thousands of rows — brute-force territory, no extension
+needed. Admit mail bodies and GPS tracks and it is millions, and §1.4 stops being true.
+
+---
+
+## 4. Phases
+
+| Phase | Deliverable | Verified by |
+|---|---|---|
+| **0a** | GGUF `EmbeddingProvider` that initialises on the Orin | the embedder comes up in a device run instead of warning twice |
+| **0b** | `ContextItem.embedding` populated in `IngestPipeline` — **after** redaction | a stored item has a vector; the vector is of redacted text |
+| **0c** | Confirm `rolling_summary` is produced on-device | read it out of `sessions` on the nano |
+| **A** | `pond_vectors.db`, port + adapter, `ATTACH` on `after_connect`, migrations | roundtrip; **delete the file and confirm it rebuilds** |
+| **B** | Write-through for all three corpora | a written item is searchable; a re-summarised session's vector *changes* |
+| **C** | Unified retrieval, scope in the SQL, `corpus` labelling | two profiles + a guest: three isolation tests |
+| **D** | Idle staleness sweep, orphan prune, model-change re-embed | user activity cancels mid-sweep; orphans pruned; a `model_id` mismatch refuses rather than scores |
+| **E** | Trigger subscribers (`BusEvent`) | a bus event produces an index entry |
+| **F** | On-demand route/tool + lazy media caption (cap ~8/query) | caption cached and embedded once |
+| **G** | Retrieval surfaces: `giap-context` tool first, then a **measured** passive prompt tier | pai-bench: does the passive tier earn its tokens? |
+
+**G is last and empirical on purpose.** Whether an always-on prompt block earns its tokens against a
+7 568-token cold turn is a measurement, not an opinion.
+
+### The four indexing modes
+
+| Mode | Trigger | Notes |
+|---|---|---|
+| **Automatic** | write-through on the normal paths | embed **after** redaction; summaries **upsert** |
+| **Trigger** | `BusEvent::Ingest` (new variant), `Camera`, `Session` idle, source disconnect | second bus subscriber beside `BusIngest` |
+| **On-demand** | explicit route/tool; lazy media captioning | bounded per query — a question must not cause a five-minute stall |
+| **Schedule** | idle-gated sweep: staleness, orphans, model-change re-embed, retention reconcile | batched + paused, cancelled by user activity |
+
+**Model change must be loud.** Every stored vector becomes meaningless while still scoring
+plausibly. On mismatch: `WARN` with both ids and the row count; retrieval prefers matching vectors
+and falls back to keyword for the rest rather than mixing spaces; re-embed runs idle-gated with
+progress and may take hours on a Jetson. "Retrieval quietly got worse" is undiagnosable.
+
+---
+
+## 5. Failure modes and the guard each needs
+
+| Failure | Guard |
+|---|---|
+| Vector survives its item's deletion | no text in the index; orphan resolves to nothing |
+| Scope filter forgotten → cross-member leak | scope in the `JOIN`'s `WHERE`, never post-filtered |
+| Post-filtering degrades retrieval | top-K slots consumed by invisible rows; filter first |
+| Summary vector describes an old conversation | upsert + re-embed on write; assert a second summary changes the vector |
+| Mixed embedding spaces | `model_id`; a mismatch is refused, not scored |
+| Sweep starves inference | idle-gated + batch pause; assert user activity cancels it |
+| Index silently incomplete | staleness is a query — expose the count on a health route |
+| Guest sees household rows | explicit test; zero from every corpus |
+| Vector of un-redacted text | embed after redaction; a vector is not auditable |
+
+---
+
+## 6. Uncommitted work in the tree at handoff
+
+`crates/pond-core/src/prompts.rs` and
+`crates/pond-core/src/models/services/prompt_builder.rs` — ~171 lines, **not committed**, gates green.
+
+Three parts, and they should not all land:
+
+1. **Identity rewrite, all four styles** — "personal agentic assistant", whose pond it is, tools as
+   live connections. **Measured good**: E4B went from 2 tool calls to 7 on a fan-out query, producing
+   a real per-state answer where it had refused. Worth keeping.
+2. **The "never narrate the harness" rule** — **measured bad.** Both probe answers still leaked
+   (`"the goal has not been fully met"`, `"I cannot continue working toward this goal"`). Asking a 4B
+   model to be discreet about its own input does not hold. Recommend **dropping it** rather than
+   shipping a prompt instruction that costs tokens on every turn and does not work.
+3. **`resolve_builtin_template_selects_correct_style` rewritten** to compare against the constants
+   instead of matching identity prose. Needed either way — the old version breaks on any wording
+   change, which is how it broke here.
+
+**The real fix for the leak is not a prohibition.** Reword the nudge in the goose fork patch so it is
+quotable: "Have you fully answered what was asked? If not, keep working." A model that echoes *that*
+produces a sentence a user can read. Two lines, and robust where an instruction is not.
