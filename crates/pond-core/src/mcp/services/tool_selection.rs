@@ -233,6 +233,47 @@ where
         .collect()
 }
 
+/// Remove every tool belonging to a group a `Guest` must never reach.
+///
+/// See [`crate::mcp::domain::tool_group::groups_denied_to_guests`] for the list
+/// and why it is a denylist rather than an allowlist.
+///
+/// **This is the enforcement point for PAI-1 P5, and it operates on TOOLS
+/// rather than groups deliberately.** The group-level subtraction inside the
+/// adapter's selection path only runs when
+/// `settings.tool_selection_mode == "relevant"`, and the default is `"all"` --
+/// so on a default install the selection path is skipped entirely and the
+/// unfiltered tool set went straight to the model. A `Guest` turn kept
+/// `giap-memory` and could recall, keyword-search or `forget_memory` the whole
+/// household. P5 was recorded as landed while being inert on every default
+/// pond.
+///
+/// The set published to the provider shim is the only thing that actually
+/// constrains the model, so the check belongs here, where every mode converges.
+/// Filtering by group before selection cannot work: `giap-memory` and
+/// `giap-draft` are core groups and `select_groups` puts core groups back
+/// unconditionally.
+///
+/// Idempotent, so applying it after a path that already subtracted at the group
+/// level is harmless.
+pub fn subtract_guest_denied_tools<'a, I>(tools: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let denied = crate::mcp::domain::tool_group::groups_denied_to_guests();
+    tools
+        .into_iter()
+        .filter(|name| match group_of_tool(name) {
+            // An unprefixed name belongs to no group and cannot be matched
+            // against the denylist. Keeping it is the widening choice, but a
+            // tool with no group is a platform tool, not personal data.
+            Some(ext) => !denied.contains(&ext),
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
 /// The `<tool-groups>` block for the user message's `<system-context>`.
 ///
 /// Lists the groups that are NOT loaded, so the model can reach for
@@ -571,5 +612,102 @@ mod tests {
     fn dormant_note_is_empty_when_nothing_is_dormant() {
         let avail = available();
         assert!(dormant_groups_note(&avail, &avail).is_empty());
+    }
+
+    // ── PAI-1 P5: the guest denial, at the tool level ───────────────────────
+
+    fn tools(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The defect this function exists for. `tool_selection_mode` defaults to
+    /// "all", which skips the whole selection path where the group-level
+    /// subtraction lives -- so the unfiltered set reached the model and a Guest
+    /// kept every memory tool. Nothing below depends on selection running.
+    #[test]
+    fn guest_denied_tools_are_removed_from_an_unfiltered_set() {
+        let all = tools(&[
+            "giap-memory__recall_memories",
+            "giap-memory__forget_memory",
+            "giap-memory__keyword_search",
+            "giap-draft__approve_draft",
+            "giap-audit__list_egress",
+            "giap-vision__describe_scene",
+            "giap-sensors__read_sensor",
+            "giap-weather__get_forecast",
+            "giap-toolkit__enable_tool_group",
+        ]);
+
+        let kept = subtract_guest_denied_tools(all.iter());
+
+        for personal in [
+            "giap-memory__recall_memories",
+            "giap-memory__forget_memory",
+            "giap-memory__keyword_search",
+            "giap-draft__approve_draft",
+            "giap-audit__list_egress",
+            "giap-vision__describe_scene",
+            "giap-sensors__read_sensor",
+        ] {
+            assert!(
+                !kept.iter().any(|t| t == personal),
+                "{personal} must not reach a guest"
+            );
+        }
+
+        // A visitor keeps a useful assistant: the denial is targeted, not a
+        // blanket refusal to work.
+        assert!(kept.iter().any(|t| t == "giap-weather__get_forecast"));
+        assert!(kept.iter().any(|t| t == "giap-toolkit__enable_tool_group"));
+    }
+
+    /// Assert the positive case too, not only the boundary. Three vacuous-test
+    /// incidents in this programme were all an assertion that held trivially
+    /// because the fixture was empty or wrong.
+    #[test]
+    fn a_non_guest_set_is_returned_intact() {
+        let all = tools(&["giap-memory__recall_memories", "giap-weather__get_forecast"]);
+        // The function is the guest branch; the caller decides when to apply it.
+        // What it must never do is drop something that is not on the denylist.
+        let kept = subtract_guest_denied_tools(all.iter());
+        assert!(
+            kept.iter().any(|t| t == "giap-weather__get_forecast"),
+            "a non-personal tool was dropped: {kept:?}"
+        );
+        assert_eq!(kept.len(), 1, "exactly the one denied tool should go");
+    }
+
+    #[test]
+    fn subtracting_twice_equals_subtracting_once() {
+        let all = tools(&["giap-memory__recall_memories", "giap-weather__get_forecast"]);
+        let once = subtract_guest_denied_tools(all.iter());
+        let twice = subtract_guest_denied_tools(once.iter());
+        assert_eq!(
+            once, twice,
+            "must be idempotent -- it runs after a path that may already have subtracted at the group level"
+        );
+    }
+
+    /// An unprefixed tool has no group to match against the denylist. Keeping
+    /// it is the widening choice, so it is stated explicitly rather than left
+    /// to be discovered.
+    #[test]
+    fn an_ungrouped_tool_is_kept() {
+        let all = tools(&["platform__final_output"]);
+        assert_eq!(subtract_guest_denied_tools(all.iter()).len(), 1);
+    }
+
+    /// Every name in the denylist must actually be a group the catalog knows,
+    /// or the subtraction silently protects nothing. A typo here is invisible:
+    /// the filter would just never match.
+    #[test]
+    fn every_guest_denied_group_exists_in_the_catalog() {
+        for g in crate::mcp::domain::tool_group::groups_denied_to_guests() {
+            assert!(
+                crate::mcp::domain::tool_group::is_catalog_extension(g),
+                "{g} is on the guest denylist but is not a catalog extension -- \
+                 the denial would match nothing"
+            );
+        }
     }
 }

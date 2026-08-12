@@ -8,6 +8,7 @@ import {
   type ChatEvent,
   type ChatStreamRequest,
   type CleanupResponse,
+  type CompactionReport,
   type Device,
   type DiskUsage,
   type DownloadEntry,
@@ -771,6 +772,7 @@ export class PondApiClient {
             is_active: (item.active as boolean | undefined) ?? false,
             ram_estimate_mb: item.ram_estimate_mb as number | undefined,
             recommended_role: item.recommended_role as string | undefined,
+            context_length: (item.context_length as number | null | undefined) ?? undefined,
             downloaded: item.downloaded as boolean | undefined,
             description: item.description as string | undefined,
             size_mb: item.size_mb as number | undefined,
@@ -858,6 +860,20 @@ export class PondApiClient {
 
   deleteSession(sessionId: string): Promise<void> {
     return this.del(`/api/v1/sessions/${encodeURIComponent(sessionId)}`);
+  }
+
+  /**
+   * PAI-4 P7. Ask the server to compact this session now.
+   *
+   * Everything short of a server fault answers 200 with a `status`/`reason`
+   * pair, so a refusal ("cooling_down", "not_under_pressure", …) arrives here
+   * as a normal resolved `CompactionReport` — `request()` only throws on
+   * non-2xx. Callers must render the reason, not treat it as an error: the
+   * endpoint deliberately does not bypass the pressure axis's rate limiter, so
+   * being refused is the common case rather than the exceptional one.
+   */
+  compactSession(sessionId: string): Promise<CompactionReport> {
+    return this.post(`/api/v1/sessions/${encodeURIComponent(sessionId)}/compact`);
   }
 
   // ── Prompts ───────────────────────────────────────────────
@@ -1140,6 +1156,47 @@ export class PondApiClient {
 
   listProfiles(): Promise<{ profiles: Array<{ id: string; display_name: string; avatar_emoji: string }> }> {
     return this.get("/api/v1/profiles");
+  }
+
+  /** A member's stored preferences, in the server's own snake_case spelling. */
+  async getProfilePrefs(profileId: string): Promise<Record<string, string>> {
+    const p = await this.get<{ preferences?: Record<string, string> }>(
+      `/api/v1/profiles/${encodeURIComponent(profileId)}`,
+    );
+    return p.preferences ?? {};
+  }
+
+  createProfile(displayName: string, avatarEmoji?: string): Promise<{
+    id: string; display_name: string; avatar_emoji: string;
+    preferences: Record<string, string>;
+  }> {
+    return this.post("/api/v1/profiles", {
+      display_name: displayName,
+      ...(avatarEmoji ? { avatar_emoji: avatarEmoji } : {}),
+    });
+  }
+
+  /**
+   * Store a household member's preferences on the SERVER.
+   *
+   * The keys are a contract with the prompt builder, which reads
+   * `preferred_name`, `birthday`, `language` and
+   * `accessibility_atypical_speech` out of `profiles.preferences`
+   * (`routes.rs :: particulars_for`). They are snake_case there and camelCase
+   * in this app's own draft types, and a camelCase key sent here returns 200,
+   * populates the row, and reaches the model as nothing at all.
+   *
+   * That is not hypothetical: until 2026-08-12 the onboarding wizard collected
+   * a preferred name and birthday and wrote them to browser `localStorage`,
+   * while the server read them from SQLite. Every piece worked and the
+   * capability did not exist. `PROFILE_PREF_KEYS` is the single spelling of
+   * these names on this side.
+   */
+  updateProfilePrefs(
+    profileId: string,
+    preferences: Record<string, string>,
+  ): Promise<{ id: string; display_name: string; preferences: Record<string, string> }> {
+    return this.patch(`/api/v1/profiles/${encodeURIComponent(profileId)}`, { preferences });
   }
 
   async registerFace(profileId: string, frame: Blob): Promise<{

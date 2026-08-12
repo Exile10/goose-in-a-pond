@@ -7,6 +7,7 @@ use pond_core::models::ports::embedding::EmbeddingProvider;
 use pond_core::user_data::domain::memory::{
     MemoryEventKind, MemoryFragment, MemoryLifecycle, MemorySegment, MemoryTier,
 };
+use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -97,7 +98,7 @@ impl MemoryMcpServer {
                     Ok(query_vec) => {
                         match self
                             .memory_repo
-                            .search_similar(&query_vec, None, limit)
+                            .search_similar(&query_vec, &ProfileScope::Household, limit)
                             .await
                         {
                             Ok(results) if !results.is_empty() => {
@@ -130,7 +131,7 @@ impl MemoryMcpServer {
         } else {
             // No query — return recent memories
             self.memory_repo
-                .search_recent(None, limit)
+                .search_recent(&ProfileScope::Household, limit)
                 .await
                 .map_err(|e| {
                     ErrorData::new(
@@ -369,7 +370,7 @@ impl MemoryMcpServer {
         if let Some(content) = &params.0.content {
             let memories = self
                 .memory_repo
-                .search_recent(None, 100)
+                .search_recent(&ProfileScope::Household, 100)
                 .await
                 .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
 
@@ -440,7 +441,7 @@ async fn keyword_search(
     limit: usize,
 ) -> Result<Vec<MemoryFragment>, ErrorData> {
     let fragments = memory_repo
-        .search_recent(None, limit * 2) // fetch more to allow for filtering
+        .search_recent(&ProfileScope::Household, limit * 2) // fetch more to allow for filtering
         .await
         .map_err(|e| {
             ErrorData::new(
@@ -624,7 +625,7 @@ mod tests {
         }
         async fn search_recent(
             &self,
-            _: Option<&str>,
+            _: &ProfileScope,
             _: usize,
         ) -> anyhow::Result<Vec<MemoryFragment>> {
             Ok(vec![])
@@ -632,7 +633,7 @@ mod tests {
         async fn search_similar(
             &self,
             _: &[f32],
-            _: Option<&str>,
+            _: &ProfileScope,
             _: usize,
         ) -> anyhow::Result<Vec<MemoryFragment>> {
             Ok(vec![])

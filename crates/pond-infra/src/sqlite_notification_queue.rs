@@ -136,4 +136,94 @@ mod tests {
         // Idempotent / empty input is a no-op.
         q.mark_delivered(&[]).await.unwrap();
     }
+
+    /// PAI-7 P5 and section 7's "Delivery" test, against real SQLite rather than
+    /// a stub: a member with two devices, one of them offline, gets one durable
+    /// row per device and the offline one is still waiting on reconnect.
+    ///
+    /// **This is the assertion the whole per-device-id decision exists for.**
+    /// `notifications.id` is the PRIMARY KEY (migration 0027) and `enqueue` is an
+    /// `INSERT OR REPLACE`, so a fan-out that reused one logical id across a
+    /// member's two devices would leave exactly ONE row -- and against the stub
+    /// queue in `broadcast_notification_sender` that mistake is invisible,
+    /// because a `Vec` happily holds two rows with the same id. The stub cannot
+    /// see this defect. Only the table can.
+    #[tokio::test]
+    async fn a_member_with_two_devices_gets_one_durable_row_each() {
+        use crate::broadcast_notification_sender::BroadcastNotificationSender;
+        use crate::sqlite_device_attribution::SqliteDeviceAttribution;
+        use pond_core::user_data::ports::device_attribution::DeviceAttribution;
+        use std::sync::Arc;
+
+        let tmp = tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        sqlx::query("INSERT INTO profiles (id, display_name) VALUES ('liz', 'Liz')")
+            .execute(&db.system)
+            .await
+            .unwrap();
+        for (id, name) in [
+            ("phone-liz", "Liz Phone"),
+            ("watch-liz", "Liz Watch"),
+            ("tablet", "Kitchen Tablet"),
+        ] {
+            sqlx::query("INSERT INTO devices (id, name) VALUES (?, ?)")
+                .bind(id)
+                .bind(name)
+                .execute(&db.system)
+                .await
+                .unwrap();
+        }
+        let attribution = Arc::new(SqliteDeviceAttribution::new(db.system.clone()));
+        for device in ["phone-liz", "watch-liz"] {
+            attribution
+                .set_device_profile(device, Some("liz"))
+                .await
+                .unwrap();
+        }
+        // The kitchen tablet stays unattributed, which is the state a shared
+        // screen is in on every real pond.
+
+        let queue = Arc::new(SqliteNotificationQueue::new(db.system.clone()));
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let sender = BroadcastNotificationSender::new(tx, queue.clone(), None)
+            .with_device_attribution(attribution.clone());
+
+        let report = sender
+            .send_to_profile("liz", notif("prop-1", "unused"))
+            .await;
+        assert_eq!(report.queued, vec!["phone-liz", "watch-liz"]);
+
+        // Both devices were offline, so both rows are still waiting.
+        assert_eq!(
+            queue.list_undelivered("phone-liz").await.unwrap().len(),
+            1,
+            "the first device's row must survive the second device's INSERT OR REPLACE"
+        );
+        assert_eq!(queue.list_undelivered("watch-liz").await.unwrap().len(), 1);
+
+        // The shared screen is not Liz's device and holds nothing. This is the
+        // vacuity control as well: an enqueue that wrote nothing at all would
+        // satisfy this assertion and fail the two above.
+        assert!(
+            queue.list_undelivered("tablet").await.unwrap().is_empty(),
+            "an unattributed device is nobody's, so a targeted proposal never lands on it"
+        );
+
+        // One device comes back online and drains; the other's row is untouched.
+        let waiting = queue.list_undelivered("phone-liz").await.unwrap();
+        queue
+            .mark_delivered(&[waiting[0].id.clone()])
+            .await
+            .unwrap();
+        assert!(queue
+            .list_undelivered("phone-liz")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            queue.list_undelivered("watch-liz").await.unwrap().len(),
+            1,
+            "delivering to one device must not mark the other's copy delivered"
+        );
+    }
 }

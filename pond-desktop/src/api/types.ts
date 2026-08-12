@@ -88,7 +88,12 @@ export interface Settings {
   chat_model?: string;
   tool_model?: string | null;
   thinking_mode?: string;
+  reasoning_effort?: string;
   show_thinking?: boolean;
+  /** PAI-5 P6. Whether reasoning text survives the stream that produced it.
+   *  Orthogonal to `show_thinking`, which only decides whether it is shown
+   *  live — showing something once and keeping it are different consents. */
+  persist_thinking?: boolean;
   review_mode?: string;
   review_max_rounds?: number;
   review_pass_threshold?: number;
@@ -108,8 +113,6 @@ export interface Settings {
   weather_latitude?: number;
   weather_longitude?: number;
 
-  // Fast path
-  fast_path_enabled?: boolean;
 
   // Active model selection
   active_embedding_model?: string;
@@ -166,14 +169,10 @@ export interface Settings {
   cloud_input_price_per_million?: number;
   cloud_output_price_per_million?: number;
 
-  // Tool cache
-  tool_cache_enabled?: boolean;
 
   // Telemetry
   telemetry_enabled?: boolean;
 
-  // Compact encoding
-  compact_encoding?: boolean;
 
   // Experimental
   multi_tool_enabled?: boolean;
@@ -193,12 +192,48 @@ export interface Settings {
   ext_audit_enabled?: boolean;
   ext_vision_enabled?: boolean;
   ext_sensor_enabled?: boolean;
+  /**
+   * Delegation to saved agent roles. The one extension toggle that ships OFF —
+   * turning it on lets the assistant run a second agent autonomously on this
+   * device. Read it as `=== true`, never `!== false`: absent must mean off.
+   */
+  ext_orchestrator_enabled?: boolean;
 
-  // API keys for keyed services
-  api_key_guardian?: string | null;
-  api_key_gnews?: string | null;
-  api_key_finnhub?: string | null;
-  api_key_coingecko?: string | null;
+  // Speaking and acting unprompted (PAI-7 P4 and P6).
+  //
+  // Both booleans ship OFF and must be read as `=== true`, never `!== false`:
+  // a key the server has not sent yet, or a settings read that failed, has to
+  // mean "does not speak" and "does not review". These are the only settings in
+  // this type that decide whether the assistant addresses somebody who did not
+  // address it, so the widening direction is the one that matters.
+  /**
+   * May the pond reason about the household unasked, and propose things?
+   * Needs `ext_orchestrator_enabled` as well — the reviewer runs its work as a
+   * delegated child, so with delegation off there is nothing to run it in.
+   */
+  proactive_review_enabled?: boolean;
+  /** May the pond speak without having been spoken to? */
+  unprompted_speech_enabled?: boolean;
+  /**
+   * Start of the nightly window in which the pond never speaks unprompted,
+   * local `"HH:MM"`. ABSOLUTE: the server checks this window before consent,
+   * presence and category, so no combination of the others produces speech
+   * inside it. Wraps midnight when start > end; equal bounds mean silent all
+   * day; a value the server cannot parse also means silence.
+   */
+  quiet_hours_start?: string;
+  /** End of the quiet-hours window, local `"HH:MM"`. See `quiet_hours_start`. */
+  quiet_hours_end?: string;
+  /**
+   * Comma-separated notification categories that may be SPOKEN unprompted.
+   * Defaults to `"alert"` alone. An unrecognised or blank entry matches
+   * nothing, so a typo silences that category rather than opening the rest.
+   */
+  unprompted_speech_categories?: string;
+
+  // API keys are NOT on Settings (PAI-2 P2). They live in the secret store and
+  // are managed through listSecretKeys / setSecret / deleteSecret; the server
+  // never returns a secret VALUE, only whether the key is set.
   searxng_url?: string | null;
 
   // Data retention
@@ -361,6 +396,13 @@ export interface ModelEntry {
   is_active: boolean;
   ram_estimate_mb?: number;
   recommended_role?: string;
+  /**
+   * Declared maximum context window, straight from the catalog row the backend
+   * persisted. LLM entries only; absent when the catalog provider could not
+   * answer. Prefer this over inferring the window from `name` — the name
+   * heuristic is a copy of a backend rule that has already moved on.
+   */
+  context_length?: number;
   downloaded?: boolean;
   description?: string;
   size_mb?: number;
@@ -428,7 +470,24 @@ export interface ChatStreamRequest {
   images?: ImageAttachment[];
 }
 
-export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision" | "turn_stats" | "turn_limit_reached";
+export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision" | "turn_stats" | "turn_limit_reached" | "context_warning" | "subagent_progress";
+
+/**
+ * PAI-6 P6. Where one delegation has got to.
+ *
+ * The spellings are `SubagentStatus::as_str` in `pond-core`, pinned against
+ * that enum's serde on the Rust side by `the_wire_spelling_is_the_serialized_spelling`.
+ * `tool` is the state a delegating turn spends most of its wall clock in, and
+ * the only one that says anything is still happening.
+ */
+export type SubagentStatus =
+  | "queued"
+  | "running"
+  | "tool"
+  | "completed"
+  | "cancelled"
+  | "turn_budget_exhausted"
+  | "failed";
 
 // Sent as a fresh user turn when the agent stopped on its turn budget. The
 // backend has no dedicated resume endpoint — a continuation IS just the next
@@ -452,6 +511,52 @@ export interface TurnStats {
   inference_count: number;
 }
 
+// PAI-4 P7b. The server pushes this mid-stream when `ContextHealth.should_compact`
+// is true for the session that just took a turn (routes.rs, guarded by the
+// default-true `context_monitor_enabled`). It is NOT the same shape as the
+// `POST /sessions/{id}/compact` response body below, and the two differences are
+// the ones a client gets wrong:
+//
+//  - `turns_remaining` is a raw u32 here, and the monitor uses `u32::MAX`
+//    (4294967295) to mean "growth is unknown". The endpoint sends `null` for the
+//    same state. Never print this number without clamping it.
+//  - `warning` is only populated above 60% utilisation, but `should_compact`
+//    also fires through the `estimated_turns_remaining < 3` limb, which can be
+//    true below that. So `warning: null` on a `context_warning` frame is a
+//    producible state, not a defensive `?`.
+export interface ContextWarning {
+  type: "context_warning";
+  utilization_pct: number;
+  turns_remaining: number;
+  avg_growth_rate: number;
+  warning: string | null;
+}
+
+/** Sentinel the monitor uses for "growth rate unknown, so turns remaining is unknown". */
+export const TURNS_REMAINING_UNKNOWN = 4294967295;
+
+/** Response body of POST /api/v1/sessions/{session_id}/compact. */
+export interface CompactionReport {
+  session_id: string;
+  /** "compacted" only when a pass actually persisted a new summary. */
+  status: "compacted" | "skipped";
+  /**
+   * Why it was skipped. The server's vocabulary, verbatim: monitor_disabled,
+   * compaction_disabled, not_under_pressure, no_summariser, already_running,
+   * cooling_down, nothing_to_summarise, preempted_by_turn, failed.
+   */
+  reason: string | null;
+  outcome: string | null;
+  context: {
+    utilization_pct: number;
+    /** `null` here where the SSE frame sends 4294967295. */
+    turns_remaining: number | null;
+    avg_growth_rate: number;
+    should_compact: boolean;
+    warning: string | null;
+  };
+}
+
 export interface ChatEvent {
   type: ChatEventType;
   content?: string;         // for "text" events
@@ -468,6 +573,20 @@ export interface ChatEvent {
   };
   /** Turn budget that was exhausted — present on "turn_limit_reached" events. */
   max_turns?: number;
+  /** PAI-6 P6 — present on "subagent_progress" events. The run this frame is
+   *  about; one turn may delegate the same role twice, so the id and not the
+   *  role is what groups a tree's nodes. */
+  task_id?: string;
+  /** The delegated role — the label on a tree node. Present on
+   *  "subagent_progress" events only; a chat event has no other notion of a
+   *  role. */
+  role?: string;
+  /** Present on "subagent_progress" events. */
+  status?: SubagentStatus;
+  /** A tool NAME while a child is calling one, or the pond's own reason when a
+   *  run failed. Never the child's words, its reasoning, or a tool call's
+   *  arguments — the server cannot put those here (PAI-2 minimisation). */
+  detail?: string;
   done?: boolean;
   session_id?: string;      // present on done events
   model_role?: string;      // present on done events (chat | think | task)
@@ -583,6 +702,12 @@ export interface SessionMessage {
   tool_call_id?: string;
   /** Present on messages (typically role="user") that had images attached. */
   images?: SessionMessageImage[];
+  /** PAI-5 P6. The reasoning passages this reply was produced by, in emission
+   *  order — present only on role="assistant" messages recorded while
+   *  `persist_thinking` was on. Absent (not `[]`) when nothing was kept, so a
+   *  turn that was never recorded is distinguishable from one that thought
+   *  nothing. */
+  thinking?: string[];
 }
 
 // ── HuggingFace / Model Download ──────────────────────────────

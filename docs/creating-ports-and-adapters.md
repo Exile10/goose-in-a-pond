@@ -301,7 +301,7 @@ If your adapter imports from `goose::*`, it must be listed in `workspace.exclude
 |---|---|---|---|
 | `Agent` | `ports/agent.rs` | `MockAgent` | `GooseAdapter` |
 | `LlmProvider` | `ports/provider.rs` | `MockProvider` | `GooseProviderAdapter`, `LlamafileProvider`, `OllamaProvider` |
-| `SessionStorage` | `ports/session_storage.rs` | `InMemorySessionStorage` | `SqliteSessionStorage`, `GooseSessionAdapter` |
+| `SessionStorage` | `ports/session_storage.rs` | `InMemorySessionStorage` | `SqliteSessionStorage` |
 | `VoiceInput` | `ports/voice_input.rs` | `StdinInput` | `WhisperInput` |
 | `VoiceOutput` | `ports/voice_output.rs` | `PrintOutput` | `PiperOutput` |
 | `WakeWordDetector` | `ports/wake_word.rs` | `InstantActivation` | `WhisperKeywordDetector` |

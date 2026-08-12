@@ -28,6 +28,7 @@ use futures::StreamExt;
 use pond_adapters_goose::giap_registration::register_giap_extensions;
 use pond_adapters_goose::GooseAdapter;
 use pond_core::shared::domain::agent::{AgentRequest, AgentStreamEvent};
+use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::domain::schedule::{Schedule, ScheduleRun};
 use pond_core::user_data::domain::settings::Settings;
 use pond_core::user_data::ports::device_control::{
@@ -360,6 +361,12 @@ async fn run_utterance(session_id: &str, utterance: &str) -> ChainRun {
         // under the tuned voice_max_turns cap.
         voice_mode: true,
         canvas_mode: false,
+        // PAI-1 P3/P6 made these required on AgentRequest and did not update
+        // the live-hardware tests, so this file stopped compiling and
+        // `cargo test -p pond-adapters-goose -- --ignored` has been failing at
+        // BUILD ever since. Household is what a test with no speaker means.
+        profile_scope: ProfileScope::Household,
+        profile_context: None,
     };
 
     let started = Instant::now();

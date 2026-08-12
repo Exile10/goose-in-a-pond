@@ -46,6 +46,13 @@ impl OnboardingRepository for CompletedOnboarding {
     async fn reset(&self) -> anyhow::Result<()> {
         Ok(())
     }
+    // PAI-2 P7 made this a required trait method rather than a defaulted one:
+    // a default would have to answer from `get_current_step`, and a stub that
+    // answers "not onboarded" makes every onboarding write route public
+    // wherever it is used. The name of this stub is the answer.
+    async fn is_complete(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
 }
 
 struct NoDevices;
@@ -250,7 +257,6 @@ async fn make_app_with_provider(
         notification_queue: None,
         notification_sender: None,
         face_recognition: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
@@ -581,7 +587,6 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         notification_queue: None,
         notification_sender: None,
         face_recognition: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
@@ -685,7 +690,6 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         notification_queue: None,
         notification_sender: None,
         face_recognition: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,

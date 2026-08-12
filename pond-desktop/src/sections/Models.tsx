@@ -38,15 +38,33 @@ function inferCapabilities(name: string): Partial<ModelCapabilities> {
   return caps;
 }
 
-/** Compact capability badge list for a model name. */
-function CapabilityBadges({ name }: { name: string }) {
+/**
+ * Compact capability badge list for a model.
+ *
+ * `contextLength` is the catalog value the backend persisted for this row
+ * (`ModelRecord.context_length`, rung 3 of the context governor). When it is
+ * present it WINS over `inferCapabilities` — the heuristic above is a copy of a
+ * backend rule and has already drifted from it, so a real number beats a
+ * substring match on the model's name every time. The badge's tooltip says
+ * which of the two it is showing, because "why does this model claim 4k?" is a
+ * question the UI should answer rather than pose.
+ */
+function CapabilityBadges({ name, contextLength }: { name: string; contextLength?: number }) {
   const caps = inferCapabilities(name);
   const badges: Array<{ label: string; title: string }> = [];
   if (caps.thinking) badges.push({ label: "Thinking", title: "Supports internal chain-of-thought reasoning" });
   if (caps.vision) badges.push({ label: "Vision", title: "Accepts image input (multimodal)" });
   if (caps.audio_input) badges.push({ label: "Audio", title: "Accepts raw audio input" });
-  if (caps.context_window_tokens && caps.context_window_tokens > 8192)
-    badges.push({ label: `${Math.round(caps.context_window_tokens / 1000)}k ctx`, title: `${caps.context_window_tokens.toLocaleString()} token context window` });
+
+  const fromCatalog = typeof contextLength === "number" && contextLength > 0;
+  const ctx = fromCatalog ? contextLength : caps.context_window_tokens;
+  if (ctx && ctx > 8192)
+    badges.push({
+      label: `${Math.round(ctx / 1000)}k ctx`,
+      title: fromCatalog
+        ? `${ctx.toLocaleString()} token context window (declared by the model, from the catalog)`
+        : `${ctx.toLocaleString()} token context window (inferred from the model name)`,
+    });
 
   if (badges.length === 0) return null;
   return (
@@ -321,7 +339,7 @@ function ModelList({
                     {ROLE_LABELS[r]}
                   </Chip>
                 ))}
-                <CapabilityBadges name={m.name} />
+                <CapabilityBadges name={m.name} contextLength={m.context_length} />
                 {memoryStatus !== undefined && (
                   <FitBadge model={m} status={memoryStatus} compact />
                 )}
@@ -811,7 +829,7 @@ function LlmTab({
                       <div className="model-row__title-row">
                         <span className="model-row__name">{m.display_name ?? m.name}</span>
                         {m.size_mb != null && <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.size_mb} MB</Chip>}
-                        <CapabilityBadges name={m.name} />
+                        <CapabilityBadges name={m.name} contextLength={m.context_length} />
                         {memoryStatus !== undefined && (
                           <FitBadge model={m} status={memoryStatus} compact />
                         )}
@@ -869,7 +887,7 @@ function LlmTab({
                       <div className="model-row__title-row">
                         <span className="model-row__name">{m.display_name ?? m.name}</span>
                         {m.size_mb != null && <Chip size="sm" variant="flat" color="default" className="model-row__size">{m.size_mb} MB</Chip>}
-                        <CapabilityBadges name={m.name} />
+                        <CapabilityBadges name={m.name} contextLength={m.context_length} />
                         {memoryStatus !== undefined && (
                           <FitBadge model={m} status={memoryStatus} compact />
                         )}

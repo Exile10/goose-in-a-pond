@@ -7,10 +7,19 @@ use goose::conversation::message::Message;
 use goose::providers::base::Provider;
 use goose::session::SessionManager;
 use pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort;
+use pond_core::models::domain::model_record::{ModelCategory, ModelRecord};
 use pond_core::models::ports::agent::{
     Agent as AgentPort, AgentRequest, AgentResponse, AgentStreamEvent,
 };
 use pond_core::models::ports::embedding::EmbeddingProvider;
+use pond_core::models::ports::model_repository::ModelRepository;
+use pond_core::models::ports::token_counter::TokenCounter as PondTokenCounter;
+use pond_core::models::services::context::context_budget::CompactionProfile;
+use pond_core::models::services::context::context_governor::{
+    ContextGovernor, ContextInputs, WindowResolution,
+};
+use pond_core::models::services::context::prefix_cache::{InvalidationReason, PrefixCacheState};
+use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
 use pond_core::models::services::prompt_builder::build_prompt_partition;
 use pond_core::prompts::PromptState;
 use pond_core::user_data::domain::memory::{cosine_similarity, MemoryFragment};
@@ -29,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::extension_manager::GiapGooseExtensionManager;
 use crate::giap_registration::registered_extensions;
+use pond_core::user_data::domain::profile::ProfileScope;
 
 /// Minimal hard-coded fallback — used only when the DB has no template for the
 /// current `prompt_style`. Not a full system prompt: just enough to be safe.
@@ -186,6 +196,15 @@ pub struct GooseAdapter {
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     /// Device registry — queried per turn to populate PromptState for Jinja2 rendering.
     device_repo: Arc<dyn DeviceRegistry>,
+    /// Model catalog — the ONLY way this adapter can reach
+    /// `ModelRecord.context_length`, which is rung 3 of the context governor.
+    ///
+    /// Optional because the CLI one-shot paths build an adapter without one and
+    /// a missing catalog row must degrade to the heuristic rather than fail a
+    /// turn. But when it is `None` on the serving path, rung 3 is unreachable
+    /// and every Ollama model falls back to a substring match on its name —
+    /// which is the bug PAI-3 exists to remove, so `main.rs` supplies it.
+    model_repo: Option<Arc<dyn ModelRepository>>,
     llamafile_url: String,
     /// GIAP data directory — used to resolve GGUF model paths under
     /// `$data_dir/models/gguf/` for the in-process LocalInferenceProvider.
@@ -212,17 +231,53 @@ pub struct GooseAdapter {
     /// Signature of the Goose env knobs currently exported, so `set_var` runs
     /// only when a setting actually changed rather than on every turn.
     last_env_signature: Mutex<String>,
+    /// Token counter for the trim/replay budget paths, built on first use.
+    ///
+    /// `None` inside the cell means construction failed and the caller falls
+    /// back to the chars/4 heuristic — a worse estimate is not a reason to fail
+    /// a turn, and the overshoot-feedback correction still bounds the error.
+    token_counter: tokio::sync::OnceCell<Option<Arc<crate::token_counter::TiktokenCounter>>>,
+    /// The context window last resolved for the active provider/model, with its
+    /// provenance.
+    ///
+    /// The budget paths (`trim_goose_history`, `hydrate_goose_session`) used to
+    /// read `GOOSE_CONTEXT_LIMIT` from the process environment and fall back to
+    /// a hardcoded 8192 — a value nobody guaranteed, since it is only exported
+    /// as a side effect of `apply_goose_env_knobs` and only when its signature
+    /// changes. This field is the same number, owned deliberately: written on
+    /// the settings path, read by the budget paths, never round-tripped through
+    /// the environment. See `docs/architecture/pai/03-context-governor.md`.
+    ///
+    /// Cached WITH the provider it was resolved for, since PAI-3 P5: the
+    /// prompt-side clamp is a function of the provider class, so a budget path
+    /// that has the window but not the provider cannot build the asymmetric
+    /// profile and would silently fall back to the symmetric one.
+    last_window: Mutex<Option<(String, WindowResolution)>>,
+    /// `Settings::compaction_verbatim_days`, cached on the settings path for
+    /// the same reason `last_window` is: `trim_goose_history` runs on every
+    /// turn, and a settings load per turn is a cost the budget paths
+    /// deliberately do not pay. PAI-4 P3.
+    last_verbatim_days: Mutex<Option<u32>>,
     /// Per-turn controls for the [`GiapProviderShim`] wrapped around every
     /// provider handed to Goose — GIAP's last-mile veto over the system
     /// prompt, Goose's `<turn-context>` message injection, and the tools list.
     shim_controls: Arc<crate::provider_shim::ShimControls>,
+    /// Each live turn's [`DelegationAuthority`], keyed by the ENGINE session id
+    /// its tool calls carry. PAI-6 P3.
+    ///
+    /// Published at the point the turn's allow-set is published to
+    /// `shim_controls` and revoked when the turn's stream is dropped, so a
+    /// `delegate` tool call can only ever be authorised by a turn that is still
+    /// running. Handed to `GooseOrchestrator` so the two read the same map.
+    turn_authorities: Arc<pond_core::shared::services::turn_authority::TurnAuthorityRegistry>,
     /// Maps GIAP session IDs → Goose session IDs (Goose auto-generates its own IDs).
     goose_session_map: Mutex<HashMap<String, String>>,
     /// Goose sessions that have already had GIAP builtin extensions loaded.
     /// Extensions are loaded once per session on first use.
     loaded_sessions: Mutex<HashSet<String>>,
     /// Dynamic tool registry — provides tool descriptions for the system prompt.
-    /// When `None`, falls back to the static `giap_tool_description_lines()`.
+    /// When `None`, no prose tool list is rendered at all -- builtins reach
+    /// the model as native tool schemas regardless.
     tool_registry: Option<Arc<dyn ToolRegistryPort>>,
     /// Tracks which extensions the user explicitly added via the REST API.
     /// These are preserved across turns (not stripped in the extension cleanup loop).
@@ -237,6 +292,15 @@ pub struct GooseAdapter {
     /// prefix has not changed and we skip `override_system_prompt()` — allowing
     /// local inference providers to reuse their KV-cache for the stable portion.
     last_prefix_hash: Mutex<u64>,
+    /// PAI-4 P5's cache-age axis: the same prefix `last_prefix_hash` tracks,
+    /// plus what it has served and what most recently destroyed it.
+    ///
+    /// Deliberately alongside rather than folded into `last_prefix_hash`. That
+    /// field is read to decide whether to call `override_system_prompt`, on the
+    /// hot path, under a lock held for two lines; this one is written from six
+    /// places that have nothing else in common and read by the trimmer. Merging
+    /// them would put the compaction decision inside the prompt-assembly lock.
+    prefix_cache: Mutex<PrefixCacheState>,
     /// GIAP session storage — read-only source of the rolling conversation
     /// summary for the deterministic turn trimmer. Optional: without it the
     /// trimmer still runs, just without a summary splice.
@@ -264,6 +328,88 @@ pub struct GooseAdapter {
     /// The descriptions are `&'static str` constants, so one pass is enough for
     /// the process lifetime.
     group_embeddings: tokio::sync::OnceCell<Option<Vec<(String, Vec<f32>)>>>,
+}
+
+/// Hard ceiling on a single buffered reasoning passage, in bytes.
+///
+/// The coalescer holds at most one passage, and every real block ends the
+/// moment the model says anything the user can see. A provider that never
+/// produces visible output — broken, hostile, or simply looping — would
+/// otherwise grow the buffer for the whole turn. 64 KiB is far past any
+/// reasoning block a shipped model emits (a 16k-token context cannot hold one)
+/// and is bounded memory rather than a correctness rule, so crossing it splits
+/// the passage and logs, instead of dropping it.
+const REASONING_BUFFER_LIMIT: usize = 64 * 1024;
+
+/// PAI-5 P1 (granularity). One reasoning passage, assembled from however many
+/// pieces the provider chose to send it in.
+///
+/// The providers disagree about what an `AgentEvent::Message` carrying
+/// `Thinking` *means*, and P1 originally assumed they agreed:
+///
+/// | provider family | shape | source |
+/// |---|---|---|
+/// | local / gguf (the Jetson headline config) | one message **per token piece** | `goose-local-inference/src/llamacpp/inference_native_tools.rs` calls `push_structured_reasoning` from inside the per-token `\|piece\|` callback |
+/// | openai-format HTTP (Ollama, DeepSeek, OpenRouter, vLLM) | one message per streamed delta | `goose-provider-types/src/formats/openai.rs` pushes each chunk's newly-arrived `reasoning_text()` |
+/// | google | one message per part | delta-shaped |
+/// | anthropic | one message per **complete block** | `formats/anthropic.rs` accumulates `ThinkingDelta` internally and emits once at `content_block_stop` |
+/// | any non-streaming response | one message per complete block | `response_to_message` |
+///
+/// Emitting one `AgentStreamEvent::Thinking` per message therefore rendered a
+/// single passage as hundreds of one-fragment `<p>`s in `sections/Chat.tsx`
+/// (which appends thinking frames while it concatenates text deltas), with the
+/// inter-fragment spacing destroyed by a per-fragment `.trim()`. Buffering
+/// fixes that without costing anything on the streaming surface: `Chat.tsx`
+/// gates the whole thinking panel on `!msg.streaming`, so nothing was rendered
+/// mid-turn anyway.
+///
+/// The buffer is written only through [`ReasoningCoalescer::push`], which
+/// carries the display gate. With `emit` false nothing is ever stored, so a
+/// voice turn or a `show_thinking = false` turn holds no reasoning text in
+/// memory at all — the gate narrows both the surface and the residency.
+#[derive(Default)]
+struct ReasoningCoalescer {
+    buf: String,
+}
+
+impl ReasoningCoalescer {
+    /// Append this message's reasoning fragments, **raw**.
+    ///
+    /// No trimming and no blank-dropping happen here: a fragment that is a lone
+    /// `" "` is the space between two words, and dropping it is precisely how
+    /// `"the user asked about the light"` became `"the userasked aboutthe
+    /// light"`. Normalisation happens once, in [`Self::flush`], at the surface
+    /// that actually produces a frame.
+    fn push(&mut self, msg: &Message, emit: bool) {
+        for fragment in GooseAdapter::reasoning_frames(msg, emit) {
+            self.buf.push_str(&fragment);
+        }
+    }
+
+    /// Whether the buffered passage has outgrown [`REASONING_BUFFER_LIMIT`].
+    fn over_cap(&self) -> bool {
+        self.buf.len() >= REASONING_BUFFER_LIMIT
+    }
+
+    /// Bytes currently buffered — for the over-cap log line only.
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Take the passage, trimmed once, or `None` if there is nothing readable.
+    ///
+    /// This is the surface that keeps P1's user-visible claim: no blank frame,
+    /// no ciphertext. `RedactedThinking` never enters the buffer (it is dropped
+    /// in the lift), and a buffer holding only whitespace trims to empty and
+    /// yields nothing rather than a flickering empty paragraph.
+    fn flush(&mut self) -> Option<String> {
+        let passage = std::mem::take(&mut self.buf);
+        let trimmed = passage.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(trimmed.to_string())
+    }
 }
 
 impl GooseAdapter {
@@ -354,6 +500,7 @@ impl GooseAdapter {
             memory_repo,
             embedding_provider: None,
             device_repo,
+            model_repo: None,
             llamafile_url,
             data_dir,
             extension_manager,
@@ -362,7 +509,13 @@ impl GooseAdapter {
             provider_configured_sessions: Mutex::new(HashSet::new()),
             last_thinking_param: Mutex::new(None),
             last_env_signature: Mutex::new(String::new()),
+            token_counter: tokio::sync::OnceCell::new(),
+            last_window: Mutex::new(None),
+            last_verbatim_days: Mutex::new(None),
             shim_controls: Arc::new(crate::provider_shim::ShimControls::default()),
+            turn_authorities: Arc::new(
+                pond_core::shared::services::turn_authority::TurnAuthorityRegistry::new(),
+            ),
             goose_session_map: Mutex::new(HashMap::new()),
             loaded_sessions: Mutex::new(HashSet::new()),
             tool_registry,
@@ -372,6 +525,7 @@ impl GooseAdapter {
                 pond_core::models::domain::model_capabilities::ModelCapabilities::default(),
             ),
             last_prefix_hash: Mutex::new(0),
+            prefix_cache: Mutex::new(PrefixCacheState::new(0, std::time::Instant::now())),
             giap_session_storage: None,
             last_prompt_tokens_arc: std::sync::OnceLock::new(),
             cached_tools: tokio::sync::RwLock::new(None),
@@ -408,9 +562,72 @@ impl GooseAdapter {
             Arc::new(MockDeviceRegistry),
             url,
             None,
-            None, // tool_registry — falls back to static giap_tool_description_lines()
+            None, // tool_registry — no prose tool list; native schemas still apply
         )
         .await
+    }
+
+    // ── PAI-4 P5: prefix-cache bookkeeping ────────────────────────────────
+    //
+    // Six places in this file already destroy the engine's KV prefix, and
+    // until P5 every one of them did so silently. These three helpers are
+    // what turns that into a signal the compaction path can read. All are
+    // synchronous and drop the guard before returning, so they are safe to
+    // call from `async fn`s that later `.await` — the same discipline
+    // `last_prefix_hash` follows two fields up.
+
+    /// Record that the prefix was destroyed, and by what.
+    fn note_prefix_invalidated(&self, reason: InvalidationReason) {
+        let mut state = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let served = state.turns_served;
+        state.invalidate(reason);
+        tracing::debug!(
+            target: "giap::trace",
+            kind = "prefix_cache_invalidated",
+            reason = reason.as_str(),
+            turns_served = served,
+            "KV prefix invalidated"
+        );
+    }
+
+    /// Which of the two provider-side reasons a completed swap was (PAI-4 P5).
+    ///
+    /// `previous_key` is `last_provider_key` as it stood BEFORE the swap, in
+    /// the `"provider:model"` form `ensure_provider_current` builds. Reaching
+    /// the swap means provider or model differs; only the model half decides
+    /// between the two reasons, because only a different model explains a
+    /// change in the answers as well as in the prefill.
+    ///
+    /// A model name may itself contain a colon (`gemma4:e2b`), so the split is
+    /// from the LEFT — the provider is the part before the first colon and the
+    /// model is everything after. Splitting from the right would compare
+    /// `"e2b"` against `"gemma4:e2b"` and call every swap a model swap.
+    fn provider_change_reason(previous_key: &str, new_model: &str) -> InvalidationReason {
+        match previous_key.split_once(':') {
+            Some((_, previous_model)) if previous_model == new_model => {
+                InvalidationReason::ProviderRebuilt
+            }
+            // No previous key at all is first use: nothing was swapped away
+            // from, and calling that a model swap is the honest reading.
+            _ => InvalidationReason::ModelSwapped,
+        }
+    }
+
+    /// Record that a new prefix was installed. Does not make it warm — only a
+    /// served turn does that; see `PrefixCacheState::rebuilt`.
+    fn note_prefix_rebuilt(&self, hash: u64) {
+        self.prefix_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rebuilt(hash, std::time::Instant::now());
+    }
+
+    /// Record that this turn is being served off the existing prefix.
+    fn note_prefix_served(&self) {
+        self.prefix_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .serve_turn();
     }
 
     /// Returns an `GiapGooseExtensionManager` for managing Goose extensions on a session.
@@ -428,6 +645,11 @@ impl GooseAdapter {
         self.user_extensions.write().await.insert(name.to_string());
         // Invalidate tool cache — new extension means new tools available.
         *self.cached_tools.write().await = None;
+        // ...and new tools mean a different tools block inside the static
+        // prefix. PAI-4 P5: this is 3.3's named example — two sessions
+        // alternating on one model diverge here and re-prefill on every
+        // switch, which used to be an invisible tax.
+        self.note_prefix_invalidated(InvalidationReason::ToolSetChanged);
     }
 
     /// Remove an extension from the user-tracking set.
@@ -435,18 +657,24 @@ impl GooseAdapter {
         self.user_extensions.write().await.remove(name);
         // Invalidate tool cache — removed extension means tools changed.
         *self.cached_tools.write().await = None;
+        self.note_prefix_invalidated(InvalidationReason::ToolSetChanged);
     }
 
-    /// Add a named builtin extension to a Goose session (idempotent).
-    pub async fn add_builtin_extension(&self, name: &str, session_id: &str) -> Result<()> {
-        let config = ExtensionConfig::Builtin {
+    /// The `ExtensionConfig` GIAP registers its builtins under.
+    fn builtin_extension_config(name: &str) -> ExtensionConfig {
+        ExtensionConfig::Builtin {
             name: name.to_string(),
             description: String::new(),
             display_name: None,
             timeout: Some(600),
             bundled: Some(false),
             available_tools: vec![],
-        };
+        }
+    }
+
+    /// Add a named builtin extension to a Goose session (idempotent).
+    pub async fn add_builtin_extension(&self, name: &str, session_id: &str) -> Result<()> {
+        let config = Self::builtin_extension_config(name);
 
         // Also register it with the extension manager so it can be re-enabled if disabled
         self.extension_manager
@@ -457,6 +685,68 @@ impl GooseAdapter {
             .add_extension(config, session_id)
             .await
             .map_err(|e| anyhow!("Failed to add builtin extension '{}': {}", name, e))
+    }
+
+    /// Add every GIAP builtin to a session in one pass.
+    ///
+    /// `Agent::add_extension` is `add_extension_inner` (a `get_session` read for
+    /// the working dir) plus `persist_extension_state` (another `get_session`
+    /// and a `sessions` UPDATE carrying the whole serialized extension blob) —
+    /// about three SQLite round trips each. Fifteen of those, awaited one after
+    /// another, sat between a new conversation's first message and its first
+    /// token. `add_extensions_bulk` loads them concurrently and persists once.
+    ///
+    /// Returns the number that loaded, and logs each failure: an extension that
+    /// does not load is a real problem, not a degraded mode.
+    async fn add_builtin_extensions(&self, names: &[String], session_id: &str) -> usize {
+        for name in names {
+            self.extension_manager
+                .register_config(name.clone(), Self::builtin_extension_config(name))
+                .await;
+        }
+
+        let configs: Vec<ExtensionConfig> = names
+            .iter()
+            .map(|n| Self::builtin_extension_config(n))
+            .collect();
+
+        match self.agent.add_extensions_bulk(configs, session_id).await {
+            Ok(results) => {
+                // Report against each result's own `name`. Nothing documents
+                // that bulk loading preserves input order, and pairing a failure
+                // with the wrong extension is worse than not reporting it.
+                let mut loaded = 0usize;
+                for result in &results {
+                    if result.success {
+                        loaded += 1;
+                        tracing::debug!("giap extension loaded: {}", result.name);
+                    } else {
+                        tracing::warn!(
+                            "giap extension failed to load: {}: {}",
+                            result.name,
+                            result.error.as_deref().unwrap_or("unknown error")
+                        );
+                    }
+                }
+                loaded
+            }
+            Err(e) => {
+                tracing::warn!("giap extensions failed to load in bulk: {e}");
+                0
+            }
+        }
+    }
+
+    /// The registry each live turn's delegation authority is published into.
+    ///
+    /// PAI-6 P3. `GooseOrchestrator` needs the SAME registry this adapter writes
+    /// to — a second one would answer `None` for every spawn and refuse every
+    /// delegation, which is the safe direction but is also a feature that does
+    /// nothing. Wiring is `GooseOrchestrator::new(runner, adapter.turn_authorities())`.
+    pub fn turn_authorities(
+        &self,
+    ) -> Arc<pond_core::shared::services::turn_authority::TurnAuthorityRegistry> {
+        self.turn_authorities.clone()
     }
 
     /// Resolve (and create if needed) the Goose-internal session for a given GIAP session ID.
@@ -485,20 +775,41 @@ impl GooseAdapter {
         }
         // Persisted pairing from a previous run. Re-validated against Goose:
         // its store can be wiped independently of ours, and a dangling id would
-        // fail every agent call for the session.
+        // fail every agent call for the session. The `name` check on top of
+        // `is_ok()` guards against a persisted pairing that resolves to a
+        // REAL but foreign session (a recycled id, or a row corrupted by a
+        // bug elsewhere) — every session this method creates is named after
+        // the GIAP id that owns it (see the create-session branch below), so
+        // a mismatch means the pairing is pointing at someone else's
+        // conversation. Falling through here still resolves correctly for a
+        // pairing that predates this check (the id-as-is branch a few lines
+        // down re-resolves the very same session id, name unchecked); it only
+        // changes behaviour for a pairing that was actually wrong.
         if let Some(storage) = &self.giap_session_storage {
             if let Ok(Some(gid)) = storage.get_engine_session_id(giap_sid).await {
-                if self.session_manager.get_session(&gid, false).await.is_ok() {
-                    self.goose_session_map
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(giap_sid.to_string(), gid.clone());
-                    tracing::debug!("Restored persisted goose session pairing {giap_sid} -> {gid}");
-                    return gid;
+                match self.session_manager.get_session(&gid, false).await {
+                    Ok(session) if session.name == giap_sid => {
+                        self.goose_session_map
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(giap_sid.to_string(), gid.clone());
+                        tracing::debug!(
+                            "Restored persisted goose session pairing {giap_sid} -> {gid}"
+                        );
+                        return gid;
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            "Persisted goose session '{gid}' for '{giap_sid}' is named for a \
+                             different session — treating the pairing as stale and re-resolving"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::info!(
+                            "Persisted goose session '{gid}' for '{giap_sid}' is gone — re-creating"
+                        );
+                    }
                 }
-                tracing::info!(
-                    "Persisted goose session '{gid}' for '{giap_sid}' is gone — re-creating"
-                );
             }
         }
         // Try using the GIAP session_id as-is (e.g. if Goose already stored it).
@@ -578,8 +889,14 @@ impl GooseAdapter {
     /// the replay degrades the turn, it must never fail it.
     async fn hydrate_goose_session(&self, goose_sid: &str, giap_session_id: &str) {
         use pond_core::models::domain::message::Role as GiapRole;
-        use pond_core::models::services::context::context_budget::CompactionProfile;
         use pond_core::models::services::context::turn_trimmer::{plan_replay, TrimRole};
+
+        // PAI-4 P5. Reaching here at all means a FRESH engine session was just
+        // created for a conversation that already has history — the definition
+        // of a resume, and there is no cache to inherit. Recorded before the
+        // storage read so it holds even when the read finds nothing: the engine
+        // session is new either way.
+        self.note_prefix_invalidated(InvalidationReason::SessionResumed);
 
         let Some(storage) = &self.giap_session_storage else {
             return;
@@ -633,15 +950,16 @@ impl GooseAdapter {
             .ok()
             .and_then(|(s, _)| s);
 
-        let effective_ctx: usize = std::env::var("GOOSE_CONTEXT_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8192);
-        let profile = CompactionProfile::from_context_window(effective_ctx);
+        let profile = self.turn_profile(giap_session_id).await;
 
         // Trailing-user drop, blank filtering, budget cut and summary splice all
         // live in pond-core's `plan_replay` so they are unit-tested there.
-        let planned = plan_replay(rows, &profile, rolling_summary.as_deref());
+        let planned = plan_replay(
+            rows,
+            &profile,
+            rolling_summary.as_deref(),
+            self.token_counter().await,
+        );
         if planned.is_empty() {
             return;
         }
@@ -794,12 +1112,32 @@ impl GooseAdapter {
     /// or `context_window_override` did nothing until a model switch or a
     /// restart. They are settings-derived, not provider-derived, so they belong
     /// on the settings path.
-    fn apply_goose_env_knobs(&self, settings: &pond_core::user_data::domain::settings::Settings) {
-        let effective_ctx = Self::effective_context_window(
-            &settings.chat_provider,
-            &settings.chat_model,
-            settings.context_window_override,
-        );
+    /// Async since PAI-3 P3b: resolving the window now consults the model
+    /// catalog, which is a repository read. The one caller already awaits.
+    async fn apply_goose_env_knobs(
+        &self,
+        settings: &pond_core::user_data::domain::settings::Settings,
+    ) {
+        let resolution = self
+            .resolve_window(
+                &settings.chat_provider,
+                &settings.chat_model,
+                settings.context_window_override,
+            )
+            .await;
+        let effective_ctx = resolution.tokens;
+        // Stored BEFORE the signature guard below returns early: the budget
+        // paths read this field every turn, while the env knobs are only
+        // re-exported when something actually changed.
+        *self.last_window.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((settings.chat_provider.clone(), resolution));
+        // Same placement, same reason: stored BEFORE the signature guard below
+        // returns early, because the trimmer reads it every turn while the env
+        // knobs are only re-exported when something changed. PAI-4 P3.
+        *self
+            .last_verbatim_days
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(settings.compaction_verbatim_days);
         let knobs = goose_env_knobs(
             &settings.chat_provider,
             effective_ctx,
@@ -864,24 +1202,10 @@ impl GooseAdapter {
     /// heuristic and forces a compaction loop. The value flows into
     /// GOOSE_CONTEXT_LIMIT and thus into Ollama's `options.num_ctx`, so the
     /// reported limit, the request's num_ctx, and the KV cache all agree.
-    /// Context size used for PROMPT-side budgets (template tier, memory
-    /// injection) — as opposed to history budgets.
     ///
-    /// For local in-process inference every preamble token is re-prefilled on
-    /// every turn (no KV prompt-session cache yet) at roughly 0.5–1K tok/s,
-    /// so a large context window must buy HISTORY room, not a more verbose
-    /// preamble: an unclamped 32K profile on the Mac selected the full
-    /// template tier + a 1.5K-token memory budget and produced a 9.4K-token
-    /// prompt (~17s TTFT) for a one-line question. Clamping to the 8K-class
-    /// profile keeps the compact tier + bounded memories regardless of how
-    /// big the KV cache is. HTTP providers keep the raw window — their
-    /// preamble is not paid for in local prefill.
-    fn prompt_budget_ctx(provider: &str, effective_ctx: usize) -> usize {
-        match provider {
-            "local" | "gguf" => effective_ctx.min(8192),
-            _ => effective_ctx,
-        }
-    }
+    /// The PROMPT-side clamp that used to live here as `prompt_budget_ctx` now
+    /// lives in `pond-core` as [`ContextGovernor::prompt_window`], unchanged —
+    /// its rationale moved with it.
 
     /// The context size the engine will ACTUALLY allocate for a local model,
     /// when the registry pins one.
@@ -904,47 +1228,360 @@ impl GooseAdapter {
         entry.settings.context_size.map(|c| c as usize)
     }
 
-    fn effective_context_window(provider: &str, model: &str, override_tokens: u32) -> usize {
+    /// `ModelRecord.context_length` for a provider/model pair, when the catalog
+    /// has a row for it.
+    ///
+    /// This is rung 3 of the context governor and the reason this adapter
+    /// carries a `model_repo` at all. It matters most for Ollama, where there
+    /// is no registry pin to read and `OllamaCatalogProvider` has already
+    /// written the real window it got from `POST /api/show`'s `model_info` map.
+    /// Without this lookup that value sits in the database and the adapter
+    /// guesses from the model's name instead.
+    /// Takes the repo as an argument rather than reading `self.model_repo` so
+    /// the lookup — id derivation included — is testable against a stub.
+    async fn catalog_context_length(
+        repo: Option<&Arc<dyn ModelRepository>>,
+        provider: &str,
+        model: &str,
+    ) -> Option<u32> {
+        let repo = repo?;
+        let id = ModelRecord::id_for(&ModelCategory::for_chat_provider(provider), model);
+        match repo.get_by_id(&id).await {
+            Ok(Some(record)) => record.context_length,
+            Ok(None) => None,
+            Err(e) => {
+                // A catalog read failure must not fail a turn: the governor
+                // still has three rungs below this one.
+                tracing::warn!(model_id = %id, error = %e, "catalog context_length lookup failed");
+                None
+            }
+        }
+    }
+
+    /// Resolve the window for a provider/model pair, reading the process-global
+    /// model registry for the pinned size and the catalog for the declared one.
+    async fn resolve_window(
+        &self,
+        provider: &str,
+        model: &str,
+        override_tokens: u32,
+    ) -> WindowResolution {
         let pinned = match provider {
             "local" | "gguf" => Self::registry_context_size(model),
             _ => None,
         };
-        Self::resolve_context_window(provider, model, override_tokens, pinned)
+        Self::resolve_window_from(
+            self.model_repo.as_ref(),
+            provider,
+            model,
+            override_tokens,
+            pinned,
+        )
+        .await
     }
 
-    /// Precedence, extracted so it can be tested without the process-global
-    /// model registry: pinned local context > user override > per-provider
-    /// heuristic.
-    fn resolve_context_window(
+    /// Everything `resolve_window` does except the process-global registry read
+    /// — which is the one part a test cannot stand up. Split out so the WIRING
+    /// is covered and not just the precedence: this phase exists because every
+    /// caller of `resolve_window_with` passed a hardcoded `None` for the
+    /// catalog, and a test that also passes the value by hand would have gone
+    /// on passing for as long as that was true.
+    ///
+    /// The catalog read is skipped whenever a registry pin exists, because rung
+    /// 2 wins outright — no point paying for a row the governor will discard.
+    async fn resolve_window_from(
+        repo: Option<&Arc<dyn ModelRepository>>,
         provider: &str,
         model: &str,
         override_tokens: u32,
         pinned: Option<usize>,
-    ) -> usize {
-        // A pinned registry context_size outranks the user override here for
-        // the same reason it outranks it in the engine: it IS the allocation.
-        if let Some(ctx) = pinned {
-            return ctx;
+    ) -> WindowResolution {
+        let catalog = match pinned {
+            Some(_) => None,
+            None => Self::catalog_context_length(repo, provider, model).await,
+        };
+        Self::resolve_window_with(provider, model, override_tokens, pinned, catalog)
+    }
+
+    /// Precedence, extracted so it can be tested without the process-global
+    /// model registry.
+    ///
+    /// The precedence itself lives in `pond-core`'s [`ContextGovernor`] so that
+    /// the trimmer, telemetry and the monitor cannot drift from it — this is
+    /// only the adapter's half, which supplies the registry value the domain
+    /// cannot reach.
+    fn resolve_window_with(
+        provider: &str,
+        model: &str,
+        override_tokens: u32,
+        pinned: Option<usize>,
+        catalog: Option<u32>,
+    ) -> WindowResolution {
+        ContextGovernor::resolve(&ContextInputs {
+            provider,
+            model,
+            override_tokens,
+            registry_pinned: pinned,
+            catalog_context_length: catalog,
+            // Deliberately absent on this path: it is settings-scoped and
+            // process-wide, and one session's last turn is not evidence about
+            // it. Session-scoped callers pass their own reading.
+            engine_reported: None,
+            // The adapter's own capability cache is stale on turn one (see
+            // `thinking_section_applies`), so the name heuristic is the more
+            // reliable answer here. Callers holding a live capability value
+            // supply it themselves.
+            capability_window: None,
+        })
+    }
+
+    /// The token counter the budget paths use.
+    ///
+    /// Prefers the tiktoken-backed counter; falls back to the chars/4 heuristic
+    /// if it cannot be built. Neither is exact for a GGUF model — see
+    /// `crate::token_counter` for what exactness would cost — so the
+    /// overshoot-feedback correction in `turn_trimmer` stays load-bearing
+    /// either way.
+    async fn token_counter(&self) -> &dyn PondTokenCounter {
+        static HEURISTIC: HeuristicTokenCounter = HeuristicTokenCounter;
+        match self.token_counter_cell().await {
+            Some(c) => c.as_ref(),
+            None => &HEURISTIC,
         }
-        if override_tokens > 0 {
-            return override_tokens as usize;
+    }
+
+    /// The same counter, as an owned handle.
+    ///
+    /// The turn stream is an `async_stream` closure with a `'static` bound and
+    /// no `&self`, so it cannot borrow the OnceCell. Held behind an `Arc` rather
+    /// than constructed per turn because `TiktokenCounter` carries a blake3-keyed
+    /// LRU — building a second one would throw the cache away and load
+    /// `o200k_base` again.
+    async fn token_counter_handle(&self) -> Arc<dyn PondTokenCounter> {
+        match self.token_counter_cell().await {
+            Some(c) => c.clone(),
+            None => Arc::new(HeuristicTokenCounter),
         }
-        match provider {
-            "local" | "gguf" => {
-                // Generous ceiling for an UNPINNED local model — the actual
-                // allocation is then constrained by the engine's memory
-                // estimate at inference time, not by this value.
-                // macOS M4 (18GB): yields ~16-40K depending on model.
-                32768
+    }
+
+    /// Builds (once) and returns the tiktoken counter, or `None` if it could
+    /// not be built. Shared by both accessors so there is exactly one init.
+    async fn token_counter_cell(&self) -> &Option<Arc<crate::token_counter::TiktokenCounter>> {
+        self.token_counter
+            .get_or_init(|| async {
+                match crate::token_counter::TiktokenCounter::new().await {
+                    Ok(c) => Some(Arc::new(c)),
+                    Err(e) => {
+                        tracing::warn!("token counter unavailable, falling back to chars/4: {e}");
+                        None
+                    }
+                }
+            })
+            .await
+    }
+
+    /// The RAW resolved window, together with the provider it belongs to.
+    ///
+    /// Prefers the resolution cached by `apply_goose_env_knobs`, which runs on
+    /// the settings path before any turn reaches the trimmer. The settings load
+    /// is the cold path only — a session hydrated before the first turn has
+    /// configured a provider.
+    ///
+    /// The provider is not decoration: `ContextGovernor::prompt_window` needs it
+    /// to decide whether the preamble is re-prefilled locally, and that decision
+    /// is what makes the budget profile asymmetric. Callers wanting budgets want
+    /// [`GooseAdapter::turn_profile`], not this — history budgets get the whole
+    /// window on purpose and only the preamble is clamped, and conflating the
+    /// two silently grows the KV prefix on local providers.
+    async fn window_and_provider(&self) -> (String, WindowResolution) {
+        if let Some(cached) = self
+            .last_window
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return cached;
+        }
+        let settings = self.settings_repo.get().await.unwrap_or_default();
+        let resolution = self
+            .resolve_window(
+                &settings.chat_provider,
+                &settings.chat_model,
+                settings.context_window_override,
+            )
+            .await;
+        (settings.chat_provider, resolution)
+    }
+
+    /// PAI-4 P3's verbatim horizon for this turn, or `None` when age weighting
+    /// is off.
+    ///
+    /// Prefers the value cached by `apply_goose_env_knobs`, exactly as
+    /// `window_and_provider` does, so the per-turn trim costs no settings read.
+    /// The cold path is a session trimmed before the settings path has ever
+    /// run; falling back to `Settings::default()` there rather than to "off"
+    /// keeps a missing cache from silently disabling the feature.
+    /// The guard is released in its own scope BEFORE the settings await. A
+    /// `MutexGuard` held across an await makes the whole future non-`Send`, and
+    /// `AgentPort`'s boxed futures require `Send` — so the first version of this
+    /// compiled nowhere and failed only under
+    /// `cargo check -p pond-adapters-goose`, which the fast-crate lint pass does
+    /// not run. `window_and_provider` avoids the same trap by cloning out of the
+    /// lock and returning early.
+    async fn verbatim_horizon(&self) -> Option<std::time::Duration> {
+        let cached = *self
+            .last_verbatim_days
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let days = match cached {
+            Some(days) => days,
+            None => {
+                self.settings_repo
+                    .get()
+                    .await
+                    .unwrap_or_default()
+                    .compaction_verbatim_days
             }
-            _ => {
-                // HTTP providers — use model-reported context window.
-                let caps =
-                    pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
-                        model,
-                    );
-                caps.context_window_tokens as usize
+        };
+        pond_core::models::services::context::turn_trimmer::verbatim_horizon_from_days(days)
+    }
+
+    /// The budget profile for this turn: history from the full resolved window,
+    /// preamble from the prompt-side clamp.
+    ///
+    /// Every budget path in this adapter goes through here since PAI-3 P5. It
+    /// used to be the caller's job to remember `ContextGovernor::prompt_window`,
+    /// and only two of the four sites did — so `trim_goose_history` and
+    /// `hydrate_goose_session` budgeted history against a profile whose preamble
+    /// fields had scaled with the whole window, while the preamble they were
+    /// budgeting alongside had been built from the 8,192 clamp. One profile per
+    /// turn, carrying both windows, is what makes those two agree.
+    /// PAI-6 P4. Takes the session id because the reservation is per
+    /// CONVERSATION: a subagent is a second claim on the window of the
+    /// conversation that spawned it, and another session's turn is entitled to
+    /// its whole budget.
+    ///
+    /// Read here rather than at each consumer so there is exactly one place
+    /// that can forget. `turn_profile` is already the single producer of every
+    /// budget in this adapter (PAI-3 P5 made it so, after two of four call
+    /// sites forgot the prompt-side clamp), and a reservation applied at one of
+    /// three call sites would be the same defect again.
+    /// PAI-5 P5 is applied here, and this is the only place that reads what
+    /// reasoning has actually cost. `None` -- no storage wired, or a read that
+    /// failed -- means the anchor stands, which is the value the curve already
+    /// shipped, so the failure direction is "no change".
+    async fn turn_profile(&self, giap_session_id: &str) -> CompactionProfile {
+        let (provider, window) = self.window_and_provider().await;
+        let observed = self.observed_reasoning_samples().await;
+        Self::profile_for_session(
+            &crate::orchestrator::process_device_ledger(),
+            &provider,
+            window.tokens,
+            giap_session_id,
+            &observed,
+        )
+    }
+
+    /// Recent measured `reasoning_tokens`, for PAI-5 P5's reserve.
+    ///
+    /// Bounded by ROWS SCANNED rather than by samples returned, so a pond with
+    /// thinking switched off does not walk its whole history once per turn --
+    /// see the port docs. 400 rows is roughly a fortnight of ordinary use and
+    /// costs one indexed read against `idx_session_messages_created_at`, which
+    /// is noise beside a prefill measured in seconds.
+    ///
+    /// A failed read answers with no samples rather than propagating: a turn
+    /// must not fail because the pond could not work out how much room to leave
+    /// itself, and no samples means the anchor.
+    async fn observed_reasoning_samples(&self) -> Vec<u32> {
+        const SCAN_ROWS: usize = 400;
+        let Some(storage) = &self.giap_session_storage else {
+            return Vec::new();
+        };
+        match storage.recent_reasoning_samples(SCAN_ROWS).await {
+            Ok(samples) => samples,
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "could not read reasoning history; keeping the anchor output reserve"
+                );
+                Vec::new()
             }
+        }
+    }
+
+    /// The ledger read and the profile build, with no live adapter around them.
+    ///
+    /// Split out because the KEY is the part that can be wrong. Reading the
+    /// ledger under an id production never writes — a Goose session id where a
+    /// GIAP one belongs, which is a mix-up this codebase has already made once
+    /// (`resolve_goose_session`) — leaves every reservation reading 0.0 in
+    /// production, so a live child shrinks nothing and the parent's next turn
+    /// budgets as though it owned the whole window. That mutation was applied
+    /// to the line above and the whole suite stayed green: `turn_profile` needs
+    /// a settings repo and a provider, so nothing could run it, and the guard
+    /// that stood for it only grepped for `reserved_fraction(`.
+    ///
+    /// Taking the ledger as an argument rather than reaching for the
+    /// process-wide one is what makes it runnable — and the ledger stays
+    /// process-wide at the one call site, for the reason recorded on
+    /// [`process_device_ledger`](crate::orchestrator::process_device_ledger).
+    fn profile_for_session(
+        ledger: &crate::orchestrator::DeviceLedger,
+        provider: &str,
+        resolved_window: usize,
+        giap_session_id: &str,
+        observed_reasoning: &[u32],
+    ) -> CompactionProfile {
+        Self::profile_for(
+            provider,
+            resolved_window,
+            ledger.reserved_fraction(giap_session_id),
+            observed_reasoning,
+        )
+    }
+
+    /// The pure half of [`GooseAdapter::turn_profile`], split out so the pairing
+    /// is testable without a live adapter.
+    ///
+    /// Which window goes in which slot is the entire phase, and getting it
+    /// backwards compiles: passing the clamp as the context window would cap
+    /// history at the 8K budget on a 32K box, and passing the raw window as the
+    /// prompt window would grow the KV prefix — the thing invariant 1 forbids.
+    ///
+    /// `reserved_fraction` is PAI-6 P4's live-child claim, and it is applied
+    /// AFTER `for_windows` for the same reason: scaling `resolved_window` by it
+    /// instead would shrink the preamble allowances and move the prefix, which
+    /// costs a full re-prefill to save tokens on a working set the trimmer was
+    /// about to cut. `0.0` — the answer on every turn of a pond that never
+    /// delegates — returns exactly the profile this function returned before
+    /// P4 existed.
+    fn profile_for(
+        provider: &str,
+        resolved_window: usize,
+        reserved_fraction: f32,
+        observed_reasoning: &[u32],
+    ) -> CompactionProfile {
+        let profile = CompactionProfile::for_windows(
+            resolved_window,
+            ContextGovernor::prompt_window(provider, resolved_window),
+        )
+        .with_history_reserved(reserved_fraction);
+
+        // PAI-5 P5. Applied AFTER `for_windows` for the same reason
+        // `with_history_reserved` is: the anchor curve is the input, not the
+        // output. `observed_output_reserve` floors at whatever the curve chose,
+        // so a pond with too little evidence -- which is every pond on its first
+        // day, and every pond with thinking switched off, forever -- gets
+        // exactly the profile this function returned before P5 existed.
+        let reserve = pond_core::models::services::context::context_budget::observed_output_reserve(
+            observed_reasoning,
+            profile.output_reserve_tokens,
+            profile.context_window_tokens,
+        );
+        CompactionProfile {
+            output_reserve_tokens: reserve,
+            ..profile
         }
     }
 
@@ -1025,6 +1662,155 @@ impl GooseAdapter {
         }
     }
 
+    /// Whether THIS turn may emit `AgentStreamEvent::Thinking` frames at all.
+    ///
+    /// Gated at the PRODUCER rather than at the SSE seam, deliberately. Three
+    /// separate consumers read this event — `routes.rs` forwards it on
+    /// `/chat/stream` and again on `/agent/chat/stream`, and `pond-server`'s CLI
+    /// printer writes it dimmed to stderr — and exactly one of them has ever
+    /// consulted `show_thinking`. The CLI printer is also the terminal voice
+    /// loop, where PAI-5 invariant 2 says reasoning is unspeakable text. A gate
+    /// here is the only one all three inherit, and it is the contract
+    /// `AgentStreamEvent::Thinking`'s own doc comment already claims ("only
+    /// emitted when `show_thinking` is enabled").
+    ///
+    /// `voice` is the OR of the instance flag (CLI `--input whisper`) and the
+    /// per-request one (the desktop voice pipeline), unlike
+    /// `vision_section_applies` — this value never reaches `PromptState`, so it
+    /// cannot move the static prefix between turns, and the per-request flag is
+    /// the only thing that catches a voice turn on a text-started process.
+    ///
+    /// On failure the access narrows: a settings load that falls back to
+    /// `Settings::default()` gets `show_thinking: false` and emits nothing.
+    fn reasoning_frames_enabled(show_thinking: bool, voice: bool) -> bool {
+        show_thinking && !voice
+    }
+
+    /// Is this a voice turn? The OR of the instance flag and the request flag.
+    ///
+    /// Extracted from `chat_stream` because a review proved the composition was
+    /// the unguarded half of P1's gate. `reasoning_frames_enabled` had a test
+    /// for all four of ITS rows, and the source guard pinned the token
+    /// `is_voice` — but nothing pinned what `is_voice` MEANT, so dropping
+    /// `|| request.voice_mode` left all 108 tests green while reasoning leaked
+    /// to every desktop voice turn with `show_thinking` on.
+    ///
+    /// That mutation is not hypothetical on the shipped product. `main.rs`
+    /// constructs the serve-mode adapter with `voice_mode: false` hardcoded, so
+    /// `instance` is ALWAYS false in the desktop/server process and `request` is
+    /// the only signal that ever goes true — `voice_turn(false, true)` is the
+    /// entire defence for the surface most users are on. It is a truth table, so
+    /// it gets tested as one.
+    fn voice_turn(instance: bool, request: bool) -> bool {
+        instance || request
+    }
+
+    /// The reasoning text a single agent message contributes to the stream.
+    ///
+    /// The producers already exist and were being dropped one call short of the
+    /// seam. `goose-local-inference` reads llama.cpp's `reasoning_content` delta
+    /// and sends `Message::assistant().with_thinking(..)`; the shared OpenAI
+    /// format does the same for every HTTP provider that separates reasoning
+    /// (Ollama's qwen3 / deepseek-r1 among them). Both arrive here inside
+    /// `AgentEvent::Message`, and `as_concat_text()` filters on `as_text()`,
+    /// which returns `None` for `Thinking` — so the structured channel was
+    /// parsed upstream, thrown away here, and then re-derived downstream by
+    /// `ThoughtFilter` scraping tags out of prose.
+    ///
+    /// `RedactedThinking` is dropped on purpose: its payload is provider
+    /// ciphertext (`data`), meaningful only when replayed back to the same
+    /// provider. Rendering it would put opaque base64 in the user's thinking
+    /// panel, and it is a data-out surface with no readable content to justify
+    /// it.
+    ///
+    /// Nothing is persisted here — PAI-5 P6 owns that, and until it lands
+    /// reasoning stays out of `session_messages` and out of any replayed
+    /// context.
+    ///
+    /// **These are fragments, not frames.** The name is kept because the gate
+    /// living inside this function is the load-bearing P1 decision and must not
+    /// move to the call site, but what comes out is raw and may be a lone
+    /// space. It goes into [`ReasoningCoalescer`], which is the only thing that
+    /// produces an `AgentStreamEvent::Thinking`.
+    fn reasoning_frames(msg: &Message, emit: bool) -> Vec<String> {
+        if !emit {
+            return Vec::new();
+        }
+        Self::reasoning_blocks(msg)
+    }
+
+    /// The reasoning fragments a message carries, with no display gate.
+    ///
+    /// Split out of `reasoning_frames` so the *count* and the *display* read
+    /// the same content through one extraction, while only the display is gated
+    /// on `show_thinking`.
+    ///
+    /// Deliberately **not** trimmed and **not** filtered for blanks. It used to
+    /// be both, back when one message was assumed to be one whole block; on the
+    /// delta providers that assumption made every inter-word space disappear.
+    /// `ReasoningCoalescer::flush` does the trim, once, on the assembled
+    /// passage.
+    fn reasoning_blocks(msg: &Message) -> Vec<String> {
+        msg.content
+            .iter()
+            .filter_map(|c| c.as_thinking())
+            .map(|t| t.thinking.clone())
+            .collect()
+    }
+
+    /// Whether this message ends the reasoning passage in flight.
+    ///
+    /// Defined as "the message carries something **this adapter would yield**":
+    /// a tool request, a tool response, or non-empty answer text. That
+    /// definition is what makes coalescing correct for every provider family
+    /// rather than only the delta ones:
+    ///
+    /// - A whole-block provider (anthropic, or any non-streaming response) is
+    ///   followed by text or a tool call, so its block flushes on its own and
+    ///   is emitted verbatim, unmerged. Two of its blocks can only be adjacent
+    ///   across a tool round-trip, which itself flushes.
+    /// - A delta provider accumulates across the `Usage` and `HistoryReplaced`
+    ///   events that interleave its fragments — those are different
+    ///   `AgentEvent` variants and never reach the buffer — and lands as one
+    ///   passage.
+    ///
+    /// `Thinking` and `RedactedThinking` never end a block, and neither does a
+    /// message carrying only a `SystemNotification`: GIAP yields nothing for
+    /// one, so splitting there would be invisible to the user and would cut a
+    /// passage in half for no reason.
+    fn message_ends_reasoning(msg: &Message) -> bool {
+        use goose::conversation::message::MessageContent;
+        msg.content.iter().any(|c| {
+            matches!(
+                c,
+                MessageContent::ToolRequest(_) | MessageContent::ToolResponse(_)
+            )
+        }) || !msg.as_concat_text().is_empty()
+    }
+
+    /// PAI-5 P2. Tokens this message spent on reasoning.
+    ///
+    /// **Ungated on purpose.** The model decodes its reasoning whether or not
+    /// `show_thinking` is on, so a count that moved with a display setting would
+    /// report a different cost for the same turn depending on a checkbox — and
+    /// PAI-5 P5 derives an output reserve from exactly this number. The gate
+    /// belongs on the frame, which is a data-out surface; the count is a number
+    /// about a turn and carries none of the text.
+    ///
+    /// **GIAP-derived, and inexact.** No provider GIAP ships reports a reasoning
+    /// count: Goose's `Usage` has input/output/total/cache_read/cache_write and
+    /// nothing else, and the providers that separate reasoning do it in a
+    /// content channel. So this counts the text we received, through the
+    /// `TokenCounter` port, whose every implementation says `is_exact() ==
+    /// false`. It is not subtracted from the provider's completion count — see
+    /// `UsageStats::reasoning_tokens`.
+    fn count_reasoning_tokens(msg: &Message, counter: &dyn PondTokenCounter) -> u32 {
+        Self::reasoning_blocks(msg)
+            .iter()
+            .map(|t| counter.count(t) as u32)
+            .sum()
+    }
+
     /// Append the `<vision>` section to a prompt template when the model can see.
     ///
     /// Appended to the TEMPLATE, before Tera runs, rather than to the rendered
@@ -1084,13 +1870,17 @@ impl GooseAdapter {
         enable_thinking: bool,
     ) -> Result<()> {
         let key = format!("{}:{}", settings.chat_provider, settings.chat_model);
-        let key_unchanged = {
+        // Kept as well as compared: PAI-4 P5 needs to know whether the MODEL
+        // changed or only the provider, and by the time the swap block runs
+        // `last_provider_key` has already been overwritten with the new one.
+        let previous_key = {
             let last = self
                 .last_provider_key
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            *last == key
+            last.clone()
         };
+        let key_unchanged = previous_key == key;
         let thinking_unchanged = {
             let last = self
                 .last_thinking_param
@@ -1139,6 +1929,13 @@ impl GooseAdapter {
                     configured.clear();
                     configured.insert(session_id.to_string());
                 }
+                // PAI-4 P5. Same model, reconfigured provider — the comment
+                // above already knew "the KV prefix is being rebuilt this turn
+                // regardless"; this is that fact written where the compaction
+                // path can read it. `ProviderRebuilt` rather than
+                // `ModelSwapped` because the model did not change, and a trace
+                // that cannot tell those apart is worth less than one that can.
+                self.note_prefix_invalidated(InvalidationReason::ProviderRebuilt);
                 tracing::info!(
                     enable_thinking,
                     "Re-stamped engine thinking flag on the current provider"
@@ -1413,6 +2210,17 @@ impl GooseAdapter {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = 0;
 
+            // PAI-4 P5. Two of the six reasons meet here and the difference is
+            // real: `key` is "provider:model", so reaching this block means one
+            // of the two changed. A different model is `ModelSwapped`; the same
+            // model behind a different provider (an Ollama model moved onto the
+            // in-process engine, say) is `ProviderRebuilt`. Both cost the same
+            // prefill; only one of them explains a change in the answers.
+            self.note_prefix_invalidated(Self::provider_change_reason(
+                &previous_key,
+                &settings.chat_model,
+            ));
+
             tracing::debug!("[model-switch] swap complete, key={}", key);
         } else {
             tracing::debug!(
@@ -1445,9 +2253,8 @@ impl GooseAdapter {
     /// Runs only when `hybrid_compaction_enabled` (the default), which is also
     /// what gates the image cap.
     async fn trim_goose_history(&self, goose_sid: &str, giap_session_id: &str) {
-        use pond_core::models::services::context::context_budget::CompactionProfile;
         use pond_core::models::services::context::turn_trimmer::{
-            trim_history, TrimMessage, TrimRole,
+            trim_history, CurrentTurn, TrimMessage, TrimRole,
         };
 
         let conversation = match self.session_manager.get_session(goose_sid, true).await {
@@ -1475,17 +2282,22 @@ impl GooseAdapter {
             None => None,
         };
 
-        let effective_ctx: usize = std::env::var("GOOSE_CONTEXT_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8192);
-        let profile = CompactionProfile::from_context_window(effective_ctx);
+        let profile = self.turn_profile(giap_session_id).await;
         let last_real = self
             .last_prompt_tokens_handle()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(giap_session_id)
             .copied();
+
+        // Wall-clock now, in unix seconds, for PAI-4 P3's age weighting.
+        // `Message::created` is the same epoch. A clock that cannot be read at
+        // all yields `None` ages, which the trimmer treats as recent — the
+        // narrowing direction, and never a failed turn.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
 
         let trim_input: Vec<TrimMessage> = source
             .iter()
@@ -1507,16 +2319,46 @@ impl GooseAdapter {
                     }
                 };
                 let is_summary = text.trim_start().starts_with("<conversation-summary>");
+                // `saturating_sub` is the clock-skew rule, and it matches the
+                // one `resume_compaction::idle_gap_since` already uses: a
+                // message stamped in the future reads as age 0 (recent), never
+                // as an enormous positive age that would degrade it.
+                let age_secs = now_secs.map(|now| now.saturating_sub(m.created.max(0) as u64));
                 TrimMessage {
                     index,
                     role,
                     text,
                     is_summary,
+                    age_secs,
                 }
             })
             .collect();
 
-        let outcome = trim_history(trim_input, &profile, rolling_summary.as_deref(), last_real);
+        // `CurrentTurn::NotYetAppended` is the same fact the image cap below
+        // already relies on: this runs before `Agent::reply`, so the newest user
+        // message in the conversation is the PREVIOUS turn's, not this one's.
+        // The trimmer used to assume the opposite and spare it, which left that
+        // turn's `<system-context>` — its date, its selected memories, its
+        // turn-budget note — to be re-prefilled as though it were current, and
+        // put two conflicting blocks in front of the model. It also meant
+        // `outcome.changed` was true on every turn from the third onwards, so
+        // the early return below never fired and every turn rewrote goose's
+        // whole message table.
+        let outcome = trim_history(
+            trim_input,
+            &profile,
+            rolling_summary.as_deref(),
+            last_real,
+            self.token_counter().await,
+            CurrentTurn::NotYetAppended,
+            self.verbatim_horizon().await,
+            // PAI-4 P5. Read through the port method rather than the field, so
+            // whatever a future caller (P7's compact endpoint) sees is exactly
+            // what the trimmer acted on — one reading, not two.
+            PrefixCacheState::posture_of(
+                pond_core::models::ports::agent::Agent::prefix_cache_state(self).as_ref(),
+            ),
+        );
 
         // ── Live-history image cap (phase F2, live half) ──────────────────
         //
@@ -1598,6 +2440,33 @@ impl GooseAdapter {
             }
         }
 
+        // Second guard, behind `outcome.changed`.
+        //
+        // `replace_conversation` is not an update — it is `BEGIN IMMEDIATE;
+        // DELETE FROM messages WHERE session_id = ?` plus one INSERT per
+        // surviving message, each with a fresh `serde_json::to_string` of its
+        // content. Turn N therefore rewrites roughly 2(N-1) rows, and an
+        // image-bearing message carries its base64 inline, so a long
+        // conversation rewrites hundreds of KB per turn onto the Jetson's eMMC —
+        // into a database the REST API never reads.
+        //
+        // `outcome.changed` is the real fix and is now honest (see the
+        // `CurrentTurn` argument above). This hash catches the rest: any path
+        // that sets `changed` or drops an image but produces a conversation
+        // identical to the one already stored.
+        let rebuilt_fingerprint = conversation_fingerprint(&rebuilt);
+        let previous_fingerprint = conversation_fingerprint(&source);
+        if rebuilt_fingerprint == previous_fingerprint {
+            tracing::debug!(
+                target: "giap::trace",
+                kind = "history_trim_skipped",
+                session_id = %giap_session_id,
+                messages = rebuilt.len(),
+                "trim produced an identical conversation; not rewriting the engine store"
+            );
+            return;
+        }
+
         let rebuilt_conversation = goose::conversation::Conversation::new_unvalidated(rebuilt);
         match self
             .session_manager
@@ -1633,14 +2502,22 @@ impl GooseAdapter {
     async fn topical_memories(
         &self,
         message: &str,
+        scope: &ProfileScope,
         limit: usize,
     ) -> Vec<(MemoryFragment, Option<f32>)> {
+        // Short-circuit before embedding. A Guest turn can match nothing, and
+        // embedding the message anyway would spend CPU on a query whose only
+        // possible answer is "no rows" -- and would hand the raw utterance to
+        // the embedding provider for no reason.
+        if scope.excludes_everything() {
+            return Vec::new();
+        }
         if let Some(provider) = &self.embedding_provider {
             match provider.embed(message).await {
                 Ok(query_vector) => {
                     match self
                         .memory_repo
-                        .search_similar(&query_vector, None, limit)
+                        .search_similar(&query_vector, scope, limit)
                         .await
                     {
                         Ok(hits) => {
@@ -1671,7 +2548,7 @@ impl GooseAdapter {
         }
         match self
             .memory_repo
-            .search_by_content(&keywords, None, limit)
+            .search_by_content(&keywords, scope, limit)
             .await
         {
             Ok(hits) => hits.into_iter().map(|m| (m, None)).collect(),
@@ -1727,6 +2604,7 @@ impl GooseAdapter {
         giap_session_id: &str,
         first_message: &str,
         memories: &str,
+        scope: &ProfileScope,
     ) -> Vec<String> {
         use pond_core::mcp::services::tool_selection as sel;
 
@@ -1802,11 +2680,34 @@ impl GooseAdapter {
             _ => None,
         };
 
-        let selection = sel::select_groups(
+        let mut selection = sel::select_groups(
             &available,
             scores.as_deref(),
             sel::DEFAULT_RELEVANCE_THRESHOLD,
         );
+
+        // PAI-1 P5. An unidentified speaker never gets the personal-data
+        // groups, whatever the scorer decided. Subtracted AFTER selection on
+        // purpose: `giap-memory` and `giap-draft` are core, so filtering the
+        // candidates going in would not stick -- `select_groups` puts core
+        // groups back unconditionally.
+        //
+        // This is the layer that actually closes the hole. Suppressing memory
+        // injection stops a guest being TOLD anything; removing the tools stops
+        // the model being ABLE to look. `recall_memories` and `forget_memory`
+        // carry no session of their own, so there is nowhere lower to check.
+        if scope.excludes_everything() {
+            let denied = pond_core::mcp::domain::tool_group::groups_denied_to_guests();
+            let before = selection.groups.len();
+            selection.groups.retain(|g| !denied.contains(&g.as_str()));
+            if selection.groups.len() != before {
+                tracing::info!(
+                    session_id = %giap_session_id,
+                    removed = before - selection.groups.len(),
+                    "unidentified speaker: personal-data tool groups withheld"
+                );
+            }
+        }
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             if let Some(scores) = scores.as_deref() {
@@ -1852,6 +2753,18 @@ impl GooseAdapter {
         self
     }
 
+    /// Attach the model catalog, so the context governor's rung 3
+    /// (`ModelRecord.context_length`) becomes reachable from this adapter.
+    ///
+    /// A builder rather than a `new()` argument for the same reason as the
+    /// embedding provider: without it every budget path still works, just on a
+    /// worse answer — the model-name heuristic, which returns 4,096 for
+    /// anything it does not recognise.
+    pub fn with_model_repo(mut self, repo: Arc<dyn ModelRepository>) -> Self {
+        self.model_repo = Some(repo);
+        self
+    }
+
     /// Attach GIAP session storage so the deterministic turn trimmer can
     /// splice the rolling `<conversation-summary>` into the model's history.
     pub fn with_giap_session_storage(
@@ -1878,7 +2791,7 @@ impl GooseAdapter {
     /// key. Idempotent: skips registration if the model is already known.
     fn register_gguf_model(model_name: &str, data_dir: &std::path::Path) -> String {
         use goose::providers::local_inference::local_model_registry::{
-            get_registry, LocalModelEntry, LocalModelStorage, ModelSettings, ToolCallingMode,
+            get_registry, LocalModelEntry, LocalModelStorage, ToolCallingMode,
         };
 
         let gguf_dir = data_dir.join("models").join("gguf");
@@ -2020,9 +2933,11 @@ impl GooseAdapter {
 
         // Settings-derived Goose knobs, re-applied every turn (cheaply — see
         // apply_goose_env_knobs) so toggling hybrid compaction or the context
-        // override takes effect immediately. Must run BEFORE anything that reads
-        // GOOSE_CONTEXT_LIMIT: session hydration and ModelConfig construction do.
-        self.apply_goose_env_knobs(&settings);
+        // override takes effect immediately. Must still run BEFORE session
+        // hydration and ModelConfig construction: it exports GOOSE_CONTEXT_LIMIT
+        // for Goose's own use, and it populates `last_window`, which is where
+        // the GIAP-side budget paths now get the window from.
+        self.apply_goose_env_knobs(&settings).await;
 
         // Goose maintains its own sessions.db with auto-generated IDs.
         let goose_sid = self.resolve_goose_session(&session_id).await;
@@ -2037,17 +2952,7 @@ impl GooseAdapter {
             if needs_load {
                 let extensions = registered_extensions();
                 let total = extensions.len();
-                let mut loaded = 0usize;
-                for ext_name in extensions {
-                    match self.add_builtin_extension(ext_name, &goose_sid).await {
-                        Ok(()) => {
-                            loaded += 1;
-                            tracing::debug!("giap extension loaded: {ext_name}");
-                        }
-                        // A failed extension is a real problem — surface it.
-                        Err(e) => tracing::warn!("giap extension failed to load: {ext_name}: {e}"),
-                    }
-                }
+                let loaded = self.add_builtin_extensions(extensions, &goose_sid).await;
                 self.loaded_sessions
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -2083,7 +2988,13 @@ impl GooseAdapter {
         // truncates in Rust — so a bigger limit is the same query and the same
         // arithmetic. Nothing downstream changes: the injection cap and the
         // token budget still decide what actually reaches the prompt.
-        let memory_limit = if settings.agent_memory_inject {
+        // PAI-1 P5: an unidentified speaker gets no memory injection at all.
+        // Gating here rather than at the queries means the whole fetch, rank
+        // and render pipeline is skipped, and it costs nothing in KV prefix --
+        // memories ride the user message's <system-context>, never the system
+        // prefix (see the comment at the block assembly below).
+        let turn_scope = request.profile_scope.clone();
+        let memory_limit = if settings.agent_memory_inject && turn_scope.allows_personal_data() {
             Some(settings.agent_memory_limit as usize)
         } else {
             None
@@ -2106,7 +3017,7 @@ impl GooseAdapter {
             // Recent memories (recency-based)
             async {
                 match candidate_limit {
-                    Some(limit) => self.memory_repo.search_recent(None, limit).await,
+                    Some(limit) => self.memory_repo.search_recent(&turn_scope, limit).await,
                     None => Ok(vec![]),
                 }
             },
@@ -2115,7 +3026,10 @@ impl GooseAdapter {
             // and it happens inside this join! so it overlaps the other fetches.
             async {
                 match candidate_limit {
-                    Some(limit) => self.topical_memories(&request.message, limit).await,
+                    Some(limit) => {
+                        self.topical_memories(&request.message, &turn_scope, limit)
+                            .await
+                    }
                     None => vec![],
                 }
             },
@@ -2150,7 +3064,7 @@ impl GooseAdapter {
         // instance-level flag (CLI --input whisper) and the per-request flag
         // (desktop voice pipeline sends voice_mode: true).
         let voice_instance = self.voice_mode.load(std::sync::atomic::Ordering::Relaxed);
-        let is_voice = voice_instance || request.voice_mode;
+        let is_voice = Self::voice_turn(voice_instance, request.voice_mode);
 
         // Resolve thinking mode from settings + capabilities.
         // Voice mode always disables thinking — reasoning tokens waste TTS time
@@ -2164,6 +3078,23 @@ impl GooseAdapter {
         let thinking_enabled =
             Self::thinking_section_applies(&settings.thinking_mode, &settings.chat_model, is_voice);
 
+        // The turn's budget profile, built once from the resolution
+        // `apply_goose_env_knobs` cached at the top of this function.
+        //
+        // Both consumers below (the prompt tier and the memory-injection
+        // budget) used to re-resolve it independently through the static
+        // `effective_context_window`. That was already duplication; once rung 3
+        // became a repository read it would also have been two extra catalog
+        // round trips per turn, and the block below is synchronous so it could
+        // not have awaited them anyway.
+        //
+        // Since PAI-3 P5 it is one profile rather than two: `turn_profile`
+        // carries the full window for history and the clamped prompt window for
+        // the preamble, so the two can no longer be built from different numbers
+        // by accident.
+        let turn_profile = self.turn_profile(&session_id).await;
+        let effective_ctx = turn_profile.context_window_tokens;
+
         let prompt_state = {
             use chrono::Local;
             let now = Local::now();
@@ -2176,24 +3107,26 @@ impl GooseAdapter {
                 .map(|d| d.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            // Derive compact_prompt from the PROMPT-side context budget: for
-            // local inference the profile is clamped so a huge KV cache never
-            // selects the verbose tier (see prompt_budget_ctx).
-            let effective_ctx = Self::effective_context_window(
-                &settings.chat_provider,
-                &settings.chat_model,
-                settings.context_window_override,
-            );
-            let compact_prompt =
-                pond_core::models::services::context_budget::CompactionProfile::from_context_window(
-                    Self::prompt_budget_ctx(&settings.chat_provider, effective_ctx),
-                )
-                .use_compact_prompt();
+            // The prompt tier follows the PROMPT-side window, which for local
+            // inference is clamped so a huge KV cache never selects the verbose
+            // tier (see `CompactionProfile::for_windows`). The profile itself
+            // now knows that; this is no longer a second construction that has
+            // to remember the clamp.
+            let compact_prompt = turn_profile.use_compact_prompt();
 
-            // Tool description lines: dynamic from registry, static fallback.
+            // Prose tool lines, from the registry or not at all.
+            //
+            // There is no static fallback any more. It was a hardcoded list of
+            // 13 names of which nine matched no tool the dispatcher would answer
+            // to, and because `InMemoryToolRegistry::new()` seeded itself from
+            // the same list, the registry branch served it too — so the fallback
+            // being "only for the None case" was never the protection it looked
+            // like. Builtins reach the model as native tool schemas generated
+            // from the real handlers; what the registry adds is external MCP
+            // extension tools, which those schemas do not describe in prose.
             let available_tools: Vec<String> = match &self.tool_registry {
                 Some(registry) => registry.prompt_description_lines(compact_prompt).await,
-                None => pond_core::prompts::giap_tool_description_lines().to_vec(),
+                None => Vec::new(),
             };
 
             PromptState {
@@ -2255,9 +3188,18 @@ impl GooseAdapter {
         // turn (legacy behavior, useful for debugging or HTTP-only providers
         // where KV-cache reuse doesn't apply).
         if settings.prefix_cache_prompt {
+            // PAI-1 P6. Resolved at the API edge and carried on the request:
+            // the adapter has no ProfileRepository, and giving it one would put
+            // "whose preferences are these" behind the same boundary the
+            // identity resolution deliberately sits in front of.
+            //
+            // KV-prefix safe: build_prompt_partition puts profile lines in the
+            // dynamic suffix, which rides <system-context> in the USER message,
+            // never the static prefix. So a speaker switch mid-session costs no
+            // re-prefill.
             let partition = build_prompt_partition(
                 &settings,
-                None, // ProfileContext — TODO: wire when profile port is available
+                request.profile_context.as_ref(),
                 &prompt_state,
                 &template_content,
             );
@@ -2285,16 +3227,29 @@ impl GooseAdapter {
                 self.agent
                     .override_system_prompt(partition.static_prefix)
                     .await;
-                let mut last_hash = self
-                    .last_prefix_hash
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                *last_hash = partition.prefix_hash;
+                {
+                    let mut last_hash = self
+                        .last_prefix_hash
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    *last_hash = partition.prefix_hash;
+                }
+                // PAI-4 P5. The prefix moved, so this turn pays a full
+                // re-prefill whatever else happens. Note that
+                // `note_prefix_rebuilt` does NOT clear the reason: the new
+                // prefix has served nothing yet, and the trimmer — which runs
+                // later in this same turn — must read Cold, not Warm.
+                self.note_prefix_invalidated(InvalidationReason::PromptChanged);
+                self.note_prefix_rebuilt(partition.prefix_hash);
             } else {
                 tracing::debug!(
                     hash = %partition.prefix_hash,
                     "Static prefix unchanged — skipping override_system_prompt (KV-cache reuse)"
                 );
+                // PAI-4 P5. The one place a prefix earns its warm standing:
+                // the engine is about to serve a turn off a cache it already
+                // holds. Everything else in this file can only take that away.
+                self.note_prefix_served();
             }
 
             // Dynamic suffix (date/time, profile) goes into <system-context> in the
@@ -2310,11 +3265,28 @@ impl GooseAdapter {
             );
             self.shim_controls.set_system_prefix(system_prompt.clone());
             self.agent.override_system_prompt(system_prompt).await;
+            // PAI-4 P5. The legacy path rebuilds the whole system prompt every
+            // turn, so on it the prefix is cold every turn — unconditionally,
+            // with no hash to compare. Saying so is what keeps the trimmer's
+            // posture honest here rather than silently warm.
+            self.note_prefix_invalidated(InvalidationReason::PromptChanged);
         }
 
         // GIAP-owned system-prompt appendix, re-attached by the provider shim
-        // after it vetoes Goose's own appendages. Everything GIAP delivers via
-        // goose extras below is mirrored here so the veto never loses it.
+        // after it vetoes Goose's own appendages.
+        //
+        // This is the ONLY delivery path. Each body used to be pushed here AND
+        // handed to `Agent::extend_system_prompt`, which meant Goose built its
+        // own `# Additional Instructions:` block that `enforce_system` then threw
+        // away — two String allocations and a `prompt_manager` mutex per extra
+        // per turn, plus a Goose-side prompt build that `sanitize_unicode_tags`
+        // -scans every extra ever registered in the process, all discarded.
+        //
+        // The map was the worse half: `remove_system_prompt_extra` has no callers
+        // anywhere, so a skill the user deactivated stayed in Goose's `IndexMap`
+        // for the lifetime of the process, held out of the model only by the
+        // prefix match in `enforce_system`. Never adding it is what actually
+        // fixes that.
         let mut shim_appendix: Vec<String> = Vec::new();
 
         // Extras and skills are appended AFTER the partitioned prompt and sit
@@ -2328,8 +3300,7 @@ impl GooseAdapter {
                     "<extension-notes name=\"{}\">\n{}\n</extension-notes>",
                     extra.key, extra.instruction
                 );
-                shim_appendix.push(body.clone());
-                self.agent.extend_system_prompt(extra.key, body).await;
+                shim_appendix.push(body);
             }
         }
 
@@ -2340,8 +3311,7 @@ impl GooseAdapter {
                     "<extension-notes name=\"{}\">\n{}\n</extension-notes>",
                     key, skill.content
                 );
-                shim_appendix.push(body.clone());
-                self.agent.extend_system_prompt(key, body).await;
+                shim_appendix.push(body);
             }
         }
 
@@ -2358,20 +3328,12 @@ impl GooseAdapter {
         // prompt) to keep the prefix token-stable for KV cache reuse.
         let mut memory_block_for_user_msg = String::new();
         //
-        // Derive a CompactionProfile for MEMORY INJECTION from the
-        // prompt-side context budget: local inference re-prefills every
-        // injected memory token each turn, so the budget stays bounded even
-        // on a 32K context (see prompt_budget_ctx). History budgets elsewhere
-        // keep the real window.
-        let effective_ctx = Self::effective_context_window(
-            &settings.chat_provider,
-            &settings.chat_model,
-            settings.context_window_override,
-        );
-        let compaction_profile =
-            pond_core::models::services::context_budget::CompactionProfile::from_context_window(
-                Self::prompt_budget_ctx(&settings.chat_provider, effective_ctx),
-            );
+        // The memory budget is a PREAMBLE budget: local inference re-prefills
+        // every injected memory token each turn, so it stays bounded even on a
+        // 32K context. `turn_profile`'s preamble fields come from the clamped
+        // prompt window for exactly that reason, while its history budget keeps
+        // the real one (see `CompactionProfile::for_windows`).
+        let compaction_profile = &turn_profile;
 
         if !memory_candidates.is_empty() {
             // Blended relevance (similarity + importance + recency decay) so a
@@ -2463,21 +3425,31 @@ impl GooseAdapter {
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(&goose_sid);
             if !already_stripped {
-                let strip_list: &[&str] = &[
-                    "developer",
-                    "computercontroller",
-                    "extensionmanager",
-                    "todo",
-                    "apps",
-                    "analyze",
-                    "summon",
-                    "summarize",
-                    "orchestrator",
-                    "tom",
-                ];
+                // PAI-6 P2: one copy of these ten names, in
+                // `orchestrator.rs :: GOOSE_STRIPPED_BUILTINS`. This block is
+                // the guard; the `is_builtin` closure below is a prompt filter;
+                // the orchestrator's plan builder refuses on the same list. All
+                // three used to be able to drift, and only one of them enforced
+                // anything, so a canary pinning one proved nothing about the
+                // others.
+                let strip_list: &[&str] = &crate::orchestrator::GOOSE_STRIPPED_BUILTINS;
+                // Only remove what is actually loaded. `remove_extension` drops
+                // the extension agent-globally and then calls
+                // `persist_extension_state`, which is a `get_session` read plus
+                // a `sessions` UPDATE — so a name that was never added still
+                // cost two round trips to not-remove. GIAP registers its own
+                // builtins and none of these ten, so in the normal case this
+                // whole block now issues no writes at all.
+                let present: std::collections::HashSet<String> = self
+                    .agent
+                    .list_extensions()
+                    .await
+                    .into_iter()
+                    .map(|e| e.to_string())
+                    .collect();
                 let user_exts = self.user_extensions.read().await;
                 for ext in strip_list {
-                    if !user_exts.contains(*ext) {
+                    if !user_exts.contains(*ext) && present.contains(*ext) {
                         self.agent.remove_extension(ext, &goose_sid).await.ok();
                     }
                 }
@@ -2527,23 +3499,14 @@ impl GooseAdapter {
 
                 // Filter out built-in GIAP extensions (already covered by the
                 // available_tools section in the prompt) and Goose defaults.
+                // `default` and `suggestions` are Goose plumbing that carries no
+                // tools — they are filtered out of the prompt but never
+                // stripped, which is why they are named here and not in
+                // `GOOSE_STRIPPED_BUILTINS`.
                 let is_builtin = |name: &str| {
                     registered_extensions().iter().any(|e| e == name)
-                        || matches!(
-                            name,
-                            "default"
-                                | "developer"
-                                | "computercontroller"
-                                | "extensionmanager"
-                                | "todo"
-                                | "apps"
-                                | "analyze"
-                                | "summon"
-                                | "summarize"
-                                | "orchestrator"
-                                | "tom"
-                                | "suggestions"
-                        )
+                        || crate::orchestrator::GOOSE_STRIPPED_BUILTINS.contains(&name)
+                        || matches!(name, "default" | "suggestions")
                 };
 
                 let external_extensions: Vec<(String, Vec<(String, String)>)> = ext_map
@@ -2574,11 +3537,11 @@ impl GooseAdapter {
                         external_extensions.len(),
                     );
 
+                    // Mirrored to the shim only, for the same reason the
+                    // per-turn extras are: Goose's copy is rebuilt into an
+                    // appendix the veto discards.
                     self.shim_controls
-                        .set_extension_appendix(Some(ext_description.clone()));
-                    self.agent
-                        .extend_system_prompt("extensions".to_string(), ext_description)
-                        .await;
+                        .set_extension_appendix(Some(ext_description));
                 } else {
                     self.shim_controls.set_extension_appendix(None);
                 }
@@ -2608,6 +3571,7 @@ impl GooseAdapter {
                     &session_id,
                     &request.message,
                     &memory_block_for_user_msg,
+                    &turn_scope,
                 )
                 .await;
             let selected: HashSet<String> =
@@ -2644,6 +3608,43 @@ impl GooseAdapter {
                 tools = allowed_tools.len(),
                 tools_total = allowed_tools.len(),
             );
+            allowed_tools
+        };
+
+        // ── 6d. PAI-1 P5, enforced in BOTH selection modes ───────────────────
+        //
+        // The group-level subtraction lives inside `resolve_session_tool_groups`,
+        // which is only reached from the `tool_selection_is_relevant()` branch
+        // above. `default_tool_selection_mode()` is "all", so on a DEFAULT
+        // install that branch never runs and this set went to the model
+        // untouched -- a Guest kept `giap-memory` and could recall, search or
+        // `forget_memory` the entire household. P5 was recorded as landed while
+        // being inert on every default pond.
+        //
+        // This set is what gets published to the shim, so it is the only place
+        // every mode converges. Subtracting here is idempotent with the
+        // group-level pass, which stays because it also keeps withheld groups
+        // out of the dormant-groups note.
+        let allowed_tools = if turn_scope.excludes_everything() {
+            let before = allowed_tools.len();
+            let kept: HashSet<String> =
+                pond_core::mcp::services::tool_selection::subtract_guest_denied_tools(
+                    allowed_tools.iter(),
+                )
+                .into_iter()
+                .collect();
+            if kept.len() != before {
+                tracing::info!(
+                    target: "giap::trace",
+                    kind = "guest_tools_withheld",
+                    session_id = %session_id,
+                    removed = before - kept.len(),
+                    kept = kept.len(),
+                    "unidentified speaker: personal-data tools withheld from the turn"
+                );
+            }
+            kept
+        } else {
             allowed_tools
         };
 
@@ -2722,6 +3723,13 @@ impl GooseAdapter {
         // between attempts or a deterministic model repeats itself.
         let turn_text = user_text.clone();
         let turn_images = request.images.clone();
+        // PAI-4 P5. A turn carrying an image forfeits KV retention outright —
+        // the reason MAX_HISTORY_REPLAY_IMAGES is 1. Recorded here, before the
+        // trim below, so the trimmer sees this turn's posture and not the
+        // previous turn's.
+        if !turn_images.is_empty() {
+            self.note_prefix_invalidated(InvalidationReason::MultimodalTurn);
+        }
         let turn_goose_sid = goose_sid.clone();
 
         let agent_clone = self.agent.clone();
@@ -2737,6 +3745,19 @@ impl GooseAdapter {
         let user_msg_len = request.message.len();
         let turn_start = std::time::Instant::now();
 
+        // Whether this turn may surface the model's reasoning at all. Resolved
+        // here, from the settings already in hand, so the 'static stream closure
+        // below carries a decision rather than a repository handle. Does not
+        // touch `PromptState` and so cannot move the KV prefix.
+        let emit_reasoning = Self::reasoning_frames_enabled(settings.show_thinking, is_voice);
+
+        // PAI-5 P2. An owned counter for the 'static stream closure, resolved
+        // here rather than inside it. Deliberately AFTER the trim above, which
+        // already builds this counter on the default configuration, so the
+        // common case pays nothing new. Nothing here reaches `PromptState`, so
+        // the KV prefix cannot move.
+        let reasoning_counter = self.token_counter_handle().await;
+
         // Cancellation token: when the stream is dropped (e.g. voice interrupt),
         // the DropGuard fires and cancels the token.  Goose's agent loop checks
         // `is_token_cancelled()` at each turn boundary and exits early, so
@@ -2745,14 +3766,100 @@ impl GooseAdapter {
         let cancel_token = CancellationToken::new();
         let cancel_guard = cancel_token.clone().drop_guard();
 
+        // ── PAI-6 P3: this turn's delegation authority ────────────────────────
+        //
+        // The ceiling on anything this turn delegates to. Deliberately built
+        // HERE and from these two values:
+        //
+        // - `turn_scope` is `request.profile_scope`, which `resolve_turn_scope`
+        //   decided at the API edge from the session's stored identity. Nothing
+        //   a model emits reaches it, and `AgentRequest` is never deserialized
+        //   from an HTTP body, so it is not forgeable by a caller either.
+        // - `allowed_tools` is the SAME binding published to the shim two steps
+        //   up: post-selection and post-guest-subtraction. Passing the catalog,
+        //   or the set before section 6d, would make every intersection
+        //   downstream a no-op — the exact shape PAI-1 P5 shipped and had to
+        //   repair. `authority_is_built_from_the_published_allow_set` fails if
+        //   this call is ever moved above that subtraction.
+        //
+        // The lease is moved into the stream closure beside `cancel_guard`, so
+        // the authority dies with the turn: a delegation can only ever be
+        // authorised while the turn that authorised it is still running.
+        let authority_lease = self.turn_authorities.publish(
+            &goose_sid,
+            pond_core::shared::domain::orchestration::DelegationAuthority::for_turn(
+                session_id.clone(),
+                turn_scope.clone(),
+                allowed_tools.iter().map(String::as_str),
+            ),
+            cancel_token.clone(),
+        );
+
+        // The provider this turn will actually reply through, for PAI-6 P4's
+        // device claim below. Taken from the same settings load the rest of the
+        // turn used, so it cannot disagree with what `turn_profile` budgeted
+        // against.
+        let turn_provider = settings.chat_provider.clone();
+        let device_session_id = session_id.clone();
+
+        // ── PAI-6 P6: where this turn hears about its own delegations ────────
+        //
+        // Subscribed HERE rather than inside the closure, and to the GIAP
+        // session id, which is what a `TaskSpec` names as its parent. The
+        // ordering matters in one direction only: a frame published before the
+        // subscription exists is dropped, and `spawn` cannot run before the
+        // stream does — it refuses any delegation whose parent turn is not
+        // published, and this turn publishes its authority two statements up.
+        //
+        // Moved into the closure beside the authority lease and the device
+        // claim, so it is dropped by whatever ends the turn, including the
+        // client hanging up. Its `Drop` takes the bus entry with it, so a child
+        // that outlives its parent's stream publishes into nothing rather than
+        // into a stale channel.
+        let mut progress = crate::orchestrator::process_progress_bus().subscribe(&session_id);
+
         let stream = async_stream::stream! {
             // Hold the guard — dropped when the stream is dropped → cancels token.
             let _guard = cancel_guard;
+            // Same lifetime, same reason: dropped with the stream, which revokes
+            // this turn's authority to delegate.
+            let _authority_lease = authority_lease;
+
+            // ── PAI-6 P4 / invariant 3: this turn's claim on the device ───────
+            //
+            // The half of invariant 3 P2 left open. The subagent semaphore
+            // serialised children against each other; it did not serialise them
+            // against the PARENT, and `goose-local-inference` keeps exactly one
+            // retained KV prefix per model slot for the whole process — so a
+            // child replying between two of this turn's provider calls does not
+            // queue, it overwrites, and this turn pays a 3.7 s re-prefill on its
+            // next call.
+            //
+            // Taken INSIDE the stream rather than before it is returned, so the
+            // HTTP response has already started and the client sees a stream
+            // that is waiting rather than a request that is hanging. Held for
+            // the whole turn, and released by `Drop` on every ending there is,
+            // including the client hanging up.
+            //
+            // `None` on a provider that runs somewhere else: there is no shared
+            // prefix to protect and hosted conversations still run four abreast.
+            // A synchronous delegation does NOT queue behind this claim — it
+            // inherits it, see `claim_device_for_turn`.
+            let _device = crate::orchestrator::claim_device_for_turn(
+                &device_session_id,
+                &turn_provider,
+                &cancel_token,
+            ).await;
 
             yield Ok(AgentStreamEvent::Status { content: "Agent working...".to_string() });
             let mut total_output_chars: usize = 0;
             // Track tool call ID → tool name so ToolResult events carry the tool name.
             let mut tool_id_to_name: HashMap<String, String> = HashMap::new();
+            // Tool-call ids the allow-set guard refused to surface. Their results
+            // are dropped when they arrive rather than being emitted with an
+            // empty tool name.
+            let mut suppressed_tool_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             // Wall-clock start per tool call (keyed by Goose tool-call ID) for latency.
             let mut tool_call_starts: HashMap<String, std::time::Instant> = HashMap::new();
 
@@ -2774,6 +3881,11 @@ impl GooseAdapter {
                 // (GOOSE_MAX_EMPTY_TURN_RETRIES=0); GIAP re-engages with a changed
                 // prompt, and says something actionable once the budget is spent.
                 let mut attempt: usize = 0;
+                // PAI-5 P1 (granularity). One reasoning passage in flight.
+                // Declared outside `'attempts` only so it is obviously a single
+                // buffer; every attempt flushes it before it ends, so no
+                // reasoning ever crosses a re-engagement boundary.
+                let mut reasoning = ReasoningCoalescer::default();
                 'attempts: loop {
                     let attempt_text = if attempt == 0 {
                         turn_text.clone()
@@ -2782,6 +3894,54 @@ impl GooseAdapter {
                     };
                     let attempt_msg =
                         attach_images(Message::user().with_text(&attempt_text), &turn_images);
+                    // The completeness check, armed for this turn only.
+                    //
+                    // Goose's reply loop, on a turn that finishes WITHOUT calling
+                    // a tool, re-prompts "check whether the goal has been fully
+                    // met; if not, continue working toward it" and iterates once
+                    // more. It is guarded on a goal being set, and nothing in
+                    // GIAP ever set one -- so the arm was dead and the loop
+                    // terminated on "the model stopped asking for tools", never
+                    // on "the question was answered".
+                    //
+                    // Measured 2026-08-12, "what time is it in the first 10
+                    // states of the USA alphabetically?": gemma-4-E2B made ZERO
+                    // tool calls and answered with a single time for all ten
+                    // states -- its own local clock, in fact -- and every layer
+                    // reported success. gemma-4-E4B declined honestly instead,
+                    // so the size of the failure is model-dependent, but the
+                    // absence of any check is not.
+                    //
+                    // `set_session_goal` and NOT `set_goal`: one retained
+                    // `Arc<GooseAgent>` serves up to four concurrent chat
+                    // streams (`sse_semaphore`), and the process-wide slot would
+                    // put one household member's request text into another
+                    // member's turn. That is a PAI-1 boundary crossing, not a
+                    // tidiness point, and it is why the fork carries the
+                    // session-keyed variant.
+                    //
+                    // The RAW request, never `turn_text`: the assembled text
+                    // carries `<system-context>` with memories and the turn
+                    // budget, and feeding those back as a goal would restate
+                    // household memories to the model as something to satisfy.
+                    //
+                    // Gated because it costs roughly TWICE the inferences per
+                    // turn: the check re-arms whenever the model does more work,
+                    // so it fired three times on one measured turn rather than
+                    // once. That is the mechanism and not a defect -- capping it
+                    // at a single check would have stopped the seven-tool-call
+                    // turn that finally produced an answer at around its fourth.
+                    // Defaulted ON because the measurements say it is worth the
+                    // cost; see `Settings::goal_check_enabled` for why this is a
+                    // household setting rather than a `ModelClass` tier.
+                    agent_clone
+                        .set_session_goal(
+                            &turn_goose_sid,
+                            settings
+                                .goal_check_enabled
+                                .then(|| request.message.clone()),
+                        )
+                        .await;
                     let attempt_cfg = goose::agents::types::SessionConfig {
                         id: turn_goose_sid.clone(),
                         schedule_id: None,
@@ -2802,10 +3962,74 @@ impl GooseAdapter {
                     }
                 };
 
-                while let Some(event_result) = goose_stream.next().await {
+                // Labelled, and the label is load-bearing: the guard
+                // `the_last_reasoning_block_of_a_turn_is_flushed_after_the_event_loop`
+                // finds this loop's closing brace to prove the trailing flush is
+                // outside it, and a bare `loop {` would match the `'attempts`
+                // loop above instead.
+                'engine: loop {
+                    // PAI-6 P6. Two things can happen next: the engine yields,
+                    // or a delegation running underneath this turn's `delegate`
+                    // tool call says something. The second has no other route
+                    // here — the child runs INSIDE the poll of `goose_stream`,
+                    // so between the tool call and its result this stream would
+                    // otherwise yield nothing at all for the whole of the
+                    // child's run. `next_parent_step` owns the select, the
+                    // bias, and the cancel-safety argument for both branches.
+                    let event_result = match crate::orchestrator::next_parent_step(
+                        &mut goose_stream,
+                        &mut progress,
+                    ).await {
+                        crate::orchestrator::ParentStep::Progress(frame) => {
+                            // Straight out, unabsorbed. It is not an engine
+                            // event: it never becomes text, a tool result, or
+                            // anything else this turn persists. PAI-6
+                            // invariant 4 — only the delegation's RESULT does,
+                            // and that arrives as the tool response below.
+                            yield Ok(frame.into());
+                            continue 'engine;
+                        }
+                        crate::orchestrator::ParentStep::EngineEnded => break 'engine,
+                        crate::orchestrator::ParentStep::Engine(event_result) => event_result,
+                    };
                     match event_result {
                         Ok(event) => match event {
                             goose::agents::AgentEvent::Message(msg) => {
+                                // Surface the model's reasoning BEFORE the tool
+                                // calls and the answer text of the same message,
+                                // which is the order the provider produced them
+                                // in. Deliberately does NOT set
+                                // `produced_visible`: reasoning alone leaves the
+                                // user with nothing, and marking the turn visible
+                                // would suppress the empty-turn recovery below.
+                                // PAI-5 P2. Counted before the display gate and
+                                // outside it: the reasoning was decoded either
+                                // way, so the cost is the same whether or not
+                                // anybody is shown it.
+                                *turn_stats.reasoning_tokens.get_or_insert(0) +=
+                                    Self::count_reasoning_tokens(&msg, reasoning_counter.as_ref());
+                                // PAI-5 P1 (granularity). Buffer the fragment;
+                                // emit only when the passage is finished. On
+                                // the local/gguf path one message is one TOKEN
+                                // PIECE, so yielding per message rendered a
+                                // paragraph per token with the spacing trimmed
+                                // out of it.
+                                reasoning.push(&msg, emit_reasoning);
+                                let ends_block = Self::message_ends_reasoning(&msg);
+                                let overflowed = reasoning.over_cap();
+                                if overflowed {
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        bytes = reasoning.len(),
+                                        "reasoning passage exceeded the coalescer cap; \
+                                         emitting it as a partial block",
+                                    );
+                                }
+                                if ends_block || overflowed {
+                                    if let Some(content) = reasoning.flush() {
+                                        yield Ok(AgentStreamEvent::Thinking { content });
+                                    }
+                                }
                                 // Emit tool call and result events
                                 for content in &msg.content {
                                     match content {
@@ -2821,9 +4045,29 @@ impl GooseAdapter {
                                                 // and the very next call must be admitted, or the escape
                                                 // hatch would enable a group and then block its use.
                                                 if !guard_controls.is_tool_allowed(&tool_name) {
+                                                    // NOT a block. Goose keeps every extension
+                                                    // loaded agent-wide, collects every
+                                                    // ToolRequest regardless of whether its
+                                                    // schema was published, and yields
+                                                    // AgentEvent::Message BEFORE dispatching. So
+                                                    // by the time this runs the tool either has
+                                                    // run or is about to, and nothing here can
+                                                    // stop it. What this does is refuse to
+                                                    // SURFACE the call — and, via
+                                                    // `suppressed_tool_ids` below, refuse to
+                                                    // surface its result.
+                                                    //
+                                                    // A real execution gate needs an inspector
+                                                    // registered with goose's
+                                                    // ToolInspectionManager, whose `add_inspector`
+                                                    // is private and whose field is pub(super) —
+                                                    // i.e. it needs a fork patch, tracked in
+                                                    // docs/goose-patch-management.md.
+                                                    suppressed_tool_ids.insert(tr.id.clone());
                                                     tracing::warn!(
                                                         tool = %tool_name,
-                                                        "Blocked unauthorized tool call (not in schema or no tools loaded)",
+                                                        tool_id = %tr.id,
+                                                        "tool call outside this session's allow-set; suppressing its call and result events (the tool itself still runs)",
                                                     );
                                                     continue;
                                                 }
@@ -2845,6 +4089,26 @@ impl GooseAdapter {
                                             }
                                         }
                                         goose::conversation::message::MessageContent::ToolResponse(tr) => {
+                                            // A suppressed call's RESULT must never reach the
+                                            // client. This used to rely on absence from
+                                            // `tool_id_to_name`, which the guard's `continue`
+                                            // caused — but absence only blanked the NAME:
+                                            // `unwrap_or_default()` gave "" and the content was
+                                            // streamed anyway. On a Guest turn that meant a
+                                            // withheld `giap-memory__recall_memories` returned
+                                            // the household's memories to the device under an
+                                            // empty tool name. Track suppression explicitly.
+                                            if suppressed_tool_ids.remove(&tr.id) {
+                                                tracing::warn!(
+                                                    target: "giap::trace",
+                                                    kind = "tool_result_suppressed",
+                                                    session_id = %session_id,
+                                                    tool_id = %tr.id,
+                                                    "dropped the result of a tool outside this session's allow-set",
+                                                );
+                                                tool_call_starts.remove(&tr.id);
+                                                continue;
+                                            }
                                             // Surface BOTH arms. A failed dispatch still
                                             // reaches the model — goose puts the error into
                                             // its own conversation — so dropping the Err here
@@ -2988,6 +4252,15 @@ impl GooseAdapter {
                     }
                 }
 
+                    // PAI-5 P1 (granularity). The passage the stream ended on.
+                    // A turn CAN end in pure reasoning — gemma-4-E2B closes its
+                    // thinking block and emits end_of_turn with no text — and a
+                    // coalescer that drops that block is strictly worse than
+                    // the confetti it replaced. Inside `'attempts` so it is
+                    // both the per-attempt and the end-of-stream flush.
+                    if let Some(content) = reasoning.flush() {
+                        yield Ok(AgentStreamEvent::Thinking { content });
+                    }
                     if produced_visible {
                         break 'attempts;
                     }
@@ -3016,6 +4289,18 @@ impl GooseAdapter {
                         ),
                     });
                 }
+            // What the empty-turn recovery actually cost, recorded rather than
+            // logged. `attempt` is incremented once per re-engagement and never
+            // on the exhaustion path, so it is already "attempts beyond the
+            // first": 0 for an ordinary turn, and on the exhausted path the
+            // number of steered retries that also came back silent.
+            //
+            // This is the hidden half of what thinking costs. A re-engaged turn
+            // is not a slow turn, it is the whole turn again — prefill, tools
+            // and all — and until this line the only trace was a WARN nobody
+            // roots their log at.
+            turn_stats.reengagements = attempt as u32;
+
             // Per-turn usage from the provider's per-inference Usage events.
             // Fall back to the chars/4 heuristic only when the provider emitted
             // no Usage events at all (some HTTP providers).
@@ -3024,11 +4309,20 @@ impl GooseAdapter {
                 pond_core::models::ports::provider::UsageStats {
                     prompt_tokens: turn_stats.prompt_tokens,
                     completion_tokens: turn_stats.completion_tokens,
+                    // Reported alongside, never deducted. The provider's output
+                    // count probably already covers the reasoning decode, but it
+                    // is the engine's number and this one is ours; subtracting
+                    // would corrupt the measured one to flatter the derived one.
+                    reasoning_tokens: turn_stats.reasoning_tokens,
                 }
             } else {
                 pond_core::models::ports::provider::UsageStats {
                     prompt_tokens: (user_msg_len / 4).max(1) as u32,
                     completion_tokens: (total_output_chars / 4).max(1) as u32,
+                    // `total_output_chars` never contained the reasoning:
+                    // thinking blocks are not `as_text()`, so they never reached
+                    // the text accumulator. Additive here, with no overlap.
+                    reasoning_tokens: turn_stats.reasoning_tokens,
                 }
             };
             turn_stats.finalize_rates();
@@ -3182,6 +4476,450 @@ impl AgentPort for GooseAdapter {
             Err(e) => Err(anyhow!("Tool dispatch failed: {}", e.message)),
         }
     }
+
+    /// Release the Goose engine session paired with a deleted GIAP session,
+    /// so its messages and `usage_ledger` rows do not outlive the GIAP row
+    /// that referenced them.
+    ///
+    /// Deliberately does NOT go through `resolve_goose_session`: that method
+    /// CREATES (and hydrates) a fresh engine session for a GIAP id it does
+    /// not recognise, which is exactly wrong on a delete path — a session
+    /// with no prior engine pairing has nothing to forget, and conjuring one
+    /// just to immediately delete it would pay for a full history replay for
+    /// no reason. Instead this looks up an already-resolved pairing (process
+    /// cache, then the persisted one) and does nothing if there isn't one.
+    ///
+    /// The persisted pairing is used as found, without re-validating it
+    /// against Goose first (unlike `resolve_goose_session`): if it is already
+    /// stale, `SessionManager::delete_session` simply fails with "not found",
+    /// which is logged and swallowed below like every other failure here.
+    async fn forget_session(&self, session_id: &str) {
+        let cached = self
+            .goose_session_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned();
+
+        let goose_sid = match cached {
+            Some(gid) => Some(gid),
+            None => match &self.giap_session_storage {
+                Some(storage) => storage
+                    .get_engine_session_id(session_id)
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            },
+        };
+
+        // Drop the in-process pairing unconditionally, before attempting the
+        // engine-side delete: whether or not the delete below succeeds, this
+        // GIAP id is being removed and must never resolve to this (or any)
+        // Goose session again on a later turn.
+        self.goose_session_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id);
+
+        let Some(goose_sid) = goose_sid else {
+            // No engine session was ever paired with this GIAP id — e.g. a
+            // session created and deleted before its first turn. Nothing to
+            // release.
+            return;
+        };
+
+        if let Err(e) = self.session_manager.delete_session(&goose_sid).await {
+            // Best-effort: the pond row is about to be deleted regardless.
+            // Leaving this engine session behind is strictly better than
+            // failing the user's delete request over storage this API
+            // doesn't even expose.
+            tracing::warn!(
+                "Failed to delete Goose engine session '{goose_sid}' for GIAP session \
+                 '{session_id}': {e}"
+            );
+        }
+    }
+
+    /// PAI-4 P5. This adapter is the only implementor that returns `Some`,
+    /// because it is the only one that tracks a prefix at all — `Agent`'s
+    /// default `None` is correct for every mock and for any agent whose engine
+    /// keeps no KV cache we can see.
+    ///
+    /// A snapshot, not a handle. The state is `Copy` and every caller acts on
+    /// it immediately; handing out a lock would let a compaction decision
+    /// straddle the prompt assembly it is describing.
+    fn prefix_cache_state(&self) -> Option<PrefixCacheState> {
+        Some(*self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+// ── PAI-6 P2: driving a child agent ─────────────────────────────────────────
+//
+// The mechanism half of orchestration. Every policy decision was already made
+// in `pond-core` (the `TaskSpec`) or in `orchestrator.rs` (the `ChildPlan`);
+// nothing below chooses a scope, a tool or a turn budget. It lives in this file
+// rather than in `orchestrator.rs` because it needs `agent`, `session_manager`,
+// `current_provider`, `settings_repo` and `template_repo`, all of which are
+// private fields — and adding public accessors for them would put the parent's
+// live provider and session manager on this crate's API surface for the sake of
+// one caller in the same crate.
+impl GooseAdapter {
+    /// The parent's live engine surface, for [`crate::orchestrator::build_child_plan`].
+    ///
+    /// The tool inventory comes from the PARENT's own Goose session, which is
+    /// what makes "a child's tools are a subset of the parent's" structural: a
+    /// tool the parent does not have loaded cannot appear here, so no plan can
+    /// name it. Passing the catalog instead would make every downstream
+    /// intersection a no-op — the shape PAI-1 P5 shipped and had to repair.
+    pub(crate) async fn child_environment(
+        &self,
+        parent_session_id: &str,
+    ) -> Result<crate::orchestrator::ChildEnvironment> {
+        let settings = self.settings_repo.get().await?;
+        let template_content = self
+            .template_repo
+            .get(&settings.prompt_style)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.content)
+            .unwrap_or_else(|| FALLBACK_PROMPT.to_string());
+
+        // A deliberately lean `PromptState`. A subagent gets a fraction of the
+        // window by construction (`context_fraction`), so it always gets the
+        // compact prompt; it has no devices to talk about and no prose tool
+        // list, because the envelope names its tools exactly; and
+        // `thinking_enabled` is false because nothing consumes a child's
+        // reasoning — the drain loop keeps `as_concat_text()`, which drops
+        // `MessageContent::Thinking` — so paying for it would be pure cost.
+        let prompt_state = PromptState {
+            current_date: String::new(),
+            current_time: String::new(),
+            device_count: 0,
+            has_home_devices: false,
+            online_device_names: String::new(),
+            voice_mode: false,
+            canvas_mode: false,
+            available_tools: Vec::new(),
+            thinking_enabled: false,
+            compact_prompt: true,
+            native_tools_json: matches!(settings.chat_provider.as_str(), "local" | "gguf"),
+            prefix_hash: None,
+        };
+
+        // THE respecification of this phase. The bullet said "render
+        // subagent_system.md"; that file was deleted on 2026-08-06 with the
+        // whole of `giap_prompts.rs`, and Goose's own copy is not substitutable
+        // (`build_subagent_prompt` renders it unconditionally and overrides the
+        // child's system prompt from inside a function GIAP cannot reach). This
+        // is the live path — the same `build_prompt_partition` the parent's turn
+        // uses — so a child introduces itself as this assistant rather than as
+        // "a specialized subagent within the goose AI framework, created by
+        // AAIF". Only the static prefix is taken: the dynamic suffix is date,
+        // time and profile lines, and a child is given its task in words.
+        let partition = build_prompt_partition(&settings, None, &prompt_state, &template_content);
+
+        let goose_sid = self.resolve_goose_session(parent_session_id).await;
+        let mut parent_tools: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
+        for tool in self.agent.list_tools(&goose_sid, None).await {
+            let name = tool.name.to_string();
+            // Unprefixed names, because that is what Goose matches
+            // `available_tools` against: `dispatch_tool_call` checks
+            // `is_tool_available(&resolved.actual_tool_name)`, not the
+            // `extension__tool` name the model sees. A name with no prefix at
+            // all belongs to no extension — Goose plumbing, or one of the
+            // `unprefixed_tools: true` platform extensions — and
+            // `split_extension_tool` drops it rather than guess an owner.
+            let Some((extension, bare)) = crate::orchestrator::split_extension_tool(&name) else {
+                continue;
+            };
+            parent_tools
+                .entry(extension.to_string())
+                .or_default()
+                .insert(bare.to_string());
+        }
+
+        Ok(crate::orchestrator::ChildEnvironment {
+            provider_name: settings.chat_provider.clone(),
+            base_system_prefix: partition.static_prefix,
+            parent_tools,
+        })
+    }
+
+    /// Create the child's engine session.
+    ///
+    /// `SessionType::SubAgent` so Goose's own bookkeeping knows what it is, and
+    /// so anything that later enumerates sessions can tell a delegation apart
+    /// from a conversation. The row has to exist before the plan runs:
+    /// `Agent::update_provider` ends in `session_manager.update(id).apply()`,
+    /// which errors on a missing row and surfaces as "Failed to set provider on
+    /// sub agent" — the same failure class as the recorded `resolve_goose_session`
+    /// foreign-key incident, wearing a provider's clothes.
+    pub(crate) async fn open_child_session(&self, role: &str) -> Result<String> {
+        let session = self
+            .session_manager
+            .create_session(
+                std::env::current_dir().unwrap_or_default(),
+                format!("giap-subagent:{role}"),
+                goose::session::session_manager::SessionType::SubAgent,
+                GooseMode::Auto,
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to create subagent session for role '{role}': {e}"))?;
+        Ok(session.id)
+    }
+
+    /// Delete a child's engine session once its run is over.
+    ///
+    /// Also drops its `ShimControls` entry. That map evicts OLDEST-FIRST with no
+    /// regard for whether an entry is live, so leaving a child's entry to age
+    /// out would mean sixty-four delegations silently evicting a long-running
+    /// PARENT's allow-set — after which the parent's turns are pass-through and
+    /// a Guest's `subtract_guest_denied_tools` result goes with them. PAI-6 P3.
+    pub(crate) async fn release_child_session(&self, child_session_id: &str) {
+        self.shim_controls.forget_session(child_session_id);
+        if let Err(e) = self.session_manager.delete_session(child_session_id).await {
+            tracing::warn!("Failed to release subagent engine session '{child_session_id}': {e}");
+        }
+    }
+
+    /// Run one child agent to completion, or until `cancel` trips.
+    ///
+    /// This is the ~120 lines that would otherwise have been Goose's
+    /// `get_agent_messages`. See `orchestrator.rs`'s module doc for why they are
+    /// here instead of behind a sixth fork patch.
+    pub(crate) async fn run_child_agent(
+        &self,
+        plan: crate::orchestrator::ChildPlan,
+        cancel: CancellationToken,
+    ) -> Result<crate::orchestrator::ChildOutcome> {
+        let (provider, model_config) = self
+            .current_provider
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                anyhow!(
+                    "no provider is configured on this pond yet - a subagent cannot be given one"
+                )
+            })?;
+
+        // PAI-6 P7. The role's model, if the plan decided it gets one. The
+        // decision was made in `build_child_plan`, which is the only place that
+        // holds both the role's request and the provider the parent is on; the
+        // whole of what happens here is applying it, and the applying lives in
+        // `child_model_config` because this function cannot be reached without a
+        // live provider. Note the child's session gets its own `ModelConfig` on
+        // the SAME provider object — the parent's cached pair is untouched, so a
+        // delegation cannot move the model out from under the parent's turn.
+        let model_config = crate::orchestrator::child_model_config(&plan.model, model_config);
+
+        // A FRESH agent, deliberately. `Agent::with_config` builds an
+        // `ExtensionManager` with no extensions and nothing auto-loads defaults
+        // into it, so the child starts with an empty tool surface and gets
+        // exactly what the plan puts in. That is what makes invariants 1, 2 and
+        // 6 structural rather than checked.
+        //
+        // `scheduler_service: None` keeps `manage_schedule_tool` off the child's
+        // list. `GooseMode::Auto` is MANDATORY, not a preference: any
+        // approval-requiring mode hangs forever on the child's
+        // `confirmation_rx`, because nothing forwards an ActionRequired message
+        // to a parent. The consequence is that the child's TOOL SET is its only
+        // safety boundary, which is why `available_tools` is populated
+        // explicitly and why nothing that actuates a device belongs in a role.
+        // ── PAI-6 P3: the child's second tool layer, and its prompt ───────────
+        //
+        // Published BEFORE the child's first provider call, which is the whole
+        // requirement: `ShimControls::existing_session` deliberately does not
+        // create entries, so a session GIAP never chatted in resolves to `None`
+        // and `enforce_tools(tools, &None)` is a silent no-op. A subagent is
+        // exactly that kind of session. Without this the child's only tool
+        // boundary is `ExtensionConfig::available_tools`, which is real (it
+        // refuses inside `dispatch_tool_call`) but is one layer, and it only
+        // stops the CALL — the tool is still listed to the model, which then
+        // spends turns trying it.
+        //
+        // The system override is not a nicety either. A child's prompt is the
+        // parent's static prefix plus GIAP's delegation envelope, so
+        // `enforce_system`'s `incoming.starts_with(prefix)` matches and the
+        // rebuild would discard the envelope — the turn budget, "you cannot
+        // delegate", and the exact tool names — and splice in the GLOBAL
+        // extension appendix instead. Silently: the rebuild "succeeds", so the
+        // `system_appendix_dropped` warning does not fire.
+        let child_controls = self.shim_controls.session(&plan.child_session_id);
+        child_controls.set_allowed_tools(plan.allowed_tool_names.iter().cloned().collect());
+        child_controls.set_system_override(Some(plan.system_prompt.clone()));
+
+        let config = AgentConfig::new(
+            self.session_manager.clone(),
+            goose::config::permission::PermissionManager::instance(),
+            None,
+            GooseMode::Auto,
+            true,
+            GoosePlatform::GooseCli,
+        );
+        let child = GooseAgent::with_config(config);
+
+        child
+            .update_provider(provider, model_config, &plan.child_session_id)
+            .await
+            .map_err(|e| anyhow!("Failed to set the provider on the subagent: {e}"))?;
+
+        // Goose's own child loop `debug!`s and SWALLOWS an extension that fails
+        // to load, so a subagent whose only useful extension never started runs
+        // anyway and returns a plausible-looking wrong answer. Owning the loop
+        // means this can fail loudly instead.
+        for extension in &plan.extensions {
+            child
+                .add_extension(extension.clone(), &plan.child_session_id)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to load extension '{}' for subagent role '{}': {e}",
+                        extension.name(),
+                        plan.role
+                    )
+                })?;
+        }
+
+        child
+            .override_system_prompt(plan.system_prompt.clone())
+            .await;
+
+        // Read once here and again after the drain, and unioned. Neither read
+        // alone is the audit: this one can only report what `add_extension` was
+        // just handed — which `child_extensions` already refused, so on its own
+        // it is an audit that cannot fail — and the post-run read alone would
+        // miss an extension that loaded and was removed again mid-run.
+        let mut loaded_extensions: std::collections::BTreeSet<String> = child
+            .list_extensions()
+            .await
+            .into_iter()
+            .map(|e| e.to_string())
+            .collect();
+
+        let session_config = goose::agents::SessionConfig {
+            id: plan.child_session_id.clone(),
+            schedule_id: None,
+            // Always `Some`. Goose's `build_subagent_prompt` does
+            // `.expect("TaskConfig always sets max_turns")`, and while that
+            // particular panic is not on this path, an unbounded child on a
+            // 2-4B on-device model is minutes of wall clock with the parent's
+            // turn blocked behind it.
+            max_turns: Some(plan.max_turns),
+            retry_config: None,
+        };
+        let user_message = Message::user().with_text(&plan.user_message);
+
+        // PAI-4 P5. A child replies through the SAME engine and the same
+        // provider as its parent, with its own system prompt and its own tool
+        // block, so the single retained KV prefix the parent's next turn hopes
+        // to be served off is about to be overwritten. Nothing said so, and the
+        // parent's next turn compares hashes it alone owns — finds them equal,
+        // takes the `prefix_changed == false` branch, and calls
+        // `note_prefix_served()`, recording as WARM a prefix that is cold. The
+        // trimmer's age rung reads that posture.
+        //
+        // Recorded BEFORE the reply rather than after it, because the honest
+        // answer to "did the child touch the provider" once `reply` has been
+        // started is "assume yes": a stream that fails part-way has still
+        // prefilled. Over-reporting cold costs one re-compaction decision;
+        // under-reporting it costs a silent 3.7s re-prefill the compaction path
+        // thought it had avoided.
+        //
+        // `PromptChanged` is the closest of the six existing reasons — the
+        // static prefix the engine holds really is a different one. A
+        // `DelegatedRun` variant would read better in a trace and is a
+        // `pond-core` change this one does not own.
+        self.note_prefix_invalidated(InvalidationReason::PromptChanged);
+
+        let mut stream =
+            goose::session_context::with_session_id(Some(plan.child_session_id.clone()), async {
+                child
+                    .reply(user_message.clone(), session_config, Some(cancel.clone()))
+                    .await
+            })
+            .await
+            .map_err(|e| anyhow!("Failed to start the subagent reply: {e}"))?;
+
+        // One `AgentEvent::Message` is a FRAGMENT, not a turn — see the
+        // provider table above `ReasoningCoalescer` in this file, and
+        // `ChildTurns`, which owns the rule. Counting them as turns is what
+        // reported every successful delegation as `TurnBudgetExhausted`;
+        // assigning `last_text` per message is what made the "answer" the last
+        // streamed word.
+        let mut turns = crate::orchestrator::ChildTurns::default();
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(goose::agents::AgentEvent::Message(msg)) => {
+                    // The reduction itself is `child_stream_step`, next to
+                    // `ChildTurns` and tested from a `Vec` of fragments. What
+                    // is left here — the two arguments — is the only part that
+                    // needs a live engine, and it is what the tripwire reads:
+                    // `as_concat_text()` filters on `as_text()`, which returns
+                    // `None` for `MessageContent::Thinking`, and that is
+                    // load-bearing rather than incidental. PAI-5's reasoning
+                    // gate lives at this adapter's own producer, a path a child
+                    // does not go through, so a child's reasoning would
+                    // otherwise reach the parent as its answer.
+                    crate::orchestrator::child_stream_step(
+                        &mut turns,
+                        msg.role == rmcp::model::Role::Assistant,
+                        &msg.as_concat_text(),
+                    );
+                    // PAI-6 P6. The only other thing this loop takes from a
+                    // child's message, and the reason it is a call rather than
+                    // an inline `for content in &msg.content`: reading the
+                    // content list directly is what loses `as_concat_text()`'s
+                    // accidental reasoning gate, so the reading is done by a
+                    // function whose return type cannot carry reasoning, answer
+                    // text, or the call's ARGUMENTS. See `child_tool_names`.
+                    for tool in crate::orchestrator::child_tool_names(&msg) {
+                        crate::orchestrator::report_child_progress(
+                            &plan.parent_session_id,
+                            &plan.task_id,
+                            &plan.role,
+                            pond_core::shared::domain::agent::SubagentStatus::Tool,
+                            Some(tool),
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        role = %plan.role,
+                        "subagent stream error, ending the run: {e}"
+                    );
+                    break;
+                }
+            }
+        }
+        drop(stream);
+        let (last_text, assistant_turns) = turns.finish();
+
+        // The post-run half of the invariant-2 audit. `add_extension` is not the
+        // only way an extension can arrive — a Goose sync could re-arm a
+        // `default_enabled` platform extension, which is what
+        // `EnabledExtensionsState::extensions_or_default` does — and asking
+        // before the run could only ever echo back what was just handed over.
+        loaded_extensions.extend(
+            child
+                .list_extensions()
+                .await
+                .into_iter()
+                .map(|e| e.to_string()),
+        );
+
+        Ok(crate::orchestrator::ChildOutcome {
+            last_text,
+            assistant_turns,
+            loaded_extensions,
+        })
+    }
 }
 
 /// Shrink the text bodies of an oversized structured tool response, or `None`
@@ -3201,6 +4939,46 @@ impl AgentPort for GooseAdapter {
 /// `structured_content` is left alone: it is arbitrary tool-defined JSON that
 /// cannot be truncated without risking invalid data, and the text bodies are
 /// what the chat template renders.
+/// A cheap stable digest of a conversation, used to decide whether rewriting the
+/// engine's message table would change anything.
+///
+/// Hashes the JSON form of each message's content rather than the content itself
+/// because `MessageContent` does not implement `Hash` — and the JSON is the
+/// faithful proxy here, since it is exactly the bytes `replace_conversation`
+/// would write. Serializing every message once per turn sounds expensive next to
+/// the alternative until you price the alternative: a transaction, a whole-table
+/// DELETE, and one INSERT per message, each doing this same serialization anyway.
+///
+/// `id` and `created` are included because the rebuild deliberately preserves
+/// them — a message that kept its identity but changed its text must still
+/// register as different.
+fn conversation_fingerprint(messages: &[goose::conversation::message::Message]) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    messages.len().hash(&mut hasher);
+    for m in messages {
+        m.id.hash(&mut hasher);
+        m.created.hash(&mut hasher);
+        match m.role {
+            rmcp::model::Role::User => 0u8,
+            rmcp::model::Role::Assistant => 1u8,
+        }
+        .hash(&mut hasher);
+        match serde_json::to_string(&m.content) {
+            Ok(json) => json.hash(&mut hasher),
+            // Unserializable content cannot be compared, so refuse to claim the
+            // conversation is unchanged: hash something unique to this message
+            // so the fingerprints differ and the write proceeds.
+            Err(_) => {
+                "unserializable".hash(&mut hasher);
+                std::ptr::from_ref(m).addr().hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
 fn truncate_tool_response_text(
     message: &goose::conversation::message::Message,
     max_chars: usize,
@@ -3650,6 +5428,50 @@ mod tests {
         ));
     }
 
+    // ── PAI-4 P5: which reason a provider swap records ────────────────────
+
+    #[test]
+    fn the_same_model_behind_a_new_provider_is_a_rebuild_not_a_swap() {
+        assert_eq!(
+            GooseAdapter::provider_change_reason("ollama:gemma4:e2b", "gemma4:e2b"),
+            InvalidationReason::ProviderRebuilt
+        );
+        assert_eq!(
+            GooseAdapter::provider_change_reason("local:gemma-4-E2B-it", "gemma-4-E2B-it"),
+            InvalidationReason::ProviderRebuilt
+        );
+    }
+
+    /// The colon-in-the-model-name case, which is not hypothetical: every
+    /// Ollama tag has one. Splitting the key from the right would compare
+    /// "e2b" with "gemma4:e2b" and report a model swap on every provider
+    /// change — a reason nobody could trust in a trace.
+    #[test]
+    fn a_model_name_containing_a_colon_survives_the_key_split() {
+        assert_eq!(
+            GooseAdapter::provider_change_reason("ollama:gemma4:e2b", "gemma4:e4b"),
+            InvalidationReason::ModelSwapped
+        );
+        assert_eq!(
+            GooseAdapter::provider_change_reason("llamafile:gemma4:e2b", "gemma4:e2b"),
+            InvalidationReason::ProviderRebuilt
+        );
+    }
+
+    #[test]
+    fn a_different_model_is_a_swap_and_so_is_the_very_first_provider() {
+        assert_eq!(
+            GooseAdapter::provider_change_reason("local:gemma-4-E2B-it", "gemma-4-E4B-it"),
+            InvalidationReason::ModelSwapped
+        );
+        // Startup: `last_provider_key` is still empty, so there is no previous
+        // model to have kept.
+        assert_eq!(
+            GooseAdapter::provider_change_reason("", "gemma-4-E2B-it"),
+            InvalidationReason::ModelSwapped
+        );
+    }
+
     #[test]
     fn explicit_thinking_modes_ignore_the_model_and_voice_always_wins() {
         assert!(GooseAdapter::thinking_section_applies(
@@ -3670,6 +5492,736 @@ mod tests {
         }
     }
 
+    // ── PAI-5 P1: the structured reasoning channel ────────────────────────
+
+    /// PAI-5 invariant 2: voice mode never renders reasoning. It is unspeakable
+    /// text, and the terminal voice loop prints `Thinking` frames to stderr
+    /// unconditionally, so a leak here is a leak all the way to the speaker.
+    ///
+    /// This is the clause that has no second line of defence. `show_thinking`
+    /// is also checked at the SSE seam for the `ThoughtFilter` capture path
+    /// (`routes.rs` builds the filter with `settings.show_thinking &&
+    /// !req.voice_mode`), but the structured frames this phase introduces are
+    /// forwarded there unconditionally — the producer is the only gate.
+    #[test]
+    fn a_voice_turn_never_surfaces_reasoning() {
+        for show_thinking in [true, false] {
+            assert!(
+                !GooseAdapter::reasoning_frames_enabled(show_thinking, true),
+                "voice mode leaked reasoning with show_thinking={show_thinking}"
+            );
+        }
+        assert!(GooseAdapter::reasoning_frames_enabled(true, false));
+        assert!(
+            !GooseAdapter::reasoning_frames_enabled(false, false),
+            "a user who turned thinking off must not receive reasoning frames"
+        );
+    }
+
+    /// The OTHER half of the gate, which was unguarded until a review broke it.
+    ///
+    /// `reasoning_frames_enabled` had all four of its rows tested and the source
+    /// guard pinned the identifier `is_voice`, but nothing pinned the
+    /// COMPOSITION. Deleting `|| request.voice_mode` from `chat_stream` left
+    /// every one of the 108 tests in this crate green, and on the shipped
+    /// desktop that mutation makes reasoning leak to every voice turn, silently:
+    /// `main.rs` builds the serve-mode adapter with `voice_mode: false`
+    /// hardcoded, so the instance flag is never true there and the request flag
+    /// is the whole defence.
+    ///
+    /// The row that matters is therefore `(false, true)`. It is asserted first
+    /// and by name so the failure names the surface it breaks, rather than
+    /// reporting a bare `assert!(false)` from the middle of a loop.
+    #[test]
+    fn a_request_flagged_voice_is_a_voice_turn_even_on_a_text_started_process() {
+        assert!(
+            GooseAdapter::voice_turn(false, true),
+            "the shipped desktop hardcodes the instance flag to false, so the per-request \
+             flag is the ONLY signal that a turn is spoken. Dropping it re-opens the leak \
+             P1 closed, and every gate downstream keeps looking correct."
+        );
+        assert!(
+            GooseAdapter::voice_turn(true, false),
+            "the CLI `--input whisper` instance flag must still count on its own"
+        );
+        assert!(GooseAdapter::voice_turn(true, true));
+        assert!(
+            !GooseAdapter::voice_turn(false, false),
+            "a text turn on a text process must not be treated as voice, or reasoning \
+             is suppressed for everyone"
+        );
+    }
+
+    /// A settings read that fails falls back to `Settings::default()`. On that
+    /// path access must NARROW, not widen.
+    #[test]
+    fn the_settings_default_emits_no_reasoning() {
+        let fallback = pond_core::user_data::domain::settings::Settings::default();
+        assert!(!GooseAdapter::reasoning_frames_enabled(
+            fallback.show_thinking,
+            false
+        ));
+    }
+
+    /// What was actually being thrown away. `as_concat_text()` filters on
+    /// `as_text()`, which returns `None` for `Thinking`, so a message carrying
+    /// both reached the stream as answer text only.
+    #[test]
+    fn reasoning_is_lifted_out_of_a_message_that_also_carries_an_answer() {
+        let msg = Message::assistant()
+            .with_thinking("  the user asked about the porch light  ", "")
+            .with_text("The porch light is on.");
+
+        assert_eq!(
+            msg.as_concat_text(),
+            "The porch light is on.",
+            "as_concat_text is still the answer-only view; that is the whole reason \
+             a separate lift is needed"
+        );
+        // The lift is RAW — padding and all. Normalisation is the coalescer's
+        // job and happens once per passage, not once per fragment.
+        assert_eq!(
+            GooseAdapter::reasoning_frames(&msg, true),
+            vec!["  the user asked about the porch light  ".to_string()],
+        );
+        assert!(
+            GooseAdapter::reasoning_frames(&msg, false).is_empty(),
+            "the gate is applied inside the lift, not only at the call site"
+        );
+        // And the frame a user actually sees is the trimmed passage.
+        let mut coalescer = ReasoningCoalescer::default();
+        coalescer.push(&msg, true);
+        assert_eq!(
+            coalescer.flush(),
+            Some("the user asked about the porch light".to_string()),
+        );
+    }
+
+    /// THE guard for PAI-5 P1's granularity clause, and the sequence the design
+    /// doc demands verbatim.
+    ///
+    /// On the shipped headline configuration — a Jetson on `chat_provider =
+    /// local` / gguf with `show_thinking = true` — goose emits one
+    /// `AgentEvent::Message` per token piece
+    /// (`goose-local-inference/src/llamacpp/inference_native_tools.rs` calls
+    /// `push_structured_reasoning` from inside the per-token callback). One
+    /// frame per message therefore meant one `<p>` per token in `Chat.tsx`,
+    /// with every inter-word space eaten by a per-fragment `.trim()`.
+    ///
+    /// The count assertion is not decoration: a coalescer that emitted the
+    /// right text in three pieces would still be the bug.
+    #[test]
+    fn a_reasoning_passage_arrives_as_one_frame_with_its_spacing_intact() {
+        let mut coalescer = ReasoningCoalescer::default();
+        let mut frames: Vec<String> = Vec::new();
+        for fragment in [" the user", " asked about", " the light"] {
+            let msg = Message::assistant().with_thinking(fragment, "");
+            coalescer.push(&msg, true);
+            assert!(
+                !GooseAdapter::message_ends_reasoning(&msg),
+                "a message carrying only reasoning must not end the passage, or \
+                 every delta flushes and nothing was coalesced"
+            );
+        }
+        if let Some(content) = coalescer.flush() {
+            frames.push(content);
+        }
+
+        assert_eq!(
+            frames.len(),
+            1,
+            "a single reasoning passage produced {} frames; the consumer renders \
+             one <p> per frame, so this is the per-token confetti P1 shipped. \
+             Frames: {:?}",
+            frames.len(),
+            frames
+        );
+        assert_eq!(
+            frames[0], "the user asked about the light",
+            "the passage lost its inter-fragment whitespace. A per-fragment trim \
+             joins the deltas as \"the userasked aboutthe light\"; the trim must \
+             happen ONCE, on the assembled passage."
+        );
+    }
+
+    /// Coalescing must not become "merge the whole turn". `anthropic.rs`
+    /// accumulates `ThinkingDelta` internally and emits exactly ONE
+    /// `with_thinking(..)` at `content_block_stop`, as does every non-streaming
+    /// response path — so on those providers a message IS a complete block, and
+    /// fusing two of them would invent a passage the model never wrote.
+    ///
+    /// Two whole blocks can only be adjacent across something the user sees, so
+    /// the flush condition ("this message carries something the adapter would
+    /// yield") separates them without knowing which provider it is talking to.
+    #[test]
+    fn a_whole_block_provider_is_not_merged_into_one_giant_block() {
+        const FIRST: &str = "The user wants the porch light. I should check the registry.";
+        const SECOND: &str = "The registry says it exists and is off. I can turn it on.";
+
+        let mut coalescer = ReasoningCoalescer::default();
+        let mut frames: Vec<String> = Vec::new();
+
+        // Mirrors the stream's own sequence: push, then flush iff this message
+        // carries something the adapter would yield.
+        fn feed(msg: Message, coalescer: &mut ReasoningCoalescer, frames: &mut Vec<String>) {
+            coalescer.push(&msg, true);
+            if GooseAdapter::message_ends_reasoning(&msg) {
+                if let Some(content) = coalescer.flush() {
+                    frames.push(content);
+                }
+            }
+        }
+
+        feed(
+            Message::assistant().with_thinking(FIRST, ""),
+            &mut coalescer,
+            &mut frames,
+        );
+        // Something visible: the answer text that closes the first block.
+        feed(
+            Message::assistant().with_text("Checking the registry."),
+            &mut coalescer,
+            &mut frames,
+        );
+        feed(
+            Message::assistant().with_thinking(SECOND, ""),
+            &mut coalescer,
+            &mut frames,
+        );
+        if let Some(content) = coalescer.flush() {
+            frames.push(content);
+        }
+
+        assert_eq!(
+            frames.len(),
+            2,
+            "two complete provider blocks came out as {} frame(s). Merging them \
+             fuses reasoning the model emitted separately. Frames: {:?}",
+            frames.len(),
+            frames
+        );
+        assert_eq!(frames[0], FIRST);
+        assert_eq!(frames[1], SECOND);
+    }
+
+    /// The worst failure mode a coalescer can have: buffering a passage and
+    /// then never emitting it. That is strictly worse than the confetti it
+    /// replaced, because the user sees nothing at all.
+    ///
+    /// It is a real case, not a hypothetical — a turn can end in pure reasoning
+    /// (gemma-4-E2B closes its thinking block and emits end_of_turn with no
+    /// text), which is exactly why the empty-turn re-engagement loop exists in
+    /// this file.
+    #[test]
+    fn a_block_that_ends_the_turn_is_not_dropped() {
+        let mut coalescer = ReasoningCoalescer::default();
+        for fragment in ["I should", " check the", " device registry."] {
+            let msg = Message::assistant().with_thinking(fragment, "");
+            coalescer.push(&msg, true);
+            assert!(!GooseAdapter::message_ends_reasoning(&msg));
+        }
+        assert_eq!(
+            coalescer.flush(),
+            Some("I should check the device registry.".to_string()),
+            "the turn ended in pure reasoning and the buffered passage was lost. \
+             The stream needs a flush AFTER the goose event loop drains, not only \
+             inside it."
+        );
+    }
+
+    /// The display gate owns the BUFFER, not just the frame. With the gate shut
+    /// nothing is stored, so a voice turn or a `show_thinking = false` turn
+    /// holds no reasoning text in memory at all — and a later flush cannot
+    /// resurrect it. Access narrows on failure: `Settings::default()` must
+    /// produce no frame either.
+    #[test]
+    fn the_display_gate_still_owns_the_buffer() {
+        let mut coalescer = ReasoningCoalescer::default();
+        for fragment in [" the user", " asked about", " the light"] {
+            coalescer.push(&Message::assistant().with_thinking(fragment, ""), false);
+        }
+        assert_eq!(
+            coalescer.flush(),
+            None,
+            "reasoning was buffered with the display gate shut; on a voice turn \
+             that is unspeakable text one flush away from the speaker"
+        );
+
+        let fallback = pond_core::user_data::domain::settings::Settings::default();
+        let emit = GooseAdapter::reasoning_frames_enabled(fallback.show_thinking, false);
+        let mut coalescer = ReasoningCoalescer::default();
+        coalescer.push(
+            &Message::assistant().with_thinking("something private", ""),
+            emit,
+        );
+        assert_eq!(
+            coalescer.flush(),
+            None,
+            "the settings-read fallback emitted reasoning; a scope-widening default \
+             is a bug"
+        );
+    }
+
+    /// `RedactedThinking` is provider ciphertext, meaningful only when replayed
+    /// to the same provider. Rendering it would put opaque base64 in the user's
+    /// thinking panel — a data-out surface with nothing readable to justify it.
+    /// Empty and whitespace-only blocks are dropped for the same reason a blank
+    /// SSE frame is: it renders as a flicker and says nothing.
+    ///
+    /// Aimed at the FLUSH, not at the lift. The lift is now raw on purpose — a
+    /// lone `" "` fragment is the space between two words and must survive it —
+    /// so asserting "the raw lift returned a non-empty whitespace string" would
+    /// be the guard quietly degrading into a restatement of the change. The
+    /// claim that matters is the one at the surface: no frame reaches the
+    /// stream.
+    #[test]
+    fn ciphertext_and_blank_reasoning_never_reach_the_stream() {
+        let msg = Message::assistant()
+            .with_redacted_thinking("ZW5jcnlwdGVkLXJlYXNvbmluZw==")
+            .with_thinking("   ", "")
+            .with_thinking("\n\t", "");
+
+        assert!(
+            !GooseAdapter::reasoning_frames(&msg, true)
+                .iter()
+                .any(|f| f.contains("ZW5jcnlwdGVk")),
+            "provider ciphertext entered the reasoning channel; RedactedThinking \
+             must be dropped in the lift, not merely trimmed later"
+        );
+
+        let mut coalescer = ReasoningCoalescer::default();
+        coalescer.push(&msg, true);
+        assert_eq!(
+            coalescer.flush(),
+            None,
+            "redacted or blank reasoning produced a frame"
+        );
+    }
+
+    /// The wiring guard, and the one that matters. The two functions above can
+    /// both be correct while the stream yields `Thinking` from somewhere else
+    /// entirely — which is exactly the shape of this phase's predecessor bug,
+    /// where the producer existed upstream and the consumer existed downstream
+    /// and nothing joined them. Asserted against the source because the stream
+    /// body is an `async_stream` closure over a live Goose agent and cannot be
+    /// driven from a unit test.
+    /// The stream body with every `//` comment removed, one entry per line.
+    ///
+    /// Round 1 shipped a guard that a COMMENT satisfied: the egress guard
+    /// searched for bare symbols, so prose naming the tracker certified two
+    /// files that did not call it. Every structural assertion in this file
+    /// reads code only.
+    fn stream_body_code() -> Vec<String> {
+        let src = include_str!("goose_agent.rs");
+        let body = src.split("mod tests").next().unwrap_or(src);
+        body.lines()
+            .map(|l| match l.find("//") {
+                Some(i) => l[..i].to_string(),
+                None => l.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_thinking_frame_leaves_through_the_gate() {
+        let src = include_str!("goose_agent.rs");
+        let body = src.split("mod tests").next().unwrap_or(src);
+        let code = stream_body_code();
+
+        // NOT a count. There are two flush sites now (one per completed block,
+        // one after the event loop drains), and pinning "== 2" is the exact
+        // shape that certified a fourth ungated egress entry point in round 1:
+        // a THIRD raw yield would satisfy a bumped number. Instead every yield
+        // must be able to name the coalescer immediately above it, so the
+        // assertion scales with however many flush sites the stream grows.
+        let yields: Vec<usize> = code
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("yield Ok(AgentStreamEvent::Thinking"))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !yields.is_empty(),
+            "nothing yields a Thinking frame any more; PAI-5 P1's structured \
+             reasoning channel has been removed"
+        );
+        for i in &yields {
+            let window = &code[i.saturating_sub(3)..*i];
+            assert!(
+                window.iter().any(|l| l.contains("reasoning.flush()")),
+                "the Thinking frame yielded at line {} does not come out of \
+                 ReasoningCoalescer::flush. The coalescer is where the once-per-\
+                 passage trim and the buffered display gate live, so a raw yield \
+                 here re-opens both the per-token confetti and the path by which \
+                 ungated reasoning reaches a voice session.",
+                i + 1
+            );
+        }
+        assert_eq!(
+            code.iter()
+                .filter(|l| l.contains("reasoning.push(&msg, emit_reasoning)"))
+                .count(),
+            1,
+            "the gated push into the reasoning coalescer must appear exactly once. \
+             A second, ungated push would fill the buffer on a voice turn and the \
+             next flush would emit it."
+        );
+        assert!(
+            body.contains("Self::reasoning_frames_enabled(settings.show_thinking, is_voice)"),
+            "emit_reasoning is no longer bound from show_thinking AND the voice flag"
+        );
+        // Pinning the identifier `is_voice` says nothing about what it holds.
+        // A review deleted `|| request.voice_mode` from its binding and this
+        // guard stayed green, along with the other 107 tests. Pin the
+        // composition too, and keep it in the testable unit so the truth table
+        // above is the real assertion and this is only the wiring.
+        assert!(
+            body.contains("let is_voice = Self::voice_turn(voice_instance, request.voice_mode);"),
+            "is_voice is no longer composed by voice_turn(instance, request). If the \
+             per-request flag was dropped, reasoning leaks to every desktop voice turn: \
+             the serve-mode adapter hardcodes the instance flag to false."
+        );
+    }
+
+    /// The flush that is easiest to delete and hardest to notice.
+    ///
+    /// `a_block_that_ends_the_turn_is_not_dropped` proves the coalescer can
+    /// emit a trailing passage; it cannot prove the STREAM asks it to. Removing
+    /// the flush that sits after the goose event loop leaves every unit test
+    /// green and silently drops the last reasoning block of every turn that
+    /// ends in reasoning.
+    ///
+    /// Anchored on the loop's own closing brace rather than on "after the
+    /// `while let` line", because the in-loop flush also sits after that line —
+    /// a guard written that way would pass with the trailing flush deleted,
+    /// which is the whole failure it exists to catch.
+    #[test]
+    fn the_last_reasoning_block_of_a_turn_is_flushed_after_the_event_loop() {
+        let code = stream_body_code();
+
+        let loop_start = code
+            .iter()
+            .position(|l| l.contains("'engine: loop {"))
+            .expect(
+                "the goose event loop is gone. PAI-6 P6 turned it from a `while let` \
+                 over `goose_stream.next()` into a labelled `loop` that selects the \
+                 engine against the subagent progress channel; the label is what this \
+                 guard anchors on, because a bare `loop {` matches the `'attempts` \
+                 loop above it",
+            );
+        let indent = |l: &String| l.len() - l.trim_start().len();
+        let loop_indent = indent(&code[loop_start]);
+        let loop_end = (loop_start + 1..code.len())
+            .find(|&i| code[i].trim() == "}" && indent(&code[i]) == loop_indent)
+            .expect("could not find the end of the goose event loop");
+        let recovery = code
+            .iter()
+            .position(|l| l.contains("if produced_visible {"))
+            .expect("the empty-turn recovery check is gone");
+        assert!(
+            loop_end < recovery,
+            "the event loop no longer closes before the empty-turn recovery check; \
+             this guard's anchors have rotted and must be re-derived"
+        );
+
+        assert!(
+            code[loop_end + 1..recovery]
+                .iter()
+                .any(|l| l.contains("reasoning.flush()")),
+            "there is no reasoning.flush() between the end of the goose event loop \
+             (line {}) and the empty-turn recovery check (line {}). Without it the \
+             LAST reasoning passage of the turn is buffered and never emitted — and \
+             a turn ending in pure reasoning is real, not hypothetical: it is the \
+             case the re-engagement loop directly below exists to handle. A \
+             coalescer that drops the final block is worse than the per-token \
+             frames it replaced.",
+            loop_end + 1,
+            recovery + 1
+        );
+    }
+
+    // ── PAI-5 P2: reasoning tokens ────────────────────────────────────────
+
+    /// The claim P2 exists to make: the COUNT does not move with the display
+    /// setting. `show_thinking` decides whether a person is shown the reasoning;
+    /// it does not decide whether the model spent the tokens. If this ever
+    /// couples, a Jetson running the shipped default (`show_thinking = false`)
+    /// reports every turn as having done no thinking at all, and PAI-5 P5 sizes
+    /// its output reserve from that lie.
+    #[test]
+    fn reasoning_is_counted_even_when_it_is_not_shown() {
+        use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
+        let msg = Message::assistant()
+            .with_thinking(
+                "The user asked about the porch light. I should check the device \
+                 registry before claiming it exists.",
+                "",
+            )
+            .with_text("The porch light is off.");
+
+        // Display gate shut: nothing leaves as a frame.
+        assert!(
+            GooseAdapter::reasoning_frames(&msg, false).is_empty(),
+            "the display gate stopped gating"
+        );
+        // Count is taken anyway.
+        let counted = GooseAdapter::count_reasoning_tokens(&msg, &HeuristicTokenCounter);
+        assert!(
+            counted > 0,
+            "reasoning must be counted even when show_thinking is off; got {counted}"
+        );
+        // And it is the same number the gate-open case would produce.
+        assert_eq!(
+            counted,
+            GooseAdapter::count_reasoning_tokens(&msg, &HeuristicTokenCounter),
+            "the count depends on something other than the message"
+        );
+    }
+
+    /// A message with no thinking channel counts zero, not "some of the answer".
+    /// The failure this rules out is counting `as_concat_text()` by mistake,
+    /// which would double-report every ordinary turn as reasoning.
+    #[test]
+    fn answer_text_is_not_reasoning() {
+        use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
+        let msg = Message::assistant()
+            .with_text("A long and perfectly ordinary answer with no reasoning channel at all.");
+        assert_eq!(
+            GooseAdapter::count_reasoning_tokens(&msg, &HeuristicTokenCounter),
+            0
+        );
+    }
+
+    /// The wiring guard. The two tests above can both pass while the stream
+    /// counts inside the display gate — which is the exact regression that would
+    /// make the number meaningless on the shipped configuration. Asserted
+    /// structurally: the accumulation must appear ABOVE the `reasoning_frames`
+    /// loop, i.e. outside it, and must not mention `emit_reasoning`.
+    #[test]
+    fn the_reasoning_count_is_taken_outside_the_display_gate() {
+        let src = include_str!("goose_agent.rs");
+        let body = src.split("mod tests").next().unwrap_or(src);
+        let lines = stream_body_code();
+
+        // Re-anchored on the coalescer push. The old anchor was the
+        // `for content in Self::reasoning_frames(&msg, emit_reasoning)` line,
+        // which this phase deleted — and it was `.expect()`ed, so the guard
+        // would have PANICKED rather than reported anything useful.
+        let gate_line = lines
+            .iter()
+            .position(|l| l.contains("reasoning.push(&msg, emit_reasoning)"))
+            .expect("the gated push is gone; the P1 guard should have caught this first");
+
+        let window = &lines[gate_line.saturating_sub(8)..gate_line];
+        window
+            .iter()
+            .position(|l| l.contains("Self::count_reasoning_tokens(&msg,"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the reasoning token count is not taken in the eight lines before the \
+                     display gate. If it moved inside `for content in reasoning_frames(..)`, \
+                     the count is now zero whenever show_thinking is off — which is the \
+                     shipped default, so every Jetson turn would report no thinking."
+                )
+            });
+        // The WHOLE window, not just the line the call sits on. The original
+        // guard checked only `window[count_line]`, so the most natural form of
+        // this regression — wrapping the accumulation in `if emit_reasoning {`
+        // on the PRECEDING line — passed green, as did a `let gated = ...`
+        // computed above it. Both were demonstrated by a reviewer against this
+        // exact test.
+        //
+        // Worth stating plainly, because it is what makes the regression
+        // invisible rather than merely wrong: `chat.rs::stream_response_inner`
+        // builds its `AgentRequest` with `voice_mode: true` unconditionally, and
+        // that is the ONLY path that persists the count. So on `run_chat`,
+        // `emit_reasoning` is always false — a gated count would write
+        // `Some(0)` for 100% of the corpus PAI-5 P5 reads, and every test that
+        // checks the pure counter would still pass.
+        for line in window {
+            assert!(
+                !line.contains("emit_reasoning"),
+                "the reasoning accumulation is now conditioned on emit_reasoning \
+                 (`{}`); the cost of a turn must not depend on whether anybody is \
+                 watching. On the only path that persists this number the flag is \
+                 always false, so this reports every turn as having done no thinking.",
+                line.trim()
+            );
+        }
+        assert!(
+            body.contains("turn_stats.reasoning_tokens.get_or_insert(0)"),
+            "the count no longer accumulates into TurnStats, so nothing downstream sees it"
+        );
+        // The carry-out. Accumulating into `TurnStats` and then building
+        // `UsageStats` with a literal `None` is this phase's own named failure
+        // mode ("produced, reaches Done, and is dropped") and it was unguarded:
+        // a reviewer replaced BOTH arms with `None` and all 108 tests passed.
+        // There are two arms because the usage build has a reported-usage path
+        // and a fallback path; a regression that fixes only one is worse than
+        // one that fixes neither, because it depends on the provider.
+        assert_eq!(
+            body.matches("reasoning_tokens: turn_stats.reasoning_tokens,")
+                .count(),
+            2,
+            "both UsageStats arms must carry the counted reasoning out of the stream. \
+             A literal `None` in either one drops the number on the providers that take \
+             that path, and every unit test here still passes because they all call the \
+             pure counter."
+        );
+    }
+
+    /// The re-engagement count is only true if every exit from `'attempts`
+    /// passes through it.
+    ///
+    /// Structural, and it has to be: the counter lives inside a several-hundred
+    /// line `async_stream` that needs a real goose `Agent`, a provider and a
+    /// model to drive. What can be checked without one is the property that
+    /// actually breaks — placement. `'attempts` has three exits (answered,
+    /// budget spent, and the ordinary fallthrough), so an assignment written
+    /// one line too early is skipped by two of them and reports 0 for exactly
+    /// the turns worth counting: the ones that went silent.
+    ///
+    /// This is the same shape as the reasoning-count guard above it. That count
+    /// was produced correctly, reached `Done`, and was dropped on the way out;
+    /// a reviewer replaced both carry-out arms with `None` and all 108 tests
+    /// passed. A number nobody guards the wiring of is a number that quietly
+    /// becomes zero.
+    #[test]
+    fn the_re_engagement_count_is_taken_after_every_exit_from_the_attempts_loop() {
+        let lines = stream_body_code();
+
+        let assign = lines
+            .iter()
+            .position(|l| l.contains("turn_stats.reengagements ="))
+            .expect(
+                "nothing assigns `turn_stats.reengagements`. The empty-turn recovery is \
+                 unmeasured again: a re-engaged turn is the whole turn a second time, \
+                 prefill included, and without this the only trace is a WARN.",
+            );
+
+        // Assigned FROM the counter, not from a literal. `= 0` compiles, keeps
+        // this guard's first assertion green, and reports every turn as
+        // ordinary.
+        assert!(
+            lines[assign].contains("attempt"),
+            "`turn_stats.reengagements` is assigned from something other than the \
+             attempt counter (`{}`), so the field no longer says what the turn cost.",
+            lines[assign].trim()
+        );
+
+        let breaks: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("break 'attempts"))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            breaks.len() >= 2,
+            "expected the several exits from `'attempts` this guard is about; found {}. \
+             The loop has been reshaped and this test is now checking nothing.",
+            breaks.len()
+        );
+        let last_break = *breaks.last().unwrap();
+        assert!(
+            assign > last_break,
+            "`turn_stats.reengagements` is assigned at line {assign}, above the exit at \
+             line {last_break}. Every `break 'attempts` after the assignment skips it, and \
+             the turns that skip it are the silent ones -- so the count would read 0 for \
+             precisely the turns it exists to measure.",
+        );
+
+        // And before the stats are sealed, or the value never leaves.
+        let finalize = lines
+            .iter()
+            .position(|l| l.contains("turn_stats.finalize_rates()"))
+            .expect("the stream no longer finalizes its TurnStats");
+        assert!(
+            assign < finalize,
+            "the re-engagement count is assigned after `finalize_rates`, i.e. after the \
+             turn's stats have been sealed and sent.",
+        );
+    }
+
+    /// The completeness check must be armed per SESSION and from the RAW
+    /// request. Both halves are load-bearing and both fail silently.
+    ///
+    /// Structural for the same reason as the re-engagement guard: the call sits
+    /// inside an `async_stream` that needs a real goose `Agent`, a provider and
+    /// a model to drive. What can be checked without one is which method is
+    /// called and what is handed to it, and those are exactly the two things
+    /// that go wrong.
+    ///
+    /// **`set_goal` would be a cross-profile disclosure.** `AppState` bounds
+    /// concurrent chat streams with `Semaphore::new(4)` and all four share one
+    /// retained `Arc<GooseAgent>`, so the process-wide slot means one household
+    /// member's request text is injected into another member's turn as a user
+    /// message. The fork carries `set_session_goal` precisely so this host can
+    /// arm the check at all.
+    ///
+    /// **`turn_text` would restate household memories as a goal.** The
+    /// assembled text wraps the request in `<system-context>` carrying injected
+    /// memories, dormant-tool notes and the turn budget. The goal is echoed back
+    /// to the model as "check whether this has been fully met" — feeding it the
+    /// envelope would ask the model to satisfy the memories.
+    #[test]
+    fn the_goal_is_armed_per_session_and_from_the_raw_request() {
+        let lines = stream_body_code();
+
+        let armed = lines
+            .iter()
+            .position(|l| l.contains("set_session_goal("))
+            .expect(
+                "nothing arms the per-session goal. Goose's completeness check is guarded on a \
+                 goal being set, so without this the reply loop terminates when the model stops \
+                 asking for tools and never when the question was answered -- which on 2026-08-12 \
+                 was a ten-item query answered with zero tool calls and no objection.",
+            );
+
+        // A WINDOW, not the anchor line. The call spans several lines once the
+        // argument is built, and a single-line assertion silently stopped
+        // matching the moment the setting gate was added -- reporting "nothing
+        // arms the goal" while the goal was armed immediately below.
+        let window = lines[armed..(armed + 10).min(lines.len())].join("\n");
+
+        assert!(
+            window.contains("request.message"),
+            "the goal is armed from something other than the raw request. `turn_text` carries \
+             <system-context> with injected memories and the turn budget, and the goal is echoed \
+             back to the model as a thing to satisfy. Window:\n{window}"
+        );
+        assert!(
+            !window.contains("turn_text"),
+            "the goal is armed from `turn_text`, which is the assembled envelope rather than the \
+             request. Window:\n{window}"
+        );
+        assert!(
+            window.contains("goal_check_enabled"),
+            "the goal is armed unconditionally. It costs roughly twice the inferences per turn, \
+             so it rides `Settings::goal_check_enabled`. Window:\n{window}"
+        );
+
+        // The process-wide setter must not appear in the stream at all.
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                !line.contains(".set_goal("),
+                "line {i} calls the process-wide `set_goal` (`{}`). One retained agent serves up \
+                 to four concurrent chat streams, so that slot puts one member's request text \
+                 into another member's turn. Use `set_session_goal`.",
+                line.trim()
+            );
+        }
+
+        // Armed BEFORE the reply that reads it, or the first attempt runs unguarded.
+        let reply = lines
+            .iter()
+            .position(|l| l.contains("agent_clone.reply("))
+            .expect("the stream no longer calls agent_clone.reply");
+        assert!(
+            armed < reply,
+            "the goal is armed at line {armed}, after the reply at line {reply} that reads it.",
+        );
+    }
+
     // ── context window precedence ─────────────────────────────────────────
 
     /// The Jetson case that motivated `registry_context_size`: the device
@@ -3678,9 +6230,12 @@ mod tests {
     /// history the engine cannot hold, and llama.cpp truncates the prompt.
     #[test]
     fn a_pinned_local_context_outranks_a_larger_override() {
+        let r =
+            GooseAdapter::resolve_window_with("local", "gemma-4-E2B-it", 16384, Some(4096), None);
+        assert_eq!(r.tokens, 4096);
         assert_eq!(
-            GooseAdapter::resolve_context_window("local", "gemma-4-E2B-it", 16384, Some(4096)),
-            4096
+            r.source,
+            pond_core::models::services::context::context_governor::WindowSource::Registry
         );
     }
 
@@ -3688,14 +6243,16 @@ mod tests {
     /// override as the escape hatch, then the generous ceiling.
     #[test]
     fn an_unpinned_local_model_falls_back_to_override_then_ceiling() {
-        assert_eq!(
-            GooseAdapter::resolve_context_window("local", "gemma-4-E2B-it", 16384, None),
-            16384
-        );
-        assert_eq!(
-            GooseAdapter::resolve_context_window("local", "gemma-4-E2B-it", 0, None),
-            32768
-        );
+        use pond_core::models::services::context::context_governor::WindowSource;
+
+        let overridden =
+            GooseAdapter::resolve_window_with("local", "gemma-4-E2B-it", 16384, None, None);
+        assert_eq!(overridden.tokens, 16384);
+        assert_eq!(overridden.source, WindowSource::Override);
+
+        let ceiling = GooseAdapter::resolve_window_with("local", "gemma-4-E2B-it", 0, None, None);
+        assert_eq!(ceiling.tokens, 32768);
+        assert_eq!(ceiling.source, WindowSource::Heuristic);
     }
 
     /// HTTP providers have no registry to pin them; the model's own reported
@@ -3703,10 +6260,444 @@ mod tests {
     #[test]
     fn http_providers_are_unaffected_by_the_registry_rule() {
         assert_eq!(
-            GooseAdapter::resolve_context_window("ollama", "gemma4:e2b", 8192, None),
+            GooseAdapter::resolve_window_with("ollama", "gemma4:e2b", 8192, None, None).tokens,
             8192
         );
-        assert!(GooseAdapter::resolve_context_window("ollama", "gemma4:e2b", 0, None) > 0);
+        assert!(
+            GooseAdapter::resolve_window_with("ollama", "gemma4:e2b", 0, None, None).tokens > 0
+        );
+    }
+
+    /// PAI-3 P3b: the catalog value the adapter now reads has to actually reach
+    /// the governor. Before this phase every construction site passed `None`,
+    /// so `WindowSource::CatalogRecord` was a rung nothing in production could
+    /// produce, and an Ollama model whose real window `POST /api/show` had
+    /// already reported still got the 4,096 substring-match default.
+    #[test]
+    fn a_catalog_window_reaches_the_governor_from_the_adapter() {
+        use pond_core::models::services::context::context_governor::WindowSource;
+
+        // Without it: the name heuristic, which does not recognise this model.
+        let guessed =
+            GooseAdapter::resolve_window_with("ollama", "some-unknown-model", 0, None, None);
+        assert_eq!(guessed.tokens, 4096);
+        assert_eq!(guessed.source, WindowSource::Heuristic);
+
+        // With it: the catalog's number, tagged as such -- but BOUNDED, because
+        // ollama runs on this box. This asserted 131_072 when it was written,
+        // which was the same wrong belief three other tests held: that ollama is
+        // a hosted provider paying no local prefill. It serves over HTTP and
+        // runs here. f770f4de made rung 3 clamp anything `runs_on_this_device`,
+        // so the declared maximum is now held to UNPINNED_LOCAL_CEILING.
+        let known = GooseAdapter::resolve_window_with(
+            "ollama",
+            "some-unknown-model",
+            0,
+            None,
+            Some(131_072),
+        );
+        assert_eq!(
+            known.tokens, 32_768,
+            "a declared maximum is not an allocation, and ollama prefills locally"
+        );
+        assert_eq!(known.source, WindowSource::CatalogRecord);
+
+        // A hosted provider keeps the raw declared window: nothing on this box
+        // prefills it. This is the case rung 3 exists for, and it is what makes
+        // the assertion above a boundary rather than a blanket clamp.
+        let hosted = GooseAdapter::resolve_window_with("openai", "gpt-4o", 0, None, Some(131_072));
+        assert_eq!(hosted.tokens, 131_072);
+        assert_eq!(hosted.source, WindowSource::CatalogRecord);
+
+        // A registry pin still wins -- it is the allocation, the catalog value
+        // is the model's declared maximum.
+        let pinned = GooseAdapter::resolve_window_with(
+            "local",
+            "gemma-4-E2B-it",
+            0,
+            Some(4096),
+            Some(131_072),
+        );
+        assert_eq!(pinned.tokens, 4096);
+        assert_eq!(pinned.source, WindowSource::Registry);
+    }
+
+    /// A model catalog holding exactly one row, for the wiring test below.
+    struct StubCatalog {
+        record: Option<ModelRecord>,
+        /// Every id the adapter asked for, so the test can assert the id was
+        /// DERIVED correctly and not merely that a number came back.
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl StubCatalog {
+        fn holding(id: &str, context_length: Option<u32>) -> Self {
+            Self {
+                record: Some(ModelRecord {
+                    id: id.to_string(),
+                    category: ModelCategory::Ollama,
+                    name: "gemma4:e2b".to_string(),
+                    filename: None,
+                    description: String::new(),
+                    size_mb: 0,
+                    url: None,
+                    hf_id: None,
+                    ram_estimate_mb: None,
+                    recommended_role: None,
+                    context_length,
+                    quantization: None,
+                    asr_language: None,
+                    asr_size: None,
+                    tts_engine: None,
+                    tts_voice_name: None,
+                    config_filename: None,
+                    config_url: None,
+                    tts_url: None,
+                    sample_rate: None,
+                    downloaded: true,
+                    is_custom: false,
+                }),
+                asked: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelRepository for StubCatalog {
+        async fn list_all(&self) -> Result<Vec<ModelRecord>> {
+            Ok(self.record.clone().into_iter().collect())
+        }
+        async fn list_by_category(&self, _c: &ModelCategory) -> Result<Vec<ModelRecord>> {
+            Ok(vec![])
+        }
+        async fn get_by_id(&self, id: &str) -> Result<Option<ModelRecord>> {
+            self.asked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(id.to_string());
+            Ok(self.record.as_ref().filter(|r| r.id == id).cloned())
+        }
+        async fn upsert(&self, _m: &ModelRecord) -> Result<()> {
+            Ok(())
+        }
+        async fn set_downloaded(&self, _id: &str, _d: bool) -> Result<()> {
+            Ok(())
+        }
+        async fn list_assignments(
+            &self,
+        ) -> Result<Vec<pond_core::models::domain::model_record::ModelRoleAssignment>> {
+            Ok(vec![])
+        }
+        async fn get_assignment(
+            &self,
+            _r: &str,
+        ) -> Result<Option<pond_core::models::domain::model_record::ModelRoleAssignment>> {
+            Ok(None)
+        }
+        async fn set_assignment(&self, _r: &str, _m: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn clear_assignment(&self, _r: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The wiring, not the precedence.
+    ///
+    /// PAI-3 P3 landed the data and left every `ContextInputs` construction site
+    /// passing `catalog_context_length: None`, so rung 3 was a rung nothing in
+    /// production could produce and every test of it passed the value in by
+    /// hand. This one goes through the repository the adapter actually holds:
+    /// break the lookup — hardcode `None`, derive the wrong id, drop the
+    /// `with_model_repo` plumbing — and it fails.
+    #[tokio::test]
+    async fn the_adapter_reads_the_catalog_it_was_given() {
+        use pond_core::models::services::context::context_governor::WindowSource;
+
+        // No catalog: the name heuristic answers, and for gemma 4 it answers
+        // 128,000 -- a round number somebody typed, not a number the model
+        // declares.
+        let blind = GooseAdapter::resolve_window_from(None, "ollama", "gemma4:e2b", 0, None).await;
+        assert_eq!(blind.tokens, 128_000);
+        assert_eq!(blind.source, WindowSource::Heuristic);
+
+        // A model the heuristic does not recognise at all gets the
+        // conservative default -- this is the case rung 3 rescues.
+        let unknown =
+            GooseAdapter::resolve_window_from(None, "ollama", "some-unknown-model", 0, None).await;
+        assert_eq!(unknown.tokens, 4096);
+        assert_eq!(unknown.source, WindowSource::Heuristic);
+
+        // With the catalog: the row IS read, and then bounded. Ollama's
+        // `model_info` reports 131,072 and the governor holds an on-device
+        // provider to UNPINNED_LOCAL_CEILING, because a declared maximum is not
+        // an allocation (f770f4de).
+        //
+        // 32,768 still cannot be reached by the fallback path -- the heuristic
+        // for this model is 128,000 -- so this assertion keeps the anti-vacuity
+        // property it was written for, and `source` pins it besides. That
+        // mattered: the value changed and the reason the test exists did not.
+        let catalog: Arc<dyn ModelRepository> =
+            Arc::new(StubCatalog::holding("ollama/gemma4:e2b", Some(131_072)));
+        let seen =
+            GooseAdapter::resolve_window_from(Some(&catalog), "ollama", "gemma4:e2b", 0, None)
+                .await;
+        assert_eq!(
+            seen.tokens, 32_768,
+            "the catalog row's context_length never reached the governor"
+        );
+        assert_eq!(seen.source, WindowSource::CatalogRecord);
+
+        // The id has to be derived the way the catalog stores it -- category,
+        // not provider. A lookup that asks for the wrong key returns None and
+        // degrades SILENTLY to the heuristic, so assert the key, not just the
+        // answer. "local" and "ollama" are different provider strings that must
+        // reach different categories.
+        let stub = Arc::new(StubCatalog::holding("ollama/gemma4:e2b", Some(131_072)));
+        let probe: Arc<dyn ModelRepository> = stub.clone();
+        let _ =
+            GooseAdapter::resolve_window_from(Some(&probe), "ollama", "gemma4:e2b", 0, None).await;
+        let _ = GooseAdapter::resolve_window_from(Some(&probe), "local", "gemma-4-E2B-it", 0, None)
+            .await;
+        assert_eq!(
+            stub.asked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            ["ollama/gemma4:e2b", "gguf/gemma-4-E2B-it"],
+            "the catalog id must be derived from the CATEGORY the row is keyed by"
+        );
+
+        // A registry pin short-circuits the catalog read entirely: rung 2 wins,
+        // so the row is never fetched.
+        let counting = Arc::new(StubCatalog::holding("gguf/gemma-4-E2B-it", Some(131_072)));
+        let counting_port: Arc<dyn ModelRepository> = counting.clone();
+        let pinned = GooseAdapter::resolve_window_from(
+            Some(&counting_port),
+            "local",
+            "gemma-4-E2B-it",
+            0,
+            Some(4096),
+        )
+        .await;
+        assert_eq!(pinned.tokens, 4096);
+        assert_eq!(pinned.source, WindowSource::Registry);
+        assert!(
+            counting
+                .asked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "a pinned registry size must not pay for a catalog read it will discard"
+        );
+    }
+
+    /// The regression guard for PAI-3 P1: the budget paths must not recover the
+    /// context window from the process environment. `GOOSE_CONTEXT_LIMIT` is
+    /// still WRITTEN (it flows into Ollama's `options.num_ctx`), but nothing in
+    /// this adapter may read it back — that indirection is what let a Jetson
+    /// budget history against a phantom 8192.
+    #[test]
+    fn no_budget_path_reads_the_context_limit_from_the_environment() {
+        let src = include_str!("goose_agent.rs");
+        let body = src.split("mod tests").next().unwrap_or(src);
+        assert!(
+            !body.contains("env::var(\"GOOSE_CONTEXT_LIMIT\")"),
+            "context windows must come from ContextGovernor, not the environment"
+        );
+    }
+
+    // ── PAI-3 P5: the adapter builds ONE asymmetric profile per turn ─────
+
+    /// What `turn_profile` reads out of the ledger on a pond with nothing
+    /// delegating, which is every pond today. Named so these tests keep saying
+    /// what they are about — the two windows — rather than carrying a bare
+    /// `0.0` that reads like a tolerance.
+    const NO_LIVE_CHILD: f32 = 0.0;
+
+    /// What `turn_profile` reads out of the message store on a pond that has
+    /// not measured any reasoning -- which is every pond until `show_thinking`
+    /// is on and a model that reasons has run. PAI-5 P5's derivation floors at
+    /// the anchor, so this must reproduce the pre-P5 profile exactly, and
+    /// `an_unmeasured_pond_gets_exactly_the_profile_it_got_before_pai_5_p5`
+    /// asserts that rather than leaving it to these constants to imply.
+    const NO_REASONING_HISTORY: &[u32] = &[];
+
+    /// PAI-5 P5's wiring guard, and it is the one that matters: the derivation
+    /// is unit-tested in pond-core, but nothing there can see whether the
+    /// ADAPTER passes the anchor as the floor or, say, passes zero -- which
+    /// would compile, and would let a quiet pond talk its own reserve down to
+    /// nothing and resume ending conversations mid-generation.
+    #[test]
+    fn an_unmeasured_pond_gets_exactly_the_profile_it_got_before_pai_5_p5() {
+        for window in [4_096usize, 8_192, 32_768] {
+            let unmeasured = GooseAdapter::profile_for("local", window, NO_LIVE_CHILD, &[]);
+            let anchor = pond_core::models::services::context::context_budget::CompactionProfile::for_windows(
+                window,
+                ContextGovernor::prompt_window("local", window),
+            );
+            assert_eq!(
+                unmeasured.output_reserve_tokens, anchor.output_reserve_tokens,
+                "at window {window} an unmeasured pond's reserve moved. P5 must be inert until                  there is evidence, or every install changes behaviour on upgrade for no reason"
+            );
+        }
+    }
+
+    /// And the other direction, without which the test above is satisfied by a
+    /// feature that does nothing at all.
+    #[test]
+    fn a_pond_that_reasons_expensively_gets_a_bigger_reserve_than_the_anchor() {
+        let unmeasured = GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD, &[]);
+
+        // The sample cost is derived from the anchor rather than written down.
+        // The first draft used a flat 900, and at this window two times that
+        // quantises to exactly the anchor -- so the test failed for a true
+        // reason that had nothing to do with the wiring it was checking.
+        // Sizing off the anchor keeps it meaningful if the curve moves.
+        let dear: Vec<u32> = vec![unmeasured.output_reserve_tokens as u32; 40];
+        let measured = GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD, &dear);
+
+        assert!(
+            measured.output_reserve_tokens > unmeasured.output_reserve_tokens,
+            "40 turns of {}-token reasoning did not move the reserve ({} vs {}). The adapter is \
+             not passing the samples through, and that is invisible from pond-core -- the \
+             derivation's own tests would all still pass",
+            unmeasured.output_reserve_tokens,
+            measured.output_reserve_tokens,
+            unmeasured.output_reserve_tokens
+        );
+    }
+
+    /// The wiring guard. `for_windows` is unit-tested in pond-core; what this
+    /// asserts is that the adapter hands it the two windows the right way round,
+    /// which is the half that cannot be checked from inside pond-core and the
+    /// half that used to be four call sites remembering (or not) to clamp.
+    #[test]
+    fn a_local_turn_budgets_history_from_the_window_and_the_preamble_from_the_clamp() {
+        // A Mac that resolved 32,768: four times the KV cache of the clamp.
+        let big = GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD, NO_REASONING_HISTORY);
+        let clamped =
+            GooseAdapter::profile_for("local", 8_192, NO_LIVE_CHILD, NO_REASONING_HISTORY);
+
+        // Preamble: frozen at the clamp's allowance. If this grows, TTFT grows
+        // with it on every single turn, because it is the KV prefix.
+        assert_eq!(big.system_prompt_budget, clamped.system_prompt_budget);
+        assert_eq!(big.memory_token_budget, clamped.memory_token_budget);
+        assert_eq!(big.max_memory_fragments, clamped.max_memory_fragments);
+        assert!(
+            big.use_compact_prompt(),
+            "a 32K KV cache selected the verbose prompt tier on a local provider"
+        );
+
+        // History: scaled with the real window, and it took the tokens the
+        // preamble was not allowed to have.
+        assert_eq!(big.context_window_tokens, 32_768);
+        assert_eq!(big.history_token_budget, 24_000);
+        assert!(big.history_token_budget > clamped.history_token_budget);
+    }
+
+    /// PAI-6 P4's half of the same wiring question.
+    ///
+    /// pond-core proves that `CompactionProfile::with_history_reserved` moves
+    /// history and nothing else; this proves the ADAPTER applies it that way
+    /// rather than by scaling the window it resolves — which is the
+    /// implementation that compiles, reads well, re-derives every preamble
+    /// allowance, and moves the KV prefix. Delegating would then cost the
+    /// parent a full re-prefill on its next turn, which is the opposite of the
+    /// context isolation the whole workstream is justified by.
+    #[test]
+    fn a_live_child_shrinks_the_parents_history_and_leaves_its_prefix_alone() {
+        let alone = GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD, NO_REASONING_HISTORY);
+        let sharing = GooseAdapter::profile_for("local", 32_768, 0.5, NO_REASONING_HISTORY);
+
+        assert!(
+            sharing.history_token_budget < alone.history_token_budget,
+            "a live child did not shrink the parent's history budget: {} vs {}",
+            sharing.history_token_budget,
+            alone.history_token_budget
+        );
+        assert_eq!(
+            sharing.context_window_tokens, alone.context_window_tokens,
+            "the resolved window moved, so the reservation was applied by scaling the window - \
+             which re-derives every preamble allowance and moves the KV prefix"
+        );
+        assert_eq!(
+            sharing.prompt_window_tokens, alone.prompt_window_tokens,
+            "the prompt-side clamp moved under a reservation"
+        );
+        assert_eq!(
+            sharing.system_prompt_budget, alone.system_prompt_budget,
+            "the system prompt allowance moved under a reservation, so the preamble is rebuilt \
+             at a different size and the parent pays a re-prefill for having delegated"
+        );
+        assert_eq!(
+            sharing.memory_token_budget, alone.memory_token_budget,
+            "the memory allowance moved under a reservation"
+        );
+        assert_eq!(
+            sharing.use_compact_prompt(),
+            alone.use_compact_prompt(),
+            "the prompt tier flipped under a reservation"
+        );
+    }
+
+    /// The SEAM between the ledger and the profile, which had no behavioural
+    /// guard at all — only a grep for `reserved_fraction(`, which any key
+    /// expression satisfies.
+    ///
+    /// A reservation is filed under the GIAP session id. Reading it back under
+    /// a derived one — `goose-{id}`, or the output of `resolve_goose_session`,
+    /// which is the mix-up this codebase has already made once — returns 0.0
+    /// for every session on the pond, so a live child shrinks nothing and both
+    /// agents budget as though they owned the whole window. That is invisible
+    /// in production: the number is right, it is just always the number for a
+    /// session that does not exist.
+    #[test]
+    fn a_parents_budget_shrinks_for_its_own_sessions_children_and_for_nobody_elses() {
+        let ledger = Arc::new(crate::orchestrator::DeviceLedger::default());
+        let _child = ledger.reserve("sess-A", 0.5);
+
+        let delegating = GooseAdapter::profile_for_session(
+            &ledger,
+            "local",
+            32_768,
+            "sess-A",
+            NO_REASONING_HISTORY,
+        );
+        let bystander = GooseAdapter::profile_for_session(
+            &ledger,
+            "local",
+            32_768,
+            "sess-B",
+            NO_REASONING_HISTORY,
+        );
+
+        assert!(
+            delegating.history_token_budget < bystander.history_token_budget,
+            "a session with a live child budgeted {} history tokens and a session with none \
+             budgeted {}; the reservation is being looked up under a key nothing writes, so \
+             every parent on this pond reads 0.0 whatever its children are holding",
+            delegating.history_token_budget,
+            bystander.history_token_budget
+        );
+        assert_eq!(
+            bystander.history_token_budget,
+            GooseAdapter::profile_for("local", 32_768, NO_LIVE_CHILD, NO_REASONING_HISTORY)
+                .history_token_budget,
+            "a session with no live child of its own was charged for somebody else's, so the \
+             lookup is not keyed by session at all"
+        );
+    }
+
+    /// HTTP providers pay no local prefill, so nothing is clamped and nothing is
+    /// redistributed — the symmetric profile, unchanged from before this phase.
+    #[test]
+    fn an_http_turn_is_not_clamped_at_all() {
+        let p = GooseAdapter::profile_for("ollama", 32_768, NO_LIVE_CHILD, NO_REASONING_HISTORY);
+        assert_eq!(p.system_prompt_budget, 6_000);
+        assert_eq!(p.memory_token_budget, 1_500);
+        assert_eq!(p.history_token_budget, 20_000);
+        assert!(!p.use_compact_prompt());
     }
 
     // ── F1: image attachment onto the user message ───────────────────────
@@ -3906,6 +6897,9 @@ mod tests {
             role: pond_core::models::services::context::turn_trimmer::TrimRole::User,
             text: text.to_string(),
             is_summary: false,
+            // The image cap is age-blind: it runs AFTER `trim_history` over
+            // whatever survived, and its policy lives in `image_history`.
+            age_secs: None,
         }
     }
 
@@ -4602,6 +7596,8 @@ mod tests {
             images: Vec::new(),
             voice_mode: false,
             canvas_mode: false,
+            profile_scope: ProfileScope::Household,
+            profile_context: None,
         };
 
         let mut stream = adapter.chat_stream(request).await.unwrap();

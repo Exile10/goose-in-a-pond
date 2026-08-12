@@ -152,7 +152,7 @@ These cost significant debugging time and are documented so you don't repeat the
 - `Agent.provider` is private — use `agent.update_provider(provider, session_id)`.
 - There is no `Role::System` in Goose — pass system content as the `system: &str` arg to `Provider::complete()`. `GooseProviderAdapter` already handles this.
 - `GooseMessage.created` is a Unix timestamp (`i64`), not `DateTime<Utc>` — use `DateTime::from_timestamp(msg.created, 0)`.
-- `SessionManager::instance()` uses a global singleton — use `GooseSessionAdapter::with_data_dir()` to isolate GIAP's storage.
+- `SessionManager::instance()` uses a global singleton whose backing store latches on first use — isolating GIAP's storage means winning that race, not wrapping the singleton after the fact. `pin_goose_state_under()` in `crates/pond-server/src/main.rs` does it: it sets `GOOSE_PATH_ROOT` to `<POND_DATA_DIR>/engine` as the first statement of `async_main`, before Goose's `SESSION_STORAGE` `LazyLock` ever resolves `Paths::data_dir()`. (A `SessionStorage` adapter over `SessionManager` was tried and abandoned unwired — it mapped `profile_id: None` and `title: Some(gs.name)`, silently dropping every PAI-1/PAI-3 field, so it would have been the wrong fix even wired.)
 
 ---
 

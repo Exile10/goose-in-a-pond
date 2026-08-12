@@ -61,8 +61,16 @@ rmcp = { version = "=1.5.0", features = ["schemars", "auth", "server", "client",
 # These entries mirror goose/Cargo.toml [workspace.dependencies]. Where a GIAP
 # crate needs default features goose turns off, the entry here is the union —
 # extra features are additive and harmless. Where goose moved to a new MAJOR a
-# pond crate is not ready for (rand, sha2, thiserror, dirs, tower-http), the
-# key holds goose's version and the pond crate pins its own version directly.
+# pond crate is not ready for (rand, sha2, thiserror), the key holds goose's
+# version and the pond crate pins its own version directly.
+#
+# `dirs` and `tower-http` used to be on that list and are not any more: both were
+# bumped and both compile, so the pins were stale rather than load-bearing. Note
+# that moving `pond-api` onto the workspace `tower-http` did NOT collapse the
+# 0.6/0.7 duplicate — 0.6.10 arrives transitively through
+# `reqwest 0.12 -> oauth2 -> goose`, so it goes when `reqwest` can move, and
+# `reqwest` is pinned by `fastembed = "=5.16.0" -> hf-hub 0.5`. The change is
+# still worth keeping: one fewer literal pin to drift.
 agent-client-protocol-schema = { version = "1.1", default-features = false, features = ["unstable"] }
 agent-client-protocol = { version = "1.0", default-features = false }
 agent-client-protocol-http = { version = "1.0", default-features = false, features = ["server", "unstable_cancel_request"] }
@@ -96,7 +104,9 @@ llama-cpp-sys-2 = { version = "=0.1.146", default-features = false }
 icu_calendar = { version = "=2.1.1", default-features = false }
 icu_locale = { version = "=2.1.1", default-features = false }
 winapi = { version = "0.3.9", features = ["wincred", "std"] }
-# zip v8 for goose; pond-server pins zip = "2" directly in its own Cargo.toml
+# zip v8 for goose; pond-server resolves the same v8 via workspace = true (it
+# used to pin zip = "2" directly, which put two zip majors in the graph for
+# no reason — nothing in pond-server's own zip usage needed the old major).
 zip = { version = "^8.0", default-features = false, features = ["deflate"] }
 anyhow = "1.0"
 async-stream = "0.3"
@@ -104,8 +114,19 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["http2"] }
 base64 = "0.22.1"
 bytes = "1"
+# Secret-store encryption (PAI-2 P4). Already in Cargo.lock at 0.10.1 via
+# nostr under the goose submodule, so this adds no download and no new C
+# toolchain requirement on a Jetson build. Default features are wanted:
+# `alloc` for the Vec-returning Aead methods and `getrandom` for aead::OsRng,
+# which resolves to rand_core 0.6 and so matches pond-infra's pinned rand 0.8.
+chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
-croner = "2.2"
+# Must track the croner that `tokio-cron-scheduler` resolves, because both parse
+# the same stored expression for different purposes: this one computes the
+# `next_run` the UI shows, the scheduler's decides when the job actually fires.
+# They were a MAJOR apart (2.x here, 3.x inside the scheduler), so a expression
+# the two read differently would display one time and fire at another.
+croner = "3.0"
 clap = { version = "4", features = ["derive"] }
 dirs = { version = "6", default-features = false }
 dotenvy = "0.15"
@@ -151,7 +172,12 @@ uuid = { version = "1.23", features = ["v4"] }
 webbrowser = "1.0"
 which = { version = "8", features = ["real-sys"] }
 wiremock = "0.6"
-tokio-cron-scheduler = "0.14"
+# Matches the version `goose/crates/goose/Cargo.toml` declares for itself. At
+# 0.14 the two resolved side by side, and each brought its own `croner` MAJOR
+# (2.x and 3.x) — two cron parsers, in one process, reading the same
+# user-authored expressions out of the same table, free to disagree about what
+# "0 0 * * SUN" means. Keep this in step with goose's declaration.
+tokio-cron-scheduler = "0.15"
 serial_test = "3.2.0"
 test-case = "3.3.1"
 assert_cmd = "2"

@@ -2,9 +2,10 @@
 //!
 //! Provides 4 tools: `get_exchange_rate` (Frankfurter), `convert_currency` (Frankfurter),
 //! `get_stock_quote` (Finnhub), `get_crypto_price` (CoinGecko).
-//! Depends on a `reqwest::Client` for HTTP fetches and `SettingsRepository` for API keys.
+//! Depends on a `reqwest::Client` for HTTP fetches. The Finnhub API key comes
+//! from the pond's `SecretRepository` via `crate::secrets` — never from
+//! `Settings`, which `GET /api/v1/settings` serialises wholesale (PAI-2 P2).
 
-use pond_core::user_data::ports::settings::SettingsRepository;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -16,7 +17,6 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::sync::Arc;
 
 // ── Parameter structs ──────────────────────────────────────────────────────
 
@@ -85,20 +85,15 @@ const DEFAULT_TARGET_CURRENCIES: &str = "EUR,GBP,JPY,KES,CHF,CAD,AUD";
 #[derive(Clone)]
 pub struct FinanceMcpServer {
     http_client: reqwest::Client,
-    settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
     #[allow(dead_code)] // accessed by rmcp's generated tool_handler code
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl FinanceMcpServer {
-    pub fn new(
-        http_client: reqwest::Client,
-        settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
-    ) -> Self {
+    pub fn new(http_client: reqwest::Client) -> Self {
         Self {
             http_client,
-            settings_repo,
             tool_router: Self::tool_router(),
         }
     }
@@ -340,30 +335,16 @@ impl FinanceMcpServer {
             }
         };
 
-        // 2. Read Finnhub API key from settings
-        let settings = match self.settings_repo.get().await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[finance] failed to load settings: {e}");
-                return Ok(CallToolResult::success(vec![Content::text(
-                    crate::format::format_api_error("Stock quotes", "settings unavailable"),
-                )]));
-            }
-        };
+        // 2. Finnhub API key — from the secret store (PAI-2 P2). A missing
+        //    key is not an error; the tool degrades to the keyless Yahoo
+        //    fallback, which is also what happens when no entry point
+        //    installed a secret store.
+        let finnhub_key = crate::secrets::secret("FINNHUB_API_KEY")
+            .await
+            .filter(|k| !k.trim().is_empty());
 
-        let has_finnhub_key = settings
-            .api_key_finnhub
-            .as_ref()
-            .is_some_and(|k| !k.trim().is_empty());
-
-        if has_finnhub_key {
-            let api_key = settings
-                .api_key_finnhub
-                .as_ref()
-                .unwrap()
-                .trim()
-                .to_string();
-            return self.get_stock_quote_finnhub(&api_key, &symbol).await;
+        if let Some(api_key) = finnhub_key {
+            return self.get_stock_quote_finnhub(api_key.trim(), &symbol).await;
         }
 
         // Fallback: Yahoo Finance v8 unofficial (no API key required)
@@ -1010,26 +991,22 @@ use tokio::io::DuplexStream;
 
 struct FinanceDeps {
     http_client: reqwest::Client,
-    settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
 }
 
 static FINANCE_DEPS: OnceLock<FinanceDeps> = OnceLock::new();
 
 /// Initialize finance server dependencies. Call once at startup.
-pub fn init_finance_deps(
-    http_client: reqwest::Client,
-    settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
-) {
-    let _ = FINANCE_DEPS.set(FinanceDeps {
-        http_client,
-        settings_repo,
-    });
+///
+/// No settings repository: the Finnhub key comes from the secret store,
+/// installed separately by `init_secret_deps` (PAI-2 P2).
+pub fn init_finance_deps(http_client: reqwest::Client) {
+    let _ = FINANCE_DEPS.set(FinanceDeps { http_client });
 }
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_finance_server(reader: DuplexStream, writer: DuplexStream) {
     let deps = FINANCE_DEPS.get().expect("init_finance_deps() not called");
-    let server = FinanceMcpServer::new(deps.http_client.clone(), deps.settings_repo.clone());
+    let server = FinanceMcpServer::new(deps.http_client.clone());
     tokio::spawn(async move {
         match server.serve((reader, writer)).await {
             Ok(running) => {

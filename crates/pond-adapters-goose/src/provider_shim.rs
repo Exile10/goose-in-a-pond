@@ -68,6 +68,20 @@ pub struct SessionControls {
     /// Exact (prefixed) tool names allowed for this session. `None` disables
     /// tool filtering entirely.
     allowed_tools: Mutex<Option<HashSet<String>>>,
+    /// The complete system prompt this session owns, bypassing the
+    /// prefix-plus-appendices rebuild.
+    ///
+    /// PAI-6 P3. Set for SUBAGENT sessions only. Without it a child's prompt is
+    /// silently destroyed: the child's system prompt is the parent's static
+    /// prefix followed by GIAP's delegation envelope, so `enforce_system`'s
+    /// `incoming.starts_with(prefix)` matches, the rebuild throws the envelope
+    /// away and substitutes the GLOBAL extension appendix — and because the
+    /// rebuild "succeeded", the `system_appendix_dropped` warning does not fire
+    /// either. The envelope is where a child is told its turn budget, that it
+    /// cannot delegate, and the exact tool names it holds. Losing it silently is
+    /// the failure mode this programme keeps hitting: the gate looks enforced
+    /// while its input never arrives.
+    system_override: Mutex<Option<String>>,
 }
 
 impl SessionControls {
@@ -94,6 +108,22 @@ impl SessionControls {
 
     pub fn allowed_tools_snapshot(&self) -> Option<HashSet<String>> {
         self.allowed_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Declare that this session's system prompt is owned wholesale, so the
+    /// shim must deliver it verbatim rather than rebuilding it.
+    pub fn set_system_override(&self, system: Option<String>) {
+        *self
+            .system_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = system;
+    }
+
+    pub fn system_override_snapshot(&self) -> Option<String> {
+        self.system_override
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -202,6 +232,21 @@ impl ShimControls {
             .cloned()
     }
 
+    /// Drop a session's entry outright.
+    ///
+    /// PAI-6 P3. Every subagent run mints an entry, and this map evicts
+    /// OLDEST-FIRST regardless of whether an entry is live — so sixty-four
+    /// delegations would silently evict a long-running parent's allow-set, after
+    /// which that parent's turns become pass-through and a Guest's
+    /// `subtract_guest_denied_tools` result goes with them. A child's entry is
+    /// therefore released the moment its run ends rather than left to age out.
+    pub fn forget_session(&self, goose_session_id: &str) {
+        let mut map = self.sessions.write().unwrap_or_else(|e| e.into_inner());
+        if map.entries.remove(goose_session_id).is_some() {
+            map.order.retain(|id| id != goose_session_id);
+        }
+    }
+
     #[cfg(test)]
     fn tracked_sessions(&self) -> usize {
         self.sessions
@@ -212,15 +257,81 @@ impl ShimControls {
     }
 }
 
+/// The last minification, kept so an unchanged tool set is not re-minified on
+/// every provider call.
+///
+/// `input` is retained deliberately, and not just as a key: identity is compared
+/// by `Arc::ptr_eq` on each tool's `input_schema`, which is only sound while the
+/// pointers we compared against are still alive. Holding the inputs keeps those
+/// allocations from being freed and their addresses reused by a different
+/// schema, which is the one way pointer identity could lie. The clone is cheap —
+/// `Tool::input_schema` is an `Arc`, so this is a refcount bump per tool, not a
+/// copy of the schema.
+struct MinifyCache {
+    input: Vec<Tool>,
+    output: Option<Vec<Tool>>,
+}
+
+impl MinifyCache {
+    /// Whether `tools` is the same set, tool for tool, that produced `output`.
+    ///
+    /// Deliberately conservative: two structurally identical schemas behind
+    /// different allocations miss, and simply re-minify. A false miss costs one
+    /// minification; a false hit would send the model the wrong tool set.
+    fn matches(&self, tools: &[Tool]) -> bool {
+        self.input.len() == tools.len()
+            && self
+                .input
+                .iter()
+                .zip(tools)
+                .all(|(a, b)| a.name == b.name && Arc::ptr_eq(&a.input_schema, &b.input_schema))
+    }
+}
+
 /// Provider decorator enforcing GIAP's veto. See module docs.
 pub struct GiapProviderShim {
     inner: Arc<dyn Provider>,
     controls: Arc<ShimControls>,
+    /// Guarded by a plain `Mutex` rather than an async one: the critical section
+    /// is a pointer comparison and a `Vec` clone, and it never awaits.
+    minify_cache: Mutex<Option<MinifyCache>>,
 }
 
 impl GiapProviderShim {
     pub fn new(inner: Arc<dyn Provider>, controls: Arc<ShimControls>) -> Self {
-        Self { inner, controls }
+        Self {
+            inner,
+            controls,
+            minify_cache: Mutex::new(None),
+        }
+    }
+
+    /// `minify_tools`, memoised on the tool set it was last given.
+    ///
+    /// The uncached call ran on EVERY provider call, and it is not cheap for
+    /// something whose answer almost never changes: a deep
+    /// `(*t.input_schema).clone()` per tool, a recursive walk of `properties`,
+    /// `$defs`, `items`, `anyOf`, `oneOf` and `allOf`, a structural inequality
+    /// compare, and a second `Tool` clone — on the order of a thousand small
+    /// allocations per call, for a tool set that changes only when an extension
+    /// is added or a session's allow-set moves.
+    ///
+    /// Note the allow-set is NOT part of the key, and must not be: this runs on
+    /// the output of `enforce_tools`, so a narrowed set arrives here as a
+    /// different, shorter slice and misses on length alone. Keying on the
+    /// published allow-set instead would be wrong — `set_allowed_tools` carries
+    /// names only, and says nothing about the schemas.
+    fn minify_tools_cached(&self, tools: &[Tool]) -> Option<Vec<Tool>> {
+        let mut cache = self.minify_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cache.as_ref().filter(|c| c.matches(tools)) {
+            return hit.output.clone();
+        }
+        let output = minify_tools(tools);
+        *cache = Some(MinifyCache {
+            input: tools.to_vec(),
+            output: output.clone(),
+        });
+        output
     }
 }
 
@@ -492,18 +603,52 @@ impl Provider for GiapProviderShim {
                     .clone(),
             )
         };
-        let (turn_apx, allowed) = match &session {
+        let (turn_apx, allowed, owned_system) = match &session {
             Some(s) => (
                 s.turn_appendix
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone(),
                 s.allowed_tools_snapshot(),
+                s.system_override_snapshot(),
             ),
-            None => (None, None),
+            None => (None, None, None),
         };
 
-        let enforced_system = enforce_system(system, &prefix, &[&turn_apx, &ext_apx]);
+        // PAI-6 P3. A session that owns its whole system prompt (a subagent)
+        // skips the prefix-plus-appendices rebuild entirely. Without this the
+        // rebuild throws away the delegation envelope -- the child's turn
+        // budget, its "you cannot delegate" rule and the exact tool names it
+        // holds -- and substitutes the GLOBAL extension appendix, which
+        // describes tools the child does not have. It matched silently, because
+        // a child's prompt starts with the same GIAP prefix the parent's does.
+        let enforced_system = match &owned_system {
+            Some(owned) => (owned.as_str() != system).then(|| owned.clone()),
+            None => enforce_system(system, &prefix, &[&turn_apx, &ext_apx]),
+        };
+
+        // The shim is the only thing that delivers GIAP's appendix now — the
+        // parallel `Agent::extend_system_prompt` calls are gone, because Goose
+        // rebuilt them into a block this function discards. That makes a
+        // pass-through here load-bearing rather than merely permissive: it means
+        // the incoming system did not start with GIAP's prefix, so the appendix
+        // is not being attached to anything.
+        //
+        // A pass-through with NO session appendix is the ordinary auxiliary call
+        // (compaction, model listing) and is silent. A pass-through that drops a
+        // real per-turn appendix is the failure this warns about: the prefix
+        // match is a byte comparison, and anything that perturbs the rendered
+        // prefix — a device or assistant name containing `{{`, which
+        // `sanitize_field` does not strip and the minijinja re-render will
+        // mangle — breaks it for that install and takes the skills with it.
+        if enforced_system.is_none() && turn_apx.is_some() && owned_system.is_none() {
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "system_appendix_dropped",
+                "this turn's prompt extras and skills were not delivered: the system prompt \
+                 did not match GIAP's prefix, so the shim passed it through unchanged"
+            );
+        }
         let stripped_messages = strip_turn_context(messages);
         // Phase F3: run AFTER the turn-context strip so the promoted carrier is
         // built from the messages the provider will actually receive.
@@ -521,7 +666,7 @@ impl Provider for GiapProviderShim {
             .unwrap_or(messages);
         let vetoed_tools = enforce_tools(tools, &allowed);
         // Minify AFTER the veto so we never pay for tools about to be dropped.
-        let minified_tools = minify_tools(vetoed_tools.as_deref().unwrap_or(tools));
+        let minified_tools = self.minify_tools_cached(vetoed_tools.as_deref().unwrap_or(tools));
         let final_tools: &[Tool] = minified_tools
             .as_deref()
             .or(vetoed_tools.as_deref())
@@ -882,6 +1027,105 @@ mod tests {
         assert!(minify_tools(&[clean]).is_none());
     }
 
+    // ── minification cache ─────────────────────────────────────────────────
+
+    /// A tool carrying the keys `minify_schema_object` strips, so the cached
+    /// answer is a `Some` rather than the less interesting `None`.
+    fn noisy_tool(name: &str) -> Tool {
+        Tool::new(
+            name.to_string(),
+            "desc".to_string(),
+            rmcp::object!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "title": "Params",
+                "type": "object",
+                "properties": { "q": { "type": "string", "title": "Query" } }
+            }),
+        )
+    }
+
+    fn shim_with(controls: ShimControls) -> GiapProviderShim {
+        // `Provider` requires only `get_name` and `stream`; the cache tests
+        // exercise neither, so both are left unreachable rather than mocked.
+        struct Unused;
+        #[async_trait::async_trait]
+        impl Provider for Unused {
+            fn get_name(&self) -> &str {
+                "unused"
+            }
+            async fn stream(
+                &self,
+                _: &goose_providers::model::ModelConfig,
+                _: &str,
+                _: &[Message],
+                _: &[Tool],
+            ) -> Result<goose::providers::base::MessageStream, ProviderError> {
+                unreachable!("the cache tests never reach the inner provider")
+            }
+        }
+        GiapProviderShim::new(Arc::new(Unused), Arc::new(controls))
+    }
+
+    #[test]
+    fn an_unchanged_tool_set_is_minified_once_and_then_replayed() {
+        let shim = shim_with(ShimControls::default());
+        let tools = vec![noisy_tool("giap-weather__get_current_weather")];
+
+        let first = shim
+            .minify_tools_cached(&tools)
+            .expect("minification fired");
+        let second = shim.minify_tools_cached(&tools).expect("cache hit");
+        assert_eq!(first, second);
+        // The stripped keys really are gone, so the cached value is the
+        // minified one and not a pass-through of the input.
+        assert!(first[0].input_schema.get("$schema").is_none());
+        assert!(first[0].input_schema.get("title").is_none());
+    }
+
+    /// The cache must key on the SCHEMAS, not the names. A narrowed allow-set
+    /// arrives here as a shorter slice, and a re-registered extension arrives as
+    /// the same names behind fresh allocations; both must miss rather than
+    /// replay a stale tool set to the model.
+    #[test]
+    fn a_different_tool_set_is_never_served_from_the_cache() {
+        let shim = shim_with(ShimControls::default());
+        let both = vec![
+            noisy_tool("giap-weather__get_current_weather"),
+            noisy_tool("giap-memory__recall_memories"),
+        ];
+        let narrowed = vec![noisy_tool("giap-weather__get_current_weather")];
+
+        let wide = shim.minify_tools_cached(&both).expect("minification fired");
+        assert_eq!(wide.len(), 2);
+
+        let narrow = shim
+            .minify_tools_cached(&narrowed)
+            .expect("minification fired");
+        assert_eq!(
+            narrow.len(),
+            1,
+            "the narrowed set was served from the cache"
+        );
+
+        // And back again, to prove the cache is replaced rather than appended.
+        let wide_again = shim.minify_tools_cached(&both).expect("minification fired");
+        assert_eq!(wide_again.len(), 2);
+    }
+
+    /// Same names, same schema CONTENT, different allocations. Pointer identity
+    /// makes this a miss, which is the conservative direction: it costs one
+    /// extra minification and can never serve the wrong schemas.
+    #[test]
+    fn structurally_equal_tools_behind_new_allocations_are_recomputed_not_replayed() {
+        let shim = shim_with(ShimControls::default());
+        let first_set = vec![noisy_tool("giap-weather__get_current_weather")];
+        let rebuilt = vec![noisy_tool("giap-weather__get_current_weather")];
+
+        let a = shim.minify_tools_cached(&first_set).expect("fired");
+        let b = shim.minify_tools_cached(&rebuilt).expect("fired");
+        assert_eq!(a, b, "a recompute must agree with the cached answer");
+    }
+
     // ── D1: session-keyed controls ─────────────────────────────────────────
 
     fn set(names: &[&str]) -> HashSet<String> {
@@ -1002,5 +1246,208 @@ mod tests {
         assert!(controls
             .existing_session(&format!("goose-{}", MAX_TRACKED_SESSIONS + 24))
             .is_some());
+    }
+
+    // ── PAI-6 P3 ────────────────────────────────────────────────────────────
+
+    /// Every subagent run mints an entry in a map that evicts oldest-first with
+    /// no regard for whether an entry is live. Releasing a child's entry when
+    /// its run ends is what stops a stream of delegations quietly taking a
+    /// long-running PARENT's allow-set with them — after which that parent's
+    /// turns are pass-through and a Guest's `subtract_guest_denied_tools`
+    /// result goes with them.
+    #[test]
+    fn releasing_children_keeps_a_live_parents_allow_set() {
+        let controls = ShimControls::default();
+        controls.session("parent").set_allowed_tools(
+            ["giap-weather__get_forecast".to_string()]
+                .into_iter()
+                .collect(),
+        );
+
+        for i in 0..(MAX_TRACKED_SESSIONS * 2) {
+            let child_id = format!("child-{i}");
+            controls
+                .session(&child_id)
+                .set_allowed_tools(HashSet::new());
+            controls.forget_session(&child_id);
+        }
+
+        let parent = controls
+            .existing_session("parent")
+            .expect("the parent's entry was evicted by children that had already finished");
+        assert_eq!(
+            parent.allowed_tools_snapshot(),
+            Some(
+                ["giap-weather__get_forecast".to_string()]
+                    .into_iter()
+                    .collect()
+            )
+        );
+        assert_eq!(controls.tracked_sessions(), 1);
+    }
+
+    /// Vacuity control for the test above: without the release the parent IS
+    /// evicted, so `forget_session` is doing the work rather than the cap
+    /// happening never to be reached.
+    #[test]
+    fn without_releasing_them_children_do_evict_a_live_parent() {
+        let controls = ShimControls::default();
+        controls.session("parent").set_allowed_tools(
+            ["giap-weather__get_forecast".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        for i in 0..(MAX_TRACKED_SESSIONS * 2) {
+            controls.session(&format!("child-{i}"));
+        }
+        assert!(
+            controls.existing_session("parent").is_none(),
+            "the map no longer evicts, so the test next door proves nothing"
+        );
+    }
+
+    #[test]
+    fn forgetting_one_session_leaves_the_others_alone() {
+        let controls = ShimControls::default();
+        controls.session("a");
+        controls.session("b");
+        controls.forget_session("a");
+        assert!(controls.existing_session("a").is_none());
+        assert!(controls.existing_session("b").is_some());
+        // Idempotent: releasing a child twice, or one that never existed, is
+        // not an error -- `release` runs on every path out of a run.
+        controls.forget_session("a");
+        controls.forget_session("never-existed");
+        assert_eq!(controls.tracked_sessions(), 1);
+    }
+
+    /// Captures what actually reached the inner provider.
+    ///
+    /// These two tests drive the REAL `Provider::stream`, not `enforce_system`,
+    /// because the subagent override is resolved inside `stream` and the direct
+    /// `enforce_system` tests above cannot see it. That distinction is the whole
+    /// point: the defect this fixes was invisible to every existing test for
+    /// exactly that reason.
+    struct Capturing {
+        seen: Arc<Mutex<Option<(String, Vec<String>)>>>,
+    }
+
+    #[async_trait]
+    impl Provider for Capturing {
+        fn get_name(&self) -> &str {
+            "capturing"
+        }
+        async fn stream(
+            &self,
+            _: &ModelConfig,
+            system: &str,
+            _: &[Message],
+            tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            *self.seen.lock().unwrap() = Some((
+                system.to_string(),
+                tools.iter().map(|t| t.name.to_string()).collect(),
+            ));
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    fn child_system_prompt() -> String {
+        format!(
+            "{PREFIX}\n\n# Delegated task\n\nYou have at most 4 turns.\n\
+             - You cannot delegate. There is no one below you.\n\
+             - Your only tools are: giap-weather__get_forecast.\n"
+        )
+    }
+
+    async fn stream_as(
+        session_id: &str,
+        controls: Arc<ShimControls>,
+        system: &str,
+    ) -> (String, Vec<String>) {
+        let seen = Arc::new(Mutex::new(None));
+        let shim = GiapProviderShim::new(Arc::new(Capturing { seen: seen.clone() }), controls);
+        let tools = vec![
+            Tool::new(
+                "giap-weather__get_forecast".to_string(),
+                "d".to_string(),
+                rmcp::object!({"type": "object"}),
+            ),
+            Tool::new(
+                "giap-memory__forget_memory".to_string(),
+                "d".to_string(),
+                rmcp::object!({"type": "object"}),
+            ),
+        ];
+        goose::session_context::with_session_id(Some(session_id.to_string()), async {
+            let _ = shim
+                .stream(&ModelConfig::new("m"), system, &[], &tools)
+                .await;
+        })
+        .await;
+        let captured = seen.lock().unwrap().clone();
+        captured.expect("the inner provider was never reached")
+    }
+
+    /// A child's system prompt is the parent's static prefix plus GIAP's
+    /// delegation envelope -- so `incoming.starts_with(prefix)` matches, and
+    /// without an override the rebuild throws the envelope away and splices in
+    /// the GLOBAL extension appendix instead. The envelope is where the child
+    /// is told its turn budget, that it cannot delegate, and the exact tools it
+    /// holds.
+    #[tokio::test]
+    async fn a_subagent_sessions_system_prompt_reaches_the_provider_intact() {
+        let controls = Arc::new(ShimControls::default());
+        controls.set_system_prefix(PREFIX.to_string());
+        controls.set_extension_appendix(Some("# MCP Extensions\n- music".to_string()));
+
+        let child_system = child_system_prompt();
+        let child = controls.session("child-1");
+        child.set_system_override(Some(child_system.clone()));
+        child.set_allowed_tools(
+            ["giap-weather__get_forecast".to_string()]
+                .into_iter()
+                .collect(),
+        );
+
+        let (system, tools) = stream_as("child-1", controls, &child_system).await;
+        assert_eq!(
+            system, child_system,
+            "the subagent's delegation envelope did not survive the shim"
+        );
+        assert!(
+            !system.contains("# MCP Extensions"),
+            "a child was told about extensions it does not have"
+        );
+        assert_eq!(
+            tools,
+            vec!["giap-weather__get_forecast".to_string()],
+            "the child's allow-set was not enforced at the provider, so a denied tool was \
+             LISTED to it even though dispatch would have refused the call"
+        );
+    }
+
+    /// Vacuity control, and the proof that the defect was real: the same child
+    /// prompt, the same session, with no override -- the envelope is destroyed
+    /// and the global appendix arrives in its place. If this ever stops
+    /// happening, the override has become decoration and the test above is
+    /// asserting nothing.
+    #[tokio::test]
+    async fn without_the_override_the_shim_destroys_a_childs_prompt() {
+        let controls = Arc::new(ShimControls::default());
+        controls.set_system_prefix(PREFIX.to_string());
+        controls.set_extension_appendix(Some("# MCP Extensions\n- music".to_string()));
+        // An entry exists -- this is not the pass-through path -- it simply
+        // does not claim to own its system prompt.
+        controls.session("child-1");
+
+        let child_system = child_system_prompt();
+        let (system, _) = stream_as("child-1", controls, &child_system).await;
+        assert!(
+            !system.contains("You cannot delegate"),
+            "the rebuild kept the envelope, so the override is not what preserves it"
+        );
+        assert!(system.contains("# MCP Extensions"));
     }
 }

@@ -47,6 +47,12 @@ impl OnboardingRepository for MockRepo {
     async fn reset(&self) -> anyhow::Result<()> {
         Ok(())
     }
+    // This fixture is a set-up pond, and since PAI-2 P7 that is what decides
+    // whether `PUT /settings` answers a caller with no token. See the token on
+    // the requests below.
+    async fn is_complete(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
 }
 
 struct MockDeviceRegistry;
@@ -87,10 +93,17 @@ async fn app() -> (axum::Router, tempfile::TempDir) {
     let session_storage: Arc<dyn pond_core::user_data::ports::session_storage::SessionStorage> =
         Arc::new(pond_infra::sqlite_session_storage::SqliteSessionStorage::new(db.system.clone()));
 
+    // PAI-2 P7: `PUT /settings` stops answering anonymous callers once the pond
+    // is set up, and this fixture IS a set-up pond -- `MockRepo` reports
+    // `Completed` and `skip_onboarding` is true. The token is what keeps these
+    // tests measuring the capture gate rather than the auth middleware.
+    let mock_hs = MockHandshake::new();
+    mock_hs.add_valid_token("test-token".to_string()).await;
+
     let state = Arc::new(AppState {
         db: Arc::new(db),
         onboarding_repo: Arc::new(MockRepo),
-        handshake: Arc::new(MockHandshake::new()),
+        handshake: Arc::new(mock_hs),
         whisper_url: "http://127.0.0.1:9000".to_string(),
         transcribe_audio: None,
         session_storage,
@@ -136,7 +149,6 @@ async fn app() -> (axum::Router, tempfile::TempDir) {
         notification_tx: tokio::sync::broadcast::channel(16).0,
         notification_queue: None,
         notification_sender: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
@@ -201,6 +213,7 @@ async fn put_mic_enabled(app: &axum::Router, value: bool) -> StatusCode {
                 .method("PUT")
                 .uri("/api/v1/settings")
                 .header("content-type", "application/json")
+                .header("Authorization", "Bearer test-token")
                 .body(Body::from(format!(r#"{{"mic_enabled": {value}}}"#)))
                 .unwrap(),
         )
@@ -265,6 +278,7 @@ async fn an_unrelated_settings_patch_leaves_the_microphone_alone() {
                 .method("PUT")
                 .uri("/api/v1/settings")
                 .header("content-type", "application/json")
+                .header("Authorization", "Bearer test-token")
                 .body(Body::from(r#"{"assistant_name": "Pond"}"#))
                 .unwrap(),
         )

@@ -21,6 +21,10 @@ chrono = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# A data format, not a framework. Agent roles (PAI-6) are stored inside the YAML
+# of an existing `agent_recipes` row, and the parse belongs in the domain: a
+# malformed narrowing block has to REFUSE, and that refusal is policy.
+serde_yaml = { workspace = true }
 tera = { workspace = true }
 thiserror = "1.0"
 tokio = { workspace = true }

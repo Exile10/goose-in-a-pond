@@ -27,7 +27,7 @@ use crate::user_data::domain::settings::Settings;
 
 /// Relevant per-user profile preferences to inject into the system prompt.
 /// Extracted from `Profile.preferences` by the API layer.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProfileContext {
     /// What the user wants to be called (e.g. "Jerry", "Captain").
     pub preferred_name: Option<String>,
@@ -70,10 +70,12 @@ pub struct PromptState {
     /// True when the model supports thinking/reasoning (Gemma 4, Qwen3, etc.)
     /// and thinking_mode is not "off".
     pub thinking_enabled: bool,
-    /// True when the effective context window is small enough that the system
+    /// True when the PROMPT-side context window is small enough that the system
     /// prompt should use a compact format (skip verbose tool descriptions and
     /// detailed instructions to save tokens).  Derived from
-    /// [`CompactionProfile::use_compact_prompt()`].
+    /// [`CompactionProfile::use_compact_prompt()`], which reads the clamped
+    /// prompt window rather than the full context window — growing the KV cache
+    /// must not buy a more verbose prefix.
     pub compact_prompt: bool,
     /// True when the provider injects the full tools JSON via the model's chat
     /// template (local llama.cpp native tool calling) — the template must then
@@ -90,38 +92,22 @@ pub struct PromptState {
     pub prefix_hash: Option<u64>,
 }
 
-/// Tool definitions shared between the system prompt template and the classifier.
-/// Returns a list of `(id, description)` pairs. Content is static.
-pub fn giap_tool_definitions() -> &'static [(&'static str, &'static str)] {
-    &[
-        ("wikipedia", "Look up ANY factual, conceptual, or encyclopedic information. Use for: people, places, events, science, history, geography, technology, definitions, concepts, comparisons (\"compare X and Y\"), \"what is X\", \"how does X work\", \"what is the difference between X and Y\", cultural topics, organizations, species, diseases, inventions, wars, countries, languages — anything where accurate, detailed knowledge matters. ALWAYS prefer this over guessing from memory. When in doubt, look it up."),
-        ("weather", "Get current weather or multi-day forecast for any location. Supports 'location' param (e.g. 'Kisumu', 'London') — omit for the user's default. Use get_current_weather for now, get_weather_forecast for upcoming days. Use when the user asks about weather, temperature, forecast, rain, or whether to bring an umbrella."),
-        ("save_memory", "Save information the user wants remembered for later (preferences, facts about themselves, important dates, notes). Use when the user says 'remember', 'don't forget', 'save this', 'note that', or states a personal preference or fact about themselves."),
-        ("recall_memory", "Search saved memories for previously stored information. Use when the user asks 'do you remember', 'what did I say about', or references something they told you before, or asks about their own preferences/history."),
-        ("devices", "List or check status of registered smart home devices. Use when the user asks about their devices, what's connected, or home automation status."),
-        ("schedules", "List scheduled tasks and automations. Use when the user asks about their schedules, reminders, or timed tasks."),
-        ("create_schedule", "Create a new scheduled automation that runs a prompt at a recurring time. Use when the user wants to schedule something, set up a recurring task, or says 'every morning', 'every day at', 'schedule to', 'remind me every', 'at 10 am do'."),
-        ("time", "Get the current date, time, and timezone. Use when the user asks 'what time is it', 'what's today's date', or needs the current time/date for any reason."),
-        ("system_info", "Get system information including OS, hostname, memory usage, and disk space. Use when the user asks about their system, available RAM, disk usage, hardware info, or system specs."),
-        ("notification", "Send a desktop notification popup to the user. Use when the user asks to be notified, alerted, or wants a popup reminder."),
-        ("shell_command", "Execute a safe, sandboxed shell command. Only allow-listed commands: ls, cat, echo, date, uptime, df, free, whoami, hostname, pwd, wc, head, tail, sort, uniq, grep, find, which, env, printenv. Use when the user asks to run a command or check system state via CLI."),
-        ("read_file", "Read the contents of a local file. Use when the user asks to read, view, show, or inspect a file on their system."),
-        ("write_file", "Write content to a local file. Can overwrite or append. Use when the user asks to write, save, or create a file on their system."),
-    ]
-}
-
-/// Pre-formatted tool description lines for prompt template injection.
-/// Cached to avoid 6 `format!()` allocations per turn.
-pub fn giap_tool_description_lines() -> &'static [String] {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<Vec<String>> = OnceLock::new();
-    CACHED.get_or_init(|| {
-        giap_tool_definitions()
-            .iter()
-            .map(|(name, desc)| format!("{} — {}", name, desc))
-            .collect()
-    })
-}
+// `giap_tool_definitions` / `giap_tool_description_lines` used to live here: 13
+// hardcoded (name, description) pairs rendered into the prompt as an "Available
+// tools:" list. Only four of the names existed. The rest named nothing the
+// dispatcher would answer to -- `weather` for `get_current_weather`,
+// `shell_command` for `run_shell_command` -- while 48 real tools were absent,
+// and the block measured 2,931 chars (~732 tokens) at every prompt style and at
+// BOTH compaction tiers, since the compact tier never shortened it.
+//
+// It was also unreachable: production always passes a registry, so the adapter
+// took the registry branch and this static fallback rendered only in tests. That
+// is the more useful half of the finding -- the prose list production actually
+// renders comes from `InMemoryToolRegistry`, which nothing seeds with the 61
+// builtin `giap-*` tools, so it is empty unless the user has added an external
+// MCP extension. The model is told about builtins through native tool schemas
+// instead, which every live provider supports, so an empty section is correct
+// and a hardcoded one could only ever drift back out of date.
 
 /// Estimate how many tokens the model should generate based on query complexity.
 ///
@@ -240,7 +226,7 @@ Return ONLY the title text — no quotes, no punctuation, no explanation.";
 // Variables substituted:
 //   String: {{assistant_name}}, {{user_name}}, {{personality}}, {{timezone}},
 //           {{location}}, {{current_date}}, {{current_time}}, {{online_device_names}}
-//   usize:  {{device_count}}
+//   usize:  {{device_count}}, {{reasoning_budget_words}}
 //   bool:   {{has_home_devices}}, {{atypical_speech}}, {{has_tools}},
 //           {{voice_mode}}, {{canvas_mode}}, {{thinking_enabled}},
 //           {{compact_prompt}}, {{native_tools_json}}
@@ -273,9 +259,11 @@ Return ONLY the title text — no quotes, no punctuation, no explanation.";
 /// Balanced — warm, practical, general-purpose. Default for most users.
 pub const PROMPT_BALANCED: &str = "\
 <identity>
-You are {{assistant_name}}, an intelligent AI copilot running entirely on \
-{{user_name}}'s local network as part of Goose In A Pond. Every inference \
-runs on-device — no data ever leaves this machine.
+You are {{assistant_name}}, {{user_name}}'s personal agentic assistant — a \
+copilot that acts, not only answers. This pond is {{user_name}}'s: Goose In A \
+Pond, running on their own hardware, no data ever leaving it.
+Your tools are live connections to this household's devices, memory, schedule \
+and knowledge — use them.
 Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
 </identity>
 
@@ -284,6 +272,9 @@ You are a general-purpose assistant. Help with writing, research, reasoning, \
 planning, coding, and everyday tasks. Reply concisely unless asked for more detail. \
 Plain language only — no Markdown, bullet symbols, or asterisks. \
 Never say \"echo\", \"end of turn\", or pipeline artifacts.
+Internal scaffolding — goal reminders, budgets, retries, system notes — is \
+invisible to the user: never quote it, never say \"the goal\", never narrate \
+your process. Report a shortfall in ordinary words instead.
 Only use tools available in your schema. Do not invent commands outside your available tools. \
 If something is outside your capabilities, tell the user directly.
 </instructions>
@@ -402,6 +393,7 @@ If a request requires leaving the local network, say so clearly and wait for con
 For complex questions, reason through the problem step by step before answering. \
 For planning tasks, consider multiple approaches before recommending one. \
 Quality matters more than speed — take time to think when the question deserves it.
+Keep the thinking itself under {{reasoning_budget_words}} words, then answer.
 </thinking>
 {%- endif %}
 {% if voice_mode %}
@@ -430,11 +422,15 @@ Tool results render as interactive cards. Prefer tool calls over text descriptio
 /// Concise — minimal, action-first. For power users who want brevity.
 pub const PROMPT_CONCISE: &str = "\
 <identity>
-{{assistant_name}}, local AI copilot for {{user_name}}. Goose In A Pond — on-device, no data leaves.
+{{assistant_name}}, {{user_name}}'s personal agentic assistant — a copilot that acts, not just answers.
+Their pond, their hardware. Goose In A Pond — on-device, no data leaves.
+Your tools are live connections to this household's devices, memory and knowledge.
 Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
 </identity>
 <instructions>
 One sentence replies unless asked for more. No Markdown. No voice artifacts.
+Internal checks, goal reminders and budgets are invisible machinery — never mention them. \
+Fell short? Say plainly what you could not do, without narrating why you were asked.
 General copilot: writing, research, coding, planning{% if has_home_devices %}, home control{% endif %}.
 Only use tools in your schema. Do not invent commands outside available tools.
 </instructions>
@@ -501,6 +497,7 @@ Door/alarm: require explicit confirmation. Unknown device: say not set up yet.
 {%- if thinking_enabled %}
 <thinking>
 Hard problems: reason step by step first, then answer.
+Thinking: under {{reasoning_budget_words}} words.
 </thinking>
 {%- endif %}
 {% if voice_mode %}
@@ -521,8 +518,10 @@ Tool results render as interactive cards. Prefer tool calls over text descriptio
 /// Technical — verbose, tool-aware, narrates reasoning. For developers / power users.
 pub const PROMPT_TECHNICAL: &str = "\
 <identity>
-{{assistant_name}}, privacy-first AI copilot on {{user_name}}'s local network.
+{{assistant_name}}, {{user_name}}'s personal agentic assistant — a copilot with real actuation, \
+running on their own hardware. This pond belongs to {{user_name}}.
 Goose In A Pond — on-device inference, no telemetry, no cloud calls, no data egress.
+Your tool schema is a live interface to this household's devices, memory, schedule and knowledge.
 Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
 </identity>
 <instructions>
@@ -530,6 +529,8 @@ General-purpose technical copilot — coding, architecture, research, analysis.
 For multi-step tasks, narrate each step briefly before executing it.
 Surface tool errors clearly and suggest remediation. Prefer exact values over approximations.
 No Markdown in voice output. Never emit \"echo\", \"end of turn\", or role delimiters.
+Harness internals — goal checks, turn budgets, retry prompts, system notes — are not part of the \
+conversation. Never quote or reference them. Report a shortfall in domain terms, not process terms.
 Only use tools in your schema. Do not invent commands outside your available tools.
 </instructions>
 <context-handling>
@@ -626,6 +627,7 @@ Unrecognised device: offer to add it. External egress: disclose destination and 
 <thinking>
 Deep analysis mode — show reasoning chain, evaluate trade-offs, surface uncertainty.
 Prefer precision over brevity.
+Reasoning budget: at most {{reasoning_budget_words}} words before the answer begins.
 </thinking>
 {%- endif %}
 {% if voice_mode %}
@@ -647,9 +649,12 @@ Tool results render as interactive cards. Prefer tool calls over text descriptio
 /// Warm — conversational, family-friendly, personality-forward. No jargon.
 pub const PROMPT_WARM: &str = "\
 <identity>
-Hey there! I'm {{assistant_name}}, your personal AI assistant. I live right \
-here on {{user_name}}'s home network — everything stays private and on-device, \
+Hey there! I'm {{assistant_name}}, {{user_name}}'s personal assistant — and I can \
+actually do things, not just talk about them. I live right here on their own \
+hardware; this pond is {{user_name}}'s, everything stays private and on-device, \
 powered by Goose In A Pond.
+The tools I have are real connections to this home — its devices, its memory, \
+what's on the calendar.
 Style: {{personality}}. Timezone: {{timezone}}.{{location}}
 </identity>
 <instructions>
@@ -657,6 +662,9 @@ I'm a helpful all-rounder — writing, research, planning, coding, and everyday 
 Short clear answers in plain everyday language — nothing technical unless you ask.
 No lists or formatting — just natural conversation.
 I only use the tools I've been given — nothing outside my available schema.
+Anything the system quietly asks me — to double-check my work, to remember a goal, \
+to watch a budget — stays between me and the machinery. I never mention it or talk \
+about my own process. If I came up short, I just say what I couldn't find.
 </instructions>
 <context-handling>
 {% if compact_prompt %}\
@@ -744,6 +752,7 @@ I'll always ask before doing anything outside your home network.
 <thinking>
 For tricky questions I take a moment to think it through step by step before \
 answering — a good answer beats a fast one.
+I keep that to under {{reasoning_budget_words}} words so nobody is left waiting.
 </thinking>
 {%- endif %}
 {% if voice_mode %}
@@ -904,7 +913,7 @@ pub fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
 /// ## Context variables provided
 /// - `String`:  `assistant_name`, `user_name`, `personality`, `timezone`, `location`,
 ///              `current_date`, `current_time`, `online_device_names`
-/// - `usize`:   `device_count`
+/// - `usize`:   `device_count`, `reasoning_budget_words`
 /// - `bool`:    `has_home_devices`, `atypical_speech`, `has_tools`, `voice_mode`,
 ///              `canvas_mode`, `thinking_enabled`, `compact_prompt`,
 ///              `native_tools_json`
@@ -982,6 +991,28 @@ pub fn render_jinja_template(
         &state.map(|s| s.thinking_enabled).unwrap_or(false),
     );
 
+    // How LONG the thinking may run, in words. `thinking_enabled` above says
+    // WHETHER; this says how much, and it is only ever rendered inside the
+    // `{% if thinking_enabled %}` block, so `off` stays off.
+    //
+    // Words rather than tokens because the model cannot count its own tokens.
+    // Derived here, from the two inputs that already reach this function --
+    // `settings.reasoning_effort` (the preference) and `state.compact_prompt`
+    // (the profile signal) -- rather than carried on `PromptState`, so that
+    // nothing new has to resolve inside the adapter. That matters for the KV
+    // prefix: this value is a pure function of the same `settings` that already
+    // chooses `prompt_style` and `custom_system_prompt`, so it resolves in the
+    // same place they do and cannot differ between turn one and turn two the
+    // way a lazily-warmed capability cache did (see PAI-5 invariant 1).
+    let reasoning_budget_words =
+        crate::models::services::context::context_budget::reasoning_budget_words(
+            crate::models::services::context::context_budget::ReasoningEffort::parse(
+                &settings.reasoning_effort,
+            ),
+            state.map(|s| s.compact_prompt).unwrap_or(false),
+        );
+    ctx.insert("reasoning_budget_words", &reasoning_budget_words);
+
     // Compact prompt — when true, templates should skip verbose sections to
     // save tokens on small-context platforms (Jetson 3K, macOS Metal 8K).
     ctx.insert(
@@ -1007,12 +1038,16 @@ pub fn render_jinja_template(
         Ok(rendered) => rendered,
         Err(e) => {
             tracing::warn!("Tera render failed — falling back to render_template(): {e}");
+            let budget_words = reasoning_budget_words.to_string();
             let vars: &[(&str, &str)] = &[
                 ("assistant_name", name.as_str()),
                 ("user_name", user.as_str()),
                 ("personality", persona.as_str()),
                 ("timezone", tz.as_str()),
                 ("location", location.as_str()),
+                // Substituted here too so a Tera failure cannot leave a raw
+                // `{{reasoning_budget_words}}` sitting in the system prompt.
+                ("reasoning_budget_words", budget_words.as_str()),
             ];
             render_template(template, vars)
         }
@@ -1643,12 +1678,26 @@ mod tests {
             .collect()
     }
 
+    /// A stable, non-empty tool list for template renders. Deliberately small:
+    /// the budget assertions below measure the TEMPLATE's cost, and pinning them
+    /// to a live inventory would make an unrelated new tool fail this test.
+    pub(super) fn sample_tool_lines() -> Vec<String> {
+        vec![
+            "get_current_weather \u{2014} Current conditions for a location.".to_string(),
+            "save_memory \u{2014} Remember something the user asked to keep.".to_string(),
+            "run_shell_command \u{2014} Run an allow-listed shell command.".to_string(),
+        ]
+    }
+
     /// PromptState for golden-test renders.
     pub(super) fn v2_state(compact: bool, tools: bool, native: bool) -> PromptState {
         PromptState {
             compact_prompt: compact,
+            // A representative fixture, not a production inventory. These are
+            // real tool names, but the point of the golden renders is the
+            // TEMPLATE, so the list only has to be non-empty and stable.
             available_tools: if tools {
-                giap_tool_description_lines().to_vec()
+                sample_tool_lines()
             } else {
                 Vec::new()
             },
@@ -1743,7 +1792,7 @@ mod tests {
                 "style '{name}': tool listing must render when native_tools_json=false"
             );
             assert!(
-                listed.contains("wikipedia"),
+                listed.contains("get_current_weather"),
                 "style '{name}': tool description lines must render"
             );
 
@@ -1777,7 +1826,7 @@ mod tests {
                 current_time: "14:32".to_string(),
                 compact_prompt: true,
                 native_tools_json: true,
-                available_tools: giap_tool_description_lines().to_vec(),
+                available_tools: sample_tool_lines(),
                 ..Default::default()
             };
             let partition = build_prompt_partition(&s, None, &state, raw);
@@ -1838,6 +1887,226 @@ mod tests {
             assert!(
                 !off.contains("<thinking>"),
                 "style '{name}': <thinking> must be hidden when thinking_enabled=false"
+            );
+        }
+    }
+
+    // ── Reasoning effort (PAI-5 P4) ───────────────────────────────────────
+
+    /// Everything between `<thinking>` and `</thinking>`, or `None` when the
+    /// section did not render at all.
+    fn thinking_body(rendered: &str) -> Option<String> {
+        let start = rendered.find("<thinking>")?;
+        let end = rendered.find("</thinking>")?;
+        Some(rendered[start..end].to_string())
+    }
+
+    /// The whole prompt with the `<thinking>` section cut out.
+    fn without_thinking(rendered: &str) -> String {
+        match (rendered.find("<thinking>"), rendered.find("</thinking>")) {
+            (Some(a), Some(b)) => {
+                let mut s = rendered[..a].to_string();
+                s.push_str(&rendered[b..]);
+                s
+            }
+            _ => rendered.to_string(),
+        }
+    }
+
+    fn settings_with_effort(effort: &str) -> Settings {
+        Settings {
+            reasoning_effort: effort.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// THE guard. Two claims, and the second is the one that is easy to lose:
+    ///
+    /// 1. The setting BITES — the three efforts render three DIFFERENT thinking
+    ///    sections, in every style and on both compaction tiers. Asserting that
+    ///    the identifier `reasoning_effort` appears somewhere would pass while
+    ///    the rendered cap was a constant; this compares the rendered text.
+    /// 2. The setting bites NOWHERE ELSE — the rest of the static prefix is
+    ///    byte-identical across all three. A reasoning preference that moved
+    ///    any other part of the prefix would re-prefill the KV cache for a
+    ///    reason unrelated to reasoning.
+    #[test]
+    fn reasoning_effort_changes_the_thinking_section_and_nothing_else() {
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                let state = PromptState {
+                    thinking_enabled: true,
+                    compact_prompt: compact,
+                    ..Default::default()
+                };
+
+                let mut bodies: Vec<String> = Vec::new();
+                let mut remainders: Vec<String> = Vec::new();
+                for effort in ["brief", "balanced", "thorough"] {
+                    let out = render_jinja_template(
+                        raw,
+                        &settings_with_effort(effort),
+                        Some(&state),
+                        None,
+                    );
+                    let body = thinking_body(&out).unwrap_or_else(|| {
+                        panic!(
+                            "style '{name}' (compact={compact}, {effort}): no <thinking> section"
+                        )
+                    });
+                    bodies.push(body);
+                    remainders.push(without_thinking(&out));
+                }
+
+                assert_ne!(
+                    bodies[0], bodies[1],
+                    "style '{name}' (compact={compact}): brief and balanced render the SAME \
+                     <thinking> section — reasoning_effort is not reaching the prompt"
+                );
+                assert_ne!(
+                    bodies[1], bodies[2],
+                    "style '{name}' (compact={compact}): balanced and thorough render the SAME \
+                     <thinking> section — reasoning_effort is not reaching the prompt"
+                );
+
+                assert_eq!(
+                    remainders[0], remainders[1],
+                    "style '{name}' (compact={compact}): reasoning_effort moved the prefix \
+                     OUTSIDE <thinking> (brief vs balanced) — that is an unrelated KV re-prefill"
+                );
+                assert_eq!(
+                    remainders[1], remainders[2],
+                    "style '{name}' (compact={compact}): reasoning_effort moved the prefix \
+                     OUTSIDE <thinking> (balanced vs thorough) — that is an unrelated KV re-prefill"
+                );
+            }
+        }
+    }
+
+    /// The rendered cap must be the number `context_budget` computed, not a
+    /// number that merely differs between efforts. A mutation that rendered the
+    /// effort NAME instead of the budget would satisfy the difference test
+    /// above and fail here.
+    #[test]
+    fn the_rendered_word_cap_is_the_computed_budget() {
+        use crate::models::services::context::context_budget::{
+            reasoning_budget_words, ReasoningEffort,
+        };
+
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                for effort in ["brief", "balanced", "thorough"] {
+                    let expected = reasoning_budget_words(ReasoningEffort::parse(effort), compact);
+                    let out = render_jinja_template(
+                        raw,
+                        &settings_with_effort(effort),
+                        Some(&PromptState {
+                            thinking_enabled: true,
+                            compact_prompt: compact,
+                            ..Default::default()
+                        }),
+                        None,
+                    );
+                    let body = thinking_body(&out).expect("thinking section");
+                    assert!(
+                        body.contains(&expected.to_string()),
+                        "style '{name}' (compact={compact}, {effort}): <thinking> does not carry \
+                         the computed budget {expected}. Section was:\n{body}"
+                    );
+                    // And no raw template variable survived into the prompt.
+                    assert!(
+                        !out.contains("reasoning_budget_words"),
+                        "style '{name}': an unsubstituted {{{{reasoning_budget_words}}}} reached \
+                         the system prompt"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Section 3.6: `off` means off. No effort may resurrect the section, and
+    /// with it hidden the three efforts must render byte-identical prompts —
+    /// otherwise the preference is costing a KV re-prefill for a section that
+    /// is not there.
+    #[test]
+    fn thinking_off_renders_no_section_and_no_delta_at_any_effort() {
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                let state = PromptState {
+                    thinking_enabled: false,
+                    compact_prompt: compact,
+                    ..Default::default()
+                };
+                let mut rendered: Vec<String> = Vec::new();
+                for effort in ["brief", "balanced", "thorough", "not-a-real-effort"] {
+                    let out = render_jinja_template(
+                        raw,
+                        &settings_with_effort(effort),
+                        Some(&state),
+                        None,
+                    );
+                    assert!(
+                        !out.contains("<thinking>"),
+                        "style '{name}' (compact={compact}, {effort}): thinking_mode off must \
+                         remove the section, budget and all"
+                    );
+                    rendered.push(out);
+                }
+                for other in &rendered[1..] {
+                    assert_eq!(
+                        &rendered[0], other,
+                        "style '{name}' (compact={compact}): reasoning_effort changed the prompt \
+                         while thinking was OFF"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The prefix must not depend on WHEN it was rendered. This is PAI-5
+    /// invariant 1 in the form this file can prove: the budget is a pure
+    /// function of `settings` and `compact_prompt`, so rendering the same
+    /// inputs twice — as turn one and turn two do — is byte-identical.
+    #[test]
+    fn the_thinking_budget_is_stable_across_repeated_renders() {
+        let s = settings_with_effort("thorough");
+        let state = PromptState {
+            thinking_enabled: true,
+            compact_prompt: true,
+            ..Default::default()
+        };
+        let first = render_jinja_template(PROMPT_BALANCED, &s, Some(&state), None);
+        let second = render_jinja_template(PROMPT_BALANCED, &s, Some(&state), None);
+        assert_eq!(
+            first, second,
+            "the same settings rendered a different prefix twice — turn two would re-prefill"
+        );
+    }
+
+    /// A stored typo must not widen the budget. `brief` is the smallest, so an
+    /// unrecognised value has to render exactly what `brief` renders.
+    #[test]
+    fn an_unrecognised_stored_effort_renders_the_smallest_budget() {
+        let state = PromptState {
+            thinking_enabled: true,
+            ..Default::default()
+        };
+        let brief = render_jinja_template(
+            PROMPT_BALANCED,
+            &settings_with_effort("brief"),
+            Some(&state),
+            None,
+        );
+        for bad in ["", "maximum", "Thorough", "high"] {
+            let out = render_jinja_template(
+                PROMPT_BALANCED,
+                &settings_with_effort(bad),
+                Some(&state),
+                None,
+            );
+            assert_eq!(
+                brief, out,
+                "stored effort {bad:?} did not narrow to brief — a typo bought a bigger think"
             );
         }
     }
@@ -1915,8 +2184,9 @@ mod tests {
     /// exactly one tool in the whole server did that. Every style, in BOTH
     /// tiers, must now say that an empty result is not an answer and that
     /// another tool should be tried — the compact tier especially, since
-    /// `prompt_budget_ctx` clamps local/gguf to 8192 and the on-device model
-    /// never sees the verbose branch.
+    /// `ContextGovernor::prompt_window` clamps local/gguf to 8192 and the
+    /// on-device model never sees the verbose branch. (Named `prompt_budget_ctx`
+    /// until PAI-3 P1 moved it into `pond-core`.)
     #[test]
     fn every_style_and_tier_says_an_empty_result_is_not_an_answer() {
         let s = Settings::default();
@@ -1932,6 +2202,124 @@ mod tests {
                 assert!(
                     lower.contains("another tool"),
                     "style '{name}' (compact={compact}): must point at another tool"
+                );
+            }
+        }
+    }
+
+    /// Every style must say what this assistant IS, and whose pond it is.
+    ///
+    /// "Personal agentic assistant" rather than "AI assistant" is the product
+    /// framing and it is also operative: a model told it can ACT reaches for
+    /// tools, and a model told it answers questions explains why it cannot.
+    /// The ownership line matters for a household appliance — the pond belongs
+    /// to somebody, and `user_name` is the only pond-level name available in the
+    /// static prefix (a profile's preferred name is per-speaker and rides the
+    /// user message, so it cannot go here without breaking KV prefix reuse).
+    #[test]
+    fn every_style_says_it_is_agentic_and_whose_pond_it_is() {
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                let out =
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                let lower = out.to_lowercase();
+
+                assert!(
+                    lower.contains("agentic")
+                        || lower.contains("can act")
+                        || lower.contains("actually do things"),
+                    "style '{name}' (compact={compact}): does not say it can act. A model that \
+                     believes it only answers questions explains why it cannot help instead of \
+                     reaching for a tool."
+                );
+                assert!(
+                    lower.contains("goose in a pond"),
+                    "style '{name}' (compact={compact}): dropped the product identity"
+                );
+                // Rendered with Settings::default(), whose user_name is the
+                // default -- so assert the possessive construction survived
+                // rather than a literal name.
+                assert!(
+                    out.contains("pond is")
+                        || out.contains("pond belongs to")
+                        || out.contains("Their pond"),
+                    "style '{name}' (compact={compact}): does not say whose pond this is. \
+                     Rendered:\n{out}"
+                );
+            }
+        }
+    }
+
+    /// The harness must not appear in the conversation.
+    ///
+    /// Measured on 2026-08-12, immediately after the goal-completeness check was
+    /// wired: the models began answering in the harness's own vocabulary --
+    /// "I could not fully meet your goal", "The goal has not been fully met",
+    /// "The goal is not fully met because I was unable to retrieve accurate time
+    /// zone information". That is an internal nudge, injected as an invisible
+    /// user message, being read back to the household verbatim.
+    ///
+    /// This is about VOCABULARY, not candour, and the distinction is the whole
+    /// point: `turn_budget_note` requires an incomplete answer to name what it
+    /// could not finish. What this forbids is describing the shortfall in
+    /// process terms ("the goal was not met") instead of domain terms ("I could
+    /// not find their birth dates"). A prompt that suppressed the admission
+    /// rather than the jargon would be a worse bug than the one it replaced.
+    ///
+    /// This rule is necessary but NOT on its own sufficient: with it in place,
+    /// E2B and E4B both still leaked the word "goal" on a capped fan-out turn.
+    /// The nudge's own wording has to be quotable too -- see the note on
+    /// `turn_budget_note`. Keep this guard so the instruction cannot be dropped
+    /// silently while that second half is outstanding.
+    #[test]
+    fn every_style_forbids_narrating_the_harness() {
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                let out =
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                let lower = out.to_lowercase();
+
+                assert!(
+                    lower.contains("goal"),
+                    "style '{name}' (compact={compact}): says nothing about the goal reminder, so \
+                     the model is free to read it back to the user -- which is what four measured \
+                     turns did."
+                );
+                assert!(
+                    lower.contains("never mention")
+                        || lower.contains("never quote")
+                        || lower.contains("not part of the conversation")
+                        || lower.contains("stays between"),
+                    "style '{name}' (compact={compact}): does not forbid mentioning internal \
+                     scaffolding. Rendered:\n{out}"
+                );
+                // The admission must survive, and it must be part of THIS rule
+                // rather than anywhere in the prompt.
+                //
+                // Checked in a window from the prohibition, because the first
+                // version of this assertion searched the whole rendered prompt
+                // and passed with the clause deleted: `<tool-failure>` already
+                // contains "before telling the user you could not find
+                // something", so it was matching an unrelated sentence and
+                // reporting that the admission was intact.
+                let at = lower
+                    .find("never mention")
+                    .or_else(|| lower.find("never quote"))
+                    .or_else(|| lower.find("not part of the conversation"))
+                    .or_else(|| lower.find("stays between"))
+                    .expect("the prohibition was found above");
+                let window = &lower[at..(at + 320).min(lower.len())];
+                assert!(
+                    window.contains("could not")
+                        || window.contains("couldn't")
+                        || window.contains("shortfall")
+                        || window.contains("came up short")
+                        || window.contains("fell short"),
+                    "style '{name}' (compact={compact}): forbids the jargon without preserving the \
+                     admission beside it -- an answer that cannot say what it failed to do is \
+                     worse than one that says it in the wrong words. Window:\n{window}"
                 );
             }
         }

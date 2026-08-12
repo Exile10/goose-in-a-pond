@@ -246,6 +246,9 @@ impl OllamaProvider {
         let usage = UsageStats {
             prompt_tokens: parsed.prompt_eval_count,
             completion_tokens: parsed.eval_count,
+            // Ollama's /api/chat reports no reasoning counter, and this adapter
+            // feeds the quarantined PondAgent loop rather than the serving path.
+            reasoning_tokens: None,
         };
         Ok((ChatMessage::assistant(parsed.message.content), usage))
     }

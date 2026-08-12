@@ -1,5 +1,7 @@
 use crate::models::domain::message::ImageAttachment;
-use crate::user_data::domain::session::{MessageAttachment, Session, SessionMessage};
+use crate::user_data::domain::session::{
+    MessageAttachment, Session, SessionIdentity, SessionMessage,
+};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -93,6 +95,38 @@ pub trait SessionStorage: Send + Sync {
         Ok(0) // default no-op for backward compat
     }
 
+    /// What reasoning has actually cost on this pond, newest first — PAI-5 P5.
+    ///
+    /// Returns the `reasoning_tokens` of recent assistant messages that HAVE
+    /// one. `None` rows are dropped rather than folded in as zero, and that is
+    /// the whole correctness of this method: migration 0039 made the column
+    /// nullable with no `DEFAULT` precisely so an unmeasured turn is
+    /// distinguishable from a turn that did not reason, and a `0` from a turn
+    /// nobody counted is a vote for a smaller output reserve cast by evidence
+    /// that does not exist.
+    ///
+    /// `scan_limit` bounds the ROWS READ, not the samples returned. A pond with
+    /// thinking switched off has no `reasoning_tokens` anywhere, and a query
+    /// bounded only by a result count would walk the entire message history
+    /// every turn finding nothing — on a Jetson, forever.
+    ///
+    /// **The default returns no samples, and that is the narrowing direction.**
+    /// No samples means [`observed_output_reserve`] keeps the measured anchor,
+    /// which is the value the curve already shipped. A defaulted trait method is
+    /// one of this programme's recorded vacuity shapes, so it is worth being
+    /// explicit about why this one is safe: forgetting to override it cannot
+    /// produce a wrong reserve, only the previous one.
+    /// `sqlite_reads_real_reasoning_samples_rather_than_the_default` guards the
+    /// real adapter against exactly that.
+    ///
+    /// [`observed_output_reserve`]: crate::models::services::context::context_budget::observed_output_reserve
+    async fn recent_reasoning_samples(
+        &self,
+        _scan_limit: usize,
+    ) -> Result<Vec<u32>, SessionStorageError> {
+        Ok(Vec::new())
+    }
+
     /// Return the content of the earliest user message in a session, if any.
     ///
     /// Used as a read-time fallback to derive a human-readable label when a
@@ -142,6 +176,23 @@ pub trait SessionStorage: Send + Sync {
         Ok(None) // default no-op for backward compat
     }
 
+    /// The GIAP session paired to an engine session id, if any.
+    ///
+    /// The inverse of [`get_engine_session_id`](Self::get_engine_session_id).
+    /// Needed because a builtin MCP tool call carries the ENGINE's session id
+    /// in its request `_meta`, and a draft decision has to resolve that to a
+    /// speaker.
+    ///
+    /// The default returns `Ok(None)` -- "unresolvable". That is the narrowing
+    /// answer, so a mock or legacy adapter that does not override it causes a
+    /// refusal, never a permission.
+    async fn get_session_id_for_engine(
+        &self,
+        _engine_session_id: &str,
+    ) -> Result<Option<String>, SessionStorageError> {
+        Ok(None)
+    }
+
     /// Record the engine session paired with this GIAP session (idempotent
     /// upsert). Deliberately not keyed to a `sessions` row: the pairing is also
     /// established on paths (direct tool calls, the voice child) that can run
@@ -152,6 +203,74 @@ pub trait SessionStorage: Send + Sync {
         _engine_session_id: &str,
     ) -> Result<(), SessionStorageError> {
         Ok(()) // default no-op for backward compat
+    }
+
+    /// Who this session is attributed to, and on what evidence.
+    ///
+    /// Returns [`SessionIdentity::unknown`] for a session that has never been
+    /// identified, which today is every session in every existing pond. That
+    /// is a real answer, not a missing one: "nobody has been identified" is
+    /// exactly what the caller needs to know, and returning it rather than an
+    /// `Option` removes the temptation to treat absence as permission.
+    ///
+    /// An unknown session id also reads as unattributed rather than erroring.
+    /// A read asking "whose session is this" has a correct answer for a session
+    /// that does not exist, and it is "nobody".
+    async fn get_session_identity(
+        &self,
+        _session_id: &str,
+    ) -> Result<SessionIdentity, SessionStorageError> {
+        Ok(SessionIdentity::unknown()) // default no-op for backward compat
+    }
+
+    /// Record who a session belongs to.
+    ///
+    /// This does NOT decide whether the new identification should win over
+    /// whatever is already stored -- that is a policy question and it lives in
+    /// [`SessionIdentity::supersedes`], in the domain. An adapter that made the
+    /// choice itself would put the rule beyond the reach of a pond-core test.
+    ///
+    /// Unlike the tool-group and engine-session pairings, this one is stored on
+    /// the `sessions` row itself, so it genuinely requires the row to exist.
+    /// Implementations return [`SessionStorageError::SessionNotFound`] rather
+    /// than succeeding silently -- an attribution that was accepted and then
+    /// discarded is the failure mode this whole phase exists to end.
+    async fn set_session_identity(
+        &self,
+        _session_id: &str,
+        _identity: &SessionIdentity,
+    ) -> Result<(), SessionStorageError> {
+        Ok(()) // default no-op for backward compat
+    }
+
+    /// Write an identity **only if** it is at least as strong as what is stored.
+    ///
+    /// The read-compare-write in the handlers is not safe on its own. Two
+    /// requests can both read `Unknown` and both pass
+    /// [`SessionIdentity::supersedes`], after which the later write wins
+    /// whatever its rank -- so a face match landing a millisecond after a
+    /// member tapped "this is Liz" takes the session, for a different person,
+    /// on weaker evidence. That is the exact downgrade `supersedes` exists to
+    /// refuse, and it is reachable today.
+    ///
+    /// Implementations must do the comparison inside the write itself. Returns
+    /// `true` when the write happened, `false` when a stronger identification
+    /// already held the session -- which is a normal outcome, not an error.
+    ///
+    /// The default implementation is **not** race-free; it falls back to the
+    /// unconditional write so mocks and legacy adapters keep compiling. Real
+    /// adapters override it.
+    async fn set_session_identity_if_stronger(
+        &self,
+        session_id: &str,
+        identity: &SessionIdentity,
+    ) -> Result<bool, SessionStorageError> {
+        let existing = self.get_session_identity(session_id).await?;
+        if !identity.supersedes(&existing) {
+            return Ok(false);
+        }
+        self.set_session_identity(session_id, identity).await?;
+        Ok(true)
     }
 
     /// The tool GROUPS (MCP extension names) selected for this session, if any.
@@ -230,5 +349,53 @@ pub trait SessionStorage: Send + Sync {
         _attachment_id: &str,
     ) -> Result<Option<(String, Vec<u8>)>, SessionStorageError> {
         Ok(None) // default no-op for backward compat
+    }
+
+    // ── Reasoning text (PAI-5 P6) ───────────────────────────────────────────
+    //
+    // The two methods below are the ONLY way the `<thinking>` text a turn
+    // produced enters or leaves the pond. They live here rather than on a
+    // dedicated port for one blunt reason: the store has to be reachable from
+    // `ChatService` (which mints the assistant message id these rows are keyed
+    // to) and from the history-read handler, and both of those already hold a
+    // `SessionStorage`. A separate port would have meant a new `AppState`
+    // field, and "the adapter exists but production never wired it" is a
+    // failure this programme has recorded three times.
+    //
+    // Defaulted, like every method above, so the four non-SQLite implementors
+    // (two mocks, a `pond-agent` test double, a capturing fake) need no change.
+    // The cost of a default is that deleting the real override leaves the tree
+    // green -- so `SqliteSessionStorage` carries its own behavioural test
+    // (`thinking_blocks_round_trip_keyed_to_their_message`), not a grep.
+
+    /// Persist the reasoning passages a turn produced, in order, keyed to the
+    /// assistant message they produced.
+    ///
+    /// Called only when `settings.persist_thinking` is true; the gate lives in
+    /// `ChatService`, which owns turn persistence, so no handler can hold the
+    /// text and forget to ask.
+    async fn add_thinking(
+        &self,
+        _session_id: &str,
+        _message_id: &str,
+        _blocks: &[String],
+    ) -> Result<(), SessionStorageError> {
+        Ok(()) // default no-op for backward compat
+    }
+
+    /// Every stored reasoning passage in a session, grouped by message id, each
+    /// message's passages in emission order.
+    ///
+    /// **This is a UI read and nothing else.** It must never be called from
+    /// anything that builds a prompt -- the trimmer, the rolling summariser,
+    /// the prompt builder, the compactor. Replaying a model's own discarded
+    /// scratch work back at it is the failure PAI-5's third invariant names, and
+    /// `crates/pond-core/tests/thinking_is_never_replayed.rs` enumerates the
+    /// permitted callers of this method by name.
+    async fn get_thinking_for_session(
+        &self,
+        _session_id: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, SessionStorageError> {
+        Ok(std::collections::HashMap::new()) // default no-op for backward compat
     }
 }

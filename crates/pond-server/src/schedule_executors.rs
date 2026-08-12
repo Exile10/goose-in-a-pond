@@ -9,6 +9,7 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use pond_core::models::ports::agent::Agent;
 use pond_core::shared::domain::agent::AgentRequest;
+use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::domain::schedule::{TaskKind, TriggerAction};
 use pond_core::user_data::ports::device_control::DeviceControlPort;
 use pond_core::user_data::ports::schedule_execution::ScheduleExecutor;
@@ -64,6 +65,15 @@ impl AgentScheduleExecutor {
             images: vec![],
             voice_mode: false,
             canvas_mode: false,
+            // A scheduled task has no speaker to identify -- nobody is in the
+            // room. It inherits nothing: an explicit Household scope, because
+            // a reminder the household set up is household context. Per-member
+            // schedules would need an owner on the schedule itself, which does
+            // not exist (there is no schedules table at all; the scheduler is
+            // in-process).
+            profile_scope: ProfileScope::Household,
+            // Nobody is in the room for a scheduled task.
+            profile_context: None,
         };
 
         tracing::info!("[scheduler] executing prompt for task {task_id}");
@@ -123,12 +133,17 @@ impl ScheduleExecutor for AgentScheduleExecutor {
             TaskKind::AgentPrompt { prompt } => self.run_agent_prompt(task_id, prompt).await,
             TaskKind::Webhook { webhook_url } => {
                 tracing::info!("[scheduler] firing webhook for task {task_id}: {webhook_url}");
-                let resp = self
-                    .http_client
-                    .post(webhook_url)
-                    .send()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("task {task_id}: webhook POST failed: {e}"))?;
+                // PAI-2 P5. There are TWO webhook executors and they are not
+                // the same code path -- gating only one is exactly the drift the
+                // egress guard test exists to catch.
+                let call = pond_core::shared::services::egress::begin(webhook_url, "POST")
+                    .map_err(|e| anyhow::anyhow!("task {task_id}: {e}"))?;
+
+                let sent = self.http_client.post(webhook_url).send().await;
+                call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+
+                let resp =
+                    sent.map_err(|e| anyhow::anyhow!("task {task_id}: webhook POST failed: {e}"))?;
 
                 let status = resp.status();
                 if !status.is_success() {

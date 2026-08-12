@@ -48,6 +48,13 @@ impl OnboardingRepository for CompletedOnboarding {
     async fn reset(&self) -> anyhow::Result<()> {
         Ok(())
     }
+    // PAI-2 P7 made this a required trait method rather than a defaulted one:
+    // a default would have to answer from `get_current_step`, and a stub that
+    // answers "not onboarded" makes every onboarding write route public
+    // wherever it is used. The name of this stub is the answer.
+    async fn is_complete(&self) -> anyhow::Result<bool> {
+        Ok(true)
+    }
 }
 
 struct MockDeviceRegistry;
@@ -161,7 +168,6 @@ async fn make_app_with_settings_repo() -> (
         notification_tx: tokio::sync::broadcast::channel(16).0,
         notification_queue: None,
         notification_sender: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,

@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use pond_core::models::domain::image_limits::extension_for_mime;
 use pond_core::models::domain::message::{ChatMessage, ImageAttachment, Role, ToolCallRecord};
-use pond_core::user_data::domain::session::{MessageAttachment, Session, SessionMessage};
+use pond_core::user_data::domain::session::{
+    IdentificationSource, MessageAttachment, Session, SessionIdentity, SessionMessage,
+};
 use pond_core::user_data::ports::session_storage::{SessionStorage, SessionStorageError};
 use sqlx::{Pool, Row, Sqlite};
 use std::collections::HashMap;
@@ -19,6 +21,7 @@ use std::path::{Path, PathBuf};
 struct SessionRow {
     id: String,
     title: Option<String>,
+    profile_id: Option<String>,
     total_prompt_tokens: i64,
     total_completion_tokens: i64,
     model_name: Option<String>,
@@ -37,6 +40,7 @@ struct MessageRow {
     created_at: String,
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
 }
 
 // ── Conversion helpers ────────────────────────────────────────────────────────
@@ -76,6 +80,7 @@ impl TryFrom<SessionRow> for Session {
         Ok(Session {
             id: r.id,
             title: r.title,
+            profile_id: r.profile_id,
             total_prompt_tokens: r.total_prompt_tokens as u32,
             total_completion_tokens: r.total_completion_tokens as u32,
             model_name: r.model_name,
@@ -110,6 +115,7 @@ impl TryFrom<MessageRow> for SessionMessage {
             created_at: parse_dt(&r.created_at),
             prompt_tokens: r.prompt_tokens.map(|v| v as u32),
             completion_tokens: r.completion_tokens.map(|v| v as u32),
+            reasoning_tokens: r.reasoning_tokens.map(|v| v as u32),
         })
     }
 }
@@ -356,7 +362,7 @@ impl SessionStorage for SqliteSessionStorage {
 
     async fn get_session(&self, session_id: &str) -> Result<Session, SessionStorageError> {
         let row = sqlx::query_as::<_, SessionRow>(
-            "SELECT id, title, total_prompt_tokens, total_completion_tokens, model_name, created_at, updated_at FROM sessions WHERE id = ?",
+            "SELECT id, title, profile_id, total_prompt_tokens, total_completion_tokens, model_name, created_at, updated_at FROM sessions WHERE id = ?",
         )
         .bind(session_id)
         .fetch_optional(&self.pool)
@@ -409,6 +415,25 @@ impl SessionStorage for SqliteSessionStorage {
         Ok(())
     }
 
+    async fn get_session_id_for_engine(
+        &self,
+        engine_session_id: &str,
+    ) -> Result<Option<String>, SessionStorageError> {
+        // Newest pairing wins. engine_session_id is not declared UNIQUE and the
+        // table is written from paths that run before a sessions row exists, so
+        // a stale duplicate is possible; taking the most recent is the only
+        // answer that stays right after a re-pair.
+        let row = sqlx::query(
+            "SELECT session_id FROM engine_session_map WHERE engine_session_id = ? \
+             ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(engine_session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        Ok(row.map(|r| r.get("session_id")))
+    }
+
     async fn get_engine_session_id(
         &self,
         session_id: &str,
@@ -442,6 +467,125 @@ impl SessionStorage for SqliteSessionStorage {
         .await
         .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
         Ok(())
+    }
+
+    async fn get_session_identity(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionIdentity, SessionStorageError> {
+        let row = sqlx::query(
+            "SELECT profile_id, identification_source, identification_confidence \
+             FROM sessions WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        let Some(row) = row else {
+            return Ok(SessionIdentity::unknown());
+        };
+
+        let stored: Option<String> = row.get("identification_source");
+        Ok(SessionIdentity {
+            profile_id: row.get("profile_id"),
+            // A NULL source is a legacy row, and legacy rows are unattributed.
+            source: stored
+                .as_deref()
+                .map(IdentificationSource::parse)
+                .unwrap_or(IdentificationSource::Unknown),
+            confidence: row
+                .get::<Option<f64>, _>("identification_confidence")
+                .map(|c| c as f32),
+        })
+    }
+
+    async fn set_session_identity(
+        &self,
+        session_id: &str,
+        identity: &SessionIdentity,
+    ) -> Result<(), SessionStorageError> {
+        // Deliberately does NOT touch `updated_at`. `list_sessions` orders by it,
+        // so bumping it here would push a conversation to the top of the user's
+        // history because a camera recognised somebody -- reordering what they
+        // see without a message having been sent. Attribution is metadata about
+        // the session, not activity in it.
+        let result = sqlx::query(
+            "UPDATE sessions SET \
+               profile_id                = ?, \
+               identification_source     = ?, \
+               identification_confidence = ? \
+             WHERE id = ?",
+        )
+        .bind(identity.profile_id.as_deref())
+        .bind(identity.source.as_str())
+        .bind(identity.confidence.map(|c| c as f64))
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(SessionStorageError::SessionNotFound(session_id.to_string()));
+        }
+        Ok(())
+    }
+
+    async fn set_session_identity_if_stronger(
+        &self,
+        session_id: &str,
+        identity: &SessionIdentity,
+    ) -> Result<bool, SessionStorageError> {
+        // The rank comparison happens INSIDE the update, so two concurrent
+        // identifications cannot both win off the same stale read. The ranking
+        // itself is policy and lives in the domain -- this builds the CASE from
+        // `IdentificationSource::ALL_RANKED` rather than restating the order,
+        // and a test pins the two together.
+        let cases: String = IdentificationSource::ALL_RANKED
+            .iter()
+            .map(|(name, rank)| format!("WHEN '{name}' THEN {rank}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // A NULL source is a legacy row: unattributed, so anything beats it.
+        // The literal must be >= the weakest real rank, hence ALL_RANKED's len.
+        let unattributed = IdentificationSource::ALL_RANKED.len();
+
+        let sql = format!(
+            "UPDATE sessions SET \
+               profile_id                = ?, \
+               identification_source     = ?, \
+               identification_confidence = ? \
+             WHERE id = ? \
+               AND ? <= (CASE COALESCE(identification_source, '') {cases} ELSE {unattributed} END)"
+        );
+
+        let result = sqlx::query(&sql)
+            .bind(identity.profile_id.as_deref())
+            .bind(identity.source.as_str())
+            .bind(identity.confidence.map(|c| c as f64))
+            .bind(session_id)
+            .bind(identity.source.rank() as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        if result.rows_affected() > 0 {
+            return Ok(true);
+        }
+
+        // Zero rows is ambiguous: either the session does not exist, or a
+        // stronger identification holds it. The caller needs those apart --
+        // one is a 404 and the other is a normal refusal.
+        let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        if exists == 0 {
+            return Err(SessionStorageError::SessionNotFound(session_id.to_string()));
+        }
+        Ok(false)
     }
 
     async fn get_session_tool_groups(
@@ -502,8 +646,8 @@ impl SessionStorage for SqliteSessionStorage {
         sqlx::query(
             "INSERT INTO session_messages \
                  (id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
-                  prompt_tokens, completion_tokens) \
-             VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?)",
+                  prompt_tokens, completion_tokens, reasoning_tokens) \
+             VALUES (?, ?, ?, ?, ?, ?, datetime('now'), ?, ?, ?)",
         )
         .bind(&message.id)
         .bind(&session_id)
@@ -513,6 +657,7 @@ impl SessionStorage for SqliteSessionStorage {
         .bind(&tool_calls_json)
         .bind(message.prompt_tokens.map(|v| v as i64))
         .bind(message.completion_tokens.map(|v| v as i64))
+        .bind(message.reasoning_tokens.map(|v| v as i64))
         .execute(&self.pool)
         .await
         .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
@@ -538,7 +683,7 @@ impl SessionStorage for SqliteSessionStorage {
 
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
-             prompt_tokens, completion_tokens \
+             prompt_tokens, completion_tokens, reasoning_tokens \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at ASC, rowid ASC",
@@ -583,7 +728,7 @@ impl SessionStorage for SqliteSessionStorage {
 
     async fn list_sessions(&self) -> Result<Vec<Session>, SessionStorageError> {
         let rows = sqlx::query_as::<_, SessionRow>(
-            "SELECT id, title, total_prompt_tokens, total_completion_tokens, model_name, created_at, updated_at FROM sessions ORDER BY updated_at DESC",
+            "SELECT id, title, profile_id, total_prompt_tokens, total_completion_tokens, model_name, created_at, updated_at FROM sessions ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
         .await
@@ -602,7 +747,7 @@ impl SessionStorage for SqliteSessionStorage {
 
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
-             prompt_tokens, completion_tokens \
+             prompt_tokens, completion_tokens, reasoning_tokens \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at ASC, rowid ASC \
@@ -628,7 +773,7 @@ impl SessionStorage for SqliteSessionStorage {
         // Fetch newest-first, then reverse to return chronological order.
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
-             prompt_tokens, completion_tokens \
+             prompt_tokens, completion_tokens, reasoning_tokens \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at DESC, rowid DESC \
@@ -686,6 +831,35 @@ impl SessionStorage for SqliteSessionStorage {
                 .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
 
         Ok(count.max(0) as u64)
+    }
+
+    async fn recent_reasoning_samples(
+        &self,
+        scan_limit: usize,
+    ) -> Result<Vec<u32>, SessionStorageError> {
+        // Walks `idx_session_messages_created_at` backwards and stops after
+        // `scan_limit` ROWS -- not after that many samples. See the port docs:
+        // bounding by result count would make a pond with thinking switched off
+        // scan its whole history every turn to find nothing.
+        //
+        // `IS NOT NULL` is applied in SQL rather than in Rust so a row nobody
+        // counted cannot arrive here as a zero. The distinction is migration
+        // 0039's entire reason for having no DEFAULT on that column.
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT reasoning_tokens FROM ( \
+                 SELECT reasoning_tokens FROM session_messages \
+                 ORDER BY created_at DESC LIMIT ? \
+             ) WHERE reasoning_tokens IS NOT NULL",
+        )
+        .bind(scan_limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(tokens,)| u32::try_from(tokens).unwrap_or(0))
+            .collect())
     }
 
     async fn first_user_message(
@@ -797,6 +971,61 @@ impl SessionStorage for SqliteSessionStorage {
             .await
             .map(|bytes| (mime_type, bytes)))
     }
+
+    // ── Reasoning text (PAI-5 P6) ───────────────────────────────────────────
+
+    async fn add_thinking(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        blocks: &[String],
+    ) -> Result<(), SessionStorageError> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        for (idx, content) in blocks.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO session_thinking \
+                     (id, message_id, session_id, block_index, content, created_at) \
+                 VALUES (?, ?, ?, ?, ?, datetime('now'))",
+            )
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(message_id)
+            .bind(session_id)
+            .bind(idx as i64)
+            .bind(content)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn get_thinking_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<HashMap<String, Vec<String>>, SessionStorageError> {
+        // `block_index` and not `created_at`: every block of one turn is
+        // written inside the same `datetime('now')` second, so ordering by time
+        // would shuffle the passages of a fast turn into an arbitrary order.
+        let rows = sqlx::query(
+            "SELECT message_id, content FROM session_thinking \
+             WHERE session_id = ? \
+             ORDER BY message_id, block_index ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for row in rows {
+            let message_id: String = row.get("message_id");
+            let content: String = row.get("content");
+            out.entry(message_id).or_default().push(content);
+        }
+        Ok(out)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -865,6 +1094,26 @@ mod tests {
             "pairing must survive a restart"
         );
         assert_eq!(reopened.get_engine_session_id("other").await.unwrap(), None);
+    }
+
+    /// PAI-2 P1: a builtin MCP tool call carries the ENGINE's session id, so a
+    /// draft decision has to walk this map backwards to find a speaker.
+    #[tokio::test]
+    async fn the_engine_session_reverse_lookup_finds_the_giap_session() {
+        let (s, _tmp) = make_storage().await;
+        s.set_engine_session_id("giap-1", "20260805_4")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_session_id_for_engine("20260805_4").await.unwrap(),
+            Some("giap-1".to_string())
+        );
+        assert_eq!(s.get_session_id_for_engine("nope").await.unwrap(), None);
+        assert_eq!(
+            s.get_session_id_for_engine("").await.unwrap(),
+            None,
+            "a blank engine id must not match a row"
+        );
     }
 
     #[tokio::test]
@@ -1509,5 +1758,554 @@ mod tests {
         assert_eq!(msgs[0].prompt_tokens, None, "user rows carry no counts");
         assert_eq!(msgs[1].prompt_tokens, Some(1930));
         assert_eq!(msgs[1].completion_tokens, Some(87));
+    }
+
+    /// PAI-5 P2, migration 0039. Two claims in one, and the second is the one
+    /// that would rot silently: reasoning is stored ALONGSIDE the provider's
+    /// completion count and does not disturb it, and a row written without a
+    /// reasoning count reads back `None` rather than `Some(0)`. PAI-5 P5 sizes
+    /// an output reserve from this column, and "nobody counted" read as "no
+    /// thinking happened" would bias every reserve downwards.
+    /// PAI-5 P5's read, and the guard on the defaulted port method.
+    ///
+    /// The port defaults `recent_reasoning_samples` to an empty vec so mocks
+    /// keep compiling, and a defaulted trait method is a recorded vacuity shape
+    /// in this programme: deleting a real override leaves the tree green while
+    /// the feature quietly stops working. Here it would stop by keeping the
+    /// anchor forever, which is silent by construction. So the real adapter is
+    /// asserted to answer with real numbers.
+    #[tokio::test]
+    async fn sqlite_reads_real_reasoning_samples_rather_than_the_default() {
+        let tmp = tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        let s = SqliteSessionStorage::new(db.system);
+        s.create_session("samples".to_string()).await.unwrap();
+
+        for (id, reasoning) in [
+            ("m1", Some(120u32)),
+            ("m2", None),
+            ("m3", Some(340)),
+            ("m4", None),
+            ("m5", Some(90)),
+        ] {
+            s.add_message(
+                "samples".to_string(),
+                SessionMessage::new(
+                    id.to_string(),
+                    "samples".to_string(),
+                    ChatMessage::assistant("turn"),
+                )
+                .with_token_counts(Some(100), Some(10))
+                .with_reasoning_tokens(reasoning),
+            )
+            .await
+            .unwrap();
+        }
+
+        let mut got = s.recent_reasoning_samples(100).await.unwrap();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![90, 120, 340],
+            "an unmeasured turn must not arrive as a zero. Migration 0039 left that column \
+             nullable with no DEFAULT for exactly this reason, and a zero here is a vote for a \
+             smaller output reserve cast by a turn that never reasoned"
+        );
+
+        // `scan_limit` bounds ROWS READ, not samples returned. Reading one row
+        // can therefore yield no samples at all -- which is the point: a pond
+        // with thinking off must not walk its whole history every turn.
+        let scanned_one = s.recent_reasoning_samples(1).await.unwrap();
+        assert!(
+            scanned_one.len() <= 1,
+            "scan_limit is being applied to the sample count rather than to the rows scanned; \
+             on a pond with no reasoning that makes this a full history scan per turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_tokens_round_trip_beside_the_provider_counts() {
+        let tmp = tempdir().unwrap();
+        let db = Database::init(tmp.path()).await.unwrap();
+        let pool = db.system.clone();
+        let s = SqliteSessionStorage::new(db.system);
+        s.create_session("reason".to_string()).await.unwrap();
+
+        s.add_message(
+            "reason".to_string(),
+            SessionMessage::new(
+                "a1".to_string(),
+                "reason".to_string(),
+                ChatMessage::assistant("thought about it"),
+            )
+            .with_token_counts(Some(1930), Some(87))
+            .with_reasoning_tokens(Some(412)),
+        )
+        .await
+        .unwrap();
+        // A row from a path that carries no reasoning: NULL, not zero.
+        s.add_message(
+            "reason".to_string(),
+            SessionMessage::new(
+                "a2".to_string(),
+                "reason".to_string(),
+                ChatMessage::assistant("did not think about it"),
+            )
+            .with_token_counts(Some(20), Some(4)),
+        )
+        .await
+        .unwrap();
+
+        // The row shape every pre-0039 message has: written by an INSERT that
+        // never mentions the column at all. This is the case the column's
+        // absent DEFAULT is FOR, and the only way to reach it from a unit test
+        // — the adapter always binds the column, so binding NULL through it
+        // would pass just as happily against `DEFAULT 0`.
+        sqlx::query(
+            "INSERT INTO session_messages (id, session_id, role, content, created_at) \
+             VALUES ('a3', 'reason', 'assistant', 'written before 0039', datetime('now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let msgs = s.get_messages("reason").await.unwrap();
+        assert_eq!(msgs[0].reasoning_tokens, Some(412));
+        assert_eq!(
+            msgs[0].completion_tokens,
+            Some(87),
+            "reasoning was folded into the completion count instead of riding beside it"
+        );
+        assert_eq!(
+            msgs[1].reasoning_tokens, None,
+            "an uncounted row must stay NULL; Some(0) would claim the turn did no thinking"
+        );
+        assert_eq!(
+            msgs[2].reasoning_tokens, None,
+            "a row written without the column read back as a counted zero — migration 0039 \
+             has grown a DEFAULT, and every message written before this phase now claims \
+             its turn did no thinking. PAI-5 P5 sizes an output reserve from that."
+        );
+    }
+
+    // ── Session identity (PAI-1 P2) ───────────────────────────────────────
+
+    /// `sessions.profile_id` has existed since migration 0003 and nothing ever
+    /// wrote it. This is the test that stops it being a dead column again.
+    #[tokio::test]
+    async fn a_new_session_is_unattributed_and_reads_back_that_way() {
+        let (s, _tmp) = make_storage().await;
+        let session = s.create_session("sess-1".to_string()).await.unwrap();
+        assert_eq!(session.profile_id, None);
+        assert_eq!(s.get_session("sess-1").await.unwrap().profile_id, None);
+        assert_eq!(
+            s.get_session_identity("sess-1").await.unwrap(),
+            SessionIdentity::unknown()
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_round_trips_including_the_face_confidence() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        insert_profile(&s, "jerry").await;
+        let before = s.get_session("sess-1").await.unwrap().updated_at;
+
+        s.set_session_identity(
+            "sess-1",
+            &SessionIdentity {
+                profile_id: Some("jerry".to_string()),
+                source: IdentificationSource::Face,
+                confidence: Some(0.62),
+            },
+        )
+        .await
+        .unwrap();
+
+        let read = s.get_session_identity("sess-1").await.unwrap();
+        assert_eq!(read.profile_id.as_deref(), Some("jerry"));
+        assert_eq!(
+            s.get_session("sess-1").await.unwrap().updated_at,
+            before,
+            "identifying a session must not reorder the user's chat history"
+        );
+        assert_eq!(read.source, IdentificationSource::Face);
+        assert!((read.confidence.unwrap() - 0.62).abs() < 1e-6);
+
+        // and the same fact is visible on the session itself, which is what
+        // the sessions list and every later scope decision will read.
+        assert_eq!(
+            s.get_session("sess-1").await.unwrap().profile_id.as_deref(),
+            Some("jerry")
+        );
+        assert_eq!(
+            s.list_sessions().await.unwrap()[0].profile_id.as_deref(),
+            Some("jerry")
+        );
+    }
+
+    /// An attribution that is accepted and then quietly dropped is exactly the
+    /// bug this phase exists to end, so a write against a session that does not
+    /// exist has to fail loudly.
+    #[tokio::test]
+    async fn identifying_a_session_that_does_not_exist_is_an_error() {
+        let (s, _tmp) = make_storage().await;
+        let err = s
+            .set_session_identity(
+                "no-such-session",
+                &SessionIdentity {
+                    profile_id: Some("jerry".to_string()),
+                    source: IdentificationSource::Explicit,
+                    confidence: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SessionStorageError::SessionNotFound(id) if id == "no-such-session"),
+            "expected SessionNotFound"
+        );
+    }
+
+    /// Reading identity for an unknown session is NOT an error -- "nobody" is a
+    /// correct answer to "whose session is this".
+    #[tokio::test]
+    async fn reading_identity_for_an_unknown_session_says_nobody() {
+        let (s, _tmp) = make_storage().await;
+        assert_eq!(
+            s.get_session_identity("no-such-session").await.unwrap(),
+            SessionIdentity::unknown()
+        );
+    }
+
+    /// Migration 0003 declared `profile_id REFERENCES profiles(id)` with no ON
+    /// DELETE action, and `Database::init` turns foreign keys on. That was
+    /// harmless only while the column stayed NULL. Now that it is written,
+    /// deleting a member who has ever spoken to the pond would fail the FK
+    /// check -- so 0037 carries a BEFORE DELETE trigger standing in for the ON
+    /// DELETE SET NULL that SQLite will not let us add in place.
+    #[tokio::test]
+    async fn deleting_a_profile_releases_their_sessions_instead_of_failing() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        insert_profile(&s, "jerry").await;
+        s.set_session_identity(
+            "sess-1",
+            &SessionIdentity {
+                profile_id: Some("jerry".to_string()),
+                source: IdentificationSource::Face,
+                confidence: Some(0.91),
+            },
+        )
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM profiles WHERE id = ?")
+            .bind("jerry")
+            .execute(&s.pool)
+            .await
+            .expect("deleting a member must not be blocked by their sessions");
+
+        // The conversation survives; only the attribution is gone. Erasing the
+        // content is a separate, deliberate cascade (PAI-1 P7).
+        let session = s.get_session("sess-1").await.unwrap();
+        assert_eq!(session.id, "sess-1");
+        assert_eq!(session.profile_id, None);
+        assert_eq!(
+            s.get_session_identity("sess-1").await.unwrap(),
+            SessionIdentity::unknown(),
+            "a released session must not keep a dangling source or confidence"
+        );
+    }
+
+    /// `profile_id` is a real foreign key, so identity cannot name a member who
+    /// does not exist. Worth pinning: it is the cheapest guard against a typo'd
+    /// or stale id becoming a permanent, unmatchable attribution.
+    #[tokio::test]
+    async fn identity_cannot_name_a_profile_that_does_not_exist() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        let err = s
+            .set_session_identity(
+                "sess-1",
+                &SessionIdentity {
+                    profile_id: Some("ghost".to_string()),
+                    source: IdentificationSource::Explicit,
+                    confidence: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SessionStorageError::StorageError(_)),
+            "expected the foreign key to reject an unknown profile, got {err:?}"
+        );
+    }
+
+    async fn insert_profile(s: &SqliteSessionStorage, id: &str) {
+        sqlx::query(
+            "INSERT INTO profiles (id, display_name, avatar_emoji, preferences) \
+             VALUES (?, ?, 'duck', '{}')",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(&s.pool)
+        .await
+        .expect("profiles row is required by the sessions.profile_id foreign key");
+    }
+
+    // ── Race-free identity writes (PAI-1 P4) ─────────────────────────────
+
+    /// The read-compare-write this replaced could lose: two requests both read
+    /// `Unknown`, both passed `supersedes`, and the later write won whatever
+    /// its rank. Here the comparison is inside the UPDATE, so the stale caller
+    /// simply does not match.
+    #[tokio::test]
+    async fn a_weaker_source_cannot_win_even_from_a_stale_read() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        insert_profile(&s, "jerry").await;
+        insert_profile(&s, "liz").await;
+
+        // Somebody taps "this is Jerry".
+        assert!(s
+            .set_session_identity_if_stronger(
+                "sess-1",
+                &SessionIdentity {
+                    profile_id: Some("jerry".into()),
+                    source: IdentificationSource::Explicit,
+                    confidence: None,
+                },
+            )
+            .await
+            .unwrap());
+
+        // A camera frame, decided against the state BEFORE that write, tries
+        // to bind a different person on weaker evidence.
+        assert!(
+            !s.set_session_identity_if_stronger(
+                "sess-1",
+                &SessionIdentity {
+                    profile_id: Some("liz".into()),
+                    source: IdentificationSource::Face,
+                    confidence: Some(0.62),
+                },
+            )
+            .await
+            .unwrap(),
+            "a face match must not take a session an explicit claim holds"
+        );
+
+        let held = s.get_session_identity("sess-1").await.unwrap();
+        assert_eq!(held.profile_id.as_deref(), Some("jerry"));
+        assert_eq!(held.source, IdentificationSource::Explicit);
+    }
+
+    #[tokio::test]
+    async fn an_equal_or_stronger_source_still_wins() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        insert_profile(&s, "jerry").await;
+        insert_profile(&s, "liz").await;
+
+        for (source, who) in [
+            (IdentificationSource::Face, "jerry"),
+            // equal strength: re-identification, the endpoint's normal case
+            (IdentificationSource::Face, "liz"),
+            // stronger
+            (IdentificationSource::Explicit, "jerry"),
+            (IdentificationSource::PairedDevice, "liz"),
+        ] {
+            assert!(
+                s.set_session_identity_if_stronger(
+                    "sess-1",
+                    &SessionIdentity {
+                        profile_id: Some(who.into()),
+                        source,
+                        confidence: None,
+                    },
+                )
+                .await
+                .unwrap(),
+                "{:?} should have been accepted",
+                source
+            );
+            assert_eq!(
+                s.get_session_identity("sess-1").await.unwrap().source,
+                source
+            );
+        }
+    }
+
+    /// A legacy row has a NULL source and is unattributed, so anything binds it.
+    #[tokio::test]
+    async fn anything_binds_a_legacy_row_with_no_source() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        insert_profile(&s, "jerry").await;
+        assert!(s
+            .set_session_identity_if_stronger(
+                "sess-1",
+                &SessionIdentity {
+                    profile_id: Some("jerry".into()),
+                    source: IdentificationSource::Face,
+                    confidence: Some(0.5),
+                },
+            )
+            .await
+            .unwrap());
+    }
+
+    /// Zero rows updated is ambiguous between "no such session" and "not
+    /// superseded". The caller needs them apart -- one is a 404, the other a
+    /// normal refusal -- so the adapter disambiguates rather than guessing.
+    #[tokio::test]
+    async fn a_conditional_write_to_a_missing_session_is_still_not_found() {
+        let (s, _tmp) = make_storage().await;
+        let err = s
+            .set_session_identity_if_stronger(
+                "no-such-session",
+                &SessionIdentity {
+                    profile_id: None,
+                    source: IdentificationSource::Explicit,
+                    confidence: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionStorageError::SessionNotFound(id) if id == "no-such-session"));
+    }
+
+    // ── Reasoning text (PAI-5 P6) ───────────────────────────────────────────
+    //
+    // `add_thinking` / `get_thinking_for_session` are DEFAULTED on the port so
+    // the four non-SQLite implementors need no change. The cost of a default is
+    // that deleting the override below leaves the whole workspace green while
+    // the feature silently stops working -- the exact vacuity shape this
+    // programme keeps recording. These tests are the counterweight: they run
+    // against the real adapter, and `pond-infra` is in ci.yml's test list.
+
+    async fn seed_assistant_row(s: &SqliteSessionStorage, session: &str, msg: &str) {
+        s.add_message(
+            session.to_string(),
+            SessionMessage::new(
+                msg.to_string(),
+                session.to_string(),
+                ChatMessage::assistant("the answer"),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn thinking_blocks_round_trip_keyed_to_their_message() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-think".to_string()).await.unwrap();
+        seed_assistant_row(&s, "sess-think", "assistant-1").await;
+        seed_assistant_row(&s, "sess-think", "assistant-2").await;
+
+        s.add_thinking(
+            "sess-think",
+            "assistant-1",
+            &["first".to_string(), "second".to_string()],
+        )
+        .await
+        .unwrap();
+        s.add_thinking("sess-think", "assistant-2", &["only".to_string()])
+            .await
+            .unwrap();
+
+        let out = s.get_thinking_for_session("sess-think").await.unwrap();
+
+        // Order within a turn is the whole readability of the panel, and both
+        // blocks of turn one are written inside the same `datetime('now')`
+        // second -- so an adapter that ordered by created_at would shuffle them
+        // and this assertion is what notices.
+        assert_eq!(
+            out.get("assistant-1").map(Vec::as_slice),
+            Some(["first".to_string(), "second".to_string()].as_slice()),
+            "turn one's passages must come back in emission order; got {:?}",
+            out.get("assistant-1")
+        );
+        assert_eq!(
+            out.get("assistant-2").map(Vec::as_slice),
+            Some(["only".to_string()].as_slice()),
+            "turn two's passage must be keyed to turn two, not merged into the \
+             session; got {:?}",
+            out.get("assistant-2")
+        );
+        assert_eq!(out.len(), 2, "one entry per message that has reasoning");
+    }
+
+    #[tokio::test]
+    async fn thinking_is_scoped_to_its_own_session() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-a".to_string()).await.unwrap();
+        s.create_session("sess-b".to_string()).await.unwrap();
+        seed_assistant_row(&s, "sess-a", "a-1").await;
+        seed_assistant_row(&s, "sess-b", "b-1").await;
+        s.add_thinking("sess-a", "a-1", &["private to A".to_string()])
+            .await
+            .unwrap();
+        s.add_thinking("sess-b", "b-1", &["private to B".to_string()])
+            .await
+            .unwrap();
+
+        // Invariant 6. A session's scope is `sessions.profile_id`, and the read
+        // is per-session; a Guest session must not be able to reach a household
+        // member's reasoning simply because both rows live in one table.
+        let a = s.get_thinking_for_session("sess-a").await.unwrap();
+        assert_eq!(a.len(), 1, "session A sees only its own reasoning: {a:?}");
+        assert!(
+            !a.contains_key("b-1"),
+            "session A can read session B's reasoning -- the session filter is \
+             missing from the query: {a:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_with_no_reasoning_reads_back_empty_not_missing() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-quiet".to_string()).await.unwrap();
+        seed_assistant_row(&s, "sess-quiet", "q-1").await;
+
+        // Every session recorded before `persist_thinking` was turned on is in
+        // this state, which is the overwhelming majority of them. Reading one
+        // must be an empty map, never an error -- `get_session_messages`
+        // swallows the error, so an adapter that failed here would turn every
+        // historical page load into a page with no thinking AND no signal.
+        let out = s.get_thinking_for_session("sess-quiet").await.unwrap();
+        assert!(out.is_empty(), "expected no reasoning rows, got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_session_takes_its_reasoning_with_it() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-gone-think".to_string())
+            .await
+            .unwrap();
+        seed_assistant_row(&s, "sess-gone-think", "g-1").await;
+        s.add_thinking("sess-gone-think", "g-1", &["candid".to_string()])
+            .await
+            .unwrap();
+
+        s.delete_session("sess-gone-think").await.unwrap();
+
+        // The erasure path that exists today. Reasoning text is the least
+        // reviewed thing the model produces; it must not be the one artefact
+        // that outlives the conversation a user asked to forget.
+        let left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_thinking WHERE session_id = ?")
+                .bind("sess-gone-think")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            left, 0,
+            "{left} reasoning row(s) survived the deletion of their session -- \
+             the ON DELETE CASCADE in migration 0040 is not being enforced \
+             (check `PRAGMA foreign_keys` is on for this pool)"
+        );
     }
 }

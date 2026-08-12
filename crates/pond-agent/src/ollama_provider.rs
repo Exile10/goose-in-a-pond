@@ -290,6 +290,7 @@ impl InferenceProvider for OllamaInferenceProvider {
                                     yield Ok(ChatEvent::Usage(UsageStats {
                                         prompt_tokens: chunk.prompt_eval_count,
                                         completion_tokens: chunk.eval_count,
+                                        reasoning_tokens: None,
                                     }));
                                 }
                                 return;
@@ -319,6 +320,7 @@ impl InferenceProvider for OllamaInferenceProvider {
                                     yield Ok(ChatEvent::Usage(UsageStats {
                                         prompt_tokens: chunk.prompt_eval_count,
                                         completion_tokens: chunk.eval_count,
+                                        reasoning_tokens: None,
                                     }));
                                 }
                             }

@@ -19,6 +19,7 @@ use pond_core::user_data::domain::memory::{
     MemoryFragment, MemoryLifecycle, MemorySegment, MemoryTier,
 };
 use pond_core::user_data::domain::onboarding::OnboardingStep;
+use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
 use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
 use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
@@ -50,6 +51,13 @@ impl OnboardingRepository for CompletedOnboarding {
     }
     async fn reset(&self) -> anyhow::Result<()> {
         Ok(())
+    }
+    // PAI-2 P7 made this a required trait method rather than a defaulted one:
+    // a default would have to answer from `get_current_step`, and a stub that
+    // answers "not onboarded" makes every onboarding write route public
+    // wherever it is used. The name of this stub is the answer.
+    async fn is_complete(&self) -> anyhow::Result<bool> {
+        Ok(true)
     }
 }
 
@@ -145,7 +153,6 @@ async fn make_app_with_real_memory(
         notification_queue: None,
         notification_sender: None,
         face_recognition: None,
-        session_user_bindings: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
@@ -227,7 +234,10 @@ async fn segment_fields_round_trip_through_sqlite() {
     );
     repo.add(frag).await.unwrap();
 
-    let results = repo.search_recent(None, 10).await.unwrap();
+    let results = repo
+        .search_recent(&ProfileScope::Household, 10)
+        .await
+        .unwrap();
     assert_eq!(results.len(), 1);
     let m = &results[0];
     assert_eq!(m.segment, Some(MemorySegment::Identity));
@@ -258,7 +268,10 @@ async fn access_tracking_increments_and_timestamps() {
     repo.record_access("acc-1").await.unwrap();
     repo.record_access("acc-1").await.unwrap();
 
-    let results = repo.search_recent(None, 10).await.unwrap();
+    let results = repo
+        .search_recent(&ProfileScope::Household, 10)
+        .await
+        .unwrap();
     assert_eq!(results[0].access_count, 3);
     assert!(results[0].last_accessed_at.is_some());
 }
@@ -295,7 +308,10 @@ async fn lifecycle_update_hides_from_search() {
         .await
         .unwrap();
 
-    let results = repo.search_recent(None, 10).await.unwrap();
+    let results = repo
+        .search_recent(&ProfileScope::Household, 10)
+        .await
+        .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, "lc-1");
 }
@@ -338,7 +354,7 @@ async fn search_by_segment_filters_correctly() {
     .unwrap();
 
     let identities = repo
-        .search_by_segment(MemorySegment::Identity, None, 10)
+        .search_by_segment(MemorySegment::Identity, &ProfileScope::Household, 10)
         .await
         .unwrap();
     assert_eq!(identities.len(), 2);
@@ -347,7 +363,7 @@ async fn search_by_segment_filters_correctly() {
         .all(|m| m.segment == Some(MemorySegment::Identity)));
 
     let prefs = repo
-        .search_by_segment(MemorySegment::Preference, None, 10)
+        .search_by_segment(MemorySegment::Preference, &ProfileScope::Household, 10)
         .await
         .unwrap();
     assert_eq!(prefs.len(), 1);
@@ -383,7 +399,10 @@ async fn mark_superseded_sets_lifecycle_and_link() {
     repo.mark_superseded("old-1", "new-1").await.unwrap();
 
     // Old memory should be hidden from search (lifecycle=merged)
-    let results = repo.search_recent(None, 10).await.unwrap();
+    let results = repo
+        .search_recent(&ProfileScope::Household, 10)
+        .await
+        .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].id, "new-1");
 }
@@ -502,7 +521,10 @@ async fn cleanup_archives_decayed_memories() {
     );
 
     // Verify: only fresh + perm remain in active search
-    let active = repo.search_recent(None, 10).await.unwrap();
+    let active = repo
+        .search_recent(&ProfileScope::Household, 10)
+        .await
+        .unwrap();
     assert_eq!(active.len(), 2);
     let ids: Vec<&str> = active.iter().map(|m| m.id.as_str()).collect();
     assert!(ids.contains(&"fresh"));
@@ -532,7 +554,10 @@ async fn api_save_memory_with_segment() {
     );
 
     // Verify in DB — memory should be stored
-    let memories = repo.search_recent(None, 10).await.unwrap();
+    let memories = repo
+        .search_recent(&ProfileScope::Household, 10)
+        .await
+        .unwrap();
     assert_eq!(memories.len(), 1);
     assert_eq!(memories[0].content, "User prefers dark mode");
 }
@@ -597,7 +622,10 @@ async fn api_delete_memory_removes_from_db() {
         resp.status()
     );
 
-    let remaining = repo.search_recent(None, 10).await.unwrap();
+    let remaining = repo
+        .search_recent(&ProfileScope::Household, 10)
+        .await
+        .unwrap();
     assert!(remaining.is_empty());
 }
 

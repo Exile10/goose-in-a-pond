@@ -473,6 +473,7 @@ pub async fn run_backfill(
 mod tests {
     use super::*;
     use crate::user_data::domain::memory::{MemoryLifecycle, MemorySegment};
+    use crate::user_data::domain::profile::ProfileScope;
     use crate::user_data::mocks::mock_memory::MockMemoryRepository;
     use chrono::Duration;
 
@@ -771,7 +772,10 @@ mod tests {
         assert_eq!(count, 5);
         assert!(repo.search_unembedded(10).await.unwrap().is_empty());
         // The pre-embedded row is left exactly as it was.
-        let stored = repo.search_recent(None, 10).await.unwrap();
+        let stored = repo
+            .search_recent(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
         let untouched = stored.iter().find(|f| f.id == "already").unwrap();
         assert_eq!(untouched.embedding, Some(vec![9.0, 9.0]));
     }

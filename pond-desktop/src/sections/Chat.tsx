@@ -13,8 +13,11 @@ import { TypingIndicator } from "../hub/views/chat/TypingIndicator";
 import { HubIco, micEl } from "../hub/primitives/HubIco";
 import { HP_PATHS } from "../hub/primitives/icons";
 import { CONTINUE_TURN_MESSAGE } from "../api/types";
-import type { ChatEvent, ImageAttachment, ModelEntry, SessionMessage, SessionSummary, TurnStats } from "../api/types";
+import type { ChatEvent, ContextWarning, ImageAttachment, ModelEntry, SessionMessage, SessionSummary, TurnStats } from "../api/types";
 import { TurnStatsFooter } from "../components/TurnStatsFooter";
+import { ContextPressureNote } from "../components/ContextPressureNote";
+import { SubagentTree, applySubagentProgress } from "../components/SubagentTree";
+import type { SubagentRun } from "../components/SubagentTree";
 import { filterThinking } from "../lib/thinkFilter";
 import { prepareImage, validateAttachmentSet } from "../lib/imageAttach";
 import type { PreparedImage } from "../lib/imageAttach";
@@ -61,6 +64,13 @@ interface Message {
   historyToolNames?: string[];
   /** Set when the agent stopped on its turn budget — renders a Continue action. */
   turnLimit?: number;
+  /** PAI-4 P7b. Set when the turn's `context_warning` frame said the window is
+   *  filling — renders the pressure line and the "Compact now" control. */
+  contextWarning?: ContextWarning;
+  /** PAI-6 P6. Delegations this turn started, folded from `subagent_progress`
+   *  frames. Rendered WHILE streaming, unlike every other note here: a tree
+   *  nobody sees until the turn ends is the spinner it replaces. */
+  delegations?: SubagentRun[];
   /** Image preview URLs — either a live send's local previewUrl, or a
    *  built `${apiBase}${url}` for images replayed from session history. */
   images?: string[];
@@ -83,7 +93,21 @@ function sessionMessagesToMessages(raw: SessionMessage[]): Message[] {
             return bare;
           })
         : undefined;
-      out.push({ id: ++_msgId, role: "agent", text: m.content, historyToolNames, images });
+      // PAI-5 P6. The panel below already renders `thinkingBlocks` and is
+      // already gated on `!streaming`, which is exactly right for replayed
+      // history. All that was missing was the refill: before this, reasoning
+      // existed only for the lifetime of the SSE connection that produced it,
+      // so reloading a conversation showed every answer with the thinking that
+      // led to it silently gone.
+      const thinkingBlocks = m.thinking?.length ? m.thinking : undefined;
+      out.push({
+        id: ++_msgId,
+        role: "agent",
+        text: m.content,
+        historyToolNames,
+        images,
+        thinkingBlocks,
+      });
     } else {
       out.push({ id: ++_msgId, role: "user", text: m.content, images });
     }
@@ -491,6 +515,25 @@ export function Chat() {
           setMessages((prev) =>
             prev.map((m) => (m.id === agentMsg.id ? { ...m, turnLimit: limit } : m)),
           );
+        } else if (ev.type === "subagent_progress") {
+          // PAI-6 P6. Attach by id — same reasoning as turn_stats — and fold
+          // through the one shared reducer, so this surface and the hub cannot
+          // disagree about what a frame means.
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === agentMsg.id
+                ? { ...m, delegations: applySubagentProgress(m.delegations ?? [], ev) }
+                : m,
+            ),
+          );
+        } else if (ev.type === "context_warning") {
+          // PAI-4 P7b. The window is filling. Attach by id — same reasoning as
+          // turn_stats and turn_limit_reached — so the note lands on this turn
+          // and not on whatever message a mid-stream session switch left last.
+          const cw = ev as unknown as ContextWarning;
+          setMessages((prev) =>
+            prev.map((m) => (m.id === agentMsg.id ? { ...m, contextWarning: cw } : m)),
+          );
         }
       }
     } catch (e) {
@@ -640,6 +683,12 @@ export function Chat() {
                     </div>
                   </details>
                 )}
+                {/* Delegation tree. Deliberately NOT gated on `!msg.streaming`:
+                    the whole point is that a turn which is blocked inside a
+                    `delegate` tool call stops looking like a hung spinner. */}
+                {msg.role === "agent" && msg.delegations && msg.delegations.length > 0 && (
+                  <SubagentTree runs={msg.delegations} />
+                )}
                 {/* Bubble */}
                 <div className={`ch-bubble ${msg.role === "user" ? "ch-bubble--user" : `ch-bubble--goose${msg.error ? " ch-bubble--error" : ""}`}`}>
                   {msg.images && msg.images.length > 0 && (
@@ -678,6 +727,17 @@ export function Chat() {
                       <PlayCircle size={12} aria-hidden /> Continue
                     </button>
                   </div>
+                )}
+                {/* Context window filling — pressure line + "Compact now".
+                    Deliberately NOT gated on showTurnStats: `show_turn_stats`
+                    defaults to false in Rust, so borrowing that gate would ship
+                    this invisible on every default install, which is exactly
+                    why TurnStatsFooter was rejected as the host. */}
+                {msg.role === "agent" && !msg.streaming && msg.contextWarning && (
+                  <ContextPressureNote
+                    warning={msg.contextWarning}
+                    sessionId={sessionIdRef.current ?? null}
+                  />
                 )}
                 {/* Inference stats footer */}
                 {msg.role === "agent" && !msg.streaming && showTurnStats && msg.turnStats && (

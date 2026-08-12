@@ -19,11 +19,16 @@ use axum::{
 use pond_core::mcp::ports::extension_manager::ExtensionInfo;
 use pond_core::models::domain::message::ChatMessage;
 use pond_core::models::ports::provider::LlmProvider;
-use pond_core::prompts::{
-    build_system_prompt_with_profile, builtin_template_content, render_template, sanitize_field,
-    ProfileContext,
+use pond_core::models::services::context::context_budget::CompactionProfile;
+use pond_core::models::services::context::context_governor::{
+    ContextGovernor, ContextInputs, EngineWindow,
 };
+use pond_core::models::services::context::context_monitor::ContextHealth;
+use pond_core::models::services::context::model_class::ModelClass;
+use pond_core::models::services::context::token_counting::HeuristicTokenCounter;
+use pond_core::prompts::{builtin_template_content, ProfileContext};
 use pond_core::security::domain::event::{EventCategory, EventQuery, PrivacySensitivity};
+use pond_core::security::domain::proven_device::{DeviceRung, ProvenDevice};
 use pond_core::security::ports::handshake::{
     ChallengeResponse, HandshakeRequest, HandshakeResponse, InitRequest, RefreshRequest,
     VerifyRequest,
@@ -32,11 +37,15 @@ use pond_core::shared::ports::event_bus::BusEvent;
 use pond_core::shared::services::chat::ChatService;
 use pond_core::user_data::domain::onboarding::OnboardingStep;
 use pond_core::user_data::domain::profile::CreateProfileRequest;
-use pond_core::user_data::domain::schedule::TaskKind;
+use pond_core::user_data::domain::schedule::{Schedule, SensorTriggerSpec, TaskKind};
 use pond_core::user_data::domain::sensor::{CameraEvent, SensorReading};
+use pond_core::user_data::domain::session::{IdentificationSource, SessionIdentity};
 use pond_core::user_data::domain::settings::Settings;
+use pond_core::user_data::ports::device_attribution::DeviceAttribution;
 use pond_core::user_data::ports::device_registry::RegisterDeviceRequest;
 use pond_core::user_data::ports::scheduler::{CreateScheduleRequest, UpdateScheduleRequest};
+use pond_core::user_data::ports::session_storage::SessionStorageError;
+use pond_core::user_data::services::identity_resolution;
 use pond_core::user_data::services::onboarding::OnboardingService;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -54,12 +63,28 @@ use pond_core::user_data::domain::skill::UserSkill;
 
 use crate::middleware::onboarding_guard::require_onboarding_complete;
 use crate::{AppState, DownloadEntry, ModelStatusEntry};
+use pond_core::context::ports::ContextRepository;
+use pond_core::security::ports::policy::is_draft_decision_permitted;
+use pond_core::user_data::domain::draft::DraftStatus;
+use pond_core::user_data::domain::profile::ProfileScope;
+use pond_core::user_data::domain::proposal::{ProposalAudience, PROPOSAL_SESSION_ID};
+use pond_core::user_data::ports::draft::DraftRepository;
+use pond_core::user_data::ports::proposal::ProposalRepository;
 
 // ───────────────────────── REST API Routes ─────────────────────────
 
 /// Builds the full REST API router with onboarding-aware middleware
 pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     // ───────────── Public routes (accessible before onboarding) ─────────────
+    //
+    // "Public" here means "not behind `require_onboarding_complete`". Whether a
+    // route answers a caller with no bearer token is a SEPARATE question,
+    // decided by `middleware::PUBLIC_ROUTES` -- and since PAI-2 P7 the answer
+    // depends on the pond's state: the wizard's writes (`PUT /settings`,
+    // `POST /profiles`, `PATCH /profiles/{id}`, `POST /onboard/*`,
+    // `/voice/calibrate`) stop answering anonymous callers once onboarding
+    // completes. Adding a route here means classifying it there; four tests
+    // fail the build otherwise.
     let public_routes = Router::new()
         .route("/health", get(health))
         .route("/handshake", post(handshake_handler))
@@ -123,6 +148,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             patch(rename_session).delete(delete_session),
         )
         .route("/sessions/{session_id}/messages", get(get_session_messages))
+        // PAI-4 P7 — the manual axis. The time axis (P4) and the pressure axis
+        // (P6) both decide for the user; this is the one a person decides.
+        .route("/sessions/{session_id}/compact", post(compact_session))
         // Phase F2: raw bytes for one persisted image attachment.
         .route(
             "/sessions/{session_id}/attachments/{attachment_id}",
@@ -170,6 +198,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // DELETE clears activity on demand (#117, "clear my activity").
         .route("/activity", get(get_activity).delete(clear_activity))
         .route("/activity/summary", get(activity_summary))
+        // PAI-2 P8a — the would-deny telemetry the enforce flip is waiting on.
+        // Protected by registration here and by its absence from PUBLIC_ROUTES.
+        .route("/security/policy-report", get(policy_report))
         .route(
             "/camera/events",
             get(list_camera_events).post(record_camera_event),
@@ -190,6 +221,31 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/schedules/{id}/run-now", post(run_schedule_now))
         .route("/schedules/{id}/runs", get(list_schedule_runs))
         .route("/schedules/events", get(schedule_events_sse))
+        // ── Sensor rules (PAI-7 P8) ────────────────────────────────────────
+        // A rule is a `SensorTrigger` schedule. Until now the only way to make
+        // one over HTTP was to POST that kind to `/schedules` along with a cron
+        // expression the scheduler never reads, which is why the MCP tools were
+        // the real interface. These handlers name the thing, validate the spec
+        // the schedule route accepts unchecked, and refuse to reach a cron
+        // schedule by id.
+        .route("/rules", get(list_rules).post(create_rule))
+        .route(
+            "/rules/{id}",
+            get(get_rule).put(update_rule).delete(delete_rule),
+        )
+        .route("/rules/{id}/pause", post(pause_rule))
+        .route("/rules/{id}/resume", post(resume_rule))
+        // ── Proactive proposals (PAI-7 P3b) ────────────────────────────────
+        // The surface PAI-7 P3a's domain has been waiting for. Protected, and
+        // deliberately absent from `middleware::PUBLIC_ROUTES`: a proposal is
+        // addressed to one member and an anonymous caller is not one.
+        .route("/proposals", get(list_proposals))
+        .route(
+            "/context/sources",
+            get(list_context_sources).post(connect_context_source),
+        )
+        .route("/context/sources/{id}", delete(disconnect_context_source))
+        .route("/proposals/{id}/decide", post(decide_proposal))
         // Foreground push: per-device notification stream (#99).
         .route("/notifications/stream", get(notifications_stream))
         // ── Extensions (MCP/Goose extension manager) ───────────────────────────
@@ -301,7 +357,9 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route(
             "/sessions/{session_id}/user",
-            get(get_session_user_handler).delete(clear_session_user_handler),
+            get(get_session_user_handler)
+                .put(set_session_user_handler)
+                .delete(clear_session_user_handler),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -630,17 +688,52 @@ async fn handshake_pairing_code(
         .await
         .map_err(|e| handshake_error("pairing_code_lookup", e))?;
     match code {
-        Some(pc) => Ok(Json(json!({"code": pc.code, "expires_at": pc.expires_at}))),
+        Some(pc) => Ok(Json(json!({
+            "code": pc.code,
+            "expires_at": pc.expires_at,
+            // PAI-1 P9: whose device this code will make. `null` is an
+            // unattributed code, which is every code issued before the field
+            // existed and every code issued with no body.
+            "profile_id": pc.profile_id,
+        }))),
         None => Ok(Json(json!({"code": null}))),
     }
+}
+
+/// The optional body of `POST /handshake/pairing-code`.
+///
+/// PAI-1 P9's HTTP half. **The member is captured here, at issuance, and never
+/// from the pairing request.** `IdentificationSource::PairedDevice` outranks
+/// both face and explicit identification, so a `profile_id` the pairing client
+/// supplied would outrank every proof this pond can actually make — the same
+/// shape as the hole PAI-1 P4 closed on `PUT /sessions/{id}/user`. What makes
+/// issuance trustworthy instead is the loopback check in the handler: the
+/// answer comes from somebody standing at the pond.
+///
+/// `deny_unknown_fields` because the failure this refuses is silent otherwise:
+/// an operator who posts `profileId` would be told "issued" and handed a code
+/// that belongs to nobody, and an unattributed device is invisible until the
+/// day somebody wonders why their phone gets no proposals.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct IssuePairingCodeRequest {
+    /// The household member the device pairing with this code will belong to.
+    /// Omitted or `null` leaves it unattributed.
+    #[serde(default)]
+    profile_id: Option<String>,
 }
 
 /// Issue a **fresh** single-use pairing code. **Loopback-only** — this is the
 /// "pair a new device" action the operator triggers from the host (CLI/desktop
 /// dashboard) to pair an additional phone after the startup code is consumed.
+///
+/// Optionally binds the code to a household member; see
+/// [`IssuePairingCodeRequest`] for why that binding happens here and nowhere
+/// else.
 async fn handshake_issue_pairing_code(
     State(state): State<Arc<AppState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if !peer.ip().is_loopback() {
         return Err((
@@ -648,12 +741,56 @@ async fn handshake_issue_pairing_code(
             Json(json!({"error": "pairing codes can only be issued on the host"})),
         ));
     }
+    // The body is optional and read as raw bytes rather than through `Json`,
+    // because this route has been POSTed with no body and no content type since
+    // #93 and both the CLI and the desktop dashboard still do that. An empty
+    // body means an unattributed code, exactly as before.
+    //
+    // A body that is PRESENT and unreadable is refused rather than defaulted.
+    // Defaulting would narrow — an unattributed code grants nothing — but it
+    // would also tell an operator who meant to bind this code to Liz that the
+    // code was issued, and the device would silently be nobody's.
+    let request: IssuePairingCodeRequest = if body.is_empty() {
+        IssuePairingCodeRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("invalid pairing-code request body: {e}"),
+                })),
+            )
+        })?
+    };
+
+    let named_a_member = request.profile_id.is_some();
     let pc = state
         .handshake
-        .issue_pairing_code()
+        .issue_pairing_code_for(request.profile_id.as_deref())
         .await
-        .map_err(|e| handshake_error("issue_pairing_code", e))?;
-    Ok(Json(json!({"code": pc.code, "expires_at": pc.expires_at})))
+        .map_err(|e| {
+            // Logged the same way either way, so the real cause is in the log
+            // and never in the response. The status differs because the cause
+            // does: the adapter leans on migration 0043's foreign key to refuse
+            // a code for a member who does not exist, and answering that with a
+            // 500 tells the operator the pond is broken when the member id is.
+            let internal = handshake_error("issue_pairing_code", e);
+            if named_a_member {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "could not issue a pairing code for that household member",
+                    })),
+                )
+            } else {
+                internal
+            }
+        })?;
+    Ok(Json(json!({
+        "code": pc.code,
+        "expires_at": pc.expires_at,
+        "profile_id": pc.profile_id,
+    })))
 }
 
 /// Start or report onboarding state (public)
@@ -873,8 +1010,14 @@ struct ChatRequest {
 /// Persists both user and assistant messages to session storage.
 async fn chat(
     State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
     body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // PAI-1 P9. Taken from the request's principal before the body is even
+    // parsed, so there is no point at which a field of that body could be
+    // mistaken for it.
+    let device = proven_device(principal.as_ref());
+
     // Resets the inactivity clock and interrupts any background consolidation.
     state.note_user_activity().await;
 
@@ -905,7 +1048,11 @@ async fn chat(
 
     // Build ChatService — agent is always primary (GooseAdapter builds system
     // prompt from DB settings, manages history, handles MCP tools internally).
-    let service = ChatService::new(state.agent.clone(), session_id.clone(), storage.clone());
+    // Resolved exactly as /chat/stream does. Without this the two endpoints
+    // disagreed about the same speaker: the stream gave Guest, this gave the
+    // whole household.
+    let service = ChatService::new(state.agent.clone(), session_id.clone(), storage.clone())
+        .with_profile_scope(resolve_turn_scope(&state, &session_id, &device).await);
 
     let response_text = service.chat_once(req.message).await.map_err(|e| {
         (
@@ -1041,51 +1188,6 @@ async fn tts_synthesise(
         })
 }
 
-fn render_tool_guidance_from_extensions(extensions: &[ExtensionInfo]) -> String {
-    if extensions.is_empty() {
-        return String::new();
-    }
-
-    let mut lines = vec![
-        "## Tool Use Guidance".to_string(),
-        "You may call tools when they are necessary to complete the user request.".to_string(),
-        "- Prefer the smallest number of tool calls that can complete the task.".to_string(),
-        "- If a tool fails, explain what failed and continue with the best possible answer."
-            .to_string(),
-        "".to_string(),
-        "Available tools:".to_string(),
-    ];
-
-    let mut tool_count = 0usize;
-    for ext in extensions {
-        if ext.tools.is_empty() {
-            continue;
-        }
-        tool_count += ext.tools.len();
-
-        if ext.description.trim().is_empty() {
-            lines.push(format!("- {} ({})", ext.name, ext.kind));
-        } else {
-            lines.push(format!(
-                "- {} ({}) - {}",
-                ext.name,
-                ext.kind,
-                ext.description.trim()
-            ));
-        }
-
-        for tool in &ext.tools {
-            lines.push(format!("  - {}", tool));
-        }
-    }
-
-    if tool_count == 0 {
-        return String::new();
-    }
-
-    lines.join("\n")
-}
-
 // ── SSE streaming chat ────────────────────────────────────────────────────────
 
 /// Stream chat tokens via Server-Sent Events.
@@ -1099,9 +1201,14 @@ fn render_tool_guidance_from_extensions(extensions: &[ExtensionInfo]) -> String 
 /// to session storage before yielding the final done event.
 async fn chat_stream(
     State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
     body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
 {
+    // PAI-1 P9. Read from the principal before the body is parsed; `ChatRequest`
+    // has no device field and must never grow one.
+    let device = proven_device(principal.as_ref());
+
     // Resets the inactivity clock and interrupts any background consolidation.
     state.note_user_activity().await;
 
@@ -1127,7 +1234,7 @@ async fn chat_stream(
     // event mid-conversation. Nothing has been decoded at this point.
     image_limit_response(&req.images)?;
 
-    Ok(chat_stream_inner(state, permit, req))
+    Ok(chat_stream_inner(state, permit, req, device))
 }
 
 /// Map an image-limit violation onto an HTTP status, or pass a legal set through.
@@ -1155,19 +1262,291 @@ fn image_limit_response(
     }
 }
 
+// ── One engine event, one SSE frame ───────────────────────────────────────────
+
+/// What one `AgentStreamEvent` means to a chat SSE stream.
+///
+/// PAI-5 P7. Both stream handlers cover the same variants and emit the same
+/// frame JSON, and each used to carry its own copy of the match. Two exhaustive
+/// matches over an enum that is still growing is a standing promise to write
+/// every new variant twice — and they had already drifted, which is how
+/// `/agent/chat/stream` came to persist turns it never extracted memory from.
+///
+/// The two outcomes that are NOT simply a frame are the two places the routes
+/// legitimately differ, so they come back as data rather than being resolved
+/// here:
+///
+/// * [`StreamStep::Reasoning`] — the frame is identical, but the passage has to
+///   reach the handler's OWN `ChatService`, which holds the `persist_thinking`
+///   gate. The translator is handed no service and therefore cannot record
+///   against the wrong one, and each handler keeps a visible `record_thinking`
+///   call rather than inheriting one it cannot see.
+/// * [`StreamStep::TurnComplete`] — `/chat/stream` yields a `turn_stats` frame
+///   here and its `done` frame much later, after persistence, telemetry and the
+///   context-pressure check; `/agent/chat/stream` closes on the spot. That is a
+///   routing decision, not a frame shape.
+#[derive(Debug, PartialEq)]
+enum StreamStep {
+    /// Emit nothing. The thought filter swallowed the whole chunk — it is
+    /// inside a reasoning block, or holding back a possible partial tag.
+    Nothing,
+    /// One SSE frame, ready to yield verbatim.
+    Frame(String),
+    /// A reasoning passage: the frame to show, and the same text for the
+    /// handler to offer its persistence owner.
+    Reasoning { frame: String, block: String },
+    /// The engine finished the turn, with whatever numbers it reported.
+    TurnComplete {
+        usage: Option<pond_core::models::ports::provider::UsageStats>,
+        stats: Option<pond_core::shared::domain::turn_stats::TurnStats>,
+    },
+}
+
+/// The one shape of a `tool_result` SSE frame.
+///
+/// Four sites build this — the `ToolResult` arm and the Harmony-envelope
+/// fallback in each handler — and the optional `ui` key is what the MCP-UI
+/// renderer keys off. A site that forgot it renders a card as raw text.
+fn tool_result_frame(tool: &str, id: &str, content: &str, ui_hint: Option<Value>) -> String {
+    let mut ev = json!({
+        "type": "tool_result",
+        "tool": tool,
+        "id": id,
+        "content": content,
+    });
+    if let Some(ui) = ui_hint {
+        ev["ui"] = ui;
+    }
+    ev.to_string()
+}
+
+/// The one shape of a `turn_stats` SSE frame.
+///
+/// PAI-5 P2's display half, and the reason it took a second phase: the number
+/// this adds — `reasoning_tokens` — has been on `TurnStats` and in
+/// `session_messages` since 2026-08-06, but this frame is built by hand from a
+/// struct, so widening the struct did not widen the frame, and `routes.rs` was
+/// held by other work at the time. The count reached
+/// `AgentStreamEvent::Done` and stopped there.
+///
+/// Two properties of that field the JSON has to preserve:
+///
+/// * It is reported **alongside** `completion_tokens`, never deducted from it.
+///   The provider's output count most likely already includes the reasoning
+///   decode, nobody has measured which way for the models GIAP pins, and
+///   subtracting a GIAP estimate from an engine-reported number corrupts the
+///   one that was actually measured.
+/// * `null` is not `0`. "Nobody counted" and "counted, and this turn thought
+///   nothing" are different facts — it is why migration 0039 has no
+///   `DEFAULT 0` — and PAI-5 P5 sizes `output_reserve_tokens` from the second.
+///   Serialising `None` as `null` keeps that distinction on the wire; a
+///   `unwrap_or(0)` here would erase it for every provider that reports no
+///   reasoning at all.
+///
+/// One function rather than a `json!` per handler for the same reason
+/// [`tool_result_frame`] is one: both stream routes emit this frame, and a
+/// field added to one copy is a client that renders it on `/chat/stream` and
+/// not on `/agent/chat/stream`.
+fn turn_stats_frame(s: &pond_core::shared::domain::turn_stats::TurnStats) -> String {
+    json!({
+        "type": "turn_stats",
+        "ttft_ms": s.ttft_ms,
+        "prefill_ms": s.prefill_ms,
+        "decode_tok_per_sec": s.decode_tok_per_sec,
+        "prefill_tok_per_sec": s.prefill_tok_per_sec,
+        "prompt_tokens": s.prompt_tokens,
+        "completion_tokens": s.completion_tokens,
+        "reasoning_tokens": s.reasoning_tokens,
+        "context_used_tokens": s.context_used_tokens,
+        "context_limit_tokens": s.context_limit_tokens,
+        "context_pct": s.context_pct(),
+        "model_load_ms": s.model_load_ms,
+        "inference_count": s.inference_count,
+        // The other half of what thinking cost. `inference_count` already says
+        // how many times the engine ran, but it cannot distinguish a turn that
+        // ran twice because it called a tool from a turn that ran twice because
+        // it thought, said nothing, and had to be steered back. Only this field
+        // separates them, and 0 is the honest value for an ordinary turn — this
+        // one is a count, not an Option, because every turn that reaches here
+        // was observed.
+        "reengagements": s.reengagements,
+    })
+    .to_string()
+}
+
+/// The per-turn state a chat SSE handler accumulates while the engine streams.
+///
+/// The three fields at the top are what both handlers need in order to persist
+/// the turn; the four below them are the per-tool and first-token timing that
+/// `/chat/stream` reports as `TurnMetrics` (PAI-3 and PAI-4 read it). They are
+/// gathered on both routes because a recorder that only runs for one caller is
+/// a behaviour flag wearing a struct, and the cost is one `Instant` per tool
+/// call.
+struct TurnAccumulator {
+    /// Strips Harmony `<|channel>thought … <channel|>` and `<think>…</think>`
+    /// out of the visible token stream, and captures what it strips.
+    thought: crate::thought_filter::ThoughtFilter,
+    /// The assistant's visible answer, as persisted.
+    full_text: String,
+    /// One JSON row per tool result, as persisted.
+    tool_results: Vec<String>,
+    /// When the first visible token arrived, as a fallback for an engine that
+    /// reports no TTFT of its own.
+    ttft: Option<std::time::Instant>,
+    tool_call_start: Option<std::time::Instant>,
+    /// The most recent tool call's name and wall-clock latency. When a turn
+    /// invokes several tools only the last survives — `TurnMetrics` has one
+    /// slot.
+    last_tool_name: Option<String>,
+    last_tool_latency_ms: Option<u64>,
+}
+
+impl TurnAccumulator {
+    /// The filter is the caller's, because the two routes configure it
+    /// differently: `/chat/stream` captures thinking blocks when the user asked
+    /// to see them and never in voice mode, `/agent/chat/stream` never does.
+    fn new(thought: crate::thought_filter::ThoughtFilter) -> Self {
+        Self {
+            thought,
+            full_text: String::new(),
+            tool_results: Vec::new(),
+            ttft: None,
+            tool_call_start: None,
+            last_tool_name: None,
+            last_tool_latency_ms: None,
+        }
+    }
+
+    /// A tool the model asked for as Harmony text markup rather than through
+    /// the structured protocol, executed by the handler as a fallback.
+    ///
+    /// It never produced an `AgentStreamEvent::ToolCall`, so the timing has to
+    /// be recorded by hand or the turn reports no tool at all.
+    fn note_fallback_tool(&mut self, name: &str, latency: std::time::Duration) {
+        self.last_tool_name = Some(name.to_string());
+        self.last_tool_latency_ms = Some(latency.as_millis() as u64);
+    }
+
+    /// Fold one engine event into the turn and say what the stream should emit.
+    ///
+    /// **This is the only match on `AgentStreamEvent` in this file, and that is
+    /// the point of it** — `stream_handler_parity.rs` fails if a second one
+    /// appears. A new variant is written here once, and both routes carry it.
+    fn absorb(&mut self, event: pond_core::models::ports::agent::AgentStreamEvent) -> StreamStep {
+        use pond_core::models::ports::agent::AgentStreamEvent;
+
+        match event {
+            AgentStreamEvent::Status { content } => {
+                StreamStep::Frame(json!({"type": "status", "content": content}).to_string())
+            }
+            AgentStreamEvent::Thinking { content } => StreamStep::Reasoning {
+                frame: json!({"type": "thinking", "content": content}).to_string(),
+                block: content,
+            },
+            AgentStreamEvent::ToolCall { tool, id, input } => {
+                self.tool_call_start = Some(std::time::Instant::now());
+                self.last_tool_name = Some(tool.clone());
+                StreamStep::Frame(
+                    json!({"type": "tool_call", "tool": tool, "id": id, "input": input})
+                        .to_string(),
+                )
+            }
+            AgentStreamEvent::ToolResult { tool, id, content } => {
+                if let Some(start) = self.tool_call_start.take() {
+                    self.last_tool_latency_ms = Some(start.elapsed().as_millis() as u64);
+                }
+                let (clean_content, ui_hint) = extract_ui_hint(&content);
+                self.tool_results.push(
+                    json!({
+                        "tool_call_id": id,
+                        "tool": tool,
+                        "content": clean_content,
+                    })
+                    .to_string(),
+                );
+                StreamStep::Frame(tool_result_frame(&tool, &id, &clean_content, ui_hint))
+            }
+            AgentStreamEvent::Text { content } => {
+                let visible = self.thought.push(&content);
+                if visible.is_empty() {
+                    StreamStep::Nothing
+                } else {
+                    if self.ttft.is_none() {
+                        self.ttft = Some(std::time::Instant::now());
+                    }
+                    self.full_text.push_str(&visible);
+                    StreamStep::Frame(
+                        json!({"type": "text", "content": visible, "token": visible}).to_string(),
+                    )
+                }
+            }
+            AgentStreamEvent::ReviewStatus { content } => {
+                StreamStep::Frame(json!({"type": "review_status", "content": content}).to_string())
+            }
+            AgentStreamEvent::ReviewRevision {
+                content,
+                score,
+                rounds,
+            } => StreamStep::Frame(
+                json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds})
+                    .to_string(),
+            ),
+            // Its own event type so the UI can offer a one-click continue
+            // instead of leaving the engine's "would you like me to continue?"
+            // as an unanswerable sentence.
+            AgentStreamEvent::TurnLimitReached { max_turns } => StreamStep::Frame(
+                json!({"type": "turn_limit_reached", "max_turns": max_turns}).to_string(),
+            ),
+            // PAI-6 P6. A frame and NOTHING else: no `full_text`, no
+            // `tool_results`, no timing slot. Those three fields are what this
+            // struct exists to persist, and invariant 4 says a subagent's
+            // activity never becomes the parent's history — only its final
+            // result does, which arrives as the `delegate` tool's ToolResult
+            // through the arm above. `absorb_progress_leaves_the_turn_untouched`
+            // is the guard.
+            AgentStreamEvent::SubagentProgress {
+                task_id,
+                role,
+                status,
+                detail,
+            } => StreamStep::Frame(
+                json!({
+                    "type": "subagent_progress",
+                    "task_id": task_id,
+                    "role": role,
+                    "status": status,
+                    "detail": detail,
+                })
+                .to_string(),
+            ),
+            AgentStreamEvent::Done { usage, stats, .. } => StreamStep::TurnComplete { usage, stats },
+            AgentStreamEvent::Error { content } => {
+                StreamStep::Frame(json!({"error": content}).to_string())
+            }
+        }
+    }
+}
+
 /// Shared SSE pipeline used by both `chat_stream` and `run_recipe`.
 ///
 /// Callers handle activity touching, body parsing, and semaphore acquisition;
 /// this helper owns the full agent turn — session creation, system-prompt
 /// build, llamafile startup wait, ThoughtFilter, telemetry, memory extraction —
 /// and emits the same SSE event shape regardless of entry point.
+///
+/// `device` is separate from `req` on purpose (PAI-1 P9): `ChatRequest` is
+/// deserialised from a client-controlled body, and the paired-device rung
+/// outranks every other identification the pond can make. Passing it beside the
+/// body keeps the two provenances apart in the type signature, so a future
+/// author cannot reach for `req.device_id` because there is nothing to reach
+/// for.
 fn chat_stream_inner(
     state: Arc<AppState>,
     permit: tokio::sync::OwnedSemaphorePermit,
     req: ChatRequest,
+    device: ProvenDevice,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     use futures::StreamExt;
-    use pond_core::models::ports::agent::AgentStreamEvent;
 
     let stream = async_stream::stream! {
         let _permit = permit;
@@ -1186,100 +1565,38 @@ fn chat_stream_inner(
 
         let settings = state.settings_repo.get().await.unwrap_or_default();
 
-        // Build the system prompt
-        let system_prompt = {
-            let profile_ctx: Option<ProfileContext> = if let Some(ref pid) = settings.primary_profile_id {
-                state.profile_repo.get(pid).await.ok().flatten().map(|p| {
-                    let prefs = &p.preferences;
-                    ProfileContext {
-                        preferred_name: prefs.get("preferred_name").cloned(),
-                        birthday: prefs.get("birthday").cloned(),
-                        language: prefs.get("language").cloned(),
-                        atypical_speech: prefs.get("accessibility_atypical_speech")
-                            .map(|v| v == "true")
-                            .unwrap_or(false),
-                    }
-                })
-            } else {
-                None
-            };
-
-            let file_template = match state.prompt_template_dir.as_ref() {
-                Some(dir) => tokio::fs::read_to_string(dir.join("system.md")).await.ok(),
-                None => None,
-            };
-
-            match file_template {
-                Some(tmpl) => {
-                    let name     = sanitize_field(&settings.assistant_name, 50);
-                    let user     = sanitize_field(&settings.user_name, 50);
-                    let persona  = sanitize_field(&settings.assistant_personality, 200);
-                    let tz       = sanitize_field(&settings.timezone, 50);
-                    let location = if settings.weather_location_name.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\nLocation: {}.", sanitize_field(&settings.weather_location_name, 100))
-                    };
-                    let addendum = sanitize_field(&settings.prompt_addendum, 500);
-                    render_template(&tmpl, &[
-                        ("assistant_name",  name.as_str()),
-                        ("user_name",       user.as_str()),
-                        ("personality",     persona.as_str()),
-                        ("timezone",        tz.as_str()),
-                        ("location",        location.as_str()),
-                        ("prompt_addendum", addendum.as_str()),
-                    ])
-                }
-                None => build_system_prompt_with_profile(&settings, profile_ctx.as_ref()),
-            }
-        };
-
-        let mut _system_prompt = match &state.mcp_memory {
-            Some(m) => {
-                let mem = m.instructions();
-                if mem.is_empty() { system_prompt } else { format!("{}\n\n---\n{}", system_prompt, mem) }
-            }
-            None => system_prompt,
-        };
-
-        if let Some(mgr) = &state.extension_manager {
-            match mgr.list_extensions().await {
-                Ok(extensions) => {
-                    const MAX_TOOL_GUIDANCE_CHARS: usize = 4_000;
-                    const TOOL_GUIDANCE_TRUNCATION_NOTE: &str =
-                        "\n\n[tool guidance truncated; additional tools omitted]";
-
-                    let guidance = render_tool_guidance_from_extensions(&extensions);
-                    if !guidance.is_empty() {
-                        let bounded_guidance = if guidance.len() > MAX_TOOL_GUIDANCE_CHARS {
-                            let reserved = TOOL_GUIDANCE_TRUNCATION_NOTE.len();
-                            let max_content_len = MAX_TOOL_GUIDANCE_CHARS.saturating_sub(reserved);
-                            let mut cut = max_content_len.min(guidance.len());
-                            while cut > 0 && !guidance.is_char_boundary(cut) {
-                                cut -= 1;
-                            }
-                            format!("{}{}", &guidance[..cut], TOOL_GUIDANCE_TRUNCATION_NOTE)
-                        } else {
-                            guidance
-                        };
-
-                        _system_prompt.push_str("\n\n");
-                        _system_prompt.push_str(&bounded_guidance);
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!("Failed to list extensions for tool guidance: {}", e);
-                }
-            }
-        }
+        // No system prompt is built here. It used to be, into a `_system_prompt`
+        // that nothing read: `AgentRequest` has no system-prompt field, and the
+        // adapter builds the real one from `build_prompt_partition`. The block cost
+        // a disk read of `<data_dir>/prompts/system.md`, a Tera render of the 8 KB
+        // balanced template, an `Agent::list_tools` round trip and a tool-guidance
+        // format -- every turn, and on every recipe run -- and then dropped all of
+        // it. Editing that file to change behaviour changed nothing, which is the
+        // worse cost: it read as a working override.
+        //
+        // Two things rode on it and are therefore inert until deliberately rewired:
+        // `AppState::prompt_template_dir` (the file override above, superseded by
+        // the template repo the adapter reads) and `AppState::mcp_memory`, whose
+        // instructions were appended here and nowhere else.
 
         let model_role = "chat";
+
+        // The same verdict the AgentRequest carries, so a turn's memory is
+        // WRITTEN under the identity it was READ under. Extraction stamps
+        // `profile_id` from this; before it, every fragment was unattributed
+        // and `Owner(id)` reads matched exactly what `Household` did.
+        let turn_scope = resolve_turn_scope(&state, &session_id, &device).await;
 
         let mut chat_service = pond_core::shared::services::chat::ChatService::new(
             state.agent.clone(),
             session_id.clone(),
             storage.clone(),
-        );
+        )
+        .with_profile_scope(turn_scope.clone())
+        // PAI-5 P6. The user's own choice, off by default. The `Thinking` arm
+        // below calls `record_thinking` unconditionally; this is what decides
+        // whether anything comes of it.
+        .with_thinking(settings.persist_thinking);
         if let (Some(ext), Some(svc)) =
             (state.memory_extractor.clone(), state.memory_extraction_service.clone())
         {
@@ -1356,26 +1673,21 @@ fn chat_stream_inner(
             images: req.images.clone(),
             voice_mode: req.voice_mode,
             canvas_mode: req.canvas_mode,
+            profile_scope: turn_scope.clone(),
+            profile_context: profile_context_for(&state, &turn_scope).await,
         };
 
-        let mut full_text = String::new();
-        let mut tool_results: Vec<String> = Vec::new();
-        let mut ttft_instant: Option<std::time::Instant> = None;
-        // Tracks the most recent tool call's name and wall-clock latency, used
-        // to populate per-turn telemetry below. When a turn invokes several
-        // tools, only the last one is recorded — TurnMetrics has a single slot.
-        let mut last_tool_name: Option<String> = None;
-        let mut last_tool_latency_ms: Option<u64> = None;
-        let mut tool_call_start: Option<std::time::Instant> = None;
-        // Filter Harmony-style `<|channel>thought ... <channel|>` reasoning
-        // preambles and `<think>…</think>` blocks out of the per-token stream.
-        // When show_thinking is enabled, capture thinking blocks as SSE events.
+        // The turn's own state: the visible answer, the tool results that go
+        // with it, and the per-tool timing this route reports as TurnMetrics.
+        // The filter strips Harmony-style `<|channel>thought ... <channel|>`
+        // preambles and `<think>…</think>` blocks out of the per-token stream;
+        // when show_thinking is enabled it captures them as SSE events instead.
         // Voice mode always disables thinking capture.
-        let mut thought = if settings.show_thinking && !req.voice_mode {
+        let mut turn = TurnAccumulator::new(if settings.show_thinking && !req.voice_mode {
             crate::thought_filter::ThoughtFilter::new().with_thinking_capture()
         } else {
             crate::thought_filter::ThoughtFilter::new()
-        };
+        });
         let mut agent_stream = match state.agent.chat_stream(agent_req).await {
             Ok(s) => s,
             Err(e) => {
@@ -1408,98 +1720,39 @@ fn chat_stream_inner(
                     deadline = tokio::time::Instant::now() + idle_budget;
                     match event_result {
                         Ok(event) => {
-                            let maybe_data = match event {
-                                AgentStreamEvent::Status { content } => {
-                                    Some(json!({"type": "status", "content": content}).to_string())
+                            match turn.absorb(event) {
+                                StreamStep::Nothing => {}
+                                StreamStep::Frame(data) => {
+                                    yield Ok(Event::default().data(data));
                                 }
-                                AgentStreamEvent::Thinking { content } => {
-                                    Some(json!({"type": "thinking", "content": content}).to_string())
+                                StreamStep::Reasoning { frame, block } => {
+                                    // PAI-5 P6. Offer it to the persistence
+                                    // owner; `record_thinking` drops it unless
+                                    // the user turned `persist_thinking` on.
+                                    // The SSE frame is unchanged either way --
+                                    // showing it live and keeping it are
+                                    // different consents.
+                                    chat_service.record_thinking(block);
+                                    yield Ok(Event::default().data(frame));
                                 }
-                                AgentStreamEvent::ToolCall { tool, id, input } => {
-                                    tool_call_start = Some(std::time::Instant::now());
-                                    last_tool_name = Some(tool.clone());
-                                    Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
-                                }
-                                AgentStreamEvent::ToolResult { tool, id, content } => {
-                                    if let Some(start) = tool_call_start.take() {
-                                        last_tool_latency_ms = Some(start.elapsed().as_millis() as u64);
-                                    }
-                                    let (clean_content, ui_hint) = extract_ui_hint(&content);
-                                    let mut ev = serde_json::json!({
-                                        "type": "tool_result",
-                                        "tool": tool,
-                                        "id": id,
-                                        "content": clean_content
-                                    });
-                                    if let Some(ui) = ui_hint {
-                                        ev["ui"] = ui;
-                                    }
-                                    tool_results.push(json!({
-                                        "tool_call_id": id,
-                                        "tool": tool,
-                                        "content": clean_content,
-                                    }).to_string());
-                                    Some(ev.to_string())
-                                }
-                                AgentStreamEvent::Text { content } => {
-                                    let visible = thought.push(&content);
-                                    if visible.is_empty() {
-                                        None
-                                    } else {
-                                        if ttft_instant.is_none() {
-                                            ttft_instant = Some(std::time::Instant::now());
-                                        }
-                                        full_text.push_str(&visible);
-                                        Some(json!({"type": "text", "content": visible, "token": visible}).to_string())
-                                    }
-                                }
-                                AgentStreamEvent::ReviewStatus { content } => {
-                                    Some(json!({"type": "review_status", "content": content}).to_string())
-                                }
-                                AgentStreamEvent::ReviewRevision { content, score, rounds } => {
-                                    Some(json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds}).to_string())
-                                }
-                                // Its own event type so the UI can offer a
-                                // one-click continue instead of leaving the
-                                // engine's "would you like me to continue?" as
-                                // an unanswerable sentence.
-                                AgentStreamEvent::TurnLimitReached { max_turns } => {
-                                    Some(json!({"type": "turn_limit_reached", "max_turns": max_turns}).to_string())
-                                }
-                                AgentStreamEvent::Done { usage, stats, .. } => {
+                                StreamStep::TurnComplete { usage, stats } => {
                                     if let Some(u) = usage {
                                         usage_prompt_tokens = u.prompt_tokens;
                                         usage_completion_tokens = u.completion_tokens;
                                     }
                                     if let Some(s) = stats {
-                                        let payload = json!({
-                                            "type": "turn_stats",
-                                            "ttft_ms": s.ttft_ms,
-                                            "prefill_ms": s.prefill_ms,
-                                            "decode_tok_per_sec": s.decode_tok_per_sec,
-                                            "prefill_tok_per_sec": s.prefill_tok_per_sec,
-                                            "prompt_tokens": s.prompt_tokens,
-                                            "completion_tokens": s.completion_tokens,
-                                            "context_used_tokens": s.context_used_tokens,
-                                            "context_limit_tokens": s.context_limit_tokens,
-                                            "context_pct": s.context_pct(),
-                                            "model_load_ms": s.model_load_ms,
-                                            "inference_count": s.inference_count,
-                                        });
+                                        let payload = turn_stats_frame(&s);
                                         turn_stats = Some(s);
-                                        yield Ok(Event::default().data(payload.to_string()));
+                                        yield Ok(Event::default().data(payload));
                                     }
+                                    // The `done` frame for this route is emitted
+                                    // at the very end, after persistence and
+                                    // telemetry, and carries the usage totals.
                                     continue;
                                 }
-                                AgentStreamEvent::Error { content } => {
-                                    Some(json!({"error": content}).to_string())
-                                }
-                            };
-                            if let Some(data) = maybe_data {
-                                yield Ok(Event::default().data(data));
                             }
                             // Emit captured thinking blocks as SSE events (when show_thinking is on)
-                            for thinking_content in thought.take_thinking() {
+                            for thinking_content in turn.thought.take_thinking() {
                                 let data = json!({"type": "thinking", "content": thinking_content}).to_string();
                                 yield Ok(Event::default().data(data));
                             }
@@ -1507,7 +1760,7 @@ fn chat_stream_inner(
                             // tool-call envelope (`<|tool_call> ... <tool_call|>`).
                             // The model emitted tool calls as Harmony text markup instead of
                             // the structured protocol. Execute them directly as a fallback.
-                            for body in thought.take_tool_calls() {
+                            for body in turn.thought.take_tool_calls() {
                                 if let Some((name, args)) = crate::thought_filter::parse_tool_envelope(&body) {
                                     tracing::info!(tool = %name, "Executing text-based tool call (model used Harmony format)");
                                     let call_id = uuid::Uuid::new_v4().to_string();
@@ -1517,25 +1770,17 @@ fn chat_stream_inner(
                                     ));
                                     let call_start = std::time::Instant::now();
                                     let call_result = state.agent.call_tool(&session_id, &name, &args).await;
-                                    last_tool_name = Some(name.clone());
-                                    last_tool_latency_ms = Some(call_start.elapsed().as_millis() as u64);
+                                    turn.note_fallback_tool(&name, call_start.elapsed());
                                     match call_result {
                                         Ok(result_text) => {
                                             let (clean, ui_hint) = extract_ui_hint(&result_text);
-                                            let mut ev = json!({
-                                                "type": "tool_result",
-                                                "tool": name,
-                                                "id": call_id,
-                                                "content": clean
-                                            });
-                                            if let Some(ui) = ui_hint {
-                                                ev["ui"] = ui;
-                                            }
-                                            yield Ok(Event::default().data(ev.to_string()));
+                                            yield Ok(Event::default().data(
+                                                tool_result_frame(&name, &call_id, &clean, ui_hint)
+                                            ));
                                         }
                                         Err(e) => {
                                             yield Ok(Event::default().data(
-                                                json!({"type": "tool_result", "tool": name, "id": call_id, "content": format!("Tool error: {e}")}).to_string()
+                                                tool_result_frame(&name, &call_id, &format!("Tool error: {e}"), None)
                                             ));
                                         }
                                     }
@@ -1574,9 +1819,9 @@ fn chat_stream_inner(
         // Flush any tail buffered by the thought filter (e.g. text after the
         // last `<channel|>` that had not yet exceeded the safe-emit threshold).
         if !timed_out {
-            let tail = thought.flush();
+            let tail = turn.thought.flush();
             if !tail.is_empty() {
-                full_text.push_str(&tail);
+                turn.full_text.push_str(&tail);
                 let data = json!({"type": "text", "content": tail, "token": tail}).to_string();
                 yield Ok(Event::default().data(data));
             }
@@ -1608,9 +1853,9 @@ fn chat_stream_inner(
                     let status = json!({"type": "review_status", "content": "Reviewing answer..."}).to_string();
                     yield Ok(Event::default().data(status));
 
-                    match reviewer.review(&req.message, &full_text, None).await {
+                    match reviewer.review(&req.message, &turn.full_text, None).await {
                         Ok(result) if result.was_revised => {
-                            full_text = result.final_answer.clone();
+                            turn.full_text = result.final_answer.clone();
                             let data = json!({
                                 "type": "review_revision",
                                 "content": result.final_answer,
@@ -1641,13 +1886,62 @@ fn chat_stream_inner(
         // accidentally omit extraction by refactoring this block.
         let _ = chat_service
             .persist_assistant_turn_with_extraction(
-                tool_results,
-                &full_text,
+                std::mem::take(&mut turn.tool_results),
+                &turn.full_text,
                 Some((usage_prompt_tokens, usage_completion_tokens)),
                 Some(&model_name_for_done),
                 &req.message,
             )
             .await;
+
+        // The turn's context window, resolved ONCE.
+        //
+        // Two consumers follow — per-turn telemetry and the context-growth
+        // monitor — and they used to resolve it independently. Telemetry went
+        // through `ContextGovernor`, whose documented precedence is
+        // EngineReported > Registry > CatalogRecord > Override > Heuristic. The
+        // monitor forty lines below took `context_window_override` when set and
+        // `capabilities().context_window_tokens` otherwise, which inverts that
+        // order and never consults the registry pin at all. On a Jetson pinned to
+        // 4096 with capabilities reporting 32768, the monitor read utilisation at
+        // roughly an eighth of the truth, so `context_warning` could not fire
+        // before the trimmer started dropping turns. Resolving once is the only
+        // way the two can be guaranteed to agree.
+        // Rung 3's input: the catalog row for the active chat model. Reached
+        // through `state.model_repo`, which is the same catalog the Models tab
+        // lists — so telemetry, the growth monitor and the UI are all quoting
+        // one number. Absent repo or absent row falls through to the rungs
+        // below, which is what happened for every turn before PAI-3 P3b.
+        let catalog_context_length = match &state.model_repo {
+            Some(repo) => {
+                let id = ModelRecord::id_for(
+                    &ModelCategory::for_chat_provider(&settings.chat_provider),
+                    &settings.chat_model,
+                );
+                repo.get_by_id(&id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|m| m.context_length)
+            }
+            None => None,
+        };
+
+        let turn_context_limit = ContextGovernor::resolve(&ContextInputs {
+            provider: &settings.chat_provider,
+            model: &settings.chat_model,
+            override_tokens: settings.context_window_override,
+            // Not reachable from the API layer; the adapter owns the registry
+            // lookup and reports the result via TurnStats.
+            registry_pinned: None,
+            catalog_context_length,
+            engine_reported: turn_stats
+                .as_ref()
+                .and_then(|s| s.context_limit_tokens)
+                .map(|t| EngineWindow::new(settings.chat_model.clone(), t)),
+            capability_window: Some(state.agent.capabilities().context_window_tokens),
+        })
+        .tokens as u32;
 
         // ── Per-turn telemetry ──────────────────────────────────────────
         if settings.telemetry_enabled {
@@ -1658,7 +1952,7 @@ fn chat_stream_inner(
                     .as_ref()
                     .and_then(|s| s.ttft_ms)
                     .or_else(|| {
-                        ttft_instant.map(|t| t.duration_since(turn_start).as_millis() as u64)
+                        turn.ttft.map(|t| t.duration_since(turn_start).as_millis() as u64)
                     })
                     .unwrap_or(total_latency_ms);
 
@@ -1669,16 +1963,7 @@ fn chat_stream_inner(
                     .map(|v| v.len() as u32)
                     .unwrap_or(0);
 
-                // Prefer the engine-reported context window over settings/capability
-                // guesses; the engine knows the real n_ctx it allocated.
-                let context_limit = turn_stats
-                    .as_ref()
-                    .and_then(|s| s.context_limit_tokens)
-                    .unwrap_or(if settings.context_window_override > 0 {
-                        settings.context_window_override
-                    } else {
-                        state.agent.capabilities().context_window_tokens
-                    });
+                let context_limit = turn_context_limit;
                 let context_used = turn_stats
                     .as_ref()
                     .and_then(|s| s.context_used_tokens)
@@ -1696,8 +1981,12 @@ fn chat_stream_inner(
                     completion_tokens: usage_completion_tokens,
                     ttft_ms,
                     total_latency_ms,
-                    tool_name: last_tool_name.clone(),
-                    tool_latency_ms: last_tool_latency_ms,
+                    // PAI-3 / PAI-4 read this. The accumulator gathers it from
+                    // the `ToolCall` / `ToolResult` pair and from the Harmony
+                    // fallback above; losing it is a silent regression in a
+                    // different workstream, not a cosmetic one.
+                    tool_name: turn.last_tool_name.clone(),
+                    tool_latency_ms: turn.last_tool_latency_ms,
                     tool_cache_hit: None,
                     context_utilization_pct,
                     model_name: model_name_for_done.clone(),
@@ -1708,6 +1997,15 @@ fn chat_stream_inner(
                     prefill_tok_per_sec: turn_stats.as_ref().and_then(|s| s.prefill_tok_per_sec),
                     context_limit_tokens: turn_stats.as_ref().and_then(|s| s.context_limit_tokens),
                     inference_count: turn_stats.as_ref().map(|s| s.inference_count),
+                    // What thinking cost, and what it cost when it went wrong.
+                    // `reasoning_tokens` stays Option all the way down: a turn
+                    // from a provider that reports no stats has not been
+                    // measured, and that is a different fact from a turn that
+                    // did no thinking. `reengagements` is a plain count on
+                    // `TurnStats`, so the only Nones here are turns with no
+                    // stats at all.
+                    reasoning_tokens: turn_stats.as_ref().and_then(|s| s.reasoning_tokens),
+                    reengagements: turn_stats.as_ref().map(|s| s.reengagements),
                 };
 
                 if let Err(e) = telemetry.record_turn(metrics).await {
@@ -1719,12 +2017,7 @@ fn chat_stream_inner(
         // ── Context growth monitoring ─────────────────────────────────
         if settings.context_monitor_enabled {
             let estimated_tokens = usage_prompt_tokens + usage_completion_tokens;
-            let context_limit = if settings.context_window_override > 0 {
-                settings.context_window_override
-            } else {
-                let caps = state.agent.capabilities();
-                caps.context_window_tokens
-            };
+            let context_limit = turn_context_limit;
 
             if estimated_tokens > 0 && context_limit > 0 {
                 state.context_monitor.record_turn(
@@ -1754,6 +2047,21 @@ fn chat_stream_inner(
                         "warning": health.warning,
                     }).to_string();
                     yield Ok(Event::default().data(data));
+
+                    // PAI-4 P6: and then actually do something about it. Until
+                    // this phase the frame above was the entire response to a
+                    // filling context window — the server warned the client and
+                    // took no action itself.
+                    //
+                    // This call spawns and returns; it must stay that way. We
+                    // are inside the SSE generator, the `done` frame below is
+                    // still unsent, and invariant 1 is that compaction never
+                    // blocks a turn, ever. Doing the work here — the obvious
+                    // reading of "act on should_compact" — would put a
+                    // summarisation model call between the user's last token and
+                    // the end of their stream, on the tier that can least afford
+                    // it. Everything real happens in the detached task.
+                    spawn_pressure_compaction(&state, &session_id);
                 }
             }
         }
@@ -1843,6 +2151,29 @@ fn derived_session_label(text: &str) -> String {
 }
 
 /// `GET /api/v1/usage/summary` — aggregate token usage across all sessions.
+///
+/// # The reasoning total, and what it costs
+///
+/// PAI-5 P2's other display surface. `total_prompt_tokens` and
+/// `total_completion_tokens` are running counters on the `sessions` row, kept
+/// by `increment_usage`; there is no such counter for reasoning, so the total
+/// here is summed from the `session_messages` rows — an O(corpus) read on a
+/// route that was O(sessions). I took that cost deliberately and it should not
+/// survive: the fix is one `SessionStorage` method
+/// (`reasoning_token_totals() -> (u64, u64)`) answering both numbers with one
+/// `SELECT SUM(reasoning_tokens), COUNT(reasoning_tokens)`, which this handler
+/// would then call instead of walking sessions. That belongs to whoever next
+/// owns `pond-core/src/user_data/ports/session_storage.rs`.
+///
+/// **`counted_reasoning_turns` is not decoration.** `total_reasoning_tokens: 0`
+/// is ambiguous between "the models did no thinking" and "nothing counted", and
+/// on a pond driven only from the desktop the honest answer is the second: both
+/// HTTP stream handlers persist through `ChatService::persist_assistant_turn`,
+/// whose usage argument is a `(prompt, completion)` tuple that cannot carry a
+/// third number, so their rows keep NULL. The count is carried end to end only
+/// on the `ChatService` path — `pond chat` and the terminal voice loop. A zero
+/// beside a zero count says "nobody counted"; a zero beside a non-zero count
+/// says the turns really did no thinking, which is what PAI-5 P5 needs to read.
 async fn usage_summary(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -1860,6 +2191,28 @@ async fn usage_summary(
         .sum();
     let total_tokens = total_prompt + total_completion;
 
+    let mut total_reasoning: u64 = 0;
+    let mut counted_reasoning_turns: u64 = 0;
+    for session in &sessions {
+        // A session whose messages cannot be read contributes nothing rather
+        // than failing the whole summary: the two provider counters above are
+        // already answerable and refusing to report them because one session's
+        // rows are unreadable trades a complete answer for none.
+        match state.session_storage.get_messages(&session.id).await {
+            Ok(messages) => {
+                for reasoning in messages.iter().filter_map(|m| m.reasoning_tokens) {
+                    total_reasoning += reasoning as u64;
+                    counted_reasoning_turns += 1;
+                }
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                session_id = %session.id,
+                "could not read a session's messages while summing reasoning tokens"
+            ),
+        }
+    }
+
     let settings = state.settings_repo.get().await.ok();
     let cloud_input = settings
         .as_ref()
@@ -1873,6 +2226,12 @@ async fn usage_summary(
     Ok(Json(json!({
         "total_prompt_tokens": total_prompt,
         "total_completion_tokens": total_completion,
+        // Deliberately NOT folded into `total_tokens`. That figure is what the
+        // cloud prices above are multiplied by, and this one is GIAP's own
+        // estimate over the thinking text rather than anything a provider
+        // billed for -- adding it would put an estimate inside a cost.
+        "total_reasoning_tokens": total_reasoning,
+        "counted_reasoning_turns": counted_reasoning_turns,
         "total_tokens": total_tokens,
         "session_count": sessions.len(),
         "cloud_input_price_per_million": cloud_input,
@@ -1990,6 +2349,14 @@ async fn delete_session(
     Path(session_id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     use pond_core::user_data::ports::session_storage::SessionStorageError;
+
+    // Engine cleanup MUST run before the pond row (and the engine_session_map
+    // pairing it cascades away) is deleted below — once the pairing is gone,
+    // the engine-side session id is unrecoverable and its messages, usage
+    // ledger, and inline image attachments become permanently unreachable
+    // garbage in a store the REST API never reads.
+    state.agent.forget_session(&session_id).await;
+
     state
         .session_storage
         .delete_session(&session_id)
@@ -2001,6 +2368,16 @@ async fn delete_session(
             };
             (status, Json(json!({"error": format!("{}", e)})))
         })?;
+
+    // PAI-4 P6 — the "on clear" half. `reset_session` had no production caller
+    // at all before this phase, so the growth map only ever grew: every session
+    // the process had ever streamed a turn for stayed in it, and a new
+    // conversation created under a recycled id would have inherited the
+    // utilisation, the growth samples and the compaction cooldown of the one it
+    // replaced. Deleting the row is the only place the session genuinely stops
+    // existing, so it is the only place a full reset is the right call.
+    state.context_monitor.reset_session(&session_id);
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2061,6 +2438,21 @@ async fn get_session_messages(
             acc
         });
 
+    // PAI-5 P6. One query for the whole page, grouped by message id, exactly
+    // like the attachments fold above. Empty for every session recorded before
+    // `persist_thinking` was turned on, and a storage error must not fail a
+    // history read -- reasoning is a convenience, the transcript is not.
+    //
+    // THIS IS THE ONLY PRODUCTION CALLER of `get_thinking_for_session`, and
+    // `crates/pond-core/tests/thinking_is_never_replayed.rs` fails the build if
+    // a second one appears anywhere that builds a prompt. Nothing here reaches
+    // the model: the value is serialised into the HTTP response and dropped.
+    let thinking_by_message: std::collections::HashMap<String, Vec<String>> = state
+        .session_storage
+        .get_thinking_for_session(&session_id)
+        .await
+        .unwrap_or_default();
+
     let list: Vec<Value> = messages
         .iter()
         .map(|m| {
@@ -2111,11 +2503,603 @@ async fn get_session_messages(
                     }))
                     .collect::<Vec<_>>());
             }
+            // PAI-5 P6: the reasoning that produced this reply, if the user
+            // chose to keep it. Absent (not `[]`) on every message that has
+            // none, so the client can tell "not kept" from "kept nothing".
+            if let Some(blocks) = thinking_by_message.get(&m.id) {
+                obj["thinking"] = json!(blocks);
+            }
             obj
         })
         .collect();
 
+    // PAI-4 P4: opening a session is the resume signal. Never awaited — see
+    // `spawn_resume_compaction`.
+    spawn_resume_compaction(&state, &session_id, offset, messages.len());
+
     Ok(Json(json!({ "messages": list })))
+}
+
+/// Sessions with a between-turns compaction pass currently in flight.
+///
+/// Process-local, because the hazard is process-local: two rapid reopens of the
+/// same session would each spawn a refresh, and on the serial on-device engine
+/// the second queues behind the first while the user's first turn queues behind
+/// both. A row in the database would be worse, not better — it would outlive a
+/// `kill -9` and strand the session as permanently "compacting".
+///
+/// PAI-4 P6 widened this from resume-only to *all* compaction passes. There are
+/// now two independent triggers — the time axis (P4, a reopen after a gap) and
+/// the pressure axis (P6, a session past 75% of its window) — and a session that
+/// has just been reopened after a long gap is exactly the session most likely to
+/// saturate on its first turn back. Keeping one set means the two axes exclude
+/// each other rather than stacking two model calls in front of the same turn.
+static COMPACTIONS_IN_FLIGHT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<String>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Run one rolling-summary refresh for a session, off the request path.
+///
+/// The shared body of both compaction triggers. Everything that makes a pass
+/// safe lives here so the two axes cannot drift:
+///
+/// - **It claims the session first**, and returns `None` when a pass is already
+///   running — see [`COMPACTIONS_IN_FLIGHT`].
+/// - **A user turn reclaims the engine immediately.** The refresh races a
+///   watcher on `last_user_activity`, the same contract the idle summary loop in
+///   `pond-server` uses; a cancelled refresh persists nothing.
+///
+/// - **The large tier rebuilds as well as refreshes** (PAI-4 P2). After the
+///   incremental refresh, `SessionSummaryService::resummarise` re-reads the
+///   covered messages and rebuilds the summary from source with a budget the
+///   window can afford. That second model call is gated on
+///   [`ModelClass::permits_compaction_model_call`], and **only** that call is:
+///   extending the gate to the refresh above would switch the rolling summary
+///   off on the small tier, which PAI-4 P1 argued against at length and P6
+///   deliberately did not do.
+///
+/// Returns the outcome of the refresh when a pass actually ran. Callers are
+/// already inside a spawned task: this awaits a model call — two, on the large
+/// tier — and must never be called from a handler body or an SSE generator.
+async fn run_compaction_pass(
+    state: &Arc<AppState>,
+    session_id: &str,
+    settings: &Settings,
+    provider: Arc<dyn pond_core::models::ports::provider::LlmProvider>,
+    trigger: &'static str,
+) -> Option<pond_core::shared::services::session_summary::RefreshOutcome> {
+    {
+        let mut in_flight = match COMPACTIONS_IN_FLIGHT.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !in_flight.insert(session_id.to_string()) {
+            return None;
+        }
+    }
+
+    // Abort the moment the user starts typing — the on-device engine is
+    // serial, and this pass must never be what a turn waits behind.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let baseline = state.last_user_activity.read().await.elapsed();
+    let watcher_activity = state.last_user_activity.clone();
+    let watcher_cancel = cancel.clone();
+    let watcher = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if watcher_activity.read().await.elapsed() < baseline {
+                watcher_cancel.cancel();
+                break;
+            }
+        }
+    });
+
+    let svc = pond_core::shared::services::session_summary::SessionSummaryService::new(
+        provider,
+        state.session_storage.clone(),
+    );
+    let result = svc.refresh(session_id, &cancel).await;
+
+    // PAI-4 P2 — the large tier's extra mechanism, and the first thing in this
+    // programme that `ModelClass` gates rather than merely describes.
+    //
+    // It runs AFTER the refresh, not instead of it and not before it. The
+    // refresh advances the through-pointer; rebuilding first would rebuild a
+    // summary the refresh then folds over. Both share this pass's single
+    // in-flight claim and its single cancellation token, so the large tier's two
+    // model calls are still one cancellable pass rather than two things a turn
+    // could queue behind.
+    let resummarised = {
+        let (class, profile) = compaction_model_class(state, settings).await;
+        // `resummarise` checks the tier before it makes even a database read, so
+        // on the small and medium tiers this whole block is the governor
+        // resolution above and nothing else.
+        match svc
+            .resummarise(session_id, class, &profile, &HeuristicTokenCounter, &cancel)
+            .await
+        {
+            Ok(outcome) => Some(outcome),
+            Err(e) => {
+                // Every failure here means "leave the stored summary exactly as
+                // it was", which is the behaviour every tier had before P2.
+                tracing::debug!("{trigger} re-summarisation failed for {session_id}: {e}");
+                None
+            }
+        }
+    };
+
+    watcher.abort();
+
+    match COMPACTIONS_IN_FLIGHT.lock() {
+        Ok(mut g) => {
+            g.remove(session_id);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().remove(session_id);
+        }
+    }
+
+    match result {
+        Ok(outcome) => {
+            tracing::info!(
+                target: "giap::trace",
+                kind = "compaction_pass",
+                trigger = trigger,
+                session_id = %session_id,
+                outcome = ?outcome,
+                resummarisation = ?resummarised,
+            );
+            Some(outcome)
+        }
+        Err(e) => {
+            tracing::debug!("{trigger} compaction failed for {session_id}: {e}");
+            None
+        }
+    }
+}
+
+/// The active model's compaction tier and budget curve, for an off-turn pass.
+///
+/// PAI-4 P2. The rungs are the ones `chat_stream` feeds the governor, minus the
+/// two that only a turn can supply: `engine_reported` arrives on `TurnStats` and
+/// `registry_pinned` belongs to the adapter. Both absent means this resolves no
+/// *higher* than the live path would, and lower is the safe direction here —
+/// [`ModelClass::Large`] is the only tier that unlocks a model call, and a
+/// smaller window can only move a model out of it.
+///
+/// The class is derived from `settings.chat_provider`, and that is the provider
+/// that will make the call: `rebuild_llm_provider` builds `state.llm_provider`
+/// from `chat_provider`/`chat_model`, so the box the gate is reasoning about is
+/// the box the summariser runs on. If those two ever diverge, this gate starts
+/// answering a question about a different machine.
+///
+/// `from_context_window` rather than `for_windows`: the prompt-side clamp only
+/// bites on providers whose preamble is re-prefilled here every turn, and the
+/// only class that reaches the re-summarisation is definitionally not one of
+/// them.
+async fn compaction_model_class(
+    state: &Arc<AppState>,
+    settings: &Settings,
+) -> (ModelClass, CompactionProfile) {
+    let catalog_context_length = match &state.model_repo {
+        Some(repo) => {
+            let id = ModelRecord::id_for(
+                &ModelCategory::for_chat_provider(&settings.chat_provider),
+                &settings.chat_model,
+            );
+            repo.get_by_id(&id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|m| m.context_length)
+        }
+        None => None,
+    };
+
+    let resolution = ContextGovernor::resolve(&ContextInputs {
+        provider: &settings.chat_provider,
+        model: &settings.chat_model,
+        override_tokens: settings.context_window_override,
+        registry_pinned: None,
+        catalog_context_length,
+        engine_reported: None,
+        capability_window: Some(state.agent.capabilities().context_window_tokens),
+    });
+
+    (
+        ModelClass::from_resolution(&settings.chat_provider, &resolution),
+        CompactionProfile::from_context_window(resolution.tokens),
+    )
+}
+
+/// PAI-4 P6 — act on `should_compact`, between turns rather than during one.
+///
+/// `should_compact` has been computed since long before PAI-4 and, until this
+/// phase, its only consumer in production was the `context_warning` SSE frame:
+/// the server told the client the window was filling and then did nothing about
+/// it. This is the server-side half. The frame is unchanged — the client still
+/// gets it, and it still fires on the same predicate.
+///
+/// **Where this runs is the whole design.** Invariant 1 says compaction never
+/// blocks a turn, ever, and the obvious implementation — doing the work at the
+/// point `should_compact` is read — breaks it, because that point is inside the
+/// SSE generator with the user watching a token stream and the `done` frame
+/// still unsent. So this function does nothing but `tokio::spawn`; every read,
+/// every gate and the model call itself happen in the detached task, after the
+/// stream that spawned it has been dropped.
+///
+/// **The claim is the rate limiter, and it is not optional.** `should_compact`
+/// is monotone in utilisation: past 75% it is true on every subsequent turn.
+/// `ContextMonitor::claim_compaction` is what turns that standing condition into
+/// at most one pass per [`COMPACTION_COOLDOWN_TURNS`](pond_core::models::services::context::context_monitor)
+/// turns, and it recomputes health under its own lock so two turns finishing at
+/// once cannot both be authorised by one snapshot.
+fn spawn_pressure_compaction(state: &Arc<AppState>, session_id: &str) {
+    let state = state.clone();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        // Same switch the time axis reads. Hybrid compaction off means the
+        // trimmer and the summary are both off; acting here would resurrect
+        // half of a feature the user turned off.
+        let Ok(settings) = state.settings_repo.get().await else {
+            return;
+        };
+        if !settings.hybrid_compaction_enabled {
+            return;
+        }
+
+        // Claimed before the provider is read, because the claim is the cheap
+        // check and it is the one that fails most often.
+        if !state.context_monitor.claim_compaction(&session_id) {
+            return;
+        }
+
+        let Some(provider) = state.llm_provider.read().await.clone() else {
+            return;
+        };
+
+        if let Some(outcome) =
+            run_compaction_pass(&state, &session_id, &settings, provider, "pressure").await
+        {
+            // Only a refresh that actually persisted a new summary changed the
+            // shape of the history. `NothingToDo` and `Cancelled` left it
+            // exactly as it was, and telling the monitor otherwise would throw
+            // away a growth window for nothing.
+            if matches!(
+                outcome,
+                pond_core::shared::services::session_summary::RefreshOutcome::Refreshed { .. }
+            ) {
+                state.context_monitor.note_compacted(&session_id);
+            }
+        }
+    });
+}
+
+/// PAI-4 P4 — compact a session on resume, before its first turn back.
+///
+/// `docs/architecture/pai/04-smart-compaction.md` 3.2: a session reopened after
+/// a gap is about to pay a full prefill whatever happens, so reshaping its
+/// history now costs the user nothing. What it buys today is the rolling
+/// summary: the idle refresh loop in `pond-server` skips every session whose
+/// `updated_at` predates process start (its "never at startup" guard), so a
+/// conversation from before the last restart carries a summary that stops where
+/// it stopped — and the trimmer splices that stale summary into every turn until
+/// four new messages accumulate. Refreshing while the user is still reading the
+/// history closes that, and does it off the token stream.
+///
+/// Three properties this must have, and how each is obtained:
+///
+/// - **It never blocks the reopen** (invariant 1). Everything below, including
+///   the two database reads the gate needs, happens inside the spawned task, so
+///   `GET /sessions/:id/messages` returns at exactly the speed it did before.
+/// - **It is never triggered by a clock.** The gate's `reopened` input is the
+///   startup guard: at boot every stored session has a gap of days, and a rule
+///   that asked only about the gap would compact the whole store on startup.
+///   Only a request a person made sets it.
+/// - **A user turn reclaims the engine immediately.** The refresh races a
+///   watcher on `last_user_activity`, the same contract the idle summary loop
+///   uses; a cancelled refresh persists nothing.
+fn spawn_resume_compaction(
+    state: &Arc<AppState>,
+    session_id: &str,
+    offset: usize,
+    page_len: usize,
+) {
+    let state = state.clone();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        use pond_core::models::services::context::resume_compaction as resume;
+
+        let Ok(settings) = state.settings_repo.get().await else {
+            return;
+        };
+        let Ok(session) = state.session_storage.get_session(&session_id).await else {
+            return;
+        };
+        let provider = state.llm_provider.read().await.clone();
+
+        let decision = resume::should_run(resume::ResumeGateInputs {
+            enabled: settings.hybrid_compaction_enabled,
+            // A page request with an offset is scroll-back through history the
+            // user is already reading, not a reopen.
+            reopened: offset == 0,
+            has_prior_history: page_len > 0,
+            idle_gap: resume::idle_gap_since(session.updated_at, chrono::Utc::now()),
+            idle_threshold: resume::idle_threshold_from_secs(settings.resume_compaction_idle_secs),
+            summariser_available: provider.is_some(),
+        });
+
+        if let resume::GateDecision::Skip(reason) = decision {
+            tracing::trace!(
+                target: "giap::trace",
+                kind = "resume_compaction_skipped",
+                session_id = %session_id,
+                reason = reason.as_str(),
+            );
+            return;
+        }
+        let Some(provider) = provider else { return };
+
+        // PAI-4 P6 moved the in-flight claim, the cancellation watcher and the
+        // refresh itself into `run_compaction_pass`, shared with the pressure
+        // axis. The gate above is what stays specific to a resume.
+        run_compaction_pass(&state, &session_id, &settings, provider, "resume").await;
+    });
+}
+
+/// Is a compaction pass already running for this session?
+///
+/// A read-only peek at [`COMPACTIONS_IN_FLIGHT`], for the one caller that has to
+/// *tell a person* why nothing happened. `run_compaction_pass` collapses "a pass
+/// was already running" and "the pass failed" into the same `None`, which is
+/// fine for the two spawned triggers — nobody is reading their return value —
+/// and useless on an endpoint whose entire job is to report. Peeking first makes
+/// the common case ("you pressed this a second after the turn that already
+/// triggered one") say so.
+///
+/// The peek is advisory and the claim inside `run_compaction_pass` is still the
+/// authority: a pass that starts between this read and that claim reports
+/// `failed` instead of `already_running`. That mislabels a benign race and
+/// changes nothing about what happened — no pass ran on this request either way.
+fn compaction_in_flight(session_id: &str) -> bool {
+    match COMPACTIONS_IN_FLIGHT.lock() {
+        Ok(g) => g.contains(session_id),
+        Err(poisoned) => poisoned.into_inner().contains(session_id),
+    }
+}
+
+/// The body every outcome of `POST /sessions/:id/compact` reports.
+///
+/// The context block is deliberately the same four fields the `context_warning`
+/// SSE frame carries, read out of the same [`ContextHealth`], so the number on
+/// the button and the number the stream pushed cannot drift into disagreeing
+/// about the same session. `turns_remaining` is the one departure: the frame
+/// serialises `u32::MAX` when growth is unknown, which reaches a client as
+/// 4294967295 and reads as a number. Here it is `null`.
+fn compaction_report(
+    session_id: &str,
+    status: &str,
+    reason: Option<&str>,
+    outcome: Option<&str>,
+    health: &ContextHealth,
+) -> Json<Value> {
+    Json(json!({
+        "session_id": session_id,
+        "status": status,
+        "reason": reason,
+        "outcome": outcome,
+        "context": {
+            "utilization_pct": health.utilization_pct,
+            "turns_remaining": (health.estimated_turns_remaining != u32::MAX)
+                .then_some(health.estimated_turns_remaining),
+            "avg_growth_rate": health.avg_growth_rate,
+            "should_compact": health.should_compact,
+            "warning": health.warning,
+        },
+    }))
+}
+
+/// POST /api/v1/sessions/:session_id/compact — compact this session now.
+///
+/// PAI-4 P7. The third and last trigger: P4 is the time axis (a session reopened
+/// after a gap), P6 the pressure axis (a session past 75% of its window), and
+/// this one is a person deciding. It runs the same pass as both of them —
+/// `run_compaction_pass` — and it is subject to the same rules, which is the
+/// whole of the design and the only part that is easy to get wrong.
+///
+/// **It took P6's rate limiter, and that was the bug — PAI-4 P7b-fix.** The
+/// original shape refused the press unless `ContextMonitor::claim_compaction`
+/// granted, on the argument that `should_compact` is monotone above 75% and an
+/// ungated endpoint would let anything holding a bearer token queue a
+/// summarisation between every pair of turns. The argument is sound and the
+/// implementation could never work, because the two axes shared one quota and
+/// the pressure axis always took it first: in the chat-stream generator the
+/// `context_warning` frame is yielded and `spawn_pressure_compaction` runs one
+/// statement later inside the same `if health.should_compact` block, while the
+/// button that frame renders only appears after `done`. Six consecutive
+/// pressured turns produced six `cooling_down` refusals and never one pass, so
+/// the advertised success path was unreachable rather than uncommon.
+///
+/// So this now calls `ContextMonitor::claim_manual_compaction`, which differs
+/// from `claim_compaction` in exactly one respect: it skips the turn cooldown.
+/// It still requires pressure, and it still *stamps* the cooldown — a press
+/// consumes the automatic axis's quota without checking it, so the two together
+/// can never buy two summarisations for one turn. That is why this is not a
+/// widening: the manual axis gains nothing the pressure axis did not already
+/// have, it only stops being refused by a claim taken on its behalf.
+///
+/// **What actually bounds repeated presses, since the cooldown no longer does.**
+/// Two things, and neither is new. `compaction_in_flight` below refuses while a
+/// pass is running, which is what protects a serial on-device engine. And
+/// `SessionSummaryService::refresh` decides `NothingToDo` from the rolling
+/// summary's through-pointer and the message count *before* it reaches
+/// `provider.complete`, so a second press with no new turns in between costs a
+/// database read and no model call — and every new message is a turn the person
+/// had to take. The large tier's `resummarise` is the one path that can spend a
+/// call per press; it is gated on `ModelClass::permits_compaction_model_call()`,
+/// i.e. not the on-device engine this argument is about, and it shares this
+/// pass's single in-flight claim.
+///
+/// **What it still costs.** A session below the compaction threshold answers
+/// `not_under_pressure` rather than compacting, because the claim recomputes
+/// `should_compact` under its own lock and refuses. A session the monitor has
+/// never recorded a turn for — anything from before this process started, and
+/// everything at all when `context_monitor_enabled` is off — is in that same
+/// state, because utilisation is only ever learned from a turn. Both answer with
+/// a reason rather than a silent no-op, which is the least a manual control
+/// owes. Making the button work under no pressure would need a wall-clock rate
+/// limit that does not exist; that is a phase, not a line, and it is still not
+/// this one.
+///
+/// **This one awaits.** P4 and P6 spawn and return because they run inside a
+/// request a user did not make — a reopen, and an SSE generator with the `done`
+/// frame still unsent — and invariant 1 says compaction never blocks a turn.
+/// Neither applies here: this request *is* the compaction, nobody is watching a
+/// token stream, and awaiting is the only way to report what the pass did. The
+/// turn-preemption watcher inside `run_compaction_pass` still holds, so a user
+/// who presses the button and then starts typing cancels their own pass and
+/// persists nothing.
+///
+/// Everything short of a server fault answers 200 with a `status`/`reason` pair
+/// rather than an error code: "I did not compact, and here is why, and here is
+/// where your window actually is" is a successful answer to this question. 404
+/// is reserved for a session id that does not exist, so a typo is not reported
+/// as a healthy window.
+async fn compact_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    use pond_core::shared::services::session_summary::RefreshOutcome;
+
+    state
+        .session_storage
+        .get_session(&session_id)
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                SessionStorageError::SessionNotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json!({ "error": format!("{e}") })))
+        })?;
+
+    let settings = state.settings_repo.get().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("read settings: {e}") })),
+        )
+    })?;
+
+    let health = state.context_monitor.check_context_health(&session_id);
+
+    // Read before the claim, and in this order, because each answers a
+    // different question the user might be asking and only the first true one
+    // is worth reporting.
+    if !settings.context_monitor_enabled {
+        // Nothing has called `record_turn` for any session, so every utilisation
+        // number below this line is a zero that means "not measured", not "empty".
+        return Ok(compaction_report(
+            &session_id,
+            "skipped",
+            Some("monitor_disabled"),
+            None,
+            &health,
+        ));
+    }
+    if !settings.hybrid_compaction_enabled {
+        // The same switch the other two axes read first. Acting here would
+        // resurrect half of a feature the user turned off.
+        return Ok(compaction_report(
+            &session_id,
+            "skipped",
+            Some("compaction_disabled"),
+            None,
+            &health,
+        ));
+    }
+    if !health.should_compact {
+        return Ok(compaction_report(
+            &session_id,
+            "skipped",
+            Some("not_under_pressure"),
+            None,
+            &health,
+        ));
+    }
+
+    // The provider is read before the claim, which is the opposite order to
+    // `spawn_pressure_compaction`, and the difference matters here. There, the
+    // claim is read first because it is the cheap check and the one that fails
+    // most often. Here, a claim spent on a pass that then cannot run burns a
+    // cooldown counted in recorded turns — and a user pressing a button is very
+    // often not taking any turns, so the button would stay dead until they did.
+    let Some(provider) = state.llm_provider.read().await.clone() else {
+        return Ok(compaction_report(
+            &session_id,
+            "skipped",
+            Some("no_summariser"),
+            None,
+            &health,
+        ));
+    };
+    if compaction_in_flight(&session_id) {
+        return Ok(compaction_report(
+            &session_id,
+            "skipped",
+            Some("already_running"),
+            None,
+            &health,
+        ));
+    }
+    if !state.context_monitor.claim_manual_compaction(&session_id) {
+        // The manual claim skips the cooldown, so the ONLY way it refuses after
+        // the `should_compact` read above is that a turn completed in between
+        // and took the session back under the threshold, or that the session
+        // left the monitor's map entirely. `cooling_down` was the label here
+        // before P7b-fix and would now be a lie; `not_under_pressure` is what
+        // the claim actually decided, and it is the same sentence the branch
+        // above reports for the same condition.
+        return Ok(compaction_report(
+            &session_id,
+            "skipped",
+            Some("not_under_pressure"),
+            None,
+            &health,
+        ));
+    }
+
+    let outcome = run_compaction_pass(&state, &session_id, &settings, provider, "manual").await;
+
+    let (status, reason, outcome_label) = match outcome {
+        // Same rule as the pressure axis: only a refresh that actually persisted
+        // a new summary changed the shape of the history, so only that one is
+        // allowed to throw away the growth window.
+        Some(RefreshOutcome::Refreshed { .. }) => {
+            state.context_monitor.note_compacted(&session_id);
+            ("compacted", None, Some("refreshed"))
+        }
+        Some(RefreshOutcome::NothingToDo) => (
+            "skipped",
+            Some("nothing_to_summarise"),
+            Some("nothing_to_do"),
+        ),
+        Some(RefreshOutcome::Cancelled) => {
+            ("skipped", Some("preempted_by_turn"), Some("cancelled"))
+        }
+        None => ("skipped", Some("failed"), None),
+    };
+
+    // Re-read: `note_compacted` drops the growth samples, so a compacted session
+    // reports `turns_remaining: null` here rather than a rate measured against a
+    // history that no longer exists. That is the post-state the caller asked for.
+    let after = state.context_monitor.check_context_health(&session_id);
+    Ok(compaction_report(
+        &session_id,
+        status,
+        reason,
+        outcome_label,
+        &after,
+    ))
 }
 
 /// Percent-encode the few characters that would break a path segment.
@@ -2665,6 +3649,47 @@ async fn update_settings(
         )
     })?;
 
+    // Reject an unrecognised network_mode. `NetworkMode::parse` deliberately
+    // falls back to "open" rather than to a restrictive mode, so a typo that
+    // reached the store would silently be no gate at all. Refusing it here is
+    // the narrowing half of that bargain -- and refusing at the edge is also
+    // the only place a user finds out, since the parse fallback is a log line.
+    if let Some(mode) = patch.get("network_mode").and_then(|v| v.as_str()) {
+        if !pond_core::user_data::domain::settings::NETWORK_MODES.contains(&mode) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": format!(
+                        "network_mode {:?} is not one of {:?}",
+                        mode,
+                        pond_core::user_data::domain::settings::NETWORK_MODES
+                    )
+                })),
+            ));
+        }
+    }
+
+    // Reject an unrecognised reasoning_effort, for the same reason and in the
+    // same direction as network_mode above. `ReasoningEffort::parse` falls back
+    // to "brief" -- the SMALLEST thinking budget -- so a typo that reached the
+    // store would quietly shrink the model's think rather than widen it. That
+    // is the safe failure, which is exactly why it must not be the silent one:
+    // refusing here is the only place the user ever finds out.
+    if let Some(effort) = patch.get("reasoning_effort").and_then(|v| v.as_str()) {
+        if !pond_core::user_data::domain::settings::REASONING_EFFORTS.contains(&effort) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": format!(
+                        "reasoning_effort {:?} is not one of {:?}",
+                        effort,
+                        pond_core::user_data::domain::settings::REASONING_EFFORTS
+                    )
+                })),
+            ));
+        }
+    }
+
     // Reject agent_backend="pond" — backend is quarantined (Q2-05, not production-ready).
     if patch.get("agent_backend").and_then(|v| v.as_str()) == Some("pond") {
         return Err((
@@ -2767,6 +3792,14 @@ async fn update_settings(
     // restart — a privacy control the user has to reboot to apply is not one.
     pond_core::models::domain::mic_gate::set_mic_enabled(merged.mic_enabled);
 
+    // Same reasoning as the mic gate directly above: a network restriction the
+    // user has to restart the pond to apply is not one. Unconditional rather
+    // than keyed on the patch, because it is a cheap idempotent write and a
+    // missed re-install is a privacy control that silently did not take.
+    pond_core::shared::services::egress::set_network_mode(
+        pond_core::shared::services::egress::NetworkMode::parse(&merged.network_mode),
+    );
+
     // Hot-reload the ModelRouter whenever any provider/model field changes.
     let provider_keys = [
         "chat_provider",
@@ -2793,13 +3826,18 @@ async fn update_settings(
                         let _ = repo.clear_assignment(role).await;
                         continue;
                     }
-                    // Derive category from provider
-                    let category = match *provider {
-                        "local" | "gguf" => "gguf",
-                        "ollama" => "ollama",
-                        "asr" | "" if *role == "asr" => "whisper",
-                        "tts" | "" if *role == "tts" => "tts_piper",
-                        _ => "llamafile",
+                    // Derive the catalog category. Keyed on the ROLE first,
+                    // because only the LLM roles have a provider to consult —
+                    // ASR and TTS pass an empty provider string. The LLM arm
+                    // delegates to `ModelCategory::for_chat_provider`, which is
+                    // the same mapping the context governor's rung-3 lookup
+                    // uses; the two used to be written out separately and a
+                    // divergence would mean one of them silently addressing a
+                    // row that does not exist.
+                    let category = match *role {
+                        "asr" => "whisper",
+                        "tts" => "tts_piper",
+                        _ => ModelCategory::for_chat_provider(provider).as_str(),
                     };
                     let model_id = format!("{}/{}", category, model_name);
                     let _ = repo.set_assignment(role, &model_id).await;
@@ -2834,16 +3872,21 @@ async fn get_weather(
         return Ok(Json(json!({ "enabled": false })));
     };
 
+    // `{e:#}` renders the whole anyhow chain, not just the outermost context.
+    // With `{e}` this said "weather API request failed" and nothing else, so a
+    // call the egress gate REFUSED was indistinguishable from open-meteo being
+    // down -- and PAI-2's rule is that a refusal has to be actionable. The
+    // reason, the mode and the host all live further down the chain.
     let current = provider.current().await.map_err(|e| {
         (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": format!("Failed to fetch weather: {}", e)})),
+            Json(json!({"error": format!("Failed to fetch weather: {e:#}")})),
         )
     })?;
     let forecast = provider.forecast(4).await.map_err(|e| {
         (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": format!("Failed to fetch forecast: {}", e)})),
+            Json(json!({"error": format!("Failed to fetch forecast: {e:#}")})),
         )
     })?;
 
@@ -3118,6 +4161,7 @@ fn record_to_dto(m: &ModelRecord, assignments: &[ModelRoleAssignment]) -> ModelS
         filename: m.filename.clone(),
         ram_estimate_mb: m.ram_estimate_mb,
         recommended_role: m.recommended_role.clone(),
+        context_length: m.context_length,
         asr_language: m.asr_language.clone(),
         asr_size: m.asr_size.clone(),
         tts_engine: m.tts_engine.clone(),
@@ -3495,6 +4539,19 @@ async fn download_model(
         )
     })?;
 
+    // PAI-2 P6b: refuse BEFORE spawning. The transfer itself is gated too (see
+    // `spawn_tracked_download`), but a refusal that only lands in a detached
+    // task shows up as a failed row in the progress tracker, which is not an
+    // answer to "why did nothing download". 502 is the right shape here because
+    // this handler already returns `(StatusCode, Json)` and the dashboard reads
+    // `error` off a non-2xx.
+    pond_core::shared::services::egress::check_egress(&url).map_err(|denied| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": denied.to_string()})),
+        )
+    })?;
+
     // Determine destination path based on category
     let dest = match cat {
         ModelCategory::Whisper => data_dir.join("models").join(&filename),
@@ -3535,13 +4592,26 @@ async fn download_model(
                     if let Some(parent) = cfg_dest.parent() {
                         let _ = tokio::fs::create_dir_all(parent).await;
                     }
-                    match cfg_client.get(&cu).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            if let Ok(bytes) = resp.bytes().await {
-                                let _ = tokio::fs::write(&cfg_dest, &bytes).await;
+                    // PAI-2 P6b: the config sibling is its OWN hop to its OWN
+                    // host and needs its OWN gate. Gating only the weights and
+                    // letting the `.onnx.json` through is exactly the shape
+                    // that kept the file-level guard green in the HF cache.
+                    match pond_core::shared::services::egress::begin(&cu, "GET") {
+                        Err(denied) => {
+                            tracing::warn!("TTS config file {cf} not fetched: {denied}")
+                        }
+                        Ok(call) => {
+                            let sent = cfg_client.get(&cu).send().await;
+                            call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+                            match sent {
+                                Ok(resp) if resp.status().is_success() => {
+                                    if let Ok(bytes) = resp.bytes().await {
+                                        let _ = tokio::fs::write(&cfg_dest, &bytes).await;
+                                    }
+                                }
+                                _ => tracing::warn!("Failed to download TTS config file {}", cf),
                             }
                         }
-                        _ => tracing::warn!("Failed to download TTS config file {}", cf),
                     }
                 }
                 let _ = model_repo.set_downloaded(&model_id, true).await;
@@ -4003,7 +5073,17 @@ async fn search_gguf_models(
         urlencoding::encode(q)
     );
     let client = &state.http_client;
-    match client
+    // PAI-2 P6b. The refusal rides the handler's EXISTING error contract
+    // (HTTP 200 with an `error` string) rather than a new status code: the
+    // dashboard renders that field and throws on a non-2xx, so returning 502
+    // here would turn a privacy refusal into an unhandled rejection. The text
+    // is the whole `EgressDenied` Display, which names the mode, the host and
+    // what to change.
+    let call = match pond_core::shared::services::egress::begin(&url, "GET") {
+        Ok(c) => c,
+        Err(denied) => return Json(json!({"models": [], "error": denied.to_string()})),
+    };
+    let sent = client
         .get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .header(
@@ -4011,8 +5091,9 @@ async fn search_gguf_models(
             concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")),
         )
         .send()
-        .await
-    {
+        .await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    match sent {
         Ok(resp) if resp.status().is_success() => {
             let models: Vec<Value> = resp.json().await.unwrap_or_default();
             // Return a simplified shape: id, downloads, likes, tags
@@ -4043,7 +5124,12 @@ async fn search_llamafile_models(
         .unwrap_or_default();
     let url = "https://api.github.com/repos/Mozilla-Ocho/llamafile/releases?per_page=5";
     let client = &state.http_client;
-    match client
+    // PAI-2 P6b — see search_gguf_models for why the refusal rides the body.
+    let call = match pond_core::shared::services::egress::begin(url, "GET") {
+        Ok(c) => c,
+        Err(denied) => return Json(json!({"models": [], "error": denied.to_string()})),
+    };
+    let sent = client
         .get(url)
         .timeout(std::time::Duration::from_secs(10))
         .header(
@@ -4051,8 +5137,9 @@ async fn search_llamafile_models(
             concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")),
         )
         .send()
-        .await
-    {
+        .await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    match sent {
         Ok(resp) if resp.status().is_success() => {
             let releases: Vec<Value> = resp.json().await.unwrap_or_default();
             let mut assets: Vec<Value> = Vec::new();
@@ -4099,7 +5186,12 @@ async fn list_hf_model_files(
     // (urlencoding::encode would turn '/' into '%2F' which returns 400)
     let url = format!("https://huggingface.co/api/models/{}", repo);
     let client = &state.http_client;
-    match client
+    // PAI-2 P6b — see search_gguf_models for why the refusal rides the body.
+    let call = match pond_core::shared::services::egress::begin(&url, "GET") {
+        Ok(c) => c,
+        Err(denied) => return Json(json!({"files": [], "error": denied.to_string()})),
+    };
+    let sent = client
         .get(&url)
         .timeout(std::time::Duration::from_secs(10))
         .header(
@@ -4107,8 +5199,9 @@ async fn list_hf_model_files(
             concat!("goose-in-a-pond/", env!("CARGO_PKG_VERSION")),
         )
         .send()
-        .await
-    {
+        .await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    match sent {
         Ok(resp) if resp.status().is_success() => {
             let meta: Value = resp.json().await.unwrap_or_default();
             let files: Vec<Value> = meta["siblings"]
@@ -4170,6 +5263,16 @@ async fn download_model_from_url(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "only https URLs are accepted"})),
+        );
+    }
+
+    // PAI-2 P6b: refuse here, synchronously, rather than only inside the
+    // detached task. This route takes an arbitrary caller-supplied URL, so it
+    // is the one place in the file where "which host" is not decided by us.
+    if let Err(denied) = pond_core::shared::services::egress::check_egress(&url) {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": denied.to_string()})),
         );
     }
 
@@ -4265,7 +5368,16 @@ async fn spawn_tracked_download<F>(
             .await
         } else {
             async {
-                let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+                // PAI-2 P6b. Both download handlers gate before they spawn, but
+                // this is the chokepoint every non-HF transfer actually passes
+                // through, and the HF branch above is gated inside
+                // `pond_hf_cache`. A gate only at the caller is one refactor
+                // away from being no gate at all.
+                let call = pond_core::shared::services::egress::begin(&url, "GET")
+                    .map_err(|denied| denied.to_string())?;
+                let sent = client.get(&url).send().await;
+                call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+                let resp = sent.map_err(|e| e.to_string())?;
                 if !resp.status().is_success() {
                     return Err(format!("HTTP {}", resp.status()));
                 }
@@ -4526,14 +5638,112 @@ async fn update_profile_prefs(
 async fn delete_profile(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Existence check first. This used to return 204 for an id that never
+    // existed, which made "did I delete the right person" unanswerable.
+    let profile = state
+        .profile_repo
+        .get(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("no such profile: {id}")})),
+            )
+        })?;
+
+    // Count BEFORE deleting. Three of the four `profile_id` foreign keys
+    // cascade, so after the DELETE there is nothing left to count.
+    let memories = state
+        .memory_repo
+        .count_for_profile(&id)
+        .await
+        .unwrap_or_default();
+    let faces = match state.face_recognition.as_ref() {
+        Some(face) => face
+            .list_embeddings(&id)
+            .await
+            .map(|e| e.len() as u64)
+            .unwrap_or_default(),
+        None => 0,
+    };
+    let sessions = state
+        .session_storage
+        .list_sessions()
+        .await
+        .map(|all| {
+            all.iter()
+                .filter(|s| s.profile_id.as_deref() == Some(id.as_str()))
+                .count() as u64
+        })
+        .unwrap_or_default();
+
+    // `settings.primary_profile_id` is a key-value row, not a foreign key, so
+    // nothing in the database clears it. Deleting the primary member used to
+    // leave an id pointing at nobody -- and the one production reader of that
+    // setting silently got `None` from the lookup, so the failure was
+    // invisible. Clear it here, before the delete, while it is still true.
+    // Both failures here ABORT rather than fall through. `unwrap_or_default()`
+    // used to hide a read failure as `primary_profile_id: None`, so the
+    // comparison never matched, the clear never ran, and the delete proceeded --
+    // reintroducing the exact dangling reference this code exists to prevent,
+    // on the failure path, silently.
+    let settings = state.settings_repo.get().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!("could not read settings, so the member was not deleted: {e}")
+            })),
+        )
+    })?;
+    let cleared_primary = if settings.primary_profile_id.as_deref() == Some(id.as_str()) {
+        state
+            .settings_repo
+            .set_key("primary_profile_id", String::new())
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": format!(
+                            "could not clear primary_profile_id, so the member was not deleted: {e}"
+                        )
+                    })),
+                )
+            })?;
+        true
+    } else {
+        false
+    };
+
     state.profile_repo.delete(&id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
         )
     })?;
-    Ok(StatusCode::NO_CONTENT)
+
+    Ok(Json(json!({
+        "profile_id":   id,
+        "display_name": profile.display_name,
+        // What went with them. Sessions are RELEASED, not deleted -- a
+        // conversation is not solely the speaker's -- so it is reported under
+        // its own name rather than folded into a "deleted" total.
+        "deleted": {
+            "memories":        memories,
+            "face_embeddings": faces,
+        },
+        "released": {
+            "sessions": sessions,
+        },
+        "cleared_primary_profile": cleared_primary,
+    })))
 }
 
 // ── Sensor handlers ───────────────────────────────────────────────────────────
@@ -4944,6 +6154,146 @@ async fn activity_summary(
     })))
 }
 
+// ── PAI-2 P8a: the would-deny read surface ────────────────────────────────────
+
+/// Cap on audit events scanned for one policy report. The count is honest about
+/// hitting it (`truncated`) rather than reporting a silently capped total: a
+/// would-deny number that quietly stopped counting is the same lie the
+/// two-source split below exists to avoid.
+const POLICY_REPORT_MAX_EVENTS: usize = 5000;
+
+#[derive(serde::Deserialize)]
+struct PolicyReportParams {
+    /// Time window for the *events* half: "hour" | "day" (default) | "week".
+    window: Option<String>,
+}
+
+/// `GET /api/v1/security/policy-report` — what would flipping
+/// `security_policy_mode` to `enforce` actually break?
+///
+/// **Two sources, labelled, never summed.** `security_policy_mode` ships as
+/// `audit` precisely so this question can be answered from evidence before P8b
+/// flips it, and each source alone gives a wrong answer:
+///
+/// - `events` comes from the unified event log. Durable across restarts, and
+///   the only half that can attribute a would-deny to a principal — but it is
+///   pruned on a retention window and `DELETE /api/v1/activity` is a
+///   user-facing "clear my activity" button, so an operator reading only this
+///   after somebody tidied up would see zero and conclude the flip is safe.
+/// - `process` comes from `POLICY_COUNTERS`, bumped at each decision site.
+///   Survives pruning and the clear button, does not survive a restart.
+///
+/// A single merged number would be wrong in whichever direction the reader did
+/// not check. Adding them would double-count. So both are reported with the
+/// window each covers.
+///
+/// Zeros, never 404, on an empty window: a green test must be distinguishable
+/// from an unwired route.
+///
+/// Registered in `protected_routes` and deliberately absent from
+/// `PUBLIC_ROUTES`, so the compile-time route guards in `middleware/mod.rs`
+/// enforce the token requirement rather than this handler restating it.
+async fn policy_report(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<PolicyReportParams>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    use pond_core::security::ports::policy as pol;
+
+    let window = params.window.as_deref().unwrap_or("day");
+    let span = match window {
+        "hour" => chrono::Duration::hours(1),
+        "day" => chrono::Duration::days(1),
+        "week" => chrono::Duration::weeks(1),
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("invalid `window` {other:?}; use hour|day|week") })),
+            ))
+        }
+    };
+    let since = chrono::Utc::now() - span;
+
+    // Every verdict gets a bucket up front, so an empty window answers with
+    // explicit zeros rather than an object missing the key the reader wanted.
+    let mut by_verdict: std::collections::BTreeMap<&str, u64> =
+        pol::VERDICTS.iter().map(|v| (*v, 0u64)).collect();
+    let mut scanned = 0usize;
+    let mut unclassified = 0u64;
+    let mut truncated = false;
+    let mut events_available = false;
+
+    if let Some(event_log) = state.event_log.as_ref() {
+        events_available = true;
+        // `EventQuery` has no action filter and no group-by, so both happen in
+        // Rust over the returned rows. That is why the cap and the `truncated`
+        // flag exist: the store cannot narrow to `security.audit` for us.
+        let rows = event_log
+            .query(EventQuery {
+                category: Some(EventCategory::Auth),
+                since: Some(since),
+                max_sensitivity: Some(PrivacySensitivity::Sensitive),
+                limit: Some(POLICY_REPORT_MAX_EVENTS),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "policy report query failed");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "policy report query failed" })),
+                )
+            })?;
+
+        truncated = rows.len() >= POLICY_REPORT_MAX_EVENTS;
+
+        for event in rows.iter().filter(|e| e.action == pol::AUDIT_ACTION) {
+            scanned += 1;
+            match event
+                .attributes
+                .get(pol::audit_attrs::VERDICT)
+                .and_then(|v| match v {
+                    pond_core::security::domain::event::AttributeValue::Text(s) => Some(s.as_str()),
+                    _ => None,
+                }) {
+                // An audit row written before the verdict became an attribute,
+                // or by something that stopped setting it. Counted separately
+                // rather than folded into `allow` -- a report that quietly
+                // reclassifies what it cannot read is the failure this endpoint
+                // exists to prevent.
+                None => unclassified += 1,
+                Some(v) => match by_verdict.get_mut(v) {
+                    Some(slot) => *slot += 1,
+                    None => unclassified += 1,
+                },
+            }
+        }
+    }
+
+    let process = pol::POLICY_COUNTERS.snapshot();
+
+    Ok(Json(json!({
+        "window": window,
+        "since": since.to_rfc3339(),
+        "events": {
+            "allow":      by_verdict["allow"],
+            "would_deny": by_verdict["would_deny"],
+            "deny":       by_verdict["deny"],
+            "unclassified": unclassified,
+            "scanned": scanned,
+            "truncated": truncated,
+            "available": events_available,
+            "note": "durable across restarts; pruned on retention and erasable by DELETE /api/v1/activity",
+        },
+        "process": {
+            "allow":      process.allow,
+            "would_deny": process.would_deny,
+            "deny":       process.deny,
+            "counting_since": process.counting_since.to_rfc3339(),
+            "note": "survives log pruning and DELETE /api/v1/activity; resets on restart",
+        },
+    })))
+}
+
 // ── Camera handlers ───────────────────────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
@@ -5114,6 +6464,19 @@ async fn transcribe(
 
     // Forward to external whisper.cpp /inference
     let whisper_url = format!("{}/inference", state.whisper_url);
+    // PAI-2 P6b. This host is NOT a loopback literal -- it is
+    // `settings.voice_whisper_url`, which defaults to 127.0.0.1:9000 but is a
+    // free-text setting, so a pond configured with a remote whisper box posts
+    // raw household audio to a third party. `check_egress` and not `begin`:
+    // under the shipped default this fires on every transcription and would
+    // otherwise write an `Internal` event per utterance, which is how a privacy
+    // feed becomes something nobody reads. Loopback passes every mode.
+    pond_core::shared::services::egress::check_egress(&whisper_url).map_err(|denied| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": denied.to_string()})),
+        )
+    })?;
     let part = reqwest::multipart::Part::bytes(bytes)
         .file_name(filename)
         .mime_str(&content_type)
@@ -5244,6 +6607,13 @@ async fn calibrate_wake_word(
             .to_string()
     } else {
         let whisper_url = format!("{}/inference", state.whisper_url);
+        // PAI-2 P6b -- same configurable-host reasoning as `transcribe_audio`.
+        pond_core::shared::services::egress::check_egress(&whisper_url).map_err(|denied| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": denied.to_string()})),
+            )
+        })?;
         let part = reqwest::multipart::Part::bytes(bytes)
             .file_name(filename)
             .mime_str(&content_type)
@@ -6414,8 +7784,21 @@ async fn test_speak(
 }
 
 /// Hit `url` with a GET, return a status/latency object.
+///
+/// Gated (PAI-2 P6b) even though two of its three call sites are 127.0.0.1
+/// literals: the third is `state.whisper_url`, which the user can point
+/// anywhere. `check_egress` permits loopback under every mode, so the
+/// diagnostics page is unchanged on a default install and reports a refusal --
+/// with the setting to change -- only for a destination the mode really refuses.
 async fn probe(client: &reqwest::Client, url: &str, timeout_secs: u64) -> Value {
     let t0 = std::time::Instant::now();
+    if let Err(denied) = pond_core::shared::services::egress::check_egress(url) {
+        return json!({
+            "status": "refused",
+            "url": url,
+            "error": denied.to_string(),
+        });
+    }
     match client
         .get(url)
         .timeout(std::time::Duration::from_secs(timeout_secs))
@@ -6521,6 +7904,16 @@ async fn create_schedule(
             Json(json!({"error": "missing 'prompt' or 'kind'"})),
         );
     };
+
+    // A rule can still arrive here, by naming the kind explicitly — this route
+    // predates `/rules` and clients depend on it. Validate it identically or
+    // the new surface's checks are decorative: whoever wanted to skip them
+    // would simply POST here instead. (PAI-7 P8)
+    if let TaskKind::SensorTrigger(spec) = &kind {
+        if let Some((status, body)) = rule_spec_rejection(spec) {
+            return (status, Json(body));
+        }
+    }
 
     let req = CreateScheduleRequest {
         id: api_req
@@ -6730,6 +8123,297 @@ async fn schedule_events_sse(
     };
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+// ───────────────────────── Sensor-rule Handlers (PAI-7 P8) ──────────
+//
+// A rule is a `TaskKind::SensorTrigger` schedule and nothing else — there is no
+// second store and no second execution path, because the rules engine fires
+// through the scheduler's own `run_now` and that is what gives a rule fire its
+// run record and its result event. What this surface adds is the two things
+// `/schedules` cannot: it names rules (so listing them does not mean filtering
+// a mixed list client-side, and creating one does not mean inventing a cron
+// expression the scheduler ignores), and it validates the spec.
+
+/// Project a schedule onto the rule surface. `None` when the id names a cron
+/// schedule rather than a rule.
+///
+/// Every `/rules/{id}` handler resolves through this, which is what stops the
+/// new surface being a second door onto `/schedules`: pausing or deleting the
+/// household's nightly backup by guessing its id answers 404 here.
+fn rule_view(s: &Schedule) -> Option<Value> {
+    let TaskKind::SensorTrigger(spec) = &s.kind else {
+        return None;
+    };
+    Some(json!({
+        "id": s.id,
+        "name": s.label,
+        "paused": s.paused,
+        "currently_running": s.currently_running,
+        "created_at": s.created_at,
+        // PAI-7 P8's durable cooldown stamp. Exposed because "why has this not
+        // fired" is answered by it and by nothing else on the response.
+        "last_fired": s.last_run,
+        "cooldown_secs": spec.cooldown_secs,
+        "source": spec.source,
+        "condition": spec.condition,
+        "actions": spec.actions,
+    }))
+}
+
+/// Rules never register a cron job — the rules engine fires them from the event
+/// bus — but a `Schedule` has to carry some cron string. This is the marker the
+/// scheduler and the MCP tools already use, kept here so a caller never has to
+/// supply an expression that is not read.
+const RULE_CRON: &str = "@event";
+
+/// The 400 a rule spec earns, or `None` if it is fit to store.
+///
+/// One function for all three doors — `POST /rules`, `PUT /rules/{id}` and the
+/// older `POST /schedules` — because a rule accepted through any of them is
+/// stored in the same place and fired by the same engine. A check on two of the
+/// three is not a check.
+fn rule_spec_rejection(spec: &SensorTriggerSpec) -> Option<(StatusCode, Value)> {
+    spec.validate().err().map(|rejected| {
+        (
+            StatusCode::BAD_REQUEST,
+            json!({"error": rejected.to_string()}),
+        )
+    })
+}
+
+/// Fetch one rule, or the response that says why not.
+async fn find_rule(
+    scheduler: &Arc<dyn pond_core::user_data::ports::scheduler::SchedulerPort>,
+    id: &str,
+) -> Result<Schedule, (StatusCode, Json<Value>)> {
+    let tasks = scheduler.list_tasks().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    tasks
+        .into_iter()
+        // `rule_view` decides what a rule is, here as well as in the listing.
+        // Two encodings of "is this a rule" drift, and the direction this one
+        // would drift in is a cron schedule becoming reachable by id.
+        .find(|t| t.id == id && rule_view(t).is_some())
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("rule '{id}' not found")})),
+            )
+        })
+}
+
+/// The scheduler is optional in `AppState`; every handler here needs it.
+fn require_scheduler(
+    state: &Arc<AppState>,
+) -> Result<Arc<dyn pond_core::user_data::ports::scheduler::SchedulerPort>, (StatusCode, Json<Value>)>
+{
+    state.scheduler.clone().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "scheduler not configured"})),
+    ))
+}
+
+/// `GET /api/v1/rules` — every sensor rule, cron schedules excluded.
+async fn list_rules(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
+    let scheduler = match require_scheduler(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match scheduler.list_tasks().await {
+        Ok(tasks) => {
+            let rules: Vec<Value> = tasks.iter().filter_map(rule_view).collect();
+            (StatusCode::OK, Json(json!(rules)))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+/// Create/replace body. The spec is flattened, so the rule reads as one object
+/// rather than a schedule wrapping a kind wrapping a spec.
+#[derive(Debug, serde::Deserialize)]
+struct ApiRuleRequest {
+    /// Optional on create; a UUID is generated. Ignored on update.
+    id: Option<String>,
+    #[serde(alias = "label")]
+    name: String,
+    #[serde(flatten)]
+    spec: SensorTriggerSpec,
+}
+
+/// `POST /api/v1/rules` — create a sensor rule.
+async fn create_rule(
+    State(state): State<Arc<AppState>>,
+    result: Result<Json<ApiRuleRequest>, JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let scheduler = match require_scheduler(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let Json(req) = match result {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
+    };
+    if let Some((status, body)) = rule_spec_rejection(&req.spec) {
+        return (status, Json(body));
+    }
+
+    // Duplicate ids and the cron are the scheduler's to judge, not this
+    // handler's — see `SensorTriggerSpec::validate`.
+    let create = CreateScheduleRequest {
+        id: req.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+        label: req.name,
+        cron: RULE_CRON.to_string(),
+        timezone: "UTC".to_string(),
+        kind: TaskKind::SensorTrigger(req.spec),
+    };
+    match scheduler.create_task(create).await {
+        Ok(task) => match rule_view(&task) {
+            Some(v) => (StatusCode::CREATED, Json(v)),
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "scheduler returned a non-rule for a rule create"})),
+            ),
+        },
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+/// `GET /api/v1/rules/{id}` — one rule.
+async fn get_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let scheduler = match require_scheduler(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match find_rule(&scheduler, &id).await {
+        Ok(rule) => match rule_view(&rule) {
+            Some(v) => (StatusCode::OK, Json(v)),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("rule '{id}' not found")})),
+            ),
+        },
+        Err(r) => r,
+    }
+}
+
+/// `PUT /api/v1/rules/{id}` — replace a rule's name and spec.
+async fn update_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    result: Result<Json<ApiRuleRequest>, JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let scheduler = match require_scheduler(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let Json(req) = match result {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
+    };
+    // Resolve BEFORE validating so a PUT at a cron schedule's id is a 404
+    // rather than a 400 telling the caller how to fix a rule that does not
+    // exist -- and so it can never overwrite one.
+    if let Err(r) = find_rule(&scheduler, &id).await {
+        return r;
+    }
+    if let Some((status, body)) = rule_spec_rejection(&req.spec) {
+        return (status, Json(body));
+    }
+
+    let update = UpdateScheduleRequest {
+        label: Some(req.name),
+        cron: None,
+        timezone: None,
+        kind: Some(TaskKind::SensorTrigger(req.spec)),
+    };
+    match scheduler.update_task(&id, update).await {
+        Ok(task) => match rule_view(&task) {
+            Some(v) => (StatusCode::OK, Json(v)),
+            None => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "scheduler returned a non-rule for a rule update"})),
+            ),
+        },
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+/// `DELETE /api/v1/rules/{id}` — remove a rule.
+async fn delete_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let scheduler = match require_scheduler(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = find_rule(&scheduler, &id).await {
+        return r;
+    }
+    match scheduler.delete_task(&id).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"deleted": id}))),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+/// `POST /api/v1/rules/{id}/pause` — stop the rule firing without deleting it.
+async fn pause_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let scheduler = match require_scheduler(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = find_rule(&scheduler, &id).await {
+        return r;
+    }
+    match scheduler.pause_task(&id).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"paused": id}))),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+/// `POST /api/v1/rules/{id}/resume` — let it fire again.
+async fn resume_rule(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let scheduler = match require_scheduler(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Err(r) = find_rule(&scheduler, &id).await {
+        return r;
+    }
+    match scheduler.resume_task(&id).await {
+        Ok(()) => (StatusCode::OK, Json(json!({"resumed": id}))),
+        Err(e) => (StatusCode::NOT_FOUND, Json(json!({"error": e.to_string()}))),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -6979,6 +8663,34 @@ fn qualify_tool_name(server: &str, tool: &str) -> String {
     }
 }
 
+/// The tools reachable without an LLM turn, through `POST /api/v1/tools/invoke`
+/// and `POST /api/v1/mcp/tools/call`. Deny-by-default.
+///
+/// These routes carry no engine session, so the `_meta` the MCP servers read the
+/// caller from is empty: `session_from_meta` returns `None` and every policy
+/// decision behind them resolves to an unknown actor. An unknown actor is not a
+/// denied one — `PolicyDecision::refuse` sets `allowed = !mode.denies_bite()`, so
+/// under `PolicyMode::Audit` it is let through. A tool whose guard asks *who is
+/// calling* therefore has no guard at all on this path, and
+/// `giap-draft__approve_draft` is precisely that tool: it is the human
+/// confirmation step for every staged side effect.
+///
+/// So the surface stays as small as what the shipped UI actually needs. The Hub
+/// actuates devices from `hubStore.ts` and `Rooms.tsx`; MCP Apps proxy through
+/// `callServerTool`, and today there is exactly one app — the weather card —
+/// which makes no tool calls of its own. Everything else goes through a chat
+/// turn, where the engine stamps a session into `_meta` and the ownership check
+/// can actually run.
+///
+/// Adding a name here grants it to any paired client *and* to any sandboxed MCP
+/// App iframe. Read-only or narrowly-actuating tools only; nothing that decides,
+/// approves, executes shell, writes files, or reads household memory.
+const DIRECT_DISPATCH_ALLOWLIST: &[&str] = &[
+    "giap-device-control__set_device_state",
+    "giap-weather__get_current_weather",
+    "giap-weather__get_weather_forecast",
+];
+
 /// Shared direct-dispatch path for the tool-invoke endpoints. Bypasses the LLM:
 /// routes straight to the MCP tool registry and returns the raw result.
 async fn dispatch_tool_direct(
@@ -6986,6 +8698,23 @@ async fn dispatch_tool_direct(
     qualified: &str,
     args: Value,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !DIRECT_DISPATCH_ALLOWLIST.contains(&qualified) {
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "direct_dispatch_refused",
+            tool = qualified,
+            "a tool outside the direct-dispatch allowlist was requested LLM-free"
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": format!(
+                    "`{qualified}` cannot be invoked without a chat turn. Only a small set of \
+                     tools is reachable directly, because this path carries no caller identity."
+                )
+            })),
+        ));
+    }
     let dispatcher = state.tool_dispatcher.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -7069,12 +8798,17 @@ async fn mcp_call_tool(
 /// - `{"error":"..."}` — on failure
 async fn agent_chat_stream(
     State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     use futures::stream::StreamExt;
-    use pond_core::models::ports::agent::AgentStreamEvent;
     use pond_core::shared::domain::agent::AgentRequest;
+
+    // PAI-1 P9. This route hand-parses a raw `Value` body, which is exactly the
+    // shape where a `body["device_id"]` would be one line away from looking
+    // reasonable. It is read from the principal, before the body is touched.
+    let device = proven_device(principal.as_ref());
 
     // Resets the inactivity clock and interrupts any background consolidation.
     state.note_user_activity().await;
@@ -7125,15 +8859,21 @@ async fn agent_chat_stream(
     let stream = async_stream::stream! {
         let _permit = permit;
 
-        let mut chat_service = pond_core::shared::services::chat::ChatService::new(
-            agent.clone(),
-            session_id.clone(),
-            storage.clone(),
-        );
-        if let Some(event_log) = state.event_log.clone() {
-            chat_service = chat_service.with_event_log(event_log);
-        }
+        // PAI-5 P6. This route reads no settings otherwise, so the one read is
+        // here and it narrows: an unreadable settings row means
+        // `persist_thinking` stays false and the reasoning is not kept. A
+        // privacy control that defaults ON when its store is unavailable is the
+        // scope-widening default this programme treats as a bug.
+        let persist_thinking = state
+            .settings_repo
+            .get()
+            .await
+            .map(|s| s.persist_thinking)
+            .unwrap_or(false);
 
+        // The session row first, because both things below depend on it: the
+        // scope resolution reads the session's identity, and the user message is
+        // a row against it.
         if storage.get_session(&session_id).await.is_err() {
             if let Err(e) = storage.create_session(session_id.clone()).await {
                 yield Ok(Event::default().data(json!({"error": e.to_string()}).to_string()));
@@ -7141,14 +8881,61 @@ async fn agent_chat_stream(
             }
         }
 
+        // Resolved here, not before the stream: this route creates the session
+        // row inside the stream body, so resolving earlier would read the
+        // identity of a session that does not exist yet and miss a binding
+        // written by PUT /sessions/{id}/user against a freshly minted id.
+        //
+        // PAI-5 P7 moved it ABOVE the `ChatService` rather than below, and that
+        // ordering is the whole safety of this phase. `ChatService`'s default
+        // scope is `ProfileScope::Household`, and the scope is what memory
+        // extraction is attributed to. Enabling extraction here -- which is
+        // exactly what P7 asks for -- while building the service before the
+        // scope was known would have written a Guest's turn, or one member's,
+        // into the whole household's memory. The default was harmless only
+        // because extraction was off on this route. A widening default reached
+        // by ordering is still a widening default.
+        let turn_scope = resolve_turn_scope(&state, &session_id, &device).await;
+
+        let mut chat_service = pond_core::shared::services::chat::ChatService::new(
+            agent.clone(),
+            session_id.clone(),
+            storage.clone(),
+        )
+        .with_profile_scope(turn_scope.clone())
+        .with_thinking(persist_thinking);
+        // PAI-5 P7 parity. `/chat/stream` has owned extraction since it was
+        // written; this route persisted its turns and never extracted from them,
+        // so a whole conversation held here contributed nothing to memory.
+        // Guarded exactly as the other handler guards it, so a pond with no
+        // extractor configured behaves as it did before.
+        if let (Some(ext), Some(svc)) =
+            (state.memory_extractor.clone(), state.memory_extraction_service.clone())
+        {
+            chat_service = chat_service.with_memory_extraction(
+                ext,
+                svc,
+                state.memory_repo.clone(),
+            );
+        }
+        if let Some(event_log) = state.event_log.clone() {
+            chat_service = chat_service.with_event_log(event_log);
+        }
+
         if let Err(e) = chat_service.persist_user_message_with_images(&message, images.clone()).await {
             yield Ok(Event::default().data(json!({"error": format!("Failed to persist user message: {}", e)}).to_string()));
             return;
         }
 
-        let mut full_text = String::new();
-        let mut tool_results: Vec<String> = Vec::new();
+        // `message` is moved into the `AgentRequest` below, and extraction needs
+        // the user's own words when the turn ends.
+        let user_message_for_extraction = message.clone();
 
+        // The same accumulator `/chat/stream` uses, so both routes fold an
+        // engine event into a turn the one way. This route never captures
+        // thinking blocks out of the token stream -- it takes the engine's
+        // structured `Thinking` events and nothing else.
+        let mut turn = TurnAccumulator::new(crate::thought_filter::ThoughtFilter::new());
         let request = AgentRequest {
             message,
             session_id: session_id.clone(),
@@ -7156,6 +8943,8 @@ async fn agent_chat_stream(
             images,
             voice_mode: false,
             canvas_mode: false,
+            profile_scope: turn_scope.clone(),
+            profile_context: profile_context_for(&state, &turn_scope).await,
         };
 
         let mut agent_stream = match agent.chat_stream(request).await {
@@ -7167,76 +8956,52 @@ async fn agent_chat_stream(
             }
         };
 
-        // See chat_stream above for rationale — same Harmony preamble filter.
-        let mut thought = crate::thought_filter::ThoughtFilter::new();
-
         while let Some(event_result) = agent_stream.next().await {
             match event_result {
                 Ok(event) => {
-                    let maybe_data = match event {
-                        AgentStreamEvent::Status { content } => {
-                            Some(json!({"type": "status", "content": content}).to_string())
+                    match turn.absorb(event) {
+                        StreamStep::Nothing => {}
+                        StreamStep::Frame(data) => {
+                            yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
                         }
-                        AgentStreamEvent::Thinking { content } => {
-                            Some(json!({"type": "thinking", "content": content}).to_string())
+                        StreamStep::Reasoning { frame, block } => {
+                            // PAI-5 P6, same contract as `chat_stream`: offered
+                            // unconditionally, kept only if the user said so.
+                            chat_service.record_thinking(block);
+                            yield Ok::<Event, std::convert::Infallible>(Event::default().data(frame));
                         }
-                        AgentStreamEvent::ToolCall { tool, id, input } => {
-                            Some(json!({"type": "tool_call", "tool": tool, "id": id, "input": input}).to_string())
-                        }
-                        AgentStreamEvent::ToolResult { tool, id, content } => {
-                            let (clean_content, ui_hint) = extract_ui_hint(&content);
-                            tool_results.push(json!({
-                                "tool_call_id": id,
-                                "tool": tool,
-                                "content": clean_content,
-                            }).to_string());
-                            let mut ev = serde_json::json!({
-                                "type": "tool_result",
-                                "tool": tool,
-                                "id": id,
-                                "content": clean_content
-                            });
-                            if let Some(ui) = ui_hint {
-                                ev["ui"] = ui;
+                        // This route closes on the engine's `Done`, which is why
+                        // the `done` frame is built here rather than in the
+                        // translator -- `/chat/stream` keeps the numbers and
+                        // emits its `done` after persistence.
+                        //
+                        // PAI-5 P2: the turn's stats go out FIRST, through the
+                        // same builder the other route uses. This route used to
+                        // drop them on the floor with a `{ .. }`, so a client
+                        // driving `/agent/chat/stream` could see no TTFT, no
+                        // decode rate, no context fill and no reasoning count
+                        // for a turn the engine had measured. `usage` is still
+                        // dropped: this route reports no totals in its `done`
+                        // frame, and inventing one now would change a shape
+                        // clients already parse.
+                        StreamStep::TurnComplete { stats, .. } => {
+                            if let Some(s) = stats {
+                                yield Ok::<Event, std::convert::Infallible>(
+                                    Event::default().data(turn_stats_frame(&s))
+                                );
                             }
-                            Some(ev.to_string())
+                            yield Ok::<Event, std::convert::Infallible>(Event::default().data(
+                                json!({"done": true, "session_id": session_id.clone()}).to_string()
+                            ));
                         }
-                        AgentStreamEvent::Text { content } => {
-                            let visible = thought.push(&content);
-                            if visible.is_empty() {
-                                None
-                            } else {
-                                full_text.push_str(&visible);
-                                Some(json!({"type": "text", "content": visible, "token": visible}).to_string())
-                            }
-                        }
-                        AgentStreamEvent::ReviewStatus { content } => {
-                            Some(json!({"type": "review_status", "content": content}).to_string())
-                        }
-                        AgentStreamEvent::ReviewRevision { content, score, rounds } => {
-                            Some(json!({"type": "review_revision", "content": content, "score": score, "rounds": rounds}).to_string())
-                        }
-                        // Parity with /chat/stream — see the note there.
-                        AgentStreamEvent::TurnLimitReached { max_turns } => {
-                            Some(json!({"type": "turn_limit_reached", "max_turns": max_turns}).to_string())
-                        }
-                        AgentStreamEvent::Done { .. } => {
-                            Some(json!({"done": true, "session_id": session_id.clone()}).to_string())
-                        }
-                        AgentStreamEvent::Error { content } => {
-                            Some(json!({"error": content}).to_string())
-                        }
-                    };
-                    if let Some(data) = maybe_data {
-                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
                     }
                     // Emit thinking blocks captured by the filter
-                    for thinking_content in thought.take_thinking() {
+                    for thinking_content in turn.thought.take_thinking() {
                         let data = json!({"type": "thinking", "content": thinking_content}).to_string();
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
                     }
                     // Execute Harmony-format tool-call envelopes captured by ThoughtFilter.
-                    for body in thought.take_tool_calls() {
+                    for body in turn.thought.take_tool_calls() {
                         if let Some((name, args)) = crate::thought_filter::parse_tool_envelope(&body) {
                             tracing::info!(tool = %name, "Executing text-based tool call (agent chat)");
                             let call_id = uuid::Uuid::new_v4().to_string();
@@ -7244,21 +9009,24 @@ async fn agent_chat_stream(
                             yield Ok::<Event, std::convert::Infallible>(Event::default().data(
                                 json!({"type": "tool_call", "tool": name.clone(), "id": call_id.clone(), "input": args_val}).to_string()
                             ));
-                            match state.agent.call_tool(&session_id, &name, &args).await {
+                            let call_start = std::time::Instant::now();
+                            let call_result = state.agent.call_tool(&session_id, &name, &args).await;
+                            turn.note_fallback_tool(&name, call_start.elapsed());
+                            match call_result {
                                 Ok(result_text) => {
                                     let (clean, ui_hint) = extract_ui_hint(&result_text);
-                                    let mut ev = json!({"type": "tool_result", "tool": name, "id": call_id, "content": clean});
-                                    if let Some(ui) = ui_hint {
-                                        ev["ui"] = ui;
-                                    }
-                                    yield Ok::<Event, std::convert::Infallible>(Event::default().data(ev.to_string()));
+                                    yield Ok::<Event, std::convert::Infallible>(Event::default().data(
+                                        tool_result_frame(&name, &call_id, &clean, ui_hint)
+                                    ));
                                 }
                                 Err(e) => {
                                     yield Ok::<Event, std::convert::Infallible>(Event::default().data(
-                                        json!({"type": "tool_result", "tool": name, "id": call_id, "content": format!("Tool error: {e}")}).to_string()
+                                        tool_result_frame(&name, &call_id, &format!("Tool error: {e}"), None)
                                     ));
                                 }
                             }
+                        } else {
+                            tracing::warn!("Unrecognised tool-call envelope: {body}");
                         }
                     }
                 }
@@ -7270,19 +9038,25 @@ async fn agent_chat_stream(
             }
         }
 
-        let tail = thought.flush();
+        let tail = turn.thought.flush();
         if !tail.is_empty() {
-            full_text.push_str(&tail);
+            turn.full_text.push_str(&tail);
             let data = json!({"type": "text", "content": tail, "token": tail}).to_string();
             yield Ok::<Event, std::convert::Infallible>(Event::default().data(data));
         }
 
         // ── Persist assistant turn ──────────────────────────────────────────
-        let _ = chat_service.persist_assistant_turn(
-            tool_results,
-            &full_text,
+        // PAI-5 P7. `persist_assistant_turn_with_extraction` owns both concerns,
+        // which is why this route calls it rather than persisting and then
+        // extracting: a handler cannot accidentally drop extraction by
+        // refactoring the block, because there is no separate call to drop.
+        // That is the same reason `/chat/stream` uses it.
+        let _ = chat_service.persist_assistant_turn_with_extraction(
+            std::mem::take(&mut turn.tool_results),
+            &turn.full_text,
             None,
             None,
+            &user_message_for_extraction,
         ).await;
     };
 
@@ -8200,6 +9974,22 @@ async fn oauth_callback_handler(
     // Exchange authorization code for tokens.
     // The redirect_uri MUST exactly match the one sent in the authorize request.
     let redirect_uri = format!("http://127.0.0.1:{}/api/v1/oauth/callback", state.api_port);
+    // PAI-2 P6b. The code exchange is a POST of a live credential to a third
+    // party, and it was ungated -- `authorization_code` as well as the refresh
+    // below. The refusal goes through `fail` so the UI polling
+    // `/oauth/status/{state}` gets the reason instead of a hang.
+    let call = match pond_core::shared::services::egress::begin(&provider.token_url, "POST") {
+        Ok(c) => c,
+        Err(denied) => {
+            let reason = denied.to_string();
+            fail(&reason).await;
+            return Html(format!(
+                "<h1>Authorization failed</h1><p>{}</p>",
+                html_escape(&reason)
+            ))
+            .into_response();
+        }
+    };
     let token_response = state
         .http_client
         .post(&provider.token_url)
@@ -8212,6 +10002,7 @@ async fn oauth_callback_handler(
         ])
         .send()
         .await;
+    call.finish(token_response.as_ref().ok().map(|r| r.status().as_u16()));
 
     match token_response {
         Ok(resp) if resp.status().is_success() => {
@@ -8450,7 +10241,18 @@ async fn oauth_refresh_handler(
             .unwrap_or_else(|| provider.bundled_client_id.clone())
     };
 
-    match state
+    // PAI-2 P6b: the refresh hop, gated separately from the code exchange.
+    let call = match pond_core::shared::services::egress::begin(&provider.token_url, "POST") {
+        Ok(c) => c,
+        Err(denied) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": denied.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    let sent = state
         .http_client
         .post(&provider.token_url)
         .form(&[
@@ -8459,8 +10261,9 @@ async fn oauth_refresh_handler(
             ("client_id", client_id.as_str()),
         ])
         .send()
-        .await
-    {
+        .await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    match sent {
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             if let Some(access_token) = body["access_token"].as_str() {
@@ -8594,7 +10397,12 @@ async fn refresh_spotify_access_token(state: &AppState) -> Option<String> {
         .flatten()
         .unwrap_or_else(|| provider.bundled_client_id.clone());
 
-    let resp = state
+    // PAI-2 P6b: hop 1 of 3 on this path. The other two are in
+    // `spotify_api_call`, and each one is gated where it is made -- a single
+    // gate at the top of the flow is the shape that lets a copy-pasted retry
+    // out through a hole nobody can see.
+    let call = pond_core::shared::services::egress::begin(&provider.token_url, "POST").ok()?;
+    let sent = state
         .http_client
         .post(&provider.token_url)
         .form(&[
@@ -8603,8 +10411,9 @@ async fn refresh_spotify_access_token(state: &AppState) -> Option<String> {
             ("client_id", client_id.as_str()),
         ])
         .send()
-        .await
-        .ok()?;
+        .await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    let resp = sent.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -8617,40 +10426,94 @@ async fn refresh_spotify_access_token(state: &AppState) -> Option<String> {
     Some(access_token)
 }
 
+/// The egress tracker records the method as a `&'static str`, deliberately: an
+/// attacker-influenced method string must never become an unbounded attribute
+/// key in the event store. `reqwest::Method` is not `'static`, so map it.
+fn static_method_label(method: &reqwest::Method) -> &'static str {
+    if method == reqwest::Method::GET {
+        "GET"
+    } else if method == reqwest::Method::PUT {
+        "PUT"
+    } else if method == reqwest::Method::POST {
+        "POST"
+    } else if method == reqwest::Method::DELETE {
+        "DELETE"
+    } else {
+        "OTHER"
+    }
+}
+
+/// Why a Spotify call produced no response.
+///
+/// PAI-2 P6b replaced a bare `Option` here. Folding a network-mode refusal into
+/// the same `None` that means "Spotify was never connected" makes the dashboard
+/// tell the user to sign in again, which cannot work and does not name the
+/// setting that is actually stopping the call. A refusal nobody can act on is
+/// the failure PAI-2 invariant 1 exists to prevent.
+enum SpotifyUnavailable {
+    /// No secret storage, or no stored token: Spotify was never connected.
+    NotConnected,
+    /// The network mode refused a hop. Carries the whole `EgressDenied` text.
+    Refused(String),
+}
+
 /// Calls the Spotify Web API with the stored access token, transparently
-/// refreshing and retrying once on a 401. Returns `None` when there's no
-/// token to try at all (Spotify not connected) or refresh fails.
+/// refreshing and retrying once on a 401.
 async fn spotify_api_call(
     state: &AppState,
     method: reqwest::Method,
     path: &str,
-) -> Option<reqwest::Response> {
-    let repo = state.secret_repo.as_ref()?;
+) -> Result<reqwest::Response, SpotifyUnavailable> {
+    use SpotifyUnavailable::{NotConnected, Refused};
+
+    let repo = state.secret_repo.as_ref().ok_or(NotConnected)?;
     let providers = pond_core::user_data::services::oauth_providers::builtin_oauth_providers();
-    let provider = providers.iter().find(|p| p.id == "spotify")?;
-    let token = repo.get(&provider.token_key).await.ok().flatten()?;
+    let provider = providers
+        .iter()
+        .find(|p| p.id == "spotify")
+        .ok_or(NotConnected)?;
+    let token = repo
+        .get(&provider.token_key)
+        .await
+        .ok()
+        .flatten()
+        .ok_or(NotConnected)?;
     let url = format!("https://api.spotify.com/v1{path}");
 
-    let resp = state
+    // PAI-2 P6b, hop 2 of 3.
+    let method_label = static_method_label(&method);
+    let call = pond_core::shared::services::egress::begin(&url, method_label)
+        .map_err(|denied| Refused(denied.to_string()))?;
+    let sent = state
         .http_client
         .request(method.clone(), &url)
         .bearer_auth(&token)
         .send()
-        .await
-        .ok()?;
+        .await;
+    call.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    let resp = sent.map_err(|_| NotConnected)?;
 
     if resp.status() != StatusCode::UNAUTHORIZED {
-        return Some(resp);
+        return Ok(resp);
     }
 
-    let refreshed = refresh_spotify_access_token(state).await?;
-    state
+    let refreshed = refresh_spotify_access_token(state)
+        .await
+        .ok_or(NotConnected)?;
+    // PAI-2 P6b, hop 3 of 3. The retry is its own request to its own host and
+    // carries a freshly minted credential; it gets its own gate. Reusing the
+    // gate above would be the copy-paste regression this file's guard is built
+    // to catch.
+    let retry = pond_core::shared::services::egress::begin(&url, method_label)
+        .map_err(|denied| Refused(denied.to_string()))?;
+    let sent = state
         .http_client
         .request(method, &url)
         .bearer_auth(&refreshed)
         .send()
-        .await
-        .ok()
+        .await;
+    retry.finish(sent.as_ref().ok().map(|r| r.status().as_u16()));
+    sent.map_err(|_| NotConnected)
 }
 
 /// Maps a failing Spotify Web API status onto a stable machine-readable code
@@ -8688,10 +10551,24 @@ fn spotify_error_hint(status: StatusCode) -> (&'static str, &'static str) {
 async fn music_now_playing_handler(State(state): State<Arc<AppState>>) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let Some(resp) =
-        spotify_api_call(&state, reqwest::Method::GET, "/me/player/currently-playing").await
-    else {
-        return Json(json!({"connected": false})).into_response();
+    let resp = match spotify_api_call(&state, reqwest::Method::GET, "/me/player/currently-playing")
+        .await
+    {
+        Ok(r) => r,
+        Err(SpotifyUnavailable::NotConnected) => {
+            return Json(json!({"connected": false})).into_response()
+        }
+        // PAI-2 P6b: not the same thing as "not connected". The widget can say
+        // which setting to change instead of offering a sign-in that will not
+        // help.
+        Err(SpotifyUnavailable::Refused(message)) => {
+            return Json(json!({
+                "connected": false,
+                "error": "network_refused",
+                "message": message,
+            }))
+            .into_response()
+        }
     };
 
     let status = resp.status();
@@ -8752,12 +10629,23 @@ async fn music_control_handler(
         }
     };
 
-    let Some(resp) = spotify_api_call(&state, method, path).await else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "Spotify not connected"})),
-        )
-            .into_response();
+    let resp = match spotify_api_call(&state, method, path).await {
+        Ok(r) => r,
+        Err(SpotifyUnavailable::NotConnected) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Spotify not connected"})),
+            )
+                .into_response()
+        }
+        // PAI-2 P6b.
+        Err(SpotifyUnavailable::Refused(message)) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": message, "code": "network_refused"})),
+            )
+                .into_response()
+        }
     };
 
     match resp.status() {
@@ -9077,7 +10965,11 @@ async fn delete_prompt_extra(
 // ── Memories ──────────────────────────────────────────────────────────────────
 
 async fn list_memories(State(state): State<Arc<AppState>>) -> impl axum::response::IntoResponse {
-    match state.memory_repo.search_recent(None, 50).await {
+    match state
+        .memory_repo
+        .search_recent(&ProfileScope::Household, 50)
+        .await
+    {
         Ok(memories) => Json(json!(memories)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -9585,15 +11477,70 @@ struct RunRecipeRequest {
     canvas_mode: bool,
 }
 
+/// The two fields GIAP reads out of a recipe's YAML.
+///
+/// This used to be `goose::recipe::Recipe::from_content`, which was the only
+/// `goose::` reference in the whole of `pond-api` — a path dependency on the
+/// entire agent framework, in the crate CLAUDE.md defines as framework-free, for
+/// two `Option<String>`s. `pond-api` also sits in CI's "fast crates" list, whose
+/// stated definition is "every crate that does not pull the Goose submodule", so
+/// the split the list encodes did not exist while that dependency was there.
+///
+/// `deny_unknown_fields` is deliberately NOT set: a recipe may legally carry
+/// anything Goose understands, and refusing to run it because we do not read a
+/// field would be worse than ignoring it. What we do instead is say so — see
+/// [`RecipePrompt::warn_about_dropped_fields`].
+#[derive(Debug, Default, Deserialize)]
+struct RecipePrompt {
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    instructions: Option<String>,
+    /// Present only so the warning below can notice them.
+    #[serde(default)]
+    parameters: Option<Value>,
+    #[serde(default)]
+    sub_recipes: Option<Value>,
+}
+
+impl RecipePrompt {
+    fn parse(yaml: &str) -> Result<Self, serde_yaml::Error> {
+        serde_yaml::from_str(yaml)
+    }
+
+    /// Recipes carrying `parameters` or `sub_recipes` parse cleanly and then run
+    /// as a bare prompt with those fields silently dropped — GIAP delegates to
+    /// the ordinary chat-stream pipeline, which has no parameter substitution and
+    /// no sub-recipe execution. Silence here reads as support.
+    fn warn_about_dropped_fields(&self, name: &str) {
+        if self.parameters.is_some() || self.sub_recipes.is_some() {
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "recipe_fields_dropped",
+                recipe = name,
+                parameters = self.parameters.is_some(),
+                sub_recipes = self.sub_recipes.is_some(),
+                "this recipe declares fields GIAP does not execute; it will run as a bare prompt"
+            );
+        }
+    }
+}
+
 /// Execute a recipe by name. Looks up the AgentRecipe, parses its YAML to
 /// extract the prompt, and delegates to the shared chat-stream pipeline so
 /// the response matches `POST /api/v1/chat/stream` event-for-event.
 async fn run_recipe(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
     body: Option<Json<RunRecipeRequest>>,
 ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
 {
+    // PAI-1 P9. A recipe run is a turn like any other and resolves the speaker
+    // the same way: the device the pond issued this caller's token to, never
+    // anything in `RunRecipeRequest`.
+    let device = proven_device(principal.as_ref());
+
     let repo = state.recipe_repo.as_ref().ok_or_else(|| {
         (
             StatusCode::NOT_IMPLEMENTED,
@@ -9621,11 +11568,14 @@ async fn run_recipe(
         tracing::warn!(name = %name, "running inactive recipe");
     }
 
-    let prompt = match goose::recipe::Recipe::from_content(&recipe.yaml) {
-        Ok(parsed) => parsed
-            .prompt
-            .or(parsed.instructions)
-            .unwrap_or_else(|| format!("Run routine: {}", name)),
+    let prompt = match RecipePrompt::parse(&recipe.yaml) {
+        Ok(parsed) => {
+            parsed.warn_about_dropped_fields(&name);
+            parsed
+                .prompt
+                .or(parsed.instructions)
+                .unwrap_or_else(|| format!("Run routine: {}", name))
+        }
         Err(e) => {
             tracing::warn!(name = %name, error = %e, "failed to parse recipe YAML; using fallback prompt");
             format!("Run routine: {}", name)
@@ -9656,7 +11606,7 @@ async fn run_recipe(
         canvas_mode: body.canvas_mode,
     };
 
-    Ok(chat_stream_inner(state, permit, chat_req))
+    Ok(chat_stream_inner(state, permit, chat_req, device))
 }
 
 // ───────────────────────── Face Biometrics (Phase 2) ────────────────────────
@@ -11204,15 +13154,739 @@ async fn delete_user_biometrics(
     })))
 }
 
+// ── Proactive proposals (PAI-7 P3b) ──────────────────────────────────────────
+//
+// P3a landed the `Proposal` domain, `ProposalRepository`, `SqliteProposalRepository`
+// and migrations 0041/0042, and said in its own stamp that NOTHING constructed
+// any of it. This is the surface that lets a person see and dispose of one.
+//
+// # Reusing the drafts machinery is the design decision, not an implementation
+// # shortcut
+//
+// A proposal IS a `drafts` row (`origin = 'proactive'`), so disposing of one is
+// `DraftRepository::update_status` and the ownership question is
+// `is_draft_decision_permitted` -- the same function `giap-draft`'s
+// `DraftMcpServer::decide` asks. That means a proactive suggestion inherits an
+// approval flow that already exists rather than growing a second one, and a
+// later change to the ownership rule reaches both callers.
+//
+// **Approving does not execute anything.** It moves the row to `approved`,
+// exactly as `DraftMcpServer::apply` does. Invariant 1 is "GIAP proposes; the
+// user disposes", and the executor is PAI-7 P4's business.
+//
+// # Why the decide route reads the PROPOSAL repository and not the draft one
+//
+// `DraftRepository::get` would answer for any draft id, and this route would
+// then be a second way to decide a user-staged draft -- one that skips the
+// policy tally and the audit entry `DraftMcpServer::decide` records, which is
+// the telemetry PAI-2 P8b's enforce flip is waiting on. `get_live` answers only
+// for a row that is proactive, pending and unexpired, so an id that is anything
+// else is a 404 here and stays the MCP path's business.
+//
+// The cost of that is real and deliberate: rejecting an EXPIRED proposal is not
+// possible at this edge, though section 3.5 wants rejections as feedback. The
+// MCP path still allows it (`decide` gates only approval on liveness). Rather
+// than widen this route to every draft to get it, the honest fix is a
+// `ProposalRepository` read that returns a decided-or-expired proposal, which
+// belongs with the phase that builds the feedback loop.
+
+/// The caller of a proposal route, as one member.
+///
+/// Invariants 4 and 5 at the HTTP edge, answered by the domain's own door
+/// rather than by a check written here. [`ProposalAudience::from_scope`] admits
+/// `Owner(id)` and refuses the other two, for opposite reasons that both land
+/// on "not one member": `Guest` generates and receives nothing, and `Household`
+/// is not a weaker address than `Owner` — it *is* the broadcast.
+///
+/// **The consequence is a real cliff and I am taking it deliberately.** A
+/// session that nobody has identified resolves to `Household` on a one-member
+/// pond, so on a default install today this answers 403 and the surface is
+/// unusable until the speaker is resolved to a member — by
+/// `PUT /sessions/{id}/user`, by a face match, or (since PAI-1 P9's identity
+/// half) by the request arriving on a device paired with a member-bound code.
+/// The third of those needs no session binding at all: `resolve_turn_scope`
+/// resolves it per request, from the token. That is narrower than
+/// [`is_draft_decision_permitted`](pond_core::security::ports::policy::is_draft_decision_permitted),
+/// which lets `Household` decide any draft on the argument that a one-member
+/// pond has nobody to protect from. The difference is that a draft can be
+/// unowned and a proposal never is: to LIST one I would have to pick a member,
+/// and picking is the fallback PAI-1 P3 refused. Rather than let the read refuse
+/// while the write permits — you could then dispose of what you cannot see — both
+/// go through this one door.
+async fn proposal_caller(
+    state: &Arc<AppState>,
+    session_id: &str,
+    device: &ProvenDevice,
+) -> Result<(ProfileScope, ProposalAudience), (StatusCode, Json<Value>)> {
+    let scope = resolve_turn_scope(state, session_id, device).await;
+    match ProposalAudience::from_scope(&scope) {
+        Ok(audience) => Ok((scope, audience)),
+        Err(e) => {
+            tracing::info!(
+                target: "giap::trace",
+                kind = "proposal_caller_unaddressable",
+                session_id,
+                reason = %e,
+                "a proposal route refused a caller that is not one household member"
+            );
+            Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": e.to_string(),
+                    "hint": "proposals are addressed to one household member; bind this \
+                             session to a member before reading or deciding one",
+                })),
+            ))
+        }
+    }
+}
+
+/// PAI-7 P3a's repository, built from the pool `AppState` already holds.
+///
+/// It belongs on `AppState` as an injected `Arc<dyn ProposalRepository>`, next
+/// to `session_storage` and the rest, and it is not there because `lib.rs` was
+/// owned by other work this round. Everything that needs it goes through this
+/// one function precisely so the swap is a one-line change here and no change
+/// in any handler.
+fn proposal_repo(state: &Arc<AppState>) -> pond_infra::sqlite_proposal::SqliteProposalRepository {
+    pond_infra::sqlite_proposal::SqliteProposalRepository::new(state.db.system.clone())
+}
+
+/// The drafts repository, same story as [`proposal_repo`]. A proposal is a
+/// `drafts` row, and this is what moves it to `approved` or `rejected`.
+fn draft_repo(state: &Arc<AppState>) -> pond_infra::sqlite_draft::SqliteDraftRepository {
+    pond_infra::sqlite_draft::SqliteDraftRepository::new(state.db.system.clone())
+}
+
+/// The wire shape of a proposal.
+///
+/// Built field by field from the accessors rather than by serialising the type,
+/// so the JSON is a decision rather than a consequence of the struct layout —
+/// and so `summary` (which is a method, not a field) is in it. Invariant 2's
+/// `rationale` is a top-level key beside it and never folded into the summary:
+/// a client that renders only the summary must not be able to look like it is
+/// showing the reason.
+fn proposal_json(p: &pond_core::user_data::domain::proposal::Proposal) -> Value {
+    let trigger = p.trigger();
+    json!({
+        "id": p.id(),
+        "summary": p.summary(),
+        "rationale": p.rationale(),
+        "confidence": p.confidence(),
+        "profile_id": p.audience().profile_id(),
+        "created_at": p.created_at().to_rfc3339(),
+        "expires_at": p.expires_at().to_rfc3339(),
+        "proposed_action": p.proposed_action(),
+        "trigger": {
+            "kind": trigger.kind(),
+            "source_id": trigger.source_id(),
+            "signal": trigger.signal(),
+            "observed_at": trigger.observed_at().to_rfc3339(),
+        },
+    })
+}
+
+/// Which session is asking. Required, and deliberately not defaulted: the
+/// session is how this edge learns who the caller is, and a defaulted one would
+/// resolve to `Household` — the broadcast — for every caller.
+#[derive(Deserialize)]
+struct ProposalCallerQuery {
+    session_id: String,
+}
+
+/// `GET /api/v1/proposals?session_id=X` — the live proposals addressed to the
+/// member this session belongs to, newest first.
+///
+/// There is no "list every proposal" route and there will not be one: the port
+/// has no method for it, because the only caller that could want one is a
+/// broadcast (invariant 4). Expiry is filtered in SQL on every read, so a stale
+/// suggestion cannot be listed even though nothing sweeps the table
+/// (invariant 7).
+async fn list_proposals(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Query(query): Query<ProposalCallerQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // PAI-1 P9. `ProposalCallerQuery` carries the session id and nothing else;
+    // the device comes from the principal, so a query string cannot widen who
+    // this caller is addressed as.
+    let device = proven_device(principal.as_ref());
+    let (_scope, audience) = proposal_caller(&state, &query.session_id, &device).await?;
+
+    let proposals = proposal_repo(&state)
+        .list_live_for(audience.profile_id(), chrono::Utc::now())
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "could not list proposals");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not read proposals"})),
+            )
+        })?;
+
+    Ok(Json(json!({
+        "profile_id": audience.profile_id(),
+        "proposals": proposals.iter().map(proposal_json).collect::<Vec<_>>(),
+    })))
+}
+
+/// Approve or reject. There is no third value and no default: a decision this
+/// route could not read is a 400, never an approval.
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ProposalDecision {
+    Approve,
+    Reject,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecideProposalRequest {
+    session_id: String,
+    decision: ProposalDecision,
+}
+
+/// `POST /api/v1/proposals/{id}/decide` — the member disposes.
+///
+/// Approving moves the row to `approved` and executes nothing; see the section
+/// header above.
+async fn decide_proposal(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    body: Result<Json<DecideProposalRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // PAI-1 P9. Read before the body: `DecideProposalRequest` is
+    // `deny_unknown_fields`, so a `device_id` in the body is a 400 rather than
+    // an identification, and this is where the real one comes from anyway.
+    let device = proven_device(principal.as_ref());
+    let Json(request) = body.map_err(|_| bad_body())?;
+    let (scope, _audience) = proposal_caller(&state, &request.session_id, &device).await?;
+
+    // Only a live proposal is decidable here, and `get_live` is what decides
+    // that this id is a proposal at all. Expired, already decided, a
+    // user-staged draft and absent are one answer on purpose.
+    let proposal = proposal_repo(&state)
+        .get_live(&id, chrono::Utc::now())
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, proposal = %id, "could not read a proposal");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not read the proposal"})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": "no live proposal with that id",
+                })),
+            )
+        })?;
+
+    // The shared ownership rule, asked with the proposal's own owner and the
+    // sentinel session `SqliteProposalRepository::save` writes. `Owner(id)` may
+    // decide only its own; a different member gets `REASON_FOREIGN_DRAFT`.
+    if let Err(reason) = is_draft_decision_permitted(
+        Some(&scope),
+        &request.session_id,
+        Some(proposal.audience().profile_id()),
+        PROPOSAL_SESSION_ID,
+    ) {
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "proposal_decision_refused",
+            proposal = %id,
+            reason,
+            "a proposal decision was refused"
+        );
+        return Err((StatusCode::FORBIDDEN, Json(json!({"error": reason}))));
+    }
+
+    let status = match request.decision {
+        ProposalDecision::Approve => DraftStatus::Approved,
+        ProposalDecision::Reject => DraftStatus::Rejected,
+    };
+    draft_repo(&state)
+        .update_status(&id, status.clone())
+        .await
+        .map_err(|e| {
+            // Migration 0041's BEFORE UPDATE trigger is the layer under this
+            // one and it aborts an approval it does not like. That is a refused
+            // transition, not a broken pond.
+            tracing::warn!(error = %e, proposal = %id, "a proposal decision was not applied");
+            (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "the proposal could not be moved to that status"})),
+            )
+        })?;
+
+    Ok(Json(json!({
+        "id": id,
+        "status": status.to_string(),
+        // Said out loud because the word "approved" invites the other reading.
+        "executed": false,
+    })))
+}
+
+/// Work out whose turn this is, once, at the edge.
+///
+/// PAI-1 P3. Called before the agent stream starts so the verdict can ride
+/// `AgentRequest` down rather than be recomputed nearer the data, where a
+/// second resolution could disagree with the first and the deeper one would
+/// silently win.
+///
+/// Every failure here narrows rather than widens. A session-storage error
+/// resolves as if nothing were bound, a profile-list error is treated as "there
+/// may be more than one member", and an unreadable attribution store identifies
+/// nobody -- all three give the more restrictive answer, per invariant 2.
+///
+/// # The device argument
+///
+/// PAI-1 P9's identity half. `device` is a [`ProvenDevice`], not a `&str`, and
+/// that is the whole security property: the only way to build one that names a
+/// device is [`ProvenDevice::from_principal`], and `Principal::device_id` is
+/// populated in exactly one place -- the auth middleware, from
+/// `Handshake::caller_for_token`, which reads the token this pond issued at
+/// pairing. `IdentificationSource::PairedDevice` outranks face and explicit
+/// identification, so a device id a client could supply in a header or a body
+/// would outrank every proof the pond can make. There is no constructor that
+/// takes one.
+///
+/// An unattributed device (`devices.profile_id` NULL) falls THROUGH to the next
+/// rung and resolves nobody -- migration 0043's header is explicit that the
+/// identity and delivery directions are not mirror images, and this is the
+/// identity one.
+async fn resolve_turn_scope(
+    state: &Arc<AppState>,
+    session_id: &str,
+    device: &ProvenDevice,
+) -> ProfileScope {
+    // The strongest rung first, and the read only happens when the request
+    // actually carried a device. `rung` consumes the `Result` so a failed read
+    // cannot be flattened into "unattributed" by an `unwrap_or_default`.
+    let device_rung = match device.id() {
+        None => DeviceRung::NoDevice,
+        Some(device_id) => device.rung(device_attribution(state).device_profile(device_id).await),
+    };
+    match &device_rung {
+        DeviceRung::Unavailable(why) => tracing::warn!(
+            error = %why,
+            session_id,
+            "could not read this device's household member; treating the speaker as \
+             unidentified rather than assuming one"
+        ),
+        DeviceRung::Member(profile_id) => tracing::debug!(
+            target: "giap::trace",
+            kind = "turn_device_identified",
+            session_id,
+            profile_id = %profile_id,
+            "the paired device this turn arrived on belongs to a household member"
+        ),
+        DeviceRung::NoDevice | DeviceRung::Unattributed => {}
+    }
+
+    let identity = state
+        .session_storage
+        .get_session_identity(session_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                session_id,
+                "could not read session identity; treating the speaker as unidentified"
+            );
+            SessionIdentity::unknown()
+        });
+
+    let household_has_multiple_members = match state.profile_repo.list().await {
+        Ok(profiles) => profiles.len() > 1,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not count household members; assuming more than one"
+            );
+            true
+        }
+    };
+
+    identity_resolution::resolve(&identity_resolution::ResolutionInputs {
+        // PAI-1 P9. `Member` is the only one of the four rungs that answers
+        // `Some`; no device, an unattributed device and an unreadable
+        // attribution store all answer `None` and fall through.
+        paired_device_profile: device_rung.profile_id(),
+        session: &identity,
+        household_has_multiple_members,
+    })
+    .scope
+}
+
+/// The device the *pond* proved this request came from.
+///
+/// Every handler that resolves a turn goes through this one function, so there
+/// is a single place where a request becomes a device id and it reads only the
+/// `Principal` the auth middleware attached. A request with no principal --
+/// an in-process caller, or a wiring fault -- names no device and falls through
+/// every rung below the paired-device one, which is what it did before this
+/// rung existed.
+fn proven_device(
+    principal: Option<&axum::Extension<pond_core::security::ports::policy::Principal>>,
+) -> ProvenDevice {
+    match principal {
+        Some(axum::Extension(principal)) => ProvenDevice::from_principal(principal),
+        None => ProvenDevice::none(),
+    }
+}
+
+// ── PAI-8 P1: connecting a source ──────────────────────────────────────────
+//
+// Without these there is no way to create a `ContextSource`, and with no source
+// the ingest pipeline has nothing to ingest under -- so `context_items` stays
+// empty on every pond however well the rest of it works. `upsert_source` had no
+// caller at all until this.
+//
+// Section 3.4 lists these under "New surfaces" without assigning them a phase.
+// They are P1's, because P1's own sentence -- "the ingest pipeline with on-pond
+// sources only" -- presupposes that a source can exist.
+
+/// The context repository, same story as [`proposal_repo`]: built from the pool
+/// `AppState` already holds because `lib.rs` and `main.rs` were owned by other
+/// work. It takes the redactor because storage redacts on the way in.
+fn context_repo(state: &Arc<AppState>) -> pond_infra::sqlite_context::SqliteContextRepository {
+    // `RuleRedactor` is deterministic and stateless -- the same rules over the
+    // same text -- so constructing one here cannot disagree with the one
+    // `main.rs` holds. That is the only reason this is acceptable rather than a
+    // second source of truth; if it ever grows configuration, it belongs on
+    // `AppState` beside the rest.
+    pond_infra::sqlite_context::SqliteContextRepository::new(
+        state.db.system.clone(),
+        std::sync::Arc::new(pond_infra::rule_redactor::RuleRedactor::new()),
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct ConnectSourceRequest {
+    /// `sensor` or `camera` today. Anything else is refused by
+    /// `SourceKind::availability`, which quotes its own sentence about what is
+    /// missing.
+    kind: String,
+    /// The device this source follows -- a `device_id` for a sensor, a
+    /// `camera_id` for a camera. It is matched against the bus event, so a
+    /// value naming no device produces a source that never ingests anything.
+    provider: String,
+    /// Which conversation the caller is speaking in. The OWNER is resolved from
+    /// this and the caller's proven device; see below.
+    session_id: String,
+}
+
+/// The owner of a source is resolved, never supplied.
+///
+/// **This is the whole security decision of these routes.** A `profile_id` in
+/// the request body would be a client naming whose data this is -- the same hole
+/// PAI-1 P4 closed on `PUT /sessions/{id}/user`, and worse here, because every
+/// item the source ever produces inherits the owner and migration 0044 refuses
+/// to let it change afterwards. So the body has no `profile_id` field to send,
+/// and the owner comes from `resolve_turn_scope`, which is PAI-1's whole lattice.
+///
+/// `Household` and `Guest` are refused rather than defaulted to anybody:
+/// invariant 1 says every item has an owner, and invariant 2 says a `Guest` sees
+/// no context at all -- a guest who could CREATE a source would be writing into
+/// a member's corpus.
+async fn context_source_owner(
+    state: &Arc<AppState>,
+    session_id: &str,
+    device: &ProvenDevice,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    let scope = resolve_turn_scope(state, session_id, device).await;
+    match scope.owner_id() {
+        Some(id) => Ok(id.to_string()),
+        None => Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "a context source belongs to one household member, and this caller \
+                          could not be resolved to one",
+                "scope": format!("{scope:?}"),
+            })),
+        )),
+    }
+}
+
+/// `POST /api/v1/context/sources` -- connect a sensor or camera as personal context.
+async fn connect_context_source(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Json(body): Json<ConnectSourceRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    use pond_core::context::domain::{ContextSource, SourceKind, SourceParts, SourceStatus};
+
+    let device = proven_device(principal.as_ref());
+    let owner = context_source_owner(&state, &body.session_id, &device).await?;
+
+    let Some(kind) = SourceKind::parse(&body.kind) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("unknown source kind: {}", body.kind)})),
+        ));
+    };
+    // Refuse a kind whose connector does not exist, HERE, with the domain's own
+    // sentence. A source stored now would sit in the table looking connected and
+    // never produce anything.
+    let availability = kind.availability();
+    if availability != pond_core::context::domain::SourceAvailability::Landed {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": availability.refusal(), "kind": kind.as_str()})),
+        ));
+    }
+
+    let now = chrono::Utc::now();
+    // Deterministic id, so connecting the same device twice is an update rather
+    // than a second source racing the first for the same events.
+    let id = format!("{}:{}", kind.as_str(), body.provider.trim());
+    let source = ContextSource::from_parts(SourceParts {
+        id: id.clone(),
+        kind,
+        provider: body.provider.trim().to_string(),
+        profile_id: owner.clone(),
+        scopes: Vec::new(),
+        cursor: None,
+        last_sync: None,
+        status: SourceStatus::Connected,
+        secret_ref: None,
+        created_at: now,
+    })
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+
+    context_repo(&state)
+        .upsert_source(&source)
+        .await
+        .map_err(|e| {
+            // Migration 0044 REFUSES an update that moves a source's owner or kind,
+            // with a trigger, because every stored item is denormalised under both.
+            // That is a 409 and not a 500: the caller asked for something coherent
+            // and the pond is refusing it, which they can act on.
+            let moved_owner = e.to_string().contains("cannot change owner")
+                || e.to_string().contains("cannot change kind");
+            if moved_owner {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "this source already exists and belongs to somebody else, or is a \
+                                  different kind. Disconnect it first; its items go with it.",
+                    })),
+                )
+            } else {
+                tracing::warn!(error = %e, "could not store a context source");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "could not store the source"})),
+                )
+            }
+        })?;
+
+    Ok(Json(
+        json!({"id": id, "kind": kind.as_str(), "profile_id": owner}),
+    ))
+}
+
+/// `GET /api/v1/context/sources?session_id=X` -- the sources this caller may see.
+async fn list_context_sources(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Query(query): Query<ProposalCallerQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let device = proven_device(principal.as_ref());
+    // Scoped, not filtered afterwards: `list_sources` takes the scope, and
+    // `scope.rs` answers `Guest` with nothing.
+    let scope = resolve_turn_scope(&state, &query.session_id, &device).await;
+    let sources = context_repo(&state)
+        .list_sources(&scope)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "could not list context sources");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not read sources"})),
+            )
+        })?;
+
+    Ok(Json(json!({
+        "sources": sources
+            .iter()
+            .map(|s| json!({
+                "id": s.id(),
+                "kind": s.kind().as_str(),
+                "provider": s.provider(),
+                "profile_id": s.profile_id(),
+                "status": s.status().as_str(),
+            }))
+            .collect::<Vec<_>>()
+    })))
+}
+
+/// `DELETE /api/v1/context/sources/{id}?session_id=X` -- disconnect, and say how many items went.
+///
+/// PAI-8 invariant 6 is "disconnecting a source deletes its items by default,
+/// **and says how many**". `disconnect_source` returns the count for exactly
+/// that reason, so the number is in the response body rather than a log line: a
+/// caller that cannot report it cannot satisfy the invariant.
+async fn disconnect_context_source(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Path(id): Path<String>,
+    Query(query): Query<ProposalCallerQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let device = proven_device(principal.as_ref());
+    let scope = resolve_turn_scope(&state, &query.session_id, &device).await;
+    let removed = context_repo(&state)
+        .disconnect_source(&id, &scope)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "could not disconnect a context source");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not disconnect the source"})),
+            )
+        })?;
+
+    Ok(Json(json!({"id": id, "items_removed": removed})))
+}
+
+/// PAI-1 P9's attribution repository, built from the pool `AppState` already
+/// holds -- the same story as [`proposal_repo`].
+///
+/// It belongs on `AppState` as an injected `Arc<dyn DeviceAttribution>`, next to
+/// `profile_repo` and the rest, and it is not there because `lib.rs` and
+/// `main.rs` were owned by other work this round. Everything that needs it goes
+/// through this one function precisely so the swap is a one-line change here and
+/// no change in any handler.
+fn device_attribution(
+    state: &Arc<AppState>,
+) -> pond_infra::sqlite_device_attribution::SqliteDeviceAttribution {
+    pond_infra::sqlite_device_attribution::SqliteDeviceAttribution::new(state.db.system.clone())
+}
+
+/// The speaking member's own preferences, for the prompt.
+///
+/// PAI-1 P6. Built from the scope [`resolve_turn_scope`] produced, so the
+/// assistant addresses whoever is actually talking:
+///
+/// - `Owner(id)` -- that member's preferences.
+/// - `Household` -- `settings.primary_profile_id`, the historical behaviour and
+///   the only sensible answer when nobody in particular has been identified.
+/// - `Guest` -- **`None`**. A visitor gets no personal context at all, which is
+///   the prompt half of guest degradation. Falling back to the primary member
+///   here would greet a stranger by the owner's name.
+///
+/// Returns `None` rather than an error throughout: a missing profile means no
+/// personal context, which is a safe prompt, not a failed turn.
+/// The profile particulars a turn may state, for the scope it resolved to.
+///
+/// # Personal particulars are OWNER-scoped
+///
+/// A preferred name, a birthday and a language are facts about ONE member. The
+/// `Household` fallback resolves `primary_profile_id`, so returning them there
+/// means any unattributed turn asserts the primary member's particulars — "the
+/// user prefers to be called Jerry", "the user's birthday is …" — while somebody
+/// else is talking. That was inert only because nothing had ever written those
+/// keys (the UI saved them to browser localStorage and the server reads them
+/// from SQLite, so they were always empty); wiring the writer is exactly what
+/// would have made it live, which is why the scoping is fixed in the same
+/// change.
+///
+/// `atypical_speech` deliberately DOES survive into `Household`. It is not a
+/// disclosure about anybody — it renders as "be patient, never correct speech
+/// patterns, interpret incomplete sentences charitably" — and a household that
+/// configured it wants it applied when it cannot tell who is speaking. Being
+/// patient with the wrong person costs nothing; announcing the wrong person's
+/// birthday does.
+async fn profile_context_for(
+    state: &Arc<AppState>,
+    scope: &ProfileScope,
+) -> Option<ProfileContext> {
+    // Whether the turn is attributed to ONE member, which is what makes it safe
+    // to state that member's particulars.
+    let (profile_id, attributed) = match scope {
+        ProfileScope::Owner(id) => (id.clone(), true),
+        ProfileScope::Household => {
+            let settings = state.settings_repo.get().await.ok()?;
+            (
+                settings.primary_profile_id.filter(|id| !id.is_empty())?,
+                false,
+            )
+        }
+        ProfileScope::Guest => return None,
+    };
+
+    let profile = state.profile_repo.get(&profile_id).await.ok().flatten()?;
+    Some(particulars_for(attributed, &profile.preferences))
+}
+
+/// The pure half of [`profile_context_for`]: given a member's stored
+/// preferences and whether the turn is attributed to that ONE member, what may
+/// the prompt state?
+///
+/// Split out so the scoping rule can be tested exhaustively without an
+/// `AppState`, a database or a router. The rule is the whole point of the
+/// function and it was previously reachable only through all three, which is
+/// why it went unexamined until the writer was traced.
+///
+/// **The key names are the contract with the writer.** They are what
+/// `PATCH /api/v1/profiles/{id}` must store, and the desktop app holds the same
+/// fields in camelCase (`preferredName`, `atypicalSpeech`). A camelCase key
+/// reaching the database reads as a successful write and changes nothing here —
+/// which is the failure this whole change exists to fix, in a new disguise.
+fn particulars_for(
+    attributed: bool,
+    prefs: &std::collections::HashMap<String, String>,
+) -> ProfileContext {
+    ProfileContext {
+        // Owner-scoped: facts about one person, stated only when the turn is
+        // attributed to that person.
+        preferred_name: attributed
+            .then(|| prefs.get("preferred_name").cloned())
+            .flatten(),
+        birthday: attributed.then(|| prefs.get("birthday").cloned()).flatten(),
+        language: attributed.then(|| prefs.get("language").cloned()).flatten(),
+        // Household-safe: an accommodation, not a disclosure. See the doc on
+        // `profile_context_for`.
+        atypical_speech: prefs
+            .get("accessibility_atypical_speech")
+            .map(|v| v == "true")
+            .unwrap_or(false),
+    }
+}
+
+/// Map a session-storage failure from an identity write onto a status code.
+///
+/// Only a genuinely missing session is a 404. Everything else -- a locked
+/// database, a foreign key naming a profile that no longer exists -- is a
+/// server fault, and reporting it as "no such session" would send whoever is
+/// debugging it looking in the wrong place.
+fn identity_write_error(e: SessionStorageError) -> (StatusCode, Json<Value>) {
+    let status = match e {
+        SessionStorageError::SessionNotFound(_) => StatusCode::NOT_FOUND,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(json!({"error": e.to_string()})))
+}
+
 /// POST /api/v1/sessions/:session_id/identify-user — wake-on-face hook.
 ///
 /// Accepts the same multipart payload as `/faces/identify` (plus optional
 /// `bbox` field).  On a confident match the identified `profile_id` is
-/// bound to the given session via the in-memory registry, so subsequent
-/// chat turns can personalise the system prompt to the recognised user.
+/// written to the session's own row, so the binding survives a restart and is
+/// readable by everything that can reach session storage.
 ///
-/// Returns the same body as `/faces/identify`, plus the `session_id` that
-/// was bound.  `identified=false` leaves the binding untouched.
+/// Returns the same body as `/faces/identify`, plus the `session_id` and
+/// whether the binding was actually applied.  `identified=false` leaves it
+/// untouched, and so does a match that would downgrade a stronger one.
 async fn identify_session_user_handler(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -11231,10 +13905,34 @@ async fn identify_session_user_handler(
         )
     })?;
 
+    // A face match is the WEAKEST source that can bind a session, so it must
+    // not silently take over one bound by a paired device or by the member
+    // saying so. Read, compare in the domain, then write.
+    //
+    // This is a read-modify-write and is therefore racy in principle. Two
+    // concurrent identifications of the same session would have to interleave
+    // inside a few milliseconds, and the loser is a competing face match on the
+    // same camera frame -- an outcome indistinguishable from either one winning
+    // cleanly. Locking the row for that is not worth the contention on a table
+    // every chat turn writes.
+    let mut bound = false;
     if result.identified {
         if let Some(pid) = result.profile_id.clone() {
-            let mut guard = state.session_user_bindings.write().await;
-            guard.insert(session_id.clone(), pid);
+            let proposed = SessionIdentity {
+                profile_id: Some(pid),
+                source: IdentificationSource::Face,
+                confidence: result.confidence,
+            };
+            // One atomic conditional write, not read-compare-write. Two
+            // requests could both read `Unknown` and both pass `supersedes`,
+            // after which the later write won whatever its rank -- so a face
+            // match landing a millisecond after somebody tapped "this is Liz"
+            // took the session, for a different person, on weaker evidence.
+            bound = state
+                .session_storage
+                .set_session_identity_if_stronger(&session_id, &proposed)
+                .await
+                .map_err(identity_write_error)?;
         }
     }
 
@@ -11244,32 +13942,236 @@ async fn identify_session_user_handler(
         "profile_id": result.profile_id,
         "confidence": result.confidence,
         "threshold":  face.match_threshold(),
+        "bound":      bound,
+    })))
+}
+
+/// Body of `PUT /api/v1/sessions/:session_id/user`.
+#[derive(Debug, Deserialize)]
+struct SetSessionUserRequest {
+    profile_id: String,
+}
+
+/// PUT /api/v1/sessions/:session_id/user — say who is talking.
+///
+/// The deliberate counterpart to the wake-on-face hook: a household member
+/// picking themselves in the UI, or telling the assistant "this is Liz". That
+/// is stronger evidence than a face match and weaker than a device that signed
+/// the request, and [`IdentificationSource::Explicit`] records exactly that.
+///
+/// Without this route `Explicit` had no producer at all, so the resolution
+/// chain in `identity_resolution` could only ever reach its face rung.
+/// Evaluate, record, and report whether a caller may claim a session belongs to
+/// a named member.
+///
+/// The mode comes from settings on every call rather than being cached: an
+/// operator flipping `security_policy_mode` is doing it precisely because
+/// something is wrong, and a cached value would make the flip take effect at
+/// some unpredictable later point.
+///
+/// **The audit entry records the verdict, not merely the effect.** In `audit`
+/// mode a refusal still proceeds, so `ok` is `true` for exactly the requests
+/// `enforce` would have blocked; a log that carried only `ok` would read
+/// "permitted" for all of them and could not answer what flipping the mode
+/// would break. `verdict` distinguishes `allow` from `would_deny`.
+async fn evaluate_identity_assertion(
+    state: &Arc<AppState>,
+    principal: Option<pond_core::security::ports::policy::Principal>,
+    asserted_profile_id: &str,
+) -> anyhow::Result<pond_core::security::ports::policy::PolicyDecision> {
+    use pond_core::security::ports::policy as pol;
+
+    let mode = pol::PolicyMode::parse(&state.settings_repo.get().await?.security_policy_mode);
+    if mode == pol::PolicyMode::Off {
+        return Ok(pol::PolicyDecision::permit(mode));
+    }
+
+    // A request that reached a protected handler with no principal attached is
+    // a wiring fault, not an anonymous caller. Treat it as the least privileged
+    // thing available rather than as permission: access narrows on failure
+    // (PAI-1 invariant 2).
+    let principal = principal.unwrap_or_else(pol::Principal::internal);
+
+    let decision = if pol::is_identity_assertion_proven(&principal, asserted_profile_id) {
+        pol::PolicyDecision::permit(mode)
+    } else {
+        pol::PolicyDecision::refuse(mode, pol::REASON_UNPROVEN_IDENTITY)
+    };
+
+    // Tallied at the decision site, not inside an `audit` implementation, and
+    // not conditionally on a policy adapter being installed: this counts what
+    // the policy decided. `POLICY_COUNTERS` is the half of the telemetry that
+    // survives log retention and the "clear my activity" button; the event log
+    // is the half that survives a restart. Neither is trustworthy alone, which
+    // is why `GET /security/policy-report` reports them separately.
+    pol::POLICY_COUNTERS.record(&decision);
+    if let Some(policy) = &state.security_policy {
+        policy
+            .audit(
+                &principal,
+                // A plain verb. The verdict used to ride this string as a
+                // `:{verdict}` suffix; it is an attribute now, so the report
+                // groups on a field instead of parsing a substring.
+                "identify_session",
+                pol::scopes::SESSION,
+                &decision,
+            )
+            .await;
+    }
+    if decision.would_deny() {
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "policy_would_deny",
+            scope = pol::scopes::SESSION,
+            reason = decision.denied_reason,
+            "security policy would have denied this in enforce mode"
+        );
+    }
+    Ok(decision)
+}
+
+async fn set_session_user_handler(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Json(req): Json<SetSessionUserRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if req.profile_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "profile_id is required"})),
+        ));
+    }
+
+    // ── PAI-1 P4 / PAI-2 P1: the policy's first production call site ────────
+    //
+    // This route takes a profile_id from the request BODY and binds it at
+    // Explicit strength. Afterwards every turn in the session resolves to that
+    // member's scope and their memories are injected. There was no ownership
+    // check of any kind, so any paired device could declare itself any
+    // household member and read their data -- cross-profile access laundered
+    // through the session row rather than through a query parameter.
+    //
+    // Nothing can PROVE an identity yet: no schema links a paired device to a
+    // member. So in `enforce` this refuses every remote explicit
+    // identification, which is why the mode ships as `audit` -- it records who
+    // asserted what, which is exactly the evidence needed before anyone flips
+    // it. See is_identity_assertion_proven for why this rule, and not a
+    // scope-by-principal-kind matrix.
+    let decision = evaluate_identity_assertion(&state, principal.map(|e| e.0), &req.profile_id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "could not evaluate the security policy"})),
+            )
+        })?;
+    if !decision.allowed {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "not permitted to identify this session as that member",
+                "reason": decision.denied_reason,
+            })),
+        ));
+    }
+
+    let proposed = SessionIdentity {
+        profile_id: Some(req.profile_id.clone()),
+        source: IdentificationSource::Explicit,
+        // Explicit identification carries no confidence. It is not "1.0" -- it
+        // is a different kind of claim, and a number invites averaging it
+        // against a face score.
+        confidence: None,
+    };
+
+    // Atomic, for the same reason as the face path above.
+    let bound = state
+        .session_storage
+        .set_session_identity_if_stronger(&session_id, &proposed)
+        .await
+        .map_err(identity_write_error)?;
+
+    if !bound {
+        // Report what actually holds the session, read after the refusal so it
+        // reflects the state that won rather than a pre-write guess.
+        let existing = state
+            .session_storage
+            .get_session_identity(&session_id)
+            .await
+            .unwrap_or_else(|_| SessionIdentity::unknown());
+        return Ok(Json(json!({
+            "session_id": session_id,
+            "profile_id": existing.profile_id,
+            "identification_source": existing.source.as_str(),
+            "bound": false,
+            "reason": "a stronger identification already holds this session",
+        })));
+    }
+
+    Ok(Json(json!({
+        "session_id": session_id,
+        "profile_id": req.profile_id,
+        "identification_source": IdentificationSource::Explicit.as_str(),
+        "bound": true,
     })))
 }
 
 /// GET /api/v1/sessions/:session_id/user — read the bound profile.
+///
+/// Reports the evidence alongside the id. A caller deciding what to show a
+/// speaker needs to know whether "this is Jerry" came from his phone's token or
+/// from a 0.6 face match, and a bare profile id cannot say.
 async fn get_session_user_handler(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let guard = state.session_user_bindings.read().await;
-    let profile_id = guard.get(&session_id).cloned();
+    let identity = state
+        .session_storage
+        .get_session_identity(&session_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
     Ok(Json(json!({
         "session_id": session_id,
-        "profile_id": profile_id,
+        "profile_id": identity.profile_id,
+        "identification_source": identity.source.as_str(),
+        "confidence": identity.confidence,
     })))
 }
 
 /// DELETE /api/v1/sessions/:session_id/user — release the binding.
+///
+/// Always available, whatever bound the session. Releasing an attribution
+/// narrows what the session may reach, so unlike setting one it needs no
+/// strength check -- there is no such thing as a downgrade to nobody.
 async fn clear_session_user_handler(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let mut guard = state.session_user_bindings.write().await;
-    let removed = guard.remove(&session_id).is_some();
+    // Unlike the identify path, defaulting on a failed read is safe here: this
+    // value only decides what the response *reports*, and the release below
+    // runs unconditionally. A failure narrows access either way.
+    let had_binding = state
+        .session_storage
+        .get_session_identity(&session_id)
+        .await
+        .map(|i| i.profile_id.is_some())
+        .unwrap_or(false);
+
+    state
+        .session_storage
+        .set_session_identity(&session_id, &SessionIdentity::unknown())
+        .await
+        .map_err(identity_write_error)?;
+
     Ok(Json(json!({
         "session_id": session_id,
-        "cleared":    removed,
+        "cleared":    had_binding,
     })))
 }
 
@@ -11278,6 +14180,312 @@ async fn clear_session_user_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── direct tool dispatch allowlist ───────────────────────────
+
+    /// The tools this path must never expose. Each one either decides something
+    /// on the caller's behalf, executes, or reads household data — and the
+    /// direct-dispatch routes carry no caller identity to check any of it
+    /// against. `approve_draft` is the sharpest: it is the confirmation step
+    /// that `save_draft` exists to force.
+    const MUST_NEVER_BE_DIRECTLY_DISPATCHABLE: &[&str] = &[
+        "giap-draft__approve_draft",
+        "giap-draft__reject_draft",
+        "giap-system__run_shell_command",
+        "giap-system__read_file",
+        "giap-system__write_file",
+        "giap-memory__recall_memories",
+        "giap-memory__save_memory",
+        "giap-schedule__create_schedule",
+        // PAI-6 P5. Direct dispatch runs a tool with no chat turn, so there is
+        // no engine session in `_meta` and therefore no `DelegationAuthority` to
+        // resolve. `delegate` would refuse every such call today -- but the
+        // reason it must never be ALLOWLISTED is stronger than that: an entry
+        // here is reachable by any paired client and by any sandboxed MCP App
+        // iframe, and a delegation is a multi-turn autonomous agent run on the
+        // household's own hardware. The thing that decides what it may do is the
+        // caller's authority, and this path has no caller.
+        "giap-orchestrator__delegate",
+    ];
+
+    #[test]
+    fn the_direct_dispatch_allowlist_holds_nothing_that_decides_executes_or_reads_memory() {
+        for tool in MUST_NEVER_BE_DIRECTLY_DISPATCHABLE {
+            assert!(
+                !DIRECT_DISPATCH_ALLOWLIST.contains(tool),
+                "{tool} is reachable without a chat turn, so without a caller"
+            );
+        }
+    }
+
+    #[test]
+    fn the_allowlist_is_fully_qualified_so_a_bare_name_can_never_match() {
+        // `qualify_tool_name` only prepends a server when one was supplied, so a
+        // bare `tool` with an empty `server` reaches the gate unqualified. If an
+        // entry here were bare, that request would match it.
+        for tool in DIRECT_DISPATCH_ALLOWLIST {
+            assert!(
+                tool.contains("__"),
+                "{tool} is not server-qualified, so an unqualified request matches it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hub_can_still_actuate_a_device() {
+        // hubStore.ts and Rooms.tsx both post {server, tool} rather than a
+        // qualified name — the gate sees whatever `qualify_tool_name` produced.
+        let qualified = qualify_tool_name("giap-device-control", "set_device_state");
+        assert!(DIRECT_DISPATCH_ALLOWLIST.contains(&qualified.as_str()));
+    }
+
+    // ── sensor rules (PAI-7 P8) ──────────────────────────────────
+
+    mod rules {
+        use super::*;
+        use pond_core::user_data::domain::schedule::{
+            SensorTriggerSpec, TriggerAction, TriggerCondition, TriggerSource, TriggerSourceKind,
+        };
+
+        fn spec() -> SensorTriggerSpec {
+            SensorTriggerSpec {
+                source: TriggerSource {
+                    kind: TriggerSourceKind::Sensor,
+                    device_id: Some("backyard-pir".into()),
+                    signal: Some("motion".into()),
+                },
+                condition: TriggerCondition::default(),
+                actions: vec![TriggerAction::Notify {
+                    title: "Motion".into(),
+                    body: "Backyard".into(),
+                }],
+                cooldown_secs: 120,
+            }
+        }
+
+        fn schedule(id: &str, kind: TaskKind) -> Schedule {
+            Schedule {
+                id: id.into(),
+                label: format!("label of {id}"),
+                cron: RULE_CRON.into(),
+                timezone: "UTC".into(),
+                kind,
+                paused: false,
+                currently_running: false,
+                last_run: None,
+                next_run: None,
+                created_at: chrono::Utc::now(),
+            }
+        }
+
+        #[test]
+        fn a_cron_schedule_is_not_a_rule() {
+            // The whole point of the id resolution: `/rules/{id}` must not be a
+            // second door onto `/schedules`.
+            //
+            // This is the PROJECTION and only the projection. It said it
+            // covered deleting and pausing "too", on the grounds that
+            // `find_rule` asks the same function — and it does not: dropping
+            // `&& rule_view(t).is_some()` from `find_rule` leaves this test,
+            // and the whole of this crate's lib suite, green while PUT at a
+            // cron schedule's id answers 200. The consumers are covered in
+            // `tests/rules_surface_test.rs`, through the router.
+            let backup = schedule(
+                "nightly-backup",
+                TaskKind::AgentPrompt {
+                    prompt: "back up".into(),
+                },
+            );
+            let leaked = "a cron schedule projected as a rule: /rules/{id} would \
+                 let a caller pause or delete the household's nightly backup by \
+                 guessing its id";
+            assert!(rule_view(&backup).is_none(), "{leaked}");
+            assert!(
+                rule_view(&schedule(
+                    "hook",
+                    TaskKind::Webhook {
+                        webhook_url: "https://example.com".into()
+                    }
+                ))
+                .is_none(),
+                "{leaked}"
+            );
+            // Vacuity control: the same projection over a real rule works, so
+            // "None" above is about the KIND and not about the fixture.
+            assert!(rule_view(&schedule("r", TaskKind::SensorTrigger(spec()))).is_some());
+        }
+
+        #[test]
+        fn the_rule_view_reports_the_durable_cooldown_stamp() {
+            // "Why has my rule not fired?" is answered by the persisted fire
+            // stamp (PAI-7 P8's first repair) and by nothing else on this
+            // response. A view that dropped it would send the user to the logs.
+            let fired_at = chrono::Utc::now() - chrono::Duration::seconds(30);
+            let mut rule = schedule("r", TaskKind::SensorTrigger(spec()));
+            rule.last_run = Some(fired_at);
+
+            let v = rule_view(&rule).expect("a sensor rule projects");
+            assert_eq!(v["last_fired"], json!(fired_at));
+            assert_eq!(v["cooldown_secs"], json!(120));
+            assert_eq!(v["name"], json!("label of r"));
+            // The cron and timezone a rule never uses stay off the surface.
+            assert!(v.get("cron").is_none(), "{v}");
+            assert!(v.get("timezone").is_none(), "{v}");
+        }
+
+        #[test]
+        fn the_create_body_is_the_rule_itself_with_no_cron() {
+            // The shape `/schedules` forced was a schedule wrapping a kind
+            // wrapping a spec, plus a cron expression the scheduler never
+            // reads for an event rule.
+            let body = json!({
+                "name": "Backyard motion after sunset",
+                "source": {"kind": "sensor", "device_id": "backyard-pir", "signal": "motion"},
+                "condition": {"after": "18:30", "before": "06:00"},
+                "actions": [{"type": "notify", "title": "Motion", "body": "Backyard"}]
+            });
+            let req: ApiRuleRequest = serde_json::from_value(body).expect("flattened spec parses");
+            assert_eq!(req.name, "Backyard motion after sunset");
+            assert!(req.id.is_none());
+            // Not supplied, so it takes the domain default rather than 0 —
+            // which would be no debounce at all on a flapping PIR.
+            assert_eq!(req.spec.cooldown_secs, 60);
+            assert_eq!(req.spec.condition.after.as_deref(), Some("18:30"));
+            assert!(req.spec.validate().is_ok());
+        }
+
+        /// This file, for the ORDER guard below.
+        ///
+        /// The guard is a TRIPWIRE, not the coverage, and the difference is
+        /// worth stating because this said the opposite: the three handlers do
+        /// not need a live pond, they need an `AppState` with a scheduler in
+        /// it, and `tests/schedule_integration_test.rs` had been building one
+        /// with `build_router` + `oneshot` since before this surface existed.
+        /// What refuses a rule that can never fire is asserted through the
+        /// router in `tests/rules_surface_test.rs`, on the status code and on
+        /// the store afterwards. This only asks that each handler still calls
+        /// the check, still calls it BEFORE the store, and still RETURNS what
+        /// it answers — the last of those because a call whose result is
+        /// discarded satisfies an offset comparison perfectly.
+        const ROUTES_SRC: &str = include_str!("routes.rs");
+
+        /// The source of one handler: from its signature to the next `async fn`.
+        fn handler_body(signature: &str) -> &'static str {
+            let start = ROUTES_SRC
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature} is gone from routes.rs"));
+            let rest = &ROUTES_SRC[start + signature.len()..];
+            let end = rest
+                .find("\nasync fn ")
+                .unwrap_or_else(|| panic!("{signature} is the last handler in the file"));
+            &rest[..end]
+        }
+
+        #[test]
+        fn the_slicer_returns_one_handler_and_not_the_file() {
+            // Vacuity control for the guard below: if `handler_body` returned
+            // the whole file, every ordering assertion would pass by accident,
+            // satisfied by some other handler's code.
+            let body = handler_body("async fn create_rule(");
+            assert!(body.len() < ROUTES_SRC.len() / 4, "the slice is too big");
+            assert!(
+                body.contains("scheduler returned a non-rule for a rule create"),
+                "the slice is not create_rule's body"
+            );
+            assert!(
+                !body.contains("scheduler returned a non-rule for a rule update"),
+                "the slice ran on into update_rule"
+            );
+        }
+
+        /// The span between one handler's rejection call and its store call —
+        /// the window the RETURN assertion below searches, and the one its
+        /// vacuity control measures. One function, so the control cannot be
+        /// measuring a window the guard does not use.
+        fn rejection_arm(signature: &str, store_call: &str) -> &'static str {
+            let body = handler_body(signature);
+            let check = body
+                .find("rule_spec_rejection(")
+                .unwrap_or_else(|| panic!("{signature} no longer validates the rule spec"));
+            let store = body
+                .find(store_call)
+                .unwrap_or_else(|| panic!("{signature} no longer calls {store_call}"));
+            &body[check..store]
+        }
+
+        #[test]
+        fn every_door_that_stores_a_rule_validates_first() {
+            for (signature, store_call) in [
+                ("async fn create_rule(", "create_task("),
+                ("async fn update_rule(", "update_task("),
+                // The pre-existing door. A rule can still be created here by
+                // naming the kind, so skipping it would leave the new
+                // surface's validation trivially avoidable.
+                ("async fn create_schedule(", "create_task("),
+            ] {
+                let body = handler_body(signature);
+                let check = body.find("rule_spec_rejection(").unwrap_or_else(|| {
+                    panic!(
+                        "{signature} no longer validates the rule spec — a rule with \
+                         no actions, or with a time window that parses as nothing, \
+                         would be stored and then never fire"
+                    )
+                });
+                let store = body
+                    .find(store_call)
+                    .unwrap_or_else(|| panic!("{signature} no longer calls {store_call}"));
+                assert!(
+                    check < store,
+                    "{signature} calls {store_call} before rule_spec_rejection(), \
+                     so the rule is stored whatever the check says"
+                );
+                // And the answer is RETURNED. `if let Some((_status, _body)) =
+                // rule_spec_rejection(..) { debug!(..) }` is a call, is before
+                // the store, and refuses nothing.
+                assert!(
+                    rejection_arm(signature, store_call).contains("return (status, Json(body))"),
+                    "{signature} calls rule_spec_rejection() and does not return \
+                     what it answers, so the 400 naming the field never reaches \
+                     the caller and the rule is stored anyway"
+                );
+            }
+        }
+
+        #[test]
+        fn the_return_window_is_the_arm_and_not_the_handler() {
+            // Vacuity control for the RETURN assertion: it searches the span
+            // BETWEEN the check and the store. Every one of these handlers
+            // returns a `(status, Json(body))` tuple somewhere further down, so
+            // a window that grew to the whole body would be satisfied by that
+            // and pass against a rejection whose answer is discarded.
+            let arm = rejection_arm("async fn create_rule(", "create_task(");
+            let body = handler_body("async fn create_rule(");
+            assert!(
+                arm.len() < body.len() / 2,
+                "the window has grown into the rest of the handler: {} of {} bytes",
+                arm.len(),
+                body.len()
+            );
+            assert!(
+                !arm.contains("scheduler returned a non-rule for a rule create"),
+                "the window runs past the store call it is meant to end at, so \
+                 the `return` it finds may be one further down the handler"
+            );
+        }
+
+        #[test]
+        fn the_handlers_refuse_a_spec_the_domain_refuses() {
+            // The handlers call `validate`; this pins the cases they must be
+            // refusing, so the two cannot drift into "accepted and silent".
+            let mut bad = spec();
+            bad.actions.clear();
+            assert!(bad.validate().is_err());
+
+            let mut bad = spec();
+            bad.condition.after = Some("half six".into());
+            assert!(bad.validate().is_err());
+        }
+    }
 
     // ── image attachment limits (phase F1) ───────────────────────
 
@@ -11616,5 +14824,527 @@ mod tests {
         let (clean, hint) = extract_ui_hint(input);
         assert_eq!(clean, "Some text");
         assert!(hint.is_none(), "missing colon should not produce a hint");
+    }
+
+    // ── The stream translator ────────────────────────────────────────────
+    //
+    // PAI-5 P7. `TurnAccumulator::absorb` is now the only place an
+    // `AgentStreamEvent` becomes an SSE frame, which makes it the only place a
+    // frame's shape can regress -- for BOTH routes at once. These are
+    // behavioural: the inputs are the values the live `GooseAdapter` yields,
+    // and the assertions are on the JSON a browser receives and on the state
+    // the handler persists and reports afterwards. `stream_handler_parity.rs`
+    // covers the other half, that no second match appears.
+    //
+    // Frames are compared WHOLE rather than key by key, and that is the
+    // difference between this suite and the one it replaced. A frame's `type`
+    // is the cheapest thing about it: transposing `tool` and `id` in the
+    // `tool_result` frame leaves the type untouched, and those two keys are
+    // exactly how `Chat.tsx` attaches a result to the card its call opened --
+    // `(c.callId && c.callId === evId) || (evTool && c.tool === evTool)`. A
+    // swap there matches no card, so every card keeps its spinner and shows
+    // nothing, and a suite that only read `["type"]` stayed green through it.
+
+    use pond_core::models::ports::agent::AgentStreamEvent;
+    use pond_core::models::ports::provider::UsageStats;
+    // Not re-exported through `models::ports::agent`, which names the three
+    // types the port's signatures need and nothing else.
+    use pond_core::shared::domain::agent::SubagentStatus;
+
+    /// An accumulator configured the way `/agent/chat/stream` configures one.
+    fn accumulator() -> TurnAccumulator {
+        TurnAccumulator::new(crate::thought_filter::ThoughtFilter::new())
+    }
+
+    fn frame_of(step: StreamStep) -> Value {
+        match step {
+            StreamStep::Frame(data) => {
+                serde_json::from_str(&data).expect("a frame is JSON the browser can parse")
+            }
+            other => panic!("expected a frame, got {other:?}"),
+        }
+    }
+
+    /// Long enough to clear the filter's lookahead, which holds back a tail
+    /// that might turn out to be the start of a `<|channel>` tag. A short
+    /// fixture emits nothing and would make every assertion here vacuous.
+    const SENTENCE: &str = "The kettle is on and the hallway lights are off, as you asked earlier.";
+
+    #[test]
+    fn a_visible_token_becomes_a_text_frame_and_joins_the_answer() {
+        let mut turn = accumulator();
+        let frame = frame_of(turn.absorb(AgentStreamEvent::Text {
+            content: SENTENCE.to_string(),
+        }));
+
+        assert_eq!(frame["type"], "text");
+        let shown = frame["content"].as_str().expect("content is a string");
+        assert!(
+            !shown.is_empty() && SENTENCE.starts_with(shown),
+            "the frame must carry what the filter released, got {shown:?}"
+        );
+        // The desktop reads `token`; the hub reads `content`. Both, or one of
+        // the two surfaces renders an empty message.
+        assert_eq!(frame["token"], frame["content"]);
+        assert_eq!(
+            turn.full_text, shown,
+            "the persisted answer must be exactly what was shown"
+        );
+    }
+
+    #[test]
+    fn text_the_filter_is_still_holding_emits_nothing() {
+        let mut turn = accumulator();
+        let step = turn.absorb(AgentStreamEvent::Text {
+            content: "<|channel>thought I should check the".to_string(),
+        });
+
+        assert_eq!(
+            step,
+            StreamStep::Nothing,
+            "reasoning markup must not reach the browser as answer text"
+        );
+        assert!(turn.full_text.is_empty());
+        assert!(
+            turn.ttft.is_none(),
+            "time-to-first-token is about the answer, not about a swallowed chunk"
+        );
+    }
+
+    #[test]
+    fn the_first_visible_token_stamps_ttft_and_a_later_one_does_not_move_it() {
+        let mut turn = accumulator();
+        turn.absorb(AgentStreamEvent::Text {
+            content: SENTENCE.to_string(),
+        });
+        let first = turn.ttft.expect("the first visible token stamps TTFT");
+        turn.absorb(AgentStreamEvent::Text {
+            content: SENTENCE.to_string(),
+        });
+        assert_eq!(
+            turn.ttft,
+            Some(first),
+            "TTFT is the FIRST token; re-stamping it reports the last one instead"
+        );
+    }
+
+    /// PAI-3 and PAI-4 read this timing off `TurnMetrics`. It is gathered
+    /// nowhere else, so deleting it here is a silent regression in a workstream
+    /// that has no test in this crate.
+    #[test]
+    fn a_tool_call_and_its_result_time_the_turn() {
+        let mut turn = accumulator();
+        let call = frame_of(turn.absorb(AgentStreamEvent::ToolCall {
+            tool: "giap-weather__get_weather".to_string(),
+            id: "call-1".to_string(),
+            input: Some(json!({"location": "Nairobi"})),
+        }));
+        assert_eq!(
+            call,
+            json!({
+                "type": "tool_call",
+                "tool": "giap-weather__get_weather",
+                "id": "call-1",
+                "input": {"location": "Nairobi"},
+            }),
+            "the tool_call frame is what the desktop opens a tool card from: `tool` \
+             names the card and `id` is the handle its result is matched against \
+             later. Compared whole, because a frame with two of those transposed \
+             still has the right `type`"
+        );
+        assert_eq!(
+            turn.last_tool_name.as_deref(),
+            Some("giap-weather__get_weather")
+        );
+        assert!(
+            turn.tool_call_start.is_some(),
+            "without a start instant the result below has nothing to subtract from"
+        );
+
+        let result = frame_of(turn.absorb(AgentStreamEvent::ToolResult {
+            tool: "giap-weather__get_weather".to_string(),
+            id: "call-1".to_string(),
+            content: "24C and clear".to_string(),
+        }));
+        assert_eq!(
+            result,
+            json!({
+                "type": "tool_result",
+                "tool": "giap-weather__get_weather",
+                "id": "call-1",
+                "content": "24C and clear",
+            }),
+            "`tool_result_frame` is called from four sites and its two identifying \
+             arguments are adjacent `&str`s, so transposing them compiles. The \
+             desktop then matches the result to no card at all: the spinner clears \
+             and the card stays empty"
+        );
+        assert!(
+            turn.last_tool_latency_ms.is_some(),
+            "the result must close the timing the call opened, or TurnMetrics \
+             reports a tool with no latency"
+        );
+        assert!(
+            turn.tool_call_start.is_none(),
+            "the start instant is consumed, so a second result cannot re-time \
+             the first call"
+        );
+
+        assert_eq!(turn.tool_results.len(), 1, "the turn persists one result");
+        let persisted: Value = serde_json::from_str(&turn.tool_results[0]).unwrap();
+        assert_eq!(
+            persisted,
+            json!({
+                "tool_call_id": "call-1",
+                "tool": "giap-weather__get_weather",
+                "content": "24C and clear",
+            }),
+            "the persisted row is replayed into the next prompt as the model's own \
+             tool history; a row whose id and name are transposed teaches the model \
+             it called a tool named `call-1`"
+        );
+    }
+
+    /// The MCP-UI marker is a rendering instruction, not something to keep.
+    #[test]
+    fn a_ui_hint_rides_the_frame_and_stays_out_of_the_transcript() {
+        let mut turn = accumulator();
+        let frame = frame_of(turn.absorb(AgentStreamEvent::ToolResult {
+            tool: "giap-weather__get_weather".to_string(),
+            id: "call-1".to_string(),
+            content: "[[[mcp-ui:weather:{\"temp\":24}]]]\n24C and clear".to_string(),
+        }));
+
+        assert_eq!(
+            frame,
+            json!({
+                "type": "tool_result",
+                "tool": "giap-weather__get_weather",
+                "id": "call-1",
+                "content": "24C and clear",
+                "ui": {"card_type": "weather", "data": {"temp": 24}},
+            }),
+            "a hinted result is still a `tool_result` frame and still has to reach \
+             the card its call opened -- `ui` is what that card renders as, not a \
+             substitute for the two keys that find it"
+        );
+
+        let persisted: Value = serde_json::from_str(&turn.tool_results[0]).unwrap();
+        assert_eq!(
+            persisted["content"], "24C and clear",
+            "the marker must not be persisted -- it would be replayed into the \
+             next prompt as literal text"
+        );
+    }
+
+    /// The reasoning comes back so the HANDLER can offer it to its own
+    /// `ChatService`, which holds the `persist_thinking` gate.
+    ///
+    /// The translator is handed no service on purpose. If it recorded, both
+    /// routes would inherit a decision neither could see at its call site, and
+    /// the gate PAI-5 P6 put in one place would be reached from a function that
+    /// does not know whose turn it is.
+    #[test]
+    fn a_reasoning_passage_comes_back_whole_for_the_persistence_owner() {
+        let mut turn = accumulator();
+        let step = turn.absorb(AgentStreamEvent::Thinking {
+            content: "  the kettle is a device, so I should look it up  ".to_string(),
+        });
+
+        let StreamStep::Reasoning { frame, block } = step else {
+            panic!("thinking must come back as Reasoning, not as a bare frame");
+        };
+        assert_eq!(
+            block, "  the kettle is a device, so I should look it up  ",
+            "the handler needs the passage as the model wrote it, not the frame"
+        );
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["type"], "thinking");
+        assert_eq!(frame["content"], block);
+        assert!(
+            turn.full_text.is_empty(),
+            "reasoning is never part of the answer that gets persisted"
+        );
+    }
+
+    /// `Done` is the one variant the two routes disagree about, so it must not
+    /// arrive as a frame.
+    ///
+    /// If the translator emitted one, `/chat/stream` would send a `done` before
+    /// it had persisted anything -- and its real `done`, the one carrying the
+    /// usage totals, would then be the second -- while `/agent/chat/stream`
+    /// would send two.
+    #[test]
+    fn the_engines_done_is_numbers_for_the_route_to_report_not_a_frame() {
+        let mut turn = accumulator();
+        let step = turn.absorb(AgentStreamEvent::Done {
+            session_id: "s-1".to_string(),
+            model_role: "chat".to_string(),
+            usage: Some(UsageStats {
+                prompt_tokens: 1_200,
+                completion_tokens: 96,
+                reasoning_tokens: Some(40),
+            }),
+            stats: None,
+        });
+
+        let StreamStep::TurnComplete { usage, stats } = step else {
+            panic!("Done must come back as TurnComplete, got {step:?}");
+        };
+        let usage = usage.expect("the engine's usage is carried through, not dropped");
+        assert_eq!(usage.prompt_tokens, 1_200);
+        assert_eq!(usage.completion_tokens, 96);
+        assert_eq!(
+            usage.reasoning_tokens,
+            Some(40),
+            "PAI-5 P2 reports reasoning ALONGSIDE the completion count"
+        );
+        assert!(stats.is_none());
+    }
+
+    /// Every remaining variant is a frame carrying the `type` the desktop
+    /// switches on, and the payload that type promises.
+    ///
+    /// The `type` alone is not the contract. `review_revision` carries two
+    /// adjacent integers that mean opposite things -- a quality score and a
+    /// count of rounds -- and the fixture uses 4 and 2 rather than one number
+    /// twice so that transposing them fails here. That is the shape of defect a
+    /// `["type"]`-only assertion is blind to, in the one variant where the
+    /// compiler cannot help either.
+    #[test]
+    fn the_status_shaped_variants_keep_the_type_the_client_switches_on() {
+        let mut turn = accumulator();
+        for (step, expected) in [
+            (
+                turn.absorb(AgentStreamEvent::Status {
+                    content: "Agent working".to_string(),
+                }),
+                json!({"type": "status", "content": "Agent working"}),
+            ),
+            (
+                turn.absorb(AgentStreamEvent::ReviewStatus {
+                    content: "Reviewing answer".to_string(),
+                }),
+                json!({"type": "review_status", "content": "Reviewing answer"}),
+            ),
+            (
+                turn.absorb(AgentStreamEvent::ReviewRevision {
+                    content: "A better answer".to_string(),
+                    score: 4,
+                    rounds: 2,
+                }),
+                json!({
+                    "type": "review_revision",
+                    "content": "A better answer",
+                    "score": 4,
+                    "rounds": 2,
+                }),
+            ),
+            (
+                turn.absorb(AgentStreamEvent::TurnLimitReached { max_turns: 25 }),
+                json!({"type": "turn_limit_reached", "max_turns": 25}),
+            ),
+        ] {
+            assert_eq!(
+                frame_of(step),
+                expected,
+                "the frame the client receives must be this frame whole, not just \
+                 something with the right `type`"
+            );
+        }
+
+        // The error frame is the exception: it carries no `type` at all, and
+        // the client detects it by the presence of `error`. Changing that to a
+        // typed frame would silently stop every existing client from showing
+        // failures.
+        let err = frame_of(turn.absorb(AgentStreamEvent::Error {
+            content: "the model went away".to_string(),
+        }));
+        assert_eq!(err["error"], "the model went away");
+        assert!(err.get("type").is_none());
+    }
+
+    /// PAI-6 P6 / invariant 4: a subagent's activity reaches the CLIENT and
+    /// never the parent's history.
+    ///
+    /// The accumulator's three top fields are what both handlers persist --
+    /// `full_text` becomes the assistant message and `tool_results` become its
+    /// tool rows. A progress frame that touched either would put a child's
+    /// conversation into `session_messages`, which is the one thing this
+    /// workstream is not allowed to do; the parent takes back exactly one
+    /// string, the `delegate` tool's result, through the `ToolResult` arm.
+    ///
+    /// The tool-timing fields are asserted too, and that is not padding: the
+    /// obvious way to write the `Tool` arm is to reuse the `ToolCall` arm, and
+    /// doing so would report the CHILD's tool as this turn's last tool in
+    /// `TurnMetrics` -- a plausible-looking number about the wrong agent.
+    #[test]
+    fn absorb_progress_leaves_the_turn_untouched() {
+        let mut turn = accumulator();
+        // A prior real tool call, so the assertions below distinguish "the
+        // progress frame did not write" from "nothing was ever written".
+        turn.absorb(AgentStreamEvent::ToolCall {
+            id: "call-1".to_string(),
+            tool: "giap-orchestrator__delegate".to_string(),
+            input: None,
+        });
+
+        for (status, detail) in [
+            (SubagentStatus::Queued, None),
+            (SubagentStatus::Running, None),
+            (
+                SubagentStatus::Tool,
+                Some("giap-memory__recall_memories".to_string()),
+            ),
+            (SubagentStatus::Completed, None),
+        ] {
+            let frame = frame_of(turn.absorb(AgentStreamEvent::SubagentProgress {
+                task_id: "task-1".to_string(),
+                role: "researcher".to_string(),
+                status,
+                detail: detail.clone(),
+            }));
+            assert_eq!(
+                frame,
+                json!({
+                    "type": "subagent_progress",
+                    "task_id": "task-1",
+                    "role": "researcher",
+                    "status": status.as_str(),
+                    "detail": detail,
+                }),
+                "the frame the client receives must be this frame whole"
+            );
+        }
+
+        assert!(
+            turn.full_text.is_empty(),
+            "a subagent's progress joined the parent's answer text, which is \
+             what gets persisted as the assistant message -- PAI-6 invariant 4 \
+             says only the delegation's RESULT may do that"
+        );
+        assert!(
+            turn.tool_results.is_empty(),
+            "a subagent's progress was persisted as one of the parent turn's \
+             tool results"
+        );
+        assert_eq!(
+            turn.last_tool_name.as_deref(),
+            Some("giap-orchestrator__delegate"),
+            "the child's tool overwrote the parent's own last tool, so \
+             TurnMetrics now reports a tool this turn never called"
+        );
+        assert!(
+            turn.last_tool_latency_ms.is_none(),
+            "a progress frame closed the parent's open tool-call timing, so the \
+             delegate call's latency is now the gap before the child's first \
+             tool instead of the whole delegation"
+        );
+    }
+
+    // ── Profile particulars are Owner-scoped ──────────────────────────────
+
+    /// The keys the reader expects, spelled exactly as the writer must store
+    /// them. Written out rather than referenced so a rename on either side
+    /// fails a test instead of silently reading nothing.
+    fn full_prefs() -> std::collections::HashMap<String, String> {
+        [
+            ("preferred_name", "Cap"),
+            ("birthday", "1990-04-02"),
+            ("language", "sw"),
+            ("accessibility_atypical_speech", "true"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    /// An attributed turn may state the member's own particulars.
+    #[test]
+    fn an_owner_scoped_turn_states_the_members_particulars() {
+        let ctx = particulars_for(true, &full_prefs());
+        assert_eq!(ctx.preferred_name.as_deref(), Some("Cap"));
+        assert_eq!(ctx.birthday.as_deref(), Some("1990-04-02"));
+        assert_eq!(ctx.language.as_deref(), Some("sw"));
+        assert!(ctx.atypical_speech);
+    }
+
+    /// An UNATTRIBUTED turn must not. `ProfileScope::Household` falls back to
+    /// `primary_profile_id`, so without this the pond announces the primary
+    /// member's name and birthday while somebody else is talking.
+    ///
+    /// This was inert until 2026-08-12 for a reason that makes it worse rather
+    /// than better: the desktop app saved these fields to browser
+    /// `localStorage` while the server read them from SQLite, so they were
+    /// always empty. Wiring the writer is exactly what would have made a
+    /// household turn start disclosing them.
+    #[test]
+    fn a_household_turn_states_no_ones_particulars() {
+        let ctx = particulars_for(false, &full_prefs());
+        assert_eq!(
+            ctx.preferred_name, None,
+            "an unattributed turn stated the primary member's preferred name"
+        );
+        assert_eq!(
+            ctx.birthday, None,
+            "an unattributed turn stated the primary member's birthday -- a fact about one \
+             person, asserted while the pond does not know who is speaking"
+        );
+        assert_eq!(
+            ctx.language, None,
+            "an unattributed turn adopted the primary member's language, which would answer \
+             everybody else in it too"
+        );
+    }
+
+    /// The one field that deliberately crosses into an unattributed turn.
+    ///
+    /// "Be patient, never correct speech patterns, interpret incomplete
+    /// sentences charitably" discloses nothing about anybody, and a household
+    /// that configured it wants it applied precisely when the pond cannot tell
+    /// who is speaking. Asserted separately from the test above so that
+    /// tightening the scope to nothing at all is a visible decision rather than
+    /// a side effect.
+    #[test]
+    fn the_speech_accommodation_survives_an_unattributed_turn() {
+        assert!(
+            particulars_for(false, &full_prefs()).atypical_speech,
+            "the speech accommodation was dropped for unattributed turns; it is not a \
+             disclosure and dropping it makes the pond less patient with the household it was \
+             configured for"
+        );
+    }
+
+    /// Absent keys are absent, not empty strings -- the prompt builder skips
+    /// `None` and would render "The user's birthday is ." for a `Some("")`.
+    #[test]
+    fn a_profile_with_no_preferences_yields_nothing_to_state() {
+        let ctx = particulars_for(true, &std::collections::HashMap::new());
+        assert_eq!(ctx.preferred_name, None);
+        assert_eq!(ctx.birthday, None);
+        assert_eq!(ctx.language, None);
+        assert!(!ctx.atypical_speech);
+    }
+
+    /// The camelCase trap, stated as a test.
+    ///
+    /// The desktop app holds these as `preferredName` / `atypicalSpeech`. If a
+    /// writer ever stores those spellings, `PATCH /profiles/{id}` returns 200,
+    /// the row looks populated, and the prompt still says nothing -- which is
+    /// indistinguishable from the bug this replaced.
+    #[test]
+    fn camel_case_keys_are_not_read_and_that_is_the_point() {
+        let camel: std::collections::HashMap<String, String> =
+            [("preferredName", "Cap"), ("atypicalSpeech", "true")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let ctx = particulars_for(true, &camel);
+        assert_eq!(
+            ctx.preferred_name, None,
+            "camelCase keys are now read, so the two spellings have silently become \
+             equivalent and the writer contract is no longer pinned by anything"
+        );
+        assert!(!ctx.atypical_speech);
     }
 }

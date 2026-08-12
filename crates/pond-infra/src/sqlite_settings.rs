@@ -240,9 +240,18 @@ impl SettingsRepository for SqliteSettingsRepository {
         );
         // Thinking / reasoning
         upsert!("thinking_mode", &settings.thinking_mode);
+        upsert!("reasoning_effort", &settings.reasoning_effort);
         upsert!(
             "show_thinking",
             if settings.show_thinking {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "persist_thinking",
+            if settings.persist_thinking {
                 "true"
             } else {
                 "false"
@@ -269,6 +278,14 @@ impl SettingsRepository for SqliteSettingsRepository {
             }
         );
         upsert!("summary_idle_secs", settings.summary_idle_secs.to_string());
+        upsert!(
+            "resume_compaction_idle_secs",
+            settings.resume_compaction_idle_secs.to_string()
+        );
+        upsert!(
+            "compaction_verbatim_days",
+            settings.compaction_verbatim_days.to_string()
+        );
         // Answer review
         upsert!("review_mode", &settings.review_mode);
         upsert!("review_max_rounds", settings.review_max_rounds.to_string());
@@ -301,36 +318,14 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
-        // API keys
-        upsert!(
-            "api_key_guardian",
-            settings.api_key_guardian.as_deref().unwrap_or("")
-        );
-        upsert!(
-            "api_key_gnews",
-            settings.api_key_gnews.as_deref().unwrap_or("")
-        );
-        upsert!(
-            "api_key_finnhub",
-            settings.api_key_finnhub.as_deref().unwrap_or("")
-        );
-        upsert!(
-            "api_key_coingecko",
-            settings.api_key_coingecko.as_deref().unwrap_or("")
-        );
+        // API keys are NOT here: PAI-2 P2 moved them to `SecretRepository`.
+        // See `crate::secret_migration` for the one-time move of any row an
+        // existing pond already had. `searxng_url` is an endpoint, not a
+        // credential, and stays.
         upsert!("searxng_url", settings.searxng_url.as_deref().unwrap_or(""));
         // Embedding
         upsert!("active_embedding_model", &settings.active_embedding_model);
         upsert!("embedding_provider", &settings.embedding_provider);
-        // Fast path
-        upsert!(
-            "fast_path_enabled",
-            if settings.fast_path_enabled {
-                "true"
-            } else {
-                "false"
-            }
-        );
         // Agent tuning
         upsert!(
             "agent_timeout_secs",
@@ -353,6 +348,8 @@ impl SettingsRepository for SqliteSettingsRepository {
             }
         );
         upsert!("tool_selection_mode", &settings.tool_selection_mode);
+        upsert!("security_policy_mode", &settings.security_policy_mode);
+        upsert!("network_mode", &settings.network_mode);
         // Memory tuning
         upsert!(
             "memory_consolidation_mode",
@@ -416,6 +413,14 @@ impl SettingsRepository for SqliteSettingsRepository {
             "schedule_max_runs_per_task",
             settings.schedule_max_runs_per_task.to_string()
         );
+        upsert!(
+            "goal_check_enabled",
+            if settings.goal_check_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
         // Monitoring & cost
         upsert!(
             "context_monitor_enabled",
@@ -434,14 +439,6 @@ impl SettingsRepository for SqliteSettingsRepository {
             settings.cloud_output_price_per_million.to_string()
         );
         // Tool behaviour
-        upsert!(
-            "tool_cache_enabled",
-            if settings.tool_cache_enabled {
-                "true"
-            } else {
-                "false"
-            }
-        );
         upsert!(
             "multi_tool_enabled",
             if settings.multi_tool_enabled {
@@ -470,14 +467,6 @@ impl SettingsRepository for SqliteSettingsRepository {
         upsert!(
             "telemetry_enabled",
             if settings.telemetry_enabled {
-                "true"
-            } else {
-                "false"
-            }
-        );
-        upsert!(
-            "compact_encoding",
-            if settings.compact_encoding {
                 "true"
             } else {
                 "false"
@@ -580,6 +569,61 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
+        upsert!(
+            "ext_orchestrator_enabled",
+            if settings.ext_orchestrator_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        // PAI-7 P6. Without these four lines the fields deserialize, apply and
+        // then vanish on the next read -- the failure mode the roundtrip test
+        // below exists for.
+        upsert!(
+            "unprompted_speech_enabled",
+            if settings.unprompted_speech_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!("quiet_hours_start", &settings.quiet_hours_start);
+        upsert!("quiet_hours_end", &settings.quiet_hours_end);
+        upsert!(
+            "unprompted_speech_categories",
+            &settings.unprompted_speech_categories
+        );
+        // PAI-7 P4's toggle. Same two lines, same failure mode if either is
+        // missing: the reviewer would be switched on, persist nothing, and be
+        // off again on the next read.
+        upsert!(
+            "proactive_review_enabled",
+            if settings.proactive_review_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        // PAI-8's on-pond producer. Same pair, same failure mode: with only one
+        // of the two, a household switches ingest on, watches nothing arrive,
+        // and reads the toggle back as `false` forever.
+        upsert!(
+            "ext_context_enabled",
+            if settings.ext_context_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "context_ingest_enabled",
+            if settings.context_ingest_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
 
         tx.commit().await?;
         Ok(())
@@ -605,6 +649,14 @@ impl SettingsRepository for SqliteSettingsRepository {
         .bind(value)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn delete_key(&self, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -804,6 +856,10 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         // Thinking / reasoning
         "thinking_mode" => s.thinking_mode = value.to_string(),
         "show_thinking" => s.show_thinking = value == "true",
+        "reasoning_effort" => s.reasoning_effort = value.to_string(),
+        // Anything other than the literal "true" leaves reasoning text
+        // unpersisted. A privacy control narrows on an unreadable value.
+        "persist_thinking" => s.persist_thinking = value == "true",
         "context_window_override" => {
             if let Ok(v) = value.parse() {
                 s.context_window_override = v;
@@ -814,6 +870,16 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "summary_idle_secs" => {
             if let Ok(v) = value.parse() {
                 s.summary_idle_secs = v;
+            }
+        }
+        "resume_compaction_idle_secs" => {
+            if let Ok(v) = value.parse() {
+                s.resume_compaction_idle_secs = v;
+            }
+        }
+        "compaction_verbatim_days" => {
+            if let Ok(v) = value.parse() {
+                s.compaction_verbatim_days = v;
             }
         }
         // Answer review
@@ -832,7 +898,6 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "active_embedding_model" => s.active_embedding_model = value.to_string(),
         "embedding_provider" => s.embedding_provider = value.to_string(),
         // Fast path
-        "fast_path_enabled" => s.fast_path_enabled = value == "true",
         // Agent tuning
         "agent_timeout_secs" => {
             if let Ok(v) = value.parse() {
@@ -842,6 +907,8 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "prefix_cache_prompt" => s.prefix_cache_prompt = value == "true",
         "tool_output_compaction" => s.tool_output_compaction = value == "true",
         "tool_selection_mode" => s.tool_selection_mode = value.to_string(),
+        "security_policy_mode" => s.security_policy_mode = value.to_string(),
+        "network_mode" => s.network_mode = value.to_string(),
         // Memory lifecycle
         "memory_extraction_enabled" => s.memory_extraction_enabled = value == "true",
         "memory_cleanup_enabled" => s.memory_cleanup_enabled = value == "true",
@@ -906,6 +973,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
                 s.schedule_max_runs_per_task = v;
             }
         }
+        "goal_check_enabled" => s.goal_check_enabled = value == "true",
         // Monitoring & cost
         "context_monitor_enabled" => s.context_monitor_enabled = value == "true",
         "cloud_input_price_per_million" => {
@@ -919,42 +987,15 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
             }
         }
         // Tool behaviour
-        "tool_cache_enabled" => s.tool_cache_enabled = value == "true",
         "multi_tool_enabled" => s.multi_tool_enabled = value == "true",
         "tool_call_validation" => s.tool_call_validation = value == "true",
         "tool_request_detection" => s.tool_request_detection = value == "true",
         // Data
         "telemetry_enabled" => s.telemetry_enabled = value == "true",
-        "compact_encoding" => s.compact_encoding = value == "true",
-        // API keys
-        "api_key_guardian" => {
-            s.api_key_guardian = if value.is_empty() {
-                None
-            } else {
-                Some(value.to_string())
-            };
-        }
-        "api_key_gnews" => {
-            s.api_key_gnews = if value.is_empty() {
-                None
-            } else {
-                Some(value.to_string())
-            };
-        }
-        "api_key_finnhub" => {
-            s.api_key_finnhub = if value.is_empty() {
-                None
-            } else {
-                Some(value.to_string())
-            };
-        }
-        "api_key_coingecko" => {
-            s.api_key_coingecko = if value.is_empty() {
-                None
-            } else {
-                Some(value.to_string())
-            };
-        }
+        // `api_key_*` has no arm: PAI-2 P2 moved that material to
+        // `SecretRepository`. A legacy row left behind by a failed migration
+        // falls through to the `_ => {}` arm below and is ignored rather than
+        // re-hydrated onto a struct that `GET /settings` serialises.
         "searxng_url" => {
             s.searxng_url = if value.is_empty() {
                 None
@@ -975,6 +1016,28 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "ext_audit_enabled" => s.ext_audit_enabled = value == "true",
         "ext_vision_enabled" => s.ext_vision_enabled = value == "true",
         "ext_sensor_enabled" => s.ext_sensor_enabled = value == "true",
+        // PAI-6 P5. `value == "true"` is the right comparison here rather than a
+        // parse-with-fallback: anything unreadable in that column is not "true",
+        // so a corrupt row leaves delegation OFF.
+        "ext_orchestrator_enabled" => s.ext_orchestrator_enabled = value == "true",
+        // PAI-7 P6. `value == "true"` for the same reason as the line above:
+        // anything unreadable in that column is not "true", so a corrupt row
+        // leaves the pond quiet rather than talking.
+        "unprompted_speech_enabled" => s.unprompted_speech_enabled = value == "true",
+        // The two window bounds and the category list are stored verbatim and
+        // validated where they are USED, not here. A parse at this layer would
+        // have to choose a value for a malformed row, and every choice it could
+        // make is a decision about whether the pond speaks -- which belongs to
+        // the gate, where "unparseable" means quiet hours are in force.
+        "quiet_hours_start" => s.quiet_hours_start = value.to_string(),
+        "quiet_hours_end" => s.quiet_hours_end = value.to_string(),
+        "unprompted_speech_categories" => s.unprompted_speech_categories = value.to_string(),
+        "proactive_review_enabled" => s.proactive_review_enabled = value == "true",
+        // PAI-8's on-pond producer. `value == "true"` for the third time and for
+        // the same reason: a corrupt or unreadable row is not "true", so the
+        // failure direction is that the pond copies nothing into the corpus.
+        "context_ingest_enabled" => s.context_ingest_enabled = value == "true",
+        "ext_context_enabled" => s.ext_context_enabled = value == "true",
         _ => {} // unknown key — ignore
     }
 }

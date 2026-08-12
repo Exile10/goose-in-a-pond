@@ -1,7 +1,10 @@
 //! In-memory tool registry implementation.
 //!
-//! Seeded with GIAP's built-in tools at construction. External MCP
-//! extension tools can be registered/deregistered at runtime.
+//! Holds the tools of external MCP extensions, registered and deregistered at
+//! runtime as the user adds and removes them. It starts EMPTY: GIAP's own
+//! builtins are described to the model by native tool schemas generated from the
+//! real handlers, and the hand-written list this used to be seeded with had
+//! drifted until only four of its thirteen names existed.
 
 use std::collections::HashMap;
 
@@ -17,28 +20,34 @@ const COMPACT_DESC_LIMIT: usize = 80;
 /// In-memory implementation of `ToolRegistryPort`.
 ///
 /// Uses a `RwLock<HashMap<extension_name, Vec<ExternalToolDescription>>>`
-/// keyed by extension name. The built-in GIAP tools are stored under
-/// the key `"giap"`.
+/// keyed by extension name. The `"giap"` key is still read on the way out, so a
+/// caller that deliberately registers builtins keeps working, but nothing
+/// populates it by default.
 pub struct InMemoryToolRegistry {
     tools: RwLock<HashMap<String, Vec<ExternalToolDescription>>>,
 }
 
 impl InMemoryToolRegistry {
-    /// Create a new registry seeded with GIAP's built-in tool definitions.
+    /// Create an empty registry.
+    ///
+    /// It used to be seeded from a hardcoded `giap_tool_definitions()` list, and
+    /// that seed was how the fabricated inventory reached the model: the adapter
+    /// prefers this registry over its own static fallback, so the registry
+    /// branch — the one that looks dynamic — served 13 hand-written names of
+    /// which only four existed. `weather` was really `get_current_weather`,
+    /// `shell_command` really `run_shell_command`, and 48 real tools were
+    /// missing entirely. It cost ~732 tokens on every provider call and invited
+    /// calls to tools that would never resolve.
+    ///
+    /// Builtins are not re-listed here because they do not need to be: every
+    /// live provider receives them as native tool schemas, which are generated
+    /// from the real handlers and cannot drift. What belongs in this registry is
+    /// what those schemas do not cover — tools from external MCP extensions,
+    /// registered at the point they are added (see `routes.rs ::
+    /// register_extension_tools`).
     pub fn new() -> Self {
-        let mut map = HashMap::new();
-        let builtins: Vec<ExternalToolDescription> = crate::prompts::giap_tool_definitions()
-            .iter()
-            .map(|(name, desc)| ExternalToolDescription {
-                tool_name: name.to_string(),
-                extension_name: "giap".to_string(),
-                description: desc.to_string(),
-                is_builtin: true,
-            })
-            .collect();
-        map.insert("giap".to_string(), builtins);
         Self {
-            tools: RwLock::new(map),
+            tools: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -139,21 +148,18 @@ fn truncate_description(desc: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    /// The registry carries no hardcoded inventory of its own.
+    ///
+    /// Its predecessor asserted the opposite — that `new()` seeded one builtin
+    /// per entry in a hardcoded list — which is exactly what made the fabricated
+    /// names look verified. Builtins reach the model as native tool schemas
+    /// generated from the real handlers; a second, hand-maintained copy could
+    /// only ever disagree with them.
     #[tokio::test]
-    async fn seed_produces_seven_builtin_tools() {
+    async fn a_fresh_registry_advertises_no_builtins() {
         let registry = InMemoryToolRegistry::new();
-        let tools = registry.all_tools().await;
-        let builtins: Vec<_> = tools.iter().filter(|t| t.is_builtin).collect();
-        assert_eq!(
-            builtins.len(),
-            crate::prompts::giap_tool_definitions().len(),
-            "registry should be seeded with all GIAP built-in tools"
-        );
-        // Verify all are marked as built-in and belong to "giap"
-        for tool in &builtins {
-            assert!(tool.is_builtin);
-            assert_eq!(tool.extension_name, "giap");
-        }
+        assert!(registry.all_tools().await.is_empty());
+        assert!(registry.prompt_description_lines(false).await.is_empty());
     }
 
     #[tokio::test]
@@ -213,16 +219,8 @@ mod tests {
 
         let lines = registry.prompt_description_lines(false).await;
 
-        // Should have builtin lines + external lines
-        let builtin_count = crate::prompts::giap_tool_definitions().len();
-        assert_eq!(lines.len(), builtin_count + 1);
-
-        // Built-in lines use "tool_name -- desc" format (no extension prefix)
-        let first = &lines[0];
-        assert!(
-            first.starts_with("wikipedia"),
-            "first line should be a built-in tool: {first}"
-        );
+        // Only the external tool: builtins travel as native schemas, not prose.
+        assert_eq!(lines.len(), 1);
 
         // External lines use "ext/tool_name -- desc" format
         let last = &lines[lines.len() - 1];
@@ -235,13 +233,26 @@ mod tests {
     #[tokio::test]
     async fn compact_mode_truncates_descriptions() {
         let registry = InMemoryToolRegistry::new();
+        // The registry no longer ships descriptions of its own, so the fixture
+        // has to supply one long enough to be worth truncating.
+        registry
+            .register_extension_tools(
+                "filesystem",
+                vec![(
+                    "fs_read".to_string(),
+                    "Read a file from disk. Accepts an absolute or relative path, \
+                     returns the contents as UTF-8 text, and refuses anything that \
+                     does not decode cleanly."
+                        .to_string(),
+                )],
+            )
+            .await;
 
         let full_lines = registry.prompt_description_lines(false).await;
         let compact_lines = registry.prompt_description_lines(true).await;
 
         assert_eq!(full_lines.len(), compact_lines.len());
 
-        // At least one built-in tool has a description longer than 80 chars
         let has_truncated = compact_lines
             .iter()
             .zip(full_lines.iter())
@@ -272,14 +283,11 @@ mod tests {
             )
             .await;
 
-        // Built-in tool
+        // A builtin name resolves to nothing: the registry holds only what was
+        // explicitly registered, and builtins are never registered here.
         assert_eq!(
-            registry.resolve_extension("wikipedia").await,
-            Some("giap".to_string())
-        );
-        assert_eq!(
-            registry.resolve_extension("weather").await,
-            Some("giap".to_string())
+            registry.resolve_extension("get_current_weather").await,
+            None
         );
 
         // External tool
@@ -293,20 +301,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deregister_does_not_remove_builtins() {
+    async fn deregistering_an_unknown_extension_leaves_the_others_alone() {
         let registry = InMemoryToolRegistry::new();
+        registry
+            .register_extension_tools(
+                "filesystem",
+                vec![("fs_read".to_string(), "Read a file from disk".to_string())],
+            )
+            .await;
 
-        // Attempting to deregister "giap" should still work (it's just a remove call)
-        // but in practice we never call deregister for built-in tools.
-        // External deregister should not affect built-ins.
-        registry.deregister_extension("filesystem").await;
+        registry.deregister_extension("never-registered").await;
 
-        let tools = registry.all_tools().await;
-        assert_eq!(
-            tools.len(),
-            crate::prompts::giap_tool_definitions().len(),
-            "built-in tools should remain after deregistering a non-existent extension"
-        );
+        assert_eq!(registry.all_tools().await.len(), 1);
     }
 
     #[test]

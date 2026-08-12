@@ -180,7 +180,7 @@ The shared language between the Backend and the Frontend.
 │ │  GooseAdapter  ←primary── │  │   │   Whisper (9) · Piper TTS (9+1)     │ │
 │ │   inference path          │  │   │   Llamafile (5) · GGUF (14)         │ │
 │ │  GooseProviderAdapter     │  │   └─ OllamaCatalogProvider               │ │
-│ │  GooseSessionAdapter      │  │       → http://localhost:11434/api/tags  │ │
+│ │  GiapProviderShim         │  │       → http://localhost:11434/api/tags  │ │
 │ │  GiapGooseExtensionMgr    │  └──────────────────────────────────────────┘ │
 │ │  GiapRegistration         │                                              │ │
 │ └───────────┬───────────────┘  ┌──────────────────────────────────────────┐ │
