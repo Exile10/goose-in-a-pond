@@ -43,6 +43,7 @@ use crate::bridge::{run_matter_supervisor, SupervisorConfig};
 use crate::client::{MatterClient, MatterEvent};
 use crate::commissioning::MatterCommissioner;
 use crate::control::{MatterDeviceControl, NodeCache};
+use crate::protocol::node_id_from_device_id;
 use crate::server_setup::{ensure_running, local_port_from_ws_url, SharedServerChild};
 
 /// How long to wait for a freshly installed controller to start listening.
@@ -134,6 +135,7 @@ impl MatterRuntime {
     ) -> Arc<SwitchableDeviceControl> {
         Arc::new(SwitchableDeviceControl {
             matter: self.control.clone(),
+            status: self.status.clone(),
             fallback,
         })
     }
@@ -413,17 +415,47 @@ pub(crate) async fn stop_controller(child: &SharedServerChild) {
 /// reconciler writes.
 pub struct SwitchableDeviceControl {
     matter: ControlCell,
+    status: Arc<RwLock<MatterStatus>>,
     fallback: Arc<dyn DeviceControlPort>,
 }
 
 impl SwitchableDeviceControl {
-    /// The backend to use for this call — cloned so the lock is released
-    /// before any await on the network.
-    async fn backend(&self) -> Arc<dyn DeviceControlPort> {
-        match self.matter.read().await.clone() {
-            Some(matter) => matter,
-            None => self.fallback.clone(),
+    /// The backend for `device_id`, or the reason there is none.
+    ///
+    /// A Matter device never falls back. The stub answers every verb with
+    /// success, so routing `matter-18` to it while Matter was off reported the
+    /// fan as switched on when nothing had been sent anywhere — the agent then
+    /// told the user so, truthfully relaying a lie it had been handed. A device
+    /// on some other transport still falls back, which is what the stub is for.
+    ///
+    /// The backend is cloned so the lock is released before any await on the
+    /// network.
+    async fn backend_for(&self, device_id: &str) -> Result<Arc<dyn DeviceControlPort>> {
+        if let Some(matter) = self.matter.read().await.clone() {
+            return Ok(matter);
         }
+        if node_id_from_device_id(device_id).is_none() {
+            return Ok(self.fallback.clone());
+        }
+        // Name the actual state: "off" and "the controller is unreachable" need
+        // different actions from the user, and the agent relays whichever it is.
+        Err(match self.status.read().await.state.clone() {
+            MatterState::Disabled => anyhow::anyhow!(
+                "Matter is off, so '{device_id}' cannot be controlled — turn Matter on in the \
+                 Devices tab"
+            ),
+            MatterState::Connecting => anyhow::anyhow!(
+                "the Matter controller is still starting, so '{device_id}' cannot be controlled yet"
+            ),
+            MatterState::Unreachable { error } => anyhow::anyhow!(
+                "the Matter controller is unreachable ({error}), so '{device_id}' cannot be \
+                 controlled"
+            ),
+            // Connected with no control cell is a momentary gap during teardown.
+            MatterState::Connected => anyhow::anyhow!(
+                "the Matter controller is restarting, so '{device_id}' cannot be controlled yet"
+            ),
+        })
     }
 }
 
@@ -433,25 +465,31 @@ impl SwitchableDeviceControl {
 #[async_trait]
 impl DeviceControlPort for SwitchableDeviceControl {
     async fn set_power(&self, device_id: &str, on: bool) -> Result<DeviceControlOutcome> {
-        self.backend().await.set_power(device_id, on).await
+        self.backend_for(device_id)
+            .await?
+            .set_power(device_id, on)
+            .await
     }
 
     async fn set_brightness(&self, device_id: &str, percent: u8) -> Result<DeviceControlOutcome> {
-        self.backend()
-            .await
+        self.backend_for(device_id)
+            .await?
             .set_brightness(device_id, percent)
             .await
     }
 
     async fn set_target_temp(&self, device_id: &str, celsius: f32) -> Result<DeviceControlOutcome> {
-        self.backend()
-            .await
+        self.backend_for(device_id)
+            .await?
             .set_target_temp(device_id, celsius)
             .await
     }
 
     async fn set_locked(&self, device_id: &str, locked: bool) -> Result<DeviceControlOutcome> {
-        self.backend().await.set_locked(device_id, locked).await
+        self.backend_for(device_id)
+            .await?
+            .set_locked(device_id, locked)
+            .await
     }
 
     async fn set_color(
@@ -460,14 +498,17 @@ impl DeviceControlPort for SwitchableDeviceControl {
         hue_degrees: u16,
         saturation_percent: u8,
     ) -> Result<DeviceControlOutcome> {
-        self.backend()
-            .await
+        self.backend_for(device_id)
+            .await?
             .set_color(device_id, hue_degrees, saturation_percent)
             .await
     }
 
     async fn set_fan_speed(&self, device_id: &str, percent: u8) -> Result<DeviceControlOutcome> {
-        self.backend().await.set_fan_speed(device_id, percent).await
+        self.backend_for(device_id)
+            .await?
+            .set_fan_speed(device_id, percent)
+            .await
     }
 
     async fn set_position(
@@ -475,8 +516,8 @@ impl DeviceControlPort for SwitchableDeviceControl {
         device_id: &str,
         percent_open: u8,
     ) -> Result<DeviceControlOutcome> {
-        self.backend()
-            .await
+        self.backend_for(device_id)
+            .await?
             .set_position(device_id, percent_open)
             .await
     }
