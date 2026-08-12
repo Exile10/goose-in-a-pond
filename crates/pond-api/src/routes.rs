@@ -3978,12 +3978,18 @@ async fn update_settings(
         && merged.matter_enabled
         && !(matter_url.starts_with("ws://") || matter_url.starts_with("wss://"))
     {
+        // An empty address and a malformed one are different mistakes and read
+        // as different sentences: "empty" tells the user the field they are
+        // looking at is blank, which the placeholder otherwise hides.
+        let message = if matter_url.is_empty() {
+            "Controller address is empty. Enter the Matter controller's WebSocket URL, \
+             for example ws://127.0.0.1:5580/ws"
+        } else {
+            "Controller address must be a WebSocket URL, for example ws://127.0.0.1:5580/ws"
+        };
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({
-                "error": "The Matter controller address must be a WebSocket URL, \
-                          for example ws://127.0.0.1:5580/ws"
-            })),
+            Json(json!({ "error": message, "field": "matter_ws_url" })),
         ));
     }
 
