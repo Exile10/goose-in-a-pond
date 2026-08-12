@@ -5243,9 +5243,17 @@ async fn run_proactive_reviewer(
         // Measured on the Orin 2026-08-12: the loop fired correctly, resolved
         // its audience, spawned a child that answered in 32 s, and every impulse
         // was refused because a 2B model wrote a `type` field that
-        // `ReviewerImpulse` does not have. Zero proposals, one DEBUG line each,
+        // `ReviewerImpulse` did not have. Zero proposals, one DEBUG line each,
         // and a GPU spent per interval for nothing. On a household pond nobody
         // would ever see the reason.
+        //
+        // That specific cause is FIXED -- `ReviewerImpulse` no longer carries
+        // `deny_unknown_fields`, because nothing in it is a capability and the
+        // attribute was refusing whole suggestions over a key that could not
+        // reach a decision. This warning stays regardless: it was never about
+        // that one schema, it is about the class. A reviewer that runs, costs a
+        // model turn and yields nothing is a defect whatever the reason, and
+        // DEBUG is where this one hid for two recorded runs.
         //
         // WARN, not INFO: refusing every impulse is a defect somewhere -- in the
         // prompt, in the schema, or in the model -- and it is never the intended

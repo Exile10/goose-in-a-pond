@@ -612,16 +612,43 @@ pub fn review_brief(now: DateTime<Utc>, recent: &[BusEventRef], ledger: &Feedbac
 
 /// One suggestion, as the model is asked to write it.
 ///
-/// `deny_unknown_fields`, in the same spirit as `TaskRequest` and for the same
-/// reason: a field this struct does not have is either a typo or an attempt to
-/// name something the model may not name, and both are better as a visible
-/// refusal than a silently dropped key that makes the answer look accepted.
-///
 /// Note what is **absent**. There is no audience, no expiry, no profile, no
-/// task kind and no id. Every one of those is decided by
-/// [`interpret_answer`] from values the model never sees.
+/// task kind and no id. Every one of those is decided by [`interpret_answer`]
+/// and [`build_proposal`] from values the model never sees — the audience comes
+/// from the caller, `now` from the caller's clock, and the action from
+/// [`impulse_action`], which can only ever return `TaskKind::AgentPrompt`.
+///
+/// # Why this is NOT `deny_unknown_fields`
+///
+/// It was, copied from `TaskRequest` on the reasoning that a field this struct
+/// does not have is either a typo or an attempt to name something the model may
+/// not name. The second half of that is false here, and it cost the whole
+/// feature.
+///
+/// Measured on an Orin 2026-08-12: the review loop fired, resolved its
+/// audience, spawned a child that answered in 32 s — and **every** impulse was
+/// refused, because a 2B model wrote a `type` field alongside the ones asked
+/// for. Zero proposals, one DEBUG line each, a GPU spent per interval for
+/// nothing, and on a household pond nobody would ever see the reason. PAI-7 was
+/// recorded as COMPLETE while yielding nothing, twice.
+///
+/// The safety property never depended on the attribute. Nothing in this struct
+/// is a capability: an unknown key cannot widen an audience, choose a task
+/// kind, set an expiry or name a profile, because none of those are read from
+/// here. What actually holds the line is unchanged and is worth stating,
+/// because a later reader will be tempted to put the attribute back:
+///
+/// * `rationale`, `suggestion` and `trigger_kind` have **no** `#[serde(default)]`,
+///   so a misspelt key is still a hard refusal — the typo case is covered by
+///   requiredness, not by strictness.
+/// * `confidence` defaults to `0.0`, below [`MIN_PROPOSAL_CONFIDENCE`], so an
+///   impulse that misspells it is refused rather than admitted at full trust.
+/// * [`impulse_action`] is the only route to a `TaskKind`, and it returns one
+///   variant.
+///
+/// So the attribute bought strictness against a field that could do nothing,
+/// and charged for it with every suggestion the pond would ever have made.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ReviewerImpulse {
     /// The bus event family this is about.
     pub trigger_kind: String,
@@ -1424,10 +1451,67 @@ mod tests {
         assert_eq!(out.proposals.len(), 1);
     }
 
+    /// A field the model may not name is IGNORED, and naming it changes
+    /// nothing — which is a stronger claim than refusing the whole impulse, and
+    /// the one that survives contact with a 2B model.
+    ///
+    /// This test used to assert the refusal, under `deny_unknown_fields`. On an
+    /// Orin that made the entire feature yield zero: the model wrote a `type`
+    /// key next to the ones it was asked for and every suggestion the pond
+    /// would have made was discarded, with the reason at DEBUG. Strictness
+    /// against a field that can do nothing is not a safety property, it is a
+    /// tax — so the test now pins what actually matters. `audience` is the
+    /// sharpest case available: it is the one thing a model naming it would
+    /// most want to control, and PAI-1's boundary depends on it.
     #[test]
-    fn an_impulse_that_names_a_field_it_may_not_name_is_discarded_whole() {
+    fn naming_the_audience_does_not_let_a_model_choose_one() {
         let body = r#"[{"trigger_kind":"camera","rationale":"why","suggestion":"ask",
-                        "confidence":0.9,"audience":"somebody-else"}]"#;
+                        "confidence":0.9,"audience":"somebody-else",
+                        "profile_id":"somebody-else","type":"reminder",
+                        "expires_at":"2099-01-01T00:00:00Z"}]"#;
+        let now = Utc::now();
+        let out = interpret_answer(&answer(body), &audience(), now, &FeedbackLedger::empty(), 0);
+
+        assert!(
+            out.refusals.is_empty(),
+            "an impulse was refused for naming fields that cannot reach a decision. \
+             That is the defect that made PAI-7 yield nothing on a real device: {:?}",
+            out.refusals
+        );
+        assert_eq!(out.proposals.len(), 1);
+        let p = &out.proposals[0];
+
+        // Every one of the four keys above was ignored, and the values below
+        // came from the caller.
+        assert_eq!(
+            p.audience().profile_id(),
+            EXEMPLAR_OWNER_ID,
+            "the model named an audience and got it. The audience must come from \
+             the caller -- this is PAI-1's boundary, and a proposal addressed by a \
+             subagent would route a household member's suggestion to somebody else."
+        );
+        assert_eq!(
+            p.expires_at(),
+            now + PROPOSAL_TTL,
+            "the model named an expiry and got it; the TTL is the caller's."
+        );
+        assert!(
+            matches!(p.proposed_action(), TaskKind::AgentPrompt { .. }),
+            "the model named a `type` and got something other than a prompt."
+        );
+    }
+
+    /// The typo case, which is what `deny_unknown_fields` was actually being
+    /// relied on for — and which requiredness covers on its own.
+    ///
+    /// Worth its own test because removing the attribute makes it tempting to
+    /// believe nothing is enforced any more. A misspelt `suggestion` is still a
+    /// hard refusal, because the field has no `#[serde(default)]`; if a later
+    /// change ever adds one "for robustness", this fails and says so.
+    #[test]
+    fn a_misspelt_required_field_is_still_refused_without_the_strict_attribute() {
+        let body = r#"[{"trigger_kind":"camera","rationale":"why",
+                        "suggestion_text":"ask","confidence":0.9}]"#;
         let out = interpret_answer(
             &answer(body),
             &audience(),
@@ -1435,7 +1519,11 @@ mod tests {
             &FeedbackLedger::empty(),
             0,
         );
-        assert!(out.proposals.is_empty());
+        assert!(
+            out.proposals.is_empty(),
+            "an impulse with no `suggestion` became a proposal. Requiredness is the \
+             only thing refusing typos now that the impulse tolerates extra keys."
+        );
         assert!(matches!(
             out.refusals.as_slice(),
             [ImpulseRefused::Unreadable { index: 0, .. }]

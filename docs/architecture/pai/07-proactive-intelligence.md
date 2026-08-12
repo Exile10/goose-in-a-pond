@@ -594,15 +594,32 @@ per interval and reports nothing at all. A run that yields no proposals from a n
 logs WARN, because refusing every impulse is a defect somewhere and never the intended steady state.
 A genuinely quiet day returns an empty array and lands in neither branch.
 
-*A decision, not taken here:* `ReviewerImpulse` is `deny_unknown_fields`, and the argument in its doc
-comment is that an unrecognised field "is either a typo or an attempt to name something the model may
-not name". The safety half of that does not depend on the attribute. The model cannot name an
-audience, an expiry or an id because **the struct has no such fields to read** — `interpret_answer`
-supplies all of them — so serde's default of ignoring unknown keys would leave that property exactly
-as it is. What `deny_unknown_fields` adds is rejecting a whole otherwise-valid suggestion over a
-stray label, which on a small local model is the difference between a working feature and a silent
-one. Dropping it costs precision in the refusal message for a mistyped known field, which
-`Proposal::from_parts` would refuse anyway.
+*The decision, now taken (2026-08-12):* `deny_unknown_fields` is **removed** from
+`ReviewerImpulse`. The argument in its doc comment had been that an unrecognised field "is either a
+typo or an attempt to name something the model may not name", and the second half is simply false
+here. The model cannot name an audience, an expiry, a profile or a task kind because **the struct has
+no such fields to read** — `build_proposal` takes the audience and `now` from the caller, and
+`impulse_action` returns one variant — so serde's default of ignoring unknown keys leaves every one of
+those properties exactly as it was. What the attribute added was rejecting a whole otherwise-valid
+suggestion over a stray label, which on a 2B local model was the difference between a working feature
+and a silent one, twice, on real hardware.
+
+The typo half is real and is covered by something else: `trigger_kind`, `rationale` and `suggestion`
+carry no `#[serde(default)]`, so a misspelt key is still a hard refusal. **Requiredness was doing that
+work all along, not strictness** — which is why removing the attribute costs nothing there.
+
+Both halves are now pinned by tests that fail in opposite directions, and the old test had to be
+replaced rather than deleted, because it asserted the wrong claim about a real concern:
+`naming_the_audience_does_not_let_a_model_choose_one` feeds an impulse naming `audience`,
+`profile_id`, `type` and `expires_at`, and asserts a proposal IS produced and that all four values
+came from the caller anyway; `a_misspelt_required_field_is_still_refused_without_the_strict_attribute`
+feeds `suggestion_text` and asserts the refusal. Mutation-tested: restoring the attribute fails the
+first with the device's own error text, and adding `#[serde(default)]` to `suggestion` fails the
+second.
+
+**Not yet re-verified on the device.** The cause is fixed and the fix is guarded; whether the pond now
+produces a proposal is a question only `scripts/pai-bench.sh --slow` on the Orin can answer, and until
+it does, PAI-7's row stays NOT VERIFIED.
 
 **What is still owed:** the offline-device delivery path. It could not be observed in this run for
 the honest reason that no proposal was produced to deliver. `ci.yml` runs `cargo check -p pond-server` and never `cargo test -p pond-server`, so
