@@ -81,10 +81,22 @@ say() { printf '\n=== %s ===\n' "$1"; }
 
 # ── The real models ──────────────────────────────────────────────────────────
 #
-# Symlinked rather than copied: a GGUF is gigabytes and this script may run
-# several times an hour. The scratch dir owns everything else, so a probe still
-# cannot write to a real pond -- but it gets real weights and therefore real
-# numbers, which is the entire difference between this and live-test.sh.
+# HARD-LINKED, one file, never symlinked to the tree.
+#
+# This script used to do `ln -s <real models dir> $DATA_DIR/models`, with a
+# comment claiming the scratch dir owned everything else so a probe "still
+# cannot write to a real pond". That claim was false and it destroyed a real
+# pond's model: the scratch server's models directory WAS the real one, so the
+# registry downloaded a GGUF into the scratch `hf_cache` and rewrote the REAL
+# `models/gguf` entry to point at it. Deleting the scratch dir then took a 3 GB
+# model with it, and the household's pond could not load its own chat model.
+#
+# A hard link cannot do that. It is a second directory entry for the same
+# inode: the probe's registry may rewrite or delete ITS entry and the real one
+# is untouched, because unlinking one name of a two-named inode frees nothing.
+# It costs no disk and no copy time. Only the chat model is linked -- the
+# mmproj/vision encoder is deliberately absent, which the engine warns about and
+# continues past.
 case "$(uname -s)" in
   Darwin) REAL_MODELS="$HOME/Library/Application Support/goose-in-a-pond/models" ;;
   *)      REAL_MODELS="$HOME/.local/share/goose-in-a-pond/models" ;;
@@ -202,9 +214,24 @@ fi
 
 # ── Start ────────────────────────────────────────────────────────────────────
 say "Starting a scratch pond with real weights"
-mkdir -p "$DATA_DIR"
-ln -s "$REAL_MODELS" "$DATA_DIR/models"
+mkdir -p "$DATA_DIR/models/gguf"
+
+# Resolve the model to a real path, following any symlink the real registry left.
+SRC="$(cd "$REAL_MODELS/gguf" 2>/dev/null && ls "$MODEL".gguf 2>/dev/null | head -1)"
+SRC="$REAL_MODELS/gguf/${SRC:-$MODEL.gguf}"
+SRC="$(readlink -f "$SRC" 2>/dev/null || python3 -c "import os,sys;print(os.path.realpath(sys.argv[1]))" "$SRC")"
+if [ ! -f "$SRC" ]; then
+  echo "FATAL: could not resolve $MODEL to a file under $REAL_MODELS/gguf" >&2
+  echo "       (looked for: $SRC)" >&2
+  exit 1
+fi
+if ! ln "$SRC" "$DATA_DIR/models/gguf/$MODEL.gguf" 2>/dev/null; then
+  # Different filesystem: copy rather than symlink. Slower, still isolated.
+  echo "  (hard link failed -- copying $MODEL; scratch is on another filesystem)"
+  cp "$SRC" "$DATA_DIR/models/gguf/$MODEL.gguf" || exit 1
+fi
 echo "model:     $MODEL   (chosen by: ${MODEL_SOURCE:-unknown})"
+echo "weights:   hard-linked from $SRC"
 echo "data dir:  $DATA_DIR"
 
 # giap::trace at info carries the per-turn metrics; the adapter at debug carries
