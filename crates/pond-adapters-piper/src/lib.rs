@@ -237,7 +237,11 @@ fn compute_audio_envelope(wav: &[u8], window_ms: u64) -> Vec<f32> {
                 sum_sq += s * s;
                 n += 1;
             }
-            if n > 0 { (sum_sq / n as f32).sqrt() } else { 0.0 }
+            if n > 0 {
+                (sum_sq / n as f32).sqrt()
+            } else {
+                0.0
+            }
         })
         .collect()
 }

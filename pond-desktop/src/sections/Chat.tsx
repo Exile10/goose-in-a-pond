@@ -115,8 +115,14 @@ function sessionMessagesToMessages(raw: SessionMessage[]): Message[] {
         historyToolNames,
         images,
         thinkingBlocks,
+        // The persisted id and the vote ride the SAME row as the reasoning.
+        // Pushing them as a second entry renders every assistant turn twice on
+        // reload, which is what a keep-both merge of these two changes does if
+        // nobody looks — `Chat.test.tsx`'s PAI-5 replay tests caught it as
+        // "found multiple elements with the text".
+        backendId: m.id,
+        liked: m.liked ?? null,
       });
-      out.push({ id: ++_msgId, role: "agent", text: m.content, historyToolNames, images, backendId: m.id, liked: m.liked ?? null });
     } else {
       out.push({ id: ++_msgId, role: "user", text: m.content, images, backendId: m.id });
     }

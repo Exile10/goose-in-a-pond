@@ -313,7 +313,11 @@ export function Devices() {
             isDisabled={matterBusy}
             onChange={(v) => void saveMatter(v, matterUrl)}
           >
-            <Switch.Control><Switch.Thumb /></Switch.Control>
+            {/* `Switch.Content` is what renders the labelled input, so without
+                it the `aria-label` above reaches nothing: the toggle has no
+                accessible name and a screen reader cannot identify or operate
+                it. Every other Switch in the app wraps its control this way. */}
+            <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content>
           </Switch>
         </div>
 
