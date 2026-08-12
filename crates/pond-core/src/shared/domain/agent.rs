@@ -1,6 +1,7 @@
 use crate::user_data::domain::profile::ProfileScope;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRequest {
@@ -268,6 +269,7 @@ impl fmt::Display for WorkflowState {
 /// {"event":"turn_complete","session_id":"<uuid>"}
 /// {"event":"error","message":"..."}
 /// {"event":"exit","reason":"stdin_eof"}       // stdin_eof | dismissed | error
+/// {"event":"audio_level","rms":0.42}          // wait/recording mic level, throttled
 /// ```
 ///
 /// `UserInput` and `AgentOutput` are legacy internal-only variants retained for
@@ -302,6 +304,9 @@ pub enum WorkflowEvent {
     Error { message: String },
     /// The loop is exiting cleanly. `reason` is `stdin_eof` | `dismissed` | `error`.
     Exit { reason: String },
+    /// Live mic input level during `wait`/`recording`, throttled by the emitter
+    /// (not every poll produces one — see the whisper adapter's audio-level sink).
+    AudioLevel { rms: f32 },
     /// Legacy internal-only: user input text. Carries no external contract shape;
     /// [`WorkflowEvent::to_ndjson`] returns `None` for it so the sink skips it.
     UserInput(String),
@@ -323,6 +328,55 @@ impl WorkflowEvent {
             Self::UserInput(_) | Self::AgentOutput(_) => None,
             other => serde_json::to_string(other).ok(),
         }
+    }
+}
+
+/// Minimum interval between emitted audio-level readings, regardless of how
+/// often the caller's polling loop runs.
+const AUDIO_LEVEL_MIN_INTERVAL_MS: u128 = 100;
+/// Minimum change in RMS required to re-emit within the interval window —
+/// cuts idle-silence chatter once the level has settled.
+const AUDIO_LEVEL_MIN_DELTA: f32 = 0.02;
+
+/// Throttles a raw per-poll RMS stream down to a UI-friendly cadence before
+/// handing it to an arbitrary sink (e.g. an NDJSON writer producing
+/// [`WorkflowEvent::AudioLevel`] lines). Lives in `pond-core` (not an
+/// adapter crate) so both the whisper adapter (mic input, wait/recording
+/// states) and the piper adapter (TTS output, speaking state) can share one
+/// throttle implementation without adapters depending on each other.
+pub struct ThrottledAudioLevelSink {
+    inner: Box<dyn Fn(f32) + Send + Sync>,
+    last_emit: Mutex<Option<std::time::Instant>>,
+    last_value: Mutex<f32>,
+}
+
+impl ThrottledAudioLevelSink {
+    pub fn new(inner: Box<dyn Fn(f32) + Send + Sync>) -> Self {
+        Self {
+            inner,
+            last_emit: Mutex::new(None),
+            last_value: Mutex::new(0.0),
+        }
+    }
+
+    /// Feed one poll's RMS reading. Emits through `inner` only if enough time
+    /// has passed since the last emission AND the value moved meaningfully —
+    /// otherwise it's a no-op.
+    pub fn maybe_emit(&self, rms: f32) {
+        let now = std::time::Instant::now();
+        let mut last_emit = self.last_emit.lock().unwrap();
+        let mut last_value = self.last_value.lock().unwrap();
+
+        let due = match *last_emit {
+            None => true,
+            Some(t) => now.duration_since(t).as_millis() >= AUDIO_LEVEL_MIN_INTERVAL_MS,
+        };
+        if !due || (rms - *last_value).abs() < AUDIO_LEVEL_MIN_DELTA {
+            return;
+        }
+        *last_emit = Some(now);
+        *last_value = rms;
+        (self.inner)(rms);
     }
 }
 
@@ -446,6 +500,15 @@ mod ndjson_golden_tests {
                 format!(r#"{{"event":"exit","reason":"{}"}}"#, reason)
             );
         }
+    }
+
+    #[test]
+    fn audio_level_line_matches_contract() {
+        let ev = WorkflowEvent::AudioLevel { rms: 0.42 };
+        assert_eq!(
+            ev.to_ndjson().unwrap(),
+            r#"{"event":"audio_level","rms":0.42}"#
+        );
     }
 
     #[test]

@@ -17,6 +17,7 @@
 //! - `start_thinking_tone_thread` — the soft working tone
 
 use anyhow::{Context, Result};
+use pond_core::shared::domain::agent::ThrottledAudioLevelSink;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -207,16 +208,56 @@ impl Drop for AudioKeeper {
 /// subprocess backend (`PiperOutput`) — the in-process backend's TTS playback
 /// uses `play_wav_on_handle` with a persistent `OutputStreamHandle` instead.
 
+/// Per-window RMS amplitude envelope from a `pcm_to_wav`-produced buffer
+/// (44-byte header + 16-bit LE mono PCM), one value per `window_ms`.
+///
+/// rodio's `Sink`/cpal callback offers no per-sample hook once `append()` is
+/// called, so live-synced amplitude isn't available *during* playback the
+/// way mic-input RMS is available during capture. Instead this precomputes
+/// the envelope from the exact PCM about to be played, and the caller
+/// replays one value per poll tick — since the poll loop already runs for
+/// the playback's full duration at a fixed cadence, elapsed ticks map
+/// directly onto elapsed playback position.
+fn compute_audio_envelope(wav: &[u8], window_ms: u64) -> Vec<f32> {
+    const HEADER_LEN: usize = 44;
+    if wav.len() <= HEADER_LEN {
+        return Vec::new();
+    }
+    let sample_rate = u32::from_le_bytes(wav[24..28].try_into().unwrap_or([0x56, 0x22, 0, 0]));
+    let pcm = &wav[HEADER_LEN..];
+    let samples_per_window = ((sample_rate as u64 * window_ms) / 1000).max(1) as usize;
+    let bytes_per_window = samples_per_window * 2;
+
+    pcm.chunks(bytes_per_window)
+        .map(|chunk| {
+            let mut sum_sq = 0f32;
+            let mut n = 0usize;
+            for pair in chunk.chunks_exact(2) {
+                let s = i16::from_le_bytes([pair[0], pair[1]]) as f32 / 32768.0;
+                sum_sq += s * s;
+                n += 1;
+            }
+            if n > 0 { (sum_sq / n as f32).sqrt() } else { 0.0 }
+        })
+        .collect()
+}
+
 /// Play WAV audio on an already-open `OutputStreamHandle` with interrupt support.
 ///
 /// Same semantics as `play_wav_interruptible` but reuses the caller's stream
 /// instead of opening a new `OutputStream`. Used by `PiperRsOutput` to avoid
 /// repeated CoreAudio AudioUnit churn across voice turns.
+///
+/// `audio_level_sink`, if given, is fed one amplitude reading per poll tick
+/// from `wav`'s own precomputed envelope (see `compute_audio_envelope`) —
+/// the `speaking` state's UI-facing analog of the mic-input RMS reported
+/// during `wait`/`recording`.
 pub(crate) fn play_wav_on_handle(
     wav: Vec<u8>,
     handle: &rodio::OutputStreamHandle,
     interrupted: &AtomicBool,
     utterance: &AtomicU64,
+    audio_level_sink: Option<&ThrottledAudioLevelSink>,
 ) -> Result<()> {
     use rodio::{Decoder, Sink};
     use std::io::Cursor;
@@ -224,11 +265,15 @@ pub(crate) fn play_wav_on_handle(
     // Which turn this audio belongs to, fixed at the moment playback starts.
     let mine = utterance.load(Ordering::SeqCst);
 
+    const POLL_MS: u64 = 50;
+    let envelope = audio_level_sink.map(|_| compute_audio_envelope(&wav, POLL_MS));
+
     let cursor = Cursor::new(wav);
     let decoder = Decoder::new(cursor).context("Failed to decode WAV for playback")?;
     let sink = Sink::try_new(handle).context("Failed to create audio sink")?;
     sink.append(decoder);
 
+    let mut tick: usize = 0;
     while !sink.empty() {
         if interrupted.load(Ordering::Relaxed) {
             sink.stop();
@@ -249,7 +294,13 @@ pub(crate) fn play_wav_on_handle(
             tracing::debug!("TTS playback dropped: it belongs to a superseded turn");
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        if let (Some(level_sink), Some(env)) = (audio_level_sink, &envelope) {
+            if let Some(&level) = env.get(tick) {
+                level_sink.maybe_emit(level);
+            }
+        }
+        tick += 1;
+        std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
     }
 
     Ok(())

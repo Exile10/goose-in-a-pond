@@ -152,6 +152,15 @@ pub fn classify_line(line: &str) -> Result<LineClass, String> {
             name: "voice-error",
             payload: serde_json::json!({ "message": string_field("message") }),
         },
+        // Distinct from the legacy, unrelated "audio-level" event (audio.rs /
+        // audio_cmd.rs) — this one belongs exclusively to the child-process
+        // voice-* event family (see useVoiceSession.ts's EVENT OWNERSHIP RULE).
+        "audio_level" => VoiceEvent {
+            name: "voice-audio-level",
+            payload: serde_json::json!({
+                "rms": value.get("rms").and_then(|v| v.as_f64()).unwrap_or(0.0)
+            }),
+        },
         // `exit` is not re-emitted directly; the reader loop emits
         // `voice-session-ended` once the child actually exits and is reaped.
         // We surface its `reason` here so the eventual ended event is labelled.
@@ -862,6 +871,13 @@ mod tests {
         assert_eq!(ev.payload, json!({ "message": "mic busy" }));
     }
 
+    #[test]
+    fn audio_level_line_maps_to_voice_audio_level() {
+        let ev = event(r#"{"event":"audio_level","rms":0.42}"#);
+        assert_eq!(ev.name, "voice-audio-level");
+        assert_eq!(ev.payload, json!({ "rms": 0.42 }));
+    }
+
     // ── exit / lifecycle lines classify as Exit, never a Tauri event ───────
 
     #[test]
@@ -1070,15 +1086,9 @@ mod tests {
     #[test]
     fn a_dead_pid_is_not_treated_as_a_voice_child() {
         // Pid 0 is never a live pond-server chat process, so identity validation
-        // must refuse it — a reused/dead pid is never a kill target.
-        //
-        // `None` (ps could not be run at all) is as good as `Some(false)` here:
-        // both mean "do not kill it". The distinction matters at the call site
-        // in `:701`, not to this assertion.
-        assert_ne!(
-            pid_is_voice_child(0),
-            Some(true),
-            "pid 0 must never be confirmed as a voice child"
-        );
+        // must refuse it — a reused/dead pid is never a kill target. `None`
+        // (indeterminate, e.g. `ps` unavailable) is acceptable; only a
+        // confirmed `Some(true)` match would be a bug.
+        assert_ne!(pid_is_voice_child(0), Some(true));
     }
 }

@@ -72,6 +72,8 @@ export interface VoiceSessionAPI {
   stopSession(): Promise<void>;
   /** Clear transcript and context cards. */
   clearConversation(): void;
+  /** Live mic RMS level (0-1) during wait/recording; 0 otherwise. */
+  audioLevel: number;
 }
 
 // ── Hook ─────────────────────────────────────────────────────────────────────
@@ -81,6 +83,7 @@ export function useVoiceSession(): VoiceSessionAPI {
 
   const [sessionActive, setSessionActive] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [audioLevel, setAudioLevel] = useState(0);
 
   // Track the session id for stale-event filtering (finding 14-consumer).
   // Updated on startSession invoke return and on voice-ready; cleared on ended.
@@ -90,30 +93,19 @@ export function useVoiceSession(): VoiceSessionAPI {
   // Populated as each promise resolves; see cancelled-flag pattern below.
   const unlistenersRef = useRef<Array<() => void>>([]);
 
-  // A single timeout handle for the error flash so overlapping flashes do not
-  // fight each other (finding 30+39).
-  const errorFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
   // Token accumulation buffer for rAF batching (finding 41).
   const pendingTokensRef = useRef<string>("");
   const rafHandleRef = useRef<number | null>(null);
 
-  // ── flashError helper (finding 30+39) ────────────────────────────────────
-  // Clears any in-flight timer, dispatches the error state, then arms a
-  // single 4s auto-clear. All three flash sites use this.
+  // ── flashError helper ────────────────────────────────────────────────────
+  // Surfaces an error message and stays until the user dismisses it or
+  // retries (VoiceMode.tsx's action bar) — no auto-clear timer. All three
+  // error sites (voice-error, abnormal voice-session-ended, failed start)
+  // use this.
 
   const flashError = useCallback((msg: string) => {
-    if (errorFlashTimerRef.current !== null) {
-      clearTimeout(errorFlashTimerRef.current);
-      errorFlashTimerRef.current = null;
-    }
     dispatch({ type: "SET_VOICE_ERROR", payload: msg });
     dispatch({ type: "SET_VOICE_STATE", payload: "error" });
-    errorFlashTimerRef.current = setTimeout(() => {
-      errorFlashTimerRef.current = null;
-      dispatch({ type: "SET_VOICE_STATE", payload: "idle" });
-      dispatch({ type: "SET_VOICE_ERROR", payload: null });
-    }, 4000);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── flushPendingTokens (finding 41) ──────────────────────────────────────
@@ -260,8 +252,8 @@ export function useVoiceSession(): VoiceSessionAPI {
       }),
     );
 
-    // voice-error: non-fatal child error; surface to user and auto-clear.
-    // Uses flashError helper to avoid stale-timeout races (finding 30+39).
+    // voice-error: non-fatal child error; surface via flashError (persists
+    // until the user dismisses or retries).
     register(
       listen<{ message?: string } | string>("voice-error", (e) => {
         const msg =
@@ -269,6 +261,14 @@ export function useVoiceSession(): VoiceSessionAPI {
             ? e.payload
             : e.payload?.message ?? "Voice session error";
         flashError(msg);
+      }),
+    );
+
+    // voice-audio-level: live mic RMS during wait/recording, throttled
+    // Rust-side. Drives the orb's audio-reactive pulse.
+    register(
+      listen<{ rms: number }>("voice-audio-level", (e) => {
+        setAudioLevel(e.payload.rms);
       }),
     );
 
@@ -291,6 +291,7 @@ export function useVoiceSession(): VoiceSessionAPI {
         }
         setSessionActive(false);
         setConnecting(false);
+        setAudioLevel(0);
         activeSessionIdRef.current = null;
 
         // Best-effort stop so the shell restores the wake listener when the
@@ -301,7 +302,7 @@ export function useVoiceSession(): VoiceSessionAPI {
         const code = e.payload?.code ?? null;
         const reason = e.payload?.reason ?? "unknown";
         if (!isCleanExit(code, reason)) {
-          // Abnormal exit — surface error and auto-clear (finding 30+39).
+          // Abnormal exit — surface error; stays until dismissed/retried.
           const msg = `Voice session exited (code ${code ?? "none"}, reason: ${reason})`;
           flashError(msg);
         } else {
@@ -328,11 +329,7 @@ export function useVoiceSession(): VoiceSessionAPI {
           pendingTokensRef.current = "";
         }
       }
-      // Clear any in-flight error flash timer (finding 30+39).
-      if (errorFlashTimerRef.current !== null) {
-        clearTimeout(errorFlashTimerRef.current);
-        errorFlashTimerRef.current = null;
-      }
+      setAudioLevel(0);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -388,5 +385,5 @@ export function useVoiceSession(): VoiceSessionAPI {
     dispatch({ type: "CLEAR_CONTEXT_CARDS" });
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  return { sessionActive, connecting, startSession, stopSession, clearConversation };
+  return { sessionActive, connecting, startSession, stopSession, clearConversation, audioLevel };
 }
