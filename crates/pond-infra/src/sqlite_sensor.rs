@@ -6,7 +6,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use pond_core::user_data::domain::sensor::{CameraEvent, SensorReading};
+use pond_core::user_data::domain::sensor::{CameraEvent, SensorAggregate, SensorReading};
 use pond_core::user_data::ports::camera_storage::CameraStorage;
 use pond_core::user_data::ports::sensor_storage::SensorStorage;
 use sqlx::{Pool, Sqlite};
@@ -32,6 +32,12 @@ struct SensorRow {
     value: f64,
     unit: String,
     created_at: String,
+}
+
+/// Render a range bound the way `created_at` is stored, so SQLite's text
+/// comparison orders it correctly — the column is TEXT, not a date type.
+fn format_bound(dt: DateTime<Utc>) -> String {
+    dt.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
@@ -105,8 +111,8 @@ impl SensorStorage for SqliteSensorStorage {
         since: Option<DateTime<Utc>>,
         until: Option<DateTime<Utc>>,
     ) -> Result<Vec<SensorReading>> {
-        let since_str = since.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
-        let until_str = until.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
+        let since_str = since.map(format_bound);
+        let until_str = until.map(format_bound);
         let rows: Vec<SensorRow> = sqlx::query_as(
             "SELECT device_id, sensor_type, value, unit, created_at \
              FROM sensor_readings \
@@ -124,6 +130,86 @@ impl SensorStorage for SqliteSensorStorage {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(sensor_row_to_reading).collect())
+    }
+
+    async fn get_history_limited(
+        &self,
+        device_id: &str,
+        sensor_type: &str,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<SensorReading>> {
+        let since_str = since.map(format_bound);
+        let until_str = until.map(format_bound);
+        let rows: Vec<SensorRow> = sqlx::query_as(
+            "SELECT device_id, sensor_type, value, unit, created_at \
+             FROM sensor_readings \
+             WHERE device_id = ? AND sensor_type = ? \
+               AND (? IS NULL OR created_at >= ?) \
+               AND (? IS NULL OR created_at < ?) \
+             ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        )
+        .bind(device_id)
+        .bind(sensor_type)
+        .bind(&since_str)
+        .bind(&since_str)
+        .bind(&until_str)
+        .bind(&until_str)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(sensor_row_to_reading).collect())
+    }
+
+    async fn aggregate(
+        &self,
+        device_id: &str,
+        sensor_type: &str,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<SensorAggregate> {
+        #[derive(sqlx::FromRow)]
+        struct AggregateRow {
+            count: i64,
+            min_value: Option<f64>,
+            max_value: Option<f64>,
+            avg_value: Option<f64>,
+            unit: Option<String>,
+        }
+        let since_str = since.map(format_bound);
+        let until_str = until.map(format_bound);
+        // MAX(unit) is a deterministic pick, not a comparison that means
+        // anything: the unit is invariant for a (device_id, sensor_type) pair,
+        // so any row in the window answers it without a second query. Over an
+        // empty window every aggregate is NULL, which is exactly the "no
+        // reading here" answer the caller needs.
+        let row: AggregateRow = sqlx::query_as(
+            "SELECT COUNT(value) AS count, \
+                    MIN(value)   AS min_value, \
+                    MAX(value)   AS max_value, \
+                    AVG(value)   AS avg_value, \
+                    MAX(unit)    AS unit \
+             FROM sensor_readings \
+             WHERE device_id = ? AND sensor_type = ? \
+               AND (? IS NULL OR created_at >= ?) \
+               AND (? IS NULL OR created_at < ?)",
+        )
+        .bind(device_id)
+        .bind(sensor_type)
+        .bind(&since_str)
+        .bind(&since_str)
+        .bind(&until_str)
+        .bind(&until_str)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(SensorAggregate {
+            count: row.count.max(0) as u64,
+            min: row.min_value,
+            max: row.max_value,
+            avg: row.avg_value,
+            unit: row.unit,
+        })
     }
 
     async fn list_sensors(&self) -> Result<Vec<(String, String)>> {
@@ -248,6 +334,28 @@ mod tests {
         }
     }
 
+    /// Seed a reading at a chosen time. `record` always stamps `datetime('now')`,
+    /// so the time-range behaviour cannot be exercised through the port.
+    async fn insert_at(pool: &Pool<Sqlite>, device_id: &str, t: &str, v: f64, created_at: &str) {
+        sqlx::query(
+            "INSERT INTO sensor_readings (device_id, sensor_type, value, unit, created_at) \
+             VALUES (?, ?, ?, 'C', ?)",
+        )
+        .bind(device_id)
+        .bind(t)
+        .bind(v)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+            .unwrap()
+            .and_utc()
+    }
+
     fn cam_event(camera_id: &str) -> CameraEvent {
         CameraEvent {
             id: None,
@@ -290,6 +398,130 @@ mod tests {
         }
         let recent = storage.get_recent("dev1", 3).await.unwrap();
         assert_eq!(recent.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn sensor_get_history_honours_since_and_until() {
+        let (pool, _tmp) = make_logs_pool().await;
+        for (v, ts) in [
+            (1.0, "2026-01-01 10:00:00"),
+            (2.0, "2026-01-01 11:00:00"),
+            (3.0, "2026-01-01 12:00:00"),
+        ] {
+            insert_at(&pool, "room1", "temperature", v, ts).await;
+        }
+        let storage = SqliteSensorStorage::new(pool);
+
+        // `since` is inclusive and `until` exclusive, so this window is the
+        // 11:00 reading alone.
+        let rows = storage
+            .get_history(
+                "room1",
+                "temperature",
+                Some(at("2026-01-01 11:00:00")),
+                Some(at("2026-01-01 12:00:00")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value, 2.0);
+    }
+
+    #[tokio::test]
+    async fn sensor_get_history_limited_caps_rows_newest_first() {
+        let (pool, _tmp) = make_logs_pool().await;
+        for (v, ts) in [
+            (1.0, "2026-01-01 10:00:00"),
+            (2.0, "2026-01-01 11:00:00"),
+            (3.0, "2026-01-01 12:00:00"),
+            (4.0, "2026-01-01 13:00:00"),
+            (5.0, "2026-01-01 14:00:00"),
+        ] {
+            insert_at(&pool, "room1", "temperature", v, ts).await;
+        }
+        let storage = SqliteSensorStorage::new(pool);
+
+        let rows = storage
+            .get_history_limited("room1", "temperature", None, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].value, 5.0);
+        assert_eq!(rows[1].value, 4.0);
+    }
+
+    #[tokio::test]
+    async fn sensor_aggregate_matches_seeded_values() {
+        let (pool, _tmp) = make_logs_pool().await;
+        for (v, ts) in [
+            (10.0, "2026-01-01 10:00:00"),
+            (20.0, "2026-01-01 11:00:00"),
+            (30.0, "2026-01-01 12:00:00"),
+        ] {
+            insert_at(&pool, "room1", "temperature", v, ts).await;
+        }
+        let storage = SqliteSensorStorage::new(pool);
+
+        let agg = storage
+            .aggregate("room1", "temperature", None, None)
+            .await
+            .unwrap();
+        assert_eq!(agg.count, 3);
+        assert_eq!(agg.min, Some(10.0));
+        assert_eq!(agg.max, Some(30.0));
+        assert_eq!(agg.avg, Some(20.0));
+        assert_eq!(agg.unit.as_deref(), Some("C"));
+    }
+
+    #[tokio::test]
+    async fn sensor_aggregate_over_empty_window_is_none() {
+        let (pool, _tmp) = make_logs_pool().await;
+        insert_at(&pool, "room1", "temperature", 10.0, "2026-01-01 10:00:00").await;
+        let storage = SqliteSensorStorage::new(pool);
+
+        // A window with no rows must report absence, not an extremum. The
+        // in-memory fold this replaced returned an infinity here.
+        let agg = storage
+            .aggregate(
+                "room1",
+                "temperature",
+                Some(at("2026-02-01 00:00:00")),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(agg.count, 0);
+        assert_eq!(agg.min, None);
+        assert_eq!(agg.max, None);
+        assert_eq!(agg.avg, None);
+        assert_eq!(agg.unit, None);
+    }
+
+    #[tokio::test]
+    async fn sensor_aggregate_respects_time_bounds() {
+        let (pool, _tmp) = make_logs_pool().await;
+        for (v, ts) in [
+            (5.0, "2026-01-01 10:00:00"),
+            (15.0, "2026-01-02 10:00:00"),
+            (25.0, "2026-01-02 12:00:00"),
+        ] {
+            insert_at(&pool, "room1", "temperature", v, ts).await;
+        }
+        let storage = SqliteSensorStorage::new(pool);
+
+        let agg = storage
+            .aggregate(
+                "room1",
+                "temperature",
+                Some(at("2026-01-02 00:00:00")),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(agg.count, 2);
+        assert_eq!(agg.min, Some(15.0));
+        assert_eq!(agg.max, Some(25.0));
+        assert_eq!(agg.avg, Some(20.0));
     }
 
     #[tokio::test]
