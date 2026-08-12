@@ -1605,6 +1605,8 @@ impl ChatService {
                 decode_tok_per_sec: stats.decode_tok_per_sec,
                 prefill_tok_per_sec: stats.prefill_tok_per_sec,
                 context_limit_tokens: stats.context_limit_tokens,
+                reasoning_tokens: stats.reasoning_tokens,
+                reengagements: Some(stats.reengagements),
                 inference_count: Some(stats.inference_count),
             };
             if let Err(e) = telemetry.record_turn(metrics).await {

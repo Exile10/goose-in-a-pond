@@ -4241,6 +4241,18 @@ impl GooseAdapter {
                         ),
                     });
                 }
+            // What the empty-turn recovery actually cost, recorded rather than
+            // logged. `attempt` is incremented once per re-engagement and never
+            // on the exhaustion path, so it is already "attempts beyond the
+            // first": 0 for an ordinary turn, and on the exhausted path the
+            // number of steered retries that also came back silent.
+            //
+            // This is the hidden half of what thinking costs. A re-engaged turn
+            // is not a slow turn, it is the whole turn again — prefill, tools
+            // and all — and until this line the only trace was a WARN nobody
+            // roots their log at.
+            turn_stats.reengagements = attempt as u32;
+
             // Per-turn usage from the provider's per-inference Usage events.
             // Fall back to the chars/4 heuristic only when the provider emitted
             // no Usage events at all (some HTTP providers).
@@ -6007,6 +6019,78 @@ mod tests {
              A literal `None` in either one drops the number on the providers that take \
              that path, and every unit test here still passes because they all call the \
              pure counter."
+        );
+    }
+
+    /// The re-engagement count is only true if every exit from `'attempts`
+    /// passes through it.
+    ///
+    /// Structural, and it has to be: the counter lives inside a several-hundred
+    /// line `async_stream` that needs a real goose `Agent`, a provider and a
+    /// model to drive. What can be checked without one is the property that
+    /// actually breaks — placement. `'attempts` has three exits (answered,
+    /// budget spent, and the ordinary fallthrough), so an assignment written
+    /// one line too early is skipped by two of them and reports 0 for exactly
+    /// the turns worth counting: the ones that went silent.
+    ///
+    /// This is the same shape as the reasoning-count guard above it. That count
+    /// was produced correctly, reached `Done`, and was dropped on the way out;
+    /// a reviewer replaced both carry-out arms with `None` and all 108 tests
+    /// passed. A number nobody guards the wiring of is a number that quietly
+    /// becomes zero.
+    #[test]
+    fn the_re_engagement_count_is_taken_after_every_exit_from_the_attempts_loop() {
+        let lines = stream_body_code();
+
+        let assign = lines
+            .iter()
+            .position(|l| l.contains("turn_stats.reengagements ="))
+            .expect(
+                "nothing assigns `turn_stats.reengagements`. The empty-turn recovery is \
+                 unmeasured again: a re-engaged turn is the whole turn a second time, \
+                 prefill included, and without this the only trace is a WARN.",
+            );
+
+        // Assigned FROM the counter, not from a literal. `= 0` compiles, keeps
+        // this guard's first assertion green, and reports every turn as
+        // ordinary.
+        assert!(
+            lines[assign].contains("attempt"),
+            "`turn_stats.reengagements` is assigned from something other than the \
+             attempt counter (`{}`), so the field no longer says what the turn cost.",
+            lines[assign].trim()
+        );
+
+        let breaks: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("break 'attempts"))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            breaks.len() >= 2,
+            "expected the several exits from `'attempts` this guard is about; found {}. \
+             The loop has been reshaped and this test is now checking nothing.",
+            breaks.len()
+        );
+        let last_break = *breaks.last().unwrap();
+        assert!(
+            assign > last_break,
+            "`turn_stats.reengagements` is assigned at line {assign}, above the exit at \
+             line {last_break}. Every `break 'attempts` after the assignment skips it, and \
+             the turns that skip it are the silent ones -- so the count would read 0 for \
+             precisely the turns it exists to measure.",
+        );
+
+        // And before the stats are sealed, or the value never leaves.
+        let finalize = lines
+            .iter()
+            .position(|l| l.contains("turn_stats.finalize_rates()"))
+            .expect("the stream no longer finalizes its TurnStats");
+        assert!(
+            assign < finalize,
+            "the re-engagement count is assigned after `finalize_rates`, i.e. after the \
+             turn's stats have been sealed and sent.",
         );
     }
 

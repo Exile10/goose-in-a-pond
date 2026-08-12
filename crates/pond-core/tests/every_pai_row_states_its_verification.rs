@@ -116,7 +116,9 @@ fn a_verified_row_names_the_hardware_and_the_date() {
     let vague: Vec<&str> = requirement_rows()
         .into_iter()
         .filter(|(_, line)| line.contains("VERIFIED"))
-        .filter(|(_, line)| !(line.contains("Orin") || line.contains("Jetson") || line.contains("Mac")))
+        .filter(|(_, line)| {
+            !(line.contains("Orin") || line.contains("Jetson") || line.contains("Mac"))
+        })
         .map(|(doc, _)| doc)
         .collect();
 

@@ -820,6 +820,64 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   body inline with no inner). Unifying means restructuring the busiest file in the programme, and it
   is worth doing before PAI-6 P6 lands, because P6 must otherwise write its new variant's arm twice
   into two blocks that have already drifted.
+- **P8 — LANDED 2026-08-12.** What thinking costs when it goes wrong, counted rather than logged.
+
+  P2 counted the reasoning tokens and P5 sized the reserve from them, and both were measuring the
+  cheaper half. A turn that thinks, produces no visible text, and ends is re-engaged by
+  `EMPTY_TURN_STEER` and run **again** — the whole turn, prefill and tool schemas included. On the
+  Orin that is seconds, and gemma-4-E2B does it reliably for certain phrasings, which is why the
+  fork carries a patch making goose treat a thinking-only turn as empty. Nothing counted it. The
+  only trace was a `WARN` in a log nobody roots at `warn`, so the honest answer to "how often does
+  the pond go silent, and what does it cost" was *nobody knows* — and the number could easily exceed
+  the reasoning tokens themselves.
+
+  `TurnStats::reengagements` is assigned from the `'attempts` loop's own counter, `TurnMetrics`
+  carries it and `reasoning_tokens` into `turn_metrics` (migration 0008 on the LOGS database, both
+  columns nullable with no `DEFAULT`), and the `turn_stats` SSE frame reports it. `pai-bench`'s
+  PAI-5 probe prints it, so the question is now answerable on the device in one run.
+
+  **Four things a later phase must not assume.**
+
+  1. **`reengagements` is not derivable from `inference_count`.** A turn that ran twice because it
+     called a tool and a turn that ran twice because it went silent are the same number there.
+     Guarded: the SSE test pins `inference_count == 1` while `reengagements == 2`.
+  2. **On `TurnStats` it is a `u32`, on `TurnMetrics` an `Option<u32>`, and that asymmetry is the
+     design.** Every turn reaching the handler was observed, so 0 is a fact; but a row written
+     before this migration, or by a provider that reports no stats, was never measured, and NULL is
+     the only honest value. The None-vs-zero distinction lives at the persistence boundary, exactly
+     as it does for `reasoning_tokens` under migration 0039.
+  3. **`#[serde(default)]` on the `TurnStats` field is load-bearing, not tidiness.** This struct
+     rides `AgentStreamEvent::Done`, which crosses a PROCESS boundary: `pond-server chat
+     --json-events` emits it as NDJSON and the desktop's voice child consumes it. Adding the field
+     as required broke two existing tests immediately — a version-skewed pair would have seen a
+     silently dead event stream, not a compile error. Defaulting to 0 fabricates nothing, because
+     nothing deserialized ever reaches `turn_metrics`; that row is built from the in-process
+     `TurnStats` the adapter constructed.
+  4. **Placement inside the stream is the property worth guarding, not presence.** `'attempts` has
+     three exits, so an assignment one line too early is skipped by two of them — and the turns that
+     skip it are precisely the silent ones, so the field would read 0 for exactly what it exists to
+     measure.
+
+  Guards: `sqlite_telemetry.rs ::
+  reasoning_cost_and_re_engagements_survive_sqlite`; `goose_agent.rs ::
+  the_re_engagement_count_is_taken_after_every_exit_from_the_attempts_loop`;
+  `reasoning_reaches_the_edge.rs :: both_stream_routes_report_what_the_empty_turn_recovery_cost` and
+  `an_ordinary_turn_reports_zero_re_engagements_rather_than_nothing`; `turn_stats.rs ::
+  a_payload_without_the_re_engagement_count_still_parses`.
+
+  **The first version of the persistence guard was vacuous, and the way it was caught is the part
+  worth reading.** `SqliteTelemetry` serves reads from an in-memory cache hydrated once at
+  construction, so a test that records and then reads through the same instance round-trips through
+  a `Vec` and touches neither the INSERT's column list nor `row_to_turn_metrics`. It passed with the
+  reader mutated to collapse NULL into a measured zero — the exact defect it was written to name.
+  Reopening the database is what forces `load_all`. Mutation-tested in both directions afterwards:
+  dropping the two columns from the INSERT fails with "a measured zero must not come back as NULL",
+  and the NULL-to-zero reader fails with "an unmeasured turn must not come back as a measured zero".
+
+  **Not done here, on purpose.** No UI surface renders the count — the desktop has no `TurnStats`
+  type carrying it, and adding one is a display change with its own review. And the *response* to a
+  high re-engagement rate (a thinking-mode classifier, a cheaper steer, a different model floor) is
+  a decision that needs this data first. Measuring came before deciding, deliberately.
 
 ---
 

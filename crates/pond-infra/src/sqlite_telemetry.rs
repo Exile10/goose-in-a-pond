@@ -36,7 +36,7 @@ impl SqliteTelemetry {
              total_latency_ms, tool_name, tool_latency_ms, tool_cache_hit, \
              context_utilization_pct, model_name, timestamp, \
              prefill_ms, model_load_ms, decode_tok_per_sec, prefill_tok_per_sec, \
-             context_limit_tokens, inference_count \
+             context_limit_tokens, inference_count, reasoning_tokens, reengagements \
              FROM turn_metrics ORDER BY id ASC",
         )
         .fetch_all(pool)
@@ -76,6 +76,14 @@ fn row_to_turn_metrics(row: &sqlx::sqlite::SqliteRow) -> TurnMetrics {
         inference_count: row
             .get::<Option<i64>, _>("inference_count")
             .map(|v| v as u32),
+        // Nullable, and NULL must stay None rather than becoming Some(0).
+        // Migration 0008 says why: a zero from an unmeasured turn is evidence
+        // that does not exist, and it averages into every conclusion drawn from
+        // this table.
+        reasoning_tokens: row
+            .get::<Option<i64>, _>("reasoning_tokens")
+            .map(|v| v as u32),
+        reengagements: row.get::<Option<i64>, _>("reengagements").map(|v| v as u32),
     }
 }
 
@@ -88,8 +96,8 @@ impl TelemetryPort for SqliteTelemetry {
               total_latency_ms, tool_name, tool_latency_ms, tool_cache_hit, \
               context_utilization_pct, model_name, timestamp, \
               prefill_ms, model_load_ms, decode_tok_per_sec, prefill_tok_per_sec, \
-              context_limit_tokens, inference_count) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              context_limit_tokens, inference_count, reasoning_tokens, reengagements) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&metrics.session_id)
         .bind(metrics.turn_number as i64)
@@ -109,6 +117,8 @@ impl TelemetryPort for SqliteTelemetry {
         .bind(metrics.prefill_tok_per_sec.map(|v| v as f64))
         .bind(metrics.context_limit_tokens.map(|v| v as i64))
         .bind(metrics.inference_count.map(|v| v as i64))
+        .bind(metrics.reasoning_tokens.map(|v| v as i64))
+        .bind(metrics.reengagements.map(|v| v as i64))
         .execute(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
@@ -187,6 +197,12 @@ mod tests {
             prefill_tok_per_sec: Some(600.0),
             context_limit_tokens: Some(3072),
             inference_count: Some(1),
+            // The unmeasured case on purpose: this is what a turn from a
+            // provider with no `ProviderStats` looks like, and what every row
+            // written before migration 0008 looks like. The tests that care
+            // about the measured case set them explicitly.
+            reasoning_tokens: None,
+            reengagements: None,
         }
     }
 
@@ -219,6 +235,73 @@ mod tests {
         assert_eq!(turns[0].tool_name.as_deref(), Some("weather"));
         assert_eq!(turns[0].tool_latency_ms, Some(350));
         assert_eq!(turns[0].tool_cache_hit, Some(false));
+    }
+
+    /// What thinking cost, and what it cost when it went wrong, must survive
+    /// the trip through SQLite — including the case that carries the most
+    /// information and is easiest to lose.
+    ///
+    /// **It reopens the database, and that is the whole test.** Reads are
+    /// served from the in-memory cache (see the module doc), so a version of
+    /// this that wrote and then read through the same `SqliteTelemetry`
+    /// round-trips through a `Vec` and touches neither the INSERT's column
+    /// list nor `row_to_turn_metrics`. That version was written first, and it
+    /// passed with the reader mutated to collapse NULL into a measured zero —
+    /// which is precisely the defect it was supposed to name. The reopen is
+    /// what forces `load_all`.
+    ///
+    /// The values are chosen so that no field can stand in for another: 0
+    /// reasoning tokens with 2 re-engagements is a turn that thought nothing
+    /// and *still* went silent twice, which is a real gemma-4-E2B shape and is
+    /// distinguishable from every other combination below.
+    #[tokio::test]
+    async fn reasoning_cost_and_re_engagements_survive_sqlite() {
+        let tmp = tempdir().unwrap();
+
+        {
+            let db = Database::init(tmp.path()).await.unwrap();
+            let telemetry = SqliteTelemetry::new(db.logs).await.unwrap();
+
+            let mut measured = make_turn("sess-1", 1);
+            measured.reasoning_tokens = Some(0);
+            measured.reengagements = Some(2);
+            telemetry.record_turn(measured).await.unwrap();
+
+            let mut thought = make_turn("sess-1", 2);
+            thought.reasoning_tokens = Some(156);
+            thought.reengagements = Some(0);
+            telemetry.record_turn(thought).await.unwrap();
+
+            // Unmeasured — `make_turn`'s default, i.e. every historical row.
+            telemetry.record_turn(make_turn("sess-1", 3)).await.unwrap();
+        }
+
+        // Reopen: the cache is empty and every value below came back out of the
+        // table through `row_to_turn_metrics`.
+        let db = Database::init(tmp.path()).await.unwrap();
+        let telemetry = SqliteTelemetry::new(db.logs).await.unwrap();
+        let turns = telemetry.get_turns("sess-1").await.unwrap();
+        assert_eq!(turns.len(), 3, "rows did not survive the reopen at all");
+
+        // The distinction the whole design rests on. If the reader ever maps
+        // NULL to 0, this is the assertion that catches it -- and it is the
+        // reason `reasoning_tokens` is Option and not u32: a zero from an
+        // unmeasured turn averages into every conclusion drawn from this table
+        // as though somebody had measured it.
+        assert_eq!(
+            turns[0].reasoning_tokens,
+            Some(0),
+            "a measured zero must not come back as NULL"
+        );
+        assert_eq!(
+            turns[2].reasoning_tokens, None,
+            "an unmeasured turn must not come back as a measured zero"
+        );
+
+        assert_eq!(turns[0].reengagements, Some(2));
+        assert_eq!(turns[1].reasoning_tokens, Some(156));
+        assert_eq!(turns[1].reengagements, Some(0));
+        assert_eq!(turns[2].reengagements, None);
     }
 
     #[tokio::test]

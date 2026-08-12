@@ -105,6 +105,8 @@ mod tests {
             prefill_tok_per_sec: None,
             context_limit_tokens: None,
             inference_count: None,
+            reasoning_tokens: None,
+            reengagements: None,
         }
     }
 
