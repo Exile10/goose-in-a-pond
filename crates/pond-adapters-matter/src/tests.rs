@@ -355,6 +355,59 @@ async fn turning_a_fan_off_writes_fan_mode_off() {
     assert_eq!(frames[0]["args"]["value"], 0, "FanMode Off");
 }
 
+/// An air purifier is asked for a mode, not a percentage: "auto" and "smart"
+/// hand the choice back to the device and have no position on the speed slider.
+#[tokio::test]
+async fn setting_a_fan_mode_writes_the_mode_the_user_named() {
+    let (client, cache, _registry, _bus, received) =
+        start_adapter(json!([fan_node_json()]), vec![]).await;
+    let control = MatterDeviceControl::new(client, cache);
+
+    let outcome = control.set_fan_mode("matter-18", "auto").await.unwrap();
+    assert_eq!(outcome.applied.fan_mode.as_deref(), Some("auto"));
+    assert_eq!(outcome.applied.on, Some(true), "auto is not off");
+
+    let frames = received.lock().unwrap().clone();
+    assert_eq!(frames[0]["command"], "write_attribute");
+    assert_eq!(frames[0]["args"]["attribute_path"], "1/514/0");
+    assert_eq!(frames[0]["args"]["value"], 5, "FanMode Auto");
+}
+
+/// Off is the one mode that says something definite about power.
+#[tokio::test]
+async fn the_off_mode_reports_the_device_as_off() {
+    let (client, cache, _registry, _bus, received) =
+        start_adapter(json!([fan_node_json()]), vec![]).await;
+    let control = MatterDeviceControl::new(client, cache);
+
+    let outcome = control.set_fan_mode("matter-18", "Off").await.unwrap();
+    assert_eq!(outcome.applied.on, Some(false));
+    assert_eq!(received.lock().unwrap()[0]["args"]["value"], 0);
+}
+
+/// A mode the device does not have is refused before anything is sent, rather
+/// than written as some nearby number.
+#[tokio::test]
+async fn an_invented_fan_mode_reaches_nothing() {
+    let (client, cache, _registry, _bus, received) =
+        start_adapter(json!([fan_node_json()]), vec![]).await;
+    let control = MatterDeviceControl::new(client, cache);
+
+    let error = control
+        .set_fan_mode("matter-18", "turbo")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("off, low, medium"),
+        "it lists the modes: {error}"
+    );
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "nothing reached the fabric"
+    );
+}
+
 /// A light must keep using On/Off: the fan branch is a fallback for nodes that
 /// lack that cluster, never a replacement for the command that already works.
 #[tokio::test]

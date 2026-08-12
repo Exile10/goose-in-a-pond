@@ -15,11 +15,11 @@ use tokio::sync::RwLock;
 
 use crate::client::MatterClient;
 use crate::protocol::{
-    brightness_to_level, celsius_to_setpoint, endpoints_with_cluster, hue_to_matter,
-    node_id_from_device_id, position_open_to_lift_100ths, saturation_to_matter, MatterNode,
-    ATTR_FAN_MODE, ATTR_FAN_PERCENT_SETTING, ATTR_OCCUPIED_HEATING_SETPOINT, CLUSTER_COLOR_CONTROL,
-    CLUSTER_DOOR_LOCK, CLUSTER_FAN_CONTROL, CLUSTER_LEVEL_CONTROL, CLUSTER_ON_OFF,
-    CLUSTER_THERMOSTAT, CLUSTER_WINDOW_COVERING, FAN_MODE_OFF, FAN_MODE_ON,
+    brightness_to_level, celsius_to_setpoint, endpoints_with_cluster, fan_mode_from_name,
+    hue_to_matter, node_id_from_device_id, position_open_to_lift_100ths, saturation_to_matter,
+    MatterNode, ATTR_FAN_MODE, ATTR_FAN_PERCENT_SETTING, ATTR_OCCUPIED_HEATING_SETPOINT,
+    CLUSTER_COLOR_CONTROL, CLUSTER_DOOR_LOCK, CLUSTER_FAN_CONTROL, CLUSTER_LEVEL_CONTROL,
+    CLUSTER_ON_OFF, CLUSTER_THERMOSTAT, CLUSTER_WINDOW_COVERING, FAN_MODE_OFF, FAN_MODE_ON,
 };
 
 /// Shared node cache: the bridge keeps it current from server events; the
@@ -274,6 +274,35 @@ impl DeviceControlPort for MatterDeviceControl {
             DeviceStatePatch {
                 fan_speed: Some(pct),
                 on: Some(pct > 0),
+                ..Default::default()
+            },
+        ))
+    }
+
+    async fn set_fan_mode(&self, device_id: &str, mode: &str) -> Result<DeviceControlOutcome> {
+        let Some(code) = fan_mode_from_name(mode) else {
+            return Err(anyhow!(
+                "'{mode}' is not a fan mode — use off, low, medium, high, on, auto or smart"
+            ));
+        };
+        let (node, ep) = self.resolve(device_id, CLUSTER_FAN_CONTROL).await?;
+        self.client()
+            .await
+            .send_command(
+                "write_attribute",
+                json!({
+                    "node_id": node,
+                    "attribute_path": format!("{ep}/{CLUSTER_FAN_CONTROL}/{ATTR_FAN_MODE}"),
+                    "value": code,
+                }),
+            )
+            .await?;
+        Ok(DeviceControlOutcome::new(
+            device_id,
+            DeviceStatePatch {
+                fan_mode: Some(mode.trim().to_lowercase()),
+                // Off is the one mode that says something definite about power.
+                on: Some(code != FAN_MODE_OFF),
                 ..Default::default()
             },
         ))

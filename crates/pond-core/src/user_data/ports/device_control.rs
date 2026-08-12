@@ -36,6 +36,11 @@ pub struct DeviceStatePatch {
     /// Fan speed as a 0–100 percentage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fan_speed: Option<u8>,
+    /// Fan mode by name: off, low, medium, high, on, auto, smart. A fan's speed
+    /// and its mode are the same control seen two ways — a device asked for
+    /// "auto" has no percentage to report, which is why this is not a number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fan_mode: Option<String>,
     /// Covering position as a 0–100 percentage **open** (100 = fully open).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<u8>,
@@ -93,6 +98,15 @@ pub trait DeviceControlPort: Send + Sync {
     /// Set fan speed as a 0–100 percentage.
     async fn set_fan_speed(&self, device_id: &str, _percent: u8) -> Result<DeviceControlOutcome> {
         anyhow::bail!("device '{device_id}' does not support fan control")
+    }
+
+    /// Set fan mode by name: off, low, medium, high, on, auto, smart.
+    ///
+    /// Separate from [`Self::set_fan_speed`] because auto and smart are not
+    /// points on the percentage scale — they hand the choice back to the
+    /// device, which is exactly what a user asking for "auto" wants.
+    async fn set_fan_mode(&self, device_id: &str, _mode: &str) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' does not support fan modes")
     }
 
     /// Set a covering (blind/curtain/shade) position, as a 0–100 percentage
