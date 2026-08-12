@@ -625,6 +625,50 @@ describe("Settings unprompted-behaviour controls", () => {
     expect(unnamed).toEqual([]);
   });
 
+  // Thinking is reachable WITHOUT developer mode.
+  //
+  // `thinking_mode` defaults to "auto", which resolves to ON for any model whose
+  // name implies reasoning -- so a household runs a reasoning model, pays 76-156
+  // reasoning tokens a turn, sees none of it (`show_thinking` ships false) and,
+  // while these rows sat behind the developer pill, had no way to stop it.
+  // "Thinking cannot be turned off" was literally true from this panel.
+  //
+  // openPanel() does not enable dev mode, so finding the control at all is the
+  // assertion. The vacuity control is the second half: a genuinely dev-only row
+  // must still be hidden, or this would pass on a panel that showed everything.
+  it("the thinking controls are reachable without developer mode", async () => {
+    // ModelsTab, not the Extensions tab `openPanel` opens -- and explicitly NOT
+    // in developer mode, which is the whole assertion. devMode is read from
+    // localStorage, which persists across tests in this file, so an earlier one
+    // leaving it on would make this pass vacuously.
+    localStorage.removeItem("settings-dev-mode");
+    await renderSettings();
+    await navigateTo("Models");
+
+    expect(screen.getByLabelText("Thinking mode")).toBeTruthy();
+    expect(screen.getByText("Thinking length")).toBeTruthy();
+    expect(screen.getByRole("switch", { name: "Show thinking steps" })).toBeTruthy();
+
+    // Vacuity control: without it this would pass on a panel that showed
+    // everything. "Show turn stats" sat in the same block and is still
+    // developer-only, so it must NOT be reachable here. Asserted by ROLE and
+    // accessible name -- a text query matches empty section headings.
+    expect(screen.queryByRole("switch", { name: "Show turn stats" })).toBeNull();
+  });
+
+  it("turning thinking off writes thinking_mode and nothing else", async () => {
+    localStorage.removeItem("settings-dev-mode");
+    await renderSettings();
+    await navigateTo("Models");
+    const el = screen.getByLabelText("Thinking mode") as HTMLSelectElement;
+    expect(el.value).toBe("auto");
+
+    fireEvent.change(el, { target: { value: "off" } });
+    await clickSave();
+
+    expect(sentPatch()).toEqual({ thinking_mode: "off" });
+  });
+
   // The specific row the PAI programme depends on, asserted by key rather than
   // by presence. `proactive_review_enabled` is refused unless delegation is on,
   // so a Settings panel where the review switch works and this one does not is
