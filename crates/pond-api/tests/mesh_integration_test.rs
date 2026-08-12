@@ -1,0 +1,238 @@
+//! #132 Milestone 6: `GET/POST /api/v1/mesh/peers`, `DELETE
+//! /api/v1/mesh/peers/{id}`, `GET /api/v1/mesh/self`. Drives a real router
+//! with real SQLite `PeerDirectory`/`CreditLedger` wired into `AppState` —
+//! `mesh_transport` stays `None` (mirrors every other test AppState; no live
+//! networking needed to exercise trust-circle CRUD).
+
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::http::{Method, Request, StatusCode};
+use pond_api::{build_router, AppState};
+use pond_core::mesh::domain::millisats::Millisats;
+use pond_core::mesh::domain::peer_id::PeerId;
+use pond_core::mesh::ports::credit_ledger::CreditLedger;
+use pond_core::shared::mocks::mock_agent::MockAgent;
+use pond_core::user_data::mocks::mock_device_registry::MockDeviceRegistry;
+use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
+use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
+use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
+use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
+use pond_infra::db::Database;
+use pond_infra::mock_handshake::MockHandshake;
+use pond_infra::onboarding::SqlxOnboardingRepository;
+use pond_infra::sqlite_credit_ledger::SqliteCreditLedger;
+use pond_infra::sqlite_peer_directory::SqlitePeerDirectory;
+use pond_infra::sqlite_session_storage::SqliteSessionStorage;
+use pond_infra::sqlite_usage_tally::SqliteUsageTally;
+use tower::ServiceExt;
+
+async fn make_app() -> (axum::Router, Arc<SqliteCreditLedger>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::init(tmp.path()).await.unwrap();
+    let pool = db.system.clone();
+
+    let credit_ledger = Arc::new(SqliteCreditLedger::new(pool.clone()));
+
+    let mock_hs = MockHandshake::new();
+    mock_hs.add_valid_token("test-token".to_string()).await;
+
+    let state = Arc::new(AppState {
+        db: Arc::new(db),
+        onboarding_repo: Arc::new(SqlxOnboardingRepository::new(pool.clone())),
+        handshake: Arc::new(mock_hs),
+        whisper_url: "http://127.0.0.1:9000".into(),
+        transcribe_audio: None,
+        session_storage: Arc::new(SqliteSessionStorage::new(pool.clone())),
+        http_client: reqwest::Client::new(),
+        agent: Arc::new(MockAgent::new()),
+        llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        llamafile_url: "http://127.0.0.1:8080".into(),
+        tts: None,
+        settings_repo: Arc::new(MockSettingsRepository::new()),
+        profile_repo: Arc::new(MockProfileRepository::new()),
+        device_registry: Arc::new(MockDeviceRegistry),
+        memory_repo: Arc::new(MockMemoryRepository::new()),
+        embedding_provider: None,
+        sensor_storage: Arc::new(MockSensorStorage::new()),
+        camera_storage: Arc::new(MockCameraStorage::new()),
+        face_recognition: None,
+        prompt_template_dir: None,
+        model_repo: None,
+        data_dir: Some(tmp.path().to_path_buf()),
+        skip_onboarding: true,
+        scheduler: None,
+        model_scheduler: None,
+        mcp_memory: None,
+        extension_manager: None,
+        mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
+        download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        piper_http_port: None,
+        model_catalog_provider: None,
+        model_storage_dir: None,
+        prompt_template_repo: None,
+        prompt_extra_repo: None,
+        skill_repo: None,
+        recipe_repo: None,
+        llamafile_manager: None,
+        operational_log: None,
+        commissioner: None,
+        oauth_outcomes: pond_api::oauth_callback::new_oauth_outcomes(),
+        event_bus: None,
+        event_log: None,
+        push_token_repo: None,
+        notification_tx: tokio::sync::broadcast::channel(16).0,
+        notification_queue: None,
+        notification_sender: None,
+        sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        answer_reviewer: None,
+        memory_extractor: None,
+        memory_extraction_service: None,
+        last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
+        consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
+        consolidation_event_tx: tokio::sync::broadcast::channel(16).0,
+        consolidation_runner: None,
+        inference_pool: None,
+        schedule_result_tx: tokio::sync::broadcast::channel(1).0,
+        telemetry: None,
+        context_monitor: Arc::new(
+            pond_core::models::services::context_monitor::ContextMonitor::new(),
+        ),
+        mcp_app_resources: std::collections::HashMap::new(),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        security_policy: None,
+        tool_dispatcher: None,
+        api_port: 4000,
+        weather_provider: None,
+        peer_directory: Arc::new(SqlitePeerDirectory::new(pool.clone())),
+        credit_ledger: credit_ledger.clone(),
+        usage_tally: Arc::new(SqliteUsageTally::new(pool.clone())),
+        mesh_transport: None,
+    });
+
+    (
+        build_router(state, std::path::PathBuf::from("web/dist")),
+        credit_ledger,
+        tmp,
+    )
+}
+
+async fn json_request(
+    app: &axum::Router,
+    method: Method,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Authorization", "Bearer test-token")
+        .header("Content-Type", "application/json")
+        .body(match body {
+            Some(b) => Body::from(b.to_string()),
+            None => Body::empty(),
+        })
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+#[tokio::test]
+async fn self_reports_disabled_when_mesh_transport_absent() {
+    let (app, _ledger, _tmp) = make_app().await;
+    let (status, body) = json_request(&app, Method::GET, "/api/v1/mesh/self", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["mesh_enabled"], false);
+}
+
+#[tokio::test]
+async fn peers_list_starts_empty() {
+    let (app, _ledger, _tmp) = make_app().await;
+    let (status, body) = json_request(&app, Method::GET, "/api/v1/mesh/peers", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["peers"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn add_list_remove_peer_roundtrips() {
+    let (app, ledger, _tmp) = make_app().await;
+    let peer = PeerId::from([7u8; 32]);
+    ledger.credit(peer, Millisats::new(500)).await.unwrap();
+
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/mesh/peers",
+        Some(serde_json::json!({
+            "peer_id": peer.to_string(),
+            "trust_scope": "circle",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["peer_id"], peer.to_string());
+    assert_eq!(body["trust_scope"], "circle");
+
+    let (status, body) = json_request(&app, Method::GET, "/api/v1/mesh/peers", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let peers = body["peers"].as_array().unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0]["peer_id"], peer.to_string());
+    assert_eq!(peers[0]["trust_scope"], "circle");
+    assert_eq!(peers[0]["connected"], false);
+    assert_eq!(peers[0]["credit_balance_millisats"], 500);
+
+    let (status, _) = json_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/mesh/peers/{peer}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, body) = json_request(&app, Method::GET, "/api/v1/mesh/peers", None).await;
+    assert_eq!(body["peers"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn add_peer_rejects_unknown_trust_scope() {
+    let (app, _ledger, _tmp) = make_app().await;
+    let peer = PeerId::from([8u8; 32]);
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/mesh/peers",
+        Some(serde_json::json!({
+            "peer_id": peer.to_string(),
+            "trust_scope": "not_a_real_scope",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn add_peer_rejects_malformed_peer_id() {
+    let (app, _ledger, _tmp) = make_app().await;
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/mesh/peers",
+        Some(serde_json::json!({
+            "peer_id": "not-hex",
+            "trust_scope": "circle",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

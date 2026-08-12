@@ -1,0 +1,27 @@
+[package]
+name = "pond-adapters-mesh-libp2p"
+description = "Real MeshTransport adapter for the private mesh (#132) — libp2p (TCP/Noise/Yamux, Kademlia rendezvous, GossipSub presence, Relay v2 + DCUtR NAT traversal)"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+pond-core          = { workspace = true }
+pond-mesh-protocol = { workspace = true }
+libp2p             = { workspace = true }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+async-trait        = { workspace = true }
+anyhow             = { workspace = true }
+thiserror          = { workspace = true }
+tracing            = { workspace = true }
+futures            = { workspace = true }
+serde              = { workspace = true }
+
+[dev-dependencies]
+# `test-mocks` for `MockPeerDirectory`: the transport now consults a
+# `PeerDirectory` on every handshake, so a test node needs one to be reachable
+# at all. Dev-deps only — nothing in the shipped adapter uses a mock.
+pond-core = { workspace = true, features = ["test-mocks"] }
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

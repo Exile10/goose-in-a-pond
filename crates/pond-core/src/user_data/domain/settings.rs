@@ -354,6 +354,17 @@ pub struct Settings {
     #[serde(default = "Settings::default_matter_ws_url")]
     pub matter_ws_url: String,
 
+    // ── Private mesh (#132) ────────────────────────────────────────────────
+    /// Whether to start the private mesh transport (a trust-scoped P2P link
+    /// to this Pond's own other devices / trusted peers). Off by default —
+    /// no UI yet (no MCP tool or route consumes the transport this
+    /// milestone), and requires a `pond-server` build with the `mesh`
+    /// feature. The mesh identity keypair is stored separately via
+    /// `SettingsRepository::get_key`/`set_key` under `mesh_identity_secret`,
+    /// not as a `Settings` field — it's an internal secret, not a setting.
+    #[serde(default = "Settings::default_mesh_enabled")]
+    pub mesh_enabled: bool,
+
     // ── Privacy / sensor access ────────────────────────────────────────────
     /// User-controlled privacy toggle for microphone access. When false, the
     /// voice pipeline (wake-word + ASR capture) is not permitted to record.
@@ -1067,6 +1078,7 @@ impl Default for Settings {
             vision_classifier_model: Self::default_vision_classifier_model(),
             matter_enabled: Self::default_matter_enabled(),
             matter_ws_url: Self::default_matter_ws_url(),
+            mesh_enabled: Self::default_mesh_enabled(),
             mic_enabled: Self::default_mic_enabled(),
             cameras_enabled: Self::default_cameras_enabled(),
             cloud_fallback_enabled: Self::default_cloud_fallback_enabled(),
@@ -1267,6 +1279,9 @@ impl Settings {
     }
     fn default_matter_ws_url() -> String {
         "ws://127.0.0.1:5580/ws".to_string()
+    }
+    fn default_mesh_enabled() -> bool {
+        false
     }
     fn default_mic_enabled() -> bool {
         true
@@ -2276,6 +2291,19 @@ mod tests {
             // whoever owns those files.
             "context_ingest_enabled",
             "ext_context_enabled",
+            // Private mesh (#132 Milestone 2): starts the real libp2p
+            // MeshTransport. Requires a `pond-server` build with the `mesh`
+            // feature, so on a default build the switch has nothing to start.
+            //
+            // Headless because there is no CONTROL for it, which is not the
+            // same as there being no UI: the Mesh section exists and reads
+            // `GET /mesh/self`, so a household can see that the mesh is off
+            // and has no way in the app to turn it on. That gap is deliberate
+            // only for as long as the feature is opt-in at compile time --
+            // once `mesh` is in the default build, this belongs on the Privacy
+            // section next to `network_mode`, because "is my pond talking to
+            // other ponds" is exactly the question that section answers.
+            "mesh_enabled",
         ];
         // Everything else is surfaced in the desktop UI (Settings tabs / hub
         // views / onboarding) and mirrored in the TS Settings type.

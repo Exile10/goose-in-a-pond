@@ -40,6 +40,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures::StreamExt as _;
 use pond_adapters_llamafile::LlamafileProvider;
+#[cfg(feature = "mesh")]
+use pond_adapters_mesh_libp2p::{Libp2pMeshTransport, Libp2pMeshTransportConfig};
 use pond_adapters_ollama::OllamaProvider;
 use pond_adapters_piper::PiperRsOutput;
 use pond_adapters_weather::{OpenMeteoWeatherAdapter, WeatherProvider};
@@ -1442,6 +1444,23 @@ async fn run_server(
         dyn pond_core::user_data::ports::camera_storage::CameraStorage + Send + Sync,
     > = Arc::new(SqliteCameraStorage::new(db.logs.clone()));
 
+    // Private mesh (#132) — PeerDirectory/CreditLedger/UsageTally are plain
+    // SQLite, no extra dependency, so unlike mesh_transport (below, behind
+    // the `mesh` feature + settings.mesh_enabled) they're always available.
+    let peer_directory: Arc<
+        dyn pond_core::mesh::ports::peer_directory::PeerDirectory + Send + Sync,
+    > = Arc::new(pond_infra::sqlite_peer_directory::SqlitePeerDirectory::new(
+        db.system.clone(),
+    ));
+    let credit_ledger: Arc<dyn pond_core::mesh::ports::credit_ledger::CreditLedger + Send + Sync> =
+        Arc::new(pond_infra::sqlite_credit_ledger::SqliteCreditLedger::new(
+            db.system.clone(),
+        ));
+    let usage_tally: Arc<dyn pond_core::mesh::ports::usage_tally::UsageTally + Send + Sync> =
+        Arc::new(pond_infra::sqlite_usage_tally::SqliteUsageTally::new(
+            db.system.clone(),
+        ));
+
     // ── Face recognition (Phase 2) ──────────────────────────────────────────
     // Built only when the --features face-onnx build flag is enabled AND an
     // ONNX embedding model is present on disk.  Missing model file → None
@@ -2089,6 +2108,12 @@ async fn run_server(
             None
         }
     };
+
+    // Private mesh (#132 Milestone 2) — real libp2p MeshTransport, gated on
+    // settings.mesh_enabled. Wired into AppState below (Milestone 6) so the
+    // /api/v1/mesh/* routes can use it.
+    let mesh_transport =
+        build_mesh_transport(&settings, &settings_repo, peer_directory.clone()).await;
 
     // Scheduler — persist task list next to the databases.
     // Uses a DeferredExecutor so the scheduler can be created before the agent
@@ -3322,6 +3347,10 @@ async fn run_server(
         security_policy,
         api_port,
         weather_provider: weather.clone(),
+        peer_directory,
+        credit_ledger,
+        usage_tally,
+        mesh_transport,
     });
 
     // Spawn OAuth token auto-refresh worker.
@@ -6603,6 +6632,115 @@ async fn run_onboard(reset: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── Private mesh (#132 Milestone 2) ───────────────────────────────────────────
+
+/// Build the real `MeshTransport` when `settings.mesh_enabled` and this
+/// binary was compiled with the `mesh` feature. The mesh identity keypair is
+/// generated once and persisted via the raw settings key-value store (not a
+/// `Settings` field — it's an internal secret) so peers stay pinned to the
+/// same `PeerId` across restarts.
+#[cfg(feature = "mesh")]
+async fn build_mesh_transport(
+    settings: &pond_core::user_data::domain::settings::Settings,
+    settings_repo: &Arc<
+        dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
+    >,
+    peer_directory: Arc<dyn pond_core::mesh::ports::peer_directory::PeerDirectory>,
+) -> Option<Arc<dyn pond_core::mesh::ports::mesh_transport::MeshTransport>> {
+    use pond_mesh_protocol::identity::MeshKeypair;
+
+    if !settings.mesh_enabled {
+        tracing::info!("mesh disabled — enable via PUT /api/v1/settings (mesh_enabled)");
+        return None;
+    }
+
+    let secret_hex = match settings_repo.get_key("mesh_identity_secret").await {
+        Ok(Some(hex)) => hex,
+        _ => {
+            let keypair = MeshKeypair::generate();
+            let hex = hex_encode_32(&keypair.secret_bytes());
+            if let Err(err) = settings_repo
+                .set_key("mesh_identity_secret", hex.clone())
+                .await
+            {
+                tracing::error!("failed to persist mesh identity secret: {err}");
+            }
+            hex
+        }
+    };
+    let secret_bytes = match hex_decode_32(&secret_hex) {
+        Some(bytes) => bytes,
+        None => {
+            tracing::error!(
+                "stored mesh_identity_secret is malformed — mesh transport not started"
+            );
+            return None;
+        }
+    };
+    let keypair = MeshKeypair::from_bytes(secret_bytes);
+    tracing::info!("mesh enabled: peer_id={}", keypair.peer_id());
+
+    // Harness/model attestation isn't wired up yet (ties to reproducible
+    // builds — explicitly out of scope for this milestone per the issue's
+    // risk list); a fixed placeholder lets any two Milestone-2 Ponds pair
+    // during development. Replace once harness/model pinning lands.
+    let config = Libp2pMeshTransportConfig {
+        listen_addr: "/ip4/0.0.0.0/tcp/0"
+            .parse()
+            .expect("valid multiaddr literal"),
+        harness_hash: pond_mesh_protocol::hashing::hash_harness(b"pond-mesh-v1-dev"),
+        model_hash: pond_mesh_protocol::hashing::hash_model(b"pond-mesh-v1-dev"),
+        keypair,
+        peer_directory,
+    };
+    match Libp2pMeshTransport::new(config) {
+        Ok(transport) => {
+            Some(Arc::new(transport)
+                as Arc<
+                    dyn pond_core::mesh::ports::mesh_transport::MeshTransport,
+                >)
+        }
+        Err(err) => {
+            tracing::error!("failed to start mesh transport: {err}");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "mesh"))]
+async fn build_mesh_transport(
+    settings: &pond_core::user_data::domain::settings::Settings,
+    _settings_repo: &Arc<
+        dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
+    >,
+    _peer_directory: Arc<dyn pond_core::mesh::ports::peer_directory::PeerDirectory>,
+) -> Option<Arc<dyn pond_core::mesh::ports::mesh_transport::MeshTransport>> {
+    if settings.mesh_enabled {
+        tracing::warn!(
+            "settings.mesh_enabled is true but this pond-server binary was built without \
+             the `mesh` feature — mesh transport not started"
+        );
+    }
+    None
+}
+
+#[cfg(feature = "mesh")]
+fn hex_encode_32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(feature = "mesh")]
+fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 // ── Goose agent backend ───────────────────────────────────────────────────────

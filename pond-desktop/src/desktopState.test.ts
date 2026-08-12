@@ -39,14 +39,16 @@ describe("desktopState", () => {
   });
 
   it("DESKTOP_SECTIONS is a flat ordered list of all sidebar items", () => {
-    // 12 = dashboard, chat, devices, pairing, schedules, memory, skills, logs,
-    // models, prompts, settings, extensions.
-    // (canvas, faces are hidden from sidebar but still routable)
-    expect(DESKTOP_SECTIONS).toHaveLength(12);
+    // 13 = dashboard, chat, devices, mesh, pairing, schedules, memory, skills,
+    // logs, models, prompts, settings, extensions.
+    // (canvas, faces, hub are routable but hidden from the sidebar, so they are
+    // in GUI_SECTIONS and not here — see HIDDEN_SECTIONS in desktopState.ts)
+    expect(DESKTOP_SECTIONS).toHaveLength(13);
     expect(DESKTOP_SECTIONS[0]).toEqual({ section: "dashboard", label: "Dashboard" });
     expect(DESKTOP_SECTIONS[1]).toEqual({ section: "chat", label: "Chat" });
     const sectionKeys = DESKTOP_SECTIONS.map((s) => s.section);
     expect(sectionKeys).toContain("devices");
+    expect(sectionKeys).toContain("mesh");
     expect(sectionKeys).toContain("pairing");
     expect(sectionKeys).toContain("schedules");
     expect(sectionKeys).toContain("memory");

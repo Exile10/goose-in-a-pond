@@ -233,6 +233,14 @@ async fn make_app_full(
         tool_dispatcher,
         api_port: 4000,
         weather_provider: None,
+        peer_directory: Arc::new(
+            pond_core::mesh::mocks::mock_peer_directory::MockPeerDirectory::new(),
+        ),
+        credit_ledger: Arc::new(
+            pond_core::mesh::mocks::mock_credit_ledger::MockCreditLedger::new(),
+        ),
+        usage_tally: Arc::new(pond_core::mesh::mocks::mock_usage_tally::MockUsageTally::new()),
+        mesh_transport: None,
     });
 
     (
@@ -456,6 +464,14 @@ async fn prompt_template_delete_system_returns_403() {
         tool_dispatcher: None,
         api_port: 4000,
         weather_provider: None,
+        peer_directory: Arc::new(
+            pond_core::mesh::mocks::mock_peer_directory::MockPeerDirectory::new(),
+        ),
+        credit_ledger: Arc::new(
+            pond_core::mesh::mocks::mock_credit_ledger::MockCreditLedger::new(),
+        ),
+        usage_tally: Arc::new(pond_core::mesh::mocks::mock_usage_tally::MockUsageTally::new()),
+        mesh_transport: None,
     });
 
     let app = build_router(state, std::path::PathBuf::from("pond-desktop/dist"));
@@ -931,6 +947,14 @@ async fn returns_501_when_repos_not_configured() {
         tool_dispatcher: None,
         api_port: 4000,
         weather_provider: None,
+        peer_directory: Arc::new(
+            pond_core::mesh::mocks::mock_peer_directory::MockPeerDirectory::new(),
+        ),
+        credit_ledger: Arc::new(
+            pond_core::mesh::mocks::mock_credit_ledger::MockCreditLedger::new(),
+        ),
+        usage_tally: Arc::new(pond_core::mesh::mocks::mock_usage_tally::MockUsageTally::new()),
+        mesh_transport: None,
     });
     let app = build_router(state, std::path::PathBuf::from("pond-desktop/dist"));
 

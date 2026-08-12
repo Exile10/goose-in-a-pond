@@ -279,6 +279,14 @@ async fn make_app_with_provider(
         tool_dispatcher: None,
         api_port: 4000,
         weather_provider: None,
+        peer_directory: Arc::new(
+            pond_core::mesh::mocks::mock_peer_directory::MockPeerDirectory::new(),
+        ),
+        credit_ledger: Arc::new(
+            pond_core::mesh::mocks::mock_credit_ledger::MockCreditLedger::new(),
+        ),
+        usage_tally: Arc::new(pond_core::mesh::mocks::mock_usage_tally::MockUsageTally::new()),
+        mesh_transport: None,
     });
     (
         build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
@@ -609,6 +617,14 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
         tool_dispatcher: None,
         api_port: 4000,
         weather_provider: None,
+        peer_directory: Arc::new(
+            pond_core::mesh::mocks::mock_peer_directory::MockPeerDirectory::new(),
+        ),
+        credit_ledger: Arc::new(
+            pond_core::mesh::mocks::mock_credit_ledger::MockCreditLedger::new(),
+        ),
+        usage_tally: Arc::new(pond_core::mesh::mocks::mock_usage_tally::MockUsageTally::new()),
+        mesh_transport: None,
     });
     let app = build_router(state, std::path::PathBuf::from("pond-desktop/dist"));
 
@@ -712,6 +728,14 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
         tool_dispatcher: None,
         api_port: 4000,
         weather_provider: None,
+        peer_directory: Arc::new(
+            pond_core::mesh::mocks::mock_peer_directory::MockPeerDirectory::new(),
+        ),
+        credit_ledger: Arc::new(
+            pond_core::mesh::mocks::mock_credit_ledger::MockCreditLedger::new(),
+        ),
+        usage_tally: Arc::new(pond_core::mesh::mocks::mock_usage_tally::MockUsageTally::new()),
+        mesh_transport: None,
     });
     let app = build_router(state, std::path::PathBuf::from("pond-desktop/dist"));
 
