@@ -1811,6 +1811,22 @@ impl GooseAdapter {
             .sum()
     }
 
+    /// Render the `CURRENT CONTEXT` time value for the given moment.
+    ///
+    /// Text mode keeps plain `HH:MM` digits — unambiguous to read. Voice mode
+    /// instead renders a spoken-English phrase (`spoken_time`) so the model
+    /// never has to convert digits to words itself: small on-device models
+    /// are unreliable at that two-digit conversion and default to a
+    /// "H:0<last digit>" pattern (e.g. 5:23 spoken back as "five oh three").
+    fn format_current_time(now: chrono::DateTime<chrono::Local>, voice: bool) -> String {
+        use chrono::Timelike;
+        if voice {
+            pond_core::models::services::voice::spoken_time::spoken_time(now.hour(), now.minute())
+        } else {
+            now.format("%H:%M").to_string()
+        }
+    }
+
     /// Append the `<vision>` section to a prompt template when the model can see.
     ///
     /// Appended to the TEMPLATE, before Tera runs, rather than to the rendered
@@ -3131,7 +3147,7 @@ impl GooseAdapter {
 
             PromptState {
                 current_date: now.format("%A, %-d %B %Y").to_string(),
-                current_time: now.format("%H:%M").to_string(),
+                current_time: Self::format_current_time(now, is_voice),
                 device_count,
                 has_home_devices,
                 online_device_names,
@@ -6884,6 +6900,23 @@ mod tests {
                 voice
             ));
         }
+    }
+
+    /// Voice mode must render a spoken-word time, never raw `HH:MM` digits —
+    /// that's the whole point of `format_current_time` (small on-device
+    /// models mangle digit-to-words conversion themselves; see spoken_time).
+    #[test]
+    fn voice_mode_renders_spoken_time_text_mode_keeps_digits() {
+        use chrono::TimeZone;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 8, 3, 5, 23, 0)
+            .unwrap();
+
+        let voice = GooseAdapter::format_current_time(now, true);
+        assert_eq!(voice, "five twenty-three in the morning");
+
+        let text = GooseAdapter::format_current_time(now, false);
+        assert_eq!(text, "05:23");
     }
 
     // ── F2 live half: the image cap on the in-turn trimmer ───────────────

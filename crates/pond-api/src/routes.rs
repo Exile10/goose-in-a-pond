@@ -153,6 +153,18 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // PAI-4 P7 — the manual axis. The time axis (P4) and the pressure axis
         // (P6) both decide for the user; this is the one a person decides.
         .route("/sessions/{session_id}/compact", post(compact_session))
+        // Delete a message and every later message in the same session — the
+        // "edit"/"refresh" primitive: the client truncates from a user
+        // message, then resubmits (same or edited text) as a normal new turn.
+        .route(
+            "/sessions/{session_id}/messages/{message_id}",
+            delete(delete_messages_from_handler),
+        )
+        // Like/dislike training-feedback on one message.
+        .route(
+            "/sessions/{session_id}/messages/{message_id}/feedback",
+            put(set_message_feedback_handler),
+        )
         // Phase F2: raw bytes for one persisted image attachment.
         .route(
             "/sessions/{session_id}/attachments/{attachment_id}",
@@ -161,6 +173,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/usage/summary", get(usage_summary))
         .route("/devices", get(list_devices).post(register_device))
         .route("/devices/commission", post(commission_device))
+        .route("/matter/status", get(matter_status))
         .route(
             "/devices/{id}",
             axum::routing::delete(unregister_device).put(update_device),
@@ -2390,6 +2403,91 @@ async fn delete_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Delete a message and every later message in the same session.
+///
+/// DELETE /api/v1/sessions/:session_id/messages/:message_id
+///
+/// This is the "edit"/"refresh" primitive, not a general message-delete: the
+/// client truncates the conversation from a user message onward, then
+/// resubmits (unchanged for refresh, edited for edit) as a normal new turn
+/// through `/chat/stream` — no separate regenerate code path needed.
+async fn delete_messages_from_handler(
+    State(state): State<Arc<AppState>>,
+    Path((session_id, message_id)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    use pond_core::user_data::ports::session_storage::SessionStorageError;
+    state
+        .session_storage
+        .delete_messages_from(&session_id, &message_id)
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                SessionStorageError::SessionNotFound(_)
+                | SessionStorageError::MessageNotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json!({"error": format!("{}", e)})))
+        })?;
+
+    // Truncating `pond_system.db` is only half of forgetting a turn, and the
+    // half nobody sees. The live engine session still holds the deleted
+    // messages, so without this the model keeps being shown the exact turns the
+    // user just removed: an edit re-answers with the old answer in context, a
+    // regenerate is asked to regenerate something it can still read, and the
+    // two stores diverge for the life of the process. The user's only signal
+    // that any of that happened is an assistant that seems not to have noticed.
+    //
+    // `forget_session` drops the GIAP->engine pairing rather than replaying a
+    // deletion into the engine. That is deliberate: the next turn re-resolves
+    // the pairing and hydrates a fresh engine session from pond history, which
+    // IS the truncated history, so the two stores converge on the one that is
+    // authoritative instead of both being edited and hoping they agree. It is
+    // also a no-op when no pairing exists, so a first-turn edit costs nothing.
+    state.agent.forget_session(&session_id).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct MessageFeedbackRequest {
+    /// `true` = liked (keep as training data), `false` = disliked (excluded),
+    /// `null`/omitted = clear any prior vote.
+    #[serde(default)]
+    liked: Option<bool>,
+}
+
+/// Set or clear the like/dislike training-feedback flag on one message.
+///
+/// PUT /api/v1/sessions/:session_id/messages/:message_id/feedback
+/// Body: `{ "liked": true | false | null }`
+async fn set_message_feedback_handler(
+    State(state): State<Arc<AppState>>,
+    Path((session_id, message_id)): Path<(String, String)>,
+    body: Result<Json<MessageFeedbackRequest>, JsonRejection>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    use pond_core::user_data::ports::session_storage::SessionStorageError;
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {}", e)})),
+        )
+    })?;
+
+    state
+        .session_storage
+        .set_message_feedback(&session_id, &message_id, req.liked)
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                SessionStorageError::SessionNotFound(_)
+                | SessionStorageError::MessageNotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json!({"error": format!("{}", e)})))
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Get messages for a session (paginated).
 ///
 /// GET /api/v1/sessions/:session_id/messages?limit=100&offset=0
@@ -2418,17 +2516,28 @@ async fn get_session_messages(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    let messages = state
-        .session_storage
-        .get_messages_paginated(&session_id, limit, offset)
-        .await
-        .map_err(|e| {
-            let status = match &e {
-                SessionStorageError::SessionNotFound(_) => StatusCode::NOT_FOUND,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            (status, Json(json!({"error": format!("{}", e)})))
-        })?;
+    // No `offset` in the query: honor the doc comment above — "most recent"
+    // means newest-first via get_recent_messages, not the oldest page that
+    // get_messages_paginated(limit, 0) would return. Callers that DO pass
+    // `offset` are doing old-style forward pagination and keep that behavior.
+    let messages = if params.contains_key("offset") {
+        state
+            .session_storage
+            .get_messages_paginated(&session_id, limit, offset)
+            .await
+    } else {
+        state
+            .session_storage
+            .get_recent_messages(&session_id, limit)
+            .await
+    }
+    .map_err(|e| {
+        let status = match &e {
+            SessionStorageError::SessionNotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, Json(json!({"error": format!("{}", e)})))
+    })?;
 
     // Phase F2. One cheap metadata query for the whole page (no bytes read),
     // grouped by message id. Absent for sessions that never had an attachment,
@@ -2477,6 +2586,7 @@ async fn get_session_messages(
                 "role": role,
                 "content": m.message.content,
                 "created_at": m.created_at.to_rfc3339(),
+                "liked": m.liked,
             });
             if let Some(tc_id) = &m.message.tool_call_id {
                 obj["tool_call_id"] = json!(tc_id);
@@ -3259,6 +3369,80 @@ async fn register_device(
     ))
 }
 
+/// `GET /api/v1/matter/status` — what the Matter integration is actually doing.
+///
+/// The Devices tab polls this after toggling Matter: enabling installs and
+/// starts a controller, which takes long enough that the UI has to show
+/// progress rather than pretend the save was the whole story.
+async fn matter_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let status = match &state.matter {
+        Some(matter) => matter.status().await,
+        // No Matter support wired at all. Reported as plain "off" — from the
+        // user's side there is nothing to distinguish, and nothing to fix.
+        None => pond_core::user_data::ports::matter_runtime::MatterStatus::disabled(),
+    };
+    Json(serde_json::to_value(status).unwrap_or_else(|_| json!({})))
+}
+
+/// The live commissioner, or the error explaining why there isn't one.
+///
+/// "Off" and "on but the controller is unreachable" used to collapse into a
+/// single "Matter is not enabled" 503, which sent users to look for a switch
+/// that was already on. They are kept apart here so the message names the thing
+/// that is actually wrong.
+async fn matter_commissioner(
+    state: &Arc<AppState>,
+) -> Result<
+    Arc<dyn pond_core::user_data::ports::device_commissioning::DeviceCommissioningPort>,
+    (StatusCode, Json<Value>),
+> {
+    use pond_core::user_data::ports::matter_runtime::{MatterState, MatterStatus};
+
+    let status = match &state.matter {
+        Some(matter) => {
+            if let Some(commissioner) = matter.commissioner().await {
+                return Ok(commissioner);
+            }
+            matter.status().await
+        }
+        None => MatterStatus::disabled(),
+    };
+
+    Err(match status.state {
+        MatterState::Disabled => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "Matter is off on this Pond. Turn it on in the Matter section \
+                          of the Devices tab, then try again."
+            })),
+        ),
+        MatterState::Connecting => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "Matter is still starting up — the controller is not ready yet. \
+                          Try again in a moment."
+            })),
+        ),
+        MatterState::Unreachable { error } => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": format!(
+                    "Matter is on, but the controller at {} could not be reached: {error}",
+                    status.url
+                )
+            })),
+        ),
+        // Connected without a commissioner means the runtime was torn down
+        // between the two reads. Transient by nature, so it reads as such.
+        MatterState::Connected => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "The Matter controller connection just dropped. Try again in a moment."
+            })),
+        ),
+    })
+}
+
 /// `POST /api/v1/devices/commission` — bring a Matter device onto the fabric.
 ///
 /// Distinct from `register_device` on purpose: a Matter device is not GIAP's to
@@ -3282,14 +3466,7 @@ async fn commission_device(
         )
     })?;
 
-    let Some(commissioner) = state.commissioner.clone() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": "Matter is not enabled on this Pond — turn it on in Settings first."
-            })),
-        ));
-    };
+    let commissioner = matter_commissioner(&state).await?;
 
     let raw = req.get("code").and_then(Value::as_str).unwrap_or_default();
     // Validated before it reaches the controller.
@@ -3312,10 +3489,14 @@ async fn commission_device(
     let device = commissioner
         .commission(code, name.clone())
         .await
+        // `{e:#}`, not `to_string()`: the latter prints only the outermost
+        // context, so every failure reached the user as a bare "commissioning
+        // failed" while the reason it was wrapped around — the controller's own
+        // error — was dropped on the floor.
         .map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
-                Json(json!({"error": e.to_string()})),
+                Json(json!({"error": format!("{e:#}")})),
             )
         })?;
 
@@ -3368,15 +3549,7 @@ async fn unregister_device(
     // If we cannot reach the controller to do so, the delete is refused rather
     // than half-applied.
     if let Some(node_id) = pond_core::user_data::ports::device_commissioning::matter_node_id(&id) {
-        let Some(commissioner) = state.commissioner.clone() else {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "error": "Matter is off, so this device cannot be removed from the fabric. \
-                              Enable Matter and try again."
-                })),
-            ));
-        };
+        let commissioner = matter_commissioner(&state).await?;
         commissioner.decommission(node_id).await.map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
@@ -3902,6 +4075,37 @@ async fn update_settings(
         )
     })?;
 
+    // The controller URL is operator-supplied and gets opened as a socket, so
+    // its shape is checked here rather than at connect time — a typo should be
+    // a rejected save, not a Matter section stuck reporting "unreachable".
+    //
+    // Only when the caller actually edited Matter: this endpoint takes a patch
+    // over the whole of Settings, so validating unconditionally would let a bad
+    // stored value block every unrelated save (renaming the home, changing a
+    // model) until someone fixed a field they were not touching.
+    let touches_matter = patch
+        .as_object()
+        .is_some_and(|o| o.contains_key("matter_enabled") || o.contains_key("matter_ws_url"));
+    let matter_url = merged.matter_ws_url.trim();
+    if touches_matter
+        && merged.matter_enabled
+        && !(matter_url.starts_with("ws://") || matter_url.starts_with("wss://"))
+    {
+        // An empty address and a malformed one are different mistakes and read
+        // as different sentences: "empty" tells the user the field they are
+        // looking at is blank, which the placeholder otherwise hides.
+        let message = if matter_url.is_empty() {
+            "Controller address is empty. Enter the Matter controller's WebSocket URL, \
+             for example ws://127.0.0.1:5580/ws"
+        } else {
+            "Controller address must be a WebSocket URL, for example ws://127.0.0.1:5580/ws"
+        };
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": message, "field": "matter_ws_url" })),
+        ));
+    }
+
     // Geocode-on-save: turn the location name into coordinates so the Settings
     // page shows real lat/lon and the weather gate is satisfied without the user
     // hand-entering coordinates. Onboarding saves through this same endpoint, so
@@ -3983,6 +4187,31 @@ async fn update_settings(
     pond_core::shared::services::egress::set_network_mode(
         pond_core::shared::services::egress::NetworkMode::parse(&merged.network_mode),
     );
+
+    // Same for Matter: the toggle used to be read once at startup, so turning
+    // it on changed nothing until someone restarted the Pond — which made the
+    // "enable Matter first" error impossible to act on.
+    //
+    // Only when the caller actually edited Matter, unlike the egress gate
+    // above. That gate is a cheap idempotent write; this one can restart a
+    // controller. The reconciler treats "enabled but not yet Connected" as
+    // needing a restart, so an unconditional send meant that ANY unrelated
+    // save during the first controller install — renaming the home, changing a
+    // model — tore down a multi-minute `pip install` and started it again.
+    // Repeat that a few times and the Devices panel sits on "Starting..."
+    // forever.
+    //
+    // Retry from the Devices tab still works: `saveMatter` sends
+    // `matter_enabled` and `matter_ws_url` explicitly, so it is a
+    // `touches_matter` save by construction.
+    if touches_matter {
+        if let Some(matter) = &state.matter {
+            matter.apply(
+                merged.matter_enabled,
+                merged.matter_ws_url.trim().to_string(),
+            );
+        }
+    }
 
     // Hot-reload the ModelRouter whenever any provider/model field changes.
     let provider_keys = [
@@ -5988,133 +6217,141 @@ struct SensorQueryParams {
     agg: Option<String>,
 }
 
+/// Upper bound on readings returned by one sensor history query, regardless of
+/// the requested `limit`, so a wide `since`/`until` window can't pull a whole
+/// retention period into memory.
+const SENSOR_HISTORY_MAX_LIMIT: usize = 1000;
+
+fn sensor_reading_json(r: &SensorReading) -> Value {
+    json!({
+        "device_id":   r.device_id,
+        "sensor_type": r.sensor_type,
+        "value":       r.value,
+        "unit":        r.unit,
+        "recorded_at": r.recorded_at.to_rfc3339(),
+    })
+}
+
 async fn get_recent_sensors(
     State(state): State<Arc<AppState>>,
     Path(device_id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<SensorQueryParams>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let agg = params.agg.as_deref().map(str::to_lowercase);
-
-    // When a sensor_type + time range is given, use the history query path.
-    if let Some(ref sensor_type) = params.sensor_type {
-        if agg.as_deref() == Some("current")
-            || (params.since.is_none() && params.until.is_none() && agg.is_none())
-        {
-            // Fall through to latest-value query below only when no time bounds.
-        } else {
-            let since = params.since.as_deref().and_then(parse_sensor_datetime);
-            let until = params.until.as_deref().and_then(parse_sensor_datetime);
-            let readings = state
-                .sensor_storage
-                .get_history(&device_id, sensor_type, since, until)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": e.to_string()})),
-                    )
-                })?;
-
-            return match agg.as_deref() {
-                Some("min") => {
-                    let val = readings
-                        .iter()
-                        .map(|r| r.value)
-                        .fold(f64::INFINITY, f64::min);
-                    Ok(Json(
-                        json!({ "device_id": device_id, "sensor_type": sensor_type, "min": val, "count": readings.len() }),
-                    ))
-                }
-                Some("max") => {
-                    let val = readings
-                        .iter()
-                        .map(|r| r.value)
-                        .fold(f64::NEG_INFINITY, f64::max);
-                    Ok(Json(
-                        json!({ "device_id": device_id, "sensor_type": sensor_type, "max": val, "count": readings.len() }),
-                    ))
-                }
-                Some("avg") => {
-                    let avg = if readings.is_empty() {
-                        serde_json::Value::Null
-                    } else {
-                        let sum: f64 = readings.iter().map(|r| r.value).sum();
-                        serde_json::Value::from(sum / readings.len() as f64)
-                    };
-                    Ok(Json(
-                        json!({ "device_id": device_id, "sensor_type": sensor_type, "avg": avg, "count": readings.len() }),
-                    ))
-                }
-                _ => {
-                    let list: Vec<Value> = readings
-                        .iter()
-                        .map(|r| {
-                            json!({
-                                "device_id":   r.device_id,
-                                "sensor_type": r.sensor_type,
-                                "value":       r.value,
-                                "unit":        r.unit,
-                                "recorded_at": r.recorded_at.to_rfc3339(),
-                            })
-                        })
-                        .collect();
-                    Ok(Json(json!({ "readings": list })))
-                }
-            };
+    // Reject an unrecognised `agg` rather than quietly serving raw history
+    // under it, which would answer a question the caller did not ask.
+    if let Some(a) = agg.as_deref() {
+        if !matches!(a, "min" | "max" | "avg" | "current") {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid `agg`: expected one of min, max, avg, current"
+                })),
+            ));
         }
     }
 
-    // Current-value query: latest reading per sensor_type (or all types).
-    if let Some(ref sensor_type) = params.sensor_type {
-        if agg.as_deref() == Some("current") || params.since.is_none() {
-            let reading = state
-                .sensor_storage
-                .get_latest(&device_id, sensor_type)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": e.to_string()})),
-                    )
-                })?;
-            return match reading {
-                Some(r) => Ok(Json(json!({
-                    "device_id":   r.device_id,
-                    "sensor_type": r.sensor_type,
-                    "value":       r.value,
-                    "unit":        r.unit,
-                    "recorded_at": r.recorded_at.to_rfc3339(),
-                }))),
-                None => Ok(Json(json!({ "readings": [] }))),
-            };
+    // Parsed before any branch runs: a malformed bound used to fall back to an
+    // unbounded query, so a typo silently widened the window to all of history
+    // and any aggregate was computed over the wrong range.
+    let since = parse_sensor_time_param("since", params.since.as_deref())?;
+    let until = parse_sensor_time_param("until", params.until.as_deref())?;
+
+    let storage_error = |e: anyhow::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    };
+
+    // Without a sensor type there is nothing to aggregate or bound: the only
+    // meaningful answer is the device's recent readings across all types.
+    let Some(sensor_type) = params.sensor_type.as_deref() else {
+        // ...but say so, rather than serving that answer to a caller who asked
+        // a different question. `agg`, `since` and `until` are parsed and
+        // validated above and then have nowhere to go on this branch, so a
+        // request for "the average since Tuesday" used to come back 200 with an
+        // unaggregated, unbounded list of the last 20 readings. That is the
+        // exact defect this endpoint's hardening set out to remove -- answering
+        // a question that was not asked -- reappearing one branch above the fix.
+        if agg.is_some() || since.is_some() || until.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "`agg`, `since` and `until` need a `sensor_type`: \
+                              a device can report several, and they cannot be \
+                              aggregated together"
+                })),
+            ));
         }
+        let limit = params.limit.unwrap_or(20).min(100);
+        let readings = state
+            .sensor_storage
+            .get_recent(&device_id, limit)
+            .await
+            .map_err(storage_error)?;
+        let list: Vec<Value> = readings.iter().map(sensor_reading_json).collect();
+        return Ok(Json(json!({ "readings": list })));
+    };
+
+    // Current value: explicitly asked for, or implied by a bare sensor_type.
+    if agg.as_deref() == Some("current") || (agg.is_none() && since.is_none() && until.is_none()) {
+        let reading = state
+            .sensor_storage
+            .get_latest(&device_id, sensor_type)
+            .await
+            .map_err(storage_error)?;
+        return Ok(Json(match reading {
+            Some(r) => sensor_reading_json(&r),
+            None => json!({ "readings": [] }),
+        }));
     }
 
-    // Default: recent readings (all types) with a limit.
-    let limit = params.limit.unwrap_or(20).min(100);
-    let readings = state
+    // min/max/avg: computed by the store, so a wide window never materialises
+    // its rows here.
+    if let Some(a) = agg.as_deref() {
+        let summary = state
+            .sensor_storage
+            .aggregate(&device_id, sensor_type, since, until)
+            .await
+            .map_err(storage_error)?;
+        // The aggregate's name is itself the response key, so the body is built
+        // rather than written out. `null` for an empty window is now the typed
+        // answer instead of a serialized infinity.
+        let value = match a {
+            "min" => summary.min,
+            "max" => summary.max,
+            _ => summary.avg,
+        };
+        let mut body = serde_json::Map::new();
+        body.insert("device_id".into(), json!(device_id));
+        body.insert("sensor_type".into(), json!(sensor_type));
+        body.insert(a.into(), json!(value));
+        body.insert("count".into(), json!(summary.count));
+        body.insert("unit".into(), json!(summary.unit));
+        return Ok(Json(Value::Object(body)));
+    }
+
+    // Raw history over the requested window.
+    let limit = params
+        .limit
+        .unwrap_or(SENSOR_HISTORY_MAX_LIMIT)
+        .min(SENSOR_HISTORY_MAX_LIMIT);
+    // Ask for one more than we will return: a window holding exactly `limit`
+    // rows is complete, and reporting it as truncated would be its own wrong
+    // answer.
+    let mut readings = state
         .sensor_storage
-        .get_recent(&device_id, limit)
+        .get_history_limited(&device_id, sensor_type, since, until, limit + 1)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
-    let list: Vec<Value> = readings
-        .iter()
-        .map(|r| {
-            json!({
-                "device_id":   r.device_id,
-                "sensor_type": r.sensor_type,
-                "value":       r.value,
-                "unit":        r.unit,
-                "recorded_at": r.recorded_at.to_rfc3339(),
-            })
-        })
-        .collect();
-    Ok(Json(json!({ "readings": list })))
+        .map_err(storage_error)?;
+    let truncated = readings.len() > limit;
+    readings.truncate(limit);
+    let list: Vec<Value> = readings.iter().map(sensor_reading_json).collect();
+    // Flag a truncated series rather than letting it read as the whole window.
+    Ok(Json(
+        json!({ "readings": list, "count": readings.len(), "truncated": truncated }),
+    ))
 }
 
 fn parse_sensor_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -6123,6 +6360,28 @@ fn parse_sensor_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
             .ok()
             .map(|ndt| ndt.and_utc())
     })
+}
+
+/// Parse an optional sensor time-range param, erroring on malformed input.
+///
+/// Keeps [`parse_sensor_datetime`]'s grammar — RFC3339 or a bare
+/// `YYYY-MM-DDTHH:MM:SS` — rather than the stricter [`parse_rfc3339_param`], so
+/// requests that work today do not start failing.
+fn parse_sensor_time_param(
+    field: &str,
+    raw: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, (StatusCode, Json<Value>)> {
+    match raw {
+        None => Ok(None),
+        Some(s) => parse_sensor_datetime(s).map(Some).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({ "error": format!("invalid `{field}`: expected an RFC3339 timestamp") }),
+                ),
+            )
+        }),
+    }
 }
 
 // ── Activity query API (#114) ──────────────────────────────────────────────────

@@ -14,12 +14,11 @@
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use pond_audio::{MicHandle, MicReader, MicState};
 use pond_core::models::ports::voice_input::SpeculativeSignal;
 use pond_core::models::ports::wake_word::{StreamingWakeWordDetector, WakeWordActivation};
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 mod in_process;
 pub use in_process::WhisperRsInput;
@@ -95,6 +94,33 @@ pub(crate) fn decode_wav_mono_f32(wav: &[u8]) -> Result<(Vec<f32>, u32)> {
 
 // ── Audio capture ─────────────────────────────────────────────────────────────
 
+/// Open the shared mic owner and block until it settles into `Open`, `Denied`,
+/// or `Failed`.
+///
+/// `MicHandle::open()` is fire-and-forget — the real device open happens
+/// asynchronously on the owner thread — so every capture entry point needs
+/// this same handshake before it can trust the mic is actually producing
+/// audio. Serializing all opens/closes through that one owner thread is what
+/// stops two capture paths (e.g. the wake-word detector and the follow-up
+/// VAD listen) from racing the same physical device.
+fn open_mic_and_confirm(mic: &MicHandle) -> Result<u64> {
+    let generation = mic.open_session();
+    if !mic.wait_for(
+        |s| !matches!(s, MicState::Closed),
+        std::time::Duration::from_secs(2),
+    ) {
+        return Err(anyhow!("microphone did not respond"));
+    }
+    match mic.state() {
+        MicState::Open => Ok(generation),
+        MicState::Denied => Err(anyhow!(
+            "microphone is disabled in Settings (mic_enabled = false)"
+        )),
+        MicState::Failed(e) => Err(anyhow!("microphone could not be opened: {}", e)),
+        MicState::Closed => unreachable!("wait_for guarantees a non-Closed state"),
+    }
+}
+
 /// Record from the microphone until the speaker stops talking.
 ///
 /// Unlike `record_mono_f32_vad`, this skips the "wait for speech onset" phase
@@ -104,6 +130,7 @@ pub(crate) fn decode_wav_mono_f32(wav: &[u8]) -> Result<(Vec<f32>, u32)> {
 /// Stops when `silence_ms` consecutive milliseconds of silence are detected,
 /// or after `max_record_secs` total recording time.
 pub(crate) fn record_mono_f32_until_silence(
+    mic: &MicHandle,
     max_record_secs: u32,
     silence_ms: u64,
 ) -> Result<(Vec<f32>, u32)> {
@@ -114,74 +141,11 @@ pub(crate) fn record_mono_f32_until_silence(
     // stays dark. Filtering samples after capture would leave it lit and make
     // the setting a lie.
     pond_core::models::domain::mic_gate::ensure_mic_enabled()?;
+    open_mic_and_confirm(mic)?;
 
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("No audio input device found"))?;
-
-    let config = device
-        .default_input_config()
-        .map_err(|e| anyhow!("Failed to get input config: {}", e))?;
-
-    let sample_rate = config.sample_rate().0;
-    let channels = config.channels() as usize;
-
-    let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-    let samples_writer = Arc::clone(&samples);
-
-    let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &config.into(),
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let mono: Vec<f32> = data
-                    .chunks(channels)
-                    .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-                    .collect();
-                samples_writer.lock().unwrap().extend_from_slice(&mono);
-            },
-            |e| tracing::warn!("audio stream error: {}", e),
-            None,
-        )?,
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &config.into(),
-            move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                let mono: Vec<f32> = data
-                    .chunks(channels)
-                    .map(|frame| {
-                        let sum: f32 = frame.iter().map(|&s| s as f32 / i16::MAX as f32).sum();
-                        sum / channels as f32
-                    })
-                    .collect();
-                samples_writer.lock().unwrap().extend_from_slice(&mono);
-            },
-            |e| tracing::warn!("audio stream error: {}", e),
-            None,
-        )?,
-        cpal::SampleFormat::U16 => device.build_input_stream(
-            &config.into(),
-            move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                let mono: Vec<f32> = data
-                    .chunks(channels)
-                    .map(|frame| {
-                        let sum: f32 = frame
-                            .iter()
-                            .map(|&s| s as f32 / u16::MAX as f32 * 2.0 - 1.0)
-                            .sum();
-                        sum / channels as f32
-                    })
-                    .collect();
-                samples_writer.lock().unwrap().extend_from_slice(&mono);
-            },
-            |e| tracing::warn!("audio stream error: {}", e),
-            None,
-        )?,
-        fmt => return Err(anyhow!("Unsupported audio sample format: {:?}", fmt)),
-    };
-
-    stream
-        .play()
-        .map_err(|e| anyhow!("Failed to start audio stream: {}", e))?;
+    let sample_rate = pond_audio::CAPTURE_RATE_HZ;
+    let mut reader = MicReader::new(mic.shared().clone());
+    let mut samples: Vec<f32> = Vec::new();
 
     // Record until silence or hard cap — no onset wait.
     let max_ms = max_record_secs as u64 * 1000;
@@ -191,13 +155,11 @@ pub(crate) fn record_mono_f32_until_silence(
     while elapsed_ms < max_ms {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         elapsed_ms += POLL_MS;
+        samples.extend(reader.drain());
 
-        let rms = {
-            let buf = samples.lock().unwrap();
-            let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
-            let start = buf.len().saturating_sub(recent);
-            rms_energy(&buf[start..])
-        };
+        let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
+        let start = samples.len().saturating_sub(recent);
+        let rms = rms_energy(&samples[start..]);
 
         if rms < SILENCE_RMS {
             silent_for += POLL_MS;
@@ -214,13 +176,8 @@ pub(crate) fn record_mono_f32_until_silence(
         }
     }
 
-    drop(stream);
-    let recorded = match Arc::try_unwrap(samples) {
-        Ok(mutex) => mutex.into_inner().unwrap(),
-        Err(arc) => arc.lock().unwrap().clone(),
-    };
-
-    Ok((recorded, sample_rate))
+    mic.close();
+    Ok((samples, sample_rate))
 }
 
 use pond_voice::dsp::VadEvent;
@@ -256,11 +213,13 @@ pub(crate) type SpeculativeSpawn =
 /// Returns mono f32 PCM samples and the device's sample rate.
 /// Returns `Ok((empty, rate, None))` if no speech was detected within the wait period.
 pub(crate) fn record_mono_f32_vad(
+    mic: &MicHandle,
     max_wait_secs: u32,
     max_record_secs: u32,
     silence_ms: u64,
     speculative_spawn: Option<&SpeculativeSpawn>,
     on_speculative_event: Option<&(dyn Fn(SpeculativeSignal) + Send + Sync)>,
+    audio_level_sink: Option<&ThrottledAudioLevelSink>,
 ) -> Result<(Vec<f32>, u32, Option<String>)> {
     const SPEECH_RMS: f32 = 0.010; // onset threshold — lowered for better sensitivity
     const SILENCE_RMS: f32 = 0.005; // end-of-speech threshold (hysteresis)
@@ -270,74 +229,11 @@ pub(crate) fn record_mono_f32_vad(
     // stays dark. Filtering samples after capture would leave it lit and make
     // the setting a lie.
     pond_core::models::domain::mic_gate::ensure_mic_enabled()?;
+    open_mic_and_confirm(mic)?;
 
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("No audio input device found"))?;
-
-    let config = device
-        .default_input_config()
-        .map_err(|e| anyhow!("Failed to get input config: {}", e))?;
-
-    let sample_rate = config.sample_rate().0;
-    let channels = config.channels() as usize;
-
-    let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-    let samples_writer = Arc::clone(&samples);
-
-    let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &config.into(),
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let mono: Vec<f32> = data
-                    .chunks(channels)
-                    .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-                    .collect();
-                samples_writer.lock().unwrap().extend_from_slice(&mono);
-            },
-            |e| tracing::warn!("audio stream error: {}", e),
-            None,
-        )?,
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &config.into(),
-            move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                let mono: Vec<f32> = data
-                    .chunks(channels)
-                    .map(|frame| {
-                        let sum: f32 = frame.iter().map(|&s| s as f32 / i16::MAX as f32).sum();
-                        sum / channels as f32
-                    })
-                    .collect();
-                samples_writer.lock().unwrap().extend_from_slice(&mono);
-            },
-            |e| tracing::warn!("audio stream error: {}", e),
-            None,
-        )?,
-        cpal::SampleFormat::U16 => device.build_input_stream(
-            &config.into(),
-            move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                let mono: Vec<f32> = data
-                    .chunks(channels)
-                    .map(|frame| {
-                        let sum: f32 = frame
-                            .iter()
-                            .map(|&s| s as f32 / u16::MAX as f32 * 2.0 - 1.0)
-                            .sum();
-                        sum / channels as f32
-                    })
-                    .collect();
-                samples_writer.lock().unwrap().extend_from_slice(&mono);
-            },
-            |e| tracing::warn!("audio stream error: {}", e),
-            None,
-        )?,
-        fmt => return Err(anyhow!("Unsupported audio sample format: {:?}", fmt)),
-    };
-
-    stream
-        .play()
-        .map_err(|e| anyhow!("Failed to start audio stream: {}", e))?;
+    let sample_rate = pond_audio::CAPTURE_RATE_HZ;
+    let mut reader = MicReader::new(mic.shared().clone());
+    let mut samples: Vec<f32> = Vec::new();
 
     // ── Phase 1: wait for speech onset ──────────────────────────────────────
     let max_wait_ms = max_wait_secs as u64 * 1000;
@@ -347,13 +243,14 @@ pub(crate) fn record_mono_f32_vad(
     while waited_ms < max_wait_ms {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         waited_ms += POLL_MS;
+        samples.extend(reader.drain());
 
-        let rms = {
-            let buf = samples.lock().unwrap();
-            let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
-            let start = buf.len().saturating_sub(recent);
-            rms_energy(&buf[start..])
-        };
+        let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
+        let start = samples.len().saturating_sub(recent);
+        let rms = rms_energy(&samples[start..]);
+        if let Some(sink) = audio_level_sink {
+            sink.maybe_emit(rms);
+        }
 
         if rms >= SPEECH_RMS {
             speech_detected = true;
@@ -362,12 +259,8 @@ pub(crate) fn record_mono_f32_vad(
     }
 
     if !speech_detected {
-        drop(stream);
-        let recorded = match Arc::try_unwrap(samples) {
-            Ok(mutex) => mutex.into_inner().unwrap(),
-            Err(arc) => arc.lock().unwrap().clone(),
-        };
-        return Ok((recorded, sample_rate, None)); // empty or just noise
+        mic.close();
+        return Ok((samples, sample_rate, None)); // empty or just noise
     }
 
     // ── Phase 2: record until end-of-speech ─────────────────────────────────
@@ -385,18 +278,19 @@ pub(crate) fn record_mono_f32_vad(
     while recorded_ms < max_record_ms {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
         recorded_ms += POLL_MS;
+        samples.extend(reader.drain());
 
-        let rms = {
-            let buf = samples.lock().unwrap();
-            let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
-            let start = buf.len().saturating_sub(recent);
-            rms_energy(&buf[start..])
-        };
+        let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
+        let start = samples.len().saturating_sub(recent);
+        let rms = rms_energy(&samples[start..]);
+        if let Some(sink) = audio_level_sink {
+            sink.maybe_emit(rms);
+        }
 
         match vad.on_rms(rms, SILENCE_RMS) {
             VadEvent::SpawnSpeculative => {
                 if let Some(spawn) = speculative_spawn {
-                    let snapshot = samples.lock().unwrap().clone();
+                    let snapshot = samples.clone();
                     speculative = Some(spawn(snapshot, sample_rate));
                     speculative_ready = None;
                 }
@@ -436,11 +330,7 @@ pub(crate) fn record_mono_f32_vad(
         }
     }
 
-    drop(stream);
-    let recorded = match Arc::try_unwrap(samples) {
-        Ok(mutex) => mutex.into_inner().unwrap(),
-        Err(arc) => arc.lock().unwrap().clone(),
-    };
+    mic.close();
 
     let speculative_transcript = if confirmed {
         speculative_ready.or_else(|| speculative.and_then(|h| h.join().ok().and_then(|r| r.ok())))
@@ -448,7 +338,7 @@ pub(crate) fn record_mono_f32_vad(
         None
     };
 
-    Ok((recorded, sample_rate, speculative_transcript))
+    Ok((samples, sample_rate, speculative_transcript))
 }
 
 // ── DSP helpers ───────────────────────────────────────────────────────────────
@@ -565,12 +455,26 @@ pub struct WhisperKeywordDetector {
     triggers: Vec<String>,
     prompt: String,
     config: KeywordDetectorConfig,
+    /// Optional live mic-level reporter, fed from the detection loop's own
+    /// RMS computation (wait state + post-trigger capture).
+    audio_level_sink: Option<Arc<ThrottledAudioLevelSink>>,
+    /// The single shared microphone owner. Required, not optional — every
+    /// caller must go through it so this detector can never race another
+    /// capture path (the follow-up VAD listen, in particular) for the device.
+    mic: MicHandle,
 }
 
 impl WhisperKeywordDetector {
     /// Create a detector that calls `backend` to transcribe each window.
-    /// `trigger` is the wake phrase (e.g. `"goose"`).
-    pub fn new(backend: Arc<dyn WhisperBackend>, trigger: impl Into<String>) -> Self {
+    /// `trigger` is the wake phrase (e.g. `"goose"`). `mic` is the process's
+    /// single shared microphone owner (see `pond_audio`) — passing a handle
+    /// rather than opening a device here is what lets this detector and the
+    /// follow-up VAD capture share one device safely.
+    pub fn new(
+        backend: Arc<dyn WhisperBackend>,
+        trigger: impl Into<String>,
+        mic: MicHandle,
+    ) -> Self {
         let raw = trigger.into();
         let prompt = format!("say \"{}\"", raw);
         Self {
@@ -578,7 +482,16 @@ impl WhisperKeywordDetector {
             triggers: vec![normalize_transcript(&raw)],
             prompt,
             config: KeywordDetectorConfig::default(),
+            audio_level_sink: None,
+            mic,
         }
+    }
+
+    /// Report live mic RMS level through `sink` while waiting for the wake
+    /// word and while capturing trailing command audio after it fires.
+    pub fn with_audio_level_sink(mut self, sink: Arc<ThrottledAudioLevelSink>) -> Self {
+        self.audio_level_sink = Some(sink);
+        self
     }
 
     /// Load calibrated transcription variants collected during onboarding.
@@ -667,12 +580,20 @@ use pond_voice::text::normalize_transcript;
 /// Returns 0.0 for an empty slice.
 use pond_voice::dsp::rms as rms_energy;
 
+// ThrottledAudioLevelSink now lives in pond-core (shared::domain::agent) so
+// the piper adapter (TTS output amplitude) can reuse it too, without one
+// adapter crate depending on another. Re-exported here so existing call
+// sites in this file don't need to change their references.
+pub use pond_core::shared::domain::agent::ThrottledAudioLevelSink;
+
 #[async_trait]
 impl StreamingWakeWordDetector for WhisperKeywordDetector {
     async fn wait_for_activation_with_audio(&self) -> Result<WakeWordActivation> {
         let backend = self.backend.clone();
         let triggers = self.triggers.clone();
         let config = self.config.clone();
+        let audio_level_sink = self.audio_level_sink.clone();
+        let mic = self.mic.clone();
 
         // `run_loop` races this future against the turn and drops it when the
         // turn wins. Dropping a `spawn_blocking` JoinHandle DETACHES the task —
@@ -684,9 +605,11 @@ impl StreamingWakeWordDetector for WhisperKeywordDetector {
         let stop = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = StopOnDrop(stop.clone());
 
-        tokio::task::spawn_blocking(move || detection_loop(backend, triggers, config, stop))
-            .await
-            .map_err(|e| anyhow!("detection thread panicked: {}", e))?
+        tokio::task::spawn_blocking(move || {
+            detection_loop(backend, triggers, config, stop, audio_level_sink, mic)
+        })
+        .await
+        .map_err(|e| anyhow!("detection thread panicked: {}", e))?
     }
 
     fn activation_prompt(&self) -> &str {
@@ -728,80 +651,35 @@ fn sleep_unless_stopped(ms: u64, stop: &AtomicBool) -> bool {
 
 /// Blocking detection loop — runs inside `tokio::task::spawn_blocking`.
 ///
-/// Opens a continuous cpal input stream into a ring buffer, then slides a
-/// detection window over it, sending each window to whisper.cpp for
-/// transcription.  Returns when the trigger phrase is confirmed.
+/// Reads from the shared mic owner's rolling ring buffer, sliding a detection
+/// window over it and sending each window to whisper.cpp for transcription.
+/// Returns when the trigger phrase is confirmed.
+///
+/// The owner's ring must be sized (at `pond_audio::spawn` time) to cover
+/// `window_ms.max(lookback_ms) + post_trigger_ms` — this loop only reads it,
+/// it does not size it.
 fn detection_loop(
     backend: Arc<dyn WhisperBackend>,
     triggers: Vec<String>,
     config: KeywordDetectorConfig,
     stop: Arc<AtomicBool>,
+    audio_level_sink: Option<Arc<ThrottledAudioLevelSink>>,
+    mic: MicHandle,
 ) -> Result<WakeWordActivation> {
-    // ── Open continuous audio stream ─────────────────────────────────────────
     // Privacy gate: refuse to OPEN the device, so the OS microphone indicator
     // stays dark. Filtering samples after capture would leave it lit and make
     // the setting a lie.
     pond_core::models::domain::mic_gate::ensure_mic_enabled()?;
+    // Keep the generation this open claimed. Every release below is scoped to
+    // it, because this function runs on a DETACHED blocking thread: when a turn
+    // is cancelled the orchestrator stops waiting and starts the follow-up
+    // capture, and this thread then reaches its release with the device already
+    // belonging to somebody else. An unconditional close there presents as a
+    // conversation that hears nothing after the wake word, attributed to a
+    // component that has already exited.
+    let session = open_mic_and_confirm(&mic)?;
 
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("No audio input device found"))?;
-    let stream_config = device
-        .default_input_config()
-        .map_err(|e| anyhow!("Failed to get input config: {}", e))?;
-
-    let sample_rate = stream_config.sample_rate().0;
-    let channels = stream_config.channels() as usize;
-
-    // The ring must satisfy whichever reader needs more history: detection
-    // reads one `window_ms`, and a capture reads `lookback_ms` before the
-    // trigger plus up to `post_trigger_ms` after it.
-    let history_ms = config.window_ms.max(config.lookback_ms) + config.post_trigger_ms;
-    let max_samples = (history_ms * sample_rate as u64 / 1000) as usize;
-    let ring: Arc<Mutex<VecDeque<f32>>> =
-        Arc::new(Mutex::new(VecDeque::with_capacity(max_samples)));
-    let ring_writer = ring.clone();
-
-    let stream = match stream_config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &stream_config.into(),
-            move |data: &[f32], _| {
-                let mut r = ring_writer.lock().unwrap();
-                for chunk in data.chunks(channels) {
-                    let mono = chunk.iter().copied().sum::<f32>() / channels as f32;
-                    r.push_back(mono);
-                }
-                while r.len() > max_samples {
-                    r.pop_front();
-                }
-            },
-            |e| tracing::warn!("audio stream error: {}", e),
-            None,
-        )?,
-        cpal::SampleFormat::I16 => {
-            let ring_writer2 = ring.clone();
-            device.build_input_stream(
-                &stream_config.into(),
-                move |data: &[i16], _| {
-                    let mut r = ring_writer2.lock().unwrap();
-                    for chunk in data.chunks(channels) {
-                        let sum: f32 = chunk.iter().map(|&s| s as f32 / i16::MAX as f32).sum();
-                        r.push_back(sum / channels as f32);
-                    }
-                    while r.len() > max_samples {
-                        r.pop_front();
-                    }
-                },
-                |e| tracing::warn!("audio stream error: {}", e),
-                None,
-            )?
-        }
-        fmt => return Err(anyhow!("Unsupported audio format: {:?}", fmt)),
-    };
-    stream
-        .play()
-        .map_err(|e| anyhow!("Failed to start audio stream: {}", e))?;
+    let sample_rate = pond_audio::CAPTURE_RATE_HZ;
 
     // ── Cooldown — wait before re-arming (prevents TTS echo re-trigger) ───────
     // Slept in slices so a cancelled turn is not stuck here for the full
@@ -809,6 +687,7 @@ fn detection_loop(
     if config.cooldown_ms > 0 {
         tracing::debug!("KWS: cooldown {}ms before arming", config.cooldown_ms);
         if !sleep_unless_stopped(config.cooldown_ms, &stop) {
+            mic.close_session(session);
             return Err(anyhow!("wake-word detection cancelled"));
         }
     }
@@ -820,33 +699,31 @@ fn detection_loop(
     loop {
         if !sleep_unless_stopped(slide_ms, &stop) {
             tracing::debug!("KWS: cancelled — releasing the microphone");
+            mic.close_session(session);
             return Err(anyhow!("wake-word detection cancelled"));
         }
 
-        // Snapshot the latest window_ms samples from the ring buffer.
-        let snapshot: Vec<f32> = {
-            let r = ring.lock().unwrap();
-            let start = r.len().saturating_sub(window_samples);
-            r.range(start..).copied().collect()
-        };
+        // Snapshot the latest window_ms samples from the shared ring.
+        let snapshot = mic.shared().recent(window_samples);
 
         if snapshot.len() < window_samples / 2 {
             continue; // buffer not yet full enough — keep waiting
         }
 
         // ── Energy gate — skip silent windows before hitting whisper ──────────
-        if config.energy_threshold > 0.0 {
-            let rms = rms_energy(&snapshot);
-            if rms < config.energy_threshold {
-                tracing::trace!("KWS: silent window skipped (rms={:.4})", rms);
-                continue;
-            }
+        // RMS is computed unconditionally (not just when the gate is active)
+        // so the audio-level sink still gets readings when energy_threshold is 0.
+        let window_rms = rms_energy(&snapshot);
+        if let Some(sink) = &audio_level_sink {
+            sink.maybe_emit(window_rms);
+        }
+        if config.energy_threshold > 0.0 && window_rms < config.energy_threshold {
+            tracing::trace!("KWS: silent window skipped (rms={:.4})", window_rms);
+            continue;
         }
 
-        // Transcribe the window via the backend (in-process or HTTP).
-        let resampled = resample_to_16k(&snapshot, sample_rate);
-
-        let transcript = match backend.transcribe_pcm_blocking(&resampled) {
+        // The shared ring is already normalised 16 kHz mono f32 — no resample.
+        let transcript = match backend.transcribe_pcm_blocking(&snapshot) {
             Ok(t) if !t.is_empty() => {
                 // Backend implementations already strip artifacts, but call
                 // it again so a stray bracketed tag never makes it into the
@@ -899,18 +776,21 @@ fn detection_loop(
 
             while elapsed_ms < config.post_trigger_ms {
                 if !sleep_unless_stopped(poll_ms, &stop) {
+                    mic.close();
                     return Err(anyhow!("wake-word detection cancelled"));
                 }
                 elapsed_ms += poll_ms;
 
+                // Computed unconditionally (not just when the VAD-silence gate
+                // below is active) so the audio-level sink keeps reporting
+                // through the whole post-trigger capture window.
+                let recent_samples = (sample_rate as u64 * poll_ms / 1000) as usize;
+                let recent_rms = rms_energy(&mic.shared().recent(recent_samples));
+                if let Some(sink) = &audio_level_sink {
+                    sink.maybe_emit(recent_rms);
+                }
+
                 if config.post_trigger_silence_ms > 0 && config.silence_threshold > 0.0 {
-                    let recent_rms = {
-                        let r = ring.lock().unwrap();
-                        let recent_samples = (sample_rate as u64 * poll_ms / 1000) as usize;
-                        let start = r.len().saturating_sub(recent_samples);
-                        let chunk: Vec<f32> = r.range(start..).copied().collect();
-                        rms_energy(&chunk)
-                    };
                     if recent_rms < config.silence_threshold {
                         silent_for_ms += poll_ms;
                         if silent_for_ms >= config.post_trigger_silence_ms {
@@ -934,11 +814,7 @@ fn detection_loop(
             // and is removed from the transcript, not from the audio.
             let captured_ms = elapsed_ms + config.lookback_ms;
             let captured_samples = (captured_ms * sample_rate as u64 / 1000) as usize;
-            let command_audio: Vec<f32> = {
-                let r = ring.lock().unwrap();
-                let start = r.len().saturating_sub(captured_samples);
-                r.range(start..).copied().collect()
-            };
+            let command_audio = mic.shared().recent(captured_samples);
             tracing::debug!(
                 "KWS: captured {}ms ({}ms lookback + {}ms after the trigger)",
                 captured_ms,
@@ -946,10 +822,9 @@ fn detection_loop(
                 elapsed_ms
             );
 
-            drop(stream); // stop recording
+            mic.close();
 
-            let cmd_resampled = resample_to_16k(&command_audio, sample_rate);
-            let cmd_wav = encode_wav_mono_16k(&cmd_resampled);
+            let cmd_wav = encode_wav_mono_16k(&command_audio);
 
             return Ok(WakeWordActivation {
                 captured_audio: Some(cmd_wav),
@@ -1078,12 +953,24 @@ mod tests {
         }
     }
 
+    /// A `MicHandle` backed by a scripted (no-hardware) device, for tests
+    /// that only need a valid handle to construct — not to actually capture.
+    fn test_mic() -> MicHandle {
+        let (mic, _join) = pond_audio::spawn(
+            Box::new(pond_audio::testing::ScriptedCapture::silence(0, 20)),
+            pond_audio::CAPTURE_RATE_HZ,
+            5_000,
+            true,
+        );
+        mic
+    }
+
     /// The transcriber strips exactly what the detector matched, so the list
     /// has to be reachable — and every entry normalized, or a variant with a
     /// capital or a comma would match but never strip.
     #[test]
     fn the_resolved_triggers_are_exposed_and_all_normalized() {
-        let d = WhisperKeywordDetector::new(Arc::new(DeafBackend), "goose")
+        let d = WhisperKeywordDetector::new(Arc::new(DeafBackend), "goose", test_mic())
             .with_transcriptions(vec!["Hey, Goose!".into(), "  a goose  ".into()]);
 
         let triggers = d.triggers();
@@ -1103,7 +990,7 @@ mod tests {
     /// renders unusually.
     #[test]
     fn calibrated_variants_and_builtin_mishearings_both_survive() {
-        let d = WhisperKeywordDetector::new(Arc::new(DeafBackend), "goose")
+        let d = WhisperKeywordDetector::new(Arc::new(DeafBackend), "goose", test_mic())
             .with_transcriptions(vec!["goose".into(), "Hey, Goose.".into()]);
         let t = d.triggers();
         assert!(t.iter().any(|x| x == "hey goose"), "calibrated: {t:?}");
@@ -1312,6 +1199,69 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_millis(1_000),
             "woke after {elapsed:?}; should be within one 50ms slice of the signal"
+        );
+    }
+
+    // ── Shared mic owner: the wake-word/VAD handoff race ────────────────────
+
+    /// The scenario the mic-race investigation found completely untested: the
+    /// wake-word detector fires and hands the mic back, and the very next
+    /// thing that happens is a follow-up VAD capture opening the *same*
+    /// handle again — exactly what `run_loop` does between conversational
+    /// turns. Before this, each used its own independent `cpal` stream with
+    /// no ordering guarantee between one's teardown and the other's open;
+    /// now both go through one serialized owner, so the second open can
+    /// never fail because the first had not finished closing yet.
+    #[tokio::test]
+    async fn wake_word_then_follow_up_capture_share_the_mic_without_racing() {
+        struct AlwaysMatches;
+        impl WhisperBackend for AlwaysMatches {
+            fn transcribe_pcm_blocking(&self, _: &[f32]) -> Result<String> {
+                Ok("goose".to_string())
+            }
+        }
+
+        let (mic, _join) = pond_audio::spawn(
+            Box::new(pond_audio::testing::ScriptedCapture::utterance(
+                2_000, 2_000, 20,
+            )),
+            pond_audio::CAPTURE_RATE_HZ,
+            15_000,
+            true,
+        );
+
+        let detector = WhisperKeywordDetector::new(Arc::new(AlwaysMatches), "goose", mic.clone())
+            .with_config(KeywordDetectorConfig {
+                cooldown_ms: 0,
+                window_ms: 200,
+                slide_ms: 20,
+                lookback_ms: 100,
+                post_trigger_ms: 100,
+                post_trigger_silence_ms: 0,
+                ..KeywordDetectorConfig::default()
+            });
+
+        let activation = detector
+            .wait_for_activation_with_audio()
+            .await
+            .expect("wake word must fire against a scripted utterance");
+        assert!(
+            activation.captured_audio.is_some(),
+            "a confirmed activation must carry captured command audio"
+        );
+
+        // The detector's `mic.close()` and this follow-up `mic.open()` race
+        // exactly the way `run_loop` races them between turns.
+        let result = tokio::task::spawn_blocking(move || {
+            record_mono_f32_vad(&mic, 1, 1, 200, None, None, None)
+        })
+        .await
+        .expect("capture thread must not panic");
+
+        assert!(
+            result.is_ok(),
+            "the follow-up capture must not fail from a device race: {:?}",
+            result.err()
         );
     }
 }

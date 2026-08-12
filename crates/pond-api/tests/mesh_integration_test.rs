@@ -79,7 +79,7 @@ async fn make_app() -> (axum::Router, Arc<SqliteCreditLedger>, tempfile::TempDir
         recipe_repo: None,
         llamafile_manager: None,
         operational_log: None,
-        commissioner: None,
+        matter: None,
         oauth_outcomes: pond_api::oauth_callback::new_oauth_outcomes(),
         event_bus: None,
         event_log: None,

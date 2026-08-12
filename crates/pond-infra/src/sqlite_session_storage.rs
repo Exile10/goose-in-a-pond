@@ -41,6 +41,7 @@ struct MessageRow {
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
     reasoning_tokens: Option<i64>,
+    liked: Option<i64>,
 }
 
 // ── Conversion helpers ────────────────────────────────────────────────────────
@@ -116,6 +117,7 @@ impl TryFrom<MessageRow> for SessionMessage {
             prompt_tokens: r.prompt_tokens.map(|v| v as u32),
             completion_tokens: r.completion_tokens.map(|v| v as u32),
             reasoning_tokens: r.reasoning_tokens.map(|v| v as u32),
+            liked: r.liked.map(|v| v != 0),
         })
     }
 }
@@ -683,7 +685,7 @@ impl SessionStorage for SqliteSessionStorage {
 
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
-             prompt_tokens, completion_tokens, reasoning_tokens \
+             prompt_tokens, completion_tokens, reasoning_tokens, liked \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at ASC, rowid ASC",
@@ -747,7 +749,7 @@ impl SessionStorage for SqliteSessionStorage {
 
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
-             prompt_tokens, completion_tokens, reasoning_tokens \
+             prompt_tokens, completion_tokens, reasoning_tokens, liked \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at ASC, rowid ASC \
@@ -773,7 +775,7 @@ impl SessionStorage for SqliteSessionStorage {
         // Fetch newest-first, then reverse to return chronological order.
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, session_id, role, content, tool_call_id, tool_calls_json, created_at, \
-             prompt_tokens, completion_tokens, reasoning_tokens \
+             prompt_tokens, completion_tokens, reasoning_tokens, liked \
              FROM session_messages \
              WHERE session_id = ? \
              ORDER BY created_at DESC, rowid DESC \
@@ -1001,6 +1003,27 @@ impl SessionStorage for SqliteSessionStorage {
         Ok(())
     }
 
+    async fn set_message_feedback(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        liked: Option<bool>,
+    ) -> Result<(), SessionStorageError> {
+        let result =
+            sqlx::query("UPDATE session_messages SET liked = ? WHERE id = ? AND session_id = ?")
+                .bind(liked.map(|v| v as i64))
+                .bind(message_id)
+                .bind(session_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(SessionStorageError::MessageNotFound(message_id.to_string()));
+        }
+        Ok(())
+    }
+
     async fn get_thinking_for_session(
         &self,
         session_id: &str,
@@ -1025,6 +1048,87 @@ impl SessionStorage for SqliteSessionStorage {
             out.entry(message_id).or_default().push(content);
         }
         Ok(out)
+    }
+
+    async fn delete_messages_from(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<(), SessionStorageError> {
+        // The attachments of the messages about to go, gathered BEFORE the
+        // delete because afterwards there is no way to find them: the rows are
+        // keyed to `message_id`, and nothing cascades. Without this an edited
+        // turn leaves its `message_attachments` rows pointing at files that
+        // belong to no message, and the files themselves on disk forever —
+        // `remove_session_attachment_files` only runs when the whole session is
+        // deleted, and it removes the entire directory, which is far too broad
+        // here.
+        let orphaned: Vec<String> = sqlx::query_scalar(
+            "SELECT a.file_path FROM message_attachments a \
+             JOIN session_messages m ON m.id = a.message_id \
+             WHERE m.session_id = ?1 \
+               AND m.rowid >= (SELECT rowid FROM session_messages WHERE id = ?2 AND session_id = ?1)",
+        )
+        .bind(session_id)
+        .bind(message_id)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        sqlx::query(
+            "DELETE FROM message_attachments \
+             WHERE message_id IN ( \
+                 SELECT id FROM session_messages \
+                 WHERE session_id = ?1 \
+                   AND rowid >= (SELECT rowid FROM session_messages WHERE id = ?2 AND session_id = ?1) \
+             )",
+        )
+        .bind(session_id)
+        .bind(message_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        // rowid, not created_at: two messages in the same turn can share a
+        // second-resolution timestamp, and `>=` on created_at alone could
+        // sweep up an earlier sibling row. rowid is SQLite's own insertion
+        // order, so it is a stable tiebreaker — the same one get_messages()
+        // and friends already use as `ORDER BY created_at ASC, rowid ASC`.
+        let result = sqlx::query(
+            "DELETE FROM session_messages \
+             WHERE session_id = ?1 \
+               AND rowid >= (SELECT rowid FROM session_messages WHERE id = ?2 AND session_id = ?1)",
+        )
+        .bind(session_id)
+        .bind(message_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        // Files last, and best-effort: a file that fails to unlink is wasted
+        // disk, whereas a row that outlives its message is a broken reference
+        // the attachment route can still be asked for.
+        for path in orphaned {
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                tracing::warn!(
+                    path = %path,
+                    error = %e,
+                    "could not remove the attachment file of a truncated message"
+                );
+            }
+        }
+
+        if result.rows_affected() == 0 {
+            return Err(SessionStorageError::MessageNotFound(message_id.to_string()));
+        }
+
+        sqlx::query("UPDATE sessions SET updated_at = datetime('now') WHERE id = ?")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        Ok(())
     }
 }
 
@@ -1189,6 +1293,137 @@ mod tests {
         assert!(matches!(
             s.get_session("sess-1").await,
             Err(SessionStorageError::SessionNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn new_messages_default_to_no_feedback() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new(
+                "m1".to_string(),
+                "sess-1".to_string(),
+                ChatMessage::assistant("Hi"),
+            ),
+        )
+        .await
+        .unwrap();
+        let msgs = s.get_messages("sess-1").await.unwrap();
+        assert_eq!(msgs[0].liked, None);
+    }
+
+    #[tokio::test]
+    async fn feedback_round_trips_like_dislike_and_clear() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new(
+                "m1".to_string(),
+                "sess-1".to_string(),
+                ChatMessage::assistant("Hi"),
+            ),
+        )
+        .await
+        .unwrap();
+
+        s.set_message_feedback("sess-1", "m1", Some(true))
+            .await
+            .unwrap();
+        assert_eq!(s.get_messages("sess-1").await.unwrap()[0].liked, Some(true));
+
+        s.set_message_feedback("sess-1", "m1", Some(false))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_messages("sess-1").await.unwrap()[0].liked,
+            Some(false)
+        );
+
+        s.set_message_feedback("sess-1", "m1", None).await.unwrap();
+        assert_eq!(s.get_messages("sess-1").await.unwrap()[0].liked, None);
+    }
+
+    #[tokio::test]
+    async fn feedback_on_missing_message_errors() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        assert!(matches!(
+            s.set_message_feedback("sess-1", "missing", Some(true))
+                .await,
+            Err(SessionStorageError::MessageNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_messages_from_removes_the_target_and_everything_after() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        for (id, text) in [("m1", "First"), ("m2", "Second"), ("m3", "Third")] {
+            s.add_message(
+                "sess-1".to_string(),
+                SessionMessage::new(
+                    id.to_string(),
+                    "sess-1".to_string(),
+                    ChatMessage::user(text),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        s.delete_messages_from("sess-1", "m2").await.unwrap();
+
+        let msgs = s.get_messages("sess-1").await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "m1");
+    }
+
+    /// "Refresh" keeps the user's message and only drops the reply after it —
+    /// this is what makes that possible: truncating from the assistant
+    /// message's id leaves every earlier message, including its own user
+    /// prompt, untouched.
+    #[tokio::test]
+    async fn delete_messages_from_the_assistant_reply_keeps_the_user_prompt() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new(
+                "m1".to_string(),
+                "sess-1".to_string(),
+                ChatMessage::user("Question"),
+            ),
+        )
+        .await
+        .unwrap();
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new(
+                "m2".to_string(),
+                "sess-1".to_string(),
+                ChatMessage::assistant("Answer"),
+            ),
+        )
+        .await
+        .unwrap();
+
+        s.delete_messages_from("sess-1", "m2").await.unwrap();
+
+        let msgs = s.get_messages("sess-1").await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "m1");
+    }
+
+    #[tokio::test]
+    async fn delete_messages_from_missing_message_errors() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        assert!(matches!(
+            s.delete_messages_from("sess-1", "missing").await,
+            Err(SessionStorageError::MessageNotFound(_))
         ));
     }
 
@@ -1498,6 +1733,60 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// Truncating a turn takes its attachments with it -- rows AND files.
+    ///
+    /// Nothing cascades from `session_messages` to `message_attachments`, and
+    /// the only file cleanup in this module removes the whole session
+    /// directory, which runs only on a full session delete. So an edited turn
+    /// used to leave rows pointing at a message that no longer exists, and the
+    /// image bytes on disk forever -- on a Jetson, where the disk is the thing
+    /// that runs out.
+    #[tokio::test]
+    async fn truncating_a_message_removes_its_attachments_and_their_files() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-img".to_string()).await.unwrap();
+        seed_image_message(&s, "sess-img", "keep", vec![png(TINY_PNG)]).await;
+        seed_image_message(&s, "sess-img", "drop", vec![png(TINY_PNG)]).await;
+
+        let before = s.list_session_attachments("sess-img").await.unwrap();
+        assert_eq!(before.len(), 2, "both turns have an attachment to start");
+        let doomed: Vec<String> =
+            sqlx::query_scalar("SELECT file_path FROM message_attachments WHERE message_id = ?")
+                .bind("drop")
+                .fetch_all(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(doomed.len(), 1);
+        assert!(
+            std::path::Path::new(&doomed[0]).exists(),
+            "the fixture never wrote the file, so this test would pass vacuously"
+        );
+
+        s.delete_messages_from("sess-img", "drop").await.unwrap();
+
+        let after = s.list_session_attachments("sess-img").await.unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "the truncated message left its attachment row behind, pointing at \
+             a message that no longer exists"
+        );
+        assert!(
+            !std::path::Path::new(&doomed[0]).exists(),
+            "the attachment row went but its file is still on disk"
+        );
+
+        // The surviving turn is untouched: this must delete forward, not all.
+        let kept: Vec<String> =
+            sqlx::query_scalar("SELECT file_path FROM message_attachments WHERE message_id = ?")
+                .bind("keep")
+                .fetch_all(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(kept.len(), 1);
+        assert!(std::path::Path::new(&kept[0]).exists());
     }
 
     fn png(data: &str) -> ImageAttachment {

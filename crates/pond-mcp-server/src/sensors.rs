@@ -4,6 +4,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use pond_core::user_data::ports::sensor_storage::SensorStorage;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -59,17 +60,42 @@ pub struct ListSensorsParams {
 #[derive(Clone)]
 pub struct SensorsMcpServer {
     sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
+    /// Read only to answer for sensors that have never reported. Readings
+    /// alone cannot distinguish "no such device" from "that device is here and
+    /// has said nothing yet", and the two need opposite replies.
+    device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl SensorsMcpServer {
-    pub fn new(sensor_storage: Arc<dyn SensorStorage + Send + Sync>) -> Self {
+    pub fn new(
+        sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
+        device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
+    ) -> Self {
         Self {
             sensor_storage,
+            device_registry,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Registered sensing devices that have no stored reading.
+    ///
+    /// A commissioned sensor is a device long before it is a row of readings —
+    /// asked about one, the old answer was "no sensor readings have been
+    /// recorded", which a model relays as "you have no such sensor".
+    async fn silent_sensors(&self, reported: &[(String, String)]) -> Vec<String> {
+        let Ok(devices) = self.device_registry.list_devices().await else {
+            return Vec::new();
+        };
+        devices
+            .into_iter()
+            .filter(|d| matches!(d.device_type.as_str(), "sensor" | "alarm"))
+            .filter(|d| !reported.iter().any(|(device, _)| device == &d.id))
+            .map(|d| format!("  {} ({}) — registered, no readings yet", d.id, d.name))
+            .collect()
     }
 
     #[tool(
@@ -267,17 +293,22 @@ impl SensorsMcpServer {
         crate::set_current_tool("list_sensors");
 
         match self.sensor_storage.list_sensors().await {
-            Ok(pairs) if pairs.is_empty() => Ok(CallToolResult::success(vec![Content::text(
-                "No sensor readings have been recorded yet.",
-            )])),
             Ok(pairs) => {
-                let lines: Vec<String> = pairs
+                let mut lines: Vec<String> = pairs
                     .iter()
                     .map(|(device, stype)| format!("  {device} — {stype}"))
                     .collect();
+                let silent = self.silent_sensors(&pairs).await;
+                let total = lines.len() + silent.len();
+                lines.extend(silent);
+
+                if lines.is_empty() {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        "No sensors are registered, and no readings have been recorded.",
+                    )]));
+                }
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Known sensors ({} total):\n{}",
-                    pairs.len(),
+                    "Known sensors ({total} total):\n{}",
                     lines.join("\n"),
                 ))]))
             }
@@ -352,14 +383,21 @@ use tokio::io::DuplexStream;
 
 struct SensorDeps {
     sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
+    device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
 }
 
 static SENSOR_DEPS: OnceLock<SensorDeps> = OnceLock::new();
 
 /// Install the sensor server's storage handle. Call once at startup,
 /// before any chat session loads the extension.
-pub fn init_sensor_deps(sensor_storage: Arc<dyn SensorStorage + Send + Sync>) {
-    let _ = SENSOR_DEPS.set(SensorDeps { sensor_storage });
+pub fn init_sensor_deps(
+    sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
+    device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
+) {
+    let _ = SENSOR_DEPS.set(SensorDeps {
+        sensor_storage,
+        device_registry,
+    });
 }
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
@@ -370,7 +408,7 @@ pub fn spawn_sensor_server(reader: DuplexStream, writer: DuplexStream) {
         );
         return;
     };
-    let server = SensorsMcpServer::new(deps.sensor_storage.clone());
+    let server = SensorsMcpServer::new(deps.sensor_storage.clone(), deps.device_registry.clone());
     tokio::spawn(async move {
         match server.serve((reader, writer)).await {
             Ok(running) => {
@@ -390,11 +428,59 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use pond_core::user_data::domain::sensor::SensorReading;
+    use pond_core::user_data::ports::device_registry::DeviceRegistry;
     use pond_core::user_data::ports::sensor_storage::SensorStorage;
     use rmcp::model::RequestId;
     use rmcp::service::serve_directly;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    use pond_core::user_data::ports::device_registry::{Device, RegisterDeviceRequest};
+
+    /// Registry stub, same reason as `StubStorage`: the pond-core mocks sit
+    /// behind a feature gate.
+    struct StubRegistry(Vec<Device>);
+
+    #[async_trait]
+    impl DeviceRegistry for StubRegistry {
+        async fn register(&self, _: RegisterDeviceRequest) -> Result<Device> {
+            unimplemented!("not exercised by the sensor tools")
+        }
+        async fn list_devices(&self) -> Result<Vec<Device>> {
+            Ok(self.0.clone())
+        }
+        async fn get_device(&self, id: &str) -> Result<Option<Device>> {
+            Ok(self.0.iter().find(|d| d.id == id).cloned())
+        }
+        async fn unregister(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn heartbeat(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn rename(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn empty_registry() -> Arc<dyn DeviceRegistry + Send + Sync> {
+        Arc::new(StubRegistry(Vec::new()))
+    }
+
+    fn sensor_device(id: &str, name: &str) -> Device {
+        Device {
+            id: id.to_string(),
+            name: name.to_string(),
+            device_type: "sensor".to_string(),
+            hostname: None,
+            ip_address: None,
+            capabilities: Vec::new(),
+            registered_at: Utc::now().to_rfc3339(),
+            last_seen: None,
+            is_online: true,
+            room: None,
+        }
+    }
 
     // Minimal in-test stub — avoids the `pond-core/test-mocks` feature gate.
     struct StubStorage {
@@ -480,7 +566,7 @@ mod tests {
     fn make_ctx() -> RequestContext<RoleServer> {
         let (_client, stream) = tokio::io::duplex(64);
         let running = serve_directly(
-            SensorsMcpServer::new(Arc::new(StubStorage::new())),
+            SensorsMcpServer::new(Arc::new(StubStorage::new()), empty_registry()),
             stream,
             None,
         );
@@ -519,7 +605,7 @@ mod tests {
             .await
             .unwrap();
 
-        let server = SensorsMcpServer::new(storage);
+        let server = SensorsMcpServer::new(storage, empty_registry());
         let params = Parameters(GetSensorReadingParams {
             device_id: Some("bedroom".to_string()),
             sensor_type: Some("temperature".to_string()),
@@ -535,7 +621,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_sensor_reading_missing_params_returns_guidance() {
-        let server = SensorsMcpServer::new(Arc::new(StubStorage::new()));
+        let server = SensorsMcpServer::new(Arc::new(StubStorage::new()), empty_registry());
         let params = Parameters(GetSensorReadingParams::default());
         let text = text_of(server.get_sensor_reading(make_ctx(), params).await.unwrap());
         assert!(
@@ -556,7 +642,7 @@ mod tests {
             .await
             .unwrap();
 
-        let server = SensorsMcpServer::new(storage);
+        let server = SensorsMcpServer::new(storage, empty_registry());
         let text = text_of(
             server
                 .list_sensors(make_ctx(), Parameters(ListSensorsParams::default()))
@@ -565,6 +651,54 @@ mod tests {
         );
         assert!(text.contains("bedroom"), "should list bedroom: {text}");
         assert!(text.contains("kitchen"), "should list kitchen: {text}");
+    }
+
+    /// A commissioned sensor is a device long before it is a row of readings.
+    /// Listing only what has reported answered "no sensor readings recorded",
+    /// which a model relays as "you have no such sensor" — while the device sat
+    /// in the list, online.
+    #[tokio::test]
+    async fn a_registered_sensor_is_listed_even_before_it_reports() {
+        let registry = Arc::new(StubRegistry(vec![sensor_device(
+            "matter-18",
+            "Air Quality Sensor",
+        )]));
+        let server = SensorsMcpServer::new(Arc::new(StubStorage::new()), registry);
+
+        let text = text_of(
+            server
+                .list_sensors(make_ctx(), Parameters(ListSensorsParams::default()))
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("matter-18"), "names the device: {text}");
+        assert!(
+            text.contains("no readings yet"),
+            "and says why it has nothing to show: {text}"
+        );
+    }
+
+    /// The silent list must not duplicate a sensor that has in fact reported.
+    #[tokio::test]
+    async fn a_reporting_sensor_is_listed_once() {
+        let storage = Arc::new(StubStorage::new());
+        storage
+            .record(reading("matter-18", "air_quality", 3.0))
+            .await
+            .unwrap();
+        let registry = Arc::new(StubRegistry(vec![sensor_device(
+            "matter-18",
+            "Air Quality Sensor",
+        )]));
+
+        let text = text_of(
+            SensorsMcpServer::new(storage, registry)
+                .list_sensors(make_ctx(), Parameters(ListSensorsParams::default()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(text.matches("matter-18").count(), 1, "listed once: {text}");
+        assert!(!text.contains("no readings yet"), "{text}");
     }
 
     #[tokio::test]
@@ -583,7 +717,7 @@ mod tests {
             .await
             .unwrap();
 
-        let server = SensorsMcpServer::new(storage);
+        let server = SensorsMcpServer::new(storage, empty_registry());
         let params = Parameters(GetSensorHistoryParams {
             device_id: Some("living-room".to_string()),
             sensor_type: Some("temperature".to_string()),
@@ -598,7 +732,7 @@ mod tests {
 
     #[test]
     fn server_constructs() {
-        let _server = SensorsMcpServer::new(Arc::new(StubStorage::new()));
+        let _server = SensorsMcpServer::new(Arc::new(StubStorage::new()), empty_registry());
     }
 
     #[test]

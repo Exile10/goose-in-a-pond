@@ -29,6 +29,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use piper_rs::Piper;
 use pond_core::models::ports::voice_output::VoiceOutput;
+use pond_core::shared::domain::agent::ThrottledAudioLevelSink;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -75,6 +76,11 @@ pub struct PiperRsOutput {
     /// calls reuse `audio_handle` to create sinks — no repeated open/close churn.
     _audio_keeper: AudioKeeper,
     audio_handle: rodio::OutputStreamHandle,
+    /// Optional live playback-amplitude reporter, fed a per-tick reading from
+    /// each WAV's precomputed envelope during play_wav_on_handle (the
+    /// `speaking` state's analog of the mic-input RMS reported by the
+    /// whisper adapter during `wait`/`recording`).
+    audio_level_sink: Option<Arc<ThrottledAudioLevelSink>>,
 }
 
 impl PiperRsOutput {
@@ -113,7 +119,14 @@ impl PiperRsOutput {
             speech_interrupted: Arc::new(AtomicBool::new(false)),
             _audio_keeper: audio_keeper,
             audio_handle,
+            audio_level_sink: None,
         })
+    }
+
+    /// Report live TTS playback amplitude through `sink` while speaking.
+    pub fn with_audio_level_sink(mut self, sink: Arc<ThrottledAudioLevelSink>) -> Self {
+        self.audio_level_sink = Some(sink);
+        self
     }
 
     /// Point espeak-rs at a specific `espeak-ng-data` directory.
@@ -299,16 +312,20 @@ impl VoiceOutput for PiperRsOutput {
             let flag = self.speech_interrupted.clone();
             let gen = self.utterance.clone();
             let handle = self.audio_handle.clone();
-            tokio::task::spawn_blocking(move || play_wav_on_handle(part1, &handle, &flag, &gen))
-                .await
-                .context("playback task panicked")??;
+            let sink = self.audio_level_sink.clone();
+            tokio::task::spawn_blocking(move || {
+                play_wav_on_handle(part1, &handle, &flag, &gen, sink.as_deref())
+            })
+            .await
+            .context("playback task panicked")??;
 
             if !self.speech_interrupted.load(Ordering::Relaxed) {
                 let flag = self.speech_interrupted.clone();
                 let gen = self.utterance.clone();
                 let handle = self.audio_handle.clone();
+                let sink = self.audio_level_sink.clone();
                 tokio::task::spawn_blocking(move || {
-                    play_wav_on_handle(part2, &handle, &flag, &gen)
+                    play_wav_on_handle(part2, &handle, &flag, &gen, sink.as_deref())
                 })
                 .await
                 .context("playback task panicked")??;
@@ -317,9 +334,12 @@ impl VoiceOutput for PiperRsOutput {
             let flag = self.speech_interrupted.clone();
             let gen = self.utterance.clone();
             let handle = self.audio_handle.clone();
-            tokio::task::spawn_blocking(move || play_wav_on_handle(wav, &handle, &flag, &gen))
-                .await
-                .context("playback task panicked")??;
+            let sink = self.audio_level_sink.clone();
+            tokio::task::spawn_blocking(move || {
+                play_wav_on_handle(wav, &handle, &flag, &gen, sink.as_deref())
+            })
+            .await
+            .context("playback task panicked")??;
         }
 
         Ok(())
@@ -339,9 +359,12 @@ impl VoiceOutput for PiperRsOutput {
         let flag = self.speech_interrupted.clone();
         let gen = self.utterance.clone();
         let handle = self.audio_handle.clone();
-        tokio::task::spawn_blocking(move || play_wav_on_handle(audio, &handle, &flag, &gen))
-            .await
-            .context("playback task panicked")?
+        let sink = self.audio_level_sink.clone();
+        tokio::task::spawn_blocking(move || {
+            play_wav_on_handle(audio, &handle, &flag, &gen, sink.as_deref())
+        })
+        .await
+        .context("playback task panicked")?
     }
 }
 

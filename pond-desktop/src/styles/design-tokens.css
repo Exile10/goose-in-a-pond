@@ -114,7 +114,8 @@
 
   /* ── Voice Orb States ───────────────────────────────────── */
   --orb-idle:      #8E8E93;
-  --orb-listening: #8C4BFF;   /* Jarida Purple — listening */
+  --orb-listening: #8C4BFF;   /* Jarida Purple — waiting for wake word */
+  --orb-receiving: #3B9EFF;   /* cool blue — actively recording, distinct from --orb-listening's purple */
   --orb-thinking:  #FF9500;   /* warm amber — thinking */
   --orb-speaking:  #34C759;   /* green — speaking */
   --orb-error:     #FF3B30;   /* red — error */

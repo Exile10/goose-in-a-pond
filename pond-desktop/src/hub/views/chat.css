@@ -387,6 +387,113 @@
   margin: 0;
 }
 
+/* Message actions — copy/edit/refresh (user) and like/dislike (agent) */
+.ch-bubble__actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  padding-left: 2px;
+}
+
+.ch-bubble__action {
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: var(--mut);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.ch-bubble__action:hover:not(:disabled) {
+  background: var(--pp-50);
+  color: var(--pp);
+}
+
+.ch-bubble__action:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.ch-bubble__action--liked {
+  background: var(--color-success-soft);
+  color: var(--color-success-fg);
+}
+
+.ch-bubble__action--liked:hover:not(:disabled) {
+  background: var(--color-success-soft);
+  color: var(--color-success-fg);
+}
+
+.ch-bubble__action--disliked {
+  background: var(--color-destructive-soft);
+  color: var(--color-destructive);
+}
+
+.ch-bubble__action--disliked:hover:not(:disabled) {
+  background: var(--color-destructive-soft);
+  color: var(--color-destructive);
+}
+
+/* Inline edit — replaces the bubble text while editing a user message */
+.ch-bubble__edit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ch-bubble__edit-input {
+  width: 100%;
+  min-width: 220px;
+  resize: vertical;
+  font: inherit;
+  font-size: 14.5px;
+  line-height: 1.5;
+  color: var(--ink);
+  background: var(--color-surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+
+.ch-bubble__edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.ch-bubble__edit-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--mut);
+  cursor: pointer;
+}
+
+.ch-bubble__edit-btn--save {
+  border-color: var(--bd, rgba(124, 58, 237, 0.3));
+  color: var(--acc, #7C3AED);
+}
+
+.ch-bubble__edit-btn--save:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.ch-bubble__edit-btn:hover:not(:disabled) {
+  background: rgba(124, 58, 237, 0.08);
+}
+
 /* Model role + token meta below agent bubble */
 .bubble__meta {
   font-size: 10px;
