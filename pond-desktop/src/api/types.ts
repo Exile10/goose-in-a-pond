@@ -256,8 +256,23 @@ export interface Settings {
   vision_fps?: number;
   vision_motion_threshold?: number;
 
+  // Matter (smart-home fabric) — surfaced in the Devices tab
+  matter_enabled?: boolean;
+  matter_ws_url?: string;
+
   // Inference stats display
   show_turn_stats?: boolean;
+}
+
+/** What the Matter integration is actually doing, as opposed to what was
+ *  asked for. `enabled` is the saved setting; `state` is reality — the two
+ *  differ while the controller is starting up or cannot be reached. */
+export interface MatterStatus {
+  enabled: boolean;
+  url: string;
+  state: "disabled" | "connecting" | "connected" | "unreachable";
+  /** Present only when `state` is "unreachable". */
+  error?: string;
 }
 
 // ── Consolidation ────────────────────────────────────────────

@@ -22,6 +22,7 @@ import {
   type LlamafileRelease,
   type LogEntry,
   type MarketplaceExtension,
+  type MatterStatus,
   type MemoryFragment,
   type MeshPeer,
   type MeshSelf,
@@ -74,6 +75,10 @@ export function defaultServerUrl(): string {
   }
   return "http://127.0.0.1:4000";
 }
+
+/** Commissioning budget, kept just above the server's own 180s pairing timeout
+ *  so the server's error is what surfaces, not a client-side abort. */
+const COMMISSION_TIMEOUT_MS = 190_000;
 
 export class PondApiClient {
   private readonly base: string;
@@ -370,12 +375,28 @@ export class PondApiClient {
   }
 
   /** Commission a Matter device onto the fabric with its setup code, optionally
-   *  naming it (written to the device and used as its GIAP name). */
+   *  naming it (written to the device and used as its GIAP name).
+   *
+   *  Given its own timeout: pairing involves discovery, attestation, and fabric
+   *  join, for which the server allows 180s. On the default 30s a real
+   *  commission aborted here as "Request timed out" while it went on to succeed
+   *  on the Pond. */
   commissionDevice(
     code: string,
     name?: string,
   ): Promise<{ id: string; name: string; node_id: number }> {
-    return this.post("/api/v1/devices/commission", name ? { code, name } : { code });
+    return this.request(
+      "POST",
+      "/api/v1/devices/commission",
+      name ? { code, name } : { code },
+      COMMISSION_TIMEOUT_MS,
+    );
+  }
+
+  /** What the Matter integration is actually doing. Polled by the Devices tab
+   *  while the controller starts up, which the settings save does not wait for. */
+  getMatterStatus(): Promise<MatterStatus> {
+    return this.get<MatterStatus>("/api/v1/matter/status");
   }
 
   unregisterDevice(id: string): Promise<void> {
