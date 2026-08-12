@@ -267,10 +267,21 @@ def probe_thinking():
         record(5, "reasoning is counted and reported", "FAIL", st["error"])
         return
     rt = st.get("reasoning_tokens")
+    # The other half of what thinking costs, and the half that was invisible
+    # until 2026-08-12: a turn that thinks, says nothing, and gets steered back
+    # by EMPTY_TURN_STEER pays for the whole turn twice -- prefill, tools and
+    # all. gemma-4-E2B does this reliably for certain phrasings. Reported
+    # separately from `inference_count`, which cannot tell a re-engagement from
+    # an ordinary tool round-trip.
+    re_eng = st.get("reengagements")
     METRICS.setdefault("5", {}).update({
         "reasoning_tokens": rt,
         "completion_tokens": st.get("completion_tokens"),
+        "reengagements": re_eng,
     })
+    if re_eng:
+        print("    NOTE: this turn went silent %s time(s) and had to be steered back; "
+              "the reply cost %s full turns." % (re_eng, re_eng + 1))
     if rt is None:
         # None is not zero, and the difference is the phase's whole point:
         # migration 0039 left the column nullable with no DEFAULT so that
@@ -606,6 +617,11 @@ def summarise():
     m5 = METRICS.get("5", {})
     if m5.get("reasoning_tokens"):
         print("    reasoning            %s tokens" % m5["reasoning_tokens"])
+    # `is not None` and not truthiness: 0 is the ordinary turn and reporting it
+    # is the point -- a blank line here would read as "not measured", which is
+    # the one thing this field exists to distinguish.
+    if m5.get("reengagements") is not None:
+        print("    re-engagements       %s (empty turns re-steered)" % m5["reengagements"])
 
     n_fail = sum(1 for r in RESULTS if r[2] == "FAIL")
     n_skip = sum(1 for r in RESULTS if r[2] == "SKIP")

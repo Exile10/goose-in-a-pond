@@ -102,6 +102,9 @@ impl DeviceRegistry for NoDevices {
 /// `unwrap_or(0)` anywhere on the way to the client would erase.
 struct StatsAgent {
     reasoning: Option<u32>,
+    /// Attempts beyond the first this turn needed. Not an `Option`: every turn
+    /// that reaches the handler was observed, so 0 is a fact and not a gap.
+    reengagements: u32,
 }
 
 #[async_trait::async_trait]
@@ -121,6 +124,7 @@ impl Agent for StatsAgent {
         let session_id = request.session_id.clone();
         let model_role = request.model_role.clone();
         let reasoning = self.reasoning;
+        let reengagements = self.reengagements;
         let stream = async_stream::stream! {
             yield Ok(AgentStreamEvent::Text { content: "Considered answer".to_string() });
             let mut stats = TurnStats {
@@ -133,6 +137,7 @@ impl Agent for StatsAgent {
                 context_used_tokens: Some(1000),
                 context_limit_tokens: Some(3072),
                 inference_count: 1,
+                reengagements,
                 ..Default::default()
             };
             stats.finalize_rates();
@@ -303,6 +308,7 @@ async fn both_stream_routes_report_the_reasoning_count_beside_the_completion_cou
     for (i, route) in STREAM_ROUTES.iter().enumerate() {
         let h = make_app(Arc::new(StatsAgent {
             reasoning: Some(240),
+            reengagements: 0,
         }))
         .await;
         let frames = drive(&h.app, route, &format!("reasoning-{i}")).await;
@@ -339,7 +345,11 @@ async fn both_stream_routes_report_the_reasoning_count_beside_the_completion_cou
 #[tokio::test]
 async fn a_turn_nobody_counted_reads_as_null_and_not_as_zero() {
     for (i, route) in STREAM_ROUTES.iter().enumerate() {
-        let h = make_app(Arc::new(StatsAgent { reasoning: None })).await;
+        let h = make_app(Arc::new(StatsAgent {
+            reasoning: None,
+            reengagements: 0,
+        }))
+        .await;
         let frames = drive(&h.app, route, &format!("uncounted-{i}")).await;
         let stats = turn_stats_of(&frames, route);
 
@@ -368,6 +378,77 @@ async fn a_turn_nobody_counted_reads_as_null_and_not_as_zero() {
     }
 }
 
+/// The other half of what thinking cost.
+///
+/// `inference_count` already says how many times the engine ran, and it is why
+/// this needed its own field rather than a derivation: a turn that ran twice
+/// because it called a tool and a turn that ran twice because it thought, said
+/// nothing, and had to be steered back with `EMPTY_TURN_STEER` are the same
+/// number there. Only `reengagements` separates them, and the second one is a
+/// whole extra turn paid at full price — prefill, tools and all.
+///
+/// Until this landed the only trace was a WARN, so nobody could answer how
+/// often the pond goes silent, which is the question the fork patch that made
+/// goose treat a thinking-only turn as empty was written to answer.
+#[tokio::test]
+async fn both_stream_routes_report_what_the_empty_turn_recovery_cost() {
+    for (i, route) in STREAM_ROUTES.iter().enumerate() {
+        let h = make_app(Arc::new(StatsAgent {
+            reasoning: Some(240),
+            reengagements: 2,
+        }))
+        .await;
+        let frames = drive(&h.app, route, &format!("reengaged-{i}")).await;
+        let stats = turn_stats_of(&frames, route);
+
+        assert_eq!(
+            stats["reengagements"], 2,
+            "{route} dropped the re-engagement count. The turn went silent twice \
+             and was steered back twice; a client reading this frame would see a \
+             slow turn with no reason for it. Frame: {stats}"
+        );
+        // The count must be its own fact, not a restatement of one already in
+        // the frame. `inference_count` is 1 here while `reengagements` is 2 --
+        // if a future change ever derives one from the other, this parts them.
+        assert_eq!(
+            stats["inference_count"], 1,
+            "re-engagements leaked into the inference count. Frame: {stats}"
+        );
+    }
+}
+
+/// Zero is a measurement, not an absence, and the ordinary turn is the one that
+/// reports it. A frame that omits the field for the common case teaches every
+/// client to treat missing as zero, and then the count that matters cannot be
+/// distinguished from a client that never learned to read it.
+#[tokio::test]
+async fn an_ordinary_turn_reports_zero_re_engagements_rather_than_nothing() {
+    for (i, route) in STREAM_ROUTES.iter().enumerate() {
+        let h = make_app(Arc::new(StatsAgent {
+            reasoning: Some(240),
+            reengagements: 0,
+        }))
+        .await;
+        let frames = drive(&h.app, route, &format!("ordinary-{i}")).await;
+        let stats = turn_stats_of(&frames, route);
+
+        let reported = stats
+            .as_object()
+            .and_then(|o| o.get("reengagements"))
+            .unwrap_or_else(|| {
+                panic!("{route}'s turn_stats frame has no `reengagements` key at all: {stats}")
+            });
+        assert_eq!(
+            reported, 0,
+            "{route} reported an ordinary turn's re-engagement count as {reported}. \
+             Frame: {stats}"
+        );
+        // Vacuity control: this is a real frame with real numbers, so the
+        // assertion above is not passing against an empty object.
+        assert_eq!(stats["ttft_ms"], 412, "frame: {stats}");
+    }
+}
+
 /// A frame after `done` is a frame no client reads: the desktop closes the
 /// EventSource on `done` and reloads the session.
 #[tokio::test]
@@ -375,6 +456,7 @@ async fn the_stats_frame_arrives_before_the_stream_closes_on_both_routes() {
     for (i, route) in STREAM_ROUTES.iter().enumerate() {
         let h = make_app(Arc::new(StatsAgent {
             reasoning: Some(240),
+            reengagements: 0,
         }))
         .await;
         let frames = drive(&h.app, route, &format!("ordering-{i}")).await;
@@ -442,7 +524,11 @@ async fn persist_assistant(
 
 #[tokio::test]
 async fn the_usage_summary_totals_reasoning_and_says_how_many_turns_counted_one() {
-    let h = make_app(Arc::new(StatsAgent { reasoning: None })).await;
+    let h = make_app(Arc::new(StatsAgent {
+        reasoning: None,
+        reengagements: 0,
+    }))
+    .await;
 
     // Two sessions, so the sum is really a sum across sessions and not one
     // session's number reported twice.
@@ -502,7 +588,11 @@ async fn the_usage_summary_totals_reasoning_and_says_how_many_turns_counted_one(
 /// not take from an empty corpus.
 #[tokio::test]
 async fn a_pond_where_nothing_counted_reports_zero_turns_not_just_zero_tokens() {
-    let h = make_app(Arc::new(StatsAgent { reasoning: None })).await;
+    let h = make_app(Arc::new(StatsAgent {
+        reasoning: None,
+        reengagements: 0,
+    }))
+    .await;
     h.storage
         .create_session("sess-quiet".to_string())
         .await

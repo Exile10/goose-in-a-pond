@@ -1362,6 +1362,14 @@ fn turn_stats_frame(s: &pond_core::shared::domain::turn_stats::TurnStats) -> Str
         "context_pct": s.context_pct(),
         "model_load_ms": s.model_load_ms,
         "inference_count": s.inference_count,
+        // The other half of what thinking cost. `inference_count` already says
+        // how many times the engine ran, but it cannot distinguish a turn that
+        // ran twice because it called a tool from a turn that ran twice because
+        // it thought, said nothing, and had to be steered back. Only this field
+        // separates them, and 0 is the honest value for an ordinary turn — this
+        // one is a count, not an Option, because every turn that reaches here
+        // was observed.
+        "reengagements": s.reengagements,
     })
     .to_string()
 }
@@ -1989,6 +1997,15 @@ fn chat_stream_inner(
                     prefill_tok_per_sec: turn_stats.as_ref().and_then(|s| s.prefill_tok_per_sec),
                     context_limit_tokens: turn_stats.as_ref().and_then(|s| s.context_limit_tokens),
                     inference_count: turn_stats.as_ref().map(|s| s.inference_count),
+                    // What thinking cost, and what it cost when it went wrong.
+                    // `reasoning_tokens` stays Option all the way down: a turn
+                    // from a provider that reports no stats has not been
+                    // measured, and that is a different fact from a turn that
+                    // did no thinking. `reengagements` is a plain count on
+                    // `TurnStats`, so the only Nones here are turns with no
+                    // stats at all.
+                    reasoning_tokens: turn_stats.as_ref().and_then(|s| s.reasoning_tokens),
+                    reengagements: turn_stats.as_ref().map(|s| s.reengagements),
                 };
 
                 if let Err(e) = telemetry.record_turn(metrics).await {

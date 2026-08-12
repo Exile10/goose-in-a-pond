@@ -37,6 +37,33 @@ pub struct TurnStats {
     /// into a provider-reported rate would make the throughput number a
     /// different quantity depending on which model answered.
     pub reasoning_tokens: Option<u32>,
+
+    /// Attempts BEYOND the first that this turn needed -- 0 for an ordinary
+    /// turn, 1 when the model produced only reasoning, ended, and had to be
+    /// steered back with `EMPTY_TURN_STEER`.
+    ///
+    /// Counted because it is the hidden half of what thinking costs. A silent
+    /// turn is not a slow turn: it is the whole turn again, prefill included,
+    /// and gemma-4-E2B does it reliably for certain phrasings. Until this
+    /// existed the only visible symptom was that the pond felt slow, with the
+    /// reason buried in a DEBUG line nobody roots their log at.
+    ///
+    /// `#[serde(default)]` because this type rides `AgentStreamEvent::Done`,
+    /// which crosses a PROCESS boundary: `pond-server chat --json-events` emits
+    /// it as NDJSON and the desktop's voice child consumes it. Without the
+    /// attribute a new consumer refuses every event an older binary produced,
+    /// and the pair is version-skewed for exactly as long as it takes someone
+    /// to rebuild both halves. Two existing tests failed on this the moment the
+    /// field was added, which is the only reason it was noticed.
+    ///
+    /// Defaulting to 0 does not fabricate a measurement the way a
+    /// `reasoning_tokens` default would. Nothing deserialized ever reaches
+    /// `turn_metrics`: that row is built from the in-process `TurnStats` the
+    /// adapter itself constructed, and a turn with no stats at all writes NULL
+    /// through `TurnMetrics::reengagements`, which stays an `Option` precisely
+    /// so the unmeasured case survives the database.
+    #[serde(default)]
+    pub reengagements: u32,
     pub prefill_tok_per_sec: Option<f32>,
     pub decode_tok_per_sec: Option<f32>,
     /// Prompt tokens of the final inference (same basis as `prompt_tokens`),
@@ -160,6 +187,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(measured.reasoning_tokens, Some(0));
+    }
+
+    /// A payload from a binary that predates the field must still parse.
+    ///
+    /// This is not hypothetical tidiness. `AgentStreamEvent::Done` carries this
+    /// struct as NDJSON out of `pond-server chat --json-events`, and the
+    /// desktop's voice child is a SEPARATE process that can be older or newer
+    /// than the server that spawned it. When `reengagements` was first added
+    /// without `#[serde(default)]` it was a required field, and every event an
+    /// older binary produced became a parse error — a silently dead voice
+    /// stream, not a compile error.
+    ///
+    /// The counterpart assertion matters as much: a NEW payload that says 0
+    /// must still read as 0, so the default cannot be hiding a producer that
+    /// stopped sending the field.
+    #[test]
+    fn a_payload_without_the_re_engagement_count_still_parses() {
+        let old: TurnStats = serde_json::from_str(
+            r#"{"prompt_tokens":10,"completion_tokens":2,"inference_count":1}"#,
+        )
+        .expect("an event from a binary that predates the field must still deserialize");
+        assert_eq!(old.reengagements, 0);
+
+        let ordinary: TurnStats = serde_json::from_str(
+            r#"{"prompt_tokens":10,"completion_tokens":2,"inference_count":1,"reengagements":0}"#,
+        )
+        .unwrap();
+        assert_eq!(ordinary.reengagements, 0);
+
+        let steered: TurnStats = serde_json::from_str(
+            r#"{"prompt_tokens":10,"completion_tokens":2,"inference_count":1,"reengagements":2}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            steered.reengagements, 2,
+            "the default is swallowing a value that was actually sent"
+        );
     }
 
     #[test]
