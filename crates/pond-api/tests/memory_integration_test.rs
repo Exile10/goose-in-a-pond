@@ -175,6 +175,14 @@ async fn make_app_with_real_memory(
         tool_dispatcher: None,
         api_port: 4000,
         weather_provider: None,
+        peer_directory: Arc::new(
+            pond_core::mesh::mocks::mock_peer_directory::MockPeerDirectory::new(),
+        ),
+        credit_ledger: Arc::new(
+            pond_core::mesh::mocks::mock_credit_ledger::MockCreditLedger::new(),
+        ),
+        usage_tally: Arc::new(pond_core::mesh::mocks::mock_usage_tally::MockUsageTally::new()),
+        mesh_transport: None,
     });
 
     let router = build_router(state, std::path::PathBuf::from("pond-desktop/dist"));

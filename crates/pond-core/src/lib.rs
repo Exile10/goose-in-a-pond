@@ -1,5 +1,6 @@
 pub mod context;
 pub mod mcp;
+pub mod mesh;
 pub mod models;
 pub mod security;
 pub mod shared;

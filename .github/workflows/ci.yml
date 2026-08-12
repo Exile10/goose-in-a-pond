@@ -91,6 +91,7 @@ jobs:
             -p pond-adapters-vision \
             -p pond-adapters-weather \
             -p pond-adapters-mcp-memory \
+            -p pond-mesh-protocol \
             -p pond-mcp-server
 
       # --ignored is NOT passed so the 28 live-hardware tests are skipped.
@@ -111,6 +112,7 @@ jobs:
             -p pond-adapters-vision \
             -p pond-adapters-weather \
             -p pond-adapters-mcp-memory \
+            -p pond-mesh-protocol \
             -p pond-mcp-server
 
       # Gate the PRODUCTION binary's compilation (pulls the Goose submodule).
@@ -146,6 +148,17 @@ jobs:
       # preprocess tests run here too — they need no ONNX Runtime library.
       - name: cargo test (vision classifier — pond-adapters-vision-onnx)
         run: cargo test -p pond-adapters-vision-onnx
+
+      # Isolated like vision-onnx above: full-feature libp2p
+      # (kad+gossipsub+relay+dcutr+identify+noise+yamux) is a materially
+      # heavier compile than the rest of the fast-crates list, and this
+      # crate doesn't touch Goose so it doesn't belong in the production
+      # binary check either.
+      - name: cargo clippy (mesh transport — pond-adapters-mesh-libp2p)
+        run: cargo clippy -p pond-adapters-mesh-libp2p --all-targets
+
+      - name: cargo test (mesh transport — pond-adapters-mesh-libp2p)
+        run: cargo test -p pond-adapters-mesh-libp2p
 
   # 2: Frontend ─────────────────────────────────────────────────────────
   # Runs Vitest unit tests and Playwright E2E tests.
