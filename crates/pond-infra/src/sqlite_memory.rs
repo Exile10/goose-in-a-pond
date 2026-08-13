@@ -355,6 +355,33 @@ impl MemoryRepository for SqliteMemoryRepository {
         Ok(rows.into_iter().map(row_to_fragment).collect())
     }
 
+    async fn search_stale_dimension(
+        &self,
+        expected_dims: usize,
+        limit: usize,
+    ) -> Result<Vec<MemoryFragment>> {
+        // The vector is stored as a packed f32 BLOB by `vec_to_blob`, so its
+        // width is `length(embedding) / 4` and SQLite can filter on it without
+        // deserialising a single row. `length()` on a BLOB is byte length (it is
+        // character length only for TEXT), which is why this is exact rather than
+        // an approximation.
+        let expected_bytes = (expected_dims * std::mem::size_of::<f32>()) as i64;
+        // Oldest first, matching `search_unembedded`: an interrupted sweep
+        // resumes where it stopped rather than re-reading the newest rows.
+        let sql = format!(
+            "SELECT {SELECT_ALL} FROM memory_fragments \
+             WHERE embedding IS NOT NULL AND length(embedding) != ? \
+             AND (lifecycle IS NULL OR lifecycle = 'active') \
+             ORDER BY created_at ASC LIMIT ?"
+        );
+        let rows: Vec<FragmentRow> = sqlx::query_as(&sql)
+            .bind(expected_bytes)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(row_to_fragment).collect())
+    }
+
     async fn update_embedding(&self, id: &str, embedding: &[f32]) -> Result<()> {
         sqlx::query("UPDATE memory_fragments SET embedding = ? WHERE id = ?")
             .bind(vec_to_blob(embedding))
@@ -842,6 +869,40 @@ mod tests {
             "the unembedded row proves search_recent ran; without it the incomparable \
              row was merely scored 0.0 and returned as a semantic hit"
         );
+    }
+
+    /// The repair selector must find exactly the rows the backfill cannot: a
+    /// stale-width vector is NOT NULL, so `search_unembedded` steps over it.
+    #[tokio::test]
+    async fn search_stale_dimension_finds_wrong_width_rows_and_only_those() {
+        let (repo, _tmp) = make_repo().await;
+
+        let mut stale = MemoryFragment::from_chat("stale".to_string(), None, None, "old".into());
+        stale.embedding = Some(vec![0.5f32; 384]);
+        repo.add(stale).await.unwrap();
+
+        let mut current =
+            MemoryFragment::from_chat("current".to_string(), None, None, "new".into());
+        current.embedding = Some(vec![0.5f32; 768]);
+        repo.add(current).await.unwrap();
+
+        let never = MemoryFragment::from_chat("never".to_string(), None, None, "none".into());
+        repo.add(never).await.unwrap();
+
+        let stale_rows = repo.search_stale_dimension(768, 10).await.unwrap();
+        let ids: Vec<&str> = stale_rows.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["stale"],
+            "expected only the 384-dim row; a NULL-embedding row belongs to the \
+             backfill and a 768-dim row is already correct"
+        );
+
+        // The complement: the backfill still sees only the never-embedded row,
+        // which is exactly why the stale one needed its own selector.
+        let unembedded = repo.search_unembedded(10).await.unwrap();
+        let ids: Vec<&str> = unembedded.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, vec!["never"]);
     }
 
     /// A mixed store must not let incomparable rows crowd out the comparable

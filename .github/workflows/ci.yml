@@ -143,6 +143,17 @@ jobs:
       - name: cargo check (quarantined PondAgent + its test targets — pond-agent + pond-inference)
         run: cargo check -p pond-agent -p pond-inference --all-targets
 
+      # `cargo check --all-targets` above COMPILES pond-inference's tests and never
+      # RUNS them, which for a while meant the GGUF embedder's guards were
+      # decoration: `no_giap_code_calls_llama_backend_init` and
+      # `the_backend_handle_is_held_strongly_and_never_freed` protect against a
+      # process-wide panic when GIAP and Goose both claim the llama backend, and
+      # neither could have fired here. The crate is already built by the step
+      # above, so this costs linking the test binaries and nothing else; the live
+      # embed test is `#[ignore]`d and needs no model.
+      - name: cargo test (in-process GGUF engine + embedder — pond-inference)
+        run: cargo test -p pond-inference
+
       # Compile-gate the ONNX vision classifier (ort is too heavy for the fast
       # lint/test pass, mirroring pond-adapters-face-onnx). Its pure decode/
       # preprocess tests run here too — they need no ONNX Runtime library.

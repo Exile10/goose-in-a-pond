@@ -2529,7 +2529,10 @@ impl GooseAdapter {
             return Vec::new();
         }
         if let Some(provider) = &self.embedding_provider {
-            match provider.embed(message).await {
+            // `embed_query`: this is the thing being searched WITH. On an
+            // asymmetric retriever (nomic) the document prefix would put it in the
+            // wrong manifold; providers without the distinction inherit `embed`.
+            match provider.embed_query(message).await {
                 Ok(query_vector) => {
                     match self
                         .memory_repo

@@ -2353,6 +2353,23 @@ async fn run_server(
                 relevance::BACKFILL_BATCH_PAUSE_MS,
             )
             .await;
+            // Then repair rows embedded by a DIFFERENT model. The backfill above
+            // cannot see them (it selects `embedding IS NULL` and a stale vector is
+            // not null), and semantic search deliberately EXCLUDES them because a
+            // vector of another width is not comparable -- so without this pass a
+            // pond that changed `embedding_provider` would look fully embedded and
+            // silently retrieve worse forever.
+            //
+            // After the backfill rather than before it: a row with no vector at all
+            // is invisible to search, while a stale one is merely excluded, so the
+            // never-embedded rows are the more urgent repair.
+            relevance::run_dimension_repair(
+                backfill_repo.as_ref(),
+                provider.as_ref(),
+                relevance::BACKFILL_BATCH_SIZE,
+                relevance::BACKFILL_BATCH_PAUSE_MS,
+            )
+            .await;
         });
     }
 
