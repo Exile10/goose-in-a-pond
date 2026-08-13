@@ -1438,6 +1438,169 @@ async fn run_server(
     // Built here so it is in scope for both chokepoints below.
     let redactor: Arc<dyn pond_core::security::ports::redactor::Redactor> =
         Arc::new(pond_infra::rule_redactor::RuleRedactor::new());
+    // Built BEFORE the memory and context repositories on purpose: both take
+    // the vector index and the id of the model whose vectors they mirror, and
+    // that id comes from this provider. It reads only `settings` and
+    // `data_dir`, both resolved far above, so moving it up is safe.
+    // ── Embedding provider (gguf / fastembed / none) ─────────────────────────
+    // Initialized before the agent backend so it can be wired into the memory
+    // MCP server for semantic search on recall/save.
+    //
+    // `"gguf"` is the on-device path: fastembed's ONNX Runtime does not
+    // initialise on the Jetson Orin (version-incompatible, times out), so a pond
+    // that shipped `"fastembed"` there fell back to keyword matching and PAI-3's
+    // semantic memory never ran. The GGUF provider reuses the llama.cpp this pond
+    // already runs and loads its model LAZILY (first embed, after Goose has
+    // claimed the backend) — see `pond_inference::embedding` for why.
+    let embedding_provider: Option<
+        Arc<dyn pond_core::models::ports::embedding::EmbeddingProvider + Send + Sync>,
+    > = {
+        use pond_core::models::ports::embedding::EmbeddingProvider as _;
+        match settings.embedding_provider.as_str() {
+            "none" => {
+                tracing::info!("embedding provider: disabled (embedding_provider = \"none\")");
+                None
+            }
+            #[cfg(feature = "local-inference")]
+            "gguf" => {
+                let embedding_dir = data_dir.join("models").join("embedding");
+                // `active_embedding_model` is shared with the fastembed path, so a
+                // stale fastembed name (or a typo) must NOT silently disable
+                // embeddings — fall back to the gguf default rather than to None.
+                let spec =
+                    pond_inference::EmbeddingModelSpec::resolve(&settings.active_embedding_model)
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(
+                                "'{}' is not a GGUF embedding model ({e}); using the default",
+                                settings.active_embedding_model
+                            );
+                            pond_inference::EmbeddingModelSpec::nomic_embed_text_v1_5()
+                        });
+                let dest = embedding_dir.join(&spec.filename);
+                if !dest.exists() {
+                    if let Err(e) = std::fs::create_dir_all(&embedding_dir) {
+                        tracing::warn!("could not create embedding model dir: {e}");
+                    }
+                    tracing::info!(
+                        model_id = %spec.model_id,
+                        size_mb = spec.size_hint_mb,
+                        "fetching GGUF embedding model in the background (one-time, egress-gated)"
+                    );
+                    // Deliberately NOT awaited. This is a ~146 MB fetch, and awaiting it
+                    // here means the server does not bind its port until it finishes --
+                    // measured on a Mac: /health refused the connection for the whole
+                    // download. On a Jetson behind a slow link that is minutes of a pond
+                    // that looks dead, and with no timeout a hung mirror never starts at
+                    // all. The provider below loads LAZILY, so it tolerates the file
+                    // arriving later; the first embed before it lands reports a clear
+                    // error and retrieval falls back to keyword until then.
+                    //
+                    // Gated by network_mode, but NOT at the chokepoint the obvious
+                    // reading suggests: this is a huggingface.co URL, so
+                    // `download_file` dispatches to `download_via_hf_cache` BEFORE
+                    // reaching its own `egress::begin`. The gate that actually covers
+                    // this fetch lives in `pond_hf_cache` (`egress::begin` on both the
+                    // HEAD and the GET). Naming the wrong chokepoint here would make a
+                    // regression in the real one invisible.
+                    let url = spec.download_url.clone();
+                    let size_hint = spec.size_hint_mb;
+                    let model_id = spec.model_id.clone();
+                    let dest_bg = dest.clone();
+                    tokio::spawn(async move {
+                        use pond_core::models::ports::model_downloader::ModelDownloader as _;
+                        let downloader = crate::http_model_downloader::HttpModelDownloader::new();
+                        match downloader.download(&url, &dest_bg, size_hint).await {
+                            Ok(()) => tracing::info!(
+                                model_id = %model_id,
+                                "GGUF embedding model downloaded; it loads on the next embed"
+                            ),
+                            Err(e) => tracing::warn!(
+                                model_id = %model_id,
+                                "GGUF embedding model download failed: {e:#} -- retrieval \
+                                 falls back to keyword until it succeeds"
+                            ),
+                        }
+                    });
+                }
+                let provider = pond_inference::GgufEmbeddingProvider::new(spec, &embedding_dir);
+                tracing::info!(
+                    model_id = provider.model_id(),
+                    dims = provider.dimensions(),
+                    "GGUF embedding provider ready (loads lazily on first embed)"
+                );
+                Some(Arc::new(provider)
+                    as Arc<
+                        dyn pond_core::models::ports::embedding::EmbeddingProvider + Send + Sync,
+                    >)
+            }
+            #[cfg(not(feature = "local-inference"))]
+            "gguf" => {
+                tracing::warn!(
+                    "embedding_provider = \"gguf\" needs the local-inference feature; \
+                     embeddings disabled"
+                );
+                None
+            }
+            _ => {
+                let emb_model = if settings.active_embedding_model.is_empty() {
+                    "all-MiniLM-L6-v2"
+                } else {
+                    &settings.active_embedding_model
+                };
+                let cache_dir = data_dir.join("models").join("embedding");
+                let emb_model_owned = emb_model.to_string();
+                let emb_result = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    tokio::task::spawn_blocking(move || {
+                        pond_infra::fastembed_embedding::FastembedEmbeddingProvider::new(
+                            &emb_model_owned,
+                            Some(cache_dir),
+                        )
+                    }),
+                )
+                .await;
+                let init_result = match emb_result {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => Err(anyhow::anyhow!("embedding spawn_blocking failed: {e}")),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "embedding provider init timed out after 30 s — ONNX Runtime may be \
+                         version-incompatible (need ORT 1.24.2)"
+                    )),
+                };
+                match init_result {
+                    Ok(provider) => {
+                        tracing::info!(
+                            model = provider.model_name(),
+                            dims = provider.dimensions(),
+                            "embedding provider ready"
+                        );
+                        Some(Arc::new(provider)
+                            as Arc<
+                                dyn pond_core::models::ports::embedding::EmbeddingProvider
+                                    + Send
+                                    + Sync,
+                            >)
+                    }
+                    Err(e) => {
+                        tracing::warn!("embedding provider failed to init: {e:#}");
+                        None
+                    }
+                }
+            }
+        }
+    };
+
+    // The shared personal-context index (phase A) and the identity of the model
+    // whose vectors go into it. `None` when embeddings are off, in which case
+    // the adapters below store exactly as they always did.
+    let vector_index: Arc<dyn pond_core::context::vector_index::VectorIndex> = Arc::new(
+        pond_infra::sqlite_vector_index::SqliteVectorIndex::new(db.vectors.clone()),
+    );
+    let vector_model_id = embedding_provider.as_ref().map(|p| {
+        use pond_core::models::ports::embedding::EmbeddingProvider as _;
+        p.model_id()
+    });
+
     // Chokepoint 1: every memory write, whatever wrote it. Wrapping the one
     // construction covers extraction, the giap-memory MCP tool, POST /memories
     // and consolidation -- and a writer nobody has added yet.
@@ -1445,7 +1608,13 @@ async fn run_server(
         dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync,
     > = Arc::new(
         pond_core::user_data::services::redacting_memory_repository::RedactingMemoryRepository::new(
-            Arc::new(SqliteMemoryRepository::new(db.system.clone())),
+            // INSIDE the redactor deliberately: this decorator drops the vector
+            // when it finds a secret, and the index must mirror what the store
+            // actually keeps, not what the caller handed in.
+            Arc::new(
+                SqliteMemoryRepository::new(db.system.clone())
+                    .with_vector_index(vector_index.clone(), vector_model_id.clone()),
+            ),
             redactor.clone(),
         ),
     );
@@ -2178,154 +2347,6 @@ async fn run_server(
         Arc<dyn pond_core::mcp::ports::mcp_knowledge::McpKnowledgePort + Send + Sync>,
     > = None;
 
-    // ── Embedding provider (gguf / fastembed / none) ─────────────────────────
-    // Initialized before the agent backend so it can be wired into the memory
-    // MCP server for semantic search on recall/save.
-    //
-    // `"gguf"` is the on-device path: fastembed's ONNX Runtime does not
-    // initialise on the Jetson Orin (version-incompatible, times out), so a pond
-    // that shipped `"fastembed"` there fell back to keyword matching and PAI-3's
-    // semantic memory never ran. The GGUF provider reuses the llama.cpp this pond
-    // already runs and loads its model LAZILY (first embed, after Goose has
-    // claimed the backend) — see `pond_inference::embedding` for why.
-    let embedding_provider: Option<
-        Arc<dyn pond_core::models::ports::embedding::EmbeddingProvider + Send + Sync>,
-    > = {
-        use pond_core::models::ports::embedding::EmbeddingProvider as _;
-        match settings.embedding_provider.as_str() {
-            "none" => {
-                tracing::info!("embedding provider: disabled (embedding_provider = \"none\")");
-                None
-            }
-            #[cfg(feature = "local-inference")]
-            "gguf" => {
-                let embedding_dir = data_dir.join("models").join("embedding");
-                // `active_embedding_model` is shared with the fastembed path, so a
-                // stale fastembed name (or a typo) must NOT silently disable
-                // embeddings — fall back to the gguf default rather than to None.
-                let spec =
-                    pond_inference::EmbeddingModelSpec::resolve(&settings.active_embedding_model)
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(
-                                "'{}' is not a GGUF embedding model ({e}); using the default",
-                                settings.active_embedding_model
-                            );
-                            pond_inference::EmbeddingModelSpec::nomic_embed_text_v1_5()
-                        });
-                let dest = embedding_dir.join(&spec.filename);
-                if !dest.exists() {
-                    if let Err(e) = std::fs::create_dir_all(&embedding_dir) {
-                        tracing::warn!("could not create embedding model dir: {e}");
-                    }
-                    tracing::info!(
-                        model_id = %spec.model_id,
-                        size_mb = spec.size_hint_mb,
-                        "fetching GGUF embedding model in the background (one-time, egress-gated)"
-                    );
-                    // Deliberately NOT awaited. This is a ~146 MB fetch, and awaiting it
-                    // here means the server does not bind its port until it finishes --
-                    // measured on a Mac: /health refused the connection for the whole
-                    // download. On a Jetson behind a slow link that is minutes of a pond
-                    // that looks dead, and with no timeout a hung mirror never starts at
-                    // all. The provider below loads LAZILY, so it tolerates the file
-                    // arriving later; the first embed before it lands reports a clear
-                    // error and retrieval falls back to keyword until then.
-                    //
-                    // Gated by network_mode, but NOT at the chokepoint the obvious
-                    // reading suggests: this is a huggingface.co URL, so
-                    // `download_file` dispatches to `download_via_hf_cache` BEFORE
-                    // reaching its own `egress::begin`. The gate that actually covers
-                    // this fetch lives in `pond_hf_cache` (`egress::begin` on both the
-                    // HEAD and the GET). Naming the wrong chokepoint here would make a
-                    // regression in the real one invisible.
-                    let url = spec.download_url.clone();
-                    let size_hint = spec.size_hint_mb;
-                    let model_id = spec.model_id.clone();
-                    let dest_bg = dest.clone();
-                    tokio::spawn(async move {
-                        use pond_core::models::ports::model_downloader::ModelDownloader as _;
-                        let downloader = crate::http_model_downloader::HttpModelDownloader::new();
-                        match downloader.download(&url, &dest_bg, size_hint).await {
-                            Ok(()) => tracing::info!(
-                                model_id = %model_id,
-                                "GGUF embedding model downloaded; it loads on the next embed"
-                            ),
-                            Err(e) => tracing::warn!(
-                                model_id = %model_id,
-                                "GGUF embedding model download failed: {e:#} -- retrieval \
-                                 falls back to keyword until it succeeds"
-                            ),
-                        }
-                    });
-                }
-                let provider = pond_inference::GgufEmbeddingProvider::new(spec, &embedding_dir);
-                tracing::info!(
-                    model_id = provider.model_id(),
-                    dims = provider.dimensions(),
-                    "GGUF embedding provider ready (loads lazily on first embed)"
-                );
-                Some(Arc::new(provider)
-                    as Arc<
-                        dyn pond_core::models::ports::embedding::EmbeddingProvider + Send + Sync,
-                    >)
-            }
-            #[cfg(not(feature = "local-inference"))]
-            "gguf" => {
-                tracing::warn!(
-                    "embedding_provider = \"gguf\" needs the local-inference feature; \
-                     embeddings disabled"
-                );
-                None
-            }
-            _ => {
-                let emb_model = if settings.active_embedding_model.is_empty() {
-                    "all-MiniLM-L6-v2"
-                } else {
-                    &settings.active_embedding_model
-                };
-                let cache_dir = data_dir.join("models").join("embedding");
-                let emb_model_owned = emb_model.to_string();
-                let emb_result = tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    tokio::task::spawn_blocking(move || {
-                        pond_infra::fastembed_embedding::FastembedEmbeddingProvider::new(
-                            &emb_model_owned,
-                            Some(cache_dir),
-                        )
-                    }),
-                )
-                .await;
-                let init_result = match emb_result {
-                    Ok(Ok(r)) => r,
-                    Ok(Err(e)) => Err(anyhow::anyhow!("embedding spawn_blocking failed: {e}")),
-                    Err(_) => Err(anyhow::anyhow!(
-                        "embedding provider init timed out after 30 s — ONNX Runtime may be \
-                         version-incompatible (need ORT 1.24.2)"
-                    )),
-                };
-                match init_result {
-                    Ok(provider) => {
-                        tracing::info!(
-                            model = provider.model_name(),
-                            dims = provider.dimensions(),
-                            "embedding provider ready"
-                        );
-                        Some(Arc::new(provider)
-                            as Arc<
-                                dyn pond_core::models::ports::embedding::EmbeddingProvider
-                                    + Send
-                                    + Sync,
-                            >)
-                    }
-                    Err(e) => {
-                        tracing::warn!("embedding provider failed to init: {e:#}");
-                        None
-                    }
-                }
-            }
-        }
-    };
-
     // Finish the extraction service now that the embedder is known — every fact
     // it stores is embedded at write, so it is searchable on the next turn
     // instead of waiting for a backfill.
@@ -2368,6 +2389,37 @@ async fn run_server(
                 provider.as_ref(),
                 relevance::BACKFILL_BATCH_SIZE,
                 relevance::BACKFILL_BATCH_PAUSE_MS,
+            )
+            .await;
+        });
+    }
+
+    // ── Summary indexing (phase B) ───────────────────────────────────────────
+    // Memories and context items reach the personal-context index for free --
+    // they already hold a vector when they are stored, so their write-through
+    // just mirrors it. Summaries are the exception: nothing has ever embedded
+    // `sessions.rolling_summary`, so this is the one part of phase B that costs
+    // inference, and it is a sweep rather than a write-through for that reason.
+    //
+    // Last of the three startup passes, and after both memory passes: a memory
+    // with no vector is invisible to search, whereas a summary that is not yet
+    // indexed is merely absent from a corpus nothing reads yet.
+    if let (Some(provider), Some(_)) = (embedding_provider.clone(), vector_model_id.clone()) {
+        let index = vector_index.clone();
+        let storage = session_storage.clone();
+        tokio::spawn(async move {
+            use pond_core::context::summary_indexing as summaries;
+            // Not wired to a cancellation source yet: this is startup, and the
+            // token exists so the idle-gated caller phase D adds can stop it
+            // mid-sweep without changing this function.
+            let cancel = tokio_util::sync::CancellationToken::new();
+            summaries::run_summary_indexing(
+                storage.as_ref(),
+                provider.as_ref(),
+                &index,
+                &cancel,
+                summaries::SUMMARY_BATCH_SIZE,
+                summaries::SUMMARY_BATCH_PAUSE_MS,
             )
             .await;
         });
@@ -3122,11 +3174,16 @@ async fn run_server(
     //    event exactly once so nothing is silently dropped by a ring that
     //    wrapped.
     {
-        let context_repo: Arc<dyn pond_core::context::ports::ContextRepository> =
-            Arc::new(pond_infra::sqlite_context::SqliteContextRepository::new(
+        let context_repo: Arc<dyn pond_core::context::ports::ContextRepository> = Arc::new(
+            pond_infra::sqlite_context::SqliteContextRepository::new(
                 db.system.clone(),
                 redactor.clone(),
-            ));
+            )
+            // A ContextItem cannot exist un-redacted (one constructor, and it
+            // takes the redactor), so mirroring its vector is safe by
+            // construction -- no decorator ordering to get wrong here.
+            .with_vector_index(vector_index.clone(), vector_model_id.clone()),
+        );
         let pipeline = Arc::new(
             pond_core::context::ingest::IngestPipeline::new(context_repo.clone(), redactor.clone())
                 .with_embedder(embedding_provider.clone()),

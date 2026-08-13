@@ -148,6 +148,23 @@ pub trait SessionStorage: Send + Sync {
         Ok((None, None)) // default no-op for backward compat
     }
 
+    /// Read the rolling summary together with the revision stamp written
+    /// alongside it (`rolling_summary_updated_at`).
+    ///
+    /// Both in ONE call on purpose. The personal-context index stamps a
+    /// summary's vector with the revision it was computed from, and reading the
+    /// text and the revision separately races the summary service: the sweep
+    /// would embed one version and stamp it with another, which makes a stale
+    /// vector look current and therefore never get repaired.
+    async fn get_rolling_summary_with_revision(
+        &self,
+        _session_id: &str,
+    ) -> Result<(Option<String>, Option<String>), SessionStorageError> {
+        // Default: no summary. Inert rather than wrong — an implementation that
+        // does not override this simply contributes no summaries to the index.
+        Ok((None, None))
+    }
+
     /// Store a refreshed rolling summary. `through_message_id` is the id of
     /// the newest message the summary covers.
     async fn set_rolling_summary(

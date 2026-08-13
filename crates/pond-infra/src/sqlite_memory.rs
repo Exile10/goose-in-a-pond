@@ -7,6 +7,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
+use pond_core::context::vector_index::{Corpus, VectorEntry, VectorIndex};
 use pond_core::user_data::domain::memory::{
     cosine_similarity, MemoryEvent, MemoryEventKind, MemoryFragment, MemoryLifecycle,
     MemorySegment, MemoryTier,
@@ -15,14 +16,98 @@ use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::ports::memory_repository::MemoryRepository;
 use serde_json;
 use sqlx::{Pool, Sqlite};
+use std::sync::Arc;
 
 pub struct SqliteMemoryRepository {
     pool: Pool<Sqlite>,
+    /// The shared personal-context index (phase B write-through).
+    ///
+    /// Optional so the adapter still constructs in tests and in a pond with the
+    /// index unavailable; when absent, memories are stored exactly as before and
+    /// the index sweep picks them up later.
+    index: Option<Arc<dyn VectorIndex>>,
+    /// Which embedder produced the vectors this adapter stores. Held beside the
+    /// index because the fragment does not carry it and the index must record it.
+    model_id: Option<String>,
 }
 
 impl SqliteMemoryRepository {
     pub fn new(pool: Pool<Sqlite>) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            index: None,
+            model_id: None,
+        }
+    }
+
+    /// Mirror every stored vector into the shared index.
+    ///
+    /// # Why this lives in the ADAPTER rather than in a decorator
+    ///
+    /// A decorator is the more hexagonal answer and it was the first design.
+    /// Three facts moved it here, all of them found by reading the write sites
+    /// rather than by reasoning about layers:
+    ///
+    /// 1. `RedactingMemoryRepository::add` sets `fragment.embedding = None` when
+    ///    the content held a secret, precisely because the vector is a durable
+    ///    derivative of the unredacted text. An index decorator stacked ABOVE it
+    ///    would index that vector — the exact thing that line exists to prevent.
+    ///    Here, the fragment has already been through the redactor.
+    /// 2. Eighteen of the port's twenty-two methods have default bodies, so a
+    ///    decorator that forgets one compiles and silently no-ops.
+    /// 3. `SqliteMemoryRepository::new` has four production construction sites
+    ///    and one of them, `pond memories add`, is a SEPARATE PROCESS with its
+    ///    own `Database`. Anything hung off the server's `AppState` misses it.
+    ///
+    /// Nothing else in the workspace issues SQL against `memory_fragments`, so
+    /// `add` and `update_embedding` below are a true 100% chokepoint.
+    pub fn with_vector_index(
+        mut self,
+        index: Arc<dyn VectorIndex>,
+        model_id: Option<String>,
+    ) -> Self {
+        self.index = Some(index);
+        self.model_id = model_id;
+        self
+    }
+
+    /// Mirror one fragment's vector into the index, or remove the entry when the
+    /// fragment has none.
+    ///
+    /// **Never fails the caller.** The index is derived data: a failed write is
+    /// recoverable by the sweep, whereas failing the memory write would lose
+    /// something a member actually said. This matches how `IngestPipeline`
+    /// already treats a failed embed.
+    async fn mirror(&self, id: &str, embedding: Option<&[f32]>) {
+        let Some(index) = &self.index else { return };
+        let outcome = match (embedding, self.model_id.as_deref()) {
+            (Some(vector), Some(model_id)) if !vector.is_empty() => {
+                index
+                    .upsert(&VectorEntry {
+                        corpus: Corpus::Memory,
+                        row_id: id.to_string(),
+                        model_id: model_id.to_string(),
+                        vector: vector.to_vec(),
+                        // A memory's content is stable once extracted —
+                        // consolidation supersedes rather than edits — so there
+                        // is no revision to track.
+                        source_rev: None,
+                    })
+                    .await
+            }
+            // A vector we cannot attribute to a model: leave the index alone
+            // and let the sweep handle it. Removing would be actively wrong --
+            // a process with no embedder configured (the `pond memories add`
+            // CLI) would strip entries the server had correctly written.
+            (Some(vector), None) if !vector.is_empty() => return,
+            // No vector at all: make sure a stale entry does not survive. This
+            // is what keeps the redactor's secret-dropping honest -- it hands us
+            // a fragment whose embedding is gone, and the index must follow.
+            _ => index.remove(Corpus::Memory, id).await,
+        };
+        if let Err(e) = outcome {
+            tracing::warn!(memory_id = %id, "vector index write failed: {e:#}");
+        }
     }
 }
 
@@ -214,6 +299,13 @@ impl MemoryRepository for SqliteMemoryRepository {
         .execute(&self.pool)
         .await?;
 
+        // Write-through to the shared index, AFTER the row is durable. The
+        // fragment has already passed the redactor by this point, and that
+        // decorator DROPS the vector when it finds a secret -- so mirroring what
+        // the row actually holds is what keeps a secret's durable derivative out
+        // of the index. Indexing at the caller instead would defeat it.
+        self.mirror(&fragment.id, fragment.embedding.as_deref())
+            .await;
         Ok(())
     }
 
@@ -336,6 +428,12 @@ impl MemoryRepository for SqliteMemoryRepository {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        // Best-effort, and it cannot be atomic with the row delete -- different
+        // database files, and cross-file transactions are not atomic under WAL.
+        // `prune_orphans` is the reconciliation; this just makes the common case
+        // immediate. Nothing leaks either way, because the index holds no text
+        // and an orphan resolves to nothing on the join.
+        self.mirror(id, None).await;
         Ok(())
     }
 
@@ -388,6 +486,9 @@ impl MemoryRepository for SqliteMemoryRepository {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        // The backfill and the dimension repair both land here, so this is what
+        // brings an older store into the index without a second sweep.
+        self.mirror(id, Some(embedding)).await;
         Ok(())
     }
 

@@ -34,4 +34,19 @@ pub trait EmbeddingProvider: Send + Sync {
 
     /// The dimension of vectors returned by this provider (e.g. 384 for MiniLM).
     fn dimensions(&self) -> usize;
+
+    /// Stable identity of the model producing these vectors.
+    ///
+    /// Stamped onto every row in the personal-context index, because a vector
+    /// from a different embedder still scores plausibly and is **wrong** — so a
+    /// mismatch has to be detectable rather than silent. Retrieval filters on
+    /// it; the staleness sweep re-embeds on it.
+    ///
+    /// The default is a placeholder on purpose: it is self-consistent (a
+    /// provider that does not override it indexes and retrieves under the same
+    /// name, so nothing mis-scores), but any provider whose vectors outlive the
+    /// process should give its real model name so a model change is visible.
+    fn model_id(&self) -> String {
+        "unspecified".to_string()
+    }
 }

@@ -248,7 +248,7 @@ needed. Admit mail bodies and GPS tracks and it is millions, and §1.4 stops bei
 | **0b** | ~~`ContextItem.embedding` populated in `IngestPipeline` — **after** redaction~~ **ALREADY LANDED**, found 2026-08-13: `ingest.rs` embeds `item.embedding_text()` after `from_parts` has redacted, and `main.rs` wires `.with_embedder(embedding_provider)`. What was missing was the GUARD — `the_vector_is_computed_from_the_redacted_text` now records what the embedder was handed, because the existing redaction test would stay green if the embed moved above it | a stored item has a vector; the vector is of redacted text — **both now pinned, mutation-tested** |
 | **0c** | Confirm `rolling_summary` is produced on-device | **code half done 2026-08-13**: `refresh` is NOT `Large`-gated (only `resummarise` is) and its idle loop is wired with a real provider, so it runs on any tier. **Device half DONE 2026-08-13**: 1 summary across 636 sessions — the mechanism works and the corpus is nearly empty; see 1.3 |
 | **A** | `pond_vectors.db`, port + adapter, `ATTACH` on `after_connect`, migrations | **LANDED 2026-08-13.** `VectorIndex` port (`context::vector_index`) + `SqliteVectorIndex`; migration `vectors/0001`; `Database::vectors` opened after the system migrations. Verified: roundtrip; **the file is deleted and rebuilds**, reporting its source rows as needing embedding; an orphan matches nothing and prunes; a foreign-model vector is excluded rather than scored; a guest sees nothing and an owner sees own + unattributed. Live: fresh pond creates and migrates it, restart against a populated one preserves rows and re-runs nothing |
-| **B** | Write-through for all three corpora | a written item is searchable; a re-summarised session's vector *changes* |
+| **B** | Write-through for all three corpora | **LANDED 2026-08-13.** Memory + context mirror their EXISTING vector at the SQLite adapter (zero extra inference); summaries are a sweep (`summary_indexing`) because nothing had ever embedded them. Verified live: a memory written through the API is embedded by the backfill and appears in `pond_vectors.db` stamped `nomic-embed-text-v1.5`/768, and a real query ranks it **0.66 vs 0.45** above a decoy sharing the word "spend" — the semantic claim, on a running pond. A re-summarised session is reported stale and its vector replaced |
 | **C** | Unified retrieval, scope in the SQL, `corpus` labelling | two profiles + a guest: three isolation tests |
 | **D** | Idle staleness sweep, orphan prune, model-change re-embed | user activity cancels mid-sweep; orphans pruned; a `model_id` mismatch refuses rather than scores |
 | **E** | Trigger subscribers (`BusEvent`) | a bus event produces an index entry |
@@ -448,6 +448,32 @@ being assumed by the other. And the fixture that invented member ids hit a real 
 `cosine` here returns `Option`, refusing incomparable widths rather than answering `0.0`. That is the
 same defect the memory store had: `0.0` is a legitimate score, so using it for "not comparable" fills
 result slots with rows that were never judged and suppresses the fallback that should have run.
+
+**Phase B landed 2026-08-13.** Write-through sits in the SQLite **adapters**, not in a decorator, and
+the reason is the sharpest thing the mapping turned up: `RedactingMemoryRepository::add` sets
+`fragment.embedding = None` when it finds a secret, precisely because the vector is a durable
+derivative of the unredacted text. An index decorator stacked ABOVE it would index exactly that
+vector. At the adapter the fragment has already been through the redactor, and `add`/`update_embedding`
+are a true 100% chokepoint — nothing else in the workspace issues SQL against `memory_fragments`.
+Two supporting facts: eighteen of the port's twenty-two methods have default bodies, so a decorator
+that forgets one silently no-ops; and one of the four construction sites (`pond memories add`) is a
+SEPARATE PROCESS, so anything hung off the server's `AppState` would miss it.
+
+**Memory and context cost nothing.** Both already hold a vector when they are stored, so the
+write-through mirrors what is in hand. **Summaries are the only new inference** — nothing had ever
+embedded `sessions.rolling_summary` — and they are a SWEEP rather than a write-through, because both
+writers are already LLM calls and one runs on the compaction path.
+
+Two bugs caught before they shipped, both by mutation. A vector that cannot be attributed to a model
+must be LEFT ALONE, not removed: the CLI has no embedder, and removing would have stripped entries the
+server wrote correctly. And the staleness clause needed `v.source_rev IS NOT NULL` — without it a
+vector stored without a revision compares unequal to a non-NULL column and is reported stale on every
+sweep **forever**, re-embedding the same summaries indefinitely on the one device where inference is
+scarce. That guard passed a mutation until a test was written specifically for it.
+
+Observed while live-testing, pre-existing and worth its own fix: `POST /api/v1/memories` constructs
+`embedding: None` and never consults the embedder, so a memory written through the API is not
+searchable until the next restart runs the backfill. The backfill is startup-only.
 
 **Owed, in priority order.** (1) A re-embed path for stale-width vectors (`search_stale_dimension`), since
 backfill cannot see them. (2) `embed_query`: nomic wants `search_query: ` on the query side and
