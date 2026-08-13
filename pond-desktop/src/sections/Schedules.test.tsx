@@ -14,6 +14,7 @@ vi.mock("../api/PondApiClient", () => ({
     pauseSchedule: vi.fn(),
     resumeSchedule: vi.fn(),
     runScheduleNow: vi.fn(),
+    getSettings: vi.fn(),
   },
 }));
 
@@ -57,6 +58,12 @@ function renderSchedules() {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  // The form seeds its timezone from Settings on mount. `resetAllMocks` leaves
+  // every mock returning `undefined`, and an unhandled rejection here would
+  // surface as a failure in whichever test happened to be running.
+  vi.mocked(api.getSettings).mockResolvedValue(
+    { timezone: "UTC" } as Awaited<ReturnType<typeof api.getSettings>>,
+  );
 });
 
 afterEach(() => {

@@ -9,7 +9,7 @@
 use crate::run_history::JsonRunHistory;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use pond_core::user_data::domain::schedule::{RunStatus, Schedule, ScheduleRun, TaskKind};
 use pond_core::user_data::ports::schedule_execution::ScheduleExecutor;
 use pond_core::user_data::ports::scheduler::{
@@ -17,7 +17,9 @@ use pond_core::user_data::ports::scheduler::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -33,6 +35,19 @@ struct PersistedTask {
     /// IANA timezone.  Defaults to "UTC" for legacy tasks.
     #[serde(default = "default_timezone")]
     timezone: String,
+    /// Has this task's zone been through the one-time legacy backfill?
+    ///
+    /// Absent (`false`) on any file written before schedules honoured their
+    /// zone. Back then the UI defaulted the picker to "UTC" and the scheduler
+    /// ignored the value anyway, so a stored "UTC" recorded no decision — it
+    /// was just what the form submitted. The backfill reads those as "meant
+    /// local" and rewrites them once.
+    ///
+    /// The flag is what makes that a MIGRATION rather than a standing
+    /// override: without it, a household that deliberately chooses UTC would
+    /// have the choice silently undone on every restart.
+    #[serde(default)]
+    tz_migrated: bool,
     /// What the task does on each fire.
     /// `None` for legacy tasks — migrated from `payload` during rehydration.
     #[serde(default)]
@@ -79,6 +94,14 @@ pub struct CronSchedulerAdapter {
     result_tx: Option<
         tokio::sync::broadcast::Sender<pond_core::user_data::domain::schedule::ScheduleResultEvent>,
     >,
+    /// The household's configured zone, used only by the legacy backfill in
+    /// [`Self::rehydrate`].
+    ///
+    /// Injected rather than read through a port: this is an infra adapter and
+    /// `pond-server` already has the settings loaded long before it builds the
+    /// scheduler, so taking a `SettingsRepository` dependency here would buy
+    /// nothing and point the arrow the wrong way.
+    household_timezone: String,
 }
 
 impl CronSchedulerAdapter {
@@ -92,10 +115,13 @@ impl CronSchedulerAdapter {
         runs_path: PathBuf,
         executor: Arc<dyn ScheduleExecutor>,
     ) -> Result<Self> {
-        Self::with_options(persist_path, runs_path, executor, None, 50).await
+        Self::with_options(persist_path, runs_path, executor, None, 50, "UTC").await
     }
 
     /// Create with all options.
+    ///
+    /// `household_timezone` — the zone from Settings, used only to backfill
+    /// schedules stored before the scheduler honoured zones at all.
     pub async fn with_options(
         persist_path: PathBuf,
         runs_path: PathBuf,
@@ -106,6 +132,7 @@ impl CronSchedulerAdapter {
             >,
         >,
         max_runs_per_task: u32,
+        household_timezone: &str,
     ) -> Result<Self> {
         let scheduler = JobScheduler::new().await?;
         let tasks: Arc<Mutex<HashMap<String, TaskEntry>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -118,6 +145,7 @@ impl CronSchedulerAdapter {
             executor,
             run_history,
             result_tx,
+            household_timezone: household_timezone.to_string(),
         };
 
         // Rehydrate persisted tasks
@@ -233,6 +261,32 @@ impl CronSchedulerAdapter {
                 migrated = true;
             }
 
+            // ── One-time timezone backfill ───────────────────────────────
+            // A stored "UTC" written before this migration existed is not a
+            // choice, it is the old UI default landing in a field the
+            // scheduler then ignored. Read literally after the fix, it would
+            // keep every existing schedule firing at the UTC hour — an 08:00
+            // briefing in Nairobi would go on arriving at 11:00, which is the
+            // complaint that started this. Rewrite it once to the household's
+            // zone and mark it, so a later deliberate "UTC" is left alone.
+            // The `!= "UTC"` guard is on the MARKER as well as the rewrite, and
+            // deliberately so: on a pond whose household zone is still the
+            // default there is nothing to migrate TO, and burning the flag
+            // there would mean the backfill never runs once a real zone is
+            // finally set during onboarding.
+            if !record.tz_migrated && self.household_timezone != "UTC" {
+                record.tz_migrated = true;
+                migrated = true;
+                if record.timezone == "UTC" {
+                    tracing::info!(
+                        task = %record.id,
+                        timezone = %self.household_timezone,
+                        "migrating a schedule stored without a timezone to the household zone"
+                    );
+                    record.timezone = self.household_timezone.clone();
+                }
+            }
+
             // A paused task and an event-triggered rule (#92) both load with
             // no cron job -- the nil id is what "no job" means for either.
             let job_id = if record.paused {
@@ -242,7 +296,7 @@ impl CronSchedulerAdapter {
                 if kind.is_event_triggered() {
                     uuid::Uuid::nil()
                 } else {
-                    self.add_job_to_scheduler(&record.id, &record.cron, kind)
+                    self.arm_chain(&record.id, &record.cron, &record.timezone)
                         .await?
                 }
             };
@@ -277,112 +331,26 @@ impl CronSchedulerAdapter {
 
     // ── Internal job management ───────────────────────────────────────────────
 
-    async fn add_job_to_scheduler(
-        &self,
-        task_id: &str,
-        cron: &str,
-        kind: TaskKind,
-    ) -> Result<uuid::Uuid> {
-        use pond_core::user_data::domain::schedule::ScheduleResultEvent;
-
-        let executor = self.executor.clone();
-        let tasks = self.tasks.clone();
-        let run_history = self.run_history.clone();
-        let result_tx = self.result_tx.clone();
-        let persist = self.persist.clone();
-        let id = task_id.to_string();
-
-        let job = Job::new_async(cron, move |_uuid, _lock| {
-            let executor = executor.clone();
-            let tasks = tasks.clone();
-            let run_history = run_history.clone();
-            let result_tx = result_tx.clone();
-            let persist = persist.clone();
-            let id = id.clone();
-            let kind = kind.clone();
-            Box::pin(async move {
-                // Get label for the event
-                let label = {
-                    let guard = tasks.lock().await;
-                    guard
-                        .get(&id)
-                        .map(|e| e.persisted.label.clone())
-                        .unwrap_or_default()
-                };
-
-                // Mark running
-                {
-                    let mut guard = tasks.lock().await;
-                    if let Some(entry) = guard.get_mut(&id) {
-                        entry.currently_running = true;
-                    }
-                }
-                Self::stamp_fire(&tasks, &persist, &id).await;
-
-                // Record run start
-                let run_id = run_history.record_start(&id).await;
-                let start = std::time::Instant::now();
-
-                // Broadcast "started" event so clients see progress immediately
-                if let Some(tx) = &result_tx {
-                    let _ = tx.send(ScheduleResultEvent {
-                        schedule_id: id.clone(),
-                        schedule_label: label.clone(),
-                        run_id: run_id.clone(),
-                        status: RunStatus::Running,
-                        result: None,
-                        error: None,
-                        duration_ms: None,
-                    });
-                }
-
-                // Execute
-                let result = executor.execute(&id, &kind).await;
-                let duration_ms = start.elapsed().as_millis() as u64;
-
-                // Record run finish + broadcast event
-                let (status, result_text, error_text) = match &result {
-                    Ok(text) => {
-                        run_history
-                            .record_finish(&run_id, RunStatus::Completed, Some(text.clone()), None)
-                            .await;
-                        (RunStatus::Completed, Some(text.clone()), None)
-                    }
-                    Err(e) => {
-                        tracing::error!("Scheduled task {id} failed: {e}");
-                        run_history
-                            .record_finish(&run_id, RunStatus::Failed, None, Some(e.to_string()))
-                            .await;
-                        (RunStatus::Failed, None, Some(e.to_string()))
-                    }
-                };
-
-                // Broadcast result event (for SSE / desktop notifications)
-                if let Some(tx) = &result_tx {
-                    let _ = tx.send(ScheduleResultEvent {
-                        schedule_id: id.clone(),
-                        schedule_label: label,
-                        run_id: run_id.clone(),
-                        status,
-                        result: result_text,
-                        error: error_text,
-                        duration_ms: Some(duration_ms),
-                    });
-                }
-
-                // Mark not-running. `last_run` was stamped at fire time above.
-                {
-                    let mut guard = tasks.lock().await;
-                    if let Some(entry) = guard.get_mut(&id) {
-                        entry.currently_running = false;
-                    }
-                }
-            })
-        })
-        .map_err(|e| anyhow::anyhow!("invalid cron expression '{cron}': {e}"))?;
-
-        let job_id = self.scheduler.add(job).await?;
-        Ok(job_id)
+    /// Arm the next occurrence of `task_id` and return the job id holding it.
+    ///
+    /// See [`arm_next`] for why this is a one-shot chain rather than a
+    /// recurring cron job.
+    async fn arm_chain(&self, task_id: &str, cron: &str, timezone: &str) -> Result<uuid::Uuid> {
+        let ctx = Arc::new(ChainCtx {
+            id: task_id.to_string(),
+            executor: self.executor.clone(),
+            tasks: self.tasks.clone(),
+            run_history: self.run_history.clone(),
+            result_tx: self.result_tx.clone(),
+            persist: self.persist.clone(),
+        });
+        arm_next(
+            ctx,
+            self.scheduler.clone(),
+            cron.to_string(),
+            parse_tz(timezone),
+        )
+        .await
     }
 
     /// Resolve the `TaskKind` for a task entry.
@@ -416,36 +384,327 @@ impl CronSchedulerAdapter {
     }
 }
 
-/// Compute the next fire time for a cron expression from now.
+// ── The one-shot chain ────────────────────────────────────────────────────────
+
+/// Never arm a timer further out than this.
 ///
-/// Returns `None` if the cron expression is invalid or no upcoming occurrence
-/// can be found within a reasonable search window.
+/// A schedule's next occurrence can be a month away, and a timer armed that far
+/// ahead is a promise about a wall clock nobody has checked since. An NTP step
+/// correction (ordinary on a Jetson that boots offline and syncs minutes later)
+/// or a tzdata update both invalidate it silently. Capping the wait means the
+/// occurrence is recomputed at least this often, so any such correction costs at
+/// most one horizon of drift instead of the whole wait.
+const REARM_HORIZON: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// How early a wake-up still counts as "this is the occurrence".
 ///
-/// Note: `_timezone` is accepted for future use but computation is done in UTC.
-/// The cron expression is evaluated against UTC; the scheduler job itself
-/// handles timezone-correct firing via `tokio-cron-scheduler`.
-fn compute_next_run(cron_expr: &str, _timezone: &str) -> Option<chrono::DateTime<Utc>> {
+/// `tokio-cron-scheduler` polls on a sub-second tick and so fires at or shortly
+/// AFTER the instant asked for, never meaningfully before. The tolerance exists
+/// for clock jitter — and it doubles as the anti-spin bound: a wake-up that is
+/// not due necessarily has more than this long left to wait, so the re-arm
+/// delay below can never collapse to zero and busy-loop.
+const FIRE_TOLERANCE: chrono::TimeDelta = chrono::TimeDelta::seconds(1);
+
+/// Everything a chained fire needs that does not change between occurrences.
+///
+/// The cron expression, the zone and the kind are deliberately NOT in here:
+/// they are re-read from the task map on every re-arm, so an edit that lands
+/// while a chain is armed is picked up by the next link instead of being
+/// carried stale until a restart.
+struct ChainCtx {
+    id: String,
+    executor: Arc<dyn ScheduleExecutor>,
+    tasks: Arc<Mutex<HashMap<String, TaskEntry>>>,
+    run_history: Arc<JsonRunHistory>,
+    result_tx: Option<
+        tokio::sync::broadcast::Sender<pond_core::user_data::domain::schedule::ScheduleResultEvent>,
+    >,
+    persist: Arc<SnapshotWriter>,
+}
+
+/// Arm a one-shot for the next occurrence, which re-arms itself after firing.
+///
+/// **Why not a recurring cron job.** `Job::new_async` is defined upstream as
+/// `new_async_tz(schedule, Utc, run)` — it evaluates the expression in UTC, full
+/// stop. That is the whole bug this replaces: hour `8` fired at 08:00 UTC, which
+/// is 11:00 in Nairobi. Its timezone-aware sibling `new_async_tz` is not the fix
+/// either, because it snapshots a FIXED offset at registration
+/// (`offset_from_utc_datetime(...).fix()`), so a zone with DST drifts by an hour
+/// at every transition and stays wrong until something re-registers the job.
+///
+/// Recomputing the occurrence in the zone before each link is armed makes the
+/// zone's rules apply to the date they actually govern, which is DST-correct by
+/// construction rather than by remembering to refresh.
+///
+/// Returns a boxed future rather than being a plain `async fn` because this and
+/// [`fire_and_rearm`] are mutually recursive — each link arms the next — and the
+/// compiler cannot infer `Send` around that cycle. Naming the bound here breaks
+/// it; `tokio-cron-scheduler` requires a `Send` future.
+fn arm_next(
+    ctx: Arc<ChainCtx>,
+    sched: JobScheduler,
+    cron: String,
+    tz: chrono_tz::Tz,
+) -> Pin<Box<dyn Future<Output = Result<uuid::Uuid>> + Send>> {
+    Box::pin(async move {
+        let next = next_occurrence_utc(&cron, tz).ok_or_else(|| {
+            anyhow::anyhow!("cron expression '{cron}' has no upcoming occurrence in timezone {tz}")
+        })?;
+
+        // Capped so a distant occurrence is re-checked rather than trusted; the
+        // wake-up that results is a no-op hop, not a fire. `armed_for` travels
+        // with the closure rather than living on the task entry, so it is
+        // correct even for the very first link — `create_task` arms before it
+        // inserts.
+        let wait = (next - Utc::now())
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO)
+            .min(REARM_HORIZON);
+
+        let job = Job::new_one_shot_async(wait, move |spent, lock| {
+            let ctx = ctx.clone();
+            Box::pin(async move { fire_and_rearm(ctx, spent, lock, next).await })
+        })
+        .map_err(|e| anyhow::anyhow!("invalid cron expression '{cron}': {e}"))?;
+
+        Ok(sched.add(job).await?)
+    })
+}
+
+/// One link of the chain: fire if this really is the occurrence, then arm the
+/// next link.
+async fn fire_and_rearm(
+    ctx: Arc<ChainCtx>,
+    spent: uuid::Uuid,
+    sched: JobScheduler,
+    armed_for: DateTime<Utc>,
+) {
+    // The chain's terminator. A deleted task is gone from the map and a paused
+    // one is flagged, and either way this link must be the last: re-arming a
+    // task that no longer exists resurrects a schedule the household deleted.
+    let current = {
+        let guard = ctx.tasks.lock().await;
+        match guard.get(&ctx.id) {
+            Some(entry) if !entry.persisted.paused => Some((
+                entry.persisted.cron.clone(),
+                entry.persisted.timezone.clone(),
+                CronSchedulerAdapter::resolve_kind(entry),
+            )),
+            _ => None,
+        }
+    };
+    let Some((cron, timezone, kind)) = current else {
+        let _ = sched.remove(&spent).await;
+        return;
+    };
+
+    // A capped wait wakes us before the occurrence; that is a hop, not a fire.
+    if Utc::now() >= armed_for - FIRE_TOLERANCE {
+        fire_once(&ctx, &kind).await;
+    }
+
+    // Re-read cron/zone above rather than reusing what this link was armed
+    // with, so an edit mid-wait takes effect on the next link.
+    match arm_next(ctx.clone(), sched.clone(), cron, parse_tz(&timezone)).await {
+        Ok(next_id) => {
+            // Adopt the successor only if THIS link is still the one the task
+            // is holding. An edit that lands while the link is executing arms
+            // its own chain and removes this link — but removal cannot recall a
+            // job already running, so without this check both chains would
+            // survive and the schedule would fire twice on every occurrence,
+            // forever, with no way to see why from the task list.
+            let superseded = {
+                let mut guard = ctx.tasks.lock().await;
+                match guard.get_mut(&ctx.id) {
+                    Some(entry) if entry.job_id == spent => {
+                        entry.job_id = next_id;
+                        false
+                    }
+                    _ => true,
+                }
+            };
+            if superseded {
+                tracing::debug!(
+                    task = %ctx.id,
+                    "a newer chain took over while this occurrence ran; dropping the successor"
+                );
+                let _ = sched.remove(&next_id).await;
+            }
+        }
+        Err(e) => {
+            // The chain stops here, so the schedule is dead until a restart or
+            // an edit re-arms it. That is worth an error, not a warning.
+            tracing::error!(
+                task = %ctx.id,
+                error = %e,
+                "could not arm the next occurrence; this schedule will not fire again until it is edited or the pond restarts"
+            );
+        }
+    }
+
+    // Reap the spent link. Without this the job store grows by one dead entry
+    // per fire, which on an always-on pond is a leak measured in months.
+    let _ = sched.remove(&spent).await;
+}
+
+/// Execute one occurrence: stamp, broadcast, run, record, broadcast.
+async fn fire_once(ctx: &ChainCtx, kind: &TaskKind) {
+    use pond_core::user_data::domain::schedule::ScheduleResultEvent;
+
+    let id = &ctx.id;
+
+    // Get label for the event
+    let label = {
+        let guard = ctx.tasks.lock().await;
+        guard
+            .get(id)
+            .map(|e| e.persisted.label.clone())
+            .unwrap_or_default()
+    };
+
+    // Mark running
+    {
+        let mut guard = ctx.tasks.lock().await;
+        if let Some(entry) = guard.get_mut(id) {
+            entry.currently_running = true;
+        }
+    }
+    CronSchedulerAdapter::stamp_fire(&ctx.tasks, &ctx.persist, id).await;
+
+    // Record run start
+    let run_id = ctx.run_history.record_start(id).await;
+    let start = std::time::Instant::now();
+
+    // Broadcast "started" event so clients see progress immediately
+    if let Some(tx) = &ctx.result_tx {
+        let _ = tx.send(ScheduleResultEvent {
+            schedule_id: id.clone(),
+            schedule_label: label.clone(),
+            run_id: run_id.clone(),
+            status: RunStatus::Running,
+            result: None,
+            error: None,
+            duration_ms: None,
+        });
+    }
+
+    // Execute
+    let result = ctx.executor.execute(id, kind).await;
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    // Record run finish + broadcast event
+    let (status, result_text, error_text) = match &result {
+        Ok(text) => {
+            ctx.run_history
+                .record_finish(&run_id, RunStatus::Completed, Some(text.clone()), None)
+                .await;
+            (RunStatus::Completed, Some(text.clone()), None)
+        }
+        Err(e) => {
+            tracing::error!("Scheduled task {id} failed: {e}");
+            ctx.run_history
+                .record_finish(&run_id, RunStatus::Failed, None, Some(e.to_string()))
+                .await;
+            (RunStatus::Failed, None, Some(e.to_string()))
+        }
+    };
+
+    // Broadcast result event (for SSE / desktop notifications)
+    if let Some(tx) = &ctx.result_tx {
+        let _ = tx.send(ScheduleResultEvent {
+            schedule_id: id.clone(),
+            schedule_label: label,
+            run_id: run_id.clone(),
+            status,
+            result: result_text,
+            error: error_text,
+            duration_ms: Some(duration_ms),
+        });
+    }
+
+    // Mark not-running. `last_run` was stamped at fire time above.
+    {
+        let mut guard = ctx.tasks.lock().await;
+        if let Some(entry) = guard.get_mut(id) {
+            entry.currently_running = false;
+        }
+    }
+}
+
+/// Resolve an IANA zone name, falling back to UTC.
+///
+/// A zone that does not resolve must not take the schedule down with it: the
+/// household would rather have a morning briefing at the wrong hour than no
+/// morning briefing and a 500. It is a `warn!` and not a `debug!` because the
+/// fallback silently reintroduces the exact defect this module was fixed for.
+fn parse_tz(name: &str) -> chrono_tz::Tz {
+    name.parse().unwrap_or_else(|_| {
+        tracing::warn!(
+            timezone = %name,
+            "unknown IANA timezone on a schedule; falling back to UTC"
+        );
+        chrono_tz::Tz::UTC
+    })
+}
+
+/// The next occurrence of `cron_expr` *in `tz`*, as a UTC instant.
+///
+/// This is the single source of truth for both when a job is armed and the
+/// `next_run` the UI promises. They were two computations before, and they
+/// agreed with each other only because BOTH ignored the timezone — which is
+/// precisely why a schedule firing three hours late looked correct in the UI.
+///
+/// Evaluating in the zone (rather than applying a fixed offset to a UTC
+/// result) is what makes this DST-correct: croner resolves the local wall
+/// time against the zone's rules for that date, so "08:00 every day" stays
+/// 08:00 across a transition instead of drifting by an hour.
+fn next_occurrence_utc(cron_expr: &str, tz: chrono_tz::Tz) -> Option<DateTime<Utc>> {
+    next_occurrence_after(cron_expr, tz, Utc::now())
+}
+
+/// [`next_occurrence_utc`] from an arbitrary instant.
+///
+/// Split out so the DST behaviour can be asserted at a chosen date rather than
+/// only at whatever "now" the test suite happens to run at — a schedule that is
+/// correct in August and wrong in January is exactly the bug worth catching.
+fn next_occurrence_after(
+    cron_expr: &str,
+    tz: chrono_tz::Tz,
+    from: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
     // tokio-cron-scheduler uses 6-field cron (sec min hour dom month dow), and
     // both 5- and 6-field expressions have to parse. croner 3 makes that the
     // default — `Seconds::Optional` — so the explicit `.with_seconds_optional()`
     // builder that 2.x needed is gone rather than merely renamed.
     //
     // This must stay on the same croner MAJOR as the one inside
-    // `tokio-cron-scheduler`: that copy decides when the job actually fires,
-    // this one decides the `next_run` the UI promises. They were 2.x and 3.x.
+    // `tokio-cron-scheduler`. That constraint is now MORE load-bearing than the
+    // comment it replaces described: this parser no longer merely predicts the
+    // fire time for the UI, it DECIDES it — `arm_next` schedules a one-shot at
+    // whatever this returns. A disagreement between the two copies used to show
+    // one time and fire at another; today it would simply fire at the wrong one.
     let cron: croner::Cron = cron_expr.parse().ok()?;
-    let now = Utc::now();
-    match cron.find_next_occurrence(&now, false) {
-        Ok(dt) => Some(dt),
+    let from_in_zone = from.with_timezone(&tz);
+    match cron.find_next_occurrence(&from_in_zone, false) {
+        Ok(dt) => Some(dt.with_timezone(&Utc)),
         Err(e) => {
             tracing::debug!(
                 cron_expr,
+                timezone = %tz,
                 error = %e,
-                "Failed to compute next_run for cron expression"
+                "Failed to compute next occurrence for cron expression"
             );
             None
         }
     }
+}
+
+/// Compute the next fire time for a cron expression from now, in `timezone`.
+///
+/// Returns `None` if the cron expression is invalid or no upcoming occurrence
+/// can be found within a reasonable search window.
+fn compute_next_run(cron_expr: &str, timezone: &str) -> Option<DateTime<Utc>> {
+    next_occurrence_utc(cron_expr, parse_tz(timezone))
 }
 
 /// Refuse a task kind the scheduler must not store.
@@ -704,6 +963,10 @@ impl SchedulerPort for CronSchedulerAdapter {
             label: req.label.clone(),
             cron: req.cron.clone(),
             timezone: req.timezone.clone(),
+            // Anything created through this path carries a zone the caller
+            // actually chose, so the legacy backfill must never second-guess
+            // it — including a deliberate "UTC".
+            tz_migrated: true,
             kind: Some(req.kind.clone()),
             payload: None,
             paused: false,
@@ -714,11 +977,18 @@ impl SchedulerPort for CronSchedulerAdapter {
         // Event-triggered rules (#92) never register a cron job — the rules
         // engine fires them via `run_now` when a matching bus event arrives.
         // The nil job id marks "no cron job", same as the paused state.
+        // Arming BEFORE the insert below is deliberate and it is load-bearing
+        // in both directions. Arming first means an invalid cron fails the
+        // create without leaving a task behind. It also means the first link is
+        // armed against a map that does not hold this task yet — and a link
+        // that fires and finds no task ends the chain, since that is how delete
+        // works. What makes that safe is that `JobScheduler` ticks on a 500 ms
+        // sleep, so nothing can fire in the microseconds before the insert.
+        // Do not put an await that can block between the two.
         let job_id = if req.kind.is_event_triggered() {
             uuid::Uuid::nil()
         } else {
-            self.add_job_to_scheduler(&req.id, &req.cron, req.kind.clone())
-                .await?
+            self.arm_chain(&req.id, &req.cron, &req.timezone).await?
         };
 
         let next_run = if req.kind.is_event_triggered() {
@@ -803,7 +1073,7 @@ impl SchedulerPort for CronSchedulerAdapter {
     }
 
     async fn resume_task(&self, id: &str) -> Result<()> {
-        let (cron, kind) = {
+        let (cron, timezone, kind) = {
             let guard = self.tasks.lock().await;
             let entry = guard
                 .get(id)
@@ -811,7 +1081,11 @@ impl SchedulerPort for CronSchedulerAdapter {
             if !entry.persisted.paused {
                 return Ok(());
             }
-            (entry.persisted.cron.clone(), Self::resolve_kind(entry))
+            (
+                entry.persisted.cron.clone(),
+                entry.persisted.timezone.clone(),
+                Self::resolve_kind(entry),
+            )
         };
 
         // Event-triggered rules have no cron job to re-register (#92);
@@ -819,7 +1093,7 @@ impl SchedulerPort for CronSchedulerAdapter {
         let job_id = if kind.is_event_triggered() {
             uuid::Uuid::nil()
         } else {
-            self.add_job_to_scheduler(id, &cron, kind).await?
+            self.arm_chain(id, &cron, &timezone).await?
         };
 
         {
@@ -932,8 +1206,8 @@ impl SchedulerPort for CronSchedulerAdapter {
         }
         let cron_changed = req.cron.is_some();
 
-        // Read current state and apply non-cron changes first.
-        let (old_job_id, new_cron, new_kind, was_paused) = {
+        // Read current state and apply non-timing changes first.
+        let (old_job_id, new_cron, new_timezone, tz_changed, was_paused) = {
             let mut guard = self.tasks.lock().await;
             let entry = guard
                 .get_mut(id)
@@ -942,6 +1216,14 @@ impl SchedulerPort for CronSchedulerAdapter {
             if let Some(label) = &req.label {
                 entry.persisted.label = label.clone();
             }
+            // Whether the zone actually MOVED, not merely whether one was sent.
+            // The UI submits the whole form, so `req.timezone` is `Some` on
+            // every edit; re-arming on that would rebuild the chain each time
+            // somebody renamed a schedule.
+            let tz_changed = req
+                .timezone
+                .as_ref()
+                .is_some_and(|tz| *tz != entry.persisted.timezone);
             if let Some(tz) = &req.timezone {
                 entry.persisted.timezone = tz.clone();
             }
@@ -953,15 +1235,21 @@ impl SchedulerPort for CronSchedulerAdapter {
             let paused = entry.persisted.paused;
             // Use the NEW cron for scheduling but don't commit it to metadata yet.
             let cron = req.cron.as_ref().unwrap_or(&entry.persisted.cron).clone();
-            let kind = Self::resolve_kind(entry);
-            (old_job_id, cron, kind, paused)
+            let timezone = entry.persisted.timezone.clone();
+            (old_job_id, cron, timezone, tz_changed, paused)
         };
 
-        // If the cron changed and the schedule is active, reschedule the job.
+        // If the TIMING changed and the schedule is active, reschedule the job.
+        // The zone belongs in this condition as much as the expression does:
+        // "08:00" means a different instant in a different zone, and while the
+        // zone was applied to the stored record above it was never applied to
+        // the armed job — so moving a schedule from UTC to Africa/Nairobi
+        // appeared to work and changed nothing until the next restart.
+        //
         // Create the new job FIRST — if it fails (e.g. invalid cron), the old job
         // stays active and the schedule keeps running with the previous cron.
-        if cron_changed && !was_paused {
-            let new_job_id = self.add_job_to_scheduler(id, &new_cron, new_kind).await?;
+        if (cron_changed || tz_changed) && !was_paused {
+            let new_job_id = self.arm_chain(id, &new_cron, &new_timezone).await?;
             // New job created successfully — now safe to remove the old one and commit
             // the cron change to in-memory metadata.
             if old_job_id != uuid::Uuid::nil() {
@@ -1054,6 +1342,71 @@ mod tests {
         )
         .await
         .expect("scheduler init failed")
+    }
+
+    /// A scheduler whose household zone is `tz`, for the backfill tests.
+    async fn make_scheduler_in(dir: &std::path::Path, tz: &str) -> CronSchedulerAdapter {
+        let counter = Arc::new(AtomicU32::new(0));
+        let exec: Arc<dyn ScheduleExecutor> = Arc::new(CountingExecutor(counter));
+        CronSchedulerAdapter::with_options(
+            dir.join("schedules.json"),
+            dir.join("schedule_runs.json"),
+            exec,
+            None,
+            50,
+            tz,
+        )
+        .await
+        .expect("scheduler init failed")
+    }
+
+    /// Write a snapshot as a pond running the pre-fix code would have: a zone
+    /// field present, and no `tz_migrated` key at all.
+    async fn write_legacy_snapshot(dir: &std::path::Path, id: &str, timezone: &str) {
+        let record = PersistedTask {
+            id: id.to_string(),
+            label: "Morning briefing".into(),
+            cron: "0 0 8 * * *".into(),
+            timezone: timezone.to_string(),
+            tz_migrated: false,
+            kind: Some(TaskKind::AgentPrompt {
+                prompt: "brief me".into(),
+            }),
+            payload: None,
+            paused: false,
+            created_at: Some(Utc::now()),
+            last_run: None,
+        };
+
+        // Serialize a real record, then delete the key outright — a pre-fix
+        // pond wrote a file with no `tz_migrated` at all, and `false` and
+        // absent must be indistinguishable here or the test is checking the
+        // wrong thing.
+        let mut value = serde_json::to_value([record]).unwrap();
+        value[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("tz_migrated")
+            .expect("the marker should have been serialized before removal");
+
+        tokio::fs::write(
+            dir.join("schedules.json"),
+            serde_json::to_string(&value).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn stored_timezone(dir: &std::path::Path, id: &str) -> String {
+        let raw = tokio::fs::read_to_string(dir.join("schedules.json"))
+            .await
+            .unwrap();
+        let records: Vec<PersistedTask> = serde_json::from_str(&raw).unwrap();
+        records
+            .into_iter()
+            .find(|r| r.id == id)
+            .expect("task missing from snapshot")
+            .timezone
     }
 
     fn create_req(id: &str, cron: &str) -> CreateScheduleRequest {
@@ -1255,6 +1608,329 @@ mod tests {
     fn compute_next_run_invalid_cron() {
         let next = super::compute_next_run("not a cron", "UTC");
         assert!(next.is_none(), "invalid cron should return None");
+    }
+
+    // ── Timezone: the schedules-fire-in-UTC defect ───────────────────────
+
+    /// The regression test for the reported bug: 8:00 AM in Nairobi is 05:00
+    /// UTC, and the old code armed 08:00 UTC — which arrives at 11:00 local,
+    /// exactly the three hours late that was reported.
+    ///
+    /// It asserts the UTC INSTANT deliberately. Asserting the local hour would
+    /// pass against the broken code too, because the broken code also produced
+    /// a time whose local hour was 8 — in the wrong zone.
+    #[test]
+    fn eight_am_in_nairobi_is_five_am_utc() {
+        let from = "2026-08-13T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let next =
+            super::next_occurrence_after("0 0 8 * * *", chrono_tz::Tz::Africa__Nairobi, from)
+                .expect("a daily 08:00 rule has an occurrence");
+
+        assert_eq!(next.to_rfc3339(), "2026-08-13T05:00:00+00:00");
+    }
+
+    /// The same expression in UTC still means 08:00 UTC — the fix must not
+    /// shift schedules that really were UTC.
+    #[test]
+    fn eight_am_in_utc_is_unchanged() {
+        let from = "2026-08-13T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let next = super::next_occurrence_after("0 0 8 * * *", chrono_tz::Tz::UTC, from)
+            .expect("a daily 08:00 rule has an occurrence");
+
+        assert_eq!(next.to_rfc3339(), "2026-08-13T08:00:00+00:00");
+    }
+
+    /// The reason this is a one-shot chain rather than `Job::new_async_tz`.
+    ///
+    /// New York is UTC-5 in winter and UTC-4 in summer. A fixed offset captured
+    /// at registration — which is what `new_async_tz` stores — is necessarily
+    /// wrong on one side of a transition. Recomputing per occurrence keeps the
+    /// LOCAL hour fixed at 08:00, which is what the household asked for.
+    #[test]
+    fn a_daily_local_hour_survives_a_dst_transition() {
+        let tz = chrono_tz::Tz::America__New_York;
+        let winter = "2026-01-15T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let summer = "2026-07-15T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        let in_winter = super::next_occurrence_after("0 0 8 * * *", tz, winter).unwrap();
+        let in_summer = super::next_occurrence_after("0 0 8 * * *", tz, summer).unwrap();
+
+        // Same local hour on both sides …
+        assert_eq!(
+            in_winter.with_timezone(&tz).format("%H:%M").to_string(),
+            "08:00"
+        );
+        assert_eq!(
+            in_summer.with_timezone(&tz).format("%H:%M").to_string(),
+            "08:00"
+        );
+
+        // … which means DIFFERENT UTC instants. A fixed offset cannot do both,
+        // and this inequality is the whole argument for the chain.
+        assert_eq!(in_winter.format("%H:%M").to_string(), "13:00");
+        assert_eq!(in_summer.format("%H:%M").to_string(), "12:00");
+    }
+
+    /// An unresolvable zone must not take the schedule down with it.
+    #[test]
+    fn an_unknown_timezone_falls_back_to_utc() {
+        assert_eq!(super::parse_tz("Mars/Olympus_Mons"), chrono_tz::Tz::UTC);
+        assert_eq!(super::parse_tz(""), chrono_tz::Tz::UTC);
+        assert_eq!(
+            super::parse_tz("Africa/Nairobi"),
+            chrono_tz::Tz::Africa__Nairobi
+        );
+    }
+
+    /// `next_run` must be computed in the schedule's zone too. It was not, and
+    /// because it agreed with the equally-wrong fire time, the UI looked
+    /// consistent while the schedule ran three hours late.
+    #[test]
+    fn next_run_is_computed_in_the_schedules_zone() {
+        let utc = super::compute_next_run("0 0 8 * * *", "UTC").unwrap();
+        let nairobi = super::compute_next_run("0 0 8 * * *", "Africa/Nairobi").unwrap();
+
+        assert_ne!(
+            utc, nairobi,
+            "08:00 UTC and 08:00 in Nairobi are three hours apart; next_run must reflect that"
+        );
+    }
+
+    // ── The one-time legacy backfill ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_legacy_schedule_is_migrated_to_the_household_zone() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_legacy_snapshot(tmp.path(), "sched-morning", "UTC").await;
+
+        let sched = make_scheduler_in(tmp.path(), "Africa/Nairobi").await;
+        let tasks = sched.list_tasks().await.unwrap();
+
+        assert_eq!(tasks[0].timezone, "Africa/Nairobi");
+        assert_eq!(
+            stored_timezone(tmp.path(), "sched-morning").await,
+            "Africa/Nairobi",
+            "the migration must reach disk, or it runs again every boot"
+        );
+    }
+
+    /// The marker is what makes this a migration and not a standing override.
+    #[tokio::test]
+    async fn a_deliberate_utc_survives_a_second_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_legacy_snapshot(tmp.path(), "sched-morning", "UTC").await;
+
+        // First start migrates it and marks it.
+        drop(make_scheduler_in(tmp.path(), "Africa/Nairobi").await);
+
+        // The household then deliberately puts this one back to UTC.
+        let raw = tokio::fs::read_to_string(tmp.path().join("schedules.json"))
+            .await
+            .unwrap();
+        let mut records: Vec<PersistedTask> = serde_json::from_str(&raw).unwrap();
+        records[0].timezone = "UTC".into();
+        tokio::fs::write(
+            tmp.path().join("schedules.json"),
+            serde_json::to_string(&records).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // A later start must leave that choice alone.
+        let sched = make_scheduler_in(tmp.path(), "Africa/Nairobi").await;
+        let tasks = sched.list_tasks().await.unwrap();
+        assert_eq!(
+            tasks[0].timezone, "UTC",
+            "a zone chosen after the migration must not be overwritten"
+        );
+    }
+
+    /// A schedule that already names a real zone is not a legacy row.
+    #[tokio::test]
+    async fn a_schedule_with_a_real_zone_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_legacy_snapshot(tmp.path(), "sched-morning", "Europe/Berlin").await;
+
+        let sched = make_scheduler_in(tmp.path(), "Africa/Nairobi").await;
+        let tasks = sched.list_tasks().await.unwrap();
+
+        assert_eq!(tasks[0].timezone, "Europe/Berlin");
+    }
+
+    /// Before onboarding sets a zone there is nothing to migrate TO, and
+    /// burning the marker there would mean the backfill never runs later.
+    #[tokio::test]
+    async fn a_utc_household_defers_the_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_legacy_snapshot(tmp.path(), "sched-morning", "UTC").await;
+
+        // Boot while the household zone is still the default.
+        drop(make_scheduler_in(tmp.path(), "UTC").await);
+
+        // Onboarding lands, and the NEXT boot migrates.
+        let sched = make_scheduler_in(tmp.path(), "Africa/Nairobi").await;
+        let tasks = sched.list_tasks().await.unwrap();
+        assert_eq!(
+            tasks[0].timezone, "Africa/Nairobi",
+            "the migration must still be pending after a UTC-household boot"
+        );
+    }
+
+    /// A schedule created through the API carries a chosen zone, so the legacy
+    /// backfill must never touch it — even when that choice is UTC.
+    #[tokio::test]
+    async fn a_newly_created_schedule_is_not_a_migration_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let sched = make_scheduler_in(tmp.path(), "Africa/Nairobi").await;
+            sched
+                .create_task(create_req("sched-new", "0 0 8 * * *"))
+                .await
+                .unwrap();
+        }
+
+        let sched = make_scheduler_in(tmp.path(), "Africa/Nairobi").await;
+        let tasks = sched.list_tasks().await.unwrap();
+        assert_eq!(
+            tasks[0].timezone, "UTC",
+            "create_req asks for UTC explicitly; the backfill must respect it"
+        );
+    }
+
+    // ── The one-shot chain actually fires, and actually stops ────────────
+
+    /// A scheduler plus the fire counter its executor increments.
+    async fn make_counting_scheduler(
+        dir: &std::path::Path,
+    ) -> (CronSchedulerAdapter, Arc<AtomicU32>) {
+        let counter = Arc::new(AtomicU32::new(0));
+        let exec: Arc<dyn ScheduleExecutor> = Arc::new(CountingExecutor(counter.clone()));
+        let sched = CronSchedulerAdapter::with_options(
+            dir.join("schedules.json"),
+            dir.join("schedule_runs.json"),
+            exec,
+            None,
+            50,
+            "UTC",
+        )
+        .await
+        .expect("scheduler init failed");
+        (sched, counter)
+    }
+
+    /// A recurring cron job repeats on its own; a one-shot does not. The whole
+    /// design rests on each link arming the next, so "it fired MORE THAN ONCE"
+    /// is the property under test — a single fire would mean the chain died
+    /// after its first link and every schedule silently became one-shot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_chain_re_arms_itself_after_each_fire() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sched, fires) = make_counting_scheduler(tmp.path()).await;
+
+        sched
+            .create_task(create_req("sched-tick", "* * * * * *"))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(3_500)).await;
+
+        assert!(
+            fires.load(Ordering::SeqCst) >= 2,
+            "a chained schedule must fire repeatedly; saw {} fire(s)",
+            fires.load(Ordering::SeqCst)
+        );
+    }
+
+    /// Deleting a schedule has to break the chain. Because re-arming now
+    /// happens INSIDE the fire path, a link that does not check whether its
+    /// task still exists would keep arming successors forever — a deleted
+    /// schedule that goes on running with no way to stop it short of a restart.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_schedule_breaks_the_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sched, fires) = make_counting_scheduler(tmp.path()).await;
+
+        sched
+            .create_task(create_req("sched-tick", "* * * * * *"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+        assert!(
+            fires.load(Ordering::SeqCst) >= 1,
+            "should have fired at least once"
+        );
+
+        sched.delete_task("sched-tick").await.unwrap();
+        // Let any in-flight link finish before taking the reading.
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+        let after_delete = fires.load(Ordering::SeqCst);
+
+        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            after_delete,
+            "a deleted schedule must not fire again"
+        );
+    }
+
+    /// Same property for pause, which leaves the task in the map rather than
+    /// removing it — so it exercises the paused branch of the terminator.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pausing_a_schedule_breaks_the_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sched, fires) = make_counting_scheduler(tmp.path()).await;
+
+        sched
+            .create_task(create_req("sched-tick", "* * * * * *"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+
+        sched.pause_task("sched-tick").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+        let after_pause = fires.load(Ordering::SeqCst);
+
+        tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            after_pause,
+            "a paused schedule must not fire again"
+        );
+    }
+
+    /// Changing only the zone is a timing change. It updated the stored record
+    /// but never re-registered the job, so the schedule went on firing at the
+    /// old zone's instant until something else restarted the pond.
+    #[tokio::test]
+    async fn changing_only_the_timezone_reschedules() {
+        use pond_core::user_data::ports::scheduler::UpdateScheduleRequest;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sched = make_scheduler(tmp.path()).await;
+        sched
+            .create_task(create_req("sched-1", "0 0 8 * * *"))
+            .await
+            .unwrap();
+
+        let before = sched.list_tasks().await.unwrap()[0].next_run.unwrap();
+
+        let updated = sched
+            .update_task(
+                "sched-1",
+                UpdateScheduleRequest {
+                    timezone: Some("Africa/Nairobi".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.timezone, "Africa/Nairobi");
+        assert_ne!(
+            updated.next_run.unwrap(),
+            before,
+            "moving the zone must move the next fire time"
+        );
     }
 
     #[tokio::test]
@@ -1459,6 +2135,7 @@ mod tests {
                 label: format!("label of {id} {}", "x".repeat(pad)),
                 cron: "0 0 4 * * *".into(),
                 timezone: "UTC".into(),
+                tz_migrated: true,
                 kind: Some(TaskKind::AgentPrompt {
                     prompt: "back up".into(),
                 }),

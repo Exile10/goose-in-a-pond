@@ -192,6 +192,36 @@ const TIMEZONE_OPTIONS = [
   "Pacific/Auckland",
 ];
 
+/**
+ * The zone a new schedule should start on.
+ *
+ * Defaulting this to "UTC" is how an 8:00 AM briefing ended up firing at 11:00
+ * in Nairobi: the picker submitted a zone nobody chose, and the scheduler was
+ * entitled to believe it. The browser's own zone is the closest thing to the
+ * household's that this component can see without a round-trip, and it is
+ * replaced by the real setting as soon as that loads.
+ */
+function browserTimezone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+}
+
+/**
+ * The list to offer, with `current` guaranteed present.
+ *
+ * `TIMEZONE_OPTIONS` is a hand-picked 18. A household in a zone outside it
+ * would otherwise open the form to a `<select>` with nothing selected and
+ * silently save whatever sat at the top.
+ */
+function timezoneChoices(current: string): string[] {
+  return TIMEZONE_OPTIONS.includes(current)
+    ? TIMEZONE_OPTIONS
+    : [current, ...TIMEZONE_OPTIONS];
+}
+
 export function Schedules() {
   const state = useAppState();
   const dispatch = useAppDispatch();
@@ -322,7 +352,9 @@ export function Schedules() {
   const [name, setName]               = useState("");
   const [cron, setCron]               = useState("");
   const [prompt, setPrompt]           = useState("");
-  const [timezone, setTimezone]       = useState("UTC");
+  // The household's zone, from Settings; the browser's until that arrives.
+  const [defaultTimezone, setDefaultTimezone] = useState(browserTimezone);
+  const [timezone, setTimezone]       = useState(browserTimezone);
   const [freqKey, setFreqKey]         = useState("Custom");   // kept for compat
   const [recipeKey, setRecipeKey]     = useState("Custom");
   const [submitting, setSubmitting]   = useState(false);
@@ -346,6 +378,25 @@ export function Schedules() {
 
   useEffect(() => {
     load();
+  }, []);
+
+  // The pond's own zone beats the browser's — the schedule fires on the pond.
+  // Only the untouched default is moved: a zone the user has already picked in
+  // an open form is theirs.
+  useEffect(() => {
+    const fallback = browserTimezone();
+    api
+      .getSettings()
+      .then((s) => {
+        const tz = s.timezone;
+        if (!tz || tz === fallback) return;
+        setTimezone((current) => (current === fallback ? tz : current));
+        setDefaultTimezone(tz);
+      })
+      .catch(() => {
+        /* keep the browser zone — a failed settings read is not worth an error
+           banner on a page whose job is listing schedules. */
+      });
   }, []);
 
   // Track running schedules and refresh on completion via global SSE listener.
@@ -419,7 +470,7 @@ export function Schedules() {
       setName("");
       setCron("");
       setPrompt("");
-      setTimezone("UTC");
+      setTimezone(defaultTimezone);
       setFreqKey("Custom");
       setRecipeKey("Custom");
       setRepeat("daily");
@@ -719,7 +770,7 @@ export function Schedules() {
                 onChange={(e) => setTimezone(e.target.value)}
                 aria-label="Schedule timezone"
               >
-                {TIMEZONE_OPTIONS.map((tz) => (
+                {timezoneChoices(timezone).map((tz) => (
                   <option key={tz} value={tz}>{tz}</option>
                 ))}
               </select>

@@ -1656,3 +1656,47 @@ will ever run their assertions.**
 - **PAI-4 P7b** — a session crossing 75% should show the note in the hub chat. Expect the "Compact
   now" control to answer `cooling_down`; per the finding above that is the current behaviour, so a
   refusal is a CONFIRMATION of the defect, not a failure of the live run.
+
+**2026-08-13 — every schedule fired in UTC. Not a PAI phase; it is the clock PAI-7 runs on.**
+
+Reported as "the schedules run every day at 11:00 instead of the 08:00 I set". Africa/Nairobi is
+UTC+3, so the +3 was the whole diagnosis: cron hour `8` was being armed as 08:00 **UTC**.
+
+The timezone was plumbed correctly through every layer — a picker in the UI, a field on the DTO, a
+documented field on the domain type, a durably persisted key in `schedules.json` — and then dropped
+at the one place it decides anything. `add_job_to_scheduler` did not take a timezone parameter at
+all, and `Job::new_async` is defined upstream as `new_async_tz(schedule, Utc, run)`. The dropdown
+was decorative for as long as it has existed.
+
+**Why it survived review, which is the part worth keeping.** `compute_next_run` ignored the zone
+too, and its doc comment asserted the opposite — that `tokio-cron-scheduler` "handles
+timezone-correct firing". So the `next_run` the UI promised and the instant the job actually fired
+were both wrong, in the same direction, by the same three hours. Nothing looked inconsistent. Two
+wrong computations agreeing is not a weaker signal than one; it is a **quieter** one, and this
+programme has now been bitten by the same shape twice (see PAI-1 P5 and PAI-6 P3, both correct and
+both inert). The fix makes one function the source of truth for both.
+
+`new_async_tz` was **not** the fix. It snapshots a fixed offset at registration
+(`offset_from_utc_datetime(...).fix()`), so a DST zone drifts an hour at every transition and stays
+wrong until something re-registers. Schedules are now a self-rescheduling **one-shot chain**: each
+link recomputes its occurrence in the zone before arming the next, which is DST-correct by
+construction rather than by remembering to refresh. The costs are real and are written into the code
+— the chain must terminate on delete and pause or a deleted schedule resurrects itself, and a link
+that is superseded mid-execution must drop its successor or the schedule fires twice forever.
+
+- **Relevance to PAI-7.** The proactive loop is scheduled. Any conclusion about *when* an impulse
+  appeared that was drawn before today was drawn against a clock running three hours fast in EAT.
+  This does not explain the 2026-08-12 Orin failure — that was `deny_unknown_fields`, already
+  fixed — but the re-run's timing observations should not be compared against notes taken before it.
+- **A migration was unavoidable, and is one-time.** A stored `"UTC"` written before today records no
+  decision; it is the old UI default landing in a field nothing read. Honouring it literally would
+  have kept every existing schedule firing at the UTC hour — the fix would have shipped and the
+  complaint would have stood. Legacy rows are rewritten once to the household zone and marked with
+  `tz_migrated`; without that marker it is a standing override rather than a migration, and a
+  household that deliberately wants UTC could never keep it.
+- **Open:** `rules_engine.rs` evaluates a rule's time-of-day window against `chrono::Local::now()`
+  — the HOST's zone — and `shared/domain/time_tick.rs` documents deliberately not consulting
+  `Settings::timezone`. Both are now the only places left where "what time is it here" has a second
+  answer. Deliberately out of scope for a bugfix; worth a decision before PAI-7 is verified, because
+  a sensor rule gated on "after 18:00" and a schedule set for 18:00 currently mean different
+  instants on any pond whose host zone is not its household zone.

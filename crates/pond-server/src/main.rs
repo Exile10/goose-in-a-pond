@@ -2146,6 +2146,7 @@ async fn run_server(
             exec,
             Some(schedule_result_tx.clone()),
             settings.schedule_max_runs_per_task,
+            &settings.timezone,
         )
         .await
         {
