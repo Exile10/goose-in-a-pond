@@ -39,6 +39,7 @@ pub mod producer;
 pub mod retention;
 pub mod retrieval;
 pub mod scope;
+pub mod vector_index;
 
 #[cfg(any(test, feature = "test-mocks"))]
 pub mod mocks;
