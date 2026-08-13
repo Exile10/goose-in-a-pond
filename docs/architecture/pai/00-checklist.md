@@ -1677,8 +1677,30 @@ that wins the init race PANICS the live path. Handled by lazy model load (Goose 
 first, on the first turn; the embedder wraps), which is why backfill must stay idle-gated.
 
 **Verified on the Mac, NOT the Orin** — the device was offline. Per the vocabulary, this is
-`LANDED`, not `VERIFIED`: the acceptance test (the embedder comes up in a device run instead of
-warning twice) has not been run. Owed: that Orin run — which is also the confirmation that nomic
-initialises there (the reason it was chosen) and that lazy-ordering alone avoids the panic. Consider
-the ~4-line goose-fork patch (that `unreachable!` → graceful wrap) if the Orin shows any ordering
-fragility; flagged in the index §7, not taken.
+`LANDED`, not `VERIFIED`.
+
+**Two things the Mac run found that unit tests could not, and both were mine.** First, the
+coexistence mitigation I documented was WRONG, and the panic is reproducible without a Jetson: a pond
+on `chat_provider=ollama` never initialises Goose's llama backend, the startup memory backfill embeds
+immediately (so "loads lazily, after a chat turn" was false twice), the embedder wins
+`LlamaBackend::init()`, and switching to a local model then panics a tokio worker inside Goose at
+`llamacpp/mod.rs:355` — after which the API stops answering. Ordering cannot fix it from this side;
+the ~4-line goose-fork patch is now REQUIRED, not hardening, and is left for Jerry because it moves
+the patch set 6 -> 7. Until then `gguf` is safe only on a pond already local-at-boot (the Jetson's
+normal shape).
+
+Second, a second embedding provider means a second WIDTH, and the `model_id` column that §5 names as
+the guard belongs to a later phase. A mixed 384/768 store did not panic or warn — every comparison
+returned `0.0`, which is a *valid score*, so the keyword fallbacks (gated on emptiness) never fired,
+`search_similar` returned an arbitrary un-`ORDER BY`ed subset ranked as if judged, prompt injection
+reverted to importance+recency, dedup stopped, and `run_backfill` (`embedding IS NULL`) could never
+repair any of it. Fixed by filtering incomparable rows out of the candidate set in both adapters and
+returning `None` rather than `Some(0.0)` in `topical_memories`. **The first two guards I wrote for
+this passed with the fix removed** — vacuous, exactly the failure this checklist keeps recording —
+and were rewritten until mutation testing failed them in both directions. The documented 384-dim
+fallback model was itself the trap and is now 768, with a test that fails the build if any GGUF model
+is ever added at fastembed's width.
+
+Also fixed while here: `activate_model` wrote `embedding_provider = "embedding"`, a string matching no
+provider arm, so activating any embedding model silently reverted a `gguf` pond to fastembed. Inert
+while fastembed was the only implementation; not inert now.

@@ -8,18 +8,31 @@
 //! model loaded through the same llama.cpp this pond already runs for chat has
 //! no separate native runtime to be incompatible with.
 //!
-//! # Coexistence with Goose — the reason model load is LAZY
+//! # Coexistence with Goose — AN OPEN HAZARD, read before enabling this
 //!
-//! llama-cpp-2 guards backend init with a process-global flag, and Goose's own
+//! llama-cpp-2 guards backend init with a PROCESS-GLOBAL flag, and Goose's own
 //! local-inference runtime treats a second [`LlamaBackend::init`] as
-//! `unreachable!` — it PANICS the process rather than degrading
-//! (`goose-local-inference/src/llamacpp/mod.rs`). On a device where Goose is the
-//! live engine, whoever calls `init()` first must be Goose. So this provider
-//! never loads at startup: the model is loaded on the first [`embed`] call,
-//! which happens during memory extraction AFTER a chat turn — by then Goose has
-//! initialised the backend, and [`get_or_init_backend`] takes its graceful
-//! "already initialised, wrap it" path. Backfill is idle-gated for the same
-//! reason: nothing must embed before the first turn.
+//! `unreachable!` — it PANICS rather than degrading
+//! (`goose-local-inference/src/llamacpp/mod.rs`, the `BackendAlreadyInitialized`
+//! arm). This crate's [`get_or_init_backend`] is graceful in that situation;
+//! Goose is not. So whoever calls `init()` FIRST must be Goose, or Goose panics
+//! when its turn comes.
+//!
+//! **Lazy loading does not make that safe, and an earlier version of this comment
+//! claimed it did.** Reproduced on a Mac 2026-08-13: a pond whose `chat_provider`
+//! is not local at boot (e.g. `ollama`) never initialises Goose's backend, so the
+//! first embed here wins the race — and it happens at STARTUP, not after a turn,
+//! because `main.rs` spawns a memory backfill as soon as the provider exists.
+//! Switching that pond to a local model afterwards panics a tokio worker inside
+//! Goose and leaves the API unresponsive.
+//!
+//! Ordering cannot fix this from the pond side: any embed at all claims the
+//! backend, and the switch to a local chat model can happen at any time. The fix
+//! is a ~4-line Goose fork patch making its `BackendAlreadyInitialized` arm wrap
+//! the existing backend exactly as [`get_or_init_backend`] does. Until that lands,
+//! `embedding_provider = "gguf"` is safe only on a pond that is ALREADY on a local
+//! chat model at boot (which is the Jetson's normal configuration — there Goose is
+//! constructed first and this provider takes the graceful wrap path).
 //!
 //! [`embed`]: EmbeddingProvider::embed
 //! [`LlamaBackend::init`]: llama_cpp_2::llama_backend::LlamaBackend::init
@@ -46,10 +59,11 @@ const MAX_EMBED_TOKENS: usize = 2048;
 /// Immutable description of an embedding model: everything that makes one
 /// model's vectors incompatible with another's.
 ///
-/// `model_id` is the vector-space stamp. A vector from a different embedder
-/// still scores plausibly and is wrong, so every stored vector records which
-/// model produced it (the index's `model_id` column, per the personal-context
-/// design); a mismatch is refused and re-embedded, never silently mixed.
+/// `model_id` is the intended vector-space stamp, but **nothing persists it
+/// yet** — the index's `model_id` column belongs to a later phase, and today the
+/// only consumer is a log field. What actually discriminates one vector space
+/// from another at read time is the WIDTH (`dims`), which is why every model here
+/// is 768 and none may be 384; see [`EmbeddingModelSpec::bge_base_en_v1_5`].
 #[derive(Clone, Debug)]
 pub struct EmbeddingModelSpec {
     /// Stable identifier stamped onto every vector this model produces.
@@ -62,14 +76,27 @@ pub struct EmbeddingModelSpec {
     /// uses CLS. Wrong pooling silently produces a worse vector.
     pub pooling: LlamaPoolingType,
     /// Task prefix prepended to every text before tokenisation. nomic REQUIRES
-    /// one (`search_document: `); MiniLM/bge use none. The port has a single
-    /// `embed`, so query- vs document-asymmetry is deferred: one consistent
-    /// prefix still retrieves correctly, just not optimally.
+    /// one (`search_document: `); bge uses none.
+    ///
+    /// **Queries get this prefix too, and for nomic they should not.** nomic is
+    /// trained with asymmetric prefixes (`search_document: ` vs `search_query: `),
+    /// so a query currently lands in the document manifold. Both sides carry the
+    /// same prefix, so the space stays self-consistent and nothing is mis-scored
+    /// across models — it is a bounded ranking-quality loss, not a correctness
+    /// fault, worst where short queries meet long passages. Fixing it means adding
+    /// an `embed_query` to the port (a provided method, so other implementors are
+    /// untouched) and pointing the three query call sites at it:
+    /// `goose_agent.rs :: topical_memories`, `context.rs :: search_context`,
+    /// `memory.rs :: recall_memories`. Owed, not done.
     pub content_prefix: &'static str,
     /// GPU layers to offload. Defaults to 0 (CPU): an embedding forward pass is
     /// tiny and non-autoregressive, and CPU keeps it off the one GPU the chat
     /// model and its KV cache are fighting over.
     pub n_gpu_layers: u32,
+    /// ggml threads for the forward pass. Deliberately small: llama.cpp would
+    /// otherwise take 4, which on a 6-core Orin is most of the CPU the chat
+    /// model needs for prefill.
+    pub n_threads: i32,
     /// Canonical download URL for `filename`. The fetch is an egress point and
     /// must go through a gated downloader; this crate only names the source.
     pub download_url: String,
@@ -93,6 +120,7 @@ impl EmbeddingModelSpec {
             // simplification while the port has one `embed`.
             content_prefix: "search_document: ",
             n_gpu_layers: 0,
+            n_threads: 2,
             download_url: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/\
                            resolve/main/nomic-embed-text-v1.5.Q8_0.gguf"
                 .to_string(),
@@ -100,37 +128,59 @@ impl EmbeddingModelSpec {
         }
     }
 
-    /// `bge-small-en-v1.5`, 384-dim, CLS-pooled. The fallback if nomic will not
-    /// load on the device: a smaller, strong retriever whose 384 dimensions
-    /// happen to match the outgoing fastembed default. Swapping the default to
-    /// this is a one-line change AS LONG AS no 768-dim vectors have been stored
-    /// yet — that is the whole reason the dimension decision is a one-way door.
-    pub fn bge_small_en_v1_5() -> Self {
+    /// `bge-base-en-v1.5`, 768-dim, CLS-pooled. The fallback if nomic will not
+    /// load on the device.
+    ///
+    /// **It is 768 on purpose, and a 384-dim model must not be added here.**
+    /// Until the index carries a `model_id` column, the ONLY thing that can tell
+    /// one vector space from another at read time is the vector's WIDTH: every
+    /// similarity function in this workspace guards `a.len() != b.len()` and
+    /// returns `0.0`. fastembed — the provider this one replaces — emits 384
+    /// (`all-MiniLM-L6-v2`, `bge-small-en-v1.5`). So while every GGUF model here
+    /// is 768, a 384 vector is unambiguously a fastembed leftover and the width
+    /// check is a COMPLETE discriminator. Add a 384-dim GGUF model and it stops
+    /// being one: two genuinely different spaces would share a width, score
+    /// plausibly against each other, and be silently wrong with no guard able to
+    /// see it. That is strictly worse than the mismatch this file is guarding.
+    pub fn bge_base_en_v1_5() -> Self {
         Self {
-            model_id: "bge-small-en-v1.5".to_string(),
-            filename: "bge-small-en-v1.5-q8_0.gguf".to_string(),
-            dims: 384,
+            model_id: "bge-base-en-v1.5".to_string(),
+            filename: "bge-base-en-v1.5-q8_0.gguf".to_string(),
+            dims: 768,
             pooling: LlamaPoolingType::Cls,
             content_prefix: "",
             n_gpu_layers: 0,
-            download_url: "https://huggingface.co/CompendiumLabs/bge-small-en-v1.5-gguf/\
-                           resolve/main/bge-small-en-v1.5-q8_0.gguf"
+            n_threads: 2,
+            download_url: "https://huggingface.co/CompendiumLabs/bge-base-en-v1.5-gguf/\
+                           resolve/main/bge-base-en-v1.5-q8_0.gguf"
                 .to_string(),
-            size_hint_mb: 34,
+            size_hint_mb: 117,
         }
     }
 
     /// Resolve a settings model-name string to a spec. The empty string and the
     /// GGUF default both mean nomic.
+    ///
+    /// `active_embedding_model` is shared with the fastembed path, so a name
+    /// this function does not know is usually a fastembed model name left behind
+    /// by a provider switch — the caller falls back to the default rather than
+    /// disabling embeddings.
     pub fn resolve(name: &str) -> Result<Self> {
         match name {
             "" | "gguf" | "nomic-embed-text-v1.5" => Ok(Self::nomic_embed_text_v1_5()),
-            "bge-small-en-v1.5" => Ok(Self::bge_small_en_v1_5()),
+            "bge-base-en-v1.5" => Ok(Self::bge_base_en_v1_5()),
             other => Err(anyhow!(
                 "unknown GGUF embedding model: '{other}'. \
-                 Supported: nomic-embed-text-v1.5, bge-small-en-v1.5"
+                 Supported: nomic-embed-text-v1.5, bge-base-en-v1.5"
             )),
         }
+    }
+
+    /// Every GGUF embedding model this crate will load. Used by the guard test
+    /// that keeps the width discriminator complete.
+    #[cfg(test)]
+    fn all() -> Vec<Self> {
+        vec![Self::nomic_embed_text_v1_5(), Self::bge_base_en_v1_5()]
     }
 }
 
@@ -246,7 +296,17 @@ fn embed_sync(loaded: &Loaded, spec: &EmbeddingModelSpec, text: &str) -> Result<
     if tokens.is_empty() {
         return Err(anyhow!("text produced no tokens to embed"));
     }
-    tokens.truncate(loaded.max_ctx);
+    if tokens.len() > loaded.max_ctx {
+        // Truncation is silent data loss: the row is then marked embedded and
+        // never revisited, so the tail is unsearchable forever. Say so.
+        tracing::warn!(
+            model_id = %spec.model_id,
+            tokens = tokens.len(),
+            kept = loaded.max_ctx,
+            "embedding input truncated; the discarded tail is not searchable"
+        );
+        tokens.truncate(loaded.max_ctx);
+    }
     let n = tokens.len();
     let n_u32 = u32::try_from(n).expect("token count exceeds u32");
 
@@ -257,7 +317,12 @@ fn embed_sync(loaded: &Loaded, spec: &EmbeddingModelSpec, text: &str) -> Result<
         .with_n_batch(n_u32)
         .with_n_ubatch(n_u32)
         .with_embeddings(true)
-        .with_pooling_type(spec.pooling);
+        .with_pooling_type(spec.pooling)
+        // Bounded on purpose. llama.cpp defaults to 4 ggml threads; on a 6-core
+        // Orin that is most of the CPU taken from the chat model's prefill for a
+        // forward pass this small.
+        .with_n_threads(spec.n_threads)
+        .with_n_threads_batch(spec.n_threads);
 
     let mut ctx = loaded
         .model
@@ -286,6 +351,16 @@ fn embed_sync(loaded: &Loaded, spec: &EmbeddingModelSpec, text: &str) -> Result<
             "embedding width {} != declared {} for {}",
             raw.len(),
             spec.dims,
+            spec.model_id
+        ));
+    }
+    // A NaN or infinity here would be stored and then poison every comparison it
+    // takes part in: `partial_cmp` on a NaN score returns None, which the sorts in
+    // sqlite_memory/sqlite_context turn into `Ordering::Equal`, so a single bad
+    // row silently scrambles ranking. Refuse it instead of storing it.
+    if !raw.iter().all(|x| x.is_finite()) {
+        return Err(anyhow!(
+            "embedding for {} contains non-finite values; refusing to store it",
             spec.model_id
         ));
     }
@@ -343,11 +418,34 @@ mod tests {
             assert_eq!(s.dims, 768);
             assert!(matches!(s.pooling, LlamaPoolingType::Mean));
         }
-        let bge = EmbeddingModelSpec::resolve("bge-small-en-v1.5").unwrap();
-        assert_eq!(bge.dims, 384);
+        let bge = EmbeddingModelSpec::resolve("bge-base-en-v1.5").unwrap();
+        assert_eq!(bge.dims, 768);
         assert!(matches!(bge.pooling, LlamaPoolingType::Cls));
 
         assert!(EmbeddingModelSpec::resolve("does-not-exist").is_err());
+    }
+
+    /// The width IS the vector-space discriminator until the index carries a
+    /// `model_id` column: every similarity function in this workspace guards
+    /// `a.len() != b.len()` and returns 0.0, and fastembed — the provider this
+    /// one replaces — emits 384. So no GGUF model here may be 384: that would
+    /// give two different vector spaces the same width, where they score
+    /// plausibly against each other and NOTHING can detect it.
+    ///
+    /// If this fires because you added a model, do not change the number. Either
+    /// pick a non-384 model, or land the `model_id` column first and replace the
+    /// width check everywhere it is relied on.
+    #[test]
+    fn no_gguf_model_shares_a_width_with_the_fastembed_provider() {
+        const FASTEMBED_DIMS: usize = 384;
+        for spec in EmbeddingModelSpec::all() {
+            assert_ne!(
+                spec.dims, FASTEMBED_DIMS,
+                "{} is {}-dim, which collides with fastembed's width and makes a \
+                 mixed store undetectable",
+                spec.model_id, spec.dims
+            );
+        }
     }
 
     #[test]

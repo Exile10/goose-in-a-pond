@@ -269,15 +269,51 @@ impl MemoryRepository for SqliteMemoryRepository {
             return self.search_recent(scope, limit).await;
         }
 
+        let candidates = rows.len();
         let mut scored: Vec<(f32, MemoryFragment)> = rows
             .into_iter()
             .map(row_to_fragment)
             .filter_map(|f| {
                 let emb = f.embedding.clone()?;
+                // A vector of a different WIDTH came from a different embedding
+                // model, and is not comparable to this query. Drop it from the
+                // candidate set rather than scoring it: `cosine_similarity`
+                // answers 0.0 for a mismatch, which is a valid score, so scoring
+                // it would fill every result slot with rows that are merely
+                // incomparable, rank them as if judged, and — because the list
+                // is then not empty — skip the recency fallback below. Dropping
+                // is what lets that fallback fire.
+                if emb.len() != query_embedding.len() {
+                    return None;
+                }
                 let score = cosine_similarity(query_embedding, &emb);
                 Some((score, f))
             })
             .collect();
+
+        if scored.is_empty() {
+            // Either nothing was embedded, or everything stored was embedded by
+            // a different model (e.g. the pond switched embedding_provider).
+            // Keyword recency is the honest answer; silent 0.0-ranked rows are not.
+            if candidates > 0 {
+                tracing::warn!(
+                    incomparable = candidates,
+                    query_dims = query_embedding.len(),
+                    "every embedded memory was produced by a different embedding model — \
+                     falling back to recency. Re-embed the store or restore the previous \
+                     embedding_provider."
+                );
+            }
+            return self.search_recent(scope, limit).await;
+        }
+        if scored.len() < candidates {
+            tracing::warn!(
+                incomparable = candidates - scored.len(),
+                comparable = scored.len(),
+                "some embedded memories were produced by a different embedding model \
+                 and were excluded from semantic search"
+            );
+        }
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(limit);
@@ -758,6 +794,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    /// Switching `embedding_provider` changes the vector WIDTH, and every stored
+    /// vector from the old model becomes incomparable. Those rows must not be
+    /// scored: `cosine_similarity` answers 0.0 for a width mismatch, which is a
+    /// legitimate score, so scoring them would return a full page of rows ranked
+    /// as if they had been judged -- and, being non-empty, would suppress the
+    /// recency fallback entirely. That is the silent-degradation mode this test
+    /// exists to prevent.
+    #[tokio::test]
+    async fn search_similar_falls_back_when_every_vector_is_from_another_model() {
+        let (repo, _tmp) = make_repo().await;
+        let mut stale =
+            MemoryFragment::from_chat("old".to_string(), None, None, "stale vector".to_string());
+        // 384-dim, as fastembed would have written.
+        stale.embedding = Some(vec![0.5f32; 384]);
+        repo.add(stale).await.unwrap();
+        // An UNEMBEDDED row is what makes this test discriminate. The semantic
+        // query selects `embedding IS NOT NULL`, so it can never return this row;
+        // only `search_recent` can. Asserting on the stale row alone would pass
+        // either way -- scoring it 0.0 also returns exactly one row -- which is
+        // how the first version of this test was vacuous.
+        let plain = MemoryFragment::from_chat(
+            "plain".to_string(),
+            None,
+            None,
+            "never embedded".to_string(),
+        );
+        repo.add(plain).await.unwrap();
+
+        // A 768-dim query, as the GGUF provider produces.
+        let query = vec![0.1f32; 768];
+        let results = repo
+            .search_similar(&query, &ProfileScope::Household, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            results.len(),
+            2,
+            "expected the recency fallback to fire and return both rows; got {:?}",
+            results.iter().map(|f| &f.content).collect::<Vec<_>>()
+        );
+        assert!(
+            results.iter().any(|f| f.content == "never embedded"),
+            "the unembedded row proves search_recent ran; without it the incomparable \
+             row was merely scored 0.0 and returned as a semantic hit"
+        );
+    }
+
+    /// A mixed store must not let incomparable rows crowd out the comparable
+    /// ones: with one 768-dim row and many 384-dim rows, a limit-1 search must
+    /// return the row it could actually judge.
+    #[tokio::test]
+    async fn incomparable_vectors_do_not_crowd_out_the_comparable_one() {
+        let (repo, _tmp) = make_repo().await;
+        for i in 0..5 {
+            let mut stale =
+                MemoryFragment::from_chat(format!("old{i}"), None, None, format!("stale {i}"));
+            stale.embedding = Some(vec![0.9f32; 384]);
+            repo.add(stale).await.unwrap();
+        }
+        let mut fresh = MemoryFragment::from_chat(
+            "new".to_string(),
+            None,
+            None,
+            "the only comparable one".to_string(),
+        );
+        let mut v = vec![0.0f32; 768];
+        v[0] = 1.0;
+        fresh.embedding = Some(v);
+        repo.add(fresh).await.unwrap();
+
+        let mut query = vec![0.0f32; 768];
+        query[0] = 1.0;
+        // A GENEROUS limit is what makes this discriminate. At limit 1 the
+        // comparable row wins on score alone (1.0 beats 0.0), so the test passed
+        // with the filter removed. With limit 10, the filter is the only thing
+        // that keeps the five incomparable rows out of the result.
+        let results = repo
+            .search_similar(&query, &ProfileScope::Household, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            results.len(),
+            1,
+            "only the comparable row may be returned; the 384-dim rows are not \
+             judgeable and must be excluded rather than scored 0.0. got {:?}",
+            results.iter().map(|f| &f.content).collect::<Vec<_>>()
+        );
+        assert_eq!(results[0].content, "the only comparable one");
     }
 
     #[tokio::test]

@@ -436,14 +436,31 @@ impl ContextRepository for SqliteContextRepository {
         }
         let rows = q.fetch_all(&self.pool).await?;
 
+        let candidates = rows.len();
         let mut scored: Vec<(ContextItem, f32)> = self
             .rows_to_items(rows)
             .into_iter()
             .filter_map(|item| {
-                let score = cosine(query_embedding, item.embedding()?);
+                let emb = item.embedding()?;
+                // Different width means a different embedding model, and `cosine`
+                // answers 0.0 for that — a valid score. Scoring such an item would
+                // fill the result with incomparable rows ranked as if judged, and
+                // leave the caller's `is_empty()` keyword fallback unable to fire.
+                if emb.len() != query_embedding.len() {
+                    return None;
+                }
+                let score = cosine(query_embedding, emb);
                 Some((item, score))
             })
             .collect();
+        if scored.len() < candidates {
+            tracing::warn!(
+                incomparable = candidates - scored.len(),
+                comparable = scored.len(),
+                "some context items were embedded by a different model and were \
+                 excluded from semantic search"
+            );
+        }
         scored.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
                 .unwrap_or(std::cmp::Ordering::Equal)
