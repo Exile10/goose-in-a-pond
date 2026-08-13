@@ -249,7 +249,7 @@ needed. Admit mail bodies and GPS tracks and it is millions, and §1.4 stops bei
 | **0c** | Confirm `rolling_summary` is produced on-device | **code half done 2026-08-13**: `refresh` is NOT `Large`-gated (only `resummarise` is) and its idle loop is wired with a real provider, so it runs on any tier. **Device half DONE 2026-08-13**: 1 summary across 636 sessions — the mechanism works and the corpus is nearly empty; see 1.3 |
 | **A** | `pond_vectors.db`, port + adapter, `ATTACH` on `after_connect`, migrations | **LANDED 2026-08-13.** `VectorIndex` port (`context::vector_index`) + `SqliteVectorIndex`; migration `vectors/0001`; `Database::vectors` opened after the system migrations. Verified: roundtrip; **the file is deleted and rebuilds**, reporting its source rows as needing embedding; an orphan matches nothing and prunes; a foreign-model vector is excluded rather than scored; a guest sees nothing and an owner sees own + unattributed. Live: fresh pond creates and migrates it, restart against a populated one preserves rows and re-runs nothing |
 | **B** | Write-through for all three corpora | **LANDED 2026-08-13.** Memory + context mirror their EXISTING vector at the SQLite adapter (zero extra inference); summaries are a sweep (`summary_indexing`) because nothing had ever embedded them. Verified live: a memory written through the API is embedded by the backfill and appears in `pond_vectors.db` stamped `nomic-embed-text-v1.5`/768, and a real query ranks it **0.66 vs 0.45** above a decoy sharing the word "spend" — the semantic claim, on a running pond. A re-summarised session is reported stale and its vector replaced |
-| **C** | Unified retrieval, scope in the SQL, `corpus` labelling | two profiles + a guest: three isolation tests |
+| **C** | Unified retrieval, scope in the SQL, `corpus` labelling | **LANDED 2026-08-13.** `PersonalContextRetrieval` (pond-core, policy) over `VectorIndex::search_resolved` (adapter, mechanism): one query answered across all three corpora, text read from LIVE rows in the same JOIN that filters scope and liveness. `three_way_isolation_two_members_and_a_guest` passes, plus guards for archived rows, unattributed (guest) summaries, and memory-wins-ties |
 | **D** | Idle staleness sweep, orphan prune, model-change re-embed | user activity cancels mid-sweep; orphans pruned; a `model_id` mismatch refuses rather than scores |
 | **E** | Trigger subscribers (`BusEvent`) | a bus event produces an index entry |
 | **F** | On-demand route/tool + lazy media caption (cap ~8/query) | caption cached and embedded once |
@@ -498,6 +498,33 @@ already exist into the index with **no inference at all**. Re-tested: five memor
 identical after the rebuild. It filters on width, because a stored vector of another width came from
 another model and must not be restamped into the live space where nothing could detect it (mutation-
 tested). Two regression tests pin both halves.
+
+**Phase C landed 2026-08-13, in two parts.** Part one was correctness, because C is where the index
+starts answering questions and reviewing its SQL against the write-site map found three defects I had
+shipped in A and B: `search` had no liveness predicate at all (archived memories were retrievable
+through the index while every direct read of the store hid them); the Summary corpus had no owner
+predicate, so a GUEST session's summary — the idle loop summarises every session and takes no scope —
+would surface to a household read; and I had written a comment asserting `sessions` has no owner
+column, which is false (migration 0003). `sessions.profile_id IS NULL` means "nobody was identified
+here", the OPPOSITE of `memory_fragments.profile_id IS NULL` meaning shared household context: same
+column name, inverted meaning, and conflating them is a privacy hole. Liveness is now one function
+used by all four query paths, since a corpus filtered in one and not another is exactly how it
+happened.
+
+Part two is the retrieval surface. `PersonalContextRetrieval` owns POLICY — a query is embedded with
+`embed_query` rather than as a document, ties break toward the more precise corpus, every hit carries
+provenance — and `VectorIndex::search_resolved` owns MECHANISM, reading each hit's text from the live
+row in the same JOIN that already filters scope and liveness. One round trip, and no window in which a
+row could be archived between being scored and being read.
+
+**"Memory wins ties" is the declaration order of `Corpus`**, with `Ord` derived, so the policy lives at
+the type rather than in a comparator somebody can quietly reorder — and a test pins it, because
+reordering those variants changes what the assistant prefers to tell a member. Provenance is prose
+("you told me", "observed by this pond", "from an earlier conversation") rather than the enum name,
+because it is written for whoever reads the answer.
+
+A failed recall returns empty rather than erroring: the caller's fallback is always better than
+failing the turn that asked.
 
 **Owed, in priority order.** (1) A re-embed path for stale-width vectors (`search_stale_dimension`), since
 backfill cannot see them. (2) `embed_query`: nomic wants `search_query: ` on the query side and

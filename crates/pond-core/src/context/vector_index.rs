@@ -32,6 +32,13 @@ use crate::user_data::domain::profile::ProfileScope;
 /// Carried on every row and every hit so retrieval can label provenance — "you
 /// told me" versus "your calendar says" are different claims and a member is
 /// entitled to know which one they are being given.
+///
+/// **Declaration order is the tie-break policy.** `Ord` is derived, and equal
+/// scores are broken by this order: a memory outranks a context item outranks a
+/// summary. That is the design's "memory wins ties" — a summary is a model's
+/// compression, not a claim, so it must never outrank the precise version of the
+/// same thing. Reordering these variants silently changes what the assistant
+/// prefers to tell a member, which is why a test pins it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Corpus {
     /// `memory_fragments` — things extracted from conversation.
@@ -87,6 +94,21 @@ pub struct VectorHit {
     pub row_id: String,
     /// Cosine similarity against the query, in `[-1, 1]`.
     pub score: f32,
+}
+
+/// A hit with its text resolved from the live source row.
+///
+/// The index stores no text; this is read back through the same `JOIN` that
+/// enforces scope and liveness, so what a caller sees is always the CURRENT row
+/// — never a denormalised copy that outlived a deletion or an archive.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedHit {
+    pub corpus: Corpus,
+    pub row_id: String,
+    pub score: f32,
+    /// The live text. For a memory its content, for a context item its title and
+    /// body, for a summary the rolling summary itself.
+    pub text: String,
 }
 
 /// How much of the index is usable for a given model.
@@ -145,6 +167,21 @@ pub trait VectorIndex: Send + Sync {
         scope: &ProfileScope,
         limit: usize,
     ) -> Result<Vec<VectorHit>>;
+
+    /// Like [`Self::search`], but with each hit's text read back from its live
+    /// source row in the same query.
+    ///
+    /// One round trip rather than N: the `ATTACH` makes the text available to
+    /// the same `JOIN` that already filters scope and liveness, so there is no
+    /// window in which a row could be archived or deleted between being scored
+    /// and being read.
+    async fn search_resolved(
+        &self,
+        query: &[f32],
+        model_id: &str,
+        scope: &ProfileScope,
+        limit: usize,
+    ) -> Result<Vec<ResolvedHit>>;
 
     /// Source rows that have no vector for `model_id`, or whose vector is stale.
     ///
