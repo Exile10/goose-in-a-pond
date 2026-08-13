@@ -79,6 +79,32 @@ fn source_table(corpus: Corpus) -> (&'static str, &'static str) {
     }
 }
 
+/// Which rows of a corpus are LIVE, as a SQL fragment on the joined source row.
+///
+/// Stated once and used by `search`, `needs_embedding`, `health` and
+/// `backfill_from_source`, because a corpus that is filtered in one and not
+/// another is how an archived memory stays searchable through the index while
+/// every direct read of the store correctly hides it. That was a real defect
+/// here: `search` had no liveness predicate at all.
+///
+/// The Summary rule is the sharp one. `sessions.profile_id` is NULL for a
+/// session nobody was identified in -- a guest, or a legacy row -- and the idle
+/// loop summarises EVERY session it lists. Unlike `memory_fragments`, where NULL
+/// means "shared household context", a NULL here means "we do not know whose
+/// this is", so an unattributed summary must never enter household retrieval.
+/// Same column, opposite meaning; that asymmetry is the whole reason this is
+/// written out per corpus rather than shared.
+fn liveness_sql(corpus: Corpus) -> &'static str {
+    match corpus {
+        Corpus::Memory => "AND (s.lifecycle IS NULL OR s.lifecycle = 'active')",
+        Corpus::Context => "",
+        Corpus::Summary => {
+            "AND s.rolling_summary IS NOT NULL AND s.rolling_summary != '' \
+             AND s.profile_id IS NOT NULL"
+        }
+    }
+}
+
 /// Scope predicate against the JOINED source row, as SQL.
 ///
 /// In the `WHERE`, never applied to the results afterwards: post-filtering lets
@@ -104,7 +130,13 @@ fn scope_sql(corpus: Corpus, scope: &ProfileScope) -> (String, Option<String>) {
             // limb to add and adding one would create a hiding place.
             ("AND s.profile_id = ?".into(), Some(id.clone()))
         }
-        (Corpus::Summary, ProfileScope::Owner(_)) => ("AND 1 = 0".into(), None),
+        // `sessions.profile_id` exists (migration 0003) and is written by the
+        // identification chain. NO `IS NULL` limb, deliberately, and this is the
+        // opposite of the Memory arm above: an unattributed session is a guest
+        // or a legacy row, not shared household context.
+        (Corpus::Summary, ProfileScope::Owner(id)) => {
+            ("AND s.profile_id = ?".into(), Some(id.clone()))
+        }
     }
 }
 
@@ -226,13 +258,14 @@ impl VectorIndex for SqliteVectorIndex {
         for corpus in Corpus::ALL {
             let (table, id_col) = source_table(corpus);
             let (scope_pred, bind) = scope_sql(corpus, scope);
+            let live = liveness_sql(corpus);
             // The JOIN is the existence check: an orphan whose source row is
             // gone simply does not match, which is what makes a vector with no
             // text harmless rather than a leak.
             let sql = format!(
                 "SELECT v.row_id, v.vector FROM vectors v \
                  JOIN {table} s ON s.{id_col} = v.row_id \
-                 WHERE v.corpus = ? AND v.model_id = ? {scope_pred}"
+                 WHERE v.corpus = ? AND v.model_id = ? {scope_pred} {live}"
             );
             let mut q = sqlx::query_as::<_, (String, Vec<u8>)>(&sql)
                 .bind(corpus.as_str())
@@ -291,11 +324,7 @@ impl VectorIndex for SqliteVectorIndex {
         };
         // Summaries only exist where the column is populated, and an empty
         // summary is not a document.
-        let extra = match corpus {
-            Corpus::Summary => "AND s.rolling_summary IS NOT NULL AND s.rolling_summary != ''",
-            Corpus::Memory => "AND (s.lifecycle IS NULL OR s.lifecycle = 'active')",
-            Corpus::Context => "",
-        };
+        let extra = liveness_sql(corpus);
         let sql = format!(
             "SELECT s.{id_col} FROM {table} s \
              LEFT JOIN vectors v ON v.row_id = s.{id_col} AND v.corpus = ? \
@@ -321,13 +350,12 @@ impl VectorIndex for SqliteVectorIndex {
         // of a single blob. The vectors already exist -- this only teaches the
         // index about them.
         let (table, id_col) = source_table(corpus);
-        let extra = match corpus {
-            // Nothing to copy: a session has no vector of its own. The summary
-            // embedding sweep owns this corpus.
-            Corpus::Summary => return Ok(0),
-            Corpus::Memory => "AND (s.lifecycle IS NULL OR s.lifecycle = 'active')",
-            Corpus::Context => "",
-        };
+        // Nothing to copy for summaries: a session has no vector of its own.
+        // The summary embedding sweep owns that corpus.
+        if corpus == Corpus::Summary {
+            return Ok(0);
+        }
+        let extra = liveness_sql(corpus);
         // `length(embedding) = dims * 4` is the width filter: a vector from a
         // different model must not be restamped with this one.
         let expected_bytes = (expected_dims * std::mem::size_of::<f32>()) as i64;
@@ -397,11 +425,7 @@ impl VectorIndex for SqliteVectorIndex {
         let mut missing = 0i64;
         for corpus in Corpus::ALL {
             let (table, id_col) = source_table(corpus);
-            let extra = match corpus {
-                Corpus::Summary => "AND s.rolling_summary IS NOT NULL AND s.rolling_summary != ''",
-                Corpus::Memory => "AND (s.lifecycle IS NULL OR s.lifecycle = 'active')",
-                Corpus::Context => "",
-            };
+            let extra = liveness_sql(corpus);
             let sql = format!(
                 "SELECT COUNT(*) FROM {table} s \
                  LEFT JOIN vectors v ON v.row_id = s.{id_col} AND v.corpus = ? \
@@ -796,6 +820,160 @@ mod write_through_tests {
         assert!(index.get(Corpus::Memory, "m1").await.unwrap().is_none());
     }
 
+    /// An ARCHIVED memory must not be searchable. Every direct read of the
+    /// store excludes it; the index must agree, or archiving becomes a lie the
+    /// moment retrieval goes through the index instead.
+    #[tokio::test]
+    async fn an_archived_memory_is_not_returned_by_search() {
+        let tmp = TempDir::new().unwrap();
+        let db = crate::db::Database::init(tmp.path()).await.unwrap();
+        let index: Arc<dyn VectorIndex> = Arc::new(SqliteVectorIndex::new(db.vectors.clone()));
+
+        add_memory_with_vector(&db.system, "live", &[1.0, 0.0]).await;
+        add_memory_with_vector(&db.system, "archived", &[1.0, 0.0]).await;
+        index
+            .backfill_from_source(Corpus::Memory, "m", 2)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE memory_fragments SET lifecycle = 'archived' WHERE id = 'archived'")
+            .execute(&db.system)
+            .await
+            .unwrap();
+
+        let hits = index
+            .search(&[1.0, 0.0], "m", &ProfileScope::Household, 10)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.row_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["live"],
+            "an archived memory came back from the index"
+        );
+    }
+
+    /// A summary of a session nobody was identified in must never enter
+    /// household retrieval.
+    ///
+    /// The idle loop summarises EVERY session it lists, and it takes no scope.
+    /// `sessions.profile_id IS NULL` means "we do not know whose this is" --
+    /// the OPPOSITE of `memory_fragments.profile_id IS NULL`, which means shared
+    /// household context. Same column name, inverted meaning; conflating them
+    /// would surface a guest's conversation to the household.
+    #[tokio::test]
+    async fn an_unattributed_session_summary_is_never_surfaced() {
+        let tmp = TempDir::new().unwrap();
+        let db = crate::db::Database::init(tmp.path()).await.unwrap();
+        let index: Arc<dyn VectorIndex> = Arc::new(SqliteVectorIndex::new(db.vectors.clone()));
+
+        add_profile(&db.system, "jerry").await;
+        add_session(
+            &db.system,
+            "owned",
+            Some("jerry chat"),
+            "2026-08-13 10:00:00",
+        )
+        .await;
+        add_session(
+            &db.system,
+            "guest",
+            Some("guest chat"),
+            "2026-08-13 10:00:00",
+        )
+        .await;
+        sqlx::query("UPDATE sessions SET profile_id = 'jerry' WHERE id = 'owned'")
+            .execute(&db.system)
+            .await
+            .unwrap();
+        // The guest case: nobody was identified in this session.
+        sqlx::query("UPDATE sessions SET profile_id = NULL WHERE id = 'guest'")
+            .execute(&db.system)
+            .await
+            .unwrap();
+
+        for id in ["owned", "guest"] {
+            index
+                .upsert(&VectorEntry {
+                    corpus: Corpus::Summary,
+                    row_id: id.into(),
+                    model_id: "m".into(),
+                    vector: vec![1.0, 0.0],
+                    source_rev: Some("2026-08-13 10:00:00".into()),
+                })
+                .await
+                .unwrap();
+        }
+
+        let hits = index
+            .search(&[1.0, 0.0], "m", &ProfileScope::Household, 10)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.row_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["owned"],
+            "an unattributed (guest) session summary reached a household read"
+        );
+
+        // And the sweep must not even offer it for embedding -- no point paying
+        // inference for a row retrieval will always refuse.
+        let todo = index
+            .needs_embedding(Corpus::Summary, "other", 10)
+            .await
+            .unwrap();
+        assert_eq!(todo, vec!["owned".to_string()]);
+    }
+
+    /// Phase C's stated acceptance: two profiles and a guest, across corpora.
+    #[tokio::test]
+    async fn three_way_isolation_two_members_and_a_guest() {
+        let tmp = TempDir::new().unwrap();
+        let db = crate::db::Database::init(tmp.path()).await.unwrap();
+        let index: Arc<dyn VectorIndex> = Arc::new(SqliteVectorIndex::new(db.vectors.clone()));
+
+        add_profile(&db.system, "jerry").await;
+        add_profile(&db.system, "sam").await;
+        add_memory_with_vector(&db.system, "jerry-own", &[1.0, 0.0]).await;
+        add_memory_with_vector(&db.system, "sam-own", &[1.0, 0.0]).await;
+        add_memory_with_vector(&db.system, "shared", &[1.0, 0.0]).await;
+        sqlx::query("UPDATE memory_fragments SET profile_id='jerry' WHERE id='jerry-own'")
+            .execute(&db.system)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE memory_fragments SET profile_id='sam' WHERE id='sam-own'")
+            .execute(&db.system)
+            .await
+            .unwrap();
+        index
+            .backfill_from_source(Corpus::Memory, "m", 2)
+            .await
+            .unwrap();
+
+        let ids = |hits: Vec<VectorHit>| {
+            let mut v: Vec<String> = hits.into_iter().map(|h| h.row_id).collect();
+            v.sort();
+            v
+        };
+
+        let jerry = ids(index
+            .search(&[1.0, 0.0], "m", &ProfileScope::Owner("jerry".into()), 10)
+            .await
+            .unwrap());
+        assert_eq!(jerry, vec!["jerry-own", "shared"], "jerry's view is wrong");
+
+        let sam = ids(index
+            .search(&[1.0, 0.0], "m", &ProfileScope::Owner("sam".into()), 10)
+            .await
+            .unwrap());
+        assert_eq!(sam, vec!["sam-own", "shared"], "sam's view is wrong");
+
+        let guest = index
+            .search(&[1.0, 0.0], "m", &ProfileScope::Guest, 10)
+            .await
+            .unwrap();
+        assert!(guest.is_empty(), "a guest reached the household's index");
+    }
+
     /// Deleting the index must be recoverable for memory too, not just for
     /// summaries. **This is a regression test for a real bug**: the memory
     /// sweeps are driven by `memory_fragments.embedding IS NULL`, so an
@@ -986,15 +1164,36 @@ mod write_through_tests {
 mod tests_support {
     use sqlx::{Pool, Sqlite};
 
+    /// Creates the session ATTRIBUTED to a member.
+    ///
+    /// Unattributed sessions are guest sessions and retrieval refuses their
+    /// summaries by design, so a fixture without an owner would be asserting
+    /// about a row the pond deliberately never surfaces. Tests that want the
+    /// unattributed case set `profile_id` back to NULL explicitly.
     pub async fn add_session(pool: &Pool<Sqlite>, id: &str, summary: Option<&str>, updated: &str) {
-        sqlx::query("INSERT INTO sessions (id, created_at) VALUES (?, datetime('now'))")
+        sqlx::query("INSERT OR IGNORE INTO profiles (id, display_name) VALUES ('owner','Owner')")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (id, created_at, profile_id) VALUES (?, datetime('now'), 'owner')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+        if let Some(s) = summary {
+            set_summary(pool, id, s, updated).await;
+        }
+    }
+
+    pub async fn add_profile(pool: &Pool<Sqlite>, id: &str) {
+        sqlx::query("INSERT INTO profiles (id, display_name) VALUES (?, ?)")
+            .bind(id)
             .bind(id)
             .execute(pool)
             .await
             .unwrap();
-        if let Some(s) = summary {
-            set_summary(pool, id, s, updated).await;
-        }
     }
 
     pub async fn add_memory_with_vector(pool: &Pool<Sqlite>, id: &str, v: &[f32]) {
