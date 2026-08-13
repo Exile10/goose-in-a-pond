@@ -16,20 +16,44 @@ use std::str::FromStr;
 pub struct Database {
     pub system: Pool<Sqlite>,
     pub logs: Pool<Sqlite>,
+    /// The personal-context vector index. **Derived data**, not authoritative:
+    /// every row in it can be recomputed from `system`, which is what lets the
+    /// file be deleted and rebuilt. It is a third file rather than a table in
+    /// `system` so it never syncs to a phone and keeps any future native vector
+    /// extension out of the authoritative database's blast radius.
+    ///
+    /// Its connections `ATTACH` `system` as `sys` — see
+    /// [`crate::sqlite_vector_index::SqliteVectorIndex::connect`].
+    pub vectors: Pool<Sqlite>,
 }
 
 impl Database {
     pub async fn init(data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
 
-        let system = Self::connect(&data_dir.join("pond_system.db")).await?;
+        let system_path = data_dir.join("pond_system.db");
+        let system = Self::connect(&system_path).await?;
         let logs = Self::connect(&data_dir.join("pond_logs.db")).await?;
 
         sqlx::migrate!("migrations/system").run(&system).await?;
         sqlx::migrate!("migrations/logs").run(&logs).await?;
 
+        // After the system migrations, deliberately: the vector pool ATTACHes
+        // that database on every connection, and a sweep joins against tables
+        // those migrations create.
+        let vectors = crate::sqlite_vector_index::SqliteVectorIndex::connect(
+            &data_dir.join("pond_vectors.db"),
+            &system_path,
+        )
+        .await?;
+        sqlx::migrate!("migrations/vectors").run(&vectors).await?;
+
         tracing::info!("Databases ready at {}", data_dir.display());
-        Ok(Self { system, logs })
+        Ok(Self {
+            system,
+            logs,
+            vectors,
+        })
     }
 
     pub async fn connect(path: &Path) -> Result<Pool<Sqlite>> {

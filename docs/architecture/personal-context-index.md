@@ -247,7 +247,7 @@ needed. Admit mail bodies and GPS tracks and it is millions, and §1.4 stops bei
 | **0a** | GGUF `EmbeddingProvider` that initialises on the Orin | **MODEL VERIFIED ON THE ORIN 2026-08-13**: `nomic-embed-text-v1.5.Q8_0` loads under the device's own CUDA llama.cpp (aarch64, `ARCHS = 870`), mean-pools, returns **768** dims, exit 0, in **0.51 s wall-clock including cold process start and model load**. The risk that killed fastembed is closed. Still owed: the same through a deployed GIAP binary with `embedding_provider = "gguf"` |
 | **0b** | ~~`ContextItem.embedding` populated in `IngestPipeline` — **after** redaction~~ **ALREADY LANDED**, found 2026-08-13: `ingest.rs` embeds `item.embedding_text()` after `from_parts` has redacted, and `main.rs` wires `.with_embedder(embedding_provider)`. What was missing was the GUARD — `the_vector_is_computed_from_the_redacted_text` now records what the embedder was handed, because the existing redaction test would stay green if the embed moved above it | a stored item has a vector; the vector is of redacted text — **both now pinned, mutation-tested** |
 | **0c** | Confirm `rolling_summary` is produced on-device | **code half done 2026-08-13**: `refresh` is NOT `Large`-gated (only `resummarise` is) and its idle loop is wired with a real provider, so it runs on any tier. **Device half DONE 2026-08-13**: 1 summary across 636 sessions — the mechanism works and the corpus is nearly empty; see 1.3 |
-| **A** | `pond_vectors.db`, port + adapter, `ATTACH` on `after_connect`, migrations | roundtrip; **delete the file and confirm it rebuilds** |
+| **A** | `pond_vectors.db`, port + adapter, `ATTACH` on `after_connect`, migrations | **LANDED 2026-08-13.** `VectorIndex` port (`context::vector_index`) + `SqliteVectorIndex`; migration `vectors/0001`; `Database::vectors` opened after the system migrations. Verified: roundtrip; **the file is deleted and rebuilds**, reporting its source rows as needing embedding; an orphan matches nothing and prunes; a foreign-model vector is excluded rather than scored; a guest sees nothing and an owner sees own + unattributed. Live: fresh pond creates and migrates it, restart against a populated one preserves rows and re-runs nothing |
 | **B** | Write-through for all three corpora | a written item is searchable; a re-summarised session's vector *changes* |
 | **C** | Unified retrieval, scope in the SQL, `corpus` labelling | two profiles + a guest: three isolation tests |
 | **D** | Idle staleness sweep, orphan prune, model-change re-embed | user activity cancels mid-sweep; orphans pruned; a `model_id` mismatch refuses rather than scores |
@@ -430,6 +430,24 @@ than it was — the same path through a DEPLOYED GIAP binary, which needs a buil
 
 *0c is done and it reprioritises phase B.* See 1.3: one summary across 636 sessions, because 604 of
 them are too short to ever qualify. The mechanism is fine; the corpus is not there.
+
+**Phase A landed 2026-08-13.** The index is its own file, `pond_vectors.db`, holding **no text** — under
+WAL a source row and its vector cannot be deleted atomically, so orphans are inevitable, and an orphan
+that held a snippet would be deleted data surviving a deletion promise. With no text it resolves to
+nothing on the join and drops out. Reads `ATTACH` the system database as `sys` on **every pooled
+connection** (`after_connect`, not once — an `ATTACH` is per-connection, and doing it once would work
+until the pool opened its second one), so scope, lifecycle and existence are filtered against LIVE rows
+in the SQL rather than against denormalised copies.
+
+Two things worth carrying. The scope guard was **vacuous on the first attempt**: `search` early-returns
+on `excludes_everything()` before any query runs, so opening the SQL predicate up left the behavioural
+test green. It is now pinned directly as well, so each layer is guarded by something rather than each
+being assumed by the other. And the fixture that invented member ids hit a real FK to `profiles` —
+`foreign_keys(true)` doing its job.
+
+`cosine` here returns `Option`, refusing incomparable widths rather than answering `0.0`. That is the
+same defect the memory store had: `0.0` is a legitimate score, so using it for "not comparable" fills
+result slots with rows that were never judged and suppresses the fallback that should have run.
 
 **Owed, in priority order.** (1) A re-embed path for stale-width vectors (`search_stale_dimension`), since
 backfill cannot see them. (2) `embed_query`: nomic wants `search_query: ` on the query side and
