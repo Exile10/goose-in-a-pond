@@ -3199,9 +3199,21 @@ async fn run_server(
         // PAI-8 P2's read surface. Installed unconditionally, like the other
         // `init_*_deps`: registration is what the toggle gates, so with the
         // extension unregistered these handles are simply unused.
+        // Unified retrieval (phase C) behind the `recall` tool. Absent when no
+        // embedder is wired, in which case `recall` answers nothing rather than
+        // quietly degrading to context-only results.
+        let unified_retrieval = embedding_provider.clone().map(|emb| {
+            Arc::new(
+                pond_core::context::retrieval_service::PersonalContextRetrieval::new(
+                    vector_index.clone(),
+                    emb,
+                ),
+            )
+        });
         pond_mcp_server::context::init_context_deps(
             context_repo.clone(),
             embedding_provider.clone(),
+            unified_retrieval,
         );
 
         let ingest = Arc::new(pond_core::context::bus_ingest::BusIngest::new(

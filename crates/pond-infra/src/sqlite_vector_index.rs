@@ -1082,6 +1082,114 @@ mod write_through_tests {
             .is_empty());
     }
 
+    /// Phase E's stated acceptance: a bus event produces an index entry.
+    ///
+    /// No separate subscriber was built for this, and that is the finding rather
+    /// than a shortcut. The chain a sensor or camera event already takes --
+    /// `BusIngest::absorb` -> `IngestPipeline::ingest` -> `save_item` -> the
+    /// write-through -- ends at the same terminal write phase B instrumented, so
+    /// a second bus subscriber beside `BusIngest` would be a parallel path to
+    /// the same row with its own way of going wrong. This exercises the real
+    /// pipeline end to end instead.
+    #[tokio::test]
+    async fn an_ingested_item_reaches_the_index_and_disconnecting_removes_it() {
+        use pond_core::context::domain::{SourceKind, SourceParts, SourceStatus};
+        use pond_core::context::ingest::{IngestPipeline, RawItem};
+        use pond_core::context::ports::ContextRepository;
+        use pond_core::security::domain::redaction::RedactionKind;
+        use pond_core::security::mocks::mock_redactor::MockRedactor;
+
+        let tmp = TempDir::new().unwrap();
+        let db = crate::db::Database::init(tmp.path()).await.unwrap();
+        let index: Arc<dyn VectorIndex> = Arc::new(SqliteVectorIndex::new(db.vectors.clone()));
+        add_profile(&db.system, "jerry").await;
+
+        let redactor = Arc::new(MockRedactor::replacing("nothing", RedactionKind::ApiKey));
+        let repo = Arc::new(
+            crate::sqlite_context::SqliteContextRepository::new(
+                db.system.clone(),
+                redactor.clone(),
+            )
+            .with_vector_index(index.clone(), Some("m".into())),
+        );
+
+        let source = pond_core::context::domain::ContextSource::from_parts(SourceParts {
+            id: "src-sensor".into(),
+            kind: SourceKind::Sensor,
+            provider: "pond".into(),
+            profile_id: "jerry".into(),
+            scopes: vec![],
+            cursor: None,
+            last_sync: None,
+            status: SourceStatus::Connected,
+            secret_ref: None,
+            created_at: chrono::Utc::now(),
+        })
+        .expect("valid source");
+        repo.upsert_source(&source).await.unwrap();
+
+        // The embedder the pipeline would have: any vector will do, the point is
+        // that it reaches the index.
+        struct E;
+        #[async_trait]
+        impl pond_core::models::ports::embedding::EmbeddingProvider for E {
+            async fn embed(&self, _t: &str) -> Result<Vec<f32>> {
+                Ok(vec![1.0, 0.0])
+            }
+            fn dimensions(&self) -> usize {
+                2
+            }
+            fn model_id(&self) -> String {
+                "m".into()
+            }
+        }
+        let pipeline = IngestPipeline::new(repo.clone(), redactor).with_embedder(Some(
+            Arc::new(E) as Arc<dyn pond_core::models::ports::embedding::EmbeddingProvider>
+        ));
+
+        pipeline
+            .ingest(
+                &source,
+                RawItem {
+                    external_id: "evt-1".into(),
+                    kind: pond_core::context::domain::ItemKind::Event,
+                    occurred_at: chrono::Utc::now(),
+                    title: "back door".into(),
+                    body: "the back door opened".into(),
+                    participants: vec![],
+                },
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("ingest");
+
+        let hits = index
+            .search_resolved(&[1.0, 0.0], "m", &ProfileScope::Household, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "an ingested event never reached the index");
+        assert_eq!(hits[0].corpus, Corpus::Context);
+        assert!(
+            hits[0].text.contains("the back door opened"),
+            "resolved text was wrong: {}",
+            hits[0].text
+        );
+
+        // Disconnecting the source is a deletion promise: the vectors go too,
+        // now, not at the next maintenance sweep.
+        repo.disconnect_source("src-sensor", &ProfileScope::Household)
+            .await
+            .unwrap();
+        assert!(
+            index
+                .search_resolved(&[1.0, 0.0], "m", &ProfileScope::Household, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a disconnected source left its vectors behind"
+        );
+    }
+
     /// Phase C's stated acceptance: two profiles and a guest, across corpora.
     #[tokio::test]
     async fn three_way_isolation_two_members_and_a_guest() {

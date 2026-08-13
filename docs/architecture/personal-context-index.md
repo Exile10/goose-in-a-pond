@@ -251,9 +251,9 @@ needed. Admit mail bodies and GPS tracks and it is millions, and §1.4 stops bei
 | **B** | Write-through for all three corpora | **LANDED 2026-08-13.** Memory + context mirror their EXISTING vector at the SQLite adapter (zero extra inference); summaries are a sweep (`summary_indexing`) because nothing had ever embedded them. Verified live: a memory written through the API is embedded by the backfill and appears in `pond_vectors.db` stamped `nomic-embed-text-v1.5`/768, and a real query ranks it **0.66 vs 0.45** above a decoy sharing the word "spend" — the semantic claim, on a running pond. A re-summarised session is reported stale and its vector replaced |
 | **C** | Unified retrieval, scope in the SQL, `corpus` labelling | **LANDED 2026-08-13.** `PersonalContextRetrieval` (pond-core, policy) over `VectorIndex::search_resolved` (adapter, mechanism): one query answered across all three corpora, text read from LIVE rows in the same JOIN that filters scope and liveness. `three_way_isolation_two_members_and_a_guest` passes, plus guards for archived rows, unattributed (guest) summaries, and memory-wins-ties |
 | **D** | Idle staleness sweep, orphan prune, model-change re-embed | **LANDED 2026-08-13.** `run_index_maintenance` composes adopt -> embed-missing -> prune -> report, deferred 60 s from boot and cancellable. Live: index wiped and an orphan planted, 5 memories adopted and the orphan pruned ~45 s later; a model mismatch WARNs with its count; an unattributed (guest) session's summary is refused and indexed only once attributed |
-| **E** | Trigger subscribers (`BusEvent`) | a bus event produces an index entry |
-| **F** | On-demand route/tool + lazy media caption (cap ~8/query) | caption cached and embedded once |
-| **G** | Retrieval surfaces: `giap-context` tool first, then a **measured** passive prompt tier | pai-bench: does the passive tier earn its tokens? |
+| **E** | Trigger subscribers (`BusEvent`) | **SATISFIED 2026-08-13 WITHOUT A NEW SUBSCRIBER.** A sensor/camera event already flows `BusIngest::absorb` -> `IngestPipeline::ingest` -> `save_item` -> the phase-B write-through, ending at the same terminal write. A second subscriber would be a parallel path to the same row with its own way of going wrong. Pinned end-to-end through the real pipeline; disconnecting a source now also removes its vectors |
+| **F** | On-demand route/tool + lazy media caption | **TOOL LANDED 2026-08-13** (`giap-context__recall`). **Media captioning DEFERRED** and not started: it needs the vision encoder, and 1.8 records that the mmproj bytes are absent on the nano |
+| **G** | Retrieval surfaces: `giap-context` tool first, then a **measured** passive prompt tier | **TOOL HALF LANDED 2026-08-13**, which is the half the design says comes first. The passive prompt tier is **NOT DONE and deliberately not guessed**: whether an always-on block earns its tokens against a 7 568-token cold turn is a `pai-bench` measurement on the Orin |
 
 **G is last and empirical on purpose.** Whether an always-on prompt block earns its tokens against a
 7 568-token cold turn is a measurement, not an opinion.
@@ -544,6 +544,37 @@ One behaviour worth recording because it looked like a bug and was not: the live
 `summaries=0`. Its session had `profile_id IS NULL` — an unattributed, i.e. guest, session — which
 phase C's rule refuses. Attributing it made the sweep index it on the next pass. The rule is doing
 exactly what it should, and the sweep will not spend inference on a row retrieval would always refuse.
+
+**E, F and G, 2026-08-13 — two landed, one deliberately not.**
+
+**E needed no new machinery, and that is the finding.** The design imagined a second bus subscriber
+beside `BusIngest`. But a sensor or camera event already reaches the index through the chain phase B
+instrumented, so a second subscriber would be a parallel path to the same row carrying its own bugs.
+Pinned end to end through the real pipeline instead. One genuine gap closed while there:
+`disconnect_source` deleted a source's items and left their vectors behind. Harmless — the index holds
+no text and the JOIN drops an orphan — but a member disconnecting a source is asking for their data to
+be gone, and "eventually, at the next sweep" is a poor answer.
+
+**F/G's tool half landed**: `giap-context__recall` answers one question across all three corpora, each
+line stating its provenance. Two guards fired while adding it, both worth keeping. The extension pins
+its own tool surface as READ-ONLY, because a write tool there is a prompt-injection path into a corpus
+the assistant treats as fact — `recall` only reads, so the list was extended rather than the rule bent.
+And a new guard pins that `spawn_context_server` actually hands the server its retrieval: a tool that
+is registered, offered to the model and permanently answers nothing is worse than an absent one, since
+it burns a schema in every turn's prompt and teaches the model that asking is pointless. That is the
+reader-with-no-writer shape this programme keeps recording; it is mutation-tested.
+
+**Note the tool ships behind `ext_context_enabled`, which is OFF by default.** That is the design's own
+decision, not an oversight: two tool schemas in every turn are real tokens on a 4 096-token window, and
+a pond with no sources can only answer "nothing found".
+
+**G's passive prompt tier is NOT done, and I am not going to guess it.** Whether an always-on context
+block earns its tokens against a 7 568-token cold turn is exactly the measurement the phase table calls
+for, on the Orin, via `pai-bench`. The tool surface comes first precisely because a tool costs nothing
+on turns that do not use it while a prompt block costs every turn.
+
+**Media captioning (F's other half) is not started**, and is blocked on the same thing 1.8 records:
+`find ~/.local/share/goose-in-a-pond/mmproj -type f` on the nano returns nothing.
 
 **Owed, in priority order.** (1) A re-embed path for stale-width vectors (`search_stale_dimension`), since
 backfill cannot see them. (2) `embed_query`: nomic wants `search_query: ` on the query side and

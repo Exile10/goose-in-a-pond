@@ -41,6 +41,7 @@ use std::sync::Arc;
 use pond_core::context::domain::ContextItem;
 use pond_core::context::ports::ContextRepository;
 use pond_core::context::retrieval;
+use pond_core::context::retrieval_service::PersonalContextRetrieval;
 use pond_core::models::ports::embedding::EmbeddingProvider;
 use pond_core::security::ports::draft_authority::DraftAuthority;
 use pond_core::user_data::domain::profile::ProfileScope;
@@ -128,6 +129,7 @@ impl Refusal {
 pub struct ContextMcpServer {
     repo: Arc<dyn ContextRepository>,
     embedder: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
+    retrieval: Option<Arc<PersonalContextRetrieval>>,
     authority: Option<Arc<dyn DraftAuthority>>,
     #[allow(dead_code)] // accessed by rmcp's generated tool_handler code
     tool_router: ToolRouter<Self>,
@@ -139,9 +141,18 @@ impl ContextMcpServer {
         Self {
             repo,
             embedder: None,
+            retrieval: None,
             authority: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Attach unified retrieval. Without it `recall` answers nothing rather than
+    /// silently degrading to context-only results, which would make the tool's
+    /// own description a lie.
+    pub fn with_retrieval(mut self, retrieval: Option<Arc<PersonalContextRetrieval>>) -> Self {
+        self.retrieval = retrieval;
+        self
     }
 
     pub fn with_embedder(
@@ -226,6 +237,26 @@ impl ContextMcpServer {
         }
     }
 
+    /// The body of `recall`: one question answered across everything the pond
+    /// knows, each line saying where it came from.
+    pub async fn run_recall(
+        &self,
+        meta: &Meta,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, Refusal> {
+        let scope = self.scope_for(meta).await?;
+        let Some(retrieval) = &self.retrieval else {
+            return Ok(vec![]);
+        };
+        Ok(retrieval
+            .recall(query, &scope, clamp_limit(Some(limit as u32)))
+            .await
+            .into_iter()
+            .map(|r| r.labelled())
+            .collect())
+    }
+
     /// The body of `get_recent_context`.
     pub async fn run_recent(
         &self,
@@ -258,6 +289,35 @@ impl ContextMcpServer {
         params: Parameters<SearchContextParams>,
     ) -> Result<CallToolResult, ErrorData> {
         Ok(to_result(self.run_search(&ctx.meta, params.0).await))
+    }
+
+    #[tool(
+        description = "Recall anything this household knows that bears on a question, across all \
+        three of what the member told you, what this pond observed, and what earlier \
+        conversations were summarised to. Prefer this when a question could be answered by any \
+        of them and you do not know which. Every line says where it came from; pass that \
+        provenance on rather than presenting a summary as something the member said."
+    )]
+    async fn recall(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        params: Parameters<SearchContextParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("recall");
+        let query = params.0.query.clone().unwrap_or_default();
+        let limit = params.0.limit.unwrap_or(5) as usize;
+        match self.run_recall(&ctx.meta, &query, limit).await {
+            Ok(lines) if lines.is_empty() => Ok(CallToolResult::success(vec![Content::text(
+                crate::format::format_no_results(
+                    &format!("anything about '{query}'"),
+                    &["giap-context__get_recent_context"],
+                ),
+            )])),
+            Ok(lines) => Ok(CallToolResult::success(vec![Content::text(
+                lines.join("\n"),
+            )])),
+            Err(refusal) => Ok(to_result(Err(refusal))),
+        }
     }
 
     #[tool(
@@ -334,6 +394,9 @@ use tokio::io::DuplexStream;
 struct ContextDeps {
     repo: Arc<dyn ContextRepository>,
     embedder: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
+    /// Unified retrieval across memory, context and summaries (phase C). Absent
+    /// on a pond with no embedder, where `recall` answers nothing.
+    retrieval: Option<Arc<PersonalContextRetrieval>>,
 }
 
 static CONTEXT_DEPS: OnceLock<ContextDeps> = OnceLock::new();
@@ -343,8 +406,13 @@ static CONTEXT_AUTHORITY: OnceLock<Option<Arc<dyn DraftAuthority>>> = OnceLock::
 pub fn init_context_deps(
     repo: Arc<dyn ContextRepository>,
     embedder: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
+    retrieval: Option<Arc<PersonalContextRetrieval>>,
 ) {
-    let _ = CONTEXT_DEPS.set(ContextDeps { repo, embedder });
+    let _ = CONTEXT_DEPS.set(ContextDeps {
+        repo,
+        embedder,
+        retrieval,
+    });
 }
 
 /// Install the caller resolution. Absent, every call is refused — see
@@ -358,6 +426,10 @@ pub fn spawn_context_server(reader: DuplexStream, writer: DuplexStream) {
     let deps = CONTEXT_DEPS.get().expect("init_context_deps() not called");
     let server = ContextMcpServer::new(deps.repo.clone())
         .with_embedder(deps.embedder.clone())
+        // Without this the `recall` tool is registered, offered to the model and
+        // permanently answers nothing -- the exact reader-with-no-writer shape
+        // this programme keeps recording.
+        .with_retrieval(deps.retrieval.clone())
         .with_authority(CONTEXT_AUTHORITY.get().cloned().flatten());
     tokio::spawn(async move {
         match server.serve((reader, writer)).await {
@@ -696,6 +768,27 @@ mod tests {
     /// first version of this guard report two handlers that do not exist -- a
     /// parser reading itself is the shape that turns a source guard into noise.
     #[test]
+    /// `recall` must actually be wired, not merely registered.
+    ///
+    /// A tool that is offered to the model and always answers nothing is worse
+    /// than an absent one: it burns a schema in every turn's prompt and teaches
+    /// the model that asking is pointless. `spawn_context_server` is where that
+    /// would silently happen, so this pins the builder call.
+    #[test]
+    fn the_recall_tool_is_actually_handed_its_retrieval() {
+        const SRC: &str = include_str!("context.rs");
+        let spawn = SRC
+            .split("pub fn spawn_context_server")
+            .nth(1)
+            .expect("spawn_context_server not found");
+        let body = &spawn[..spawn.find("tokio::spawn").unwrap_or(spawn.len())];
+        assert!(
+            body.contains(".with_retrieval("),
+            "spawn_context_server does not hand the server its retrieval, so the \
+             recall tool is registered and permanently empty"
+        );
+    }
+
     fn the_extension_is_read_only() {
         const SRC: &str = include_str!("context.rs");
         let production = SRC
@@ -735,7 +828,7 @@ mod tests {
         );
         assert_eq!(
             handlers,
-            vec!["search_context", "get_recent_context"],
+            vec!["search_context", "recall", "get_recent_context"],
             "the context extension's tool surface changed. It is read-only on purpose; a write \
              tool here is a prompt-injection path into a corpus the assistant treats as fact."
         );
