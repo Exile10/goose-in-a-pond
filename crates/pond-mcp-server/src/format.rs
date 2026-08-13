@@ -67,7 +67,7 @@ pub fn format_list_result(items: &[String], header: &str, max_chars: usize) -> S
 /// answer, and names what to try instead.
 ///
 /// `alternatives` must be FULLY-QUALIFIED schema names
-/// (`giap-discovery__search_web`, not `search_web`). A 2B model does not reliably
+/// (`giap-knowledge__search_wikipedia`, not `search_wikipedia`). A 2B model does not reliably
 /// map a bare suffix onto the prefixed name in its schema — measured on
 /// gemma-4-E2B: with a bare name it apologised instead of chaining. Pass an empty
 /// slice when the caller cannot name a specific sibling; never name a tool that
@@ -206,12 +206,14 @@ mod tests {
         let msg = format_no_results(
             "Wikipedia articles for 'x'",
             &[
-                "giap-discovery__search_web",
-                "giap-knowledge__instant_answer",
+                "giap-knowledge__search_wikipedia",
+                "giap-knowledge__get_wikipedia_article",
             ],
         );
         assert!(
-            msg.contains("call giap-discovery__search_web or giap-knowledge__instant_answer now"),
+            msg.contains(
+                "call giap-knowledge__search_wikipedia or giap-knowledge__get_wikipedia_article now"
+            ),
             "got: {msg}"
         );
         assert!(
@@ -228,39 +230,191 @@ mod tests {
     }
 
     /// A bare suffix is not what the model sees in its schema — gemma-4-E2B
-    /// apologised rather than mapping `search_web` onto
-    /// `giap-discovery__search_web`. Every suggestion must be callable verbatim,
+    /// apologised rather than mapping `search_wikipedia` onto
+    /// `giap-knowledge__search_wikipedia`. Every suggestion must be callable verbatim,
     /// so scan the real call sites rather than trusting review.
     #[test]
     fn every_suggested_alternative_is_fully_qualified() {
-        const SOURCES: &[(&str, &str)] = &[
+        let mut checked = 0;
+        for (name, src) in suggestion_sources() {
+            for quoted in suggestions_in(src) {
+                assert!(
+                    quoted.starts_with("giap-") && quoted.contains("__"),
+                    "{name}: suggested alternative '{quoted}' is not a \
+                     fully-qualified schema name; the model cannot call it"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "the scan matched nothing — parser is broken");
+    }
+
+    /// The files whose `format_no_results` call sites are scanned. Every server
+    /// that can report a miss belongs here; one left out is simply unchecked.
+    fn suggestion_sources() -> &'static [(&'static str, &'static str)] {
+        &[
             ("knowledge.rs", include_str!("knowledge.rs")),
+            ("wolfram.rs", include_str!("wolfram.rs")),
             ("discovery.rs", include_str!("discovery.rs")),
             ("news.rs", include_str!("news.rs")),
             ("finance.rs", include_str!("finance.rs")),
             ("memory.rs", include_str!("memory.rs")),
             ("sensors.rs", include_str!("sensors.rs")),
             ("vision.rs", include_str!("vision.rs")),
+        ]
+    }
+
+    /// Every quoted alternative passed to a `format_no_results` call in `src`.
+    ///
+    /// Bounds the argument list to its own matching paren, then the alternatives
+    /// slice to its own matching bracket. Anything looser reads on into the next
+    /// call's `what` string and starts asserting about prose.
+    fn suggestions_in(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, _) in src.match_indices("format_no_results(") {
+            let args = balanced(src, i + "format_no_results(".len(), '(', ')');
+            let Some(open) = args.find("&[") else {
+                continue;
+            };
+            let slice = balanced(&args, open + 2, '[', ']');
+            out.extend(slice.split('"').skip(1).step_by(2).map(str::to_string));
+        }
+        out
+    }
+
+    /// Every `giap-*` tool this crate registers, as `extension__tool`.
+    ///
+    /// Parsed from source because there is no other honest input here:
+    /// constructing all eighteen servers needs the goose submodule and a dozen
+    /// repositories, and the registration list is a `OnceLock` that no-ops on a
+    /// second call in-process. `registration_matches_the_catalog.rs` reaches the
+    /// same conclusion about the extension list for the same reasons.
+    ///
+    /// **Line comments are stripped first.** `discovery.rs` carries a disabled
+    /// tool whose doc comment shows the `#[tool(...)]` line it would need to
+    /// come back; counting that would report a tool the model is never offered,
+    /// which is the exact failure this inventory exists to prevent.
+    ///
+    /// `wolfram.rs` maps to `giap-knowledge`, not to a `giap-wolfram`: its tools
+    /// are a second router composed onto the knowledge server, so the file name
+    /// is not the extension name.
+    fn registered_tools() -> std::collections::BTreeSet<String> {
+        const TOOL_SOURCES: &[(&str, &str)] = &[
+            ("giap-audit", include_str!("audit.rs")),
+            ("giap-context", include_str!("context.rs")),
+            ("giap-device", include_str!("device.rs")),
+            ("giap-device-control", include_str!("device_control.rs")),
+            ("giap-discovery", include_str!("discovery.rs")),
+            ("giap-draft", include_str!("draft.rs")),
+            ("giap-finance", include_str!("finance.rs")),
+            ("giap-knowledge", include_str!("knowledge.rs")),
+            ("giap-knowledge", include_str!("wolfram.rs")),
+            ("giap-memory", include_str!("memory.rs")),
+            ("giap-news", include_str!("news.rs")),
+            ("giap-orchestrator", include_str!("orchestrator.rs")),
+            ("giap-schedule", include_str!("schedule.rs")),
+            ("giap-sensors", include_str!("sensors.rs")),
+            ("giap-system", include_str!("system.rs")),
+            ("giap-toolkit", include_str!("toolkit.rs")),
+            ("giap-vision", include_str!("vision.rs")),
+            ("giap-weather", include_str!("weather.rs")),
         ];
-        let mut checked = 0;
-        for (name, src) in SOURCES {
-            for (i, _) in src.match_indices("format_no_results(") {
-                // Bound the argument list to its own matching paren, then the
-                // alternatives slice to its own matching bracket. Anything
-                // looser reads into the next call's `what` string.
-                let args = balanced(src, i + "format_no_results(".len(), '(', ')');
-                let Some(open) = args.find("&[") else {
-                    continue;
-                };
-                let slice = balanced(&args, open + 2, '[', ']');
-                for quoted in slice.split('"').skip(1).step_by(2) {
-                    assert!(
-                        quoted.starts_with("giap-") && quoted.contains("__"),
-                        "{name}: suggested alternative '{quoted}' is not a \
-                         fully-qualified schema name; the model cannot call it"
-                    );
-                    checked += 1;
+        let mut out = std::collections::BTreeSet::new();
+        for (ext, src) in TOOL_SOURCES {
+            let code = strip_line_comments(src);
+            for (i, _) in code.match_indices("#[tool(") {
+                if let Some(name) = next_fn_ident(&code[i + "#[tool(".len()..]) {
+                    out.insert(format!("{ext}__{name}"));
                 }
+            }
+        }
+        out
+    }
+
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The name of the first `fn <ident>(` at or after `s`. A `#[tool]`
+    /// attribute always immediately precedes the method it annotates.
+    fn next_fn_ident(s: &str) -> Option<String> {
+        let mut idx = 0;
+        while let Some(rel) = s[idx..].find("fn ") {
+            let at = idx + rel;
+            let boundary = s[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+            if boundary {
+                let after = &s[at + 3..];
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() && after[name.len()..].trim_start().starts_with('(') {
+                    return Some(name);
+                }
+            }
+            idx = at + 3;
+        }
+        None
+    }
+
+    /// The inventory parser must not be quietly reading nothing.
+    #[test]
+    fn the_tool_inventory_parser_sees_the_tools_that_are_there() {
+        let tools = registered_tools();
+        assert!(
+            tools.contains("giap-weather__get_current_weather"),
+            "{tools:?}"
+        );
+        // The composed second router on giap-knowledge — the case a file-name
+        // to extension-name assumption gets wrong.
+        assert!(
+            tools.contains("giap-knowledge__compute_answer"),
+            "{tools:?}"
+        );
+        // Disabled 2026-08-13 by removing its #[tool] attribute. Its doc comment
+        // still shows that attribute, so this is also the comment-stripping test.
+        assert!(!tools.contains("giap-discovery__search_web"), "{tools:?}");
+        assert_eq!(
+            tools.len(),
+            65,
+            "the tool inventory changed. Update the count in CLAUDE.md in the same \
+             commit — it read 64 for months while the real number was 65, and prose \
+             nobody checks is how that happens."
+        );
+    }
+
+    /// A suggestion must name a tool that EXISTS, not merely one that is
+    /// spelled like a tool.
+    ///
+    /// `format_no_results`' own doc says never to name a tool that does not
+    /// exist, because a fabricated suggestion burns the one retry the model
+    /// makes. Nothing enforced it: when `search_web` was disabled, seventeen
+    /// call sites across four files went on pointing at it, and the sibling
+    /// guard below was happy because `giap-discovery__search_web` is
+    /// well-formed. Well-formed and callable are different claims.
+    #[test]
+    fn every_suggested_alternative_is_a_tool_that_exists() {
+        let tools = registered_tools();
+        let mut checked = 0;
+        for (name, src) in suggestion_sources() {
+            for quoted in suggestions_in(src) {
+                assert!(
+                    tools.contains(&quoted),
+                    "{name}: suggests '{quoted}', which no server registers. \
+                     Either the tool was removed or renamed and this call site \
+                     was missed, or the name is a typo the model will burn a \
+                     retry on."
+                );
+                checked += 1;
             }
         }
         assert!(checked > 0, "the scan matched nothing — parser is broken");

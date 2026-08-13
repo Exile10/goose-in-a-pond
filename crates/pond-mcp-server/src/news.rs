@@ -433,8 +433,9 @@ impl NewsMcpServer {
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_no_results(
+                    // Nothing else on the pond reports current events.
                     "current events from Wikipedia today",
-                    &["giap-discovery__search_web"],
+                    &[],
                 ),
             )]));
         }
@@ -463,8 +464,9 @@ impl NewsMcpServer {
             text.push_str(&format!(
                 "\n\nNOTE: no keyword news source is configured, so this is today's \
                  GENERAL world news — it is NOT a search for '{query}'. If nothing \
-                 above is about '{query}', this is NOT the answer: call \
-                 giap-discovery__search_web now."
+                 above is about '{query}', this is NOT the answer: say so plainly, \
+                 and that adding a Guardian or GNews API key in Settings would let \
+                 you search the news by keyword."
             ));
         }
         eprintln!(

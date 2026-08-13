@@ -363,8 +363,8 @@ pub fn egress_event(
 const KNOWN_PUBLIC_SUFFIXES: &[&str] = &[
     "wikipedia.org",
     "wikimedia.org",
-    "duckduckgo.com",
     "dictionaryapi.dev",
+    "wolframalpha.com",
     "openlibrary.org",
     "restcountries.com",
     "openfoodfacts.org",
@@ -576,7 +576,6 @@ mod tests {
     fn classifies_known_apis_as_public() {
         for host in [
             "en.wikipedia.org",
-            "api.duckduckgo.com",
             "api.coingecko.com",
             "hacker-news.firebaseio.com",
             "api.open-meteo.com",

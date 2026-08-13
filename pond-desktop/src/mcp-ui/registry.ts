@@ -6,6 +6,20 @@ export interface McpCardProps {
   toolName: string;
   onClose?: () => void;
   variant?: "compact" | "normal" | "large";
+  /**
+   * Ask the assistant something on the user's behalf — for a card that offers
+   * follow-ups, such as the other readings of an ambiguous Wolfram query.
+   *
+   * Deliberately a *message*, not a tool call. The follow-up goes back through
+   * the engine, so it is audited, policy-checked, and visible in the
+   * conversation. Calling a tool straight from a card would need that tool on
+   * `routes.rs :: DIRECT_DISPATCH_ALLOWLIST`, which grants it to every paired
+   * client and every sandboxed MCP App iframe at the same time.
+   *
+   * Optional: surfaces that have no composer (Canvas) simply do not pass it,
+   * and a card must render something sensible without it.
+   */
+  onAction?: (prompt: string) => void;
 }
 
 /** Registration entry for an MCP-UI card renderer */

@@ -15217,6 +15217,45 @@ mod tests {
         assert_eq!(ui["data"]["temp"], 64);
     }
 
+    /// A real `giap-knowledge__compute_answer` result, captured verbatim from
+    /// `pond-mcp-server`'s `print_a_real_rendered_result` (an `#[ignore]`d test
+    /// that exists to regenerate this fixture — `pond-api` does not depend on
+    /// that crate, so this side of the contract can only be pinned by copy).
+    ///
+    /// Worth its own case because the Wolfram payload is the first one that is
+    /// awkward for this parser rather than merely long: the marker is ended by
+    /// the FIRST `]]]` and split on the FIRST `:`, and this payload carries a
+    /// `https://` URL full of colons, percent escapes, and nested objects. A
+    /// result whose own text contained `]]]` would cut the marker short, which
+    /// is why the producing side substitutes it.
+    #[test]
+    fn extract_ui_hint_parses_a_real_wolfram_result() {
+        let input = concat!(
+            r#"[[[mcp-ui:wolfram:{"explore":[{"id":"w1","kind":"assumption","label":"a word","#,
+            r#""verb":"interpret as"}],"pods":[{"text":"about 1.2 x the length of Central Park","#,
+            r#""title":"Comparison"}],"primary":"4.828 km","primary_title":"Result","#,
+            r#""query":"3 miles in km","source_url":"#,
+            r#""https://www.wolframalpha.com/input?i=3%20miles%20in%20km"}]]]"#,
+            "\n**Result**: 4.828 km",
+        );
+        let (clean, hint) = extract_ui_hint(input);
+        assert_eq!(clean, "**Result**: 4.828 km");
+
+        let ui = hint.expect("a real Wolfram result must produce a hint");
+        // This string is what the frontend looks the card up by
+        // (`findCardByHint`), so it is the whole contract with WolframCard.tsx.
+        assert_eq!(ui["card_type"], "wolfram");
+        assert_eq!(ui["data"]["primary"], "4.828 km");
+        // The URL's own colons must not have been mistaken for the separator.
+        assert_eq!(
+            ui["data"]["source_url"],
+            "https://www.wolframalpha.com/input?i=3%20miles%20in%20km"
+        );
+        // The suggestion ids are what `explore_computation` resolves; losing
+        // them here would leave the card's chips pointing at nothing.
+        assert_eq!(ui["data"]["explore"][0]["id"], "w1");
+    }
+
     #[test]
     fn extract_ui_hint_no_marker_passthrough() {
         let input = "Plain text no hint";

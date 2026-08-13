@@ -1,8 +1,17 @@
-//! Knowledge MCP Server — Wikipedia, instant answers, dictionary, and book search.
+//! Knowledge MCP Server — Wikipedia, dictionary, book search, and computation.
 //!
-//! Provides 5 tools: `search_wikipedia`, `get_wikipedia_article`,
-//! `instant_answer`, `define_word`, `search_books`.
+//! Six tools. Four live here: `search_wikipedia`, `get_wikipedia_article`,
+//! `define_word`, `search_books`. Two more — `compute_answer` and
+//! `explore_computation` — are a second `#[tool_router]` impl on this same
+//! server in [`crate::wolfram`], composed in [`KnowledgeMcpServer::new`].
 //! Depends only on a `reqwest::Client` for HTTP fetches.
+//!
+//! There used to be a fifth tool here, `instant_answer`, over DuckDuckGo's
+//! Instant Answer API. DuckDuckGo is gone, and Wolfram|Alpha took its place
+//! rather than inheriting its job: what DuckDuckGo returned was overwhelmingly a
+//! Wikipedia abstract, which `get_wikipedia_article` already fetches in full, so
+//! the tool cost a schema in every turn's prompt to reach a worse copy of a
+//! sibling's source. Wolfram computes, which nothing in this pond could do.
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -59,7 +68,6 @@ pub struct BookSearchParams {
 const WIKI_UA: &str =
     "goose-in-a-pond/0.1 (GIAP MCP; https://github.com/jarida-io/goose-in-a-pond)";
 
-const INSTANT_ANSWER_BUDGET: usize = 2000;
 const DEFINE_WORD_BUDGET: usize = 2000;
 const SEARCH_BOOKS_BUDGET: usize = 1500;
 
@@ -67,8 +75,11 @@ const SEARCH_BOOKS_BUDGET: usize = 1500;
 
 #[derive(Clone)]
 pub struct KnowledgeMcpServer {
-    http_client: reqwest::Client,
-    #[allow(dead_code)] // accessed by rmcp's generated tool_handler code
+    // `pub(crate)` because the Wolfram tools are a second `#[tool_router]` impl
+    // on this same server (see `wolfram.rs`) and share its client pool.
+    pub(crate) http_client: reqwest::Client,
+    // Read by the generated `tool_handler` code, which is pointed at this field
+    // explicitly — see the note on the `ServerHandler` impl below.
     tool_router: ToolRouter<Self>,
 }
 
@@ -77,7 +88,10 @@ impl KnowledgeMcpServer {
     pub fn new(http_client: reqwest::Client) -> Self {
         Self {
             http_client,
-            tool_router: Self::tool_router(),
+            // Two routers, one server: the Wolfram tools live in `wolfram.rs`
+            // so this file stays about reference lookups, but they belong to
+            // the same extension because they answer the same kind of question.
+            tool_router: Self::tool_router() + Self::wolfram_tool_router(),
         }
     }
 
@@ -169,10 +183,7 @@ or listing options; for factual questions prefer get_wikipedia_article.")]
             _ => (
                 crate::format::format_no_results(
                     &format!("Wikipedia articles for '{}'", query),
-                    &[
-                        "giap-discovery__search_web",
-                        "giap-knowledge__instant_answer",
-                    ],
+                    &["giap-knowledge__compute_answer"],
                 ),
                 Vec::new(),
             ),
@@ -249,104 +260,6 @@ repeat the extract verbatim.")]
         }
     }
 
-    #[tool(description = "\
-Quick factual answer or summary. Try first for simple 'what is X' questions \
-before Wikipedia.")]
-    async fn instant_answer(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<WikipediaQueryParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        crate::set_current_tool("instant_answer");
-        let query = resolve_topic(&params.0, "instant_answer").await;
-        eprintln!("[knowledge] instant_answer called: query={:?}", query);
-
-        if query.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "I need a question or topic. Retry with a 'topic' parameter.",
-            )]));
-        }
-
-        let url = format!(
-            "https://api.duckduckgo.com/?q={}&format=json&no_html=1&skip_disambig=1",
-            urlencoding::encode(&query),
-        );
-        eprintln!("[knowledge] GET {}", url);
-
-        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
-            b.timeout(std::time::Duration::from_secs(10))
-        })
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[knowledge] instant_answer request failed: {e}");
-                return Ok(CallToolResult::success(vec![Content::text(
-                    crate::format::format_api_error("DuckDuckGo Instant Answer", &e.to_string()),
-                )]));
-            }
-        };
-
-        if !resp.status().is_success() {
-            eprintln!("[knowledge] instant_answer HTTP {}", resp.status());
-            return Ok(CallToolResult::success(vec![Content::text(
-                crate::format::format_api_error(
-                    "DuckDuckGo Instant Answer",
-                    &format!("HTTP {}", resp.status()),
-                ),
-            )]));
-        }
-
-        let body: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[knowledge] instant_answer parse failed: {e}");
-                return Ok(CallToolResult::success(vec![Content::text(
-                    crate::format::format_api_error("DuckDuckGo Instant Answer", &e.to_string()),
-                )]));
-            }
-        };
-
-        // Prefer AbstractText, then Answer, then Definition
-        let abstract_text = body["AbstractText"].as_str().unwrap_or("");
-        let answer = body["Answer"].as_str().unwrap_or("");
-        let definition = body["Definition"].as_str().unwrap_or("");
-
-        let (content, source_url) = if !abstract_text.is_empty() {
-            let source = body["AbstractSource"].as_str().unwrap_or("DuckDuckGo");
-            let url = body["AbstractURL"].as_str().unwrap_or("");
-            let text = format!("{}\n\nSource: {} ({})", abstract_text, source, url);
-            (text, url.to_string())
-        } else if !answer.is_empty() {
-            (answer.to_string(), String::new())
-        } else if !definition.is_empty() {
-            let url = body["DefinitionURL"].as_str().unwrap_or("");
-            (
-                format!("{}\n\nSource: {}", definition, url),
-                url.to_string(),
-            )
-        } else {
-            eprintln!("[knowledge] instant_answer: no result for '{}'", query);
-            return Ok(CallToolResult::success(vec![Content::text(
-                crate::format::format_no_results(
-                    &format!("an instant answer for '{}'", query),
-                    &[
-                        "giap-knowledge__get_wikipedia_article",
-                        "giap-discovery__search_web",
-                    ],
-                ),
-            )]));
-        };
-
-        let _ = source_url; // consumed above in formatting
-        let truncated = crate::format::truncate_to_budget(&content, INSTANT_ANSWER_BUDGET);
-        eprintln!(
-            "[knowledge] instant_answer done, returning {} chars",
-            truncated.len()
-        );
-        Ok(CallToolResult::success(vec![Content::text(truncated)]))
-    }
-
     #[tool(description = "Define an English word: meanings, pronunciation, examples.")]
     async fn define_word(
         &self,
@@ -389,10 +302,7 @@ before Wikipedia.")]
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_no_results(
                     &format!("a dictionary definition of '{}'", word),
-                    &[
-                        "giap-knowledge__search_wikipedia",
-                        "giap-discovery__search_web",
-                    ],
+                    &["giap-knowledge__search_wikipedia"],
                 ),
             )]));
         }
@@ -515,8 +425,9 @@ recommendations, or 'who wrote X'.")]
             eprintln!("[knowledge] search_books: no results for '{}'", query);
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_no_results(
+                    // Nothing else on the pond knows about books.
                     &format!("books for '{}'", query),
-                    &["giap-discovery__search_web"],
+                    &[],
                 ),
             )]));
         }
@@ -531,7 +442,13 @@ recommendations, or 'who wrote X'.")]
     }
 }
 
-#[tool_handler]
+// `router = self.tool_router` is load-bearing. The default is
+// `Self::tool_router()`, the macro-generated function for THIS impl block only —
+// so with a bare `#[tool_handler]` the composed field built in `new()` is
+// ignored and the four tools below are the only ones `list_tools` ever reports.
+// The Wolfram tools compiled, unit-tested and were never offered to the model;
+// `both_tools_are_actually_exposed_by_the_server` is what caught it.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for KnowledgeMcpServer {
     fn get_info(&self) -> ServerInfo {
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
@@ -541,12 +458,20 @@ impl ServerHandler for KnowledgeMcpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "GIAP Knowledge server — reference lookups and definitions.\n\n\
-                 Tools: instant_answer (quick facts), get_wikipedia_article (deep articles), \
-                 search_wikipedia (find articles), define_word (dictionary), search_books (book search).\n\n\
-                 For simple 'what is X' questions, try instant_answer first — it's fastest. \
-                 For deep factual lookups, use get_wikipedia_article. \
-                 For word definitions, use define_word. For book queries, use search_books.\n\
+                "GIAP Knowledge server — reference lookups, definitions, and computation.\n\n\
+                 Tools: get_wikipedia_article (deep articles), \
+                 search_wikipedia (find articles), define_word (dictionary), search_books (book search), \
+                 compute_answer (Wolfram|Alpha), explore_computation (open a Wolfram suggestion).\n\n\
+                 Reading vs computing is the split. If the answer has to be worked out — \
+                 arithmetic, a unit or currency conversion, a date difference, a statistic — \
+                 use compute_answer. If it has to be read — who someone was, what happened, \
+                 what a place is like — use get_wikipedia_article; it auto-searches when the \
+                 title is not exact. Use search_wikipedia only to disambiguate between several \
+                 possible articles. For word definitions, use define_word. For book queries, \
+                 use search_books.\n\
+                 A compute_answer result may end with suggestions, each with an id like 'w3'. \
+                 When one of them is what the user actually meant, call explore_computation \
+                 with that id rather than guessing or re-asking.\n\
                  After receiving results: synthesize in your own words. Do not parrot verbatim.\n\
                  In voice mode: 1-3 sentences. Offer to elaborate if the user wants more.",
             )
@@ -799,10 +724,7 @@ fn format_dictionary_response(body: &serde_json::Value, word: &str) -> String {
         _ => {
             return crate::format::format_no_results(
                 &format!("a dictionary definition of '{}'", word),
-                &[
-                    "giap-knowledge__search_wikipedia",
-                    "giap-discovery__search_web",
-                ],
+                &["giap-knowledge__search_wikipedia"],
             )
         }
     };
@@ -1083,10 +1005,7 @@ impl KnowledgeMcpServer {
                 );
                 Ok(crate::format::format_no_results(
                     &format!("Wikipedia articles for '{}'", query),
-                    &[
-                        "giap-discovery__search_web",
-                        "giap-knowledge__instant_answer",
-                    ],
+                    &["giap-knowledge__compute_answer"],
                 ))
             }
         }
@@ -1294,7 +1213,7 @@ mod tests {
         );
     }
 
-    // ── instant_answer tests ──────────────────────────────────────────────
+    // ── query-cleaning tests ──────────────────────────────────────────────
 
     #[test]
     fn clean_query_strips_define_prefix() {
@@ -1307,19 +1226,6 @@ mod tests {
         );
         // "what is" IS stripped:
         assert_eq!(clean_query_for_search("what is ephemeral?"), "ephemeral");
-    }
-
-    #[tokio::test]
-    async fn resolve_topic_for_instant_answer() {
-        let params = WikipediaQueryParams {
-            topic: Some("Rust programming".to_string()),
-            limit: None,
-            extra: Default::default(),
-        };
-        assert_eq!(
-            resolve_topic(&params, "instant_answer").await,
-            "Rust programming"
-        );
     }
 
     // ── define_word tests ─────────────────────────────────────────────────
@@ -1385,7 +1291,7 @@ mod tests {
         assert!(result.contains("No results for"), "got: {result}");
         assert!(result.contains("xyzzy"));
         assert!(
-            result.contains("giap-discovery__search_web"),
+            result.contains("giap-knowledge__search_wikipedia"),
             "got: {result}"
         );
     }
@@ -1442,24 +1348,6 @@ mod tests {
     }
 
     // ── Live integration tests (new tools) ────────────────────────────────
-
-    #[tokio::test]
-    #[ignore] // requires internet
-    async fn live_instant_answer_returns_result() {
-        let server = test_server();
-        // DuckDuckGo IA for a well-known topic — use the internal HTTP client directly
-        let url =
-            "https://api.duckduckgo.com/?q=Albert+Einstein&format=json&no_html=1&skip_disambig=1";
-        let resp = server.http_client.get(url).send().await.unwrap();
-        assert!(resp.status().is_success());
-        let body: serde_json::Value = resp.json().await.unwrap();
-        let abstract_text = body["AbstractText"].as_str().unwrap_or("");
-        eprintln!("instant_answer abstract: {}", abstract_text);
-        assert!(
-            !abstract_text.is_empty(),
-            "DuckDuckGo should return an abstract for Einstein"
-        );
-    }
 
     #[tokio::test]
     #[ignore] // requires internet

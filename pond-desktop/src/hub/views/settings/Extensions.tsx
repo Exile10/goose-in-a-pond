@@ -16,7 +16,7 @@ const STORE_PATH =
 // ─── Mock fallback (offline) ──────────────────────────────────
 const MOCK_EXTENSIONS: Extension[] = [
   { name: "giap-weather",      kind: "builtin",         description: "Local & forecast weather",         tools: ["get_current_weather", "get_forecast"],                                  enabled: true,  status: "connected" },
-  { name: "giap-knowledge",    kind: "builtin",         description: "Wikipedia, definitions, books",    tools: ["get_wikipedia_article", "search_wikipedia", "instant_answer"],          enabled: true,  status: "connected" },
+  { name: "giap-knowledge",    kind: "builtin",         description: "Wikipedia, definitions, books, maths", tools: ["get_wikipedia_article", "search_wikipedia", "define_word", "compute_answer"], enabled: true, status: "connected" },
   { name: "giap-news",         kind: "builtin",         description: "Daily headlines & stories",        tools: ["get_top_stories", "search_news", "get_headlines"],                      enabled: false, status: undefined },
   { name: "giap-finance",      kind: "builtin",         description: "Crypto & market prices",           tools: ["get_exchange_rate", "get_stock_quote", "get_crypto_price"],              enabled: true,  status: "connected" },
   { name: "giap-memory",       kind: "builtin",         description: "Save & recall memories",           tools: ["save_memory", "recall_memories", "forget_memory"],                      enabled: true,  status: "connected" },
