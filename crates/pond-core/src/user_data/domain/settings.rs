@@ -2390,7 +2390,6 @@ mod tests {
             "schedule_max_runs_per_task",
             "schedule_result_notify",
             "reasoning_effort",
-            "searxng_url",
             "show_thinking",
             "show_turn_stats",
             "telemetry_enabled",
@@ -2420,6 +2419,14 @@ mod tests {
             "weather_latitude",
             "weather_location_name",
             "weather_longitude",
+            // Headless since 2026-08-13, and only until `search_web` comes back:
+            // it is the sole reader, and it is no longer registered as a tool
+            // (`pond-mcp-server/src/discovery.rs`). The row was removed from
+            // Settings.tsx rather than left inert -- an input that cannot affect
+            // anything is the "switches that were not switches" defect, and the
+            // value is still persisted, so restoring the tool restores the
+            // setting with whatever was last typed into it.
+            "searxng_url",
         ];
 
         let value = serde_json::to_value(Settings::default()).expect("serialize Settings");

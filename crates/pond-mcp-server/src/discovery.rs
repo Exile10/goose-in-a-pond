@@ -1,9 +1,11 @@
-//! Discovery MCP Server — country data, food products, prices, and web search.
+//! Discovery MCP Server — country data, food products, and prices.
 //!
-//! Provides 4 tools: `get_country_info` (REST Countries), `lookup_product` (Open Food Facts),
-//! `get_product_price` (Open Prices), `search_web` (SearXNG / DuckDuckGo fallback).
-//! All APIs are free and require no API keys.
-//! Depends on a `reqwest::Client` for HTTP fetches and `SettingsRepository` for SearXNG URL.
+//! Provides 3 tools: `get_country_info` (REST Countries), `lookup_product` (Open Food Facts),
+//! `get_product_price` (Open Prices). All APIs are free and require no API keys.
+//!
+//! A fourth, `search_web`, is present in the file but **not registered** — see the
+//! note on it. `SettingsRepository` is still a dependency because that is the only
+//! thing that reads `searxng_url`, and it comes back with the tool.
 
 use pond_core::user_data::ports::settings::SettingsRepository;
 use rmcp::{
@@ -71,7 +73,6 @@ pub struct WebSearchParams {
 const REST_COUNTRIES_BASE: &str = "https://restcountries.com/v3.1";
 const OFF_BASE: &str = "https://world.openfoodfacts.org";
 const OFF_PRICES_BASE: &str = "https://prices.openfoodfacts.org/api/v1";
-const DDG_IA_BASE: &str = "https://api.duckduckgo.com";
 
 const COUNTRY_INFO_BUDGET: usize = 800;
 const PRODUCT_SINGLE_BUDGET: usize = 1000;
@@ -158,7 +159,7 @@ impl DiscoveryMcpServer {
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_no_results(
                     &format!("country data for '{}'", country),
-                    &["giap-discovery__search_web"],
+                    &["giap-knowledge__get_wikipedia_article"],
                 ),
             )]));
         }
@@ -192,7 +193,7 @@ impl DiscoveryMcpServer {
             Some(c) => format_country(c),
             None => crate::format::format_no_results(
                 &format!("country data for '{}'", country),
-                &["giap-discovery__search_web"],
+                &["giap-knowledge__get_wikipedia_article"],
             ),
         };
 
@@ -266,8 +267,9 @@ Look up a food product by barcode or name: nutrition, ingredients, allergens, Nu
             if status == 0 {
                 return Ok(CallToolResult::success(vec![Content::text(
                     crate::format::format_no_results(
+                        // A barcode is not something any other tool here can look up.
                         &format!("barcode '{}' in the Open Food Facts database", code),
-                        &["giap-discovery__search_web"],
+                        &[],
                     ),
                 )]));
             }
@@ -338,10 +340,7 @@ Look up a food product by barcode or name: nutrition, ingredients, allergens, Nu
             return Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_no_results(
                     &format!("products matching '{}'", query),
-                    &[
-                        "giap-discovery__lookup_product",
-                        "giap-discovery__search_web",
-                    ],
+                    &["giap-discovery__lookup_product"],
                 ),
             )]));
         }
@@ -461,10 +460,7 @@ Recent crowdsourced prices for a product barcode (find it via lookup_product). C
 
         if items.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
-                crate::format::format_no_results(
-                    "crowdsourced prices for this product",
-                    &["giap-discovery__search_web"],
-                ),
+                crate::format::format_no_results("crowdsourced prices for this product", &[]),
             )]));
         }
 
@@ -484,8 +480,33 @@ Recent crowdsourced prices for a product barcode (find it via lookup_product). C
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(description = "\
-General web search. LAST RESORT — prefer specific tools (news, finance, knowledge) first.")]
+    /// General web search. **DISABLED 2026-08-13 — not registered as a tool.**
+    ///
+    /// The `#[tool(...)]` attribute is deliberately absent, which is the whole
+    /// of the disable: the router only collects annotated methods, so the model
+    /// is never offered this and pays no schema for it. Restoring it is putting
+    /// the attribute back:
+    ///
+    /// ```ignore
+    /// #[tool(description = "\
+    /// General web search. LAST RESORT — prefer specific tools (news, finance, knowledge) first.")]
+    /// ```
+    ///
+    /// **Why it went.** SearXNG was the only backend left after the DuckDuckGo
+    /// Instant Answer fallback was removed, and SearXNG is something the user
+    /// has to run. So out of the box the tool could only ever return a dead end
+    /// — while still costing a schema in every turn's prompt and still being
+    /// picked by a model that reads "general web search" and believes it.
+    ///
+    /// The body is kept, and kept compiling, on purpose. A `#[cfg(feature)]`
+    /// would have hidden it from the compiler, and CLAUDE.md's standing warning
+    /// applies: code CI only ever `check`s, or does not build at all, rots. This
+    /// still type-checks against `SettingsRepository` and `format`, so whatever
+    /// backend comes back — SearXNG, Brave, Mojeek — starts from working code.
+    ///
+    /// `search_searxng` below is reached only from here, so it is dead with it
+    /// rather than separately.
+    #[allow(dead_code)]
     async fn search_web(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -516,8 +537,26 @@ General web search. LAST RESORT — prefer specific tools (news, finance, knowle
             return self.search_searxng(base_url, &query, limit).await;
         }
 
-        // Fallback: DuckDuckGo Instant Answer API
-        self.search_duckduckgo(&query, limit).await
+        // No backend. SearXNG is the only one this tool has since the
+        // DuckDuckGo Instant Answer fallback was removed, and DDG was never a
+        // web search — it returned an abstract and a handful of related topics,
+        // which is why its own header called itself "limited".
+        //
+        // Terminal on purpose, and the wording is load-bearing. search_web is
+        // the last resort, so a miss here ends the chain and the model has to be
+        // told so, or it repeats its previous sentence instead of reporting the
+        // outcome. (Measured on gemma-4-E2B: an earlier settings-tip wording
+        // produced a verbatim repeat of the preamble it had already streamed.)
+        eprintln!("[discovery] search_web: no SearXNG configured, nothing to search");
+        Ok(CallToolResult::success(vec![Content::text(
+            crate::format::format_dead_end(
+                &format!("web results for '{}'", query),
+                "this pond has no web search backend configured, and search_web is \
+                 the last resort, so there is nothing further to try. Tell the user \
+                 plainly that you could not find it, and that setting a SearXNG \
+                 instance in Settings would enable web search.",
+            ),
+        )]))
     }
 }
 
@@ -603,8 +642,8 @@ impl DiscoveryMcpServer {
                 crate::format::format_no_results(
                     &format!("web results for '{}'", query),
                     &[
+                        "giap-knowledge__get_wikipedia_article",
                         "giap-knowledge__search_wikipedia",
-                        "giap-knowledge__instant_answer",
                     ],
                 ),
             )]));
@@ -649,144 +688,6 @@ impl DiscoveryMcpServer {
 
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
-
-    /// Fallback search via DuckDuckGo Instant Answer API.
-    async fn search_duckduckgo(
-        &self,
-        query: &str,
-        _limit: u32,
-    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
-        let url = format!(
-            "{}/?q={}&format=json&no_html=1&skip_disambig=1",
-            DDG_IA_BASE,
-            urlencoding::encode(query),
-        );
-        eprintln!("[discovery] DDG IA GET {}", url);
-
-        let resp = match crate::http::traced_get_with(&self.http_client, &url, |b| {
-            b.timeout(std::time::Duration::from_secs(10))
-        })
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[discovery] DDG IA request failed: {e}");
-                return Ok(CallToolResult::success(vec![Content::text(
-                    crate::format::format_api_error("DuckDuckGo", &e.to_string()),
-                )]));
-            }
-        };
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            eprintln!("[discovery] DDG IA HTTP {status}");
-            return Ok(CallToolResult::success(vec![Content::text(
-                crate::format::format_api_error("DuckDuckGo", &format!("HTTP {status}")),
-            )]));
-        }
-
-        let body: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[discovery] failed to parse DDG IA response: {e}");
-                return Ok(CallToolResult::success(vec![Content::text(
-                    crate::format::format_api_error("DuckDuckGo", &e.to_string()),
-                )]));
-            }
-        };
-
-        let mut items: Vec<String> = Vec::new();
-
-        // Prefer AbstractText
-        let abstract_text = body["AbstractText"].as_str().unwrap_or("");
-        if !abstract_text.is_empty() {
-            let source = body["AbstractSource"].as_str().unwrap_or("DuckDuckGo");
-            let abstract_url = body["AbstractURL"].as_str().unwrap_or("");
-            items.push(format!(
-                "**{}** -- {} ({})",
-                source, abstract_text, abstract_url
-            ));
-        }
-
-        // Add Related Topics
-        if let Some(topics) = body["RelatedTopics"].as_array() {
-            for topic in topics.iter().take(5) {
-                if let Some(text) = topic["Text"].as_str() {
-                    let url = topic["FirstURL"].as_str().unwrap_or("");
-                    let domain = extract_domain(url);
-                    if !text.is_empty() {
-                        items.push(format!("{} ({})", text, domain));
-                    }
-                }
-            }
-        }
-
-        if items.is_empty() {
-            // Terminal on purpose. search_web is the last resort, so a miss here
-            // ends the chain — and the model needs to be told that, or it
-            // repeats its previous sentence instead of reporting the outcome.
-            // (Measured on gemma-4-E2B: the old settings-tip wording produced a
-            // verbatim repeat of the preamble it had already streamed.)
-            return Ok(CallToolResult::success(vec![Content::text(
-                crate::format::format_dead_end(
-                    &format!("web results for '{}'", query),
-                    "search_web is the last resort, so there is nothing further to \
-                     try. Tell the user plainly that you could not find it, and that \
-                     configuring a SearXNG instance in Settings would enable full \
-                     web search.",
-                ),
-            )]));
-        }
-
-        // Build UI hint from DDG results
-        let mut ui_results: Vec<serde_json::Value> = Vec::new();
-        if !abstract_text.is_empty() {
-            let abstract_url = body["AbstractURL"].as_str().unwrap_or("");
-            let source = body["AbstractSource"].as_str().unwrap_or("DuckDuckGo");
-            ui_results.push(serde_json::json!({
-                "title": source,
-                "snippet": abstract_text,
-                "url": abstract_url,
-            }));
-        }
-        if let Some(topics) = body["RelatedTopics"].as_array() {
-            for topic in topics.iter().take(5) {
-                if let Some(topic_text) = topic["Text"].as_str() {
-                    if !topic_text.is_empty() {
-                        let url = topic["FirstURL"].as_str().unwrap_or("");
-                        ui_results.push(serde_json::json!({
-                            "title": topic_text.chars().take(80).collect::<String>(),
-                            "snippet": topic_text,
-                            "url": url,
-                        }));
-                    }
-                }
-            }
-        }
-
-        let header = format!(
-            "DuckDuckGo results for \"{}\" (limited — for full web search, configure SearXNG in Settings):",
-            query,
-        );
-        let text = crate::format::format_list_result(&items, &header, WEB_SEARCH_BUDGET);
-        eprintln!(
-            "[discovery] search_web (DDG) done, {} items, {} chars",
-            items.len(),
-            text.len()
-        );
-
-        if !ui_results.is_empty() {
-            let ui_data = serde_json::json!({
-                "query": query,
-                "results": ui_results,
-            });
-            let hint = format!("[[[mcp-ui:search:{}]]]\n", ui_data);
-            let full_result = format!("{}{}", hint, text);
-            return Ok(CallToolResult::success(vec![Content::text(full_result)]));
-        }
-
-        Ok(CallToolResult::success(vec![Content::text(text)]))
-    }
 }
 
 #[tool_handler]
@@ -799,12 +700,13 @@ impl ServerHandler for DiscoveryMcpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "GIAP Discovery server — products, countries, and web search.\n\n\
+                "GIAP Discovery server — products and countries.\n\n\
                  Tools: get_country_info (country data), lookup_product (food/nutrition), \
-                 get_product_price (price lookup), search_web (general web search).\n\n\
+                 get_product_price (price lookup).\n\n\
                  For country questions: get_country_info. For food/nutrition: lookup_product.\n\
                  For product pricing: get_product_price (works best with barcodes).\n\
-                 search_web is the last resort — use specific tools first for better results.\n\
+                 This server does not search the web. If the question needs a general \
+                 web search, say so plainly rather than guessing.\n\
                  All tools are free, no API keys needed.",
             )
     }
@@ -1878,36 +1780,5 @@ mod tests {
         let body: serde_json::Value = resp.json().await.expect("parse failed");
         let status = body["status"].as_u64().unwrap_or(0);
         assert_eq!(status, 0, "should return status 0 for non-existent barcode");
-    }
-
-    #[tokio::test]
-    #[ignore] // requires internet
-    async fn live_duckduckgo_fallback_search() {
-        let client = reqwest::Client::new();
-        let url = format!(
-            "{}/?q={}&format=json&no_html=1&skip_disambig=1",
-            DDG_IA_BASE,
-            urlencoding::encode("Rust programming language"),
-        );
-        let resp = client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-            .expect("DDG IA request failed");
-        assert!(resp.status().is_success());
-        let body: serde_json::Value = resp.json().await.expect("failed to parse response");
-        // Should have either AbstractText or RelatedTopics
-        let abstract_text = body["AbstractText"].as_str().unwrap_or("");
-        let related = body["RelatedTopics"].as_array();
-        eprintln!("DDG abstract: {}", abstract_text);
-        eprintln!(
-            "DDG related topics: {}",
-            related.map(|r| r.len()).unwrap_or(0)
-        );
-        assert!(
-            !abstract_text.is_empty() || related.map(|r| !r.is_empty()).unwrap_or(false),
-            "DDG should return some results for Rust programming language"
-        );
     }
 }

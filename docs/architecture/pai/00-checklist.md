@@ -1656,3 +1656,112 @@ will ever run their assertions.**
 - **PAI-4 P7b** — a session crossing 75% should show the note in the hub chat. Expect the "Compact
   now" control to answer `cooling_down`; per the finding above that is the current behaviour, so a
   refusal is a CONFIRMATION of the defect, not a failure of the live run.
+
+---
+
+**2026-08-13 — DuckDuckGo removed from the pond; Wolfram|Alpha in its place. Touches PAI-2 only.**
+
+Not a PAI phase. It is recorded here because it moved two things this checklist owns — the egress
+allowlist and a new keyed credential — and check 2.2 says to write down what a change does to the
+other seven even when it belongs to none of them.
+
+**What changed.** `giap-knowledge`'s `instant_answer` and `search_web`'s fallback were the pond's
+only two DuckDuckGo callers; both are gone. `compute_answer` and `explore_computation` replace the
+first, over Wolfram|Alpha's Full Results API, in a second `#[tool_router]` impl
+(`pond-mcp-server/src/wolfram.rs`) composed onto the same `KnowledgeMcpServer`. Tool count 64 -> 65,
+extension count unchanged at 17.
+
+**Run against 2.2, item by item.**
+
+- **Secret on `Settings`?** No. `WOLFRAM_APP_ID` is in the secret store via `secrets.rs`, the PAI-2
+  P2 pattern, and reaches the UI only as a name in `Settings.tsx :: API_KEYS` — the same row shape as
+  `GUARDIAN_API_KEY`. `GET /api/v1/settings` never sees it.
+- **New egress point without `record_egress`?** No. Every call goes through
+  `crate::http::traced_get_with`, which is the choke point. `wolframalpha.com` is on
+  `KNOWN_PUBLIC_SUFFIXES`, so the list is back to 17 entries after losing `duckduckgo.com` the same
+  day. Two line ranges cited in the PAI-2 document had rotted by ~230 lines and now name symbols.
+- **A new way to leak a credential.** This is the one genuinely new risk and it is not one 2.2 lists,
+  because until now no built-in tool carried its key in a **query string**. `reqwest`'s error
+  `Display` includes the URL it failed on, so the naive `eprintln!("GET {url}")` that every other
+  tool in this crate uses would have printed the AppID into the log on the happy path and into the
+  tool result on the failure path. `redact_appid` covers both, and two tests hold it there.
+- **Guest reaching personal data?** Yes, latently, and it was caught by a test rather than by
+  design. The explore ids are short (`w3`) so a small model can echo them, which also makes them
+  guessable — and the ring holds the user's own question text. It is now keyed by the engine session
+  from the call's `_meta`, never by `current_session_id()`, which `session_meta.rs` documents as
+  unusable for exactly this because four chat streams race that one cell. A call with no session in
+  `_meta` is offered no ids at all rather than sharing a bucket, which is the `giap-draft` "default"
+  bug the same file records.
+- **Preamble tokens?** Net +1 tool schema, roughly +100 tokens per turn through the Gemma template.
+  Paid deliberately: the pond had no way to compute anything, and `tool_selection_mode` is the lever
+  that answers this properly for all 65.
+- **KV prefix, blocking a turn on an LLM call, acting without approval?** None of the three. The
+  suggestion chips in the card send a *message*, so the follow-up goes back through the engine and
+  is audited and policy-checked; reaching the tool directly would have needed the knowledge tools on
+  `DIRECT_DISPATCH_ALLOWLIST`, which grants them to every paired client and MCP App iframe at once.
+
+**A consent question this does not answer.** Wolfram requires an AppID, so unlike Wikipedia or
+DuckDuckGo the far end can attribute every question to an account. The egress classifier calls the
+host `Public` because that is what `Public` already means on that list (`finnhub.io`, `gnews.io` and
+`guardianapis.com` are all keyed), but "the pond was built to talk to this host" is not "this host
+cannot profile the household". The tool is inert until someone enters a key, which is the whole of
+the consent story today. Whether that is enough is a PAI-2 decision nobody has made.
+
+**Gates run.** `cargo fmt --check` clean; `cargo test -p pond-mcp-server -p pond-core` green;
+`cargo check -p pond-server -p pond-adapters-goose` green; 343 frontend tests green; `npm run build`
+clean. **No live run** — nothing here touches a migration, a route, a handler or startup wiring, so
+gate 11 does not apply. **Not benchmarked on the Orin**, and it should be before anyone calls the
+in-chat card verified: `pai-bench` has no probe for it, and the one claim I cannot make from a
+laptop is that a 2B model reliably echoes `w3` back into `explore_computation`. That is the entire
+premise of the short-id design and it is measured nowhere.
+
+**`search_web` disabled the same day, at Jerry's call.** Wolfram cannot stand in for it — its own
+API docs are explicit that an uninterpretable query returns no pods and no links, only
+`didyoumeans` / `tips` / `futuretopic`, because it indexes a curated dataset and not the web. And
+`search_web` is declared LAST RESORT, so the traffic reaching it is exactly what the specific tools
+already failed on: current events, local businesses, product pages. With the DuckDuckGo fallback
+gone, SearXNG was its only backend and SearXNG is something the user has to run, so out of the box
+the tool could only return a dead end while still costing a schema in every turn.
+
+The disable is the absence of the `#[tool(...)]` attribute; the body is kept and kept compiling,
+because a `#[cfg(feature)]` would hide it from the compiler and this checklist already records what
+happens to code CI only ever `check`s. Consequences worked through rather than left: **seventeen
+`format_no_results` call sites across four files were pointing at it**, and `format.rs`'s own doc
+says never to name a tool that does not exist because a fabricated suggestion burns the model's one
+retry. Financial misses now chain to `compute_answer` (Wolfram has currency, crypto and
+public-company figures), country misses to Wikipedia, and the three that genuinely have no sibling —
+barcodes, crowdsourced prices, books — say so with an empty alternatives list instead of inventing
+one. `searxng_url` moved to `HEADLESS_BY_DESIGN` and its Settings row was deleted, because nothing
+reads it any more and an input that cannot affect anything is the switches-that-were-not-switches
+defect in a different costume.
+
+**Two guards came out of it**, both mutation-checked. `every_suggested_alternative_is_a_tool_that_exists`
+parses every `#[tool]` in the crate into an inventory and asserts each suggestion is in it — the
+sibling guard only ever checked that a name was *well-formed*, which
+`giap-discovery__search_web` still was. And `the_tool_inventory_parser_sees_the_tools_that_are_there`
+pins the count, which is how I found that **CLAUDE.md's "64 tools" had been wrong**: the number at
+`HEAD` before any of this session's work was 65. Prose nobody checks drifts; that line is now
+guarded and says so.
+
+**A defect this batch shipped and then caught, worth the retelling.** `compute_answer` and
+`explore_computation` were registered, compiled, covered by twenty-odd unit tests, and **not offered
+to the model at all**. `giap-knowledge` is the first extension assembled from two `#[tool_router]`
+impls composed with `+` in `new()`, and a bare `#[tool_handler]` resolves its router as
+`Self::tool_router()` — the function generated for one impl block — so the composed field was
+ignored and `list_tools` returned four tools instead of six. Nothing failed. `cargo check` was
+green, the production binary built, every test of the parsing, rendering, session scoping and
+redaction passed, because all of them called the functions directly.
+
+The fix is `#[tool_handler(router = self.tool_router)]`. The lesson is the one section 2.1 already
+states and this programme keeps re-learning: **a test that calls the function is not a test that the
+system calls the function.** The guard that found it drives `ServerHandler::list_tools` and
+`call_tool` on a real `RequestContext` (`both_tools_are_actually_exposed_by_the_server`,
+`calling_the_tool_without_a_key_names_the_signup_page`), and it is paired with
+`an_unknown_tool_name_is_refused_by_the_router` so "the tool is registered" cannot pass against a
+router that accepts anything.
+
+**Pre-existing, found while here, not fixed:** `cargo clippy -p pond-core --all-targets` fails on
+`tests/egress_guard.rs :: ungated_egress_is_capped_and_shrinking` (`absurd_extreme_comparisons` —
+`MAX_UNGATED` is now 0, so `len() <= 0` is always-or-never). CI's clippy step has no `--all-targets`,
+so it is invisible there. Changing `<=` to `==` changes what the guard claims ("only shrinks" vs "is
+exactly this"), so it is a deliberate call, not a lint fix.
