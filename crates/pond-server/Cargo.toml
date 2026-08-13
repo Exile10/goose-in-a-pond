@@ -36,7 +36,16 @@ mcp-memory = ["dep:pond-adapters-mcp-memory"]
 # Enable in-process GGUF inference (no llamafile/Ollama subprocess required).
 # First build compiles llama-cpp-2 + candle — expect 5–15 min.
 # cargo run -p pond-server --features local-inference -- chat --provider local
-local-inference = ["dep:pond-adapters-local-inference", "pond-api/local-inference"]
+#
+# Pulls `pond-inference` too: it hosts the GGUF `EmbeddingProvider`
+# (`embedding_provider = "gguf"`), which shares this feature's llama.cpp rather
+# than fastembed's ONNX (which will not initialise on the Jetson Orin). No extra
+# native compile — llama-cpp-2 is already built by this feature and goose-agent.
+local-inference = [
+    "dep:pond-adapters-local-inference",
+    "dep:pond-inference",
+    "pond-api/local-inference",
+]
 # Enable ONNX face recognition (Phase 2 biometric user differentiation).
 # Requires the ONNX Runtime shared library to be available at startup
 # (set ORT_DYLIB_PATH, or place libonnxruntime in the system library path).

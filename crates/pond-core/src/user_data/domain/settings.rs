@@ -287,7 +287,9 @@ pub struct Settings {
     #[serde(default)]
     pub active_embedding_model: String,
 
-    /// Embedding provider: "fastembed" (default, local ONNX) or "none"
+    /// Embedding provider: "fastembed" (default, local ONNX), "gguf" (llama.cpp,
+    /// the on-device path — fastembed's ONNX Runtime does not initialise on the
+    /// Jetson Orin), or "none". "gguf" requires the `local-inference` build.
     #[serde(default = "Settings::default_embedding_provider")]
     pub embedding_provider: String,
 
