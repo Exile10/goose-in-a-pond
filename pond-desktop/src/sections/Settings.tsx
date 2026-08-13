@@ -441,8 +441,11 @@ function ModelsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k:
                 <span className="muted-12">tokens</span>
               </div>
             </Row>
-            <Row label="Embedding provider"><select className="native-select" value={s.embedding_provider ?? "fastembed"} onChange={(e) => patch("embedding_provider", e.target.value)}><option value="fastembed">FastEmbed (local ONNX)</option><option value="none">None</option></select></Row>
-            <Row label="Embedding model"><input className="native-input" disabled={(s.embedding_provider ?? "fastembed") === "none"} value={s.active_embedding_model ?? ""} onChange={(e) => patch("active_embedding_model", e.target.value)} placeholder="all-MiniLM-L6-v2" /></Row>
+            {/* GGUF must be listed: a pond whose stored value is "gguf" would otherwise render
+                this select blank, and the first touch of it would silently rewrite the pond to
+                fastembed (384-dim) with 768-dim vectors already stored. */}
+            <Row label="Embedding provider" hint="GGUF runs through the same llama.cpp as chat and is the one that works on a Jetson; FastEmbed's ONNX runtime does not start there. Switching provider changes the vector space, so existing memories stop matching until they are re-embedded."><select className="native-select" value={s.embedding_provider ?? "fastembed"} onChange={(e) => patch("embedding_provider", e.target.value)}><option value="fastembed">FastEmbed (local ONNX)</option><option value="gguf">GGUF (llama.cpp, on-device)</option><option value="none">None</option></select></Row>
+            <Row label="Embedding model"><input className="native-input" disabled={(s.embedding_provider ?? "fastembed") === "none"} value={s.active_embedding_model ?? ""} onChange={(e) => patch("active_embedding_model", e.target.value)} placeholder={(s.embedding_provider ?? "fastembed") === "gguf" ? "nomic-embed-text-v1.5" : "all-MiniLM-L6-v2"} /></Row>
             <Row label="Tool loading" hint="Relevant keeps the prompt small on-device by loading only the tool groups a conversation needs. The assistant can load more itself at any time."><select className="native-select" value={s.tool_selection_mode ?? "all"} onChange={(e) => patch("tool_selection_mode", e.target.value)}><option value="all">All tools, every turn</option><option value="relevant">Only relevant groups</option></select></Row>
           </Section>
         </>

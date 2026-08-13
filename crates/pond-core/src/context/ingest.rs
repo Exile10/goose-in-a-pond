@@ -303,6 +303,76 @@ mod tests {
         assert!(stored[0].body().contains("[redacted:api-key]"));
     }
 
+    /// An embedder that keeps the text it was handed, so a test can assert on
+    /// what was actually embedded rather than on what the code says it embeds.
+    struct RecordingEmbedder {
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for RecordingEmbedder {
+        async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            self.seen.lock().unwrap().push(text.to_string());
+            Ok(vec![0.25; 8])
+        }
+        fn dimensions(&self) -> usize {
+            8
+        }
+    }
+
+    /// The vector must be computed from the REDACTED text.
+    ///
+    /// `the_stored_row_is_the_redacted_one` only proves the stored *body* is
+    /// clean, and would stay green if the embed moved above the redaction — the
+    /// row would still be redacted while the vector became a durable derivative
+    /// of a secret, which is the one thing a vector cannot be audited for later.
+    /// This pins the ORDER by recording what the embedder was actually given.
+    #[tokio::test]
+    async fn the_vector_is_computed_from_the_redacted_text() {
+        let repo = Arc::new(MockContextRepository::new());
+        let redactor = Arc::new(MockRedactor::replacing(KEY, RedactionKind::ApiKey));
+        let embedder = Arc::new(RecordingEmbedder {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let pipeline = IngestPipeline::new(repo.clone(), redactor)
+            .with_embedder(Some(embedder.clone() as Arc<dyn EmbeddingProvider>));
+
+        pipeline
+            .ingest(
+                &source(SourceKind::Voice),
+                raw("e1", &format!("he said {KEY} out loud")),
+                Utc::now(),
+            )
+            .await
+            .expect("ingest");
+
+        let seen = embedder.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "expected exactly one embed call");
+        assert!(
+            !seen[0].contains(KEY),
+            "the embedder was handed the UNREDACTED text, so the stored vector \
+             is a derivative of a secret: {}",
+            seen[0]
+        );
+        assert!(
+            seen[0].contains("[redacted:api-key]"),
+            "expected the redacted form to be what was embedded: {}",
+            seen[0]
+        );
+
+        // And the vector actually reached the row -- 0b's other half.
+        let stored = repo
+            .recent_items(&ProfileScope::Household, 10)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            stored[0].embedding().map(|e| e.len()),
+            Some(8),
+            "the item was stored without the vector the pipeline computed"
+        );
+    }
+
     /// The connector deadlock, asserted. Every kind that is not on-pond is
     /// refused, and the refusal names what has to land.
     #[tokio::test]

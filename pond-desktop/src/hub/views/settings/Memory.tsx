@@ -234,6 +234,9 @@ export function MemoryDetail({ go }: MemoryDetailProps) {
   const [deleting, setDeleting] = useState<string | null>(null);
   const [showComposer, setShowComposer] = useState(false);
   const [compactionEnabled, setCompactionEnabled] = useState(false);
+  // Mirrored from the sections Settings view on purpose: both UIs ship, and a
+  // control that exists in only one of them is a setting half the app cannot see.
+  const [embeddingProvider, setEmbeddingProvider] = useState("fastembed");
   const [flash, setFlash] = useState<{ text: string; ok: boolean } | null>(null);
   const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -260,6 +263,11 @@ export function MemoryDetail({ go }: MemoryDetailProps) {
         setCompactionEnabled(
           (settings as Record<string, unknown>).memory_consolidation_enabled === true,
         );
+        // `embedding_provider` is on the Settings type, so no cast is needed here
+        // (and adding one introduces a TS2352 the untyped sibling above already has).
+        if (settings.embedding_provider) {
+          setEmbeddingProvider(settings.embedding_provider);
+        }
       }
     } catch (e) {
       console.warn("[MemoryDetail] API offline — using mock fallback:", e);
@@ -302,6 +310,24 @@ export function MemoryDetail({ go }: MemoryDetailProps) {
     } catch (e) {
       showFlash(`Failed to save: ${String(e)}`, false);
       throw e;
+    }
+  }
+
+  async function handleChangeEmbeddingProvider(next: string) {
+    const previous = embeddingProvider;
+    setEmbeddingProvider(next);
+    try {
+      await api.updateSettings(
+        { embedding_provider: next } as Parameters<typeof api.updateSettings>[0],
+      );
+      showFlash(
+        next === "none"
+          ? "Embeddings off — recall falls back to keywords"
+          : "Embedding provider changed. Existing memories keep their old vectors until they are re-embedded.",
+      );
+    } catch (e) {
+      setEmbeddingProvider(previous);
+      showFlash(`Settings update failed: ${String(e)}`, false);
     }
   }
 
@@ -406,6 +432,26 @@ export function MemoryDetail({ go }: MemoryDetailProps) {
               on={compactionEnabled}
               onChange={handleToggleCompaction}
             />
+          }
+        />
+      </Card>
+
+      {/* How memories are searched */}
+      <Card title="Semantic search">
+        <Row
+          label="Embedding provider"
+          sub="GGUF uses the same engine as chat and is the one that starts on a Jetson. Changing this changes the vector space, so existing memories stop matching until they are re-embedded."
+          control={
+            <select
+              className="native-select"
+              aria-label="Embedding provider"
+              value={embeddingProvider}
+              onChange={(e) => handleChangeEmbeddingProvider(e.target.value)}
+            >
+              <option value="fastembed">FastEmbed (local ONNX)</option>
+              <option value="gguf">GGUF (llama.cpp, on-device)</option>
+              <option value="none">None (keyword only)</option>
+            </select>
           }
         />
       </Card>
