@@ -33,6 +33,7 @@ use pond_core::context::domain::{
 };
 use pond_core::context::ports::ContextRepository;
 use pond_core::context::retention::ContextRetention;
+use pond_core::context::vector_index::{Corpus, VectorEntry, VectorIndex};
 use pond_core::security::domain::event::PrivacySensitivity;
 use pond_core::security::ports::redactor::Redactor;
 use pond_core::user_data::domain::profile::ProfileScope;
@@ -79,13 +80,71 @@ type ItemRow = (
 pub struct SqliteContextRepository {
     pool: Pool<Sqlite>,
     redactor: Arc<dyn Redactor>,
+    /// Shared personal-context index (phase B). Optional; without it items are
+    /// stored exactly as before and the sweep picks them up later.
+    index: Option<Arc<dyn VectorIndex>>,
+    model_id: Option<String>,
 }
 
 impl SqliteContextRepository {
     /// The redactor is a constructor parameter, not a setter: see the module
     /// docs. There is deliberately no `new(pool)`.
     pub fn new(pool: Pool<Sqlite>, redactor: Arc<dyn Redactor>) -> Self {
-        Self { pool, redactor }
+        Self {
+            pool,
+            redactor,
+            index: None,
+            model_id: None,
+        }
+    }
+
+    /// Mirror stored vectors into the shared index.
+    ///
+    /// Placed at the adapter for the same reason as the memory side: this is the
+    /// terminal write and nothing else issues SQL against `context_items`. It is
+    /// simpler here than for memory, because a `ContextItem` cannot exist
+    /// un-redacted — `from_parts` is the only constructor and it takes the
+    /// redactor — so whatever vector the item carries is already of redacted
+    /// text by construction.
+    pub fn with_vector_index(
+        mut self,
+        index: Arc<dyn VectorIndex>,
+        model_id: Option<String>,
+    ) -> Self {
+        self.index = Some(index);
+        self.model_id = model_id;
+        self
+    }
+
+    /// Never fails the caller: the index is derived and the sweep repairs it.
+    async fn mirror(&self, item: &ContextItem) {
+        let Some(index) = &self.index else { return };
+        let outcome = match (item.embedding(), self.model_id.as_deref()) {
+            (Some(vector), Some(model_id)) if !vector.is_empty() => {
+                index
+                    .upsert(&VectorEntry {
+                        corpus: Corpus::Context,
+                        row_id: item.id().to_string(),
+                        model_id: model_id.to_string(),
+                        vector: vector.to_vec(),
+                        // A re-sync REWRITES the row in place (upsert on
+                        // `source_id, external_id`), so the ingest timestamp is
+                        // what tells a sweep the stored vector is of older text.
+                        source_rev: Some(sql_ts(item.ingested_at())),
+                    })
+                    .await
+            }
+            // A vector we cannot attribute: leave it to the sweep rather than
+            // strip an entry another process wrote correctly.
+            (Some(vector), None) if !vector.is_empty() => return,
+            // An upsert with no embedder wired NULLs a previously stored vector,
+            // so the index must follow rather than keep an entry for a row that
+            // no longer has one.
+            _ => index.remove(Corpus::Context, item.id()).await,
+        };
+        if let Err(e) = outcome {
+            tracing::warn!(item_id = %item.id(), "vector index write failed: {e:#}");
+        }
     }
 }
 
@@ -366,6 +425,10 @@ impl ContextRepository for SqliteContextRepository {
         .bind(item.embedding().map(vec_to_blob))
         .execute(&self.pool)
         .await?;
+        // Write-through, after the row is durable. Safe by construction here:
+        // `ContextItem` has one constructor and it redacts, so the vector this
+        // mirrors is already of redacted text.
+        self.mirror(item).await;
         Ok(())
     }
 

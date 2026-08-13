@@ -412,6 +412,10 @@ impl EmbeddingProvider for GgufEmbeddingProvider {
     fn dimensions(&self) -> usize {
         self.spec.dims
     }
+
+    fn model_id(&self) -> String {
+        self.spec.model_id.clone()
+    }
 }
 
 #[cfg(test)]

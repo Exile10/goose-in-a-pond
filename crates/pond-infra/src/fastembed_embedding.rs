@@ -124,6 +124,10 @@ impl EmbeddingProvider for FastembedEmbeddingProvider {
     fn dimensions(&self) -> usize {
         self.dims
     }
+
+    fn model_id(&self) -> String {
+        self.model_name.clone()
+    }
 }
 
 #[cfg(test)]

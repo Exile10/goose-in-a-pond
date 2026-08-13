@@ -377,6 +377,30 @@ impl SessionStorage for SqliteSessionStorage {
         }
     }
 
+    async fn get_rolling_summary_with_revision(
+        &self,
+        session_id: &str,
+    ) -> Result<(Option<String>, Option<String>), SessionStorageError> {
+        // One SELECT, so the text and the stamp cannot disagree. See the port
+        // doc: reading them separately races `set_rolling_summary` and lets a
+        // stale vector be stamped as current.
+        let row = sqlx::query(
+            "SELECT rolling_summary, rolling_summary_updated_at FROM sessions WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        Ok(row
+            .map(|r| {
+                (
+                    r.get("rolling_summary"),
+                    r.get("rolling_summary_updated_at"),
+                )
+            })
+            .unwrap_or((None, None)))
+    }
+
     async fn get_rolling_summary(
         &self,
         session_id: &str,
