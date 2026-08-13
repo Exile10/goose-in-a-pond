@@ -250,7 +250,7 @@ needed. Admit mail bodies and GPS tracks and it is millions, and §1.4 stops bei
 | **A** | `pond_vectors.db`, port + adapter, `ATTACH` on `after_connect`, migrations | **LANDED 2026-08-13.** `VectorIndex` port (`context::vector_index`) + `SqliteVectorIndex`; migration `vectors/0001`; `Database::vectors` opened after the system migrations. Verified: roundtrip; **the file is deleted and rebuilds**, reporting its source rows as needing embedding; an orphan matches nothing and prunes; a foreign-model vector is excluded rather than scored; a guest sees nothing and an owner sees own + unattributed. Live: fresh pond creates and migrates it, restart against a populated one preserves rows and re-runs nothing |
 | **B** | Write-through for all three corpora | **LANDED 2026-08-13.** Memory + context mirror their EXISTING vector at the SQLite adapter (zero extra inference); summaries are a sweep (`summary_indexing`) because nothing had ever embedded them. Verified live: a memory written through the API is embedded by the backfill and appears in `pond_vectors.db` stamped `nomic-embed-text-v1.5`/768, and a real query ranks it **0.66 vs 0.45** above a decoy sharing the word "spend" — the semantic claim, on a running pond. A re-summarised session is reported stale and its vector replaced |
 | **C** | Unified retrieval, scope in the SQL, `corpus` labelling | **LANDED 2026-08-13.** `PersonalContextRetrieval` (pond-core, policy) over `VectorIndex::search_resolved` (adapter, mechanism): one query answered across all three corpora, text read from LIVE rows in the same JOIN that filters scope and liveness. `three_way_isolation_two_members_and_a_guest` passes, plus guards for archived rows, unattributed (guest) summaries, and memory-wins-ties |
-| **D** | Idle staleness sweep, orphan prune, model-change re-embed | user activity cancels mid-sweep; orphans pruned; a `model_id` mismatch refuses rather than scores |
+| **D** | Idle staleness sweep, orphan prune, model-change re-embed | **LANDED 2026-08-13.** `run_index_maintenance` composes adopt -> embed-missing -> prune -> report, deferred 60 s from boot and cancellable. Live: index wiped and an orphan planted, 5 memories adopted and the orphan pruned ~45 s later; a model mismatch WARNs with its count; an unattributed (guest) session's summary is refused and indexed only once attributed |
 | **E** | Trigger subscribers (`BusEvent`) | a bus event produces an index entry |
 | **F** | On-demand route/tool + lazy media caption (cap ~8/query) | caption cached and embedded once |
 | **G** | Retrieval surfaces: `giap-context` tool first, then a **measured** passive prompt tier | pai-bench: does the passive tier earn its tokens? |
@@ -525,6 +525,25 @@ because it is written for whoever reads the answer.
 
 A failed recall returns empty rather than erroring: the caller's fallback is always better than
 failing the turn that asked.
+
+**Phase D landed 2026-08-13.** One composed pass rather than the three ad-hoc startup spawns B left
+behind: adopt existing vectors (free, pure SQL), embed the summaries that have none (the only step
+costing inference), prune orphans, then REPORT. The order is asserted, because pruning before adopting
+would delete rows adoption is about to legitimately re-create.
+
+It is **deferred 60 s from boot and cancellable**, which is the design's own rule finally honoured —
+"backfill deferred to idle, not startup", because a household's first turn after an upgrade must not
+be slow because the pond chose that moment to index itself.
+
+Verified live by breaking the index on purpose: deleted `pond_vectors.db`, planted an orphan, and
+watched a boot show **0 vectors** (the deferral working, where before it indexed immediately) and then
+repair itself ~45 s later — five memories adopted with no inference, the orphan pruned. A model
+mismatch WARNs with its count rather than degrading silently.
+
+One behaviour worth recording because it looked like a bug and was not: the live pond reported
+`summaries=0`. Its session had `profile_id IS NULL` — an unattributed, i.e. guest, session — which
+phase C's rule refuses. Attributing it made the sweep index it on the next pass. The rule is doing
+exactly what it should, and the sweep will not spend inference on a row retrieval would always refuse.
 
 **Owed, in priority order.** (1) A re-embed path for stale-width vectors (`search_stale_dimension`), since
 backfill cannot see them. (2) `embed_query`: nomic wants `search_query: ` on the query side and

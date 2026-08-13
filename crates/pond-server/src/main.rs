@@ -995,6 +995,15 @@ impl LlamafileManagerImpl {
     }
 }
 
+/// How long after boot the personal-context index repairs itself.
+///
+/// Not zero: the design's rule is that backfill is deferred to idle rather than
+/// run at startup, because a household's first turn after an upgrade must not be
+/// slow because the pond chose that moment to index itself. Sixty seconds is
+/// enough for a boot to settle and short enough that a pond left alone is
+/// repaired within the minute.
+const INDEX_MAINTENANCE_DELAY_SECS: u64 = 60;
+
 async fn run_server(
     static_dir: std::path::PathBuf,
     open: bool,
@@ -1596,6 +1605,8 @@ async fn run_server(
     let vector_index: Arc<dyn pond_core::context::vector_index::VectorIndex> = Arc::new(
         pond_infra::sqlite_vector_index::SqliteVectorIndex::new(db.vectors.clone()),
     );
+    // A member's first turn must not queue behind the pond indexing itself.
+    let index_maintenance_cancel = tokio_util::sync::CancellationToken::new();
     let vector_model_id = embedding_provider.as_ref().map(|p| {
         use pond_core::models::ports::embedding::EmbeddingProvider as _;
         p.model_id()
@@ -2394,61 +2405,30 @@ async fn run_server(
         });
     }
 
-    // ── Index adoption (phase B) ─────────────────────────────────────────────
-    // Copy vectors that ALREADY exist in the memory and context tables into the
-    // shared index. No inference: the vectors are there, the index simply does
-    // not know about them.
+    // ── Personal-context index maintenance (phases B + D) ────────────────────
+    // One pass, composed rather than three ad-hoc spawns: adopt existing vectors
+    // (free, pure SQL), embed the summaries that have none (the only step that
+    // costs inference), prune orphans, then REPORT what is still wrong.
     //
-    // Without this the index is not rebuildable, which is the one property that
-    // justifies it being a separate, deletable file. The embedding sweeps are
-    // driven by the per-store `embedding` column being NULL, so an already-
-    // embedded row never reaches the write-through again -- delete
-    // `pond_vectors.db` and those rows are absent from it forever while the
-    // store looks perfectly healthy. Found by doing exactly that on a live pond:
-    // the summaries came back and the memories did not.
-    if let (Some(provider), Some(model_id)) = (embedding_provider.clone(), vector_model_id.clone())
-    {
-        let index = vector_index.clone();
-        tokio::spawn(async move {
-            use pond_core::context::vector_index::Corpus;
-            use pond_core::models::ports::embedding::EmbeddingProvider as _;
-            let dims = provider.dimensions();
-            for corpus in [Corpus::Memory, Corpus::Context] {
-                if let Err(e) = index.backfill_from_source(corpus, &model_id, dims).await {
-                    tracing::warn!(corpus = corpus.as_str(), "index adoption failed: {e:#}");
-                }
-            }
-        });
-    }
-
-    // ── Summary indexing (phase B) ───────────────────────────────────────────
-    // Memories and context items reach the personal-context index for free --
-    // they already hold a vector when they are stored, so their write-through
-    // just mirrors it. Summaries are the exception: nothing has ever embedded
-    // `sessions.rolling_summary`, so this is the one part of phase B that costs
-    // inference, and it is a sweep rather than a write-through for that reason.
+    // Order matters and is asserted in `run_index_maintenance`: pruning before
+    // adopting would delete rows adoption is about to legitimately re-create.
     //
-    // Last of the three startup passes, and after both memory passes: a memory
-    // with no vector is invisible to search, whereas a summary that is not yet
-    // indexed is merely absent from a corpus nothing reads yet.
+    // Deferred by `index_maintenance_delay_secs` rather than run at boot: a
+    // household's first turn after an upgrade must not be slow because the pond
+    // chose that moment to index itself. It is cancellable for the same reason.
     if let (Some(provider), Some(_)) = (embedding_provider.clone(), vector_model_id.clone()) {
         let index = vector_index.clone();
         let storage = session_storage.clone();
+        let cancel = index_maintenance_cancel.clone();
         tokio::spawn(async move {
-            use pond_core::context::summary_indexing as summaries;
-            // Not wired to a cancellation source yet: this is startup, and the
-            // token exists so the idle-gated caller phase D adds can stop it
-            // mid-sweep without changing this function.
-            let cancel = tokio_util::sync::CancellationToken::new();
-            summaries::run_summary_indexing(
-                storage.as_ref(),
-                provider.as_ref(),
-                &index,
-                &cancel,
-                summaries::SUMMARY_BATCH_SIZE,
-                summaries::SUMMARY_BATCH_PAUSE_MS,
-            )
-            .await;
+            use pond_core::context::index_maintenance::run_index_maintenance;
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(
+                    INDEX_MAINTENANCE_DELAY_SECS,
+                )) => {}
+            }
+            run_index_maintenance(&index, storage.as_ref(), provider.as_ref(), &cancel).await;
         });
     }
 

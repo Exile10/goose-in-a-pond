@@ -33,6 +33,7 @@
 
 pub mod bus_ingest;
 pub mod domain;
+pub mod index_maintenance;
 pub mod ingest;
 pub mod ports;
 pub mod producer;
