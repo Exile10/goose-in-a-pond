@@ -91,9 +91,17 @@ So every conversation has a curated summary that is unreachable from any other s
 decide about the trip?" three weeks later has an answer sitting in the database with no path to it.
 Indexing them costs one embedding per refresh and no new inference.
 
-Unverified and worth checking first: the *re*-summarisation path is `ModelClass::Large`-only and its
-own field doc says "PAI-4 P2 builds it; nothing implements it yet", so confirm what actually populates
-`rolling_summary` **on the Orin** before relying on these existing there.
+**Checked 2026-08-13, and the worry was misplaced.** Two things write `sessions.rolling_summary`, and
+only one is tier-gated. `SessionSummaryService::refresh` — the incremental fold of "previous summary +
+the messages it does not cover" — **runs on every tier**, and `resummarise` (PAI-4 P2's rebuild from
+source) is the `ModelClass::Large`-only one. The idle loop that drives `refresh` is wired in
+`main.rs` with a real `LlmProvider`, so an on-device pond does produce summaries.
+
+Two caveats for phase B rather than blockers: a refresh costs a LOCAL LLM call at idle on the Orin
+(not free, though no turn waits on it), and it only fires past `summary_idle_secs` with at least
+`MIN_UNSUMMARIZED_MESSAGES` beyond the through-pointer and outside the recent tail — so a pond used in
+short bursts may hold few summaries. **The device half of 0c is still owed**: read `rolling_summary`
+out of `sessions` on the nano and confirm rows exist in practice, not just in principle.
 
 ### 1.4 No vector extension, and that is fine
 
@@ -227,7 +235,7 @@ needed. Admit mail bodies and GPS tracks and it is millions, and §1.4 stops bei
 |---|---|---|
 | **0a** | GGUF `EmbeddingProvider` that initialises on the Orin | the embedder comes up in a device run instead of warning twice |
 | **0b** | ~~`ContextItem.embedding` populated in `IngestPipeline` — **after** redaction~~ **ALREADY LANDED**, found 2026-08-13: `ingest.rs` embeds `item.embedding_text()` after `from_parts` has redacted, and `main.rs` wires `.with_embedder(embedding_provider)`. What was missing was the GUARD — `the_vector_is_computed_from_the_redacted_text` now records what the embedder was handed, because the existing redaction test would stay green if the embed moved above it | a stored item has a vector; the vector is of redacted text — **both now pinned, mutation-tested** |
-| **0c** | Confirm `rolling_summary` is produced on-device | read it out of `sessions` on the nano |
+| **0c** | Confirm `rolling_summary` is produced on-device | **code half done 2026-08-13**: `refresh` is NOT `Large`-gated (only `resummarise` is) and its idle loop is wired with a real provider, so it runs on any tier. **Device half owed**: read it out of `sessions` on the nano |
 | **A** | `pond_vectors.db`, port + adapter, `ATTACH` on `after_connect`, migrations | roundtrip; **delete the file and confirm it rebuilds** |
 | **B** | Write-through for all three corpora | a written item is searchable; a re-summarised session's vector *changes* |
 | **C** | Unified retrieval, scope in the SQL, `corpus` labelling | two profiles + a guest: three isolation tests |
