@@ -383,10 +383,32 @@ impl ContextRepository for SqliteContextRepository {
         // foreign key's ON DELETE CASCADE: `PRAGMA foreign_keys` is per
         // connection, and a cascade that silently does not happen would leave
         // orphaned personal data behind while reporting that it was deleted.
+        // Collect the ids BEFORE deleting, so their vectors can follow. An
+        // orphaned vector is harmless -- the index holds no text and the JOIN
+        // drops it -- and the maintenance sweep would prune it eventually. But a
+        // member who disconnects a source is asking for their data to be gone,
+        // and "eventually, at the next restart" is a poor answer to that.
+        let doomed: Vec<(String,)> =
+            sqlx::query_as("SELECT id FROM context_items WHERE source_id = ?")
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await
+                .unwrap_or_default();
+
         sqlx::query("DELETE FROM context_items WHERE source_id = ?")
             .bind(id)
             .execute(&self.pool)
             .await?;
+
+        if let Some(index) = &self.index {
+            for (item_id,) in &doomed {
+                if let Err(e) = index.remove(Corpus::Context, item_id).await {
+                    // Best effort: the sweep is the backstop, and failing the
+                    // disconnect would leave the member with neither.
+                    tracing::warn!(item_id = %item_id, "index cleanup on disconnect failed: {e:#}");
+                }
+            }
+        }
         sqlx::query("DELETE FROM context_sources WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
