@@ -59,7 +59,7 @@ fixed.
 | Redacted before store | **yes** — `from_parts` takes a `&dyn Redactor`, no second constructor | **no** | no |
 | Sensitivity | `PrivacySensitivity`, floor-enforced, `Secret` unreachable | **none** | none |
 | Redaction record | `findings: Vec<RedactionKind>` | — | — |
-| Vector field | `embedding: Option<Vec<f32>>` — **nothing populates it** | `embedding: Option<Vec<f32>>`, `#[serde(skip)]` | — |
+| Vector field | `embedding: Option<Vec<f32>>` — **populated by `IngestPipeline`, after redaction** (the 2026-08-12 claim that nothing populated it was stale; corrected 2026-08-13) | `embedding: Option<Vec<f32>>`, `#[serde(skip)]` | — |
 | Mutability | re-sync by `external_id` | supersede via consolidation | **overwritten in place** |
 | Deletion | source disconnect deletes items | decay/prune | with the session |
 | Consolidation | none, and it would be a bug | **already built** | n/a |
@@ -226,7 +226,7 @@ needed. Admit mail bodies and GPS tracks and it is millions, and §1.4 stops bei
 | Phase | Deliverable | Verified by |
 |---|---|---|
 | **0a** | GGUF `EmbeddingProvider` that initialises on the Orin | the embedder comes up in a device run instead of warning twice |
-| **0b** | `ContextItem.embedding` populated in `IngestPipeline` — **after** redaction | a stored item has a vector; the vector is of redacted text |
+| **0b** | ~~`ContextItem.embedding` populated in `IngestPipeline` — **after** redaction~~ **ALREADY LANDED**, found 2026-08-13: `ingest.rs` embeds `item.embedding_text()` after `from_parts` has redacted, and `main.rs` wires `.with_embedder(embedding_provider)`. What was missing was the GUARD — `the_vector_is_computed_from_the_redacted_text` now records what the embedder was handed, because the existing redaction test would stay green if the embed moved above it | a stored item has a vector; the vector is of redacted text — **both now pinned, mutation-tested** |
 | **0c** | Confirm `rolling_summary` is produced on-device | read it out of `sessions` on the nano |
 | **A** | `pond_vectors.db`, port + adapter, `ATTACH` on `after_connect`, migrations | roundtrip; **delete the file and confirm it rebuilds** |
 | **B** | Write-through for all three corpora | a written item is searchable; a re-summarised session's vector *changes* |
