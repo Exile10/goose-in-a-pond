@@ -315,28 +315,80 @@ hardcoded anywhere it cannot be checked: `dimensions()` returns the spec width, 
 model whose `n_embd` disagrees, and the spec carries the `model_id` stamp §2 requires. Fallback
 `bge-small-en-v1.5` (384) is a one-line default change **only before the first 768-dim store**.
 
-**The hazard §4/the phase table did not name, and it is a process panic, not a degrade.** llama-cpp-2
-guards backend init with a process-global flag, and Goose's own local-inference treats a second
-`LlamaBackend::init()` as `unreachable!` — it PANICS
-(`goose/crates/goose-local-inference/src/llamacpp/mod.rs`). On a device where Goose is the live
-engine, an embedder that wins the init race crashes chat. Mitigation without a goose patch: the model
-loads **lazily** on first `embed()` (during memory extraction, after a turn), so Goose always claims
-the real backend first and the embedder takes `get_or_init_backend`'s graceful
-"already-initialised → wrap" path. This is why backfill must stay idle-gated (§2): nothing may embed
-before the first turn. **Recommended hardening:** a ~4-line goose-fork patch turning that
-`unreachable!` into the same graceful wrap makes coexistence order-independent — flagged, not taken,
-because it touches the managed patch set and lazy-ordering is sufficient under the plan's own rules.
+**The hazard §4/the phase table did not name, and it is a panic — REPRODUCED ON A MAC 2026-08-13.**
+llama-cpp-2 guards backend init with a process-global flag, and Goose's own local-inference treats a
+second `LlamaBackend::init()` as `unreachable!`
+(`goose/crates/goose-local-inference/src/llamacpp/mod.rs`, the `BackendAlreadyInitialized` arm).
 
-**Verification.** Unit tests green (`resolve`, declared-dims-without-load, L2-normalise). A live embed
-on the Mac (Metal) passed: nomic loads, produces a unit-length 768-vec, and ranks related text above
-unrelated (`live_embed_produces_a_unit_vector_and_ranks_related_text_higher`, `#[ignore]`, needs
-`POND_EMBED_MODEL_DIR`). `cargo fmt` clean; `cargo test -p pond-inference` green;
-`cargo check -p pond-server -p pond-adapters-goose` green. **NOT run on the Orin** — the device was
-offline (`No route to host` on `nano.local`), so 0a's acceptance test (the embedder comes up in a
-device run instead of warning twice) is owed. This is `LANDED`, not `VERIFIED`.
+**The lazy-load mitigation this entry originally claimed was sufficient is NOT.** That claim — "the
+model loads on first `embed()`, after a chat turn, so Goose always goes first" — is false twice over.
+`main.rs` spawns a memory **backfill** as soon as the provider exists, so the first embed happens at
+STARTUP, not after a turn; and a pond whose `chat_provider` is not local at boot never initialises
+Goose's backend at all, so the embedder wins the race whatever the ordering. Reproduction:
 
-**Not yet done, and blocking the rest:** the `POND_EMBED_MODEL_DIR` live test is a Mac check, not a
-device one. Before trusting any phase below on hardware, run the embedder on the Orin (confirm nomic
-initialises there — the whole reason nomic was chosen over a heavier model) and confirm no
-init-ordering panic against Goose. Phases 0b–G (populate `ContextItem.embedding` after redaction,
-`pond_vectors.db`, write-through, retrieval, sweep) remain unstarted.
+```
+chat_provider=ollama + embedding_provider=gguf + one unembedded memory
+  -> backfill embeds at startup, embedder calls LlamaBackend::init() and WINS
+  -> switch chat_provider to local
+  -> thread 'tokio-rt-worker' panicked at goose-local-inference/src/llamacpp/mod.rs:355:17:
+     internal error: entered unreachable code: the runtime holds the only LlamaBackend
+```
+
+The process survived the panic (it is on a worker task) but the API stopped answering, and local
+inference is dead for the life of the process. **Ordering cannot fix this from the pond side** — any
+embed claims the backend, and the provider switch can happen at any time — so moving the backfill
+later would be cosmetic. **The fix is the ~4-line goose-fork patch** making that arm wrap the existing
+backend exactly as `get_or_init_backend` already does. It is now REQUIRED rather than hardening, and
+it is not taken here because it changes the managed patch set (6 -> 7) and its fork branch: Jerry's
+call.
+
+**Until that patch lands, `embedding_provider = "gguf"` is safe only on a pond already running a local
+chat model at boot** — which is the Jetson's normal configuration, and the one case where Goose is
+constructed first (verified: the log then reads `llama backend already initialised (shared with
+Goose)`).
+
+**The second hazard, and it is the one that would have shipped silently: MIXED VECTOR SPACES.**
+Introducing a second provider introduces a second WIDTH, and §5 lists this failure mode with a
+`model_id` column as its guard — a column that belongs to a later phase and does not exist. What a
+384/768 pond actually did, before this change: **nothing panicked, nothing warned, and every
+comparison returned exactly `0.0`**, because every similarity function guards `a.len() != b.len()`
+and returns 0.0 — a *valid score*, not an error. The consequences compounded:
+
+* `sqlite_memory :: search_similar` has **no `ORDER BY`** and checks `rows.is_empty()` *before*
+  scoring, so a full page of incomparable rows suppressed the recency fallback and was returned
+  ranked as if judged — an arbitrary subset presented as relevance.
+* `recall_memories` / `search_context` gate their keyword fallback on non-emptiness, so it never fired.
+* `topical_memories` yielded `Some(0.0)` rather than `None`, quietly reverting prompt-time injection
+  to importance+recency.
+* Semantic dedup (threshold 0.92) silently stopped deduplicating.
+* `run_backfill` selects `embedding IS NULL`, so a stale-width vector is **never** re-embedded: the
+  degradation is permanent.
+
+Fixed here by filtering incomparable vectors out of the **candidate set** in both adapters (which
+makes the existing `is_empty()` fallbacks correct for free) and mapping them to `None` in
+`topical_memories`. Both guards were **mutation-tested**: the first versions passed with the fix
+removed and were rewritten until they failed. The re-embed path and the `model_id` column remain owed.
+
+**And the fallback model I had documented was itself the trap.** The original entry named
+`bge-small-en-v1.5` (384) as the one-line fallback — the same width fastembed emits. Since the width
+is the *only* discriminator available, that would have put two genuinely different spaces at one width
+where nothing could tell them apart: strictly worse than the mismatch being guarded. The fallback is
+now `bge-base-en-v1.5` (**768**), and `no_gguf_model_shares_a_width_with_the_fastembed_provider`
+fails the build if any GGUF model is ever added at 384.
+
+**Verification.** `cargo fmt` clean; `cargo test -p pond-core -p pond-infra -p pond-inference` green
+(1235 + 308 + module tests); `cargo check -p pond-server -p pond-adapters-goose` green; 326 frontend
+tests green. A live embed on the Mac (Metal) passes. **And a real pond-server run on the Mac**: with
+`embedding_provider = "gguf"` the server downloads the model, reports
+`GGUF embedding provider ready dims=768`, and the startup backfill embedded a seeded row at **768
+dims** — the first time this pond has produced a real semantic vector through the live server.
+
+**NOT run on the Orin** — the device was offline (`No route to host` on `nano.local`). This is
+`LANDED`, not `VERIFIED`.
+
+**Owed, in priority order.** (1) The goose-fork backend patch above — without it `gguf` is only safe
+on a local-at-boot pond. (2) A re-embed path for stale-width vectors (`search_stale_dimension`), since
+backfill cannot see them. (3) `embed_query`: nomic wants `search_query: ` on the query side and
+currently gets `search_document: `, a bounded ranking-quality loss on the three query call sites
+(`topical_memories`, `search_context`, `recall_memories`). (4) `cargo test -p pond-inference` is in no
+CI job, so none of this module's tests run there. (5) The Orin run. Phases 0b–G remain unstarted.

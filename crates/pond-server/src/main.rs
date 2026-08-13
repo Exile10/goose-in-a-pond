@@ -2199,7 +2199,6 @@ async fn run_server(
             }
             #[cfg(feature = "local-inference")]
             "gguf" => {
-                use pond_core::models::ports::model_downloader::ModelDownloader as _;
                 let embedding_dir = data_dir.join("models").join("embedding");
                 // `active_embedding_model` is shared with the fastembed path, so a
                 // stale fastembed name (or a typo) must NOT silently disable
@@ -2220,37 +2219,50 @@ async fn run_server(
                     }
                     tracing::info!(
                         model_id = %spec.model_id,
-                        "fetching GGUF embedding model (one-time, egress-gated)"
+                        size_mb = spec.size_hint_mb,
+                        "fetching GGUF embedding model in the background (one-time, egress-gated)"
                     );
+                    // Deliberately NOT awaited. This is a ~146 MB fetch, and awaiting it
+                    // here means the server does not bind its port until it finishes --
+                    // measured on a Mac: /health refused the connection for the whole
+                    // download. On a Jetson behind a slow link that is minutes of a pond
+                    // that looks dead, and with no timeout a hung mirror never starts at
+                    // all. The provider below loads LAZILY, so it tolerates the file
+                    // arriving later; the first embed before it lands reports a clear
+                    // error and retrieval falls back to keyword until then.
+                    //
                     // `HttpModelDownloader` -> `model_download::download_file`, which
-                    // calls `egress::begin` — so this fetch is gated by network_mode.
-                    let downloader = crate::http_model_downloader::HttpModelDownloader::new();
-                    if let Err(e) = downloader
-                        .download(&spec.download_url, &dest, spec.size_hint_mb)
-                        .await
-                    {
-                        tracing::warn!("GGUF embedding model download failed: {e:#}");
-                    }
+                    // calls `egress::begin` -- so this fetch is gated by network_mode.
+                    let url = spec.download_url.clone();
+                    let size_hint = spec.size_hint_mb;
+                    let model_id = spec.model_id.clone();
+                    let dest_bg = dest.clone();
+                    tokio::spawn(async move {
+                        use pond_core::models::ports::model_downloader::ModelDownloader as _;
+                        let downloader = crate::http_model_downloader::HttpModelDownloader::new();
+                        match downloader.download(&url, &dest_bg, size_hint).await {
+                            Ok(()) => tracing::info!(
+                                model_id = %model_id,
+                                "GGUF embedding model downloaded; it loads on the next embed"
+                            ),
+                            Err(e) => tracing::warn!(
+                                model_id = %model_id,
+                                "GGUF embedding model download failed: {e:#} -- retrieval \
+                                 falls back to keyword until it succeeds"
+                            ),
+                        }
+                    });
                 }
-                if dest.exists() {
-                    let provider = pond_inference::GgufEmbeddingProvider::new(spec, &embedding_dir);
-                    tracing::info!(
-                        model_id = provider.model_id(),
-                        dims = provider.dimensions(),
-                        "GGUF embedding provider ready (loads lazily on first embed)"
-                    );
-                    Some(Arc::new(provider)
-                        as Arc<
-                            dyn pond_core::models::ports::embedding::EmbeddingProvider
-                                + Send
-                                + Sync,
-                        >)
-                } else {
-                    tracing::warn!(
-                        "GGUF embedding model absent after fetch — retrieval falls back to keyword"
-                    );
-                    None
-                }
+                let provider = pond_inference::GgufEmbeddingProvider::new(spec, &embedding_dir);
+                tracing::info!(
+                    model_id = provider.model_id(),
+                    dims = provider.dimensions(),
+                    "GGUF embedding provider ready (loads lazily on first embed)"
+                );
+                Some(Arc::new(provider)
+                    as Arc<
+                        dyn pond_core::models::ports::embedding::EmbeddingProvider + Send + Sync,
+                    >)
             }
             #[cfg(not(feature = "local-inference"))]
             "gguf" => {
