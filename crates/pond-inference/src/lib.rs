@@ -38,6 +38,7 @@
 //! # }
 //! ```
 
+pub mod embedding;
 mod engine;
 pub mod kv_cache;
 mod memory;
@@ -45,4 +46,5 @@ mod provider;
 mod sampling;
 mod tool_calling;
 
+pub use embedding::{EmbeddingModelSpec, GgufEmbeddingProvider};
 pub use engine::LlamaCppEngine;

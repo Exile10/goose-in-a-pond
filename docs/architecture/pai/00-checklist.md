@@ -1656,3 +1656,29 @@ will ever run their assertions.**
 - **PAI-4 P7b** — a session crossing 75% should show the note in the hub chat. Expect the "Compact
   now" control to answer `cooling_down`; per the finding above that is the current behaviour, so a
   refusal is a CONFIRMATION of the defect, not a failure of the live run.
+
+**2026-08-13 — personal-context blocker 0a: GGUF embedder landed, Mac-verified, Orin owed.**
+
+Not a PAI phase of its own; it belongs to the [personal-context index](../personal-context-index.md),
+which spans PAI-3/4/8. Recorded here because it fixes a live defect the checklist's own
+verification story exists to catch: `embedding_provider = "fastembed"` shipped as the default and its
+ONNX Runtime does not initialise on the Orin, so "semantic memory injection" (recorded landed under
+PAI-3 Phase A) fell back to keyword on the hardware GIAP ships to — green everywhere, inert on the
+device. A GGUF `EmbeddingProvider` over the llama.cpp this pond already runs replaces it
+(`pond_inference::embedding`, selected by `embedding_provider = "gguf"`).
+
+Run against 2.2: it puts **no** secret on `Settings` (the model is a file path, not a key); the
+one-time model download is egress-gated (`HttpModelDownloader` → `egress::begin`); it does **not**
+move the KV prefix or block a turn on an LLM call (embedding is a separate CPU forward pass, default
+`n_gpu_layers = 0`, off the chat model's GPU); it adds no preamble tokens (retrieval is a tool/query
+surface, not a prompt block). The one interdependency it turned up is new and sharp: **Goose's
+local-inference `unreachable!`s on an already-initialised llama backend**, so a co-resident embedder
+that wins the init race PANICS the live path. Handled by lazy model load (Goose claims the backend
+first, on the first turn; the embedder wraps), which is why backfill must stay idle-gated.
+
+**Verified on the Mac, NOT the Orin** — the device was offline. Per the vocabulary, this is
+`LANDED`, not `VERIFIED`: the acceptance test (the embedder comes up in a device run instead of
+warning twice) has not been run. Owed: that Orin run — which is also the confirmation that nomic
+initialises there (the reason it was chosen) and that lazy-ordering alone avoids the panic. Consider
+the ~4-line goose-fork patch (that `unreachable!` → graceful wrap) if the Orin shows any ordering
+fragility; flagged in the index §7, not taken.

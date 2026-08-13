@@ -1,6 +1,7 @@
 # Personal-context index — design and handoff
 
-**Status: DESIGNED, nothing landed. Written 2026-08-12.**
+**Status: DESIGNED 2026-08-12. Blocker 0a IMPLEMENTED + Mac-verified 2026-08-13; Orin run
+pending (device was offline). See §7.**
 
 A single semantic retrieval surface over the three things this pond knows about a household —
 extracted **memories**, ingested **context items**, and conversation **summaries** — so the agent can
@@ -176,8 +177,16 @@ Taken deliberately, with the reason. Changing one is allowed; changing it silent
 
 ### Open decisions
 
-1. **Embedding dimension — a one-way door.** Changing it invalidates every stored vector. Depends on
-   which GGUF embedding models actually initialise on the Orin, so decide it *with* blocker 0a.
+1. **Embedding dimension — a one-way door. RESOLVED 2026-08-13: 768, via
+   `nomic-embed-text-v1.5` (mean-pooled).** Retrieval-tuned, among the best-supported embedding
+   GGUFs in llama.cpp (so most likely to init on the Orin — the real gate), and its task prefixes fit
+   the query-vs-memory asymmetry. At household scale 768-dim brute-force cosine is still sub-ms. The
+   code derives nothing from a hardcoded dimension it cannot check: `dimensions()` returns the spec's
+   declared width, `load_sync` refuses the model if `n_embd` disagrees, and every vector will carry
+   `model_id = "nomic-embed-text-v1.5"`. The declared fallback is `bge-small-en-v1.5` (384, CLS) —
+   swapping the default to it is one line **only while no 768-dim vectors have been stored**, which is
+   the whole meaning of "one-way door". Confirm nomic loads on the Orin before the first store; if it
+   does not, switch the default then, not after. (`pond_inference::EmbeddingModelSpec`.)
 2. **Mail: subjects only, or bodies too?** Recommendation is subjects + sender + date. Bodies change
    the volume and the exposure enough to be their own phase.
 3. **Does a Guest see shared household memories?** `profile_id: None` is household-visible by the
@@ -283,3 +292,51 @@ Three parts, and they should not all land:
 **The real fix for the leak is not a prohibition.** Reword the nudge in the goose fork patch so it is
 quotable: "Have you fully answered what was asked? If not, keep working." A model that echoes *that*
 produces a sentence a user can read. Two lines, and robust where an instruction is not.
+
+---
+
+## 7. Progress log
+
+### 2026-08-13 — Blocker 0a: GGUF `EmbeddingProvider` implemented and Mac-verified. Orin run owed.
+
+**What landed** (`crates/pond-inference/src/embedding.rs`, wired in `pond-server/src/main.rs`):
+`GgufEmbeddingProvider` implements the `EmbeddingProvider` port over llama.cpp
+(`llama-cpp-2 =0.1.146`, whose embeddings API — `with_embeddings`, `with_pooling_type`,
+`embeddings_seq_ith`, `n_embd` — is present at that pin). It lives in `pond-inference` because that
+crate already owns the goose-coexisting backend singleton, the model loader and the exact
+metal/cuda feature wiring, and depends on `pond-core`. Selected by `embedding_provider = "gguf"`,
+which the default build reaches because `local-inference` now pulls `pond-inference` (no new native
+compile — llama.cpp is already built by `goose-agent` and `local-inference`). The model is fetched
+once through `HttpModelDownloader` → `model_download::download_file`, which calls `egress::begin`, so
+the download is `network_mode`-gated (invariant 4).
+
+**Dimension decided: 768, `nomic-embed-text-v1.5`, mean-pooled.** See §2 open-decision 1. Not
+hardcoded anywhere it cannot be checked: `dimensions()` returns the spec width, `load_sync` refuses a
+model whose `n_embd` disagrees, and the spec carries the `model_id` stamp §2 requires. Fallback
+`bge-small-en-v1.5` (384) is a one-line default change **only before the first 768-dim store**.
+
+**The hazard §4/the phase table did not name, and it is a process panic, not a degrade.** llama-cpp-2
+guards backend init with a process-global flag, and Goose's own local-inference treats a second
+`LlamaBackend::init()` as `unreachable!` — it PANICS
+(`goose/crates/goose-local-inference/src/llamacpp/mod.rs`). On a device where Goose is the live
+engine, an embedder that wins the init race crashes chat. Mitigation without a goose patch: the model
+loads **lazily** on first `embed()` (during memory extraction, after a turn), so Goose always claims
+the real backend first and the embedder takes `get_or_init_backend`'s graceful
+"already-initialised → wrap" path. This is why backfill must stay idle-gated (§2): nothing may embed
+before the first turn. **Recommended hardening:** a ~4-line goose-fork patch turning that
+`unreachable!` into the same graceful wrap makes coexistence order-independent — flagged, not taken,
+because it touches the managed patch set and lazy-ordering is sufficient under the plan's own rules.
+
+**Verification.** Unit tests green (`resolve`, declared-dims-without-load, L2-normalise). A live embed
+on the Mac (Metal) passed: nomic loads, produces a unit-length 768-vec, and ranks related text above
+unrelated (`live_embed_produces_a_unit_vector_and_ranks_related_text_higher`, `#[ignore]`, needs
+`POND_EMBED_MODEL_DIR`). `cargo fmt` clean; `cargo test -p pond-inference` green;
+`cargo check -p pond-server -p pond-adapters-goose` green. **NOT run on the Orin** — the device was
+offline (`No route to host` on `nano.local`), so 0a's acceptance test (the embedder comes up in a
+device run instead of warning twice) is owed. This is `LANDED`, not `VERIFIED`.
+
+**Not yet done, and blocking the rest:** the `POND_EMBED_MODEL_DIR` live test is a Mac check, not a
+device one. Before trusting any phase below on hardware, run the embedder on the Orin (confirm nomic
+initialises there — the whole reason nomic was chosen over a heavier model) and confirm no
+init-ordering panic against Goose. Phases 0b–G (populate `ContextItem.embedding` after redaction,
+`pond_vectors.db`, write-through, retrieval, sweep) remain unstarted.
