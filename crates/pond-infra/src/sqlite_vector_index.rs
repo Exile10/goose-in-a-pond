@@ -26,7 +26,9 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
-use pond_core::context::vector_index::{Corpus, IndexHealth, VectorEntry, VectorHit, VectorIndex};
+use pond_core::context::vector_index::{
+    Corpus, IndexHealth, ResolvedHit, VectorEntry, VectorHit, VectorIndex,
+};
 use pond_core::user_data::domain::profile::ProfileScope;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Executor, Pool, Sqlite};
@@ -137,6 +139,26 @@ fn scope_sql(corpus: Corpus, scope: &ProfileScope) -> (String, Option<String>) {
         (Corpus::Summary, ProfileScope::Owner(id)) => {
             ("AND s.profile_id = ?".into(), Some(id.clone()))
         }
+    }
+}
+
+/// The SQL expression yielding a corpus's live text.
+///
+/// Read back through the JOIN rather than stored in the index: the index holds
+/// no text on purpose (an orphan carrying a snippet would be deleted data that
+/// survived a deletion promise), so this is where the words come from.
+///
+/// Context mirrors `ContextItem::embedding_text` — title and body joined — so
+/// what a caller reads is what was embedded.
+fn text_sql(corpus: Corpus) -> &'static str {
+    match corpus {
+        Corpus::Memory => "s.content",
+        Corpus::Context => {
+            "CASE WHEN s.title = '' THEN s.body \
+                            WHEN s.body = '' THEN s.title \
+                            ELSE s.title || char(10) || s.body END"
+        }
+        Corpus::Summary => "s.rolling_summary",
     }
 }
 
@@ -294,6 +316,58 @@ impl VectorIndex for SqliteVectorIndex {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 // Stable tie-break, so equal scores do not reorder between runs
                 // and a test can assert on the result.
+                .then_with(|| a.row_id.cmp(&b.row_id))
+        });
+        scored.truncate(limit);
+        Ok(scored)
+    }
+
+    async fn search_resolved(
+        &self,
+        query: &[f32],
+        model_id: &str,
+        scope: &ProfileScope,
+        limit: usize,
+    ) -> Result<Vec<ResolvedHit>> {
+        if query.is_empty() || limit == 0 || scope.excludes_everything() {
+            return Ok(vec![]);
+        }
+        let mut scored: Vec<ResolvedHit> = Vec::new();
+        for corpus in Corpus::ALL {
+            let (table, id_col) = source_table(corpus);
+            let (scope_pred, bind) = scope_sql(corpus, scope);
+            let live = liveness_sql(corpus);
+            let text = text_sql(corpus);
+            let sql = format!(
+                "SELECT v.row_id, v.vector, {text} FROM vectors v \
+                 JOIN {table} s ON s.{id_col} = v.row_id \
+                 WHERE v.corpus = ? AND v.model_id = ? {scope_pred} {live}"
+            );
+            let mut q = sqlx::query_as::<_, (String, Vec<u8>, String)>(&sql)
+                .bind(corpus.as_str())
+                .bind(model_id);
+            if let Some(b) = bind {
+                q = q.bind(b);
+            }
+            for (row_id, blob, text) in q.fetch_all(&self.pool).await? {
+                if let Some(score) = cosine(query, &blob_to_vec(&blob)) {
+                    scored.push(ResolvedHit {
+                        corpus,
+                        row_id,
+                        score,
+                        text,
+                    });
+                }
+            }
+        }
+        // Score first; then the corpus order, which IS the "memory wins ties"
+        // policy (see `Corpus`); then the id, so equal rows never reorder
+        // between runs and a test can assert on the result.
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.corpus.cmp(&b.corpus))
                 .then_with(|| a.row_id.cmp(&b.row_id))
         });
         scored.truncate(limit);
@@ -922,6 +996,90 @@ mod write_through_tests {
             .await
             .unwrap();
         assert_eq!(todo, vec!["owned".to_string()]);
+    }
+
+    /// `search_resolved` must return the LIVE text of each hit, per corpus, and
+    /// must obey exactly the same scope and liveness rules as `search`.
+    ///
+    /// This is what phase C's retrieval service consumes, so a divergence
+    /// between the two queries would mean the thing users actually hit behaves
+    /// differently from the thing the isolation tests cover.
+    #[tokio::test]
+    async fn resolved_search_returns_live_text_and_obeys_the_same_rules() {
+        let tmp = TempDir::new().unwrap();
+        let db = crate::db::Database::init(tmp.path()).await.unwrap();
+        let index: Arc<dyn VectorIndex> = Arc::new(SqliteVectorIndex::new(db.vectors.clone()));
+
+        add_memory_with_vector(&db.system, "m1", &[1.0, 0.0]).await;
+        sqlx::query(
+            "UPDATE memory_fragments SET content = 'the bill is eighty pounds' WHERE id='m1'",
+        )
+        .execute(&db.system)
+        .await
+        .unwrap();
+        add_memory_with_vector(&db.system, "gone", &[1.0, 0.0]).await;
+        index
+            .backfill_from_source(Corpus::Memory, "m", 2)
+            .await
+            .unwrap();
+
+        // A summary, which resolves from a different column entirely.
+        add_session(
+            &db.system,
+            "s1",
+            Some("we discussed the garden"),
+            "2026-08-13 10:00:00",
+        )
+        .await;
+        index
+            .upsert(&VectorEntry {
+                corpus: Corpus::Summary,
+                row_id: "s1".into(),
+                model_id: "m".into(),
+                vector: vec![1.0, 0.0],
+                source_rev: Some("2026-08-13 10:00:00".into()),
+            })
+            .await
+            .unwrap();
+
+        // Archive one: it must vanish from the resolved search too.
+        sqlx::query("UPDATE memory_fragments SET lifecycle='archived' WHERE id='gone'")
+            .execute(&db.system)
+            .await
+            .unwrap();
+
+        let hits = index
+            .search_resolved(&[1.0, 0.0], "m", &ProfileScope::Household, 10)
+            .await
+            .unwrap();
+        let texts: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
+        assert!(
+            texts.contains(&"the bill is eighty pounds"),
+            "memory text was not resolved: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"we discussed the garden"),
+            "summary text was not resolved: {texts:?}"
+        );
+        assert!(
+            !hits.iter().any(|h| h.row_id == "gone"),
+            "an archived memory came back from the resolved search"
+        );
+
+        // Equal scores: the memory must come first. This is "memory wins ties",
+        // and it is the enum's declaration order doing the work.
+        assert_eq!(
+            hits[0].corpus,
+            Corpus::Memory,
+            "a summary outranked a memory on a tie"
+        );
+
+        // And a guest still gets nothing through this path.
+        assert!(index
+            .search_resolved(&[1.0, 0.0], "m", &ProfileScope::Guest, 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// Phase C's stated acceptance: two profiles and a guest, across corpora.
