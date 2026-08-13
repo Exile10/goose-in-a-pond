@@ -10,7 +10,7 @@ use llama_cpp_2::model::{LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::LogOptions;
 use pond_core::models::domain::model_capabilities::ModelCapabilities;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
+use std::sync::{Arc, Once, OnceLock, RwLock as StdRwLock};
 use tokio::sync::Mutex;
 
 /// A model loaded into memory with its chat template and capabilities.
@@ -54,49 +54,69 @@ pub(crate) struct CachedInferenceContext {
 unsafe impl Send for CachedInferenceContext {}
 unsafe impl Sync for CachedInferenceContext {}
 
-/// Global weak reference to the shared backend. Only a `Weak` is stored --
-/// strong `Arc`s live in `LlamaCppEngine` instances. When all strong refs
-/// drop (normal shutdown), the backend is deallocated and freed. The `Weak`
-/// left behind is inert, avoiding ggml statics races during `__cxa_finalize`.
-static BACKEND: StdMutex<Weak<LlamaBackend>> = StdMutex::new(Weak::new());
+/// The process's shared backend handle.
+///
+/// A STRONG `Arc` is held here for the life of the process, on purpose: see
+/// [`get_or_init_backend`] for why nothing in GIAP may ever drop a
+/// `LlamaBackend`. This replaced a `Weak`, whose whole point was to let the last
+/// engine free the backend -- exactly the behaviour that is now forbidden.
+static BACKEND: OnceLock<Arc<LlamaBackend>> = OnceLock::new();
 
-/// Obtain or initialise the global `LlamaBackend` singleton.
+/// Set the llama.cpp log bridge exactly once, no matter how many callers race.
+static LOG_BRIDGE: Once = Once::new();
+
+/// Obtain the process-wide llama.cpp backend, **without ever entering
+/// `LlamaBackend::init`'s global compare-and-swap.**
 ///
-/// Thread-safe: the init check and `LlamaBackend::init()` both execute
-/// inside the same mutex guard so there is no window for a race.
+/// # Why this does not call `LlamaBackend::init()`
 ///
-/// Returns `Err` if the backend was already initialised by another crate
-/// (e.g. Goose's InferenceRuntime) in the same process. The caller should
-/// fall back to a different provider (Ollama) in that case.
+/// `llama-cpp-2` tracks initialisation in a process-global `AtomicBool`
+/// (`LLAMA_BACKEND_INITIALIZED`), and `init()` is a CAS on it: the first caller
+/// in the process wins and every later one gets `BackendAlreadyInitialized`.
+/// Cargo unifies `llama-cpp-2 =0.1.146` into ONE crate shared with Goose, so that
+/// static is shared too -- and Goose treats losing that CAS as `unreachable!`,
+/// which PANICS (`goose-local-inference/src/llamacpp/mod.rs`). Its comment says
+/// "the runtime holds the only LlamaBackend for the life of the process": true of
+/// Goose with respect to itself, false in a process that also contains us.
+///
+/// Reproduced on a Mac 2026-08-13: an `ollama` pond embeds at startup, GIAP won
+/// the CAS, and the first local chat model afterwards panicked a tokio worker.
+///
+/// So GIAP does not compete for the flag at all. It initialises the C backend
+/// directly -- `llama_backend_init()` is idempotent, which this crate already
+/// relied on -- and constructs the proof-of-initialisation token itself.
+/// `LlamaBackend` is a field-less public struct, so that construction is safe and
+/// needs no `mem::zeroed()`. **The flag is therefore only ever set by Goose, whose
+/// CAS now always succeeds and whose `unreachable!` is genuinely unreachable.**
+/// This does not fight Goose's invariant; it restores it.
+///
+/// # Why the handle is never dropped
+///
+/// `impl Drop for LlamaBackend` resets that global flag AND calls
+/// `llama_backend_free()`. In a process with two consumers, whoever drops first
+/// frees the backend under the other and un-sets a flag it does not own; the
+/// second dropper then hits `unreachable!` inside a destructor. The only sound
+/// rule once the backend is shared is **initialise once, never free** -- so the
+/// `OnceLock` above holds a strong reference for the life of the process and the
+/// `Drop` never runs. Freeing at exit buys nothing (the OS reclaims) and the
+/// previous code already went out of its way to avoid ggml teardown races.
 pub(crate) fn get_or_init_backend() -> Result<Arc<LlamaBackend>> {
-    let mut guard = BACKEND.lock().expect("backend lock poisoned");
-    if let Some(backend) = guard.upgrade() {
-        return Ok(backend);
-    }
-    match LlamaBackend::init() {
-        Ok(backend) => {
-            llama_cpp_2::send_logs_to_tracing(LogOptions::default());
-            let arc = Arc::new(backend);
-            *guard = Arc::downgrade(&arc);
-            Ok(arc)
-        }
-        Err(_) => {
-            // Backend already initialized by another crate (e.g. Goose's LocalInferenceProvider).
-            // This is fine — the underlying llama_backend_init() is idempotent at the C level.
-            // We create a LlamaBackend struct by transmuting an empty struct — the Drop impl
-            // calls llama_backend_free() which is also safe to call multiple times.
+    Ok(BACKEND
+        .get_or_init(|| {
+            // SAFETY: `llama_backend_init` is the documented entry point and is
+            // idempotent -- Goose may also call it via `LlamaBackend::init()`.
+            // It touches only ggml's process-global setup, no GIAP state.
+            unsafe { llama_cpp_sys_2::llama_backend_init() };
+            LOG_BRIDGE.call_once(|| llama_cpp_2::send_logs_to_tracing(LogOptions::default()));
             tracing::info!(
-                "llama backend already initialised (shared with Goose) — creating wrapper"
+                "llama backend ready (initialised directly; the llama-cpp-2 init flag is \
+                 left to Goose so its runtime can never lose the race)"
             );
-            // SAFETY: LlamaBackend is a zero-sized struct. The C backend is already initialized.
-            // Creating this wrapper just gives us lifetime tracking. The llama_backend_free()
-            // called on Drop is a no-op when called after the first free.
-            let backend: LlamaBackend = unsafe { std::mem::zeroed() };
-            let arc = Arc::new(backend);
-            *guard = Arc::downgrade(&arc);
-            Ok(arc)
-        }
-    }
+            // Safe: `LlamaBackend` is a public field-less struct. It is only a
+            // token asserting the backend is up, which the call above guarantees.
+            Arc::new(LlamaBackend {})
+        })
+        .clone())
 }
 
 /// In-process GGUF inference engine.

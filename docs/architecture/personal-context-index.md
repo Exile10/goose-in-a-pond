@@ -1,6 +1,7 @@
 # Personal-context index — design and handoff
 
-**Status: DESIGNED, nothing landed. Written 2026-08-12.**
+**Status: DESIGNED 2026-08-12. Blocker 0a IMPLEMENTED, Mac-verified, and MODEL-VERIFIED ON THE ORIN
+2026-08-13. 0b and 0c done. Phases A–G unstarted. See §7.**
 
 A single semantic retrieval surface over the three things this pond knows about a household —
 extracted **memories**, ingested **context items**, and conversation **summaries** — so the agent can
@@ -58,7 +59,7 @@ fixed.
 | Redacted before store | **yes** — `from_parts` takes a `&dyn Redactor`, no second constructor | **no** | no |
 | Sensitivity | `PrivacySensitivity`, floor-enforced, `Secret` unreachable | **none** | none |
 | Redaction record | `findings: Vec<RedactionKind>` | — | — |
-| Vector field | `embedding: Option<Vec<f32>>` — **nothing populates it** | `embedding: Option<Vec<f32>>`, `#[serde(skip)]` | — |
+| Vector field | `embedding: Option<Vec<f32>>` — **populated by `IngestPipeline`, after redaction** (the 2026-08-12 claim that nothing populated it was stale; corrected 2026-08-13) | `embedding: Option<Vec<f32>>`, `#[serde(skip)]` | — |
 | Mutability | re-sync by `external_id` | supersede via consolidation | **overwritten in place** |
 | Deletion | source disconnect deletes items | decay/prune | with the session |
 | Consolidation | none, and it would be a bug | **already built** | n/a |
@@ -86,13 +87,32 @@ fighting the connector forever. Context is a mirror; memory is a workspace.
 path that is cancelled by a new turn and that no turn waits on. Used for exactly one thing today:
 splicing into **that same session's** history for compaction.
 
-So every conversation has a curated summary that is unreachable from any other session. "What did we
-decide about the trip?" three weeks later has an answer sitting in the database with no path to it.
-Indexing them costs one embedding per refresh and no new inference.
+The design premise here was "every conversation has a curated summary that is unreachable from any
+other session", so indexing them is nearly free value. **Measured on the Orin 2026-08-13, that premise
+is false on real usage**: 636 sessions, 2 153 messages, and **exactly ONE rolling summary**.
 
-Unverified and worth checking first: the *re*-summarisation path is `ModelClass::Large`-only and its
-own field doc says "PAI-4 P2 builds it; nothing implements it yet", so confirm what actually populates
-`rolling_summary` **on the Orin** before relying on these existing there.
+It is not a bug. `refresh` needs `len - KEEP_RECENT_MESSAGES(6) >= MIN_UNSUMMARIZED_MESSAGES(4)`, so a
+session needs **10+ messages** before it can ever produce one — and this pond's usage is short bursts:
+380 sessions of exactly 2 messages, only 32 sessions at 10 or more. So **604 of 636 sessions are
+structurally incapable of ever having a summary**, and of the 32 that could, one does.
+
+Consequence for the phases below, and it is a reprioritisation rather than a blocker: the summary
+corpus is a rounding error next to memories and context items. Phase B should still write summaries
+through (it costs one embedding on a refresh that already happened), but **C and G must not be
+designed assuming summaries carry retrieval weight on a real device** — on this one they would
+contribute a single row.
+
+**Checked 2026-08-13, and the worry was misplaced.** Two things write `sessions.rolling_summary`, and
+only one is tier-gated. `SessionSummaryService::refresh` — the incremental fold of "previous summary +
+the messages it does not cover" — **runs on every tier**, and `resummarise` (PAI-4 P2's rebuild from
+source) is the `ModelClass::Large`-only one. The idle loop that drives `refresh` is wired in
+`main.rs` with a real `LlmProvider`, so an on-device pond does produce summaries.
+
+Two caveats for phase B rather than blockers: a refresh costs a LOCAL LLM call at idle on the Orin
+(not free, though no turn waits on it), and it only fires past `summary_idle_secs` with at least
+`MIN_UNSUMMARIZED_MESSAGES` beyond the through-pointer and outside the recent tail — so a pond used in
+short bursts may hold few summaries. **The device half of 0c is still owed**: read `rolling_summary`
+out of `sessions` on the nano and confirm rows exist in practice, not just in principle.
 
 ### 1.4 No vector extension, and that is fine
 
@@ -176,8 +196,16 @@ Taken deliberately, with the reason. Changing one is allowed; changing it silent
 
 ### Open decisions
 
-1. **Embedding dimension — a one-way door.** Changing it invalidates every stored vector. Depends on
-   which GGUF embedding models actually initialise on the Orin, so decide it *with* blocker 0a.
+1. **Embedding dimension — a one-way door. RESOLVED 2026-08-13: 768, via
+   `nomic-embed-text-v1.5` (mean-pooled).** Retrieval-tuned, among the best-supported embedding
+   GGUFs in llama.cpp (so most likely to init on the Orin — the real gate), and its task prefixes fit
+   the query-vs-memory asymmetry. At household scale 768-dim brute-force cosine is still sub-ms. The
+   code derives nothing from a hardcoded dimension it cannot check: `dimensions()` returns the spec's
+   declared width, `load_sync` refuses the model if `n_embd` disagrees, and every vector will carry
+   `model_id = "nomic-embed-text-v1.5"`. The declared fallback is `bge-small-en-v1.5` (384, CLS) —
+   swapping the default to it is one line **only while no 768-dim vectors have been stored**, which is
+   the whole meaning of "one-way door". Confirm nomic loads on the Orin before the first store; if it
+   does not, switch the default then, not after. (`pond_inference::EmbeddingModelSpec`.)
 2. **Mail: subjects only, or bodies too?** Recommendation is subjects + sender + date. Bodies change
    the volume and the exposure enough to be their own phase.
 3. **Does a Guest see shared household memories?** `profile_id: None` is household-visible by the
@@ -216,9 +244,9 @@ needed. Admit mail bodies and GPS tracks and it is millions, and §1.4 stops bei
 
 | Phase | Deliverable | Verified by |
 |---|---|---|
-| **0a** | GGUF `EmbeddingProvider` that initialises on the Orin | the embedder comes up in a device run instead of warning twice |
-| **0b** | `ContextItem.embedding` populated in `IngestPipeline` — **after** redaction | a stored item has a vector; the vector is of redacted text |
-| **0c** | Confirm `rolling_summary` is produced on-device | read it out of `sessions` on the nano |
+| **0a** | GGUF `EmbeddingProvider` that initialises on the Orin | **MODEL VERIFIED ON THE ORIN 2026-08-13**: `nomic-embed-text-v1.5.Q8_0` loads under the device's own CUDA llama.cpp (aarch64, `ARCHS = 870`), mean-pools, returns **768** dims, exit 0, in **0.51 s wall-clock including cold process start and model load**. The risk that killed fastembed is closed. Still owed: the same through a deployed GIAP binary with `embedding_provider = "gguf"` |
+| **0b** | ~~`ContextItem.embedding` populated in `IngestPipeline` — **after** redaction~~ **ALREADY LANDED**, found 2026-08-13: `ingest.rs` embeds `item.embedding_text()` after `from_parts` has redacted, and `main.rs` wires `.with_embedder(embedding_provider)`. What was missing was the GUARD — `the_vector_is_computed_from_the_redacted_text` now records what the embedder was handed, because the existing redaction test would stay green if the embed moved above it | a stored item has a vector; the vector is of redacted text — **both now pinned, mutation-tested** |
+| **0c** | Confirm `rolling_summary` is produced on-device | **code half done 2026-08-13**: `refresh` is NOT `Large`-gated (only `resummarise` is) and its idle loop is wired with a real provider, so it runs on any tier. **Device half DONE 2026-08-13**: 1 summary across 636 sessions — the mechanism works and the corpus is nearly empty; see 1.3 |
 | **A** | `pond_vectors.db`, port + adapter, `ATTACH` on `after_connect`, migrations | roundtrip; **delete the file and confirm it rebuilds** |
 | **B** | Write-through for all three corpora | a written item is searchable; a re-summarised session's vector *changes* |
 | **C** | Unified retrieval, scope in the SQL, `corpus` labelling | two profiles + a guest: three isolation tests |
@@ -283,3 +311,128 @@ Three parts, and they should not all land:
 **The real fix for the leak is not a prohibition.** Reword the nudge in the goose fork patch so it is
 quotable: "Have you fully answered what was asked? If not, keep working." A model that echoes *that*
 produces a sentence a user can read. Two lines, and robust where an instruction is not.
+
+---
+
+## 7. Progress log
+
+### 2026-08-13 — Blocker 0a: GGUF `EmbeddingProvider` implemented and Mac-verified. Orin run owed.
+
+**What landed** (`crates/pond-inference/src/embedding.rs`, wired in `pond-server/src/main.rs`):
+`GgufEmbeddingProvider` implements the `EmbeddingProvider` port over llama.cpp
+(`llama-cpp-2 =0.1.146`, whose embeddings API — `with_embeddings`, `with_pooling_type`,
+`embeddings_seq_ith`, `n_embd` — is present at that pin). It lives in `pond-inference` because that
+crate already owns the goose-coexisting backend singleton, the model loader and the exact
+metal/cuda feature wiring, and depends on `pond-core`. Selected by `embedding_provider = "gguf"`,
+which the default build reaches because `local-inference` now pulls `pond-inference` (no new native
+compile — llama.cpp is already built by `goose-agent` and `local-inference`). The model is fetched
+once through `HttpModelDownloader` → `model_download::download_file`, which calls `egress::begin`, so
+the download is `network_mode`-gated (invariant 4).
+
+**Dimension decided: 768, `nomic-embed-text-v1.5`, mean-pooled.** See §2 open-decision 1. Not
+hardcoded anywhere it cannot be checked: `dimensions()` returns the spec width, `load_sync` refuses a
+model whose `n_embd` disagrees, and the spec carries the `model_id` stamp §2 requires. Fallback
+`bge-small-en-v1.5` (384) is a one-line default change **only before the first 768-dim store**.
+
+**The hazard §4/the phase table did not name, and it is a panic — REPRODUCED ON A MAC 2026-08-13.**
+llama-cpp-2 guards backend init with a process-global flag, and Goose's own local-inference treats a
+second `LlamaBackend::init()` as `unreachable!`
+(`goose/crates/goose-local-inference/src/llamacpp/mod.rs`, the `BackendAlreadyInitialized` arm).
+
+**The lazy-load mitigation this entry originally claimed was sufficient is NOT.** That claim — "the
+model loads on first `embed()`, after a chat turn, so Goose always goes first" — is false twice over.
+`main.rs` spawns a memory **backfill** as soon as the provider exists, so the first embed happens at
+STARTUP, not after a turn; and a pond whose `chat_provider` is not local at boot never initialises
+Goose's backend at all, so the embedder wins the race whatever the ordering. Reproduction:
+
+```
+chat_provider=ollama + embedding_provider=gguf + one unembedded memory
+  -> backfill embeds at startup, embedder calls LlamaBackend::init() and WINS
+  -> switch chat_provider to local
+  -> thread 'tokio-rt-worker' panicked at goose-local-inference/src/llamacpp/mod.rs:355:17:
+     internal error: entered unreachable code: the runtime holds the only LlamaBackend
+```
+
+The process survived the panic (it is on a worker task) but the API stopped answering, and local
+inference is dead for the life of the process. **Ordering cannot fix this from the pond side** — any
+embed claims the backend, and the provider switch can happen at any time — so moving the backfill
+later would have been cosmetic.
+
+**FIXED 2026-08-13, and with NO goose patch — the patch set stays at 6.** The insight is that the
+`AtomicBool` is llama-cpp-2's *Rust-side* bookkeeping, not llama.cpp's: the C `llama_backend_init()`
+is idempotent (this crate already relied on that), and `LlamaBackend` is a public field-less struct,
+so the proof-of-initialisation token can be constructed safely without `mem::zeroed()`.
+`engine.rs :: get_or_init_backend` therefore initialises the C backend directly and **never enters the
+CAS**, so the flag is only ever set by Goose, whose init always succeeds. This does not fight Goose's
+stated invariant ("the runtime holds the only LlamaBackend for the life of the process") — **it makes
+it true again.**
+
+The handle is also now held as a strong `Arc` in a `OnceLock` rather than a `Weak`, because
+`impl Drop for LlamaBackend` resets that global flag *and* calls `llama_backend_free()`: with two
+consumers, whoever drops first frees the backend under the other and the second dropper panics inside
+a destructor. Once the backend is shared the only sound rule is **initialise once, never free** —
+which also removes the ggml teardown race the old `Weak` comment was worried about.
+
+Verified on the Mac, both orderings, zero panics: the exact previously-panicking sequence
+(`ollama` boot -> embed at startup -> switch to a local model) now returns 200 and leaves the API
+healthy; and with a local model at boot, a **real chat turn** (gemma-4-E2B, 7 212 prompt tokens,
+`model_load_ms=2108`) completes in the same process as a loaded embedding model. Two source tripwires
+guard the property — `no_giap_code_calls_llama_backend_init` and
+`the_backend_handle_is_held_strongly_and_never_freed` — both mutation-tested.
+
+**The second hazard, and it is the one that would have shipped silently: MIXED VECTOR SPACES.**
+Introducing a second provider introduces a second WIDTH, and §5 lists this failure mode with a
+`model_id` column as its guard — a column that belongs to a later phase and does not exist. What a
+384/768 pond actually did, before this change: **nothing panicked, nothing warned, and every
+comparison returned exactly `0.0`**, because every similarity function guards `a.len() != b.len()`
+and returns 0.0 — a *valid score*, not an error. The consequences compounded:
+
+* `sqlite_memory :: search_similar` has **no `ORDER BY`** and checks `rows.is_empty()` *before*
+  scoring, so a full page of incomparable rows suppressed the recency fallback and was returned
+  ranked as if judged — an arbitrary subset presented as relevance.
+* `recall_memories` / `search_context` gate their keyword fallback on non-emptiness, so it never fired.
+* `topical_memories` yielded `Some(0.0)` rather than `None`, quietly reverting prompt-time injection
+  to importance+recency.
+* Semantic dedup (threshold 0.92) silently stopped deduplicating.
+* `run_backfill` selects `embedding IS NULL`, so a stale-width vector is **never** re-embedded: the
+  degradation is permanent.
+
+Fixed here by filtering incomparable vectors out of the **candidate set** in both adapters (which
+makes the existing `is_empty()` fallbacks correct for free) and mapping them to `None` in
+`topical_memories`. Both guards were **mutation-tested**: the first versions passed with the fix
+removed and were rewritten until they failed. The re-embed path and the `model_id` column remain owed.
+
+**And the fallback model I had documented was itself the trap.** The original entry named
+`bge-small-en-v1.5` (384) as the one-line fallback — the same width fastembed emits. Since the width
+is the *only* discriminator available, that would have put two genuinely different spaces at one width
+where nothing could tell them apart: strictly worse than the mismatch being guarded. The fallback is
+now `bge-base-en-v1.5` (**768**), and `no_gguf_model_shares_a_width_with_the_fastembed_provider`
+fails the build if any GGUF model is ever added at 384.
+
+**Verification.** `cargo fmt` clean; `cargo test -p pond-core -p pond-infra -p pond-inference` green
+(1235 + 308 + module tests); `cargo check -p pond-server -p pond-adapters-goose` green; 326 frontend
+tests green. A live embed on the Mac (Metal) passes. **And a real pond-server run on the Mac**: with
+`embedding_provider = "gguf"` the server downloads the model, reports
+`GGUF embedding provider ready dims=768`, and the startup backfill embedded a seeded row at **768
+dims** — the first time this pond has produced a real semantic vector through the live server.
+
+**NOT run on the Orin** — the device was offline (`No route to host` on `nano.local`). This is
+`LANDED`, not `VERIFIED`.
+
+**Orin session 2026-08-13 (the device came back mid-session).** Two things settled on real hardware.
+
+*0a's core risk is closed.* `nomic-embed-text-v1.5.Q8_0` loads and embeds under the Jetson's own
+CUDA llama.cpp build — aarch64, `CUDA : ARCHS = 870`, NEON/DOTPROD, `-ngl 0` as this provider
+configures it — returning 768 dims in 0.51 s wall-clock *including* cold process start and model
+load. Against a flat ~30 tok/s decode, an embed is free. This is the question that killed fastembed
+and it is answered: llama.cpp starts there, ONNX Runtime does not. What is still owed is narrower
+than it was — the same path through a DEPLOYED GIAP binary, which needs a build on the device.
+
+*0c is done and it reprioritises phase B.* See 1.3: one summary across 636 sessions, because 604 of
+them are too short to ever qualify. The mechanism is fine; the corpus is not there.
+
+**Owed, in priority order.** (1) A re-embed path for stale-width vectors (`search_stale_dimension`), since
+backfill cannot see them. (2) `embed_query`: nomic wants `search_query: ` on the query side and
+currently gets `search_document: `, a bounded ranking-quality loss on the three query call sites
+(`topical_memories`, `search_context`, `recall_memories`). (3) `cargo test -p pond-inference` is in no
+CI job, so none of this module's tests run there. (4) The Orin run. Phases 0b–G remain unstarted.

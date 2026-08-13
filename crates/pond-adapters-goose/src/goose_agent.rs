@@ -2529,7 +2529,10 @@ impl GooseAdapter {
             return Vec::new();
         }
         if let Some(provider) = &self.embedding_provider {
-            match provider.embed(message).await {
+            // `embed_query`: this is the thing being searched WITH. On an
+            // asymmetric retriever (nomic) the document prefix would put it in the
+            // wrong manifold; providers without the distinction inherit `embed`.
+            match provider.embed_query(message).await {
                 Ok(query_vector) => {
                     match self
                         .memory_repo
@@ -2543,9 +2546,18 @@ impl GooseAdapter {
                                     // `search_similar` degrades to search_recent when
                                     // NOTHING in the store is embedded; those hits have
                                     // no vector and so carry no similarity.
+                                    //
+                                    // A vector of a different WIDTH is likewise carrying
+                                    // no usable similarity — it came from another
+                                    // embedding model. It must map to `None` (forfeit the
+                                    // similarity term, exactly as a recency-only hit
+                                    // does) and NOT to `Some(0.0)`, which is a real score
+                                    // that drags the blend down and quietly reverts
+                                    // injection to importance+recency.
                                     let similarity = fragment
                                         .embedding
                                         .as_deref()
+                                        .filter(|e| e.len() == query_vector.len())
                                         .map(|e| cosine_similarity(&query_vector, e));
                                     (fragment, similarity)
                                 })

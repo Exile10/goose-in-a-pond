@@ -5332,9 +5332,17 @@ async fn activate_model(
             let _ = settings_repo
                 .set_key("active_embedding_model", name.clone())
                 .await;
-            let _ = settings_repo
-                .set_key("embedding_provider", provider.to_string())
-                .await;
+            // Deliberately does NOT write `embedding_provider`. It used to write
+            // `provider`, which for this category is the literal "embedding" --
+            // not a runtime provider name at all, as this block's own comment
+            // requires. `embedding_provider` accepts "fastembed" | "gguf" |
+            // "none", so "embedding" matched nothing and silently selected the
+            // fastembed arm. That was invisible while fastembed was the only
+            // implementation; it is not now, because activating any embedding
+            // model would quietly revert a pond that was deliberately put on
+            // "gguf" -- the one provider that starts on a Jetson. Which model to
+            // use and which engine loads it are separate choices; this route owns
+            // only the first.
         }
         _ => {}
     }

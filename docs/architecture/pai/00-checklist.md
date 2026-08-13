@@ -1656,3 +1656,61 @@ will ever run their assertions.**
 - **PAI-4 P7b** — a session crossing 75% should show the note in the hub chat. Expect the "Compact
   now" control to answer `cooling_down`; per the finding above that is the current behaviour, so a
   refusal is a CONFIRMATION of the defect, not a failure of the live run.
+
+**2026-08-13 — personal-context blocker 0a: GGUF embedder landed, Mac-verified, Orin owed.**
+
+Not a PAI phase of its own; it belongs to the [personal-context index](../personal-context-index.md),
+which spans PAI-3/4/8. Recorded here because it fixes a live defect the checklist's own
+verification story exists to catch: `embedding_provider = "fastembed"` shipped as the default and its
+ONNX Runtime does not initialise on the Orin, so "semantic memory injection" (recorded landed under
+PAI-3 Phase A) fell back to keyword on the hardware GIAP ships to — green everywhere, inert on the
+device. A GGUF `EmbeddingProvider` over the llama.cpp this pond already runs replaces it
+(`pond_inference::embedding`, selected by `embedding_provider = "gguf"`).
+
+Run against 2.2: it puts **no** secret on `Settings` (the model is a file path, not a key); the
+one-time model download is egress-gated (`HttpModelDownloader` → `egress::begin`); it does **not**
+move the KV prefix or block a turn on an LLM call (embedding is a separate CPU forward pass, default
+`n_gpu_layers = 0`, off the chat model's GPU); it adds no preamble tokens (retrieval is a tool/query
+surface, not a prompt block). The one interdependency it turned up is new and sharp: **Goose's
+local-inference `unreachable!`s on an already-initialised llama backend**, so a co-resident embedder
+that wins the init race PANICS the live path. Handled by lazy model load (Goose claims the backend
+first, on the first turn; the embedder wraps), which is why backfill must stay idle-gated.
+
+**Verified on the Mac, NOT the Orin** — the device was offline. Per the vocabulary, this is
+`LANDED`, not `VERIFIED`.
+
+**Two things the Mac run found that unit tests could not, and both were mine.** First, the
+coexistence mitigation I documented was WRONG, and the panic is reproducible without a Jetson: a pond
+on `chat_provider=ollama` never initialises Goose's llama backend, the startup memory backfill embeds
+immediately (so "loads lazily, after a chat turn" was false twice), the embedder wins
+`LlamaBackend::init()`, and switching to a local model then panics a tokio worker inside Goose at
+`llamacpp/mod.rs:355` — after which the API stops answering. Ordering could never have fixed it: any
+embed claims the backend.
+
+**FIXED the same day, and the patch set stays at 6.** That `AtomicBool` is llama-cpp-2's Rust-side
+bookkeeping, not llama.cpp's — the C `llama_backend_init()` is idempotent (this crate already relied
+on it) and `LlamaBackend` is a public field-less struct, so the token can be constructed safely.
+`get_or_init_backend` now initialises the C backend directly and **never enters the CAS**, so the flag
+is only ever set by Goose and its `unreachable!` is genuinely unreachable — the fix restores Goose's
+own stated invariant rather than patching around it. The handle is also held as a strong `Arc` in a
+`OnceLock` instead of a `Weak`, because `Drop for LlamaBackend` resets that flag *and* calls
+`llama_backend_free()`; with two consumers the only sound rule is initialise once, never free.
+Verified both orderings on the Mac with zero panics, including a real gemma-4-E2B chat turn running in
+the same process as a loaded embedding model. Two mutation-tested tripwires hold it
+(`no_giap_code_calls_llama_backend_init`, `the_backend_handle_is_held_strongly_and_never_freed`).
+
+Second, a second embedding provider means a second WIDTH, and the `model_id` column that §5 names as
+the guard belongs to a later phase. A mixed 384/768 store did not panic or warn — every comparison
+returned `0.0`, which is a *valid score*, so the keyword fallbacks (gated on emptiness) never fired,
+`search_similar` returned an arbitrary un-`ORDER BY`ed subset ranked as if judged, prompt injection
+reverted to importance+recency, dedup stopped, and `run_backfill` (`embedding IS NULL`) could never
+repair any of it. Fixed by filtering incomparable rows out of the candidate set in both adapters and
+returning `None` rather than `Some(0.0)` in `topical_memories`. **The first two guards I wrote for
+this passed with the fix removed** — vacuous, exactly the failure this checklist keeps recording —
+and were rewritten until mutation testing failed them in both directions. The documented 384-dim
+fallback model was itself the trap and is now 768, with a test that fails the build if any GGUF model
+is ever added at fastembed's width.
+
+Also fixed while here: `activate_model` wrote `embedding_provider = "embedding"`, a string matching no
+provider arm, so activating any embedding model silently reverted a `gguf` pond to fastembed. Inert
+while fastembed was the only implementation; not inert now.

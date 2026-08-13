@@ -197,7 +197,8 @@ impl ContextMcpServer {
         // than on raw cosine, so a near-future item can displace a marginally
         // more similar one from last month.
         if let Some(embedder) = &self.embedder {
-            if let Ok(vector) = embedder.embed(&query).await {
+            // A query, not a document -- see EmbeddingProvider::embed_query.
+            if let Ok(vector) = embedder.embed_query(&query).await {
                 match self.repo.search_similar(&vector, &scope, limit).await {
                     Ok(hits) if !hits.is_empty() => {
                         let mut ranked: Vec<(ContextItem, Option<f32>)> = hits

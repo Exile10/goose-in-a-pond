@@ -424,13 +424,71 @@ pub async fn run_backfill(
     batch_size: usize,
     pause_ms: u64,
 ) -> usize {
+    embed_in_batches(
+        repo,
+        embedder,
+        batch_size,
+        pause_ms,
+        "memory-backfill",
+        None,
+    )
+    .await
+}
+
+/// Re-embed every active memory whose stored vector is the WRONG WIDTH — i.e.
+/// produced by a different embedding model.
+///
+/// [`run_backfill`] cannot reach these, because it selects `embedding IS NULL`
+/// and a stale vector is not null. Without this pass, a pond that switched
+/// `embedding_provider` keeps rows that semantic search correctly EXCLUDES (they
+/// are not comparable) and that nothing ever repairs — retrieval quietly and
+/// permanently worse, with the store looking fully embedded.
+///
+/// Same batching and pause as the backfill, and for the same reason: on a Jetson
+/// this competes with inference for CPU. Best-effort; returns rows re-embedded.
+pub async fn run_dimension_repair(
+    repo: &dyn MemoryRepository,
+    embedder: &dyn EmbeddingProvider,
+    batch_size: usize,
+    pause_ms: u64,
+) -> usize {
+    let expected = embedder.dimensions();
+    if expected == 0 {
+        tracing::warn!("[memory-reembed] provider reports 0 dimensions — skipping");
+        return 0;
+    }
+    embed_in_batches(
+        repo,
+        embedder,
+        batch_size,
+        pause_ms,
+        "memory-reembed",
+        Some(expected),
+    )
+    .await
+}
+
+/// The shared batching loop. `stale_dims` selects which rows are fetched: `None`
+/// means "never embedded", `Some(d)` means "embedded at some width other than d".
+async fn embed_in_batches(
+    repo: &dyn MemoryRepository,
+    embedder: &dyn EmbeddingProvider,
+    batch_size: usize,
+    pause_ms: u64,
+    label: &str,
+    stale_dims: Option<usize>,
+) -> usize {
     let mut embedded = 0usize;
     loop {
-        let batch = match repo.search_unembedded(batch_size).await {
+        let fetched = match stale_dims {
+            Some(dims) => repo.search_stale_dimension(dims, batch_size).await,
+            None => repo.search_unembedded(batch_size).await,
+        };
+        let batch = match fetched {
             Ok(rows) if rows.is_empty() => break,
             Ok(rows) => rows,
             Err(e) => {
-                tracing::warn!("[memory-backfill] fetch failed: {e}");
+                tracing::warn!("[{label}] fetch failed: {e}");
                 break;
             }
         };
@@ -444,17 +502,17 @@ pub async fn run_backfill(
                         progressed = true;
                     }
                     Err(e) => {
-                        tracing::warn!("[memory-backfill] store failed for {}: {e}", fragment.id)
+                        tracing::warn!("[{label}] store failed for {}: {e}", fragment.id)
                     }
                 },
-                Err(e) => tracing::warn!("[memory-backfill] embed failed for {}: {e}", fragment.id),
+                Err(e) => tracing::warn!("[{label}] embed failed for {}: {e}", fragment.id),
             }
         }
 
         // Every row in the batch failed, so the same rows would come back
         // forever — stop instead of spinning.
         if !progressed {
-            tracing::warn!("[memory-backfill] no progress in a batch — stopping");
+            tracing::warn!("[{label}] no progress in a batch — stopping");
             break;
         }
 
@@ -464,7 +522,7 @@ pub async fn run_backfill(
     }
 
     if embedded > 0 {
-        tracing::info!("[memory-backfill] embedded {embedded} previously unembedded memories");
+        tracing::info!("[{label}] embedded {embedded} memories");
     }
     embedded
 }
