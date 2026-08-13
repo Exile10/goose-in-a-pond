@@ -1,7 +1,7 @@
 # Personal-context index — design and handoff
 
-**Status: DESIGNED 2026-08-12. Blocker 0a IMPLEMENTED + Mac-verified 2026-08-13; Orin run
-pending (device was offline). See §7.**
+**Status: DESIGNED 2026-08-12. Blocker 0a IMPLEMENTED, Mac-verified, and MODEL-VERIFIED ON THE ORIN
+2026-08-13. 0b and 0c done. Phases A–G unstarted. See §7.**
 
 A single semantic retrieval surface over the three things this pond knows about a household —
 extracted **memories**, ingested **context items**, and conversation **summaries** — so the agent can
@@ -87,9 +87,20 @@ fighting the connector forever. Context is a mirror; memory is a workspace.
 path that is cancelled by a new turn and that no turn waits on. Used for exactly one thing today:
 splicing into **that same session's** history for compaction.
 
-So every conversation has a curated summary that is unreachable from any other session. "What did we
-decide about the trip?" three weeks later has an answer sitting in the database with no path to it.
-Indexing them costs one embedding per refresh and no new inference.
+The design premise here was "every conversation has a curated summary that is unreachable from any
+other session", so indexing them is nearly free value. **Measured on the Orin 2026-08-13, that premise
+is false on real usage**: 636 sessions, 2 153 messages, and **exactly ONE rolling summary**.
+
+It is not a bug. `refresh` needs `len - KEEP_RECENT_MESSAGES(6) >= MIN_UNSUMMARIZED_MESSAGES(4)`, so a
+session needs **10+ messages** before it can ever produce one — and this pond's usage is short bursts:
+380 sessions of exactly 2 messages, only 32 sessions at 10 or more. So **604 of 636 sessions are
+structurally incapable of ever having a summary**, and of the 32 that could, one does.
+
+Consequence for the phases below, and it is a reprioritisation rather than a blocker: the summary
+corpus is a rounding error next to memories and context items. Phase B should still write summaries
+through (it costs one embedding on a refresh that already happened), but **C and G must not be
+designed assuming summaries carry retrieval weight on a real device** — on this one they would
+contribute a single row.
 
 **Checked 2026-08-13, and the worry was misplaced.** Two things write `sessions.rolling_summary`, and
 only one is tier-gated. `SessionSummaryService::refresh` — the incremental fold of "previous summary +
@@ -233,9 +244,9 @@ needed. Admit mail bodies and GPS tracks and it is millions, and §1.4 stops bei
 
 | Phase | Deliverable | Verified by |
 |---|---|---|
-| **0a** | GGUF `EmbeddingProvider` that initialises on the Orin | the embedder comes up in a device run instead of warning twice |
+| **0a** | GGUF `EmbeddingProvider` that initialises on the Orin | **MODEL VERIFIED ON THE ORIN 2026-08-13**: `nomic-embed-text-v1.5.Q8_0` loads under the device's own CUDA llama.cpp (aarch64, `ARCHS = 870`), mean-pools, returns **768** dims, exit 0, in **0.51 s wall-clock including cold process start and model load**. The risk that killed fastembed is closed. Still owed: the same through a deployed GIAP binary with `embedding_provider = "gguf"` |
 | **0b** | ~~`ContextItem.embedding` populated in `IngestPipeline` — **after** redaction~~ **ALREADY LANDED**, found 2026-08-13: `ingest.rs` embeds `item.embedding_text()` after `from_parts` has redacted, and `main.rs` wires `.with_embedder(embedding_provider)`. What was missing was the GUARD — `the_vector_is_computed_from_the_redacted_text` now records what the embedder was handed, because the existing redaction test would stay green if the embed moved above it | a stored item has a vector; the vector is of redacted text — **both now pinned, mutation-tested** |
-| **0c** | Confirm `rolling_summary` is produced on-device | **code half done 2026-08-13**: `refresh` is NOT `Large`-gated (only `resummarise` is) and its idle loop is wired with a real provider, so it runs on any tier. **Device half owed**: read it out of `sessions` on the nano |
+| **0c** | Confirm `rolling_summary` is produced on-device | **code half done 2026-08-13**: `refresh` is NOT `Large`-gated (only `resummarise` is) and its idle loop is wired with a real provider, so it runs on any tier. **Device half DONE 2026-08-13**: 1 summary across 636 sessions — the mechanism works and the corpus is nearly empty; see 1.3 |
 | **A** | `pond_vectors.db`, port + adapter, `ATTACH` on `after_connect`, migrations | roundtrip; **delete the file and confirm it rebuilds** |
 | **B** | Write-through for all three corpora | a written item is searchable; a re-summarised session's vector *changes* |
 | **C** | Unified retrieval, scope in the SQL, `corpus` labelling | two profiles + a guest: three isolation tests |
@@ -407,6 +418,18 @@ dims** — the first time this pond has produced a real semantic vector through 
 
 **NOT run on the Orin** — the device was offline (`No route to host` on `nano.local`). This is
 `LANDED`, not `VERIFIED`.
+
+**Orin session 2026-08-13 (the device came back mid-session).** Two things settled on real hardware.
+
+*0a's core risk is closed.* `nomic-embed-text-v1.5.Q8_0` loads and embeds under the Jetson's own
+CUDA llama.cpp build — aarch64, `CUDA : ARCHS = 870`, NEON/DOTPROD, `-ngl 0` as this provider
+configures it — returning 768 dims in 0.51 s wall-clock *including* cold process start and model
+load. Against a flat ~30 tok/s decode, an embed is free. This is the question that killed fastembed
+and it is answered: llama.cpp starts there, ONNX Runtime does not. What is still owed is narrower
+than it was — the same path through a DEPLOYED GIAP binary, which needs a build on the device.
+
+*0c is done and it reprioritises phase B.* See 1.3: one summary across 636 sessions, because 604 of
+them are too short to ever qualify. The mechanism is fine; the corpus is not there.
 
 **Owed, in priority order.** (1) A re-embed path for stale-width vectors (`search_stale_dimension`), since
 backfill cannot see them. (2) `embed_query`: nomic wants `search_query: ` on the query side and
