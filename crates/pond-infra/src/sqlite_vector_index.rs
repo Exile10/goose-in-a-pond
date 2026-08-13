@@ -311,6 +311,58 @@ impl VectorIndex for SqliteVectorIndex {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
+    async fn backfill_from_source(
+        &self,
+        corpus: Corpus,
+        model_id: &str,
+        expected_dims: usize,
+    ) -> Result<u64> {
+        // Pure SQL across the ATTACH: no round trips, no inference, no decoding
+        // of a single blob. The vectors already exist -- this only teaches the
+        // index about them.
+        let (table, id_col) = source_table(corpus);
+        let extra = match corpus {
+            // Nothing to copy: a session has no vector of its own. The summary
+            // embedding sweep owns this corpus.
+            Corpus::Summary => return Ok(0),
+            Corpus::Memory => "AND (s.lifecycle IS NULL OR s.lifecycle = 'active')",
+            Corpus::Context => "",
+        };
+        // `length(embedding) = dims * 4` is the width filter: a vector from a
+        // different model must not be restamped with this one.
+        let expected_bytes = (expected_dims * std::mem::size_of::<f32>()) as i64;
+        let rev = match source_rev_sql(corpus) {
+            Some(col) => col,
+            None => "NULL",
+        };
+        let sql = format!(
+            "INSERT INTO vectors (corpus, row_id, model_id, dims, vector, source_rev, embedded_at) \
+             SELECT ?, s.{id_col}, ?, ?, s.embedding, {rev}, ? \
+             FROM {table} s \
+             LEFT JOIN vectors v ON v.row_id = s.{id_col} AND v.corpus = ? \
+             WHERE s.embedding IS NOT NULL AND length(s.embedding) = ? \
+             AND v.row_id IS NULL {extra}"
+        );
+        let copied = sqlx::query(&sql)
+            .bind(corpus.as_str())
+            .bind(model_id)
+            .bind(expected_dims as i64)
+            .bind(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true))
+            .bind(corpus.as_str())
+            .bind(expected_bytes)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if copied > 0 {
+            tracing::info!(
+                corpus = corpus.as_str(),
+                copied,
+                "adopted existing vectors into the index"
+            );
+        }
+        Ok(copied)
+    }
+
     async fn prune_orphans(&self) -> Result<u64> {
         let mut removed = 0u64;
         for corpus in Corpus::ALL {
@@ -744,6 +796,75 @@ mod write_through_tests {
         assert!(index.get(Corpus::Memory, "m1").await.unwrap().is_none());
     }
 
+    /// Deleting the index must be recoverable for memory too, not just for
+    /// summaries. **This is a regression test for a real bug**: the memory
+    /// sweeps are driven by `memory_fragments.embedding IS NULL`, so an
+    /// already-embedded row never reaches the write-through again. Found by
+    /// deleting `pond_vectors.db` on a live pond — the summary came back and
+    /// five memories did not, silently, with the store looking healthy.
+    #[tokio::test]
+    async fn an_already_embedded_memory_is_adopted_when_the_index_is_rebuilt() {
+        let tmp = TempDir::new().unwrap();
+        let db = crate::db::Database::init(tmp.path()).await.unwrap();
+        let index: Arc<dyn VectorIndex> = Arc::new(SqliteVectorIndex::new(db.vectors.clone()));
+
+        // A store that is fully embedded, and an index that knows nothing.
+        add_memory_with_vector(&db.system, "m1", &vec![0.5f32; 8]).await;
+        add_memory_with_vector(&db.system, "m2", &vec![0.25f32; 8]).await;
+        assert!(index.get(Corpus::Memory, "m1").await.unwrap().is_none());
+
+        let copied = index
+            .backfill_from_source(Corpus::Memory, "m", 8)
+            .await
+            .unwrap();
+        assert_eq!(copied, 2, "existing vectors were not adopted");
+        let got = index.get(Corpus::Memory, "m1").await.unwrap().unwrap();
+        assert_eq!(
+            got.vector,
+            vec![0.5f32; 8],
+            "the adopted vector is not the stored one"
+        );
+        assert_eq!(got.model_id, "m");
+
+        // Idempotent: a second pass must not duplicate or re-copy.
+        assert_eq!(
+            index
+                .backfill_from_source(Corpus::Memory, "m", 8)
+                .await
+                .unwrap(),
+            0,
+            "adoption ran twice over the same rows"
+        );
+    }
+
+    /// A stored vector of a DIFFERENT width came from a different model and must
+    /// not be restamped with the current one — that would launder a stale vector
+    /// into the live space where nothing could ever detect it.
+    #[tokio::test]
+    async fn adoption_refuses_a_vector_of_the_wrong_width() {
+        let tmp = TempDir::new().unwrap();
+        let db = crate::db::Database::init(tmp.path()).await.unwrap();
+        let index: Arc<dyn VectorIndex> = Arc::new(SqliteVectorIndex::new(db.vectors.clone()));
+
+        add_memory_with_vector(&db.system, "current", &vec![0.5f32; 8]).await;
+        add_memory_with_vector(&db.system, "legacy", &vec![0.5f32; 4]).await;
+
+        let copied = index
+            .backfill_from_source(Corpus::Memory, "m", 8)
+            .await
+            .unwrap();
+        assert_eq!(copied, 1);
+        assert!(index
+            .get(Corpus::Memory, "current")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            index.get(Corpus::Memory, "legacy").await.unwrap().is_none(),
+            "a 4-wide vector was adopted as if this model had produced it"
+        );
+    }
+
     /// The sweep must CONVERGE. A vector stored without a revision stamp
     /// compares unequal to a non-NULL column, so without the `IS NOT NULL` limb
     /// in the staleness clause it is reported stale on every sweep forever --
@@ -874,6 +995,19 @@ mod tests_support {
         if let Some(s) = summary {
             set_summary(pool, id, s, updated).await;
         }
+    }
+
+    pub async fn add_memory_with_vector(pool: &Pool<Sqlite>, id: &str, v: &[f32]) {
+        let blob: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+        sqlx::query(
+            "INSERT INTO memory_fragments (id, content, embedding, source, tags, created_at, \
+             access_count, lifecycle) VALUES (?, 'x', ?, 'chat', '[]', datetime('now'), 0, 'active')",
+        )
+        .bind(id)
+        .bind(blob)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     pub async fn set_summary(pool: &Pool<Sqlite>, id: &str, summary: &str, updated: &str) {

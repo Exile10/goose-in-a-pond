@@ -159,6 +159,32 @@ pub trait VectorIndex: Send + Sync {
         limit: usize,
     ) -> Result<Vec<String>>;
 
+    /// Copy vectors that already exist in a source store into the index,
+    /// without re-embedding anything. Returns how many were copied.
+    ///
+    /// **This is what makes the index genuinely rebuildable.** Memories and
+    /// context items keep their own vector in their own table, and the sweeps
+    /// that produce those vectors are driven by *that* column being NULL — so
+    /// once a row is embedded, nothing ever calls the write-through for it
+    /// again. Delete this file and those rows would be absent from the index
+    /// forever, silently, while the store looks perfectly healthy. Found by
+    /// deleting `pond_vectors.db` on a live pond: the summary corpus came back
+    /// and the memories did not.
+    ///
+    /// `expected_dims` is a filter, not a hint: a stored vector of another width
+    /// came from another model and must NOT be stamped with this one, which
+    /// would launder a stale vector into the current space where nothing could
+    /// detect it.
+    ///
+    /// Corpora with no vector of their own (summaries) copy nothing and are
+    /// served by their own embedding sweep instead.
+    async fn backfill_from_source(
+        &self,
+        corpus: Corpus,
+        model_id: &str,
+        expected_dims: usize,
+    ) -> Result<u64>;
+
     /// Delete index rows whose source row is gone. Returns how many.
     async fn prune_orphans(&self) -> Result<u64>;
 
