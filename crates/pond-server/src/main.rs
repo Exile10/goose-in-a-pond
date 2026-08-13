@@ -2231,8 +2231,13 @@ async fn run_server(
                     // arriving later; the first embed before it lands reports a clear
                     // error and retrieval falls back to keyword until then.
                     //
-                    // `HttpModelDownloader` -> `model_download::download_file`, which
-                    // calls `egress::begin` -- so this fetch is gated by network_mode.
+                    // Gated by network_mode, but NOT at the chokepoint the obvious
+                    // reading suggests: this is a huggingface.co URL, so
+                    // `download_file` dispatches to `download_via_hf_cache` BEFORE
+                    // reaching its own `egress::begin`. The gate that actually covers
+                    // this fetch lives in `pond_hf_cache` (`egress::begin` on both the
+                    // HEAD and the GET). Naming the wrong chokepoint here would make a
+                    // regression in the real one invisible.
                     let url = spec.download_url.clone();
                     let size_hint = spec.size_hint_mb;
                     let model_id = spec.model_id.clone();
