@@ -94,7 +94,8 @@ impl MemoryMcpServer {
         let filtered: Vec<_> = if let Some(ref query) = params.0.query {
             // Try vector search first when embedding provider is available
             if let Some(ref emb) = self.embedding_provider {
-                match emb.embed(query).await {
+                // A query, not a document -- see EmbeddingProvider::embed_query.
+                match emb.embed_query(query).await {
                     Ok(query_vec) => {
                         match self
                             .memory_repo

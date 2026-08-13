@@ -69,6 +69,28 @@ pub trait MemoryRepository: Send + Sync {
         Ok(vec![])
     }
 
+    /// Return up to `limit` active fragments whose stored vector is NOT
+    /// `expected_dims` wide — i.e. produced by a different embedding model.
+    ///
+    /// [`Self::search_unembedded`] cannot find these: a stale vector is not
+    /// NULL, so a pond that switched `embedding_provider` (fastembed's 384 to
+    /// GGUF's 768) would keep rows that are excluded from semantic search and
+    /// never repaired, degrading retrieval permanently and silently. This is
+    /// what makes that recoverable.
+    ///
+    /// Width is the discriminator because nothing persists a model id yet; see
+    /// `pond_inference::EmbeddingModelSpec`, where every GGUF model is 768
+    /// precisely so a 384 vector is unambiguously a fastembed leftover.
+    /// Adapters that cannot report this return nothing and the sweep finds no
+    /// work — the same degrade-to-nothing contract as `search_unembedded`.
+    async fn search_stale_dimension(
+        &self,
+        _expected_dims: usize,
+        _limit: usize,
+    ) -> Result<Vec<MemoryFragment>> {
+        Ok(vec![])
+    }
+
     /// Attach (or replace) the embedding vector of an existing fragment.
     async fn update_embedding(&self, _id: &str, _embedding: &[f32]) -> Result<()> {
         Ok(())

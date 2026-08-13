@@ -70,20 +70,15 @@ pub struct EmbeddingModelSpec {
     /// Sequence pooling. BERT retrievers differ: nomic/MiniLM mean-pool, bge
     /// uses CLS. Wrong pooling silently produces a worse vector.
     pub pooling: LlamaPoolingType,
-    /// Task prefix prepended to every text before tokenisation. nomic REQUIRES
-    /// one (`search_document: `); bge uses none.
-    ///
-    /// **Queries get this prefix too, and for nomic they should not.** nomic is
-    /// trained with asymmetric prefixes (`search_document: ` vs `search_query: `),
-    /// so a query currently lands in the document manifold. Both sides carry the
-    /// same prefix, so the space stays self-consistent and nothing is mis-scored
-    /// across models — it is a bounded ranking-quality loss, not a correctness
-    /// fault, worst where short queries meet long passages. Fixing it means adding
-    /// an `embed_query` to the port (a provided method, so other implementors are
-    /// untouched) and pointing the three query call sites at it:
-    /// `goose_agent.rs :: topical_memories`, `context.rs :: search_context`,
-    /// `memory.rs :: recall_memories`. Owed, not done.
+    /// Task prefix for a stored DOCUMENT, prepended before tokenisation. nomic
+    /// REQUIRES one (`search_document: `); bge uses none. See `query_prefix` --
+    /// the asymmetry is the point, and using this one for queries costs ranking
+    /// quality on exactly the short-query-to-long-passage case retrieval is for.
     pub content_prefix: &'static str,
+    /// Task prefix for a QUERY, used by `embed_query`. nomic is trained with
+    /// `search_query: ` here and `search_document: ` above; a model with no such
+    /// asymmetry sets both to the same thing (bge uses none for either).
+    pub query_prefix: &'static str,
     /// GPU layers to offload. Defaults to 0 (CPU): an embedding forward pass is
     /// tiny and non-autoregressive, and CPU keeps it off the one GPU the chat
     /// model and its KV cache are fighting over.
@@ -110,10 +105,10 @@ impl EmbeddingModelSpec {
             filename: "nomic-embed-text-v1.5.Q8_0.gguf".to_string(),
             dims: 768,
             pooling: LlamaPoolingType::Mean,
-            // nomic will not produce a good vector without a task prefix. A
-            // single prefix for both stored text and queries is a deliberate
-            // simplification while the port has one `embed`.
+            // nomic will not produce a good vector without a task prefix, and
+            // is trained with a DIFFERENT one per side.
             content_prefix: "search_document: ",
+            query_prefix: "search_query: ",
             n_gpu_layers: 0,
             n_threads: 2,
             download_url: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/\
@@ -144,6 +139,7 @@ impl EmbeddingModelSpec {
             dims: 768,
             pooling: LlamaPoolingType::Cls,
             content_prefix: "",
+            query_prefix: "",
             n_gpu_layers: 0,
             n_threads: 2,
             download_url: "https://huggingface.co/CompendiumLabs/bge-base-en-v1.5-gguf/\
@@ -281,8 +277,13 @@ fn load_sync(spec: &EmbeddingModelSpec, model_path: &Path) -> Result<Loaded> {
 
 /// Run one text through a freshly-created embedding context and return the
 /// pooled, L2-normalised vector. Blocking; called inside `spawn_blocking`.
-fn embed_sync(loaded: &Loaded, spec: &EmbeddingModelSpec, text: &str) -> Result<Vec<f32>> {
-    let prefixed = format!("{}{}", spec.content_prefix, text);
+fn embed_sync(
+    loaded: &Loaded,
+    spec: &EmbeddingModelSpec,
+    text: &str,
+    prefix: &str,
+) -> Result<Vec<f32>> {
+    let prefixed = format!("{prefix}{text}");
 
     let mut tokens = loaded
         .model
@@ -374,9 +375,10 @@ fn l2_normalize(v: &[f32]) -> Vec<f32> {
     }
 }
 
-#[async_trait]
-impl EmbeddingProvider for GgufEmbeddingProvider {
-    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+impl GgufEmbeddingProvider {
+    /// The shared body of `embed` / `embed_query`: they differ only in which task
+    /// prefix the model is given, never in the model or the space.
+    async fn embed_with_prefix(&self, text: &str, prefix: &'static str) -> Result<Vec<f32>> {
         let loaded = Arc::clone(&self.loaded);
         let spec = self.spec.clone();
         let model_path = self.model_path.clone();
@@ -390,10 +392,21 @@ impl EmbeddingProvider for GgufEmbeddingProvider {
                 *guard = Some(load_sync(&spec, &model_path)?);
             }
             let loaded_ref = guard.as_ref().expect("just loaded");
-            embed_sync(loaded_ref, &spec, &owned)
+            embed_sync(loaded_ref, &spec, &owned, prefix)
         })
         .await
         .map_err(|e| anyhow!("embedding spawn_blocking join error: {e}"))?
+    }
+}
+
+#[async_trait]
+impl EmbeddingProvider for GgufEmbeddingProvider {
+    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_with_prefix(text, self.spec.content_prefix).await
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_with_prefix(text, self.spec.query_prefix).await
     }
 
     fn dimensions(&self) -> usize {
@@ -418,6 +431,29 @@ mod tests {
         assert!(matches!(bge.pooling, LlamaPoolingType::Cls));
 
         assert!(EmbeddingModelSpec::resolve("does-not-exist").is_err());
+    }
+
+    /// A retriever is either asymmetric on BOTH sides or neither: nomic wants
+    /// `search_document: ` on stored text and `search_query: ` on the question,
+    /// while bge wants nothing on either. Setting one and forgetting the other is
+    /// the failure this pins -- it would embed queries and documents with the same
+    /// prefix again, which is the exact defect `embed_query` was added to fix.
+    #[test]
+    fn a_model_is_asymmetric_on_both_sides_or_neither() {
+        for spec in EmbeddingModelSpec::all() {
+            let doc = spec.content_prefix.is_empty();
+            let query = spec.query_prefix.is_empty();
+            assert_eq!(
+                doc, query,
+                "{} sets content_prefix={:?} but query_prefix={:?} -- an asymmetric \
+                 model needs both, a symmetric one needs neither",
+                spec.model_id, spec.content_prefix, spec.query_prefix
+            );
+        }
+        // And the asymmetric one must not use the SAME string for both, which
+        // would satisfy the check above while changing nothing.
+        let nomic = EmbeddingModelSpec::nomic_embed_text_v1_5();
+        assert_ne!(nomic.content_prefix, nomic.query_prefix);
     }
 
     /// The width IS the vector-space discriminator until the index carries a
@@ -480,6 +516,19 @@ mod tests {
         assert_eq!(cat.len(), 768);
         let norm = cat.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-3, "not unit length: {norm}");
+
+        // The query side must actually take a DIFFERENT path: same text through
+        // embed vs embed_query has to produce a different vector, or the prefix
+        // is not reaching the model and `embed_query` is decoration.
+        let as_query = provider
+            .embed_query("the cat sat on the mat")
+            .await
+            .unwrap();
+        assert_eq!(as_query.len(), 768);
+        assert!(
+            as_query.iter().zip(&cat).any(|(q, d)| (q - d).abs() > 1e-6),
+            "embed_query returned the document vector -- the query prefix is not applied"
+        );
 
         let kitten = provider.embed("a kitten rested on the rug").await.unwrap();
         let finance = provider
