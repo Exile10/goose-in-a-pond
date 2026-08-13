@@ -46,3 +46,12 @@ llama-cpp-2 = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 llama-cpp-2 = { workspace = true, features = ["metal"] }
+
+# The raw FFI, so `engine.rs` can initialise the C backend WITHOUT entering
+# `LlamaBackend::init`'s process-global CAS -- which belongs to Goose. See the
+# comment on `get_or_init_backend`. Workspace entry only: it carries the same
+# `=0.1.146` exact pin as `llama-cpp-2`, and a skew here would link a second copy
+# of the C library. It declares no features, so the resolver's union is unchanged
+# (the metal/cuda features still come from `llama-cpp-2`'s own dependency on it).
+[dependencies.llama-cpp-sys-2]
+workspace = true

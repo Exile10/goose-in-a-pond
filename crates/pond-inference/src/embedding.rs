@@ -8,34 +8,29 @@
 //! model loaded through the same llama.cpp this pond already runs for chat has
 //! no separate native runtime to be incompatible with.
 //!
-//! # Coexistence with Goose — AN OPEN HAZARD, read before enabling this
+//! # Coexistence with Goose — solved, and NOT by load ordering
 //!
-//! llama-cpp-2 guards backend init with a PROCESS-GLOBAL flag, and Goose's own
-//! local-inference runtime treats a second [`LlamaBackend::init`] as
-//! `unreachable!` — it PANICS rather than degrading
-//! (`goose-local-inference/src/llamacpp/mod.rs`, the `BackendAlreadyInitialized`
-//! arm). This crate's [`get_or_init_backend`] is graceful in that situation;
-//! Goose is not. So whoever calls `init()` FIRST must be Goose, or Goose panics
-//! when its turn comes.
+//! Two llama.cpp consumers share one process here, and llama-cpp-2 tracks backend
+//! initialisation in a PROCESS-GLOBAL flag that cargo shares between them. Goose
+//! treats losing that CAS as `unreachable!` and PANICS
+//! (`goose-local-inference/src/llamacpp/mod.rs`).
 //!
-//! **Lazy loading does not make that safe, and an earlier version of this comment
-//! claimed it did.** Reproduced on a Mac 2026-08-13: a pond whose `chat_provider`
-//! is not local at boot (e.g. `ollama`) never initialises Goose's backend, so the
-//! first embed here wins the race — and it happens at STARTUP, not after a turn,
-//! because `main.rs` spawns a memory backfill as soon as the provider exists.
-//! Switching that pond to a local model afterwards panics a tokio worker inside
-//! Goose and leaves the API unresponsive.
+//! An earlier version of this comment claimed lazy loading made that safe because
+//! Goose would always go first. **That was false**, and the panic was reproduced
+//! on a Mac 2026-08-13: an `ollama` pond never initialises Goose's backend at all,
+//! and the memory backfill embeds at STARTUP rather than after a turn, so this
+//! provider won the race and the next local chat model panicked a tokio worker.
+//! Ordering could never have fixed it — any embed claims the backend, and the
+//! switch to a local model can happen at any time.
 //!
-//! Ordering cannot fix this from the pond side: any embed at all claims the
-//! backend, and the switch to a local chat model can happen at any time. The fix
-//! is a ~4-line Goose fork patch making its `BackendAlreadyInitialized` arm wrap
-//! the existing backend exactly as [`get_or_init_backend`] does. Until that lands,
-//! `embedding_provider = "gguf"` is safe only on a pond that is ALREADY on a local
-//! chat model at boot (which is the Jetson's normal configuration — there Goose is
-//! constructed first and this provider takes the graceful wrap path).
+//! [`get_or_init_backend`] fixes it structurally instead: GIAP initialises the C
+//! backend directly and never enters the CAS, so the flag is only ever set by
+//! Goose and its `unreachable!` is genuinely unreachable. Read that function for
+//! the full argument. Verified on a Mac: the previously-panicking sequence now
+//! completes, and a real local chat turn runs in the same process as this
+//! embedder with both models loaded.
 //!
 //! [`embed`]: EmbeddingProvider::embed
-//! [`LlamaBackend::init`]: llama_cpp_2::llama_backend::LlamaBackend::init
 //! [`get_or_init_backend`]: crate::engine::get_or_init_backend
 
 use anyhow::{anyhow, Context, Result};
