@@ -2394,6 +2394,33 @@ async fn run_server(
         });
     }
 
+    // ── Index adoption (phase B) ─────────────────────────────────────────────
+    // Copy vectors that ALREADY exist in the memory and context tables into the
+    // shared index. No inference: the vectors are there, the index simply does
+    // not know about them.
+    //
+    // Without this the index is not rebuildable, which is the one property that
+    // justifies it being a separate, deletable file. The embedding sweeps are
+    // driven by the per-store `embedding` column being NULL, so an already-
+    // embedded row never reaches the write-through again -- delete
+    // `pond_vectors.db` and those rows are absent from it forever while the
+    // store looks perfectly healthy. Found by doing exactly that on a live pond:
+    // the summaries came back and the memories did not.
+    if let (Some(provider), Some(model_id)) = (embedding_provider.clone(), vector_model_id.clone())
+    {
+        let index = vector_index.clone();
+        tokio::spawn(async move {
+            use pond_core::context::vector_index::Corpus;
+            use pond_core::models::ports::embedding::EmbeddingProvider as _;
+            let dims = provider.dimensions();
+            for corpus in [Corpus::Memory, Corpus::Context] {
+                if let Err(e) = index.backfill_from_source(corpus, &model_id, dims).await {
+                    tracing::warn!(corpus = corpus.as_str(), "index adoption failed: {e:#}");
+                }
+            }
+        });
+    }
+
     // ── Summary indexing (phase B) ───────────────────────────────────────────
     // Memories and context items reach the personal-context index for free --
     // they already hold a vector when they are stored, so their write-through

@@ -475,6 +475,30 @@ Observed while live-testing, pre-existing and worth its own fix: `POST /api/v1/m
 `embedding: None` and never consults the embedder, so a memory written through the API is not
 searchable until the next restart runs the backfill. The backfill is startup-only.
 
+**Exercised A and B against realistic use cases 2026-08-13, and it found a real bug.** Six scenarios on
+a live pond seeded as a household (two members, shared rows, six memories, one summarised session):
+
+| Use case | Result |
+|---|---|
+| Cross-corpus retrieval | correct top hit on all five queries; "what did we decide about the garden?" returns the **SUMMARY** (0.67) above every memory — the case 1.3 called an answer with no path to it |
+| Member isolation | `jerry` sees own + shared, `sam` sees own + shared, **guest sees nothing**, household sees all seven. No cross-member leak |
+| Model change | a vector restamped to another model is **excluded, not scored** |
+| Deletion / orphan | source row deleted, vector left: the JOIN drops it |
+| Scale | 2 007 vectors scanned and ranked in **114 ms in PYTHON** (Rust is far faster), correct hit still first — the brute-force decision holds |
+| **Rebuild** | **FAILED.** Deleting `pond_vectors.db` restored the summary and NOT the five memories |
+
+That last one is the bug, and it is the property the whole separate-file design rests on. The memory
+and context sweeps are driven by the per-store `embedding` column being NULL, so an already-embedded
+row never reaches the write-through again: delete the index and those rows are absent from it
+**forever**, silently, while the store looks perfectly healthy. Only summaries recovered, because that
+sweep is index-aware.
+
+Fixed by `VectorIndex::backfill_from_source` — pure SQL across the ATTACH, copying vectors that
+already exist into the index with **no inference at all**. Re-tested: five memories adopted, retrieval
+identical after the rebuild. It filters on width, because a stored vector of another width came from
+another model and must not be restamped into the live space where nothing could detect it (mutation-
+tested). Two regression tests pin both halves.
+
 **Owed, in priority order.** (1) A re-embed path for stale-width vectors (`search_stale_dimension`), since
 backfill cannot see them. (2) `embed_query`: nomic wants `search_query: ` on the query side and
 currently gets `search_document: `, a bounded ranking-quality loss on the three query call sites
