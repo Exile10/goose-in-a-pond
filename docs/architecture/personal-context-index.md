@@ -337,15 +337,29 @@ chat_provider=ollama + embedding_provider=gguf + one unembedded memory
 The process survived the panic (it is on a worker task) but the API stopped answering, and local
 inference is dead for the life of the process. **Ordering cannot fix this from the pond side** — any
 embed claims the backend, and the provider switch can happen at any time — so moving the backfill
-later would be cosmetic. **The fix is the ~4-line goose-fork patch** making that arm wrap the existing
-backend exactly as `get_or_init_backend` already does. It is now REQUIRED rather than hardening, and
-it is not taken here because it changes the managed patch set (6 -> 7) and its fork branch: Jerry's
-call.
+later would have been cosmetic.
 
-**Until that patch lands, `embedding_provider = "gguf"` is safe only on a pond already running a local
-chat model at boot** — which is the Jetson's normal configuration, and the one case where Goose is
-constructed first (verified: the log then reads `llama backend already initialised (shared with
-Goose)`).
+**FIXED 2026-08-13, and with NO goose patch — the patch set stays at 6.** The insight is that the
+`AtomicBool` is llama-cpp-2's *Rust-side* bookkeeping, not llama.cpp's: the C `llama_backend_init()`
+is idempotent (this crate already relied on that), and `LlamaBackend` is a public field-less struct,
+so the proof-of-initialisation token can be constructed safely without `mem::zeroed()`.
+`engine.rs :: get_or_init_backend` therefore initialises the C backend directly and **never enters the
+CAS**, so the flag is only ever set by Goose, whose init always succeeds. This does not fight Goose's
+stated invariant ("the runtime holds the only LlamaBackend for the life of the process") — **it makes
+it true again.**
+
+The handle is also now held as a strong `Arc` in a `OnceLock` rather than a `Weak`, because
+`impl Drop for LlamaBackend` resets that global flag *and* calls `llama_backend_free()`: with two
+consumers, whoever drops first frees the backend under the other and the second dropper panics inside
+a destructor. Once the backend is shared the only sound rule is **initialise once, never free** —
+which also removes the ggml teardown race the old `Weak` comment was worried about.
+
+Verified on the Mac, both orderings, zero panics: the exact previously-panicking sequence
+(`ollama` boot -> embed at startup -> switch to a local model) now returns 200 and leaves the API
+healthy; and with a local model at boot, a **real chat turn** (gemma-4-E2B, 7 212 prompt tokens,
+`model_load_ms=2108`) completes in the same process as a loaded embedding model. Two source tripwires
+guard the property — `no_giap_code_calls_llama_backend_init` and
+`the_backend_handle_is_held_strongly_and_never_freed` — both mutation-tested.
 
 **The second hazard, and it is the one that would have shipped silently: MIXED VECTOR SPACES.**
 Introducing a second provider introduces a second WIDTH, and §5 lists this failure mode with a
@@ -386,9 +400,8 @@ dims** — the first time this pond has produced a real semantic vector through 
 **NOT run on the Orin** — the device was offline (`No route to host` on `nano.local`). This is
 `LANDED`, not `VERIFIED`.
 
-**Owed, in priority order.** (1) The goose-fork backend patch above — without it `gguf` is only safe
-on a local-at-boot pond. (2) A re-embed path for stale-width vectors (`search_stale_dimension`), since
-backfill cannot see them. (3) `embed_query`: nomic wants `search_query: ` on the query side and
+**Owed, in priority order.** (1) A re-embed path for stale-width vectors (`search_stale_dimension`), since
+backfill cannot see them. (2) `embed_query`: nomic wants `search_query: ` on the query side and
 currently gets `search_document: `, a bounded ranking-quality loss on the three query call sites
-(`topical_memories`, `search_context`, `recall_memories`). (4) `cargo test -p pond-inference` is in no
-CI job, so none of this module's tests run there. (5) The Orin run. Phases 0b–G remain unstarted.
+(`topical_memories`, `search_context`, `recall_memories`). (3) `cargo test -p pond-inference` is in no
+CI job, so none of this module's tests run there. (4) The Orin run. Phases 0b–G remain unstarted.

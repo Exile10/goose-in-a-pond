@@ -1684,10 +1684,20 @@ coexistence mitigation I documented was WRONG, and the panic is reproducible wit
 on `chat_provider=ollama` never initialises Goose's llama backend, the startup memory backfill embeds
 immediately (so "loads lazily, after a chat turn" was false twice), the embedder wins
 `LlamaBackend::init()`, and switching to a local model then panics a tokio worker inside Goose at
-`llamacpp/mod.rs:355` — after which the API stops answering. Ordering cannot fix it from this side;
-the ~4-line goose-fork patch is now REQUIRED, not hardening, and is left for Jerry because it moves
-the patch set 6 -> 7. Until then `gguf` is safe only on a pond already local-at-boot (the Jetson's
-normal shape).
+`llamacpp/mod.rs:355` — after which the API stops answering. Ordering could never have fixed it: any
+embed claims the backend.
+
+**FIXED the same day, and the patch set stays at 6.** That `AtomicBool` is llama-cpp-2's Rust-side
+bookkeeping, not llama.cpp's — the C `llama_backend_init()` is idempotent (this crate already relied
+on it) and `LlamaBackend` is a public field-less struct, so the token can be constructed safely.
+`get_or_init_backend` now initialises the C backend directly and **never enters the CAS**, so the flag
+is only ever set by Goose and its `unreachable!` is genuinely unreachable — the fix restores Goose's
+own stated invariant rather than patching around it. The handle is also held as a strong `Arc` in a
+`OnceLock` instead of a `Weak`, because `Drop for LlamaBackend` resets that flag *and* calls
+`llama_backend_free()`; with two consumers the only sound rule is initialise once, never free.
+Verified both orderings on the Mac with zero panics, including a real gemma-4-E2B chat turn running in
+the same process as a loaded embedding model. Two mutation-tested tripwires hold it
+(`no_giap_code_calls_llama_backend_init`, `the_backend_handle_is_held_strongly_and_never_freed`).
 
 Second, a second embedding provider means a second WIDTH, and the `model_id` column that §5 names as
 the guard belongs to a later phase. A mixed 384/768 store did not panic or warn — every comparison
