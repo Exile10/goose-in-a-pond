@@ -127,13 +127,76 @@ fn join_tool_names(names: &[&str]) -> String {
     }
 }
 
-/// Format a "not configured" guidance message for tools that need an API key.
+/// Format a "not configured" guidance message for tools that CANNOT work
+/// without an API key.
+///
 /// Returns a message the LLM can relay to the user with signup instructions.
+/// Only for a hard stop — `giap-wolfram` is the shape, since there is no keyless
+/// way to compute an answer. A tool that merely gets *worse* without a key wants
+/// [`format_degraded`]: telling the user a working tool "requires an API key to
+/// work" is false, and a false explanation for a real result is worse than no
+/// explanation.
 pub fn format_not_configured(feature: &str, signup_url: &str) -> String {
     format!(
         "{feature} requires an API key to work. Get one free at {signup_url} — \
          then add it in Settings under 'Knowledge & Discovery'."
     )
+}
+
+/// Note that a result came from a keyless fallback, and is therefore worse than
+/// the tool can do.
+///
+/// The counterpart to [`format_not_configured`], for the far more common case:
+/// `search_news` without a Guardian key still answers, from the Wikimedia
+/// featured feed rather than a keyword search; `get_stock_quote` without a
+/// Finnhub key still answers, from an unofficial Yahoo endpoint. Both are real
+/// answers and both are quietly worse, and nothing said so — the degradation was
+/// an `eprintln!` on the server's stderr, which no user sees.
+///
+/// Appended AFTER the result rather than replacing it, and phrased as a fact
+/// about the source rather than an instruction, because the answer is the
+/// answer: a model told to relay setup advice tends to lead with it.
+pub fn format_degraded(result: &str, what_is_missing: &str, signup_url: &str) -> String {
+    format!(
+        "{result}\n\n[Source note: this came from a free fallback because no \
+         {what_is_missing} is configured. Better results are available with one — \
+         free at {signup_url}, added in Settings. Mention this only if asked \
+         about the source or the quality.]"
+    )
+}
+
+/// Append [`format_degraded`]'s note to a tool result that already succeeded.
+///
+/// Takes and returns a `CallToolResult` so a degraded path is one line at the
+/// call site — the alternative is every caller unwrapping content, formatting,
+/// and rebuilding, which is how three call sites ended up saying nothing at all.
+///
+/// A result with no text content is returned untouched: there is nothing to
+/// annotate, and inventing a body to hang a note on would turn "no answer" into
+/// "an answer plus advice".
+pub fn degrade_result(
+    result: rmcp::model::CallToolResult,
+    what_is_missing: &str,
+    signup_url: &str,
+) -> rmcp::model::CallToolResult {
+    use rmcp::model::{Content, RawContent};
+    let existing: String = result
+        .content
+        .iter()
+        .filter_map(|c| match &c.raw {
+            RawContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if existing.trim().is_empty() {
+        return result;
+    }
+    rmcp::model::CallToolResult::success(vec![Content::text(format_degraded(
+        &existing,
+        what_is_missing,
+        signup_url,
+    ))])
 }
 
 /// Format an API error as a helpful message (not ErrorData — the LLM reads this).
@@ -509,6 +572,46 @@ mod tests {
         let msg = format_api_error("Finnhub", "connection timeout");
         assert!(msg.contains("another tool in your schema"));
         assert!(!msg.contains("Try again in a moment"));
+    }
+
+    /// A working tool that got a worse answer is not an unconfigured tool.
+    ///
+    /// `format_not_configured` says "requires an API key to work". For
+    /// `search_news` and `get_stock_quote` that is false — both answer without
+    /// one, from the Wikimedia feed and an unofficial Yahoo endpoint. Saying
+    /// they do not work would be a false explanation attached to a real result,
+    /// which is worse than the silence it replaced.
+    #[test]
+    fn a_degraded_result_keeps_its_answer_and_names_what_is_missing() {
+        let out = format_degraded(
+            "Top story: Kenya election",
+            "Guardian API key",
+            "https://x.test",
+        );
+        assert!(
+            out.starts_with("Top story: Kenya election"),
+            "the answer must come first — a note that displaces the result is a \
+             regression, not a warning: {out}"
+        );
+        assert!(out.contains("Guardian API key"), "{out}");
+        assert!(out.contains("https://x.test"), "{out}");
+        assert!(
+            !out.contains("requires an API key to work"),
+            "a degraded result must not claim the tool is non-functional: {out}"
+        );
+    }
+
+    /// Nothing to annotate means nothing is invented.
+    #[test]
+    fn degrading_an_empty_result_changes_nothing() {
+        use rmcp::model::CallToolResult;
+        let empty = CallToolResult::success(vec![]);
+        let out = degrade_result(empty, "Some key", "https://x.test");
+        assert!(
+            out.content.is_empty(),
+            "a note was hung on a result with no body, turning 'no answer' into \
+             'an answer plus advice'"
+        );
     }
 
     #[test]
