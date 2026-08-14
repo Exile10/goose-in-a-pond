@@ -20,8 +20,34 @@ pub struct PromptTemplate {
     pub is_system: bool,
     /// `true` = the user edited this template; the startup factory reseed
     /// skips it so the edit survives restarts. Cleared by an explicit reset.
+    ///
+    /// This is the table's analogue of `settings.is_user_set`: written by
+    /// exactly one thing, an explicit save from the Prompts tab. It is never
+    /// cleared on the user's behalf — see [`Self::factory_version`].
     #[serde(default)]
     pub is_customized: bool,
+    /// Which generation of the built-in templates this row was seeded from.
+    ///
+    /// The reseed stamps [`FACTORY_VERSION`] on rows it owns. A customized row
+    /// keeps the generation it was forked from, so
+    /// `is_customized && factory_version < FACTORY_VERSION` is exactly "your
+    /// edit is based on an older built-in", which the UI can offer to update
+    /// rather than silently taking the edit away.
+    ///
+    /// `0` means the row predates the column.
+    #[serde(default)]
+    pub factory_version: i64,
     /// ISO datetime of the last update (SQLite `datetime('now')` format).
     pub updated_at: String,
 }
+
+/// The current generation of the built-in prompt templates.
+///
+/// Bump this when the shipped templates change in a way an existing user would
+/// want — not for a typo. It is what turns "you edited this once" into "you
+/// edited this once, and there is a newer built-in you have not seen".
+///
+/// 1 is the tag-skeleton rewrite of 2026-08-14: judgment licences for tools and
+/// thinking, the covertness rule generalised to any angle-bracket block, and
+/// compact tiers for every section that lacked one.
+pub const FACTORY_VERSION: i64 = 1;

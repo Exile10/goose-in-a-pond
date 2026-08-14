@@ -339,6 +339,65 @@ async fn prompt_templates_upsert_then_get_then_list() {
     assert_eq!(list.as_array().unwrap().len(), 1);
 }
 
+/// A save returns the saved row, and an omitted description keeps the stored one.
+///
+/// Both halves are one bug seen from two sides. The handler returned
+/// `{"name","status":"ok"}` while the desktop client typed it
+/// `Promise<PromptTemplate>` and read `updated.content` from it — `undefined`, so
+/// a SUCCESSFUL save blanked the editor. And `description` was a
+/// `#[serde(default)] String`, so the client's `{ content }` body arrived as
+/// `""` and overwrote the stored description.
+///
+/// Together they made the Prompts tab destructive: the edit appeared to vanish,
+/// and the obvious recovery is Reset, which hands the row back to the factory and
+/// discards the edit for real.
+#[tokio::test]
+async fn saving_a_template_returns_it_and_keeps_the_description() {
+    let (app, _tmp) = make_app().await;
+
+    let resp = app
+        .clone()
+        .oneshot(put(
+            "/api/v1/prompts/custom",
+            serde_json::json!({"content": "v1", "description": "Written once"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let saved = body_json(resp).await;
+    assert_eq!(
+        saved["content"], "v1",
+        "the save did not return the saved row, so a client that renders the \
+         response shows nothing: {saved}"
+    );
+    assert_eq!(saved["name"], "custom");
+
+    // Exactly what the desktop client sends: content only.
+    let resp = app
+        .clone()
+        .oneshot(put(
+            "/api/v1/prompts/custom",
+            serde_json::json!({"content": "v2"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let saved = body_json(resp).await;
+    assert_eq!(saved["content"], "v2");
+    assert_eq!(
+        saved["description"], "Written once",
+        "omitting `description` cleared it. An absent field means leave it alone, \
+         not blank it — the client has never sent one: {saved}"
+    );
+
+    let resp = app.oneshot(get("/api/v1/prompts/custom")).await.unwrap();
+    let stored = body_json(resp).await;
+    assert_eq!(
+        stored["description"], "Written once",
+        "the response looked right but the row was written blank"
+    );
+}
+
 #[tokio::test]
 async fn prompt_template_get_missing_returns_404() {
     let (app, _tmp) = make_app().await;
@@ -385,6 +444,7 @@ async fn prompt_template_delete_system_returns_403() {
         description: "Built-in".into(),
         is_system: true,
         is_customized: false,
+        factory_version: pond_core::user_data::domain::prompt_template::FACTORY_VERSION,
         updated_at: String::new(),
     })
     .await

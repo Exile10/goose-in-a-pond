@@ -956,8 +956,20 @@ export class PondApiClient {
     return this.get(`/api/v1/prompts/${name}`);
   }
 
-  updatePrompt(name: string, content: string): Promise<PromptTemplate> {
-    return this.put(`/api/v1/prompts/${name}`, { content });
+  /**
+   * Omitting `description` preserves the stored one — the server treats an
+   * absent field as "leave it alone" rather than "clear it". Pass it only when
+   * the caller actually means to change it.
+   */
+  updatePrompt(
+    name: string,
+    content: string,
+    description?: string,
+  ): Promise<PromptTemplate> {
+    return this.put(`/api/v1/prompts/${name}`, {
+      content,
+      ...(description === undefined ? {} : { description }),
+    });
   }
 
   resetPrompt(name: string): Promise<PromptTemplate> {

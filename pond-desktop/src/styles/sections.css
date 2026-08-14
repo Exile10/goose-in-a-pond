@@ -2411,6 +2411,20 @@
   color: var(--fg);
   resize: vertical;
 }
+/* A notice, not a warning: the user's edit is intact and nothing is required of
+   them. Soft accent rather than the warning colour, which would read as "you
+   have a problem" for what is only "there is a newer built-in". */
+.prompt-outdated {
+  display: flex; align-items: flex-start; gap: 8px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--bg-subtle, var(--bg));
+  font-size: var(--text-sm); color: var(--grey-500);
+  line-height: 1.45;
+}
+.prompt-outdated svg { flex-shrink: 0; margin-top: 2px; }
 .prompt-foot {
   display: flex; align-items: center; justify-content: space-between;
   padding-top: 10px;

@@ -1,0 +1,29 @@
+-- Which generation of the built-in prompts a row was seeded from.
+--
+-- The boot reseed skips any row with is_customized = 1, so a user who ever
+-- pressed Save in the Prompts tab is pinned to whatever the templates said that
+-- day and never receives another built-in revision. There was no way to tell
+-- them a newer one existed, and no way for them to take it without losing their
+-- edit.
+--
+-- The tempting fix is to clear is_customized where the content still matches an
+-- old factory string. That is the settings adoption (migration 0035) run
+-- BACKWARDS. DEFAULT_ADOPTIONS moves a value only where `value = old_default`
+-- AND `is_user_set = 0` -- two independent facts, because, in that migration's
+-- own words, "a row on its own proves nothing". is_customized IS this table's
+-- is_user_set: it is written by exactly one thing, an explicit UI Save. Clearing
+-- it discards the only honest signal of intent this table has and replaces it
+-- with a guess.
+--
+-- So the row keeps its edit and gains a number instead. The reseed stamps the
+-- current generation on rows it owns; a customized row keeps the generation it
+-- was forked from, and the UI can then offer the update rather than perform it.
+-- Consent, not adoption -- the same call 0035 already makes for
+-- embedding_provider ("reaching it needs a hand flip or a UI prompt").
+--
+-- 0 means "seeded before this column existed", which is every row that already
+-- exists. It is deliberately NOT backfilled to the current version: those rows
+-- genuinely predate v2, and claiming otherwise would suppress the very notice
+-- this column is for.
+ALTER TABLE prompt_templates
+    ADD COLUMN factory_version INTEGER NOT NULL DEFAULT 0;
