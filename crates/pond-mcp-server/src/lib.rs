@@ -19,6 +19,7 @@ pub mod system;
 pub mod toolkit;
 pub mod vision;
 pub mod weather;
+pub mod wolfram;
 
 // ── Shared utilities for Knowledge-family servers ───────────────────────────
 pub mod format;

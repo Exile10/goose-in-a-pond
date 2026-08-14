@@ -739,7 +739,7 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
     ["Devices","Device registry, profile info, model assignments","ext_device_enabled"],
     ["News","Top stories and headline search","ext_news_enabled"],
     ["Finance","Stock quotes, crypto prices, and currency exchange rates","ext_finance_enabled"],
-    ["Discovery","Country info, product lookup, web search","ext_discovery_enabled"],
+    ["Discovery","Country info, food product lookup, prices","ext_discovery_enabled"],
     ["Audit / Privacy tools","Recent activity, activity summary, and privacy-risk report","ext_audit_enabled"],
     ["Vision","Camera event detection and vision queries (read-only event store)","ext_vision_enabled"],
     ["Sensors","Read stored IoT sensor data: latest reading, history, and list sensors","ext_sensor_enabled"],
@@ -753,6 +753,7 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
     ["GNews","GNEWS_API_KEY","Enables GNews headline search for the News tools"],
     ["Finnhub (stocks)","FINNHUB_API_KEY","Enables stock quotes in the Finance tools"],
     ["CoinGecko (crypto)","COINGECKO_API_KEY","Enables crypto prices in the Finance tools"],
+    ["Wolfram|Alpha","WOLFRAM_APP_ID","Enables computed answers — maths, unit and currency conversion, dates, statistics. Free AppID at developer.wolframalpha.com"],
   ] as const;
 
   return (
@@ -819,9 +820,6 @@ function ToolsTab({ s, patch, devMode }: { s: Partial<SettingsType>; patch: (k: 
             </Row>
           );
         })}
-        <Row label="SearXNG URL" hint="Self-hosted SearXNG instance for private web search (Discovery tools)">
-          <input className="native-input" value={s.searxng_url ?? ""} onChange={(e) => patch("searxng_url", e.target.value === "" ? null : e.target.value)} placeholder="http://localhost:8888" />
-        </Row>
       </Section>
       {devMode && (
         <>

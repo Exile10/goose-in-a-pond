@@ -4316,6 +4316,115 @@
   box-sizing: border-box;
 }
 
+/* Expanded MCP-UI card panel — the registered card, not the raw text.
+   Same box as .tool-call-result but without its pre-wrap/monospace text
+   treatment and without the height cap, since a card lays itself out. */
+.tool-call-card {
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: var(--grey-50);
+  border-radius: 6px;
+  border: 1px solid var(--grey-200);
+  width: 100%;
+  box-sizing: border-box;
+  cursor: default;
+  font-family: var(--font-body);
+}
+
+/* ─── Wolfram|Alpha computation card ─── */
+.ui-wolfram {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--grey-700);
+}
+.ui-wolfram--loading { flex-direction: row; align-items: center; gap: 7px; }
+.ui-wolfram__spinner { color: var(--purple-500); animation: ui-wolfram-spin 1.5s linear infinite; }
+@keyframes ui-wolfram-spin { to { transform: rotate(360deg); } }
+.ui-wolfram__working { color: var(--grey-500); font-size: 11.5px; }
+
+.ui-wolfram__header { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.ui-wolfram__icon { color: var(--purple-500); flex-shrink: 0; }
+.ui-wolfram__query {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--grey-500);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The answer is the point of the card, so it is the only thing set large. */
+.ui-wolfram__answer { display: flex; flex-direction: column; gap: 1px; }
+.ui-wolfram__answer-label {
+  font-size: 10.5px;
+  color: var(--grey-500);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ui-wolfram__answer-value {
+  font-size: 16px;
+  font-weight: var(--weight-medium);
+  line-height: 1.25;
+  color: var(--grey-900, var(--grey-700));
+  user-select: text;
+  word-break: break-word;
+}
+
+.ui-wolfram__pods { display: flex; flex-direction: column; gap: 3px; margin: 0; }
+.ui-wolfram__pod { display: flex; gap: 6px; align-items: baseline; margin: 0; }
+.ui-wolfram__pod-title {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--grey-500);
+  min-width: 88px;
+}
+.ui-wolfram__pod-text {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--grey-700);
+  user-select: text;
+  word-break: break-word;
+}
+
+.ui-wolfram__explore { display: flex; flex-direction: column; gap: 4px; }
+.ui-wolfram__explore-label {
+  font-size: 10.5px;
+  color: var(--grey-500);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.ui-wolfram__chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.ui-wolfram__chip {
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--grey-300);
+  background: transparent;
+  color: var(--grey-700);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+.ui-wolfram__chip:hover { background: rgba(140, 75, 255, 0.08); border-color: var(--purple-500); }
+.ui-wolfram__chip:focus-visible { outline: 2px solid var(--fg-brand); outline-offset: 1px; }
+/* No composer to send to on this surface, so it must not look pressable. */
+.ui-wolfram__chip--static { cursor: default; color: var(--grey-500); }
+.ui-wolfram__chip--static:hover { background: transparent; border-color: var(--grey-300); }
+
+.ui-wolfram__source {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+  color: var(--grey-500);
+  text-decoration: none;
+  align-self: flex-start;
+}
+.ui-wolfram__source:hover { color: var(--fg-brand); text-decoration: underline; }
+
 /* ─── Thinking Blocks ─── */
 .thinking-block { margin-bottom: 6px; border: 1px solid var(--grey-200); border-radius: 8px; background: var(--grey-50); font-size: 12px; }
 .thinking-block__toggle { cursor: pointer; padding: 5px 9px; display: flex; align-items: center; gap: 5px; color: var(--grey-500); font-family: var(--font-mono); font-size: 11px; user-select: none; list-style: none; }

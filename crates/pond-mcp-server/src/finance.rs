@@ -182,7 +182,7 @@ impl FinanceMcpServer {
         let text = if rate_parts.is_empty() {
             crate::format::format_no_results(
                 &format!("exchange rate data for {} (as of {})", base, date),
-                &["giap-discovery__search_web"],
+                &["giap-knowledge__compute_answer"],
             )
         } else {
             format!(
@@ -416,7 +416,7 @@ impl FinanceMcpServer {
                                     return Ok(CallToolResult::success(vec![Content::text(
                                         crate::format::format_no_results(
                                             &format!("a cryptocurrency matching '{}'", asset),
-                                            &["giap-discovery__search_web"],
+                                            &["giap-knowledge__compute_answer"],
                                         ),
                                     )]));
                                 }
@@ -465,7 +465,7 @@ impl FinanceMcpServer {
                         return Ok(CallToolResult::success(vec![Content::text(
                             crate::format::format_no_results(
                                 &format!("a cryptocurrency matching '{}'", asset),
-                                &["giap-discovery__search_web"],
+                                &["giap-knowledge__compute_answer"],
                             ),
                         )]));
                     }
@@ -592,7 +592,7 @@ impl FinanceMcpServer {
                          e.g. AAPL, MSFT, GOOGL)",
                         symbol
                     ),
-                    &["giap-discovery__search_web"],
+                    &["giap-knowledge__compute_answer"],
                 ),
             )]));
         }
@@ -682,7 +682,7 @@ impl FinanceMcpServer {
                          e.g. AAPL, MSFT, GOOGL)",
                         symbol
                     ),
-                    &["giap-discovery__search_web"],
+                    &["giap-knowledge__compute_answer"],
                 ),
             )]));
         }
