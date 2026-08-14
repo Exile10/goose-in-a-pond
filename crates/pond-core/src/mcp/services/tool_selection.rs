@@ -238,8 +238,25 @@ where
 /// See [`crate::mcp::domain::tool_group::groups_denied_to_guests`] for the list
 /// and why it is a denylist rather than an allowlist.
 ///
-/// **This is the enforcement point for PAI-1 P5, and it operates on TOOLS
-/// rather than groups deliberately.** The group-level subtraction inside the
+/// **This is a PROMPT-SURFACE control, not an execution gate, and the
+/// difference matters.** It decides what the model can SEE, which is what stops
+/// it choosing a withheld tool. It does not stop one running: `goose_agent.rs`'s
+/// tool-call guard says so in terms — by the time it runs, "the tool either has
+/// run or is about to, and nothing here can stop it" — because goose keeps every
+/// extension loaded agent-wide and collects every `ToolRequest` regardless of
+/// which schemas were published. What that guard does is refuse to SURFACE the
+/// call and its result. A real execution gate needs an inspector registered with
+/// goose's `ToolInspectionManager`, whose `add_inspector` is private: a fork
+/// patch, not a local change.
+///
+/// So this is the layer that makes a withheld capability unreachable in
+/// practice, and it is defence in depth rather than a wall. It was previously
+/// described here as "the enforcement point for PAI-1 P5", which reads as the
+/// stronger claim and is worth not making, because the tool-narrowing design
+/// leans on this function.
+///
+/// **It operates on TOOLS rather than groups deliberately.** The group-level
+/// subtraction inside the
 /// adapter's selection path only runs when
 /// `settings.tool_selection_mode == "relevant"`, and the default is `"all"` --
 /// so on a default install the selection path is skipped entirely and the
