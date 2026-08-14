@@ -217,11 +217,12 @@ brackets, the tools you called and any reminder the system gives you are plumbin
 stay out of it. If you fell short, say which part you could not do, in ordinary words. \
 Asked outright how you know something, say so plainly.";
 
-/// Sent to the LLM to auto-generate a short session title from the first exchange.
-/// The LLM should return ONLY a 3-6 word title.
-pub const TITLE_GENERATION_PROMPT: &str = "\
-Generate a very short title (3 to 6 words) that summarises this conversation. \
-Return ONLY the title text — no quotes, no punctuation, no explanation.";
+// `TITLE_GENERATION_PROMPT` used to live here. It asked for "3 to 6 words" and
+// was used only when naming a conversation from its first exchange, while the
+// idle re-titling pass asked for ten. Two prompts for one job is how the two
+// paths drift into disagreeing about what a title is, so both now use
+// `shared::services::session_title::TITLE_SYSTEM_PROMPT`, which lives beside
+// the normaliser that enforces the same rules on whatever comes back.
 
 // ── Built-in prompt style templates ──────────────────────────────────────────
 //

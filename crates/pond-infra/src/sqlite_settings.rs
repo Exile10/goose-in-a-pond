@@ -327,6 +327,14 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
+        upsert!(
+            "session_titling_enabled",
+            if settings.session_titling_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
         // API keys are NOT here: PAI-2 P2 moved them to `SecretRepository`.
         // See `crate::secret_migration` for the one-time move of any row an
         // existing pond already had. `searxng_url` is an endpoint, not a
@@ -935,6 +943,7 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "memory_extraction_enabled" => s.memory_extraction_enabled = value == "true",
         "memory_cleanup_enabled" => s.memory_cleanup_enabled = value == "true",
         "memory_consolidation_enabled" => s.memory_consolidation_enabled = value == "true",
+        "session_titling_enabled" => s.session_titling_enabled = value == "true",
         // Memory tuning
         "memory_consolidation_mode" => s.memory_consolidation_mode = value.to_string(),
         "memory_graph_enabled" => s.memory_graph_enabled = value == "true",

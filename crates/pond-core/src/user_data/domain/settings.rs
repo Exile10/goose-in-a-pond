@@ -682,6 +682,22 @@ pub struct Settings {
     #[serde(default = "Settings::default_memory_consolidation_enabled")]
     pub memory_consolidation_enabled: bool,
 
+    /// Let the pond rename conversations while it is idle.
+    ///
+    /// A session's first title is the first six words of the first thing said
+    /// in it, which is reliable and unmemorable. When this is on, a background
+    /// pass replaces those with a name worth reading in the sidebar, and
+    /// revisits a name once its conversation has moved substantially past it.
+    ///
+    /// Shares the inactivity contract with memory consolidation -- never at
+    /// startup, only after the idle threshold, and abandoned the instant
+    /// somebody comes back -- because both spend the same single on-device
+    /// inference slot. A title is never worth taking that slot from a person.
+    ///
+    /// A name typed by hand is never overwritten, whatever this is set to.
+    #[serde(default = "Settings::default_session_titling_enabled")]
+    pub session_titling_enabled: bool,
+
     /// Consolidation mode: "single" (1 LLM call) or "adversarial" (3-stage Proposer/Adversary/Judge).
     #[serde(default = "Settings::default_memory_consolidation_mode")]
     pub memory_consolidation_mode: String,
@@ -1118,6 +1134,7 @@ impl Default for Settings {
             memory_extraction_enabled: true,
             memory_cleanup_enabled: true,
             memory_consolidation_enabled: Self::default_memory_consolidation_enabled(),
+            session_titling_enabled: Self::default_session_titling_enabled(),
             memory_consolidation_mode: Self::default_memory_consolidation_mode(),
             memory_graph_enabled: false, // experimental causal graph retrieval
             schedule_result_notify: Self::default_schedule_result_notify(),
@@ -1465,6 +1482,9 @@ impl Settings {
         true
     }
     fn default_memory_consolidation_enabled() -> bool {
+        true
+    }
+    fn default_session_titling_enabled() -> bool {
         true
     }
     fn default_memory_consolidation_mode() -> String {
@@ -2391,6 +2411,7 @@ mod tests {
             "schedule_max_concurrent",
             "schedule_max_runs_per_task",
             "schedule_result_notify",
+            "session_titling_enabled",
             "reasoning_effort",
             "show_thinking",
             "show_turn_stats",

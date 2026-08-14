@@ -176,6 +176,93 @@ pub trait SessionStorage: Send + Sync {
         Ok(()) // default no-op for backward compat
     }
 
+    /// Who last wrote `sessions.title`, and — for a model-written one — the id
+    /// of the newest message it covers: `(title_source, title_through_id)`.
+    ///
+    /// `(None, None)` means the row predates the provenance columns. The
+    /// re-titling gate reads that as "assume a person chose this name" unless
+    /// the stored title is byte-identical to the six-word fallback, so a
+    /// missing override here can only ever make the job *more* conservative.
+    async fn get_title_provenance(
+        &self,
+        _session_id: &str,
+    ) -> Result<(Option<String>, Option<String>), SessionStorageError> {
+        Ok((None, None)) // default: unknown provenance, treated as off-limits
+    }
+
+    /// Return the content of the earliest assistant message in a session.
+    ///
+    /// The history wall's card preview. It shows what the pond *answered*
+    /// rather than what it was asked, because the title already says what was
+    /// asked — a card whose heading and body paraphrase the same sentence
+    /// reads as a rendering fault, and the answer is the half you would not
+    /// have been able to reconstruct from memory anyway.
+    ///
+    /// The default returns `None` so mocks and legacy adapters keep compiling;
+    /// a card with no preview simply shows its title.
+    async fn first_assistant_message(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<String>, SessionStorageError> {
+        Ok(None) // default no-op for backward compat
+    }
+
+    /// How many messages a session has gained since `message_id`.
+    ///
+    /// `None` means that message is not in this session — deleted, or a
+    /// rebuilt history. Callers should read that as "this marker covers
+    /// nothing" rather than "nothing has changed", or a compacted conversation
+    /// would freeze whatever it was last marked with.
+    ///
+    /// Exists to be cheap. The idle re-titling pass asks this of every
+    /// conversation it considers, and its steady state is "already named,
+    /// nothing new since" — so the obvious implementation, loading the history
+    /// and finding the index, would re-read every message of every
+    /// conversation every five minutes, forever, on the smallest device this
+    /// runs on. That obvious implementation is exactly what the default below
+    /// does, which is correct and is why overriding it is worth doing.
+    async fn messages_after(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Option<u64>, SessionStorageError> {
+        let messages = self.get_messages(session_id).await?;
+        Ok(messages
+            .iter()
+            .position(|m| m.id == message_id)
+            .map(|i| (messages.len() - i - 1) as u64))
+    }
+
+    /// Store the deterministic six-word fallback title, stamped `derived` so
+    /// the re-titling job knows it is free to improve on it.
+    ///
+    /// The default delegates to [`update_title`](Self::update_title) rather
+    /// than no-opping: this replaces a call that every adapter already
+    /// implements, and a silent no-op would stop sessions getting titles at
+    /// all. An adapter that does not override simply records no provenance.
+    async fn set_derived_title(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<(), SessionStorageError> {
+        self.update_title(session_id, title.to_string()).await
+    }
+
+    /// Store a model-written title together with the id of the newest message
+    /// it covers, stamping its provenance as `model`.
+    ///
+    /// Same delegation reasoning as [`set_derived_title`](Self::set_derived_title).
+    /// An adapter that does not override still gets the better title; it just
+    /// cannot distinguish it later, so the gate leaves it alone from then on.
+    async fn set_generated_title(
+        &self,
+        session_id: &str,
+        title: &str,
+        _through_message_id: &str,
+    ) -> Result<(), SessionStorageError> {
+        self.update_title(session_id, title.to_string()).await
+    }
+
     /// The agent engine's own session id paired with this GIAP session, if one
     /// has been recorded.
     ///
