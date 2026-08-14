@@ -119,6 +119,7 @@ impl SchedulerPort for InMemoryScheduler {
             anyhow::bail!("task '{}' already exists", req.id);
         }
         let schedule = Schedule {
+            fire_at: None,
             id: req.id.clone(),
             label: req.label,
             cron: req.cron,

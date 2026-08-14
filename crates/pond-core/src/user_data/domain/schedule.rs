@@ -32,6 +32,11 @@ impl TaskKind {
     }
 }
 
+/// The sentinel `cron` value for a one-shot, mirroring `"@event"` for a sensor
+/// rule. Neither is ever parsed; both exist so a list of schedules reads
+/// honestly.
+pub const CRON_ONCE: &str = "@once";
+
 // ── Sensor/event-triggered rules (#92) ───────────────────────────────────────
 
 /// Which bus-event family a rule listens to.
@@ -321,7 +326,26 @@ pub struct Schedule {
     pub id: String,
     pub label: String,
     /// 6-field cron expression: `<sec> <min> <hour> <dom> <month> <dow>`
+    ///
+    /// Carries a display sentinel rather than an expression for schedules that
+    /// are never cron-registered: `"@event"` for a sensor rule, `"@once"` for a
+    /// one-shot. See [`Schedule::is_one_shot`].
     pub cron: String,
+    /// Fire ONCE at this instant, then delete. `None` for a recurring schedule.
+    ///
+    /// **A cron expression cannot express a one-shot, and that is the whole
+    /// reason this field exists.** The 6-field form has no year, so even a fully
+    /// specified `0 35 14 9 8 *` means *every* 9 August at 14:35 — a ten-minute
+    /// timer written as cron becomes an annual alarm. The catalog has advertised
+    /// "Reminders, alarms, timers" and `pond-voice` has documented "stop the
+    /// kitchen timer" for as long as neither was possible.
+    ///
+    /// Stored as an absolute UTC instant, not a duration, because the delay has
+    /// to be re-derived on restart: `tokio_cron_scheduler`'s one-shot takes a
+    /// `std::time::Instant`, which is monotonic and meaningless across a
+    /// process boundary.
+    #[serde(default)]
+    pub fire_at: Option<DateTime<Utc>>,
     /// IANA timezone (e.g. `"Africa/Nairobi"`). Cron is evaluated in this zone.
     pub timezone: String,
     pub kind: TaskKind,
@@ -330,6 +354,22 @@ pub struct Schedule {
     pub last_run: Option<DateTime<Utc>>,
     pub next_run: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+}
+
+impl Schedule {
+    /// Fires once and then deletes itself.
+    ///
+    /// Sits beside [`TaskKind::is_event_triggered`] and is read by the same
+    /// place for the same reason: both answer "should the scheduler register a
+    /// cron job for this", and for both the answer is no.
+    ///
+    /// Deliberately NOT a `TaskKind` variant. *What* a schedule does and *when*
+    /// it fires are orthogonal — a timer that sends a notification and a timer
+    /// that runs an agent prompt are both timers — and a variant would force
+    /// every `match` on `TaskKind` to grow an arm that has nothing to say.
+    pub fn is_one_shot(&self) -> bool {
+        self.fire_at.is_some()
+    }
 }
 
 /// Status of a single scheduled execution.
