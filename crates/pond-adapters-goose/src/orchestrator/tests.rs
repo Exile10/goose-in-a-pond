@@ -1294,6 +1294,42 @@ fn the_child_prompt_is_giaps_own_and_states_the_limits_the_child_runs_under() {
     assert_eq!(plan.user_message, "what is the weather");
 }
 
+/// The child gets the answer rule, from the same constant the chat path uses.
+///
+/// A delegated child is the one agent that cannot receive it the way a chat turn
+/// does. `child_user_message` is the task and nothing else — no
+/// `<system-context>`, so no per-turn note — and its whole system prompt is
+/// `base_system_prefix` plus the envelope. Anything the chat path adds to the
+/// envelope around a user message simply does not exist here.
+///
+/// Asserted against `ANSWER_RULE` itself rather than a quoted copy, so rewording
+/// the rule cannot leave the child on the old text: that drift is exactly what
+/// `BUILTIN_PROMPT_TEMPLATES` was created to stop one layer up.
+#[test]
+fn the_child_is_told_to_return_a_finding_not_a_travelogue() {
+    use pond_core::models::services::answer_contract::ANSWER_RULE;
+
+    let role = role("researcher", &["giap-weather"]);
+    let spec = spec_for(&role, &["giap-weather"]);
+    let env = env_with(
+        "ollama",
+        parent_tools(&[("giap-weather", &["get_weather"])]),
+    );
+    let plan = build_child_plan(&spec, "child-1", &env, None).unwrap();
+
+    assert!(
+        !ANSWER_RULE.trim().is_empty(),
+        "ANSWER_RULE is empty — this assertion would pass against any prompt"
+    );
+    assert!(
+        plan.system_prompt.contains(ANSWER_RULE),
+        "the child's prompt does not carry the answer rule. Its own user message has \
+         no <system-context> to restate it in, so the envelope is the only place it \
+         can arrive. Prompt:\n{}",
+        plan.system_prompt
+    );
+}
+
 /// **Half of a two-half fix, and said plainly rather than dressed up.**
 ///
 /// A role's stored `instructions` are its persona. `AgentRole` validates them as

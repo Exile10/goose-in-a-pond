@@ -3734,6 +3734,12 @@ impl GooseAdapter {
             }
             msg.push_str(&turn_budget_block);
             msg.push('\n');
+            // Last inside the envelope, so the answer's shape is the closest
+            // instruction to where the answer gets written. The system prefix
+            // remains authoritative; this is a restatement of the part that
+            // decays with distance. See `answer_contract`'s module docs.
+            msg.push_str(&pond_core::models::services::answer_contract::answer_contract());
+            msg.push('\n');
             msg.push_str("</system-context>\n");
             msg.push_str("<user-message>\n");
             msg.push_str(&request.message);
@@ -5842,6 +5848,58 @@ mod tests {
                 None => l.to_string(),
             })
             .collect()
+    }
+
+    /// The answer contract is inside the envelope, not beside it.
+    ///
+    /// Placement is the whole claim. Inside `<system-context>` it is stripped
+    /// from prior turns by `turn_trimmer::strip_system_context`, so it costs its
+    /// own tokens once and never accumulates down a conversation. Pushed after
+    /// `</system-context>` it would survive in every historical turn, and a
+    /// twenty-turn chat would carry twenty copies of it.
+    ///
+    /// A source scan rather than a behavioural test because the envelope is built
+    /// inline in a 700-line async stream body with no seam to call — the same
+    /// reason `the_goal_is_armed_per_session_and_from_the_raw_request` scans.
+    /// The child's half IS tested behaviourally, in
+    /// `orchestrator::tests::the_child_is_told_to_return_a_finding_not_a_travelogue`.
+    #[test]
+    fn the_answer_contract_rides_inside_the_system_context_envelope() {
+        let lines = stream_body_code();
+
+        let open = lines
+            .iter()
+            .position(|l| l.contains("push_str(\"<system-context>"))
+            .expect("the <system-context> envelope is no longer opened here");
+        let close = lines
+            .iter()
+            .skip(open)
+            .position(|l| l.contains("push_str(\"</system-context>"))
+            .map(|i| i + open)
+            .expect("the <system-context> envelope is no longer closed here");
+
+        let inside = lines[open..close].join("\n");
+        assert!(
+            inside.contains("answer_contract()"),
+            "the answer contract is not inside the <system-context> envelope. Outside \
+             it, the trimmer does not strip it from prior turns and every historical \
+             turn keeps a copy. Envelope:\n{inside}"
+        );
+
+        // And after the budget note, so the last thing before the request is the
+        // shape of the reply rather than a number of steps.
+        let budget_at = inside
+            .find("turn_budget_block")
+            .expect("the turn-budget note left the envelope");
+        let contract_at = inside
+            .find("answer_contract()")
+            .expect("checked immediately above");
+        assert!(
+            contract_at > budget_at,
+            "the answer contract is emitted before the turn budget. It is the closest \
+             instruction to where the answer gets written, which is the only reason it \
+             is restated here at all."
+        );
     }
 
     #[test]

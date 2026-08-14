@@ -22,6 +22,7 @@
 //! - [`turn_budget`] — the per-request reasoning-budget note shown to the model.
 //! - [`image_history`] — how many historical image attachments are replayed as
 //!   real pixels rather than a text placeholder.
+pub mod answer_contract;
 pub mod context_budget;
 pub mod context_governor;
 pub mod context_monitor;

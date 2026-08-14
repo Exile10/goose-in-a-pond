@@ -1185,6 +1185,15 @@ fn subagent_envelope(spec: &TaskSpec, persona: Option<&str>, tools: &[String]) -
     envelope.push_str(
         "- Your last message IS the answer. Make it complete on its own, in a few sentences.\n",
     );
+    // The same rule the chat path restates per turn, from the same constant.
+    //
+    // The child cannot get it the way a chat turn does: `child_user_message` is
+    // the task and nothing else -- no `<system-context>`, so no place for a
+    // per-turn note. Without this line the one agent that most needs to return a
+    // finding rather than a travelogue is the only one never told to.
+    envelope.push_str("- ");
+    envelope.push_str(pond_core::models::services::answer_contract::ANSWER_RULE);
+    envelope.push('\n');
     envelope.push_str(&format!(
         "- You have at most {} turns. Spend them on the task.\n",
         spec.max_turns()
