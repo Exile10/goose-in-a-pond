@@ -107,7 +107,7 @@ When adding a new capability, follow this order (see [Creating Ports & Adapters]
 
 ### Workspace exclusions
 
-`pond-adapters-goose`, `pond-mcp-server`, and any crate that depends on Goose must remain in `workspace.exclude` in the root `Cargo.toml`. See [CLAUDE.md](../CLAUDE.md) for the `rmcp` version conflict reason.
+`pond-adapters-goose`, `pond-mcp-server`, and any crate that depends on Goose must remain in `workspace.exclude` in the root `Cargo.toml`. See [AGENTS.md](../AGENTS.md) for the `rmcp` version conflict reason.
 
 ---
 

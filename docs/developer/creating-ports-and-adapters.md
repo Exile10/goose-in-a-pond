@@ -158,7 +158,7 @@ impl YourPort for GooseYourPortAdapter {
 }
 ```
 
-> **Workspace exclusion rule:** `pond-adapters-goose` and any crate importing `goose::*` must stay in `workspace.exclude` in the root `Cargo.toml`. See `CLAUDE.md` for details.
+> **Workspace exclusion rule:** `pond-adapters-goose` and any crate importing `goose::*` must stay in `workspace.exclude` in the root `Cargo.toml`. See `AGENTS.md` for details.
 
 ---
 

@@ -499,7 +499,7 @@ Recent crowdsourced prices for a product barcode (find it via lookup_product). C
     /// picked by a model that reads "general web search" and believes it.
     ///
     /// The body is kept, and kept compiling, on purpose. A `#[cfg(feature)]`
-    /// would have hidden it from the compiler, and CLAUDE.md's standing warning
+    /// would have hidden it from the compiler, and AGENTS.md's standing warning
     /// applies: code CI only ever `check`s, or does not build at all, rots. This
     /// still type-checks against `SettingsRepository` and `format`, so whatever
     /// backend comes back — SearXNG, Brave, Mojeek — starts from working code.

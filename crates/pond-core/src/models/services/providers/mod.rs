@@ -11,7 +11,7 @@
 //! the `fast_path_enabled` switch that appeared to control it was read by
 //! nothing — the pond has always paid the full round trip for "hi". It is gone
 //! rather than wired, because pre-classifying a turn by keyword is the thing
-//! CLAUDE.md's working agreement rules out: the model decides.
+//! AGENTS.md's working agreement rules out: the model decides.
 //!
 //! `dynamic_provider` and `model_router` sat here undeclared, so neither the
 //! compiler nor the test runner ever saw them. `model_router` had six tests

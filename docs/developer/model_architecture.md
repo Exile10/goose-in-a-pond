@@ -430,7 +430,7 @@ let provider: Arc<dyn LlmProvider> =
 
 Add a new `"my-provider"` string to the `build_llm_provider()` match in `main.rs` and return the wrapped provider.
 
-See `CLAUDE.md` § "Goose Built-in Providers" for the full list and `OLLAMA_HOST` trick for llamafile.
+See `AGENTS.md` § "Goose Built-in Providers" for the full list and `OLLAMA_HOST` trick for llamafile.
 
 ### Option B — Write a new `LlmProvider` adapter
 
