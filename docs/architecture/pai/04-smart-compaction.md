@@ -838,7 +838,7 @@ rolling summary stays idle-only and cancellable. Images stay out of the trimmer
   `api/types.ts`. So P7b is a new surface — a frame the client learns to read, a pressure indicator,
   and a control that calls this endpoint and renders its `reason` — across both chat surfaces
   (`Chat.tsx` and `Canvas.tsx`), not a button added to an existing card. It is scoped and estimated as
-  such, and it is deliberately not bundled into the API landing: CLAUDE.md's "know what has no UI
+  such, and it is deliberately not bundled into the API landing: AGENTS.md's "know what has no UI
   before writing a UI test for it" applies exactly here, and a Playwright test written against the
   assumed `ContextCard` control would have exercised nothing and passed vacuously.
 

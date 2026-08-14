@@ -291,7 +291,7 @@ let state = Arc::new(AppState {
 
 ## Workspace Note for Goose-dependent Crates
 
-If your adapter imports from `goose::*`, it must be listed in `workspace.exclude` in the root `Cargo.toml` and use `default-features = false` on the `goose` dependency. See `CLAUDE.md` for the full explanation of the `rmcp` version conflict.
+If your adapter imports from `goose::*`, it must be listed in `workspace.exclude` in the root `Cargo.toml` and use `default-features = false` on the `goose` dependency. See `AGENTS.md` for the full explanation of the `rmcp` version conflict.
 
 ---
 

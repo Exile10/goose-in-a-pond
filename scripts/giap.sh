@@ -257,7 +257,7 @@ resolve_data_dir() {
 detect_runtime() {
   resolve_data_dir
   # The server writes its REAL bound port here. The fallback is 4000..4009
-  # (ports::API_SERVER + MAX_TRIES) — not the 80/8080/4000/5000 order CLAUDE.md
+  # (ports::API_SERVER + MAX_TRIES) — not the 80/8080/4000/5000 order AGENTS.md
   # claims, so never guess.
   D_PORT=""
   [ -f "$D_DATA_DIR/.runtime_api_port" ] && D_PORT="$(cat "$D_DATA_DIR/.runtime_api_port" 2>/dev/null | tr -d ' \n')"

@@ -338,7 +338,7 @@ Queries are routed to the appropriate tool domain using a two-stage classifier:
 
 | Document | Path | Content |
 |----------|------|---------|
-| CLAUDE.md | `/CLAUDE.md` | Full architecture reference: crate structure, agent pipeline, voice pipeline, memory system, scheduling, databases, model capabilities, known identifiers |
+| AGENTS.md | `/AGENTS.md` | Full architecture reference: crate structure, agent pipeline, voice pipeline, memory system, scheduling, databases, model capabilities, known identifiers |
 | API Reference | `/docs/api.md` | 79 REST endpoints with request/response schemas, error codes, authentication |
 | Extension Guide | `/docs/developer/extensions.md` | Step-by-step guide for building MCP extensions, protocol spec, testing, best practices |
 | MCP Compliance | `/docs/architecture/mcp-compliance.md` | Protocol version tracking, transport support, primitive coverage, authorization model |

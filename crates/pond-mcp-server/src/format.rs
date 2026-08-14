@@ -385,10 +385,13 @@ mod tests {
         assert!(!tools.contains("giap-discovery__search_web"), "{tools:?}");
         assert_eq!(
             tools.len(),
-            65,
-            "the tool inventory changed. Update the count in CLAUDE.md in the same \
+            66,
+            "the tool inventory changed. Update the count in AGENTS.md in the same \
              commit — it read 64 for months while the real number was 65, and prose \
-             nobody checks is how that happens."
+             nobody checks is how that happens. This assertion itself proved the \
+             point: it was written as 65 on a branch 17 commits behind main, and \
+             was wrong the moment that branch merged onto a main that had gained \
+             `giap-context__recall`."
         );
     }
 
