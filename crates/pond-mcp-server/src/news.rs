@@ -67,6 +67,11 @@ pub struct HeadlinesParams {
 const HN_BASE_URL: &str = "https://hacker-news.firebaseio.com/v0";
 const GUARDIAN_BASE_URL: &str = "https://content.guardianapis.com";
 const GNEWS_BASE_URL: &str = "https://gnews.io/api/v4";
+
+/// Where a household gets the keys that make these tools good rather than
+/// merely working. Both tiers are free.
+const GUARDIAN_SIGNUP: &str = "https://open-platform.theguardian.com/access/";
+const GNEWS_SIGNUP: &str = "https://gnews.io/register";
 const WIKIMEDIA_FEED_URL: &str = "https://api.wikimedia.org/feed/v1/wikipedia/en/featured";
 
 const TOP_STORIES_BUDGET: usize = 1500;
@@ -231,10 +236,24 @@ specific topic.")]
             return self.search_news_guardian(api_key.trim(), &params.0).await;
         }
 
-        // Fallback: Wikimedia Featured Content Feed (no API key required)
-        eprintln!("[news] No Guardian key — using Wikimedia feed fallback");
+        // Fallback: Wikimedia Featured Content Feed (no API key required).
+        // A real answer, from a worse source. `format_degraded` says so in the
+        // result; the old `eprintln!` said so on the server's stderr, where no
+        // user has ever looked.
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "tool_degraded",
+            tool = "search_news",
+            missing = "GUARDIAN_API_KEY",
+            "no Guardian key — answering from the Wikimedia feed"
+        );
         let query = params.0.query.as_deref().unwrap_or("").trim().to_string();
-        self.search_news_wikimedia(&query).await
+        let result = self.search_news_wikimedia(&query).await?;
+        Ok(crate::format::degrade_result(
+            result,
+            "Guardian API key",
+            GUARDIAN_SIGNUP,
+        ))
     }
 
     #[tool(description = "\
@@ -254,9 +273,20 @@ Today's top general/breaking news headlines when no specific topic is asked.")]
             return self.get_headlines_gnews(api_key.trim(), &params.0).await;
         }
 
-        // Fallback: Wikimedia Featured Content Feed (no API key required)
-        eprintln!("[news] No GNews key — using Wikimedia feed fallback for headlines");
-        self.get_headlines_wikimedia().await
+        // Fallback: Wikimedia Featured Content Feed (no API key required).
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "tool_degraded",
+            tool = "get_headlines",
+            missing = "GNEWS_API_KEY",
+            "no GNews key — answering from the Wikimedia feed"
+        );
+        let result = self.get_headlines_wikimedia().await?;
+        Ok(crate::format::degrade_result(
+            result,
+            "GNews API key",
+            GNEWS_SIGNUP,
+        ))
     }
 }
 

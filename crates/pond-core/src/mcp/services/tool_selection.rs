@@ -284,12 +284,45 @@ where
             // An unprefixed name belongs to no group and cannot be matched
             // against the denylist. Keeping it is the widening choice, but a
             // tool with no group is a platform tool, not personal data.
-            Some(ext) => !denied.contains(&ext),
             None => true,
+            // A CATALOG extension is judged by the denylist, which is a list of
+            // `giap-*` literals.
+            Some(ext) if is_catalog_extension(ext) => !denied.contains(&ext),
+            // Engine plumbing. Not personal data, and the shim's allow-set
+            // governs it anyway — same reasoning as the unprefixed case.
+            Some(ext) if ENGINE_TOOL_PREFIXES.contains(&ext) => true,
+            // Anything else with a prefix is a user-added MCP server, and the
+            // denylist can never name it — it holds `giap-*` literals and this
+            // prefix is not one. So the old `!denied.contains(&ext)` was
+            // structurally `true` here: a third-party server reading mail,
+            // calendars or files was invisible to PAI-1's guest boundary while
+            // every builtin was checked against it.
+            //
+            // Default-deny instead. An unidentified speaker is somebody the pond
+            // could not name, and for a server whose data GIAP knows nothing
+            // about the honest answer is no. The consented path is a per-server
+            // "guests may use this" flag, not a silent yes.
+            //
+            // The subagent side needs no equivalent: `TaskSpec::grants_tool`
+            // denies any group not explicitly in the child's set, so unknown
+            // already means no there.
+            Some(_) => false,
         })
         .cloned()
         .collect()
 }
+
+/// Tool-name prefixes that belong to the AGENT ENGINE rather than to any
+/// extension.
+///
+/// goose injects a handful of its own tools (`platform__manage_schedule`,
+/// `recipe__final_output`). They are not personal data and the provider shim's
+/// allow-set already vetoes them, so they are kept for a guest on the same
+/// reasoning as an unprefixed name. Named explicitly because
+/// [`subtract_guest_denied_tools`] otherwise default-denies every non-catalog
+/// prefix, and silently dropping engine plumbing would look like a tool-calling
+/// bug rather than a boundary decision.
+const ENGINE_TOOL_PREFIXES: &[&str] = &["platform", "recipe", "dynamic_task"];
 
 /// The groups a speaker with this scope may EVER hold.
 ///
@@ -852,8 +885,46 @@ mod tests {
     /// to be discovered.
     #[test]
     fn an_ungrouped_tool_is_kept() {
-        let all = tools(&["platform__final_output"]);
-        assert_eq!(subtract_guest_denied_tools(all.iter()).len(), 1);
+        let all = tools(&["final_output", "platform__final_output"]);
+        assert_eq!(
+            subtract_guest_denied_tools(all.iter()).len(),
+            2,
+            "engine plumbing was dropped for a guest — it is not personal data, \
+             and the shim's allow-set already governs it"
+        );
+    }
+
+    /// A user-added MCP server is default-DENIED to a guest, and that is the
+    /// asymmetry with the line above.
+    ///
+    /// `groups_denied_to_guests()` is a list of `giap-*` literals, so a
+    /// non-catalog prefix could never appear in it: the old check was
+    /// structurally `true` for every third-party server. A server reading mail,
+    /// calendars or files was invisible to PAI-1's guest boundary while every
+    /// builtin was being checked against it.
+    ///
+    /// Withholding it from an unidentified speaker is the answer that can be
+    /// walked back with a per-server flag. The other direction cannot.
+    #[test]
+    fn a_third_party_server_is_withheld_from_a_guest() {
+        let all = tools(&[
+            "acme-mail__read_inbox",
+            "giap-weather__get_forecast",
+            "platform__manage_schedule",
+        ]);
+        let kept = subtract_guest_denied_tools(all.iter());
+        assert!(
+            !kept.iter().any(|t| t.starts_with("acme-mail__")),
+            "a user-added MCP server survived the guest boundary: {kept:?}"
+        );
+        assert!(
+            kept.iter().any(|t| t.starts_with("giap-weather__")),
+            "a permitted builtin was dropped: {kept:?}"
+        );
+        assert!(
+            kept.iter().any(|t| t.starts_with("platform__")),
+            "engine plumbing was dropped: {kept:?}"
+        );
     }
 
     /// Every name in the denylist must actually be a group the catalog knows,

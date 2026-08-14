@@ -69,6 +69,10 @@ pub struct CryptoPriceParams {
 
 const FRANKFURTER_BASE_URL: &str = "https://api.frankfurter.dev/v1";
 const FINNHUB_BASE_URL: &str = "https://finnhub.io/api/v1";
+
+/// Free tier. Without it `get_stock_quote` falls back to an UNOFFICIAL Yahoo
+/// endpoint, which is a real answer from a source nobody supports.
+const FINNHUB_SIGNUP: &str = "https://finnhub.io/register";
 const COINGECKO_BASE_URL: &str = "https://api.coingecko.com/api/v3";
 const YAHOO_FINANCE_BASE_URL: &str = "https://query1.finance.yahoo.com/v8/finance/chart";
 
@@ -347,11 +351,25 @@ impl FinanceMcpServer {
             return self.get_stock_quote_finnhub(api_key.trim(), &symbol).await;
         }
 
-        // Fallback: Yahoo Finance v8 unofficial (no API key required)
-        eprintln!(
-            "[finance] WARNING: using unofficial Yahoo Finance endpoint (no Finnhub key configured)"
+        // Fallback: Yahoo Finance v8 unofficial (no API key required).
+        //
+        // A real quote from an endpoint nobody supports. `format_degraded` puts
+        // that in the result where a user can learn it; the `eprintln!` this
+        // replaces put it on the server's stderr, and `tracing` puts it in the
+        // log the audit trail actually reads.
+        tracing::warn!(
+            target: "giap::trace",
+            kind = "tool_degraded",
+            tool = "get_stock_quote",
+            missing = "FINNHUB_API_KEY",
+            "no Finnhub key — quoting from the unofficial Yahoo endpoint"
         );
-        self.get_stock_quote_yahoo(&symbol).await
+        let result = self.get_stock_quote_yahoo(&symbol).await?;
+        Ok(crate::format::degrade_result(
+            result,
+            "Finnhub API key",
+            FINNHUB_SIGNUP,
+        ))
     }
 
     #[tool(description = "Get cryptocurrency price and 24h market data by name or symbol.")]
