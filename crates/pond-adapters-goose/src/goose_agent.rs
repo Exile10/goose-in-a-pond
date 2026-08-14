@@ -40,30 +40,24 @@ use crate::extension_manager::GiapGooseExtensionManager;
 use crate::giap_registration::registered_extensions;
 use pond_core::user_data::domain::profile::ProfileScope;
 
-/// Minimal hard-coded fallback — used only when the DB has no template for the
-/// current `prompt_style`. Not a full system prompt: just enough to be safe.
-const FALLBACK_PROMPT: &str = "You are {{assistant_name}}, a privacy-first local AI copilot. \
-     No data leaves this device. Be concise and practical. \
-     Help with everyday tasks, research, writing, coding, and home control. \
-     No Markdown. Never emit pipeline control tokens. \
-     IMPORTANT: Only use tools listed in your schema. \
-     Never use shell, bash, python, curl, or any execution tool. \
-     If a service is unavailable, tell the user directly.\n\n\
-     ## Tools\n\
-     You have tools for weather, scheduling, memory, device management, knowledge lookup, \
-     and system operations. Tool schemas describe each one. Use them when the user's request \
-     matches — do not guess answers that tools could provide accurately.\n\
-     When unsure about something, check your tools first. No matching tool? Tell the user honestly.\n\n\
-     ## Memory\n\
-     When the user shares personal information, save it immediately with save_memory. \
-     Check recall_memories before knowledge lookups. \
-     Corrections are highest priority.\n\n\
-     ## Output Quality\n\
-     Never fabricate URLs, statistics, dates, or quotes. Use a tool or say you don't know. \
-     Keep responses concise. Synthesize tool results — do not parrot raw output.\n\n\
-     ## Per-Turn Context\n\
-     User messages use XML tags: <system-context> has date/time and <memories>. \
-     <user-message> has the actual request. Only respond to <user-message>.";
+/// The template used when the DB has no row for the current `prompt_style`.
+///
+/// This is the shipped `balanced` template, not a separate string. It used to be
+/// a hand-written Markdown-headed prompt that predated the tag skeleton, was
+/// covered by none of the guards in `pond_core::prompts` — no covertness rule,
+/// no tool licence, no `<tool-failure>` — and drifted further every time the
+/// real templates were edited, because nothing tied them together.
+///
+/// It is NOT a rare path. Both `chat_stream` and `child_environment` fall back
+/// here, so a `prompt_style` naming an absent template renders a delegated
+/// subagent's entire prefix from it.
+fn fallback_prompt() -> &'static str {
+    // `balanced` is the documented default and the fallback for an unknown
+    // style in `resolve_builtin_template`, so the two agree by construction.
+    pond_core::prompts::builtin_template_content("balanced")
+        .map(|(content, _)| content)
+        .unwrap_or(pond_core::prompts::PROMPT_BALANCED)
+}
 
 /// Verbatim copy of Goose's PRIVATE `MAX_TURNS_MESSAGE`
 /// (`goose/crates/goose/src/agents/agent.rs:72`) — the plain assistant text
@@ -3085,7 +3079,7 @@ impl GooseAdapter {
             .ok()
             .flatten()
             .map(|t| t.content)
-            .unwrap_or_else(|| FALLBACK_PROMPT.to_string());
+            .unwrap_or_else(|| fallback_prompt().to_string());
 
         // Voice detection is shared by prompt construction (disables thinking)
         // and the session turn cap (#105 — voice_max_turns). Check both the
@@ -4612,7 +4606,7 @@ impl GooseAdapter {
             .ok()
             .flatten()
             .map(|t| t.content)
-            .unwrap_or_else(|| FALLBACK_PROMPT.to_string());
+            .unwrap_or_else(|| fallback_prompt().to_string());
 
         // A deliberately lean `PromptState`. A subagent gets a fraction of the
         // window by construction (`context_fraction`), so it always gets the

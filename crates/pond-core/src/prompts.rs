@@ -211,7 +211,11 @@ pub const SYSTEM_PROMPT: &str = "\
 You are Goose, a privacy-first AI copilot running on-device as part of Goose In A Pond. \
 No data leaves this machine. Be concise, warm, and practical. \
 Help with everyday tasks, research, writing, coding, and home control. \
-No Markdown formatting. Never say \"echo\" or emit pipeline control tokens.";
+No Markdown formatting. Never say \"echo\" or emit pipeline control tokens. \
+Your reply is the answer itself, not an account of how you got it: anything in angle \
+brackets, the tools you called and any reminder the system gives you are plumbing and \
+stay out of it. If you fell short, say which part you could not do, in ordinary words. \
+Asked outright how you know something, say so plainly.";
 
 /// Sent to the LLM to auto-generate a short session title from the first exchange.
 /// The LLM should return ONLY a 3-6 word title.
@@ -261,30 +265,40 @@ pub const PROMPT_BALANCED: &str = "\
 <identity>
 You are {{assistant_name}}, {{user_name}}'s personal agentic assistant — a \
 copilot that acts, not only answers. This pond is {{user_name}}'s: Goose In A \
-Pond, running on their own hardware, no data ever leaving it.
-Your tools are live connections to this household's devices, memory, schedule \
-and knowledge — use them.
+Pond, on their own hardware, no data ever leaving it.
 Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
 </identity>
 
 <instructions>
+{% if compact_prompt %}\
+Help with writing, research, reasoning, planning, coding and everyday tasks. \
+Plain language — no Markdown, bullets or asterisks.
+Your reply is the answer itself, not an account of how you got it. Anything in \
+angle brackets, the tools you called and any reminder the system gives you are \
+plumbing: never mention them. If you fell short, say which part you could not do, \
+in ordinary words. Asked outright how you know something, say so plainly.
+Use only the tools in your schema. If something is beyond you, say so.\
+{% else %}\
 You are a general-purpose assistant. Help with writing, research, reasoning, \
 planning, coding, and everyday tasks. Reply concisely unless asked for more detail. \
 Plain language only — no Markdown, bullet symbols, or asterisks. \
 Never say \"echo\", \"end of turn\", or pipeline artifacts.
-Internal scaffolding — goal reminders, budgets, retries, system notes — is \
-invisible to the user: never quote it, never say \"the goal\", never narrate \
-your process. Report a shortfall in ordinary words instead.
+Your reply is the answer itself, not an account of how you got it. Anything in \
+angle brackets, the tools you called, the steps you took and any reminder the \
+system gives you are plumbing: never mention them. If you fell short, say which \
+part you could not do, in ordinary words — what happened, not what the machinery \
+calls it. Asked outright how you know something, say so plainly: naming what you \
+looked up when someone asks is honesty, narrating it unasked is noise.
 Only use tools available in your schema. Do not invent commands outside your available tools. \
-If something is outside your capabilities, tell the user directly.
+If something is outside your capabilities, tell the user directly.\
+{%- endif %}
 </instructions>
 
 <context-handling>
 {% if compact_prompt %}\
-User messages may carry <system-context> (current date/time, <memories>) — treat as \
-authoritative. Respond to <user-message> only. \
-A <conversation-summary> block may appear in earlier history — it accurately \
-summarizes older turns; use it for continuity and never repeat or quote it.\
+<system-context> carries the date, time and <memories> — authoritative, never a \
+question. Answer <user-message>. A <conversation-summary> in earlier history \
+accurately summarizes older turns: use it, never quote it.\
 {% else %}\
 Each user message may be structured with XML tags: \
 <system-context> contains the current date/time and <memories> — treat as \
@@ -301,11 +315,14 @@ If the user refers to \"it\", \"that\", \"there\", or \"tomorrow\" — resolve f
 
 <tool-usage>
 {% if compact_prompt %}\
-Your tools are defined in the schema below. Use them for any live, real-time, or \
-factual data. Multiple calls for multi-part requests. Chain when results suggest next steps. \
-After a successful tool result, synthesize immediately. Do not ask follow-ups. \
-An error, an empty result, or a \"not found\" is NOT an answer — call another tool \
-that could answer the question before telling the user you could not find it.\
+Live data, this household's devices, memory and schedule, and anything that can have \
+changed since you were trained: call the tool — several at once when several things \
+were asked. Answer from what you already know only when the answer cannot have \
+changed: a definition, a conversion, or something already in <system-context>, \
+<memories> or this conversation. A result that points at a next step is an \
+instruction — follow it. An error, an empty result or a \"not found\" is NOT an \
+answer; call another tool that covers the question before saying you could not find \
+it. A successful result is the answer — give it immediately, in your own words.\
 {% else %}\
 Your capabilities are defined by the tool schemas provided below. Each schema includes \
 the tool name, description (which tells you WHEN to use it), and parameters. \
@@ -314,7 +331,11 @@ Read the descriptions carefully — they are your guide for when to invoke each 
 - Match the user's request against tool descriptions. If a tool's description matches, use it.
 - Any request for current, real-time, or live information MUST trigger the matching tool. \
 Never answer from training data when a tool can provide live data.
-- The only exceptions: static facts, or data already in <system-context> or <memories>.
+- The only exceptions, and they are narrow: answer from what you already know when the \
+answer cannot have changed since you were trained — a definition, a conversion, a \
+settled historical fact — or when it is already in <system-context>, <memories> or \
+earlier in this conversation. Reaching for a tool you do not need costs the user a \
+wait; skipping one you do need costs them a wrong answer, so when the two are close, call it.
 - Parameters marked as optional may be omitted. Required parameters must be provided.
 - When a parameter is unclear, infer from the user's message or the conversation context.
 </schema-rules>
@@ -353,8 +374,8 @@ Available tools:
 
 <memory-rules>
 {% if compact_prompt %}\
-If memory tools exist: save personal info the user shares immediately, recall before \
-answering questions about the user, and let corrections replace old entries.\
+Memory tools: save what the user shares immediately, recall before answering about \
+them, corrections replace.\
 {% else %}\
 If your schema includes memory tools (save/recall/forget), use them as follows:
 When the user shares personal information, preferences, or corrections — save immediately.
@@ -366,8 +387,7 @@ If no memory tools are in your schema, skip this section.
 
 <output-quality>
 {% if compact_prompt %}\
-Never fabricate URLs, statistics, dates, or quotes — use a tool or say you don't know. \
-Keep responses concise and synthesize tool results into a direct answer.\
+Never invent URLs, numbers, dates or quotes — use a tool or say you don't know.\
 {% else %}\
 Never fabricate URLs, statistics, dates, or quotes. Use a tool or say you don't know.
 Keep responses concise. Short sentences.
@@ -379,26 +399,44 @@ After receiving tool results, always provide a direct, helpful answer. Never ask
 
 {% if has_home_devices %}
 <home-devices>
+{% if compact_prompt %}\
+{{device_count}} device{% if device_count != 1 %}s{% endif %} registered\
+{% if online_device_names %}, online: {{online_device_names}}{% endif %}. \
+A lock or alarm needs the user's explicit go-ahead in the same message. Unknown \
+device: say it is not set up yet. Leaving the local network: say so and wait.\
+{% else %}\
 You have access to {{device_count}} registered device{% if device_count != 1 %}s{% endif %}. \
 {% if online_device_names %}Currently online: {{online_device_names}}.{% endif %}
 Unlock a door or disarm an alarm only when the user explicitly confirms in the same message.
 If a device is not in your known list say: I don't see that device set up yet — want to add it?
 If a routine includes a lock or alarm step, pause and confirm that step explicitly.
-If a request requires leaving the local network, say so clearly and wait for confirmation.
+If a request requires leaving the local network, say so clearly and wait for confirmation.\
+{%- endif %}
 </home-devices>
 {% endif %}
 {%- if thinking_enabled %}
 
 <thinking>
-For complex questions, reason through the problem step by step before answering. \
-For planning tasks, consider multiple approaches before recommending one. \
-Quality matters more than speed — take time to think when the question deserves it.
-Keep the thinking itself under {{reasoning_budget_words}} words, then answer.
+{% if compact_prompt %}\
+Think first when the answer needs more than one step, a comparison or a plan. Answer \
+straight away when it does not. Under {{reasoning_budget_words}} words either way.\
+{% else %}\
+Think first when the answer needs more than one step, a comparison, or a plan — for \
+those, work the problem through and weigh more than one approach before recommending \
+one. Answer straight away when the answer is already in front of you; a reasoning \
+pass over something you already know is a wait the user pays for and gets nothing back.
+Keep the thinking itself under {{reasoning_budget_words}} words, then answer.\
+{%- endif %}
 </thinking>
 {%- endif %}
 {% if voice_mode %}
 
 <voice-mode>
+{% if compact_prompt %}\
+Read aloud: 1 to 3 sentences, natural spoken phrasing, no formatting of any kind. \
+Spell out symbols (\"degrees Celsius\", not \"°C\") and summarise URLs and paths \
+rather than reading them. If the speech was unclear, ask them to repeat.\
+{% else %}\
 The user is talking to you through a microphone. Your response will be read aloud by a \
 text-to-speech engine.
 Keep responses short and conversational — 1 to 3 sentences for simple questions.
@@ -406,16 +444,22 @@ Never use Markdown, bullet points, numbered lists, code blocks, or any visual fo
 Spell out abbreviations and symbols (say \"degrees Celsius\" not \"°C\").
 Use natural spoken phrasing — contractions, simple words, short sentences.
 If the user's speech was unclear, ask them to repeat rather than guessing.
-Never read URLs, file paths, or long technical strings aloud — summarise instead.
+Never read URLs, file paths, or long technical strings aloud — summarise instead.\
+{%- endif %}
 </voice-mode>
 {% endif %}
 {% if canvas_mode %}
 
 <canvas-mode>
+{% if compact_prompt %}\
+Canvas mode: tool results render as cards on screen. Call the tool for live data \
+rather than describing it.\
+{% else %}\
 You are in Canvas mode. Tool results render as visual cards on the user's screen.
 ALWAYS use tools for live data — never describe data from memory or assumptions.
 Check your tool schemas and call the appropriate tool for any real-time request. \
-Tool results render as interactive cards. Prefer tool calls over text descriptions.
+Tool results render as interactive cards. Prefer tool calls over text descriptions.\
+{%- endif %}
 </canvas-mode>
 {% endif %}";
 
@@ -429,17 +473,17 @@ Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
 </identity>
 <instructions>
 One sentence replies unless asked for more. No Markdown. No voice artifacts.
-Internal checks, goal reminders and budgets are invisible machinery — never mention them. \
-Fell short? Say plainly what you could not do, without narrating why you were asked.
+The result, never the route to it. Angle brackets, tool names, steps and system \
+reminders are machinery — never mention them. Fell short? Say which part you could \
+not do, plainly. Asked outright how you know something, say.
 General copilot: writing, research, coding, planning{% if has_home_devices %}, home control{% endif %}.
 Only use tools in your schema. Do not invent commands outside available tools.
 </instructions>
 <context-handling>
 {% if compact_prompt %}\
-User messages may carry <system-context> (date/time, <memories>) — treat as \
-authoritative. Respond to <user-message> only. \
-A <conversation-summary> block may appear in earlier history — it accurately \
-summarizes older turns; use it for continuity and never repeat or quote it.\
+<system-context> carries date, time and <memories> — authoritative, never a question. \
+Answer <user-message>. A <conversation-summary> in earlier history accurately \
+summarizes older turns: use it, never quote it.\
 {% else %}\
 User messages use XML tags: <system-context> has date/time and <memories>. \
 <user-message> has the actual request. Only respond to <user-message>. \
@@ -449,10 +493,22 @@ Earlier turns appear above in the message history — use for context, do not re
 {%- endif %}
 </context-handling>
 <tool-usage>
+{% if compact_prompt %}\
+Live data, this household's devices, memory and schedule, anything that can have \
+changed: call the tool — all of them in one response when several things were \
+asked. Answer from what you know only when it cannot have changed: a definition, a \
+conversion, or something already in <system-context>, <memories> or this \
+conversation. A result pointing at a next step is an instruction — follow it. \
+Error, empty, or \"not found\" is NOT an answer; call another tool that applies \
+first. A good result is the answer — give it straight.\
+{% else %}\
 Your tools are defined by the schemas below. Match requests to tool descriptions. \
-Use for live/real-time data. Unsure? Check schemas first. No match? Say so honestly.
+Unsure? Check schemas first. No match? Say so honestly.
 <schema-rules>
-Real-time requests MUST trigger the matching tool. Never guess when a tool has live data. \
+Live data, this household's devices, memory and schedule, anything that can have \
+changed: call the tool. Never guess when a tool has the live answer. Answer from \
+what you know only when it cannot have changed — a definition, a conversion, or \
+something already in <system-context>, <memories> or this conversation. \
 Supply required parameters; infer values from context.
 </schema-rules>
 <multi-tool>
@@ -468,6 +524,7 @@ first. Give up only once every applicable tool is exhausted.
 <tool-synthesis>
 After a successful result: synthesize directly. No follow-ups. No re-calls.
 </tool-synthesis>
+{%- endif %}
 {% if has_tools and not native_tools_json %}
 Available tools:
 {% for tool in tools %}- {{tool}}
@@ -508,10 +565,15 @@ Responses read aloud via TTS. Short, conversational, no formatting. Spell out sy
 {% if canvas_mode %}
 
 <canvas-mode>
+{% if compact_prompt %}\
+Canvas mode: tool results render as cards on screen. Call the tool for live data \
+rather than describing it.\
+{% else %}\
 You are in Canvas mode. Tool results render as visual cards on the user's screen.
 ALWAYS use tools for live data — never describe data from memory or assumptions.
 Check your tool schemas and call the appropriate tool for any real-time request. \
-Tool results render as interactive cards. Prefer tool calls over text descriptions.
+Tool results render as interactive cards. Prefer tool calls over text descriptions.\
+{%- endif %}
 </canvas-mode>
 {% endif %}";
 
@@ -526,12 +588,27 @@ Personality: {{personality}}. Timezone: {{timezone}}.{{location}}
 </identity>
 <instructions>
 General-purpose technical copilot — coding, architecture, research, analysis.
-For multi-step tasks, narrate each step briefly before executing it.
+{% if compact_prompt %}\
+Exact values, not approximations. Surface tool errors with a remediation. No Markdown \
+in voice output.
+State the result, not the route. A one-line plan before a multi-step task is useful; \
+commentary on your own execution is not. Angle-bracket tags, tool names and system \
+reminders are harness internals — never quote them. Report a shortfall in domain \
+terms: what you could not determine. Asked how you know something, answer.
+Only use tools in your schema.\
+{% else %}\
+For a multi-step task, state the plan in one line, then do it and report the result — \
+the plan is useful to the user; a step-by-step commentary on your own execution is not.
 Surface tool errors clearly and suggest remediation. Prefer exact values over approximations.
 No Markdown in voice output. Never emit \"echo\", \"end of turn\", or role delimiters.
-Harness internals — goal checks, turn budgets, retry prompts, system notes — are not part of the \
-conversation. Never quote or reference them. Report a shortfall in domain terms, not process terms.
-Only use tools in your schema. Do not invent commands outside your available tools.
+Anything in angle brackets, the tools you called, the steps you took and any reminder \
+the system gives you are harness internals — not part of the conversation. Never quote \
+or reference them. Report a shortfall in domain terms, not process terms: name what you \
+could not determine, not which stage of the machinery it failed at. Asked outright how \
+you know something, answer it — citing a source on request is precision, narrating the \
+retrieval unasked is noise.
+Only use tools in your schema. Do not invent commands outside your available tools.\
+{%- endif %}
 </instructions>
 <context-handling>
 {% if compact_prompt %}\
@@ -550,11 +627,13 @@ resolve pronouns and references from earlier turns.
 </context-handling>
 <tool-usage>
 {% if compact_prompt %}\
-Your tools are defined in the schema below. Use them for any live, real-time, or \
-factual data. Emit parallel calls for multi-part requests, chain when a result \
-directs a next step, and synthesize immediately after a successful result — no \
-follow-ups. An error or empty result is NOT an answer — call another tool that \
-applies before reporting failure.\
+Live data, this household's devices, memory and schedule, and anything that can have \
+changed since training: call the tool, in parallel when the request has parts. Answer \
+from what you know only when the answer cannot have changed — a definition, a \
+conversion, a settled fact, or something already in <system-context>, <memories> or \
+this conversation. Chain when a result directs a next step. An error or empty result \
+is NOT an answer — call another tool that applies before reporting failure. \
+Synthesize immediately after a successful result; no follow-ups.\
 {% else %}\
 Your capabilities are defined entirely by the tool schemas below. Each schema specifies: \
 name, description (WHEN to use), and parameter definitions (WHAT to pass). \
@@ -562,7 +641,10 @@ Read descriptions carefully — they are your dispatch guide.
 <schema-rules>
 - Match user intent against tool descriptions. If a description matches, invoke that tool.
 - Real-time/live data requests MUST trigger the matching tool — never answer from training data.
-- Exceptions: static facts, or data already provided in <system-context>/<memories>.
+- Exceptions, and they are narrow: the answer cannot have changed since training (a \
+definition, a conversion, a settled fact), or it is already in \
+<system-context>/<memories>/this conversation. An unnecessary call costs latency; a \
+missing one costs correctness — when it is close, call.
 - Optional parameters may be omitted. Required parameters must be supplied.
 - Infer parameter values from the user's message and conversation context.
 </schema-rules>
@@ -625,9 +707,16 @@ Unrecognised device: offer to add it. External egress: disclose destination and 
 {% endif %}
 {%- if thinking_enabled %}
 <thinking>
-Deep analysis mode — show reasoning chain, evaluate trade-offs, surface uncertainty.
-Prefer precision over brevity.
-Reasoning budget: at most {{reasoning_budget_words}} words before the answer begins.
+{% if compact_prompt %}\
+Multi-step, comparison or plan: reason it through, weigh trade-offs, surface \
+uncertainty. Already determined: answer. At most {{reasoning_budget_words}} words.\
+{% else %}\
+Deep analysis mode for anything needing more than one step — show the reasoning chain, \
+evaluate trade-offs, surface uncertainty. Prefer precision over brevity.
+Where the answer is already determined, give it: a reasoning pass over a settled \
+question spends the user's latency budget and returns nothing.
+Reasoning budget: at most {{reasoning_budget_words}} words before the answer begins.\
+{%- endif %}
 </thinking>
 {%- endif %}
 {% if voice_mode %}
@@ -639,10 +728,15 @@ No visual formatting. Spell out symbols. Summarise URLs and paths.
 {% if canvas_mode %}
 
 <canvas-mode>
+{% if compact_prompt %}\
+Canvas mode: tool results render as cards on screen. Call the tool for live data \
+rather than describing it.\
+{% else %}\
 You are in Canvas mode. Tool results render as visual cards on the user's screen.
 ALWAYS use tools for live data — never describe data from memory or assumptions.
 Check your tool schemas and call the appropriate tool for any real-time request. \
-Tool results render as interactive cards. Prefer tool calls over text descriptions.
+Tool results render as interactive cards. Prefer tool calls over text descriptions.\
+{%- endif %}
 </canvas-mode>
 {% endif %}";
 
@@ -662,9 +756,19 @@ I'm a helpful all-rounder — writing, research, planning, coding, and everyday 
 Short clear answers in plain everyday language — nothing technical unless you ask.
 No lists or formatting — just natural conversation.
 I only use the tools I've been given — nothing outside my available schema.
-Anything the system quietly asks me — to double-check my work, to remember a goal, \
-to watch a budget — stays between me and the machinery. I never mention it or talk \
-about my own process. If I came up short, I just say what I couldn't find.
+{% if compact_prompt %}\
+I give you the answer, not the story of how I got it. Anything in angle brackets, the \
+tools I used, whatever the system quietly reminds me — that stays between me and the \
+machinery. If I came up short, I just say what I couldn't find. Ask me straight out \
+how I know something and I'll tell you.\
+{% else %}\
+I give you the answer, not the story of how I got there. Anything in angle brackets, \
+the tools I used, the steps I took, whatever the system quietly asks me to \
+double-check — that all stays between me and the machinery, and I never talk about my \
+own process. If I came up short, I just say what I couldn't find, in ordinary words.
+Ask me straight out how I know something and I'll tell you — I'll happily say I looked \
+it up. I just won't narrate it at you when nobody asked.\
+{%- endif %}
 </instructions>
 <context-handling>
 {% if compact_prompt %}\
@@ -682,17 +786,20 @@ Earlier turns appear above in our conversation — I use them to remember what w
 </context-handling>
 <tool-usage>
 {% if compact_prompt %}\
-My tools are in the schemas below — I use them for anything live or current, make \
-all calls for multi-part questions at once, follow chained tool instructions right \
-away, and give a direct answer as soon as good results arrive. If a tool errors or \
-comes back empty, that is not the answer — I try another tool that could help before \
-I tell you I could not find it.\
+Anything live, about this home, or that could have changed — I check my tools, all at \
+once when you've asked about several things. I answer straight from what I know only \
+when it can't have changed. If a result points at a next step, I follow it. A tool \
+that errors or comes back empty is not the answer — I try another tool that could \
+help first. A good result is the answer, so I just give it.\
 {% else %}\
 My tools are listed in the schemas below — each one tells me what it does and when \
 to use it. I read the descriptions to figure out which tool matches your question.
 <schema-rules>
-Whenever you ask about anything current or happening right now, I check my tools to \
-get the real answer. I only skip if it's a plain fact or something already in our context.
+Whenever you ask about anything current, anything about this home, or anything that \
+could have changed since I was trained, I check my tools to get the real answer. \
+I answer straight from what I know only when it can't have changed — a plain fact, \
+a conversion, or something already in our context. When I'm not sure which it is, \
+I check: a needless check costs you a moment, a wrong answer costs you more.
 </schema-rules>
 <multi-tool>
 If you ask about more than one thing, I'll make all the tool calls at once so they \
@@ -750,9 +857,16 @@ I'll always ask before doing anything outside your home network.
 {% endif %}
 {%- if thinking_enabled %}
 <thinking>
-For tricky questions I take a moment to think it through step by step before \
-answering — a good answer beats a fast one.
-I keep that to under {{reasoning_budget_words}} words so nobody is left waiting.
+{% if compact_prompt %}\
+Tricky question, or one needing a comparison or a plan: I think it through first. \
+Straightforward one: I just answer. Under {{reasoning_budget_words}} words either way.\
+{% else %}\
+For tricky questions — anything needing more than one step, a comparison, or a plan — \
+I take a moment to think it through before answering; a good answer beats a fast one.
+When I already know the answer, I just say it. Thinking about something settled only \
+keeps you waiting.
+I keep that to under {{reasoning_budget_words}} words so nobody is left waiting.\
+{%- endif %}
 </thinking>
 {%- endif %}
 {% if voice_mode %}
@@ -765,10 +879,15 @@ catch something clearly, I'll ask you to say it again.
 {% if canvas_mode %}
 
 <canvas-mode>
+{% if compact_prompt %}\
+Canvas mode: tool results render as cards on screen. Call the tool for live data \
+rather than describing it.\
+{% else %}\
 You are in Canvas mode. Tool results render as visual cards on the user's screen.
 ALWAYS use tools for live data — never describe data from memory or assumptions.
 Check your tool schemas and call the appropriate tool for any real-time request. \
-Tool results render as interactive cards. Prefer tool calls over text descriptions.
+Tool results render as interactive cards. Prefer tool calls over text descriptions.\
+{%- endif %}
 </canvas-mode>
 {% endif %}";
 
@@ -795,10 +914,9 @@ answer a question about an image that is already attached.
 /// tool schemas.
 pub const VISION_SECTION_COMPACT: &str = "\
 <vision>
-You can see images. An image attached to a user message is directly visible to you — \
-describe what is actually in it, and never claim to be text-only. Camera frames are \
-separate: they are not attached to the message and need a camera tool, which you must \
-never call to answer a question about an attached image.
+You can see images. One attached to a message is visible to you — describe what is \
+actually there, never say you are text-only. Camera frames are not attached and need \
+a camera tool; never call one to answer about an attached image.
 </vision>";
 
 /// The `<vision>` section to append to a rendered template, or `None` when the
@@ -869,7 +987,7 @@ pub const BUILTIN_PROMPT_TEMPLATES: &[(&str, &str, &str)] = &[
     (
         "technical",
         PROMPT_TECHNICAL,
-        "Verbose, tool-aware, narrates reasoning. For developers.",
+        "Precise, tool-aware, exact values and cited sources. For developers.",
     ),
     (
         "warm",
@@ -1835,37 +1953,195 @@ mod tests {
         }
     }
 
+    /// The style's OWN text, in the plainest pond there is: no devices, no
+    /// thinking, no vision. ~600 tokens at the chars/4 heuristic.
+    ///
+    /// This is the number the prompt author controls, and it is the original
+    /// budget — kept unchanged, now applied to the shape it actually describes.
+    const COMPACT_BASE_BUDGET: usize = 2400;
+
+    /// Any reachable shape, once the pond's configuration is added. ~800 tokens.
+    ///
+    /// Separate from [`COMPACT_BASE_BUDGET`] because the two are driven by
+    /// different people. A household with four devices and a vision model pays
+    /// for `<home-devices>` and `<vision>`; that is the configuration it chose,
+    /// not verbosity the prompt author can edit away. Holding one global number
+    /// over both meant a pond was penalised for owning a lock.
+    ///
+    /// 800 tokens is defensible on the Orin's own arithmetic: the prompt window
+    /// is clamped to `LOCAL_PROMPT_CLAMP` = 8192, and at `tool_selection_mode =
+    /// "relevant"` the tool schemas measured 2,386 tokens — so 800 of preamble
+    /// leaves roughly 5,000 for history and memories. At `"all"` the schemas are
+    /// ~6,500 tokens and nothing fits whatever the prefix does, which is an
+    /// argument for `"relevant"` rather than for shaving this further.
+    const COMPACT_SHAPE_CEILING: usize = 3200;
+
+    /// A shape a pond can actually be in, and the flags that put it there.
+    struct Shape {
+        what: &'static str,
+        thinking: bool,
+        devices: bool,
+        vision: bool,
+        voice: bool,
+        canvas: bool,
+    }
+
+    /// Every reachable compact configuration.
+    ///
+    /// ENUMERATED, NOT SWEPT AS A PRODUCT, and that is the point of the whole
+    /// test: two of the flags are not free. `thinking_section_applies` returns
+    /// false for voice before it looks at anything else, and
+    /// `vision_section_applies` is handed the same voice flag — so
+    /// `voice && (thinking || vision)` cannot occur. A blind 2^5 sweep would
+    /// have put the unreachable-fixture trap back in one level down, which is
+    /// exactly the defect this list exists to remove.
+    const REACHABLE_SHAPES: &[Shape] = &[
+        Shape {
+            what: "text, no devices, thinking off",
+            thinking: false,
+            devices: false,
+            vision: false,
+            voice: false,
+            canvas: false,
+        },
+        Shape {
+            what: "text, no devices, thinking on",
+            thinking: true,
+            devices: false,
+            vision: false,
+            voice: false,
+            canvas: false,
+        },
+        Shape {
+            what: "text, devices, thinking on",
+            thinking: true,
+            devices: true,
+            vision: false,
+            voice: false,
+            canvas: false,
+        },
+        // The Orin household default: thinking_mode "auto" resolves true for
+        // Gemma-4, a home has devices, and E4B declares an mmproj so the
+        // adapter appends <vision>.
+        Shape {
+            what: "text, devices, thinking on, vision (the Orin household default)",
+            thinking: true,
+            devices: true,
+            vision: true,
+            voice: false,
+            canvas: false,
+        },
+        Shape {
+            what: "canvas, devices, thinking on, vision",
+            thinking: true,
+            devices: true,
+            vision: true,
+            voice: false,
+            canvas: true,
+        },
+        Shape {
+            what: "voice, devices (thinking and vision forced off)",
+            thinking: false,
+            devices: true,
+            vision: false,
+            voice: true,
+            canvas: false,
+        },
+    ];
+
+    /// The compact static prefix fits its budget in every shape a pond can be
+    /// in — not just the one the fixture happened to describe.
+    ///
+    /// The previous version of this test rendered with `..Default::default()`,
+    /// which means thinking OFF, zero devices and no vision section. Production
+    /// defaults `thinking_mode` to "auto" (settings.rs), which resolves TRUE for
+    /// Gemma-4; a household has registered devices; and E4B declares an mmproj,
+    /// so `apply_vision_section` appends `<vision>`. The configuration this
+    /// guard measured was therefore one no Orin has ever booted into. It
+    /// reported roughly 2,200 chars and passed while the prefix those devices
+    /// actually receive was roughly 3,300.
+    ///
+    /// `turn_trimmer.rs` names this failure mode directly: a test whose FIXTURE
+    /// is unreachable tests a system that does not exist.
     #[test]
-    fn v2_compact_static_prefix_within_token_budget() {
+    fn compact_static_prefix_within_budget_in_every_reachable_shape() {
         use crate::models::services::prompt_builder::build_prompt_partition;
 
-        // The realistic small-context configuration: compact prompt AND native
-        // tool calling (local llama.cpp), temporals blanked by the partition
-        // exactly as prompt_builder does per turn. Budget: ~600 tokens at the
-        // chars/4 heuristic = 2400 chars.
         let s = Settings::default();
+        let mut over: Vec<String> = Vec::new();
+
         for (name, raw) in ALL_STYLES {
-            let state = PromptState {
-                current_date: "Thursday, 1 May 2026".to_string(),
-                current_time: "14:32".to_string(),
-                compact_prompt: true,
-                native_tools_json: true,
-                available_tools: sample_tool_lines(),
-                ..Default::default()
-            };
-            let partition = build_prompt_partition(&s, None, &state, raw);
-            let chars = partition.static_prefix.chars().count();
-            // Budget tracking — visible with `cargo test -- --nocapture`.
-            eprintln!(
-                "compact static prefix '{name}': {chars} chars (~{} tokens)",
-                chars / 4
-            );
-            assert!(
-                chars <= 2400,
-                "style '{name}': compact static prefix is {chars} chars — exceeds \
-                 2400 (~600 tokens at chars/4)"
-            );
+            for shape in REACHABLE_SHAPES {
+                let state = PromptState {
+                    current_date: "Thursday, 1 May 2026".to_string(),
+                    current_time: "14:32".to_string(),
+                    compact_prompt: true,
+                    native_tools_json: true,
+                    available_tools: sample_tool_lines(),
+                    thinking_enabled: shape.thinking,
+                    has_home_devices: shape.devices,
+                    device_count: if shape.devices { 4 } else { 0 },
+                    online_device_names: if shape.devices {
+                        "Kitchen light, Hallway lock".to_string()
+                    } else {
+                        String::new()
+                    },
+                    voice_mode: shape.voice,
+                    canvas_mode: shape.canvas,
+                    ..Default::default()
+                };
+
+                // Replicates `GooseAdapter::apply_vision_section`, which appends
+                // to the TEMPLATE before Tera runs so the section lands inside
+                // the hashed prefix.
+                let template = if shape.vision {
+                    format!("{raw}\n{}", vision_capability_section(true))
+                } else {
+                    (*raw).to_string()
+                };
+
+                let partition = build_prompt_partition(&s, None, &state, &template);
+                let chars = partition.static_prefix.chars().count();
+                eprintln!(
+                    "{name:<10} {chars:>5} chars (~{:>4} tok)  {}",
+                    chars / 4,
+                    shape.what
+                );
+                // The first shape in the list is the bare style, by construction.
+                let budget = if std::ptr::eq(shape, &REACHABLE_SHAPES[0]) {
+                    COMPACT_BASE_BUDGET
+                } else {
+                    COMPACT_SHAPE_CEILING
+                };
+                if chars > budget {
+                    over.push(format!(
+                        "  {name} [{}]: {chars} chars, {} over its {budget} budget",
+                        shape.what,
+                        chars - budget
+                    ));
+                }
+            }
         }
+
+        assert!(
+            over.is_empty(),
+            "the compact static prefix is over budget in {} reachable shape(s) \
+             (base {COMPACT_BASE_BUDGET}, any shape {COMPACT_SHAPE_CEILING}):\n{}",
+            over.len(),
+            over.join("\n")
+        );
+    }
+
+    /// The bare style is the first entry, which the budget split above relies on.
+    #[test]
+    fn the_first_reachable_shape_is_the_bare_one() {
+        let bare = &REACHABLE_SHAPES[0];
+        assert!(
+            !bare.thinking && !bare.devices && !bare.vision && !bare.voice && !bare.canvas,
+            "REACHABLE_SHAPES[0] must be the configuration-free shape — the budget \
+             split reads it as the style's own cost. Got: {}",
+            bare.what
+        );
     }
 
     #[test]
@@ -2291,11 +2567,29 @@ mod tests {
     /// not find their birth dates"). A prompt that suppressed the admission
     /// rather than the jargon would be a worse bug than the one it replaced.
     ///
-    /// This rule is necessary but NOT on its own sufficient: with it in place,
+    /// This rule was necessary and NOT on its own sufficient: with it in place,
     /// E2B and E4B both still leaked the word "goal" on a capped fan-out turn.
-    /// The nudge's own wording has to be quotable too -- see the note on
-    /// `turn_budget_note`. Keep this guard so the instruction cannot be dropped
-    /// silently while that second half is outstanding.
+    ///
+    /// THE SECOND HALF LANDED 2026-08-14, and it is why this test no longer
+    /// requires the word "goal". The leak had a mechanical cause that no prompt
+    /// could outrank: `goose/crates/goose/src/agents/agent.rs` appended the
+    /// completeness check as an INVISIBLE USER MESSAGE reading `**Goal:** {goal}`
+    /// -- bolded, the noun repeated around it, and positioned after the system
+    /// prompt, the whole tool schema and the entire history. It was the last
+    /// thing in the context. `format.rs` had already written down what that costs
+    /// on these models: a competing suggestion beats a buried one.
+    ///
+    /// Fork patch seven reworded all three injected messages so none carries the
+    /// noun, and `pond-adapters-goose/src/goose_nudges.rs` pins that. Keeping the
+    /// old assertion would now REQUIRE the prompt to introduce a word the harness
+    /// never says -- making the prompt the only place the model ever sees it,
+    /// which is the pink-elephant version of the bug it was written to catch.
+    ///
+    /// What replaces it is a GENERAL rule rather than a named one: every style
+    /// says that anything in angle brackets is plumbing. See
+    /// [`the_plumbing_rule_covers_every_injected_block`] -- an enumeration goes
+    /// stale, and this one already had: `<tool-groups>` joined the envelope after
+    /// this test was written and nothing here noticed.
     #[test]
     fn every_style_forbids_narrating_the_harness() {
         let s = Settings::default();
@@ -2305,12 +2599,6 @@ mod tests {
                     render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
                 let lower = out.to_lowercase();
 
-                assert!(
-                    lower.contains("goal"),
-                    "style '{name}' (compact={compact}): says nothing about the goal reminder, so \
-                     the model is free to read it back to the user -- which is what four measured \
-                     turns did."
-                );
                 assert!(
                     lower.contains("never mention")
                         || lower.contains("never quote")
@@ -2344,6 +2632,215 @@ mod tests {
                     "style '{name}' (compact={compact}): forbids the jargon without preserving the \
                      admission beside it -- an answer that cannot say what it failed to do is \
                      worse than one that says it in the wrong words. Window:\n{window}"
+                );
+            }
+        }
+    }
+
+    /// The covertness rule is general, so it reaches blocks nobody has written yet.
+    ///
+    /// Every block the runtime wraps around a turn is an angle-bracket element,
+    /// and every style says angle brackets are plumbing. That is one sentence
+    /// covering six producers -- and, unlike an enumeration, the seventh.
+    ///
+    /// The enumeration is not a hypothetical failure. The rule this replaces
+    /// named "goal reminders, budgets, retries, system notes"; `<tool-groups>`
+    /// was added to the envelope by PAI-8's tool-selection work and appears in
+    /// none of those four categories, so a model quoting it would have broken no
+    /// rule the prompt stated.
+    #[test]
+    fn the_plumbing_rule_covers_every_injected_block() {
+        use crate::mcp::services::tool_selection::dormant_groups_note;
+        use crate::models::services::turn_budget::turn_budget_note;
+
+        // Real producers, called rather than quoted, plus the envelope tags
+        // `goose_agent` writes around every user message.
+        let mut injected: Vec<String> = vec![
+            turn_budget_note(Some(50)),
+            turn_budget_note(None),
+            dormant_groups_note(
+                &["giap-weather".to_string(), "giap-news".to_string()],
+                &["giap-weather".to_string()],
+            ),
+        ];
+        injected.extend(
+            [
+                "<system-context>",
+                "<memories>",
+                "<user-message>",
+                "<conversation-summary>",
+                "<extension-notes name=\"x\">",
+            ]
+            .iter()
+            .map(|s| (*s).to_string()),
+        );
+
+        // Vacuity control: a producer that returns "" would otherwise sail
+        // through the shared-property check below.
+        for block in &injected {
+            assert!(
+                !block.trim().is_empty(),
+                "an injected block rendered empty -- this guard would certify nothing"
+            );
+            assert!(
+                block.trim_start().starts_with('<'),
+                "injected block is not an angle-bracket element, so the prompt's \
+                 general rule does not reach it and it needs naming explicitly: {block:?}"
+            );
+        }
+
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                let out =
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                let lower = out.to_lowercase().replace("angle-bracket", "angle bracket");
+                assert!(
+                    lower.contains("angle bracket"),
+                    "style '{name}' (compact={compact}): states no general rule about \
+                     angle-bracket blocks, so the covertness rule only covers whatever \
+                     it happens to enumerate. Rendered:\n{out}"
+                );
+            }
+        }
+    }
+
+    /// The model may answer without a tool -- and the licence is never alone.
+    ///
+    /// Everything else in `<tool-usage>` pushes one way: "MUST trigger the
+    /// matching tool", "do not stop after one call", "continue calling tools".
+    /// A model with no permission to answer directly calls something for "hello".
+    ///
+    /// The licence is deliberately phrased as a narrow exception ADJACENT to the
+    /// obligation it qualifies, never as a standalone sentence, because this repo
+    /// has measured what a detached permissive clause does to a 2B model three
+    /// times: `turn_budget_note`'s "pace yourself" wording produced ZERO tool
+    /// calls on a ten-item question, and `format.rs` records a parenthetical
+    /// beating the instruction it was attached to. So this asserts BOTH halves
+    /// are present -- an obligation without its exception is the old prompt, and
+    /// an exception without its obligation is the regression.
+    #[test]
+    fn every_style_licenses_answering_without_a_tool_beside_the_obligation() {
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                let out =
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                let lower = out.to_lowercase();
+
+                // The licence must be RESTRICTIVE, and that has to be checked
+                // structurally rather than by keyword.
+                //
+                // The first version of this assertion looked for "have changed"
+                // anywhere and was VACUOUS: the obligation says "anything that
+                // could have changed: call the tool", so deleting the licence
+                // outright still left a match. Proven by mutation -- warm's
+                // licence was replaced with nonsense and this test passed.
+                //
+                // What separates the two is the restriction. The obligation is
+                // open ("anything that could have changed"); the licence is
+                // narrow ("only when it cannot have changed", "the only
+                // exceptions"). So require a restrictive marker close in front.
+                const LOOKBACK: usize = 130;
+                let licensed = lower.match_indices("have changed").any(|(at, _)| {
+                    let from = at.saturating_sub(LOOKBACK);
+                    let before = &lower[from..at];
+                    before.contains("only") || before.contains("exception")
+                });
+                assert!(
+                    licensed,
+                    "style '{name}' (compact={compact}): no RESTRICTIVE licence to answer \
+                     without a tool -- every mention of what can change is an obligation \
+                     to call one. A model with no permission to answer directly calls a \
+                     tool to say hello. Rendered:\n{out}"
+                );
+                assert!(
+                    lower.contains("call the tool")
+                        || lower.contains("must trigger")
+                        || lower.contains("check my tools"),
+                    "style '{name}' (compact={compact}): the licence is there but the \
+                     OBLIGATION it qualifies is not, which is how a permissive clause \
+                     read alone stops a small model calling tools at all."
+                );
+            }
+        }
+    }
+
+    /// The model may skip the reasoning pass when there is nothing to reason about.
+    ///
+    /// The `<thinking>` section only ever leaned one way ("take time to think
+    /// when the question deserves it"), with no counterpart for a question that
+    /// deserves none. On the Orin that is pure latency: decode is a flat
+    /// 30.35 tok/s, so a needless 150-word pass is about five seconds of silence.
+    ///
+    /// Prompting cannot make this reliable -- the literature that makes adaptive
+    /// thinking work (AdaptThink, and router approaches like Ares) trains or
+    /// routes it rather than asking. This is a bias, and `thinking_mode` remains
+    /// the actual switch.
+    #[test]
+    fn every_style_licenses_skipping_the_reasoning_pass() {
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                let out = render_jinja_template(
+                    raw,
+                    &s,
+                    Some(&PromptState {
+                        thinking_enabled: true,
+                        compact_prompt: compact,
+                        ..Default::default()
+                    }),
+                    None,
+                );
+                assert!(
+                    out.contains("<thinking>"),
+                    "style '{name}' (compact={compact}): fixture did not render the section"
+                );
+                let lower = out.to_lowercase();
+                assert!(
+                    lower.contains("answer straight away")
+                        || lower.contains("just answer")
+                        || lower.contains("just say it")
+                        || lower.contains("already determined")
+                        || lower.contains("already in front of you"),
+                    "style '{name}' (compact={compact}): <thinking> tells the model when \
+                     to think and never when not to, so every turn pays for a reasoning \
+                     pass. Rendered:\n{out}"
+                );
+            }
+        }
+    }
+
+    /// Covert is not dishonest.
+    ///
+    /// The requirement is silence by default, not denial: never volunteer a tool
+    /// name or a step count, and answer truthfully when the user asks outright.
+    /// Those are different properties and only the first is about noise.
+    ///
+    /// Building the second as concealment would have the assistant lie to its
+    /// owner about their own hardware, which contradicts
+    /// `pai/02-privacy-and-security-guardrails.md`: the privacy property GIAP
+    /// offers is that the model runs on your machine, explicitly NOT that the
+    /// model is blindfolded. It would also contradict `<vision>`, which forbids
+    /// the model claiming a capability it does not have -- the same honesty rule
+    /// pointing the other way.
+    #[test]
+    fn every_style_stays_honest_when_asked_outright() {
+        let s = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [false, true] {
+                let out =
+                    render_jinja_template(raw, &s, Some(&v2_state(compact, false, false)), None);
+                let lower = out.to_lowercase();
+                assert!(
+                    lower.contains("asked outright")
+                        || lower.contains("asked how you know")
+                        || lower.contains("ask me straight out")
+                        || lower.contains("straight out how i know"),
+                    "style '{name}' (compact={compact}): forbids narrating the process \
+                     without preserving the answer to a direct question. Silence by \
+                     default is the requirement; denial is not, and a prompt that only \
+                     says 'never mention your tools' reads as the second. Rendered:\n{out}"
                 );
             }
         }
