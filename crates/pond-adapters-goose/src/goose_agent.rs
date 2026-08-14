@@ -3729,6 +3729,16 @@ impl GooseAdapter {
         // on-device budget. The model still chooses natively, and can pull in any
         // dormant group itself via giap-toolkit.
         let mut dormant_groups_note = String::new();
+        // What this turn is ENTITLED to, as opposed to what it is carrying.
+        //
+        // Narrowing is a prompt-cost decision about this turn's own prompt. The
+        // turn can widen to any permitted group at any moment via
+        // `enable_tool_group`, so its entitlement is the permitted set and its
+        // allow-set is merely where it happens to be standing. Delegation is
+        // bounded by the entitlement, for reasons in the `for_turn` call below.
+        //
+        // `None` in "all" mode, where the two are the same set.
+        let mut entitled_tools: Option<HashSet<String>> = None;
         let allowed_tools = if settings.tool_selection_is_relevant() {
             let groups = self
                 .resolve_session_tool_groups(
@@ -3753,6 +3763,18 @@ impl GooseAdapter {
             dormant_groups_note = pond_core::mcp::services::tool_selection::dormant_groups_note(
                 &groups.permitted,
                 &groups.loaded,
+            );
+
+            // The delegation ceiling: every tool this turn could reach, not just
+            // the ones it is carrying. Same guest subtraction as the allow-set,
+            // applied to the same source, so it can never be the wider set.
+            entitled_tools = Some(
+                pond_core::mcp::services::tool_selection::filter_tools_by_groups(
+                    allowed_tools.iter(),
+                    &groups.permitted,
+                )
+                .into_iter()
+                .collect(),
             );
 
             tracing::info!(
@@ -3821,6 +3843,20 @@ impl GooseAdapter {
         } else {
             allowed_tools
         };
+
+        // The entitlement passes through the SAME subtraction, in the same
+        // branch, on the same condition. A ceiling that skipped it would be the
+        // widening half of the exact defect this section exists to close — and
+        // the delegation authority is built from it below.
+        let entitled_tools = entitled_tools.map(|tools| {
+            if turn_scope.excludes_everything() {
+                pond_core::mcp::services::tool_selection::subtract_guest_denied_tools(tools.iter())
+                    .into_iter()
+                    .collect()
+            } else {
+                tools
+            }
+        });
 
         tracing::debug!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
 
@@ -3955,12 +3991,25 @@ impl GooseAdapter {
         //   decided at the API edge from the session's stored identity. Nothing
         //   a model emits reaches it, and `AgentRequest` is never deserialized
         //   from an HTTP body, so it is not forgeable by a caller either.
-        // - `allowed_tools` is the SAME binding published to the shim two steps
-        //   up: post-selection and post-guest-subtraction. Passing the catalog,
-        //   or the set before section 6d, would make every intersection
-        //   downstream a no-op — the exact shape PAI-1 P5 shipped and had to
-        //   repair. `authority_is_built_from_the_published_allow_set` fails if
+        // - the tool set is this turn's ENTITLEMENT, which is `allowed_tools`
+        //   widened back to every group this session is PERMITTED to hold, and
+        //   then put through the same guest subtraction in the same branch. In
+        //   "all" mode the two are the same set and this is `allowed_tools`
+        //   itself. Passing the catalog, or the set before section 6d, would make
+        //   every intersection downstream a no-op — the exact shape PAI-1 P5
+        //   shipped and had to repair, and
+        //   `the_turn_authority_is_built_from_the_published_allow_set` fails if
         //   this call is ever moved above that subtraction.
+        //
+        //   Entitlement rather than allow-set, because narrowing is a decision
+        //   about THIS turn's prompt budget and a child gets its own prompt. A
+        //   parent holding 4 core groups + 1 scored, three of whose cores are on
+        //   `groups_denied_to_subagents`, handed a research role asking for
+        //   `giap-knowledge` + `giap-news` an EMPTY set — unless its opening
+        //   message happened to score those two. No authority was gained by the
+        //   old bound: the parent can reach any permitted group itself with
+        //   `enable_tool_group`, so `loaded` was never a boundary, only a
+        //   position.
         //
         // The lease is moved into the stream closure beside `cancel_guard`, so
         // the authority dies with the turn: a delegation can only ever be
@@ -3970,7 +4019,11 @@ impl GooseAdapter {
             pond_core::shared::domain::orchestration::DelegationAuthority::for_turn(
                 session_id.clone(),
                 turn_scope.clone(),
-                allowed_tools.iter().map(String::as_str),
+                entitled_tools
+                    .as_ref()
+                    .unwrap_or(&allowed_tools)
+                    .iter()
+                    .map(String::as_str),
             ),
             cancel_token.clone(),
         );
