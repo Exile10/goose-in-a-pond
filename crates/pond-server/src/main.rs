@@ -657,35 +657,13 @@ async fn run_setup(model: &str) -> Result<()> {
 
     // Seed built-in prompt templates (INSERT OR IGNORE — never overwrites user edits)
     {
-        use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+        use pond_core::prompts::BUILTIN_PROMPT_TEMPLATES;
         use pond_core::user_data::domain::prompt_template::PromptTemplate;
         #[allow(unused_imports)]
         use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
 
         let template_repo = SqlitePromptTemplateRepository::new(db_setup.system.clone());
-        let built_ins = [
-            (
-                "balanced",
-                PROMPT_BALANCED,
-                "Warm, practical, complete behaviour rules. Default for most households.",
-            ),
-            (
-                "concise",
-                PROMPT_CONCISE,
-                "Minimal, action-first. For power users who want brevity.",
-            ),
-            (
-                "technical",
-                PROMPT_TECHNICAL,
-                "Verbose, tool-aware, narrates reasoning. For developers.",
-            ),
-            (
-                "warm",
-                PROMPT_WARM,
-                "Conversational, family-friendly, personality-forward.",
-            ),
-        ];
-        for (name, content, description) in built_ins {
+        for &(name, content, description) in BUILTIN_PROMPT_TEMPLATES {
             let t = PromptTemplate {
                 name: name.to_string(),
                 content: content.to_string(),
@@ -1693,33 +1671,11 @@ async fn run_server(
 
     // Reseed built-in prompt templates with latest Jinja2 general-purpose content.
     {
-        use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+        use pond_core::prompts::BUILTIN_PROMPT_TEMPLATES;
         use pond_core::user_data::domain::prompt_template::PromptTemplate;
         #[allow(unused_imports)]
         use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
-        let built_ins = [
-            (
-                "balanced",
-                PROMPT_BALANCED,
-                "Warm, practical, general-purpose. Default.",
-            ),
-            (
-                "concise",
-                PROMPT_CONCISE,
-                "Minimal, action-first. For power users.",
-            ),
-            (
-                "technical",
-                PROMPT_TECHNICAL,
-                "Verbose, tool-aware, narrates reasoning. For developers.",
-            ),
-            (
-                "warm",
-                PROMPT_WARM,
-                "Conversational, family-friendly, personality-forward.",
-            ),
-        ];
-        for (name, content, description) in built_ins {
+        for &(name, content, description) in BUILTIN_PROMPT_TEMPLATES {
             let t = PromptTemplate {
                 name: name.to_string(),
                 content: content.to_string(),
@@ -4114,33 +4070,11 @@ async fn run_chat(
     // Uses upsert (not insert_if_absent) so existing installs get the updated templates.
     // User-created templates (is_system = false) are never touched.
     {
-        use pond_core::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
+        use pond_core::prompts::BUILTIN_PROMPT_TEMPLATES;
         use pond_core::user_data::domain::prompt_template::PromptTemplate;
         #[allow(unused_imports)]
         use pond_core::user_data::ports::prompt_template::PromptTemplateRepository;
-        let built_ins = [
-            (
-                "balanced",
-                PROMPT_BALANCED,
-                "Warm, practical, general-purpose. Default.",
-            ),
-            (
-                "concise",
-                PROMPT_CONCISE,
-                "Minimal, action-first. For power users.",
-            ),
-            (
-                "technical",
-                PROMPT_TECHNICAL,
-                "Verbose, tool-aware, narrates reasoning. For developers.",
-            ),
-            (
-                "warm",
-                PROMPT_WARM,
-                "Conversational, family-friendly, personality-forward.",
-            ),
-        ];
-        for (name, content, description) in built_ins {
+        for &(name, content, description) in BUILTIN_PROMPT_TEMPLATES {
             let t = PromptTemplate {
                 name: name.to_string(),
                 content: content.to_string(),
@@ -8020,32 +7954,15 @@ async fn run_prompts_cmd(action: PromptAction) -> Result<()> {
         },
 
         PromptAction::Reset { name } => {
-            use pond_core::prompts::{
-                PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM,
-            };
+            use pond_core::prompts::builtin_template_content;
             use pond_core::user_data::domain::prompt_template::PromptTemplate;
 
-            let (content, description) = match name.as_str() {
-                "balanced" => (
-                    PROMPT_BALANCED,
-                    "Warm, practical, complete behaviour rules. Default for most households.",
-                ),
-                "concise" => (
-                    PROMPT_CONCISE,
-                    "Minimal, action-first. For power users who want brevity.",
-                ),
-                "technical" => (
-                    PROMPT_TECHNICAL,
-                    "Verbose, tool-aware, narrates reasoning. For developers.",
-                ),
-                "warm" => (
-                    PROMPT_WARM,
-                    "Conversational, family-friendly, personality-forward.",
-                ),
-                other => {
-                    eprintln!("'{other}' is not a built-in template. Only balanced | concise | technical | warm can be reset.");
-                    std::process::exit(1);
-                }
+            // Deliberately the same lookup the REST reset handler uses. This arm
+            // used to carry its own `match`, so the two reset paths could ship
+            // different factory text — and did, for the description.
+            let Some((content, description)) = builtin_template_content(&name) else {
+                eprintln!("'{name}' is not a built-in template. Only balanced | concise | technical | warm can be reset.");
+                std::process::exit(1);
             };
             let t = PromptTemplate {
                 name: name.clone(),

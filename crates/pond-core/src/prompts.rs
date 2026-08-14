@@ -839,31 +839,55 @@ pub fn vision_capability_section(compact: bool) -> &'static str {
 
 // ── Built-in template lookup ─────────────────────────────────────────────
 
+/// Every built-in prompt template, as `(name, content, description)`.
+///
+/// This is the ONE table. Five call sites used to carry a copy of it — `run_setup`,
+/// the boot reseed, the chat-CLI reseed, `pond prompts reset`, and
+/// [`builtin_template_content`] — and they had already drifted apart: three said
+/// balanced was *"Warm, practical, complete behaviour rules. Default for most
+/// households."* and two said *"Warm, practical, general-purpose. Default."*.
+///
+/// That drift was not cosmetic, because the two disagreeing sets were written by
+/// paths that run in sequence. `seed_system_template` upserts
+/// `description = excluded.description` for any row that is not customized, so
+/// `pond prompts reset` wrote one description and the very next boot silently
+/// replaced it with the other. A user could watch the field change without
+/// touching anything.
+///
+/// Order is catalog order and is relied on by nothing; look rows up by name.
+pub const BUILTIN_PROMPT_TEMPLATES: &[(&str, &str, &str)] = &[
+    (
+        "balanced",
+        PROMPT_BALANCED,
+        "Warm, practical, complete behaviour rules. Default for most households.",
+    ),
+    (
+        "concise",
+        PROMPT_CONCISE,
+        "Minimal, action-first. For power users who want brevity.",
+    ),
+    (
+        "technical",
+        PROMPT_TECHNICAL,
+        "Verbose, tool-aware, narrates reasoning. For developers.",
+    ),
+    (
+        "warm",
+        PROMPT_WARM,
+        "Conversational, family-friendly, personality-forward.",
+    ),
+];
+
 /// Return the original (factory-default) content and description for a built-in
 /// prompt template name.
 ///
 /// Returns `None` for unknown or user-created template names.
 /// Used by both the CLI `prompts reset` command and `POST /api/v1/prompts/{name}/reset`.
 pub fn builtin_template_content(name: &str) -> Option<(&'static str, &'static str)> {
-    match name {
-        "balanced" => Some((
-            PROMPT_BALANCED,
-            "Warm, practical, complete behaviour rules. Default for most households.",
-        )),
-        "concise" => Some((
-            PROMPT_CONCISE,
-            "Minimal, action-first. For power users who want brevity.",
-        )),
-        "technical" => Some((
-            PROMPT_TECHNICAL,
-            "Verbose, tool-aware, narrates reasoning. For developers.",
-        )),
-        "warm" => Some((
-            PROMPT_WARM,
-            "Conversational, family-friendly, personality-forward.",
-        )),
-        _ => None,
-    }
+    BUILTIN_PROMPT_TEMPLATES
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, content, description)| (*content, *description))
 }
 
 // ── Sanitization ──────────────────────────────────────────────────────────────
