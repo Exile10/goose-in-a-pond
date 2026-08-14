@@ -207,3 +207,171 @@ fn the_extension_count_is_pinned() {
          rather than a string literal."
     );
 }
+
+// ── The third list in the family ───────────────────────────────────────────
+
+/// `dispatcher.rs`'s routed prefixes, as extension names.
+///
+/// Parsed from `prefix: PREFIX_X` occurrences rather than from the `PREFIX_*`
+/// declarations, because the two differ on purpose: `PREFIX_AUDIT` is declared
+/// and deliberately not routed, and a guard that read declarations would call
+/// that a match.
+fn dispatcher_routed_extensions() -> BTreeSet<String> {
+    let path = workspace_root().join("crates/pond-mcp-server/src/dispatcher.rs");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let code: String = src
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(i) => &line[..i],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // const PREFIX_WEATHER: &str = "giap-weather__";
+    let mut by_const: std::collections::BTreeMap<String, String> = Default::default();
+    for line in code.lines() {
+        let Some(rest) = line.trim().strip_prefix("const PREFIX_") else {
+            continue;
+        };
+        let Some((name, tail)) = rest.split_once(':') else {
+            continue;
+        };
+        let Some(open) = tail.find('"') else { continue };
+        let Some(close) = tail[open + 1..].find('"') else {
+            continue;
+        };
+        let value = &tail[open + 1..open + 1 + close];
+        by_const.insert(
+            format!("PREFIX_{}", name.trim()),
+            value.trim_end_matches("__").to_string(),
+        );
+    }
+    assert!(
+        by_const.len() >= 10,
+        "found {} PREFIX_* consts in dispatcher.rs — the parser is broken, so an \
+         empty result would prove nothing",
+        by_const.len()
+    );
+
+    let mut routed = BTreeSet::new();
+    for (at, _) in code.match_indices("prefix: PREFIX_") {
+        let tail = &code[at + "prefix: ".len()..];
+        let end = tail
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(tail.len());
+        let ident = &tail[..end];
+        let ext = by_const.get(ident).unwrap_or_else(|| {
+            panic!("dispatcher.rs routes `{ident}`, which is not a PREFIX_* const it declares")
+        });
+        routed.insert(ext.clone());
+    }
+    routed
+}
+
+/// Extensions the direct dispatcher deliberately does not route, and why.
+///
+/// Every entry is a REASON, not a name on a list. Adding a new extension makes
+/// the test below fail until somebody either routes it or writes down why not,
+/// which is the point: this drifted to 11-against-17 silently.
+const DISPATCHER_EXCLUSIONS: &[(&str, &str)] = &[
+    (
+        "giap-audit",
+        "needs the EventLog installed by pond-server's init_audit_deps; \
+         McpToolDispatcher::new receives no logs DB",
+    ),
+    (
+        "giap-vision",
+        "needs the CameraStorage installed by pond-server's init_vision_deps",
+    ),
+    (
+        "giap-sensors",
+        "needs the SensorStorage installed by pond-server's init_sensor_deps",
+    ),
+    (
+        "giap-context",
+        "needs the context deps AND a resolvable caller; these routes carry no \
+         engine session, so scope_for could only ever refuse",
+    ),
+    (
+        "giap-toolkit",
+        "widens a SESSION's tool selection, and these routes have no session",
+    ),
+    (
+        "giap-orchestrator",
+        "delegation needs a live turn authority, which only a chat turn publishes",
+    ),
+];
+
+/// The dispatcher, the registration list and the catalog are three views of one
+/// set, and only two of them were tied together.
+///
+/// `dispatcher.rs` is a SECOND live dispatch path — `main.rs` binds it into
+/// `AppState` unconditionally and `POST /api/v1/tools/invoke` and
+/// `POST /api/v1/mcp/tools/call` serve it. Its `servers` vec had drifted to 11
+/// against `giap_registration.rs`'s 17, and for four of the six missing ones the
+/// omission was undocumented — so nobody could tell an intentional exclusion
+/// from a forgotten one.
+///
+/// What actually keeps that path safe is `routes.rs :: DIRECT_DISPATCH_ALLOWLIST`,
+/// which is three tools. This test does not weaken that: it only requires the
+/// two lists to agree about what EXISTS.
+#[test]
+fn the_dispatcher_routes_a_documented_subset_of_the_registered_extensions() {
+    let registered: BTreeSet<String> = registered_extensions_from_source().into_iter().collect();
+    let routed = dispatcher_routed_extensions();
+    let excluded: BTreeSet<String> = DISPATCHER_EXCLUSIONS
+        .iter()
+        .map(|(name, _)| (*name).to_string())
+        .collect();
+
+    assert!(
+        !routed.is_empty(),
+        "the dispatcher routes nothing — parser broken"
+    );
+
+    // 1. Nothing routed that is not registered: a phantom prefix can never match
+    //    a real tool.
+    for ext in &routed {
+        assert!(
+            registered.contains(ext),
+            "dispatcher.rs routes '{ext}', which giap_registration.rs does not register"
+        );
+    }
+
+    // 2. Nothing both excluded and routed — a contradiction inside this test's
+    //    own input.
+    for ext in &excluded {
+        assert!(
+            !routed.contains(ext),
+            "'{ext}' is on DISPATCHER_EXCLUSIONS and is routed anyway"
+        );
+    }
+
+    // 3. Every registered extension is routed, or excluded WITH a reason.
+    let unexplained: Vec<&String> = registered
+        .iter()
+        .filter(|e| !routed.contains(*e) && !excluded.contains(*e))
+        .collect();
+    assert!(
+        unexplained.is_empty(),
+        "registered but neither routed by dispatcher.rs nor listed in \
+         DISPATCHER_EXCLUSIONS with a reason: {unexplained:?}\n\
+         Route it, or say why it cannot be — a silent omission is \
+         indistinguishable from a forgotten one, which is how this drifted."
+    );
+
+    // 4. Vacuity control on the exclusion list: an entry naming an extension
+    //    that no longer exists is dead weight that hides real drift.
+    for (ext, reason) in DISPATCHER_EXCLUSIONS {
+        assert!(
+            registered.contains(&ext.to_string()),
+            "DISPATCHER_EXCLUSIONS names '{ext}', which is not registered at all"
+        );
+        assert!(
+            !reason.trim().is_empty(),
+            "'{ext}' is excluded with no reason"
+        );
+    }
+}

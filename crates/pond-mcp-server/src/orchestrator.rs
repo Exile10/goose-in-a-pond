@@ -716,7 +716,6 @@ impl ServerHandler for OrchestratorMcpServer {
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -796,14 +795,7 @@ pub fn spawn_orchestrator_server(reader: DuplexStream, writer: DuplexStream) {
     // `giap-toolkit`, the degraded behaviour is refusal rather than a truthful
     // "nothing to do".
     let server = OrchestratorMcpServer::new(ORCHESTRATOR_DEPS.get().cloned());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-orchestrator MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-orchestrator", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

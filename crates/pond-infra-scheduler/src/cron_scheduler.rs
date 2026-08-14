@@ -52,6 +52,12 @@ struct PersistedTask {
     /// then on.
     #[serde(default)]
     last_run: Option<chrono::DateTime<Utc>>,
+    /// Fire ONCE at this instant, then delete. `None` for a recurring task.
+    ///
+    /// `#[serde(default)]`, so a state file written before one-shots existed
+    /// rehydrates as recurring — which is what it was.
+    #[serde(default)]
+    fire_at: Option<chrono::DateTime<Utc>>,
 }
 
 fn default_timezone() -> String {
@@ -283,8 +289,6 @@ impl CronSchedulerAdapter {
         cron: &str,
         kind: TaskKind,
     ) -> Result<uuid::Uuid> {
-        use pond_core::user_data::domain::schedule::ScheduleResultEvent;
-
         let executor = self.executor.clone();
         let tasks = self.tasks.clone();
         let run_history = self.run_history.clone();
@@ -293,93 +297,83 @@ impl CronSchedulerAdapter {
         let id = task_id.to_string();
 
         let job = Job::new_async(cron, move |_uuid, _lock| {
-            let executor = executor.clone();
-            let tasks = tasks.clone();
-            let run_history = run_history.clone();
-            let result_tx = result_tx.clone();
-            let persist = persist.clone();
-            let id = id.clone();
-            let kind = kind.clone();
+            let ctx = TaskRunContext {
+                executor: executor.clone(),
+                tasks: tasks.clone(),
+                run_history: run_history.clone(),
+                result_tx: result_tx.clone(),
+                persist: persist.clone(),
+                id: id.clone(),
+                kind: kind.clone(),
+            };
+            Box::pin(async move { ctx.run().await })
+        })
+        .map_err(|e| anyhow::anyhow!("invalid cron expression '{cron}': {e}"))?;
+
+        let job_id = self.scheduler.add(job).await?;
+        Ok(job_id)
+    }
+
+    /// Register a task that fires ONCE at `at`, then removes itself.
+    ///
+    /// `Job::new_one_shot_at_instant_async` takes a `std::time::Instant`, which
+    /// is monotonic and meaningless across a restart — so the delay is derived
+    /// here from the stored absolute `fire_at` every time the task is
+    /// registered, including on rehydration. A `fire_at` already in the past
+    /// fires immediately rather than being dropped: a timer the pond was asleep
+    /// for is late, not cancelled, and the user asked for it.
+    async fn add_one_shot_to_scheduler(
+        &self,
+        task_id: &str,
+        at: chrono::DateTime<Utc>,
+        kind: TaskKind,
+    ) -> Result<uuid::Uuid> {
+        let delay = (at - Utc::now())
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO);
+
+        let executor = self.executor.clone();
+        let tasks = self.tasks.clone();
+        let run_history = self.run_history.clone();
+        let result_tx = self.result_tx.clone();
+        let persist = self.persist.clone();
+        let id = task_id.to_string();
+
+        let job = Job::new_one_shot_async(delay, move |_uuid, _lock| {
+            let ctx = TaskRunContext {
+                executor: executor.clone(),
+                tasks: tasks.clone(),
+                run_history: run_history.clone(),
+                result_tx: result_tx.clone(),
+                persist: persist.clone(),
+                id: id.clone(),
+                kind: kind.clone(),
+            };
             Box::pin(async move {
-                // Get label for the event
-                let label = {
-                    let guard = tasks.lock().await;
+                let tasks = ctx.tasks.clone();
+                let persist = ctx.persist.clone();
+                let id = ctx.id.clone();
+                ctx.run().await;
+                // Self-delete. A fired one-shot that stays in the list is a
+                // corpse: `list_schedules` accumulates them and a small model
+                // reading that list gets worse at using it over time. Pausing
+                // instead would leave something a user could "resume" into a
+                // timer for a moment that has passed.
+                let records = {
+                    let mut guard = tasks.lock().await;
+                    guard.remove(&id);
                     guard
-                        .get(&id)
-                        .map(|e| e.persisted.label.clone())
-                        .unwrap_or_default()
+                        .values()
+                        .map(|e| e.persisted.clone())
+                        .collect::<Vec<_>>()
                 };
-
-                // Mark running
-                {
-                    let mut guard = tasks.lock().await;
-                    if let Some(entry) = guard.get_mut(&id) {
-                        entry.currently_running = true;
-                    }
-                }
-                Self::stamp_fire(&tasks, &persist, &id).await;
-
-                // Record run start
-                let run_id = run_history.record_start(&id).await;
-                let start = std::time::Instant::now();
-
-                // Broadcast "started" event so clients see progress immediately
-                if let Some(tx) = &result_tx {
-                    let _ = tx.send(ScheduleResultEvent {
-                        schedule_id: id.clone(),
-                        schedule_label: label.clone(),
-                        run_id: run_id.clone(),
-                        status: RunStatus::Running,
-                        result: None,
-                        error: None,
-                        duration_ms: None,
-                    });
-                }
-
-                // Execute
-                let result = executor.execute(&id, &kind).await;
-                let duration_ms = start.elapsed().as_millis() as u64;
-
-                // Record run finish + broadcast event
-                let (status, result_text, error_text) = match &result {
-                    Ok(text) => {
-                        run_history
-                            .record_finish(&run_id, RunStatus::Completed, Some(text.clone()), None)
-                            .await;
-                        (RunStatus::Completed, Some(text.clone()), None)
-                    }
-                    Err(e) => {
-                        tracing::error!("Scheduled task {id} failed: {e}");
-                        run_history
-                            .record_finish(&run_id, RunStatus::Failed, None, Some(e.to_string()))
-                            .await;
-                        (RunStatus::Failed, None, Some(e.to_string()))
-                    }
-                };
-
-                // Broadcast result event (for SSE / desktop notifications)
-                if let Some(tx) = &result_tx {
-                    let _ = tx.send(ScheduleResultEvent {
-                        schedule_id: id.clone(),
-                        schedule_label: label,
-                        run_id: run_id.clone(),
-                        status,
-                        result: result_text,
-                        error: error_text,
-                        duration_ms: Some(duration_ms),
-                    });
-                }
-
-                // Mark not-running. `last_run` was stamped at fire time above.
-                {
-                    let mut guard = tasks.lock().await;
-                    if let Some(entry) = guard.get_mut(&id) {
-                        entry.currently_running = false;
-                    }
+                let seq = persist.ticket();
+                if let Err(e) = persist.publish(seq, &records).await {
+                    tracing::warn!("one-shot {id} fired but could not be removed from disk: {e}");
                 }
             })
         })
-        .map_err(|e| anyhow::anyhow!("invalid cron expression '{cron}': {e}"))?;
+        .map_err(|e| anyhow::anyhow!("could not schedule a one-shot for {at}: {e}"))?;
 
         let job_id = self.scheduler.add(job).await?;
         Ok(job_id)
@@ -398,6 +392,11 @@ impl CronSchedulerAdapter {
     fn to_schedule(entry: &TaskEntry) -> Schedule {
         let next_run = if entry.persisted.paused {
             None
+        } else if let Some(at) = entry.persisted.fire_at {
+            // A one-shot's next run IS its fire time. `compute_next_run` would
+            // try to parse the "@once" sentinel and return None, which reads to
+            // a caller as "never runs".
+            Some(at)
         } else {
             compute_next_run(&entry.persisted.cron, &entry.persisted.timezone)
         };
@@ -405,6 +404,7 @@ impl CronSchedulerAdapter {
             id: entry.persisted.id.clone(),
             label: entry.persisted.label.clone(),
             cron: entry.persisted.cron.clone(),
+            fire_at: entry.persisted.fire_at,
             timezone: entry.persisted.timezone.clone(),
             kind: Self::resolve_kind(entry),
             paused: entry.persisted.paused,
@@ -709,13 +709,22 @@ impl SchedulerPort for CronSchedulerAdapter {
             paused: false,
             created_at: Some(Utc::now()),
             last_run: None,
+            fire_at: req.fire_at,
         };
 
         // Event-triggered rules (#92) never register a cron job — the rules
         // engine fires them via `run_now` when a matching bus event arrives.
         // The nil job id marks "no cron job", same as the paused state.
+        // Three registration shapes, and only one of them is cron.
+        //
+        // An event rule waits for the bus; a one-shot waits for a wall-clock
+        // instant; everything else waits for a cadence. The nil job id marks
+        // "no cron job", same as the paused state.
         let job_id = if req.kind.is_event_triggered() {
             uuid::Uuid::nil()
+        } else if let Some(at) = req.fire_at {
+            self.add_one_shot_to_scheduler(&req.id, at, req.kind.clone())
+                .await?
         } else {
             self.add_job_to_scheduler(&req.id, &req.cron, req.kind.clone())
                 .await?
@@ -723,6 +732,8 @@ impl SchedulerPort for CronSchedulerAdapter {
 
         let next_run = if req.kind.is_event_triggered() {
             None
+        } else if let Some(at) = req.fire_at {
+            Some(at)
         } else {
             compute_next_run(&req.cron, &req.timezone)
         };
@@ -730,6 +741,7 @@ impl SchedulerPort for CronSchedulerAdapter {
             id: req.id.clone(),
             label: req.label,
             cron: req.cron,
+            fire_at: req.fire_at,
             timezone: req.timezone,
             kind: req.kind,
             last_run: None,
@@ -862,7 +874,7 @@ impl SchedulerPort for CronSchedulerAdapter {
             // Every sensor-rule fire arrives here: the rules engine fires a
             // rule through `run_now`, so this is the stamp its cooldown reads
             // back after a restart.
-            Self::stamp_fire(&tasks, &persist, &id).await;
+            CronSchedulerAdapter::stamp_fire(&tasks, &persist, &id).await;
 
             let run_id = run_history.record_start(&id).await;
             let start = std::time::Instant::now();
@@ -1061,6 +1073,7 @@ mod tests {
             id: id.to_string(),
             label: format!("Test task {id}"),
             cron: cron.to_string(),
+            fire_at: None,
             timezone: "UTC".to_string(),
             kind: TaskKind::AgentPrompt {
                 prompt: "Hello".to_string(),
@@ -1351,6 +1364,7 @@ mod tests {
             SensorTriggerSpec, TriggerCondition, TriggerSource, TriggerSourceKind,
         };
         CreateScheduleRequest {
+            fire_at: None,
             id: id.to_string(),
             label: format!("rule {id}"),
             cron: "@event".to_string(),
@@ -1455,6 +1469,7 @@ mod tests {
     fn snapshot_of(ids: &[&str], pad: usize) -> Vec<PersistedTask> {
         ids.iter()
             .map(|id| PersistedTask {
+                fire_at: None,
                 id: (*id).to_string(),
                 label: format!("label of {id} {}", "x".repeat(pad)),
                 cron: "0 0 4 * * *".into(),
@@ -1713,6 +1728,112 @@ mod tests {
                 assert_eq!(webhook_url, "https://example.com/hook");
             }
             other => panic!("expected Webhook kind, got {other:?}"),
+        }
+    }
+}
+
+/// Everything one task fire needs, so a cron job and a one-shot can share the
+/// body rather than keeping two copies of it in sync.
+struct TaskRunContext {
+    executor: Arc<dyn ScheduleExecutor>,
+    tasks: Arc<Mutex<HashMap<String, TaskEntry>>>,
+    run_history: Arc<JsonRunHistory>,
+    result_tx: Option<
+        tokio::sync::broadcast::Sender<pond_core::user_data::domain::schedule::ScheduleResultEvent>,
+    >,
+    persist: Arc<SnapshotWriter>,
+    id: String,
+    kind: TaskKind,
+}
+
+impl TaskRunContext {
+    async fn run(self) {
+        use pond_core::user_data::domain::schedule::ScheduleResultEvent;
+        let TaskRunContext {
+            executor,
+            tasks,
+            run_history,
+            result_tx,
+            persist,
+            id,
+            kind,
+        } = self;
+
+        // Get label for the event
+        let label = {
+            let guard = tasks.lock().await;
+            guard
+                .get(&id)
+                .map(|e| e.persisted.label.clone())
+                .unwrap_or_default()
+        };
+
+        // Mark running
+        {
+            let mut guard = tasks.lock().await;
+            if let Some(entry) = guard.get_mut(&id) {
+                entry.currently_running = true;
+            }
+        }
+        CronSchedulerAdapter::stamp_fire(&tasks, &persist, &id).await;
+
+        // Record run start
+        let run_id = run_history.record_start(&id).await;
+        let start = std::time::Instant::now();
+
+        // Broadcast "started" event so clients see progress immediately
+        if let Some(tx) = &result_tx {
+            let _ = tx.send(ScheduleResultEvent {
+                schedule_id: id.clone(),
+                schedule_label: label.clone(),
+                run_id: run_id.clone(),
+                status: RunStatus::Running,
+                result: None,
+                error: None,
+                duration_ms: None,
+            });
+        }
+
+        // Execute
+        let result = executor.execute(&id, &kind).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Record run finish + broadcast event
+        let (status, result_text, error_text) = match &result {
+            Ok(text) => {
+                run_history
+                    .record_finish(&run_id, RunStatus::Completed, Some(text.clone()), None)
+                    .await;
+                (RunStatus::Completed, Some(text.clone()), None)
+            }
+            Err(e) => {
+                tracing::error!("Scheduled task {id} failed: {e}");
+                run_history
+                    .record_finish(&run_id, RunStatus::Failed, None, Some(e.to_string()))
+                    .await;
+                (RunStatus::Failed, None, Some(e.to_string()))
+            }
+        };
+
+        // Broadcast result event (for SSE / desktop notifications)
+        if let Some(tx) = &result_tx {
+            let _ = tx.send(ScheduleResultEvent {
+                schedule_id: id.clone(),
+                schedule_label: label,
+                run_id: run_id.clone(),
+                status,
+                result: result_text,
+                error: error_text,
+                duration_ms: Some(duration_ms),
+            });
+        }
+
+        // Mark not-running. `last_run` was stamped at fire time above.
+        {
+            let mut guard = tasks.lock().await;
+            if let Some(entry) = guard.get_mut(&id) {
+                entry.currently_running = false;
+            }
         }
     }
 }

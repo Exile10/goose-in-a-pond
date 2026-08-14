@@ -238,8 +238,25 @@ where
 /// See [`crate::mcp::domain::tool_group::groups_denied_to_guests`] for the list
 /// and why it is a denylist rather than an allowlist.
 ///
-/// **This is the enforcement point for PAI-1 P5, and it operates on TOOLS
-/// rather than groups deliberately.** The group-level subtraction inside the
+/// **This is a PROMPT-SURFACE control, not an execution gate, and the
+/// difference matters.** It decides what the model can SEE, which is what stops
+/// it choosing a withheld tool. It does not stop one running: `goose_agent.rs`'s
+/// tool-call guard says so in terms — by the time it runs, "the tool either has
+/// run or is about to, and nothing here can stop it" — because goose keeps every
+/// extension loaded agent-wide and collects every `ToolRequest` regardless of
+/// which schemas were published. What that guard does is refuse to SURFACE the
+/// call and its result. A real execution gate needs an inspector registered with
+/// goose's `ToolInspectionManager`, whose `add_inspector` is private: a fork
+/// patch, not a local change.
+///
+/// So this is the layer that makes a withheld capability unreachable in
+/// practice, and it is defence in depth rather than a wall. It was previously
+/// described here as "the enforcement point for PAI-1 P5", which reads as the
+/// stronger claim and is worth not making, because the tool-narrowing design
+/// leans on this function.
+///
+/// **It operates on TOOLS rather than groups deliberately.** The group-level
+/// subtraction inside the
 /// adapter's selection path only runs when
 /// `settings.tool_selection_mode == "relevant"`, and the default is `"all"` --
 /// so on a default install the selection path is skipped entirely and the
@@ -267,9 +284,77 @@ where
             // An unprefixed name belongs to no group and cannot be matched
             // against the denylist. Keeping it is the widening choice, but a
             // tool with no group is a platform tool, not personal data.
-            Some(ext) => !denied.contains(&ext),
             None => true,
+            // A CATALOG extension is judged by the denylist, which is a list of
+            // `giap-*` literals.
+            Some(ext) if is_catalog_extension(ext) => !denied.contains(&ext),
+            // Engine plumbing. Not personal data, and the shim's allow-set
+            // governs it anyway — same reasoning as the unprefixed case.
+            Some(ext) if ENGINE_TOOL_PREFIXES.contains(&ext) => true,
+            // Anything else with a prefix is a user-added MCP server, and the
+            // denylist can never name it — it holds `giap-*` literals and this
+            // prefix is not one. So the old `!denied.contains(&ext)` was
+            // structurally `true` here: a third-party server reading mail,
+            // calendars or files was invisible to PAI-1's guest boundary while
+            // every builtin was checked against it.
+            //
+            // Default-deny instead. An unidentified speaker is somebody the pond
+            // could not name, and for a server whose data GIAP knows nothing
+            // about the honest answer is no. The consented path is a per-server
+            // "guests may use this" flag, not a silent yes.
+            //
+            // The subagent side needs no equivalent: `TaskSpec::grants_tool`
+            // denies any group not explicitly in the child's set, so unknown
+            // already means no there.
+            Some(_) => false,
         })
+        .cloned()
+        .collect()
+}
+
+/// Tool-name prefixes that belong to the AGENT ENGINE rather than to any
+/// extension.
+///
+/// goose injects a handful of its own tools (`platform__manage_schedule`,
+/// `recipe__final_output`). They are not personal data and the provider shim's
+/// allow-set already vetoes them, so they are kept for a guest on the same
+/// reasoning as an unprefixed name. Named explicitly because
+/// [`subtract_guest_denied_tools`] otherwise default-denies every non-catalog
+/// prefix, and silently dropping engine plumbing would look like a tool-calling
+/// bug rather than a boundary decision.
+const ENGINE_TOOL_PREFIXES: &[&str] = &["platform", "recipe", "dynamic_task"];
+
+/// The groups a speaker with this scope may EVER hold.
+///
+/// This is the PAI-1 boundary as a value, and it exists because two callers used
+/// to derive it independently and one of them got it wrong. `dormant_groups_note`
+/// was built from the full registered list, so an unidentified speaker was shown
+/// `giap-memory`, `giap-vision`, `giap-audit` and `giap-context` under a sentence
+/// telling it that enabling one makes its tools available immediately — the
+/// groups had been withheld from the selection and then advertised anyway. And
+/// the escape hatch checked catalog membership and registration only, so the
+/// speaker could take what the menu offered.
+///
+/// Applied to the candidates going INTO [`select_groups`] rather than subtracted
+/// after. That works because `select_groups` filters the core set by `available`;
+/// an older comment in the adapter claimed a pre-filter "would not stick because
+/// select_groups puts core groups back unconditionally", which has not been true
+/// for as long as that filter has existed.
+///
+/// A denylist, for the same reason `groups_denied_to_guests` is one: a new
+/// extension is not personal data by default, and the failure mode of the
+/// alternative is a capability silently missing rather than one silently granted.
+pub fn permitted_groups(
+    available: &[String],
+    scope: &crate::user_data::domain::profile::ProfileScope,
+) -> Vec<String> {
+    if !scope.excludes_everything() {
+        return available.to_vec();
+    }
+    let denied = crate::mcp::domain::tool_group::groups_denied_to_guests();
+    available
+        .iter()
+        .filter(|e| !denied.contains(&e.as_str()))
         .cloned()
         .collect()
 }
@@ -436,6 +521,113 @@ mod tests {
         assert!(sel.groups.contains(&"giap-weather".to_string()));
         // giap-memory / giap-system are core but not registered here.
         assert!(!sel.groups.contains(&"giap-memory".to_string()));
+    }
+
+    // ── The PAI-1 boundary ────────────────────────────────────────────────
+
+    /// A guest may not hold a personal-data group, and may not be shown one.
+    ///
+    /// Both halves in one test because they were one bug. The groups were
+    /// withheld from the selection and then advertised by
+    /// `dormant_groups_note`, which was built from the full registered list —
+    /// under a sentence that tells the model enabling a group makes its tools
+    /// available immediately. Withholding a capability and then publishing a
+    /// menu of it is worse than not withholding it, because it reads as an
+    /// invitation.
+    #[test]
+    fn a_guest_is_neither_given_nor_offered_a_personal_group() {
+        use crate::user_data::domain::profile::ProfileScope;
+
+        let all = available();
+        let denied = crate::mcp::domain::tool_group::groups_denied_to_guests();
+        assert!(
+            !denied.is_empty(),
+            "the guest denylist is empty, so this test would pass against anything"
+        );
+
+        let permitted = permitted_groups(&all, &ProfileScope::Guest);
+
+        // Held: nothing denied survives into the ceiling.
+        for d in denied {
+            assert!(
+                !permitted.iter().any(|p| p == d),
+                "'{d}' is denied to guests but is in the permitted set"
+            );
+        }
+        assert!(
+            permitted.len() < all.len(),
+            "the guest ceiling is the whole catalog — the subtraction did nothing"
+        );
+
+        // Offered: the note may only name groups from the ceiling. Loaded is
+        // empty, which is the worst case — everything permitted is dormant.
+        let note = dormant_groups_note(&permitted, &[]);
+        assert!(
+            !note.is_empty(),
+            "no note rendered, so the assertions below prove nothing"
+        );
+        for d in denied {
+            assert!(
+                !note.contains(d),
+                "the dormant-groups note offers '{d}' to a guest:\n{note}"
+            );
+        }
+    }
+
+    /// An identified speaker loses nothing. The boundary is for guests only.
+    #[test]
+    fn an_identified_speaker_keeps_the_whole_catalog() {
+        use crate::user_data::domain::profile::ProfileScope;
+
+        let all = available();
+        for scope in [
+            ProfileScope::Household,
+            ProfileScope::Owner("member-1".to_string()),
+        ] {
+            let permitted = permitted_groups(&all, &scope);
+            assert_eq!(
+                permitted.len(),
+                all.len(),
+                "{scope:?} lost groups it is entitled to"
+            );
+        }
+    }
+
+    /// The ceiling bounds selection, including the core groups.
+    ///
+    /// This is what lets the boundary be applied once, going in, rather than
+    /// subtracted afterwards: `select_groups` filters `core_group_names()` by
+    /// `available`, so passing the guest ceiling as `available` keeps `giap-draft`
+    /// and `giap-memory` out even though both are core.
+    #[test]
+    fn selecting_from_the_guest_ceiling_drops_even_core_groups() {
+        use crate::mcp::domain::tool_group::core_group_names;
+        use crate::user_data::domain::profile::ProfileScope;
+
+        let permitted = permitted_groups(&available(), &ProfileScope::Guest);
+        let denied = crate::mcp::domain::tool_group::groups_denied_to_guests();
+
+        // Precondition the whole approach rests on: at least one core group is
+        // denied to guests. If that stopped being true this test would be
+        // measuring nothing.
+        let denied_core: Vec<&str> = core_group_names()
+            .into_iter()
+            .filter(|c| denied.contains(c))
+            .collect();
+        assert!(
+            !denied_core.is_empty(),
+            "no core group is denied to guests, so 'the pre-filter also bounds \
+             core groups' is untested"
+        );
+
+        // No embedder — the widening path, which is what a fresh Jetson takes.
+        let selection = select_groups(&permitted, None, DEFAULT_RELEVANCE_THRESHOLD);
+        for c in &denied_core {
+            assert!(
+                !selection.groups.iter().any(|g| g == c),
+                "core group '{c}' came back for a guest despite the ceiling"
+            );
+        }
     }
 
     /// A user-added MCP server is not in the catalog, so selection leaves it be.
@@ -693,8 +885,46 @@ mod tests {
     /// to be discovered.
     #[test]
     fn an_ungrouped_tool_is_kept() {
-        let all = tools(&["platform__final_output"]);
-        assert_eq!(subtract_guest_denied_tools(all.iter()).len(), 1);
+        let all = tools(&["final_output", "platform__final_output"]);
+        assert_eq!(
+            subtract_guest_denied_tools(all.iter()).len(),
+            2,
+            "engine plumbing was dropped for a guest — it is not personal data, \
+             and the shim's allow-set already governs it"
+        );
+    }
+
+    /// A user-added MCP server is default-DENIED to a guest, and that is the
+    /// asymmetry with the line above.
+    ///
+    /// `groups_denied_to_guests()` is a list of `giap-*` literals, so a
+    /// non-catalog prefix could never appear in it: the old check was
+    /// structurally `true` for every third-party server. A server reading mail,
+    /// calendars or files was invisible to PAI-1's guest boundary while every
+    /// builtin was being checked against it.
+    ///
+    /// Withholding it from an unidentified speaker is the answer that can be
+    /// walked back with a per-server flag. The other direction cannot.
+    #[test]
+    fn a_third_party_server_is_withheld_from_a_guest() {
+        let all = tools(&[
+            "acme-mail__read_inbox",
+            "giap-weather__get_forecast",
+            "platform__manage_schedule",
+        ]);
+        let kept = subtract_guest_denied_tools(all.iter());
+        assert!(
+            !kept.iter().any(|t| t.starts_with("acme-mail__")),
+            "a user-added MCP server survived the guest boundary: {kept:?}"
+        );
+        assert!(
+            kept.iter().any(|t| t.starts_with("giap-weather__")),
+            "a permitted builtin was dropped: {kept:?}"
+        );
+        assert!(
+            kept.iter().any(|t| t.starts_with("platform__")),
+            "engine plumbing was dropped: {kept:?}"
+        );
     }
 
     /// Every name in the denylist must actually be a group the catalog knows,

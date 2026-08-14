@@ -1913,3 +1913,102 @@ router that accepts anything.
 `MAX_UNGATED` is now 0, so `len() <= 0` is always-or-never). CI's clippy step has no `--all-targets`,
 so it is invisible there. Changing `<=` to `==` changes what the guard claims ("only shrinks" vs "is
 exactly this"), so it is a deliberate call, not a lint fix.
+
+---
+
+**2026-08-14 (later) — the extension surface: a catalog with a working set, and four things that were inert only because the default is `"all"`.**
+
+Brief was a redesign across seven axes — queuing, batching, precision, fault tolerance and
+cross-recommendation, MCP-UI, extensibility with the builtins standardised, and "extensions
+for everything". Plan at `.claude/plans/`, branch `feat/extensions-redesign`, seven commits.
+
+**The number that drove the design.** GIAP ships **66 tools across 17 extensions** to
+gemma-4-E2B/E4B on an 8192-clamped prompt window, with `tool_selection_mode` defaulting to
+`"all"`. Published benchmarks put tool-selection accuracy for *Haiku* below 90% between **10
+and 15** tools; at 107 both large and small models fail outright. GIAP's own D-phase numbers
+agree on cost (59 tools = 6,539 tok = 11.4 s TTFT; 17 = 2,386 = 4.0 s). "Extensions for
+everything" and "precision" therefore pull against each other, and the resolution is the
+design: a capability CATALOG with a small resident WORKING SET, so adding an extension grows
+the catalog and not the prompt.
+
+**PAI-1 — a guest was shown a menu of what had just been withheld from it.** The selection
+stripped `groups_denied_to_guests()`, and then `dormant_groups_note` was built from
+`registered_extensions()` — the full list. Dormant = registered ∖ selected, so `giap-memory`,
+`giap-vision`, `giap-sensors`, `giap-audit`, `giap-context` and `giap-orchestrator` all
+appeared under the sentence *"call enable_tool_group with its name and its tools become
+available immediately"*. And `enable_group` checked catalog membership and registration only,
+neither of which knows who is asking; `giap-toolkit` is deliberately not on the guest denylist.
+Guest reads menu, takes item. There is now one `permitted` ceiling that both the menu and the
+hatch read, applied to the candidates going *in* — which works because `select_groups` filters
+the core set by `available`, contrary to a comment that had claimed otherwise for as long as
+that filter existed.
+
+**PAI-1 again — every third-party MCP server was outside the boundary.**
+`subtract_guest_denied_tools` compared a prefix against a list of `giap-*` literals, so
+`!denied.contains(&ext)` was structurally `true` for every user-added server. Now
+default-denied, with engine plumbing (`platform`, `recipe`, `dynamic_task`) exempted by name —
+a distinction the first version of the fix missed and an existing test caught.
+
+**PAI-6 — under narrowing, most delegations get NO tools.** The child's ceiling came from the
+parent's *loaded* groups; a parent holds ~4 core + 1 scored and three of the four cores are on
+`groups_denied_to_subagents()`, so a research role asking for knowledge + news got `{}`. The
+bound was wrong, not the arithmetic: the parent can enable any permitted group at will, so
+`loaded` was never a boundary, only a position. Now bounded by the entitlement, through the
+same guest subtraction. **This retired the plan's own Phase 2** — a child-scoped escape hatch
+would have had nothing to do, because a child's allow-set *is* its whole grant.
+
+**The one that would have made narrowing a lie on the Orin.** `group_embeddings` was
+`OnceCell<Option<_>>`, so a failed first attempt was a value kept for the process lifetime.
+The Jetson downloads its embedding model in a task `main.rs` deliberately does not await, so a
+fresh install's first session embeds against a file that has not arrived — and then ran with
+all 66 schemas in every prompt, for every session, while the trace said `mode = "relevant"`.
+Now `get_or_try_init` plus a `tool_selection_widened` warning carrying `no_embedder` /
+`embed_failed`.
+
+**Not PAI, but found on the way and shipped alone and first:** `McpAppHost` rendered untrusted
+MCP-App HTML as `srcDoc` with `allow-same-origin`. A srcdoc frame inherits the embedder's
+origin, so the guest had `parent.localStorage` — where the session and refresh tokens live —
+and could strip its own `sandbox` attribute off the parent DOM. Attacker-controlled the moment
+any third-party server ships a `ui://` resource, with `tauri.conf.json` at `"csp": null` and no
+CSP header on any route. One attribute value; the opaque origin it yields also satisfies
+SEP-1865's different-origin MUST.
+
+**Still owed, and each is blocked on something this machine cannot supply.**
+
+*The flip itself.* Everything above is a prerequisite; `tool_selection_mode` still defaults to
+`"all"`, and that default is what has been suppressing all four defects above. Flipping it is a
+`DEFAULT_ADOPTIONS` migration, not a default change — a stored `"all"` outranks any default,
+and `settings.rs:84` names this exact key. Its acceptance criteria are an Orin run with the
+criteria fixed BEFORE it: a MUST-CALL set whose tool-call rate must not fall, a MUST-NOT-CALL
+set whose spurious rate must not rise, and — the row that carries the real risk — a CROSS-GROUP
+set asking whether the tool the model needed actually arrived. Selection is per-session, so the
+mechanism that has to answer that row is re-scoring on topic drift, NOT the model rescuing
+itself: this checklist already records a 2B declining to call `delegate` at all, and writing
+`type` for a key that did not exist.
+
+*MCP Apps.* `structuredContent` exists on rmcp 1.5.0 and is not the blocker. The blockers are
+all 17 servers declaring `ProtocolVersion::V_2024_11_05`, no server declaring `resources`, and
+`mcpui = false` because `GoosePlatform::GooseCli` was passed with `mcp_host_info: None` — goose
+implements the whole hydration and GIAP never switched it on. `AgentConfig::with_mcp_host_info`
+is a builder, so no fork patch; but hydration adds a `read_resource` round trip INSIDE the
+tool-dispatch future, which on the Orin is per-call latency on the critical path and wants
+measuring first. Note also that `extract_ui_hint` runs in the SSE layer, i.e. AFTER goose has
+committed the full `[[[mcp-ui:…]]]` marker to the model's conversation — so `routes.rs`'s claim
+that "the LLM only sees the clean text" is false, and 28 marker sites pay prompt tokens every
+turn. That is the real argument for the migration.
+
+*One-shot timers.* `tool_group.rs` advertises "Reminders, alarms, **timers**" and
+`pond-voice/src/control.rs` documents "stop the kitchen timer". Neither is possible:
+`SchedulerPort` is cron-only by type, and a fully-specified 6-field cron has no year field, so
+`0 35 14 9 8 *` fires every 9 August — a ten-minute timer silently becomes an annual alarm.
+`tokio-cron-scheduler` supports one-shot natively (`Job::new_one_shot_at_instant_async`); GIAP
+only ever calls `Job::new_async(cron, …)`. Needs `fire_at` on the domain type and the port, a
+migration, and self-delete-after-fire in the same transaction that writes the `ScheduleRun`.
+
+**Interdependency check (2.2), run against all eight.** KV prefix: unmoved — nothing here
+touches the static prefix, and the entitlement set is computed per turn without being sent.
+Preamble tokens: unchanged this round (the reduction is the flip, which has not happened).
+Guest scope: tightened twice. Approval: untouched. PAI-6: the delegation ceiling widened to the
+entitlement, which grants nothing the parent could not already reach. PAI-2: the degradation
+notes name a missing key but never its value, and `secret()` still returns `None`
+indistinguishably for unset / unreadable / no-store.

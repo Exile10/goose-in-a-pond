@@ -92,6 +92,15 @@
   --color-border-strong: rgba(23, 22, 22, 0.15);
   --color-border-focus:  color-mix(in srgb, var(--pp, #8C4BFF) 45%, transparent);
 
+  /* Focus RING, distinct from --color-border-focus.
+   *
+   * That token is 45% purple and is used two ways: as a soft input border, and
+   * (until now) as the focus outline. Measured as an outline it composites to
+   * rgb(196,166,247) over white — 2.06:1, under the 3:1 WCAG 2.2 requires of a
+   * focus indicator. Solid accent measures 5.70:1. The border use is fine at
+   * 45%, so the ring gets its own token instead of restaining both. */
+  --focus-ring: var(--color-accent);
+
   /* ── Semantic Colors ────────────────────────────────────── */
   --color-success:          #34C759;
   --color-success-soft:     rgba(52, 199, 89, 0.12);
@@ -171,6 +180,22 @@
   --sidebar-width-collapsed:  52px;
   --sidebar-transition: width 200ms ease, min-width 200ms ease;
   --toolbar-height:    48px;
+  /* ── Touch ────────────────────────────────────────────────────────────
+   * `--tap-min` is the hit-area floor for anything a finger drives (44px,
+   * the Apple HIG minimum and the one Material's 48dp also clears).
+   *
+   * It is deliberately NOT the same as visual size. Classic's advantage over
+   * the hub is density — Logs shows ten filter pills in a row — so inflating
+   * every control to 44px would cost the one reason to keep this view.
+   * Chrome (navigation, primary actions) grows visually to --tap-min; dense
+   * data controls keep --tap-dense visually and reach --tap-min through
+   * `touch.css`. See that file for why the expansion is vertical only. */
+  --tap-min:           44px;
+  --tap-dense:         36px;
+  --tile-sm:           30px;
+  --tile-md:           36px;
+  --tile-radius:        9px;
+
   --row-height-sm:     36px;
   --row-height-md:     44px;
   --row-height-lg:     52px;
@@ -318,4 +343,8 @@
   --color-notif-daily-fg:  #FB923C;
   --color-notif-weekly-bg: rgba(37, 99, 235, 0.15);
   --color-notif-weekly-fg: #60A5FA;
+
+  /* Lifted off the accent: #7C3AED on the dark sidebar measures ~3.1:1,
+     which passes but reads faint. */
+  --focus-ring:           #B794FF;
 }

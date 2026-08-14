@@ -387,7 +387,6 @@ impl ServerHandler for ContextMcpServer {
 // no capture — so the repositories have to arrive through a global installed at
 // startup.
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -431,14 +430,7 @@ pub fn spawn_context_server(reader: DuplexStream, writer: DuplexStream) {
         // this programme keeps recording.
         .with_retrieval(deps.retrieval.clone())
         .with_authority(CONTEXT_AUTHORITY.get().cloned().flatten());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("{CONTEXT_EXTENSION} MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin(CONTEXT_EXTENSION, server, reader, writer);
 }
 
 #[cfg(test)]

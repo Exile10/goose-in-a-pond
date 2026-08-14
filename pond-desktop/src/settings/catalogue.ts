@@ -1,0 +1,711 @@
+// ─── The settings catalogue ────────────────────────────────────────────────
+//
+// One entry per `Settings` field, grouped the way a household thinks about the
+// house rather than the way the Rust struct grew. `docs/architecture/settings-catalogue.md`
+// is the prose version of this file and the two are meant to move together.
+//
+// THE THREE AXES. A setting is not one thing; it is three, and they fail
+// independently:
+//
+//   Store     — is the value persisted?        (guarded in pond-infra)
+//   Consumer  — does anything ACT on it?       (this file's `consumer` field)
+//   Surface   — can a person change it, where? (this file's existence)
+//
+// pond-core's `every_settings_field_is_dispositioned` covers Store and Surface.
+// Nothing covered Consumer, which is how ten settings came to render as
+// operable controls that no code reads. `consumer` is that missing axis, and
+// `catalogue.test.ts` fails the build if an entry drifts from the `Settings`
+// type.
+//
+// `consumer` is maintained BY HAND against the Rust tree, so it can go stale in
+// one direction the test cannot catch: a setting that gets wired up stays
+// marked "none" until somebody edits this file. That is the safe direction —
+// it under-promises. The durable fix is `GET /api/v1/settings/schema` serving
+// this from the server (Fix 6 in the design doc); until then, re-check with:
+//
+//   grep -rn --include='*.rs' -w '<key>' crates/ | grep -v sqlite_settings.rs
+//
+// A key with no hit outside `sqlite_settings.rs` and `domain/settings.rs` has
+// no consumer.
+
+import type { Settings } from "../api/types";
+import {
+  all, atLeast, hhmm, ianaTimezone, integer, latitude, longitude, oneOf,
+  optional, range, retentionMap, speechCategories, url, type Validator,
+} from "./validation";
+
+/** Does anything read this setting once it is saved? */
+export type Consumer =
+  /** The pond reads it and acts on it. */
+  | "live"
+  /** Only this app reads it. The server never does. */
+  | "app"
+  /** Nothing reads it anywhere. The control is inert. */
+  | "none";
+
+/**
+ * Where a picker's options come from when they are not a fixed list.
+ *
+ * Filters mirror `sections/Models.tsx`, which is the app's existing authority
+ * on which `provider` values belong to which role.
+ */
+export type OptionSource = "llm-models" | "whisper-models" | "tts-voices" | "embedding-models" | "llm-providers";
+
+export type Control =
+  | { kind: "toggle" }
+  | { kind: "text"; placeholder?: string }
+  | { kind: "number"; step?: number; min?: number; max?: number; unit?: string }
+  /** A short, consequential choice — all options visible without opening anything. */
+  | { kind: "radio"; options: readonly { value: string; label: string; hint?: string }[] }
+  | { kind: "select"; options: readonly string[] }
+  /** A picker filled from the model registry. Falls back to free text offline. */
+  | { kind: "lookup"; source: OptionSource; placeholder?: string; allowCustom?: boolean };
+
+export interface Entry {
+  /** The `Settings` field. Typed, so a typo is a build error. */
+  key: keyof Settings;
+  /** What the person controls, in their words — never the field name. */
+  label: string;
+  control: Control;
+  consumer: Consumer;
+  /**
+   * Why the mark is not "live", in plain language. Required for `app` and
+   * `none` — a mark the interface will not explain is worse than no mark.
+   */
+  note?: string;
+  /**
+   * No control existed in the desktop app before this catalogue; the setting
+   * was reachable only through the API. Rendered as a "New" badge so the
+   * design reads as a proposal rather than a claim about what shipped.
+   */
+  proposed?: boolean;
+  /**
+   * Checked on every edit; a message blocks Save and renders under the control.
+   * See `validation.ts` for why the client checks what the server does not.
+   */
+  validate?: Validator;
+}
+
+export interface Subcategory {
+  name: string;
+  entries: Entry[];
+}
+
+export type Tier = "Household" | "Workshop";
+
+export interface Category {
+  id: string;
+  name: string;
+  tier: Tier;
+  /** One line under the category title. Says what the category answers. */
+  blurb: string;
+}
+
+export interface CatalogueCategory extends Category {
+  groups: Subcategory[];
+}
+
+/** Shown once per tier in the rail, above its categories. */
+export const TIER_NOTE: Record<Tier, string> = {
+  Household: "What the people living here set.",
+  Workshop: "Tuning for how the pond thinks and runs. Safe to leave alone.",
+};
+
+const TIMEZONES = [
+  "UTC", "Africa/Nairobi", "Africa/Lagos", "Africa/Johannesburg",
+  "Europe/London", "Europe/Paris", "Europe/Berlin",
+  "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles",
+  "Asia/Dubai", "Asia/Kolkata", "Asia/Shanghai", "Asia/Tokyo", "Australia/Sydney",
+] as const;
+
+export const CATALOGUE: CatalogueCategory[] = [
+  // ── Household ───────────────────────────────────────────────────────────
+  {
+    id: "account",
+    name: "Account & Home",
+    tier: "Household",
+    blurb: "Who lives here, what the home is called, and where in the world it is.",
+    groups: [
+      {
+        name: "Who lives here",
+        entries: [
+          { key: "user_name", label: "Your name", control: { kind: "text", placeholder: "Friend" }, consumer: "live" },
+          { key: "primary_profile_id", label: "Household profile", control: { kind: "text", placeholder: "Not set" }, consumer: "live" },
+        ],
+      },
+      {
+        name: "Where and when",
+        entries: [
+          {
+            key: "home_name", label: "Home name",
+            control: { kind: "text", placeholder: "Not set" }, consumer: "app",
+            note: "Shown in this app only. The assistant never sees it — it greets you using your name and location instead.",
+          },
+          {
+            key: "timezone", label: "Time zone",
+            control: { kind: "select", options: TIMEZONES }, consumer: "live",
+            validate: ianaTimezone,
+          },
+          { key: "weather_location_name", label: "Location", control: { kind: "text", placeholder: "Nairobi" }, consumer: "live" },
+          { key: "weather_enabled", label: "Use local weather", control: { kind: "toggle" }, consumer: "live" },
+          // Filled in for you: saving a location name the coordinates do not
+          // match makes the server geocode it and answer with the result.
+          // Editing either number by hand suppresses that, so a deliberate
+          // coordinate is never overwritten by a name lookup.
+          { key: "weather_latitude", label: "Latitude", control: { kind: "number", step: 0.0001, min: -90, max: 90, unit: "°" }, consumer: "live", validate: optional(latitude) },
+          { key: "weather_longitude", label: "Longitude", control: { kind: "number", step: 0.0001, min: -180, max: 180, unit: "°" }, consumer: "live", validate: optional(longitude) },
+        ],
+      },
+    ],
+  },
+  {
+    id: "prompts",
+    name: "Prompts & Personality",
+    tier: "Household",
+    blurb: "What the assistant calls itself, and how it talks to you.",
+    groups: [
+      {
+        name: "Voice and manner",
+        entries: [
+          { key: "assistant_name", label: "Assistant name", control: { kind: "text", placeholder: "Goose" }, consumer: "live" },
+          { key: "assistant_personality", label: "Personality", control: { kind: "text", placeholder: "friendly and concise" }, consumer: "live" },
+          {
+            key: "prompt_style", label: "Prompt style", consumer: "live",
+            control: { kind: "radio", options: [
+              { value: "balanced",  label: "Balanced",  hint: "Warm, and gets to the point" },
+              { value: "concise",   label: "Concise",   hint: "As few words as the answer allows" },
+              { value: "technical", label: "Technical", hint: "Precise, assumes you know the terms" },
+              { value: "warm",      label: "Warm",      hint: "Conversational and unhurried" },
+            ] },
+            validate: oneOf(["balanced", "concise", "technical", "warm"]),
+          },
+        ],
+      },
+      {
+        name: "Advanced",
+        entries: [
+          { key: "prompt_addendum", label: "Extra instructions", control: { kind: "text", placeholder: "Always answer in Swahili." }, consumer: "live" },
+          { key: "custom_system_prompt", label: "Replace the system prompt", control: { kind: "text", placeholder: "Uses the prompt style above" }, consumer: "live" },
+        ],
+      },
+    ],
+  },
+  {
+    id: "voice",
+    name: "Voice",
+    tier: "Household",
+    blurb: "What wakes the assistant, how it listens, and the voice it answers in.",
+    groups: [
+      {
+        name: "Wake word",
+        entries: [
+          { key: "voice_wake_word", label: "Wake word", control: { kind: "text", placeholder: "goose" }, consumer: "live" },
+          { key: "voice_wake_word_transcriptions", label: "Learned pronunciations", control: { kind: "text", placeholder: "Not calibrated" }, consumer: "live" },
+        ],
+      },
+      {
+        name: "Listening",
+        entries: [
+          { key: "voice_kws_energy_threshold", label: "Ignore sound quieter than", control: { kind: "number", step: 0.001, min: 0, max: 1 }, consumer: "live", validate: range(0, 1) },
+          { key: "voice_kws_post_trigger_silence_ms", label: "Stop after silence", control: { kind: "number", min: 0, unit: "ms" }, consumer: "live", validate: all(integer, atLeast(0, "ms")) },
+          { key: "voice_kws_cooldown_ms", label: "Wait before listening again", control: { kind: "number", min: 0, unit: "ms" }, consumer: "live", validate: all(integer, atLeast(0, "ms")) },
+          {
+            key: "voice_recording_duration_secs", label: "Recording length",
+            control: { kind: "number", min: 1, unit: "seconds" }, consumer: "app",
+            note: "This app uses it. The pond's own microphone loop does not — it ends a recording on silence instead.",
+            validate: all(integer, range(1, 300, "seconds")),
+          },
+          {
+            key: "voice_kws_whisper_url", label: "Wake-word server",
+            control: { kind: "text", placeholder: "Uses the transcription server" }, consumer: "none",
+            note: "Nothing reads this. Wake-word detection uses the transcription server below, whatever you type here.",
+            validate: optional(url(["http://", "https://"], "http://127.0.0.1:9000")),
+          },
+        ],
+      },
+      {
+        name: "Transcription",
+        entries: [
+          {
+            key: "voice_whisper_url", label: "Transcription server",
+            control: { kind: "text", placeholder: "http://127.0.0.1:9000" }, consumer: "live",
+            validate: optional(url(["http://", "https://"], "http://127.0.0.1:9000")),
+          },
+          { key: "active_whisper_model", label: "Whisper model", control: { kind: "lookup", source: "whisper-models", placeholder: "Choose a downloaded model" }, consumer: "live" },
+        ],
+      },
+      {
+        name: "Speaking",
+        entries: [
+          { key: "voice_tts_voice", label: "Voice", control: { kind: "lookup", source: "tts-voices", placeholder: "Choose a downloaded voice" }, consumer: "live" },
+          { key: "active_tts_model", label: "Speech model", control: { kind: "text", placeholder: "piper-lessac" }, consumer: "live" },
+          { key: "voice_max_turns", label: "Steps before answering aloud", control: { kind: "number", min: 0, max: 50 }, consumer: "live", proposed: true, validate: all(integer, range(0, 50)) },
+        ],
+      },
+    ],
+  },
+  {
+    id: "models",
+    name: "Models",
+    tier: "Household",
+    blurb: "Which model answers you, and how much room it has to work in.",
+    groups: [
+      {
+        name: "Chat model",
+        entries: [
+          { key: "chat_provider", label: "Provider", control: { kind: "lookup", source: "llm-providers", placeholder: "Choose a provider" }, consumer: "live" },
+          { key: "chat_model", label: "Model", control: { kind: "lookup", source: "llm-models", placeholder: "Choose a downloaded model" }, consumer: "live" },
+          { key: "llm_provider", label: "Startup provider", control: { kind: "lookup", source: "llm-providers", placeholder: "Same as above" }, consumer: "live", proposed: true },
+          { key: "active_llm_model", label: "Last selected model", control: { kind: "lookup", source: "llm-models", placeholder: "Not set" }, consumer: "live", proposed: true },
+        ],
+      },
+      {
+        name: "Generation",
+        entries: [
+          { key: "llm_max_tokens", label: "Longest reply", control: { kind: "number", min: 1, max: 131072, unit: "tokens" }, consumer: "live", validate: all(integer, range(1, 131072, "tokens")) },
+          { key: "llm_temperature", label: "Creativity", control: { kind: "number", step: 0.05, min: 0, max: 2 }, consumer: "live", validate: range(0, 2) },
+          // 0 means "use the model's own window", so the floor is 0 and not 1.
+          { key: "context_window_override", label: "Context window cap", control: { kind: "number", min: 0, max: 1048576, unit: "tokens" }, consumer: "live", validate: all(integer, atLeast(0, "tokens")) },
+        ],
+      },
+      {
+        name: "Engine",
+        entries: [
+          // "pond" is refused by the server with a 422 — the backend is
+          // quarantined (Q2-05), so offering it would be offering a failure.
+          {
+            key: "agent_backend", label: "Agent engine", consumer: "live",
+            control: { kind: "radio", options: [
+              { value: "goose", label: "Goose", hint: "The only engine that ships today" },
+            ] },
+            validate: oneOf(["goose"]),
+          },
+        ],
+      },
+      {
+        name: "Embeddings",
+        entries: [
+          {
+            key: "embedding_provider", label: "Embedding provider", consumer: "live",
+            control: { kind: "radio", options: [
+              { value: "gguf",      label: "On-device (GGUF)", hint: "Runs through llama.cpp. The only one that starts on a Jetson" },
+              { value: "fastembed", label: "FastEmbed",        hint: "ONNX Runtime. Does not initialise on the Orin" },
+              { value: "none",      label: "Off",              hint: "No semantic memory or context search" },
+            ] },
+            validate: oneOf(["fastembed", "gguf", "none"]),
+          },
+          { key: "active_embedding_model", label: "Embedding model", control: { kind: "lookup", source: "embedding-models", placeholder: "Not set" }, consumer: "live" },
+        ],
+      },
+    ],
+  },
+  {
+    id: "memory",
+    name: "Memory",
+    tier: "Household",
+    blurb: "What the assistant keeps about your household, and what it lets go of.",
+    groups: [
+      {
+        name: "What it remembers",
+        entries: [
+          { key: "agent_memory_inject", label: "Use memories in replies", control: { kind: "toggle" }, consumer: "live" },
+          { key: "agent_memory_limit", label: "Memories per reply", control: { kind: "number", min: 0, max: 100 }, consumer: "live", validate: all(integer, range(0, 100)) },
+          { key: "memory_extraction_enabled", label: "Learn from conversations", control: { kind: "toggle" }, consumer: "live" },
+          { key: "memory_extraction_max_facts", label: "Facts kept per conversation", control: { kind: "number", min: 0, max: 50 }, consumer: "live", validate: all(integer, range(0, 50)) },
+          { key: "memory_extraction_interval_secs", label: "Wait between learning", control: { kind: "number", min: 0, unit: "seconds" }, consumer: "live", validate: all(integer, atLeast(0, "seconds")) },
+        ],
+      },
+      {
+        name: "Forgetting",
+        entries: [
+          { key: "memory_cleanup_enabled", label: "Let memories fade", control: { kind: "toggle" }, consumer: "live" },
+          { key: "memory_cleanup_interval_hours", label: "Check for faded memories every", control: { kind: "number", min: 1, unit: "hours" }, consumer: "live", validate: all(integer, atLeast(1, "hours")) },
+          { key: "memory_prune_threshold", label: "Delete below", control: { kind: "number", step: 0.01, min: 0, max: 1 }, consumer: "live", validate: range(0, 1) },
+          { key: "memory_archive_threshold", label: "Archive below", control: { kind: "number", step: 0.01, min: 0, max: 1 }, consumer: "live", validate: range(0, 1) },
+          { key: "memory_decay_base_half_life_days", label: "Half-life", control: { kind: "number", step: 0.25, min: 0, unit: "days" }, consumer: "live", proposed: true, validate: atLeast(0, "days") },
+          { key: "memory_decay_beta", label: "Fade curve", control: { kind: "number", step: 0.05, min: 0, max: 10 }, consumer: "live", proposed: true, validate: range(0, 10) },
+        ],
+      },
+      {
+        name: "Tidying up",
+        entries: [
+          { key: "memory_consolidation_enabled", label: "Merge duplicate memories", control: { kind: "toggle" }, consumer: "live" },
+          {
+            key: "memory_consolidation_mode", label: "How it merges", consumer: "live",
+            control: { kind: "radio", options: [
+              { value: "single",      label: "One pass",    hint: "A single model call. Cheapest on-device" },
+              { value: "adversarial", label: "Three passes", hint: "Proposer, adversary, judge. Slower, catches more" },
+            ] },
+            validate: oneOf(["single", "adversarial"]),
+          },
+          { key: "memory_consolidation_interval_hours", label: "Merge every", control: { kind: "number", min: 1, unit: "hours" }, consumer: "live", validate: all(integer, atLeast(1, "hours")) },
+          { key: "memory_consolidation_batch_size", label: "Memories per pass", control: { kind: "number", min: 1, max: 1000 }, consumer: "live", validate: all(integer, range(1, 1000)) },
+        ],
+      },
+      {
+        name: "Experimental",
+        entries: [
+          {
+            key: "memory_graph_enabled", label: "Follow links between memories",
+            control: { kind: "toggle" }, consumer: "none",
+            note: "Nothing reads this. The links are stored, but no reply has ever followed one.",
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "privacy",
+    name: "Privacy & Security",
+    tier: "Household",
+    blurb: "What the pond may sense, where it may reach, and what it records about itself.",
+    groups: [
+      {
+        name: "Sensors",
+        entries: [
+          { key: "mic_enabled", label: "Microphone", control: { kind: "toggle" }, consumer: "live" },
+          {
+            key: "cameras_enabled", label: "Cameras",
+            control: { kind: "toggle" }, consumer: "none",
+            note: "Nothing reads this. Turning it off does not stop the cameras — only Watch the camera, under Vision & Cameras, does that.",
+          },
+        ],
+      },
+      {
+        name: "Reach",
+        entries: [
+          {
+            key: "network_mode", label: "Network reach", consumer: "live", proposed: true,
+            // A radio, not a dropdown: this is the setting that decides whether
+            // the pond can talk to the internet, and all three answers should
+            // be readable without opening anything.
+            control: { kind: "radio", options: [
+              { value: "open",      label: "Open",       hint: "Every outbound call is recorded, none refused" },
+              { value: "allowlist", label: "Allowed only", hint: "Refuses hosts that are not loopback or on the curated list" },
+              { value: "offline",   label: "Offline",    hint: "Refuses everything except this machine" },
+            ] },
+            validate: oneOf(["open", "allowlist", "offline"]),
+          },
+          {
+            key: "cloud_fallback_enabled", label: "Fall back to a cloud model",
+            control: { kind: "toggle" }, consumer: "none",
+            note: "Nothing reads this. There is no cloud fallback to switch on yet — the pond stays local either way.",
+          },
+          { key: "mesh_enabled", label: "Talk to your other ponds", control: { kind: "toggle" }, consumer: "live", proposed: true },
+        ],
+      },
+      {
+        name: "Policy",
+        entries: [
+          {
+            key: "security_policy_mode", label: "Permission checks", consumer: "live", proposed: true,
+            control: { kind: "radio", options: [
+              { value: "audit",   label: "Watch",   hint: "Records every decision, blocks nothing. The shipped default" },
+              { value: "enforce", label: "Enforce", hint: "Denials bite. Read the activity log first" },
+              { value: "off",     label: "Off",     hint: "No checks and no record. Debugging only" },
+            ] },
+            validate: oneOf(["off", "audit", "enforce"]),
+          },
+          { key: "telemetry_enabled", label: "Record how it performs", control: { kind: "toggle" }, consumer: "live" },
+          { key: "context_ingest_enabled", label: "Build personal context from sensors", control: { kind: "toggle" }, consumer: "live", proposed: true },
+        ],
+      },
+    ],
+  },
+  {
+    id: "extensions",
+    name: "Extensions & Tools",
+    tier: "Household",
+    blurb: "Which capabilities the assistant can reach for, and how they are offered to it.",
+    groups: [
+      {
+        name: "Capabilities",
+        entries: [
+          { key: "ext_memory_enabled", label: "Memories", control: { kind: "toggle" }, consumer: "live" },
+          { key: "ext_schedule_enabled", label: "Schedules", control: { kind: "toggle" }, consumer: "live" },
+          { key: "ext_weather_enabled", label: "Weather", control: { kind: "toggle" }, consumer: "live" },
+          { key: "ext_knowledge_enabled", label: "Knowledge", control: { kind: "toggle" }, consumer: "live" },
+          { key: "ext_system_enabled", label: "System", control: { kind: "toggle" }, consumer: "live" },
+          { key: "ext_device_enabled", label: "Devices", control: { kind: "toggle" }, consumer: "live" },
+          { key: "ext_news_enabled", label: "News", control: { kind: "toggle" }, consumer: "live" },
+          { key: "ext_finance_enabled", label: "Finance", control: { kind: "toggle" }, consumer: "live" },
+          { key: "ext_discovery_enabled", label: "Discovery", control: { kind: "toggle" }, consumer: "live" },
+          { key: "ext_audit_enabled", label: "Activity log", control: { kind: "toggle" }, consumer: "live" },
+          { key: "ext_vision_enabled", label: "Camera events", control: { kind: "toggle" }, consumer: "live" },
+          { key: "ext_sensor_enabled", label: "Sensors", control: { kind: "toggle" }, consumer: "live" },
+          { key: "ext_orchestrator_enabled", label: "Delegation", control: { kind: "toggle" }, consumer: "live" },
+          { key: "ext_context_enabled", label: "Personal context", control: { kind: "toggle" }, consumer: "live", proposed: true },
+        ],
+      },
+      {
+        name: "How tools are offered",
+        entries: [
+          {
+            key: "tool_selection_mode", label: "Tools sent each turn", consumer: "live",
+            control: { kind: "radio", options: [
+              { value: "all",      label: "All of them", hint: "Every enabled tool, every turn. Costs about 5.9K tokens" },
+              { value: "relevant", label: "The relevant ones", hint: "A small core plus what this conversation seems to need" },
+            ] },
+            validate: oneOf(["all", "relevant"]),
+          },
+          { key: "tool_model", label: "Tool-call helper model", control: { kind: "lookup", source: "llm-models", placeholder: "Not set" }, consumer: "live" },
+          {
+            key: "searxng_url", label: "Search server",
+            control: { kind: "text", placeholder: "Not set" }, consumer: "live", proposed: true,
+            validate: optional(url(["http://", "https://"], "http://127.0.0.1:8888")),
+          },
+        ],
+      },
+      {
+        name: "Tool handling",
+        entries: [
+          {
+            key: "tool_output_compaction", label: "Shorten tool results",
+            control: { kind: "toggle" }, consumer: "none",
+            note: "Nothing reads this. Tool results reach the model in full, whatever this says.",
+          },
+          {
+            key: "tool_call_validation", label: "Repair malformed tool calls",
+            control: { kind: "toggle" }, consumer: "none",
+            note: "Nothing reads this. No repair step exists in the pond yet.",
+          },
+          {
+            key: "tool_request_detection", label: "Catch tool requests in replies",
+            control: { kind: "toggle" }, consumer: "none",
+            note: "Nothing reads this. Replies are not scanned for tool requests.",
+          },
+          {
+            key: "multi_tool_enabled", label: "Run tools at the same time",
+            control: { kind: "toggle" }, consumer: "none",
+            note: "Nothing reads this. Tools run one after another.",
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "automation",
+    name: "Automation & Proactivity",
+    tier: "Household",
+    blurb: "What runs on its own, and whether the assistant may speak before you do.",
+    groups: [
+      {
+        name: "Schedules",
+        entries: [
+          { key: "schedule_max_concurrent", label: "Tasks at once", control: { kind: "number", min: 1, max: 32 }, consumer: "live", validate: all(integer, range(1, 32)) },
+          { key: "schedule_max_runs_per_task", label: "History per task", control: { kind: "number", min: 0, max: 10000 }, consumer: "live", validate: all(integer, range(0, 10000)) },
+          {
+            key: "schedule_result_notify", label: "Tell me when a task finishes",
+            control: { kind: "toggle" }, consumer: "none",
+            note: "Nothing reads this. Finished tasks are announced either way.",
+          },
+        ],
+      },
+      {
+        name: "Speaking unprompted",
+        entries: [
+          { key: "unprompted_speech_enabled", label: "Speak without being asked", control: { kind: "toggle" }, consumer: "live" },
+          { key: "unprompted_speech_categories", label: "Only for", control: { kind: "text", placeholder: "alert" }, consumer: "live", validate: speechCategories },
+          // Free text, not a time picker: a value the server cannot parse means
+          // silence, and a picker renders such a value as blank — which reads
+          // as "not set" when it actually means "quiet all day".
+          // Validated hard, because the server's failure mode here is silence:
+          // a time it cannot parse makes `quiet_hours_cover` fail closed and the
+          // pond never speaks, with nothing anywhere explaining why.
+          { key: "quiet_hours_start", label: "Quiet from", control: { kind: "text", placeholder: "22:00" }, consumer: "live", validate: hhmm },
+          { key: "quiet_hours_end", label: "Quiet until", control: { kind: "text", placeholder: "07:00" }, consumer: "live", validate: hhmm },
+        ],
+      },
+      {
+        name: "Thinking unprompted",
+        entries: [
+          { key: "proactive_review_enabled", label: "Review the day on its own", control: { kind: "toggle" }, consumer: "live" },
+        ],
+      },
+    ],
+  },
+
+  // ── Workshop ────────────────────────────────────────────────────────────
+  {
+    id: "reasoning",
+    name: "Reasoning",
+    tier: "Workshop",
+    blurb: "Whether the model thinks before answering, how long, and who checks its work.",
+    groups: [
+      {
+        name: "Thinking",
+        entries: [
+          {
+            key: "thinking_mode", label: "Thinking", consumer: "live",
+            control: { kind: "radio", options: [
+              { value: "auto", label: "When the model supports it", hint: "The default" },
+              { value: "on",   label: "Always try",  hint: "Even on models that ignore it" },
+              { value: "off",  label: "Never",       hint: "Removes the section from the prompt entirely" },
+            ] },
+            validate: oneOf(["auto", "on", "off"]),
+          },
+          {
+            key: "reasoning_effort", label: "How long it may think", consumer: "live",
+            control: { kind: "radio", options: [
+              { value: "brief",    label: "Brief",    hint: "On a Jetson every thinking token is silence before the answer" },
+              { value: "balanced", label: "Balanced", hint: "" },
+              { value: "thorough", label: "Thorough", hint: "Right on a hosted provider, slow on-device" },
+            ] },
+            validate: oneOf(["brief", "balanced", "thorough"]),
+          },
+          { key: "show_thinking", label: "Show thinking as it happens", control: { kind: "toggle" }, consumer: "live" },
+          { key: "persist_thinking", label: "Keep thinking after the reply", control: { kind: "toggle" }, consumer: "live" },
+        ],
+      },
+      {
+        name: "Answer review",
+        entries: [
+          {
+            key: "review_mode", label: "Review answers", consumer: "live",
+            control: { kind: "radio", options: [
+              { value: "off",  label: "Never",             hint: "Answers stream straight to you" },
+              { value: "auto", label: "Factual questions", hint: "Only where a wrong answer would be quotable" },
+              { value: "on",   label: "Every answer",      hint: "Doubles the model calls per turn" },
+            ] },
+            validate: oneOf(["off", "on", "auto"]),
+          },
+          { key: "review_max_rounds", label: "Revision rounds", control: { kind: "number", min: 0, max: 5 }, consumer: "live", validate: all(integer, range(0, 5)) },
+          { key: "review_pass_threshold", label: "Pass mark", control: { kind: "number", min: 1, max: 5 }, consumer: "live", validate: all(integer, range(1, 5)) },
+          { key: "goal_check_enabled", label: "Check the question was answered", control: { kind: "toggle" }, consumer: "live", proposed: true },
+        ],
+      },
+    ],
+  },
+  {
+    id: "performance",
+    name: "Performance & Context",
+    tier: "Workshop",
+    blurb: "How long a request may run, and how history is trimmed to fit the device.",
+    groups: [
+      {
+        name: "Turn budget",
+        entries: [
+          // 0 is meaningful here (uncapped), so the floor is 0 rather than 1.
+          { key: "agent_max_turns", label: "Steps per request", control: { kind: "number", min: 0, max: 500 }, consumer: "live", validate: all(integer, range(0, 500)) },
+          { key: "agent_timeout_secs", label: "Give up after silence", control: { kind: "number", min: 0, unit: "seconds" }, consumer: "live", validate: all(integer, atLeast(0, "seconds")) },
+          {
+            key: "agent_goose_mode", label: "Agent mode",
+            control: { kind: "select", options: ["auto", "chat", "smart"] }, consumer: "none",
+            note: "Nothing reads this. The mode comes from the request, not from here.",
+          },
+        ],
+      },
+      {
+        name: "Prompt cache",
+        entries: [
+          { key: "prefix_cache_prompt", label: "Reuse the prompt prefix", control: { kind: "toggle" }, consumer: "live" },
+        ],
+      },
+      {
+        name: "Compaction",
+        entries: [
+          { key: "hybrid_compaction_enabled", label: "Trim history as you go", control: { kind: "toggle" }, consumer: "live", proposed: true },
+          { key: "summary_idle_secs", label: "Summarise after idle", control: { kind: "number", min: 0, unit: "seconds" }, consumer: "live", proposed: true, validate: all(integer, atLeast(0, "seconds")) },
+          // The server floors this at MIN_RESUME_IDLE_SECS; too SMALL is the
+          // damaging direction, so the client refuses the values that would be
+          // silently corrected rather than letting them look accepted.
+          { key: "resume_compaction_idle_secs", label: "Count as resumed after", control: { kind: "number", min: 300, unit: "seconds" }, consumer: "live", proposed: true, validate: all(integer, atLeast(300, "seconds")) },
+          { key: "compaction_verbatim_days", label: "Keep in full for", control: { kind: "number", min: 0, unit: "days" }, consumer: "live", proposed: true, validate: all(integer, atLeast(0, "days")) },
+        ],
+      },
+      {
+        name: "Monitoring",
+        entries: [
+          { key: "context_monitor_enabled", label: "Warn before context fills", control: { kind: "toggle" }, consumer: "live" },
+          {
+            key: "show_turn_stats", label: "Show speed under each reply",
+            control: { kind: "toggle" }, consumer: "app",
+            note: "This app draws it. The pond does not read it — it measures every turn regardless.",
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "vision",
+    name: "Vision & Cameras",
+    tier: "Workshop",
+    blurb: "The camera pipeline itself, and the Matter controller that drives your devices.",
+    groups: [
+      {
+        name: "Camera pipeline",
+        entries: [
+          { key: "vision_enabled", label: "Watch the camera", control: { kind: "toggle" }, consumer: "live" },
+          {
+            key: "vision_camera_url", label: "Camera address",
+            control: { kind: "text", placeholder: "rtsp://… or /dev/video0" }, consumer: "live",
+            // A device path is not a URL, so this accepts either shape rather
+            // than insisting on a scheme the local-camera case does not have.
+            validate: optional((v) => {
+              const t = String(v).trim();
+              if (t.startsWith("/dev/")) return null;
+              return url(["rtsp://", "http://", "https://"], "rtsp://camera.local/stream")(t);
+            }),
+          },
+          { key: "vision_camera_id", label: "Camera name", control: { kind: "text", placeholder: "camera-1" }, consumer: "live" },
+          { key: "vision_fps", label: "Frames per second", control: { kind: "number", min: 1, max: 30, unit: "fps" }, consumer: "live", validate: all(integer, range(1, 30, "fps")) },
+          { key: "vision_motion_threshold", label: "Motion sensitivity", control: { kind: "number", step: 0.01, min: 0, max: 1 }, consumer: "live", validate: range(0, 1) },
+          { key: "vision_classifier_model", label: "Detector model", control: { kind: "text", placeholder: "Bundled YOLOX-Nano" }, consumer: "live", proposed: true },
+        ],
+      },
+      {
+        name: "Matter",
+        entries: [
+          { key: "matter_enabled", label: "Use a Matter controller", control: { kind: "toggle" }, consumer: "live" },
+          {
+            key: "matter_ws_url", label: "Controller address",
+            control: { kind: "text", placeholder: "ws://127.0.0.1:5580/ws" }, consumer: "live",
+            // Mirrors the server's own 422 so the message arrives before the
+            // round-trip rather than instead of it.
+            validate: optional(url(["ws://", "wss://"], "ws://127.0.0.1:5580/ws")),
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "retention",
+    name: "Data & Retention",
+    tier: "Workshop",
+    blurb: "How long anything is kept before the pond deletes it, and what cloud would have cost.",
+    groups: [
+      {
+        name: "How long things are kept",
+        entries: [
+          // 0 means "keep forever" for every one of these, which is why none of
+          // them has a floor of 1.
+          { key: "retention_event_log_days", label: "Activity log", control: { kind: "number", min: 0, unit: "days" }, consumer: "live", validate: all(integer, atLeast(0, "days")) },
+          { key: "retention_sensor_days", label: "Sensor readings", control: { kind: "number", min: 0, unit: "days" }, consumer: "live", validate: all(integer, atLeast(0, "days")) },
+          { key: "retention_session_messages_keep", label: "Messages per conversation", control: { kind: "number", min: 0, unit: "messages" }, consumer: "live", validate: all(integer, atLeast(0, "messages")) },
+          { key: "retention_events_days", label: "Events", control: { kind: "number", min: 0, unit: "days" }, consumer: "live", proposed: true, validate: all(integer, atLeast(0, "days")) },
+          { key: "retention_events_by_category", label: "Per-category overrides", control: { kind: "text", placeholder: "network 14, sensor 7" }, consumer: "live", proposed: true, validate: retentionMap },
+          { key: "retention_sensitive_days", label: "Anything sensitive", control: { kind: "number", min: 0, unit: "days" }, consumer: "live", proposed: true, validate: all(integer, atLeast(0, "days")) },
+        ],
+      },
+      {
+        name: "Cost accounting",
+        entries: [
+          { key: "cloud_input_price_per_million", label: "Cloud input price", control: { kind: "number", step: 0.01, min: 0, unit: "per million tokens" }, consumer: "live", validate: atLeast(0) },
+          { key: "cloud_output_price_per_million", label: "Cloud output price", control: { kind: "number", step: 0.01, min: 0, unit: "per million tokens" }, consumer: "live", validate: atLeast(0) },
+        ],
+      },
+    ],
+  },
+];
+
+/** Every entry, flattened. */
+export function allEntries(): Entry[] {
+  return CATALOGUE.flatMap((c) => c.groups.flatMap((g) => g.entries));
+}
+
+/** How many entries in a category nothing reads. Drives the rail's flag. */
+export function inertCount(category: CatalogueCategory): number {
+  return category.groups
+    .flatMap((g) => g.entries)
+    .filter((e) => e.consumer === "none").length;
+}

@@ -164,9 +164,30 @@ than asking which city. Never guess data.")]
                             data.days.len(),
                             data.location_name
                         );
-                        Ok(CallToolResult::success(vec![Content::text(
-                            data.as_context_block(),
-                        )]))
+                        // Same `[[[mcp-ui:…]]]` marker the current-weather tool
+                        // emits. Without it `extract_ui_hint` returns no
+                        // `renderHint`, and the desktop deliberately refuses to
+                        // render a card it has no structured data for — which is
+                        // why a forecast used to arrive as a wall of text next to
+                        // a proper weather card.
+                        let ui_data = serde_json::json!({
+                            "location": data.location_name,
+                            "forecast": data.days.iter().map(|d| serde_json::json!({
+                                "date": d.date,
+                                "description": d.description,
+                                "temp_max_c": d.temp_max_c,
+                                "temp_min_c": d.temp_min_c,
+                                "precipitation_sum_mm": d.precipitation_sum_mm,
+                                "precipitation_probability_pct": d.precipitation_probability_pct,
+                                "wind_speed_max_kmh": d.wind_speed_max_kmh,
+                                "uv_index_max": d.uv_index_max,
+                                "sunrise": d.sunrise,
+                                "sunset": d.sunset,
+                            })).collect::<Vec<_>>(),
+                        });
+                        let hint = format!("[[[mcp-ui:weather:{}]]]\n", ui_data);
+                        let full_result = format!("{}{}", hint, data.as_context_block());
+                        Ok(CallToolResult::success(vec![Content::text(full_result)]))
                     }
                     Err(e) => {
                         tracing::warn!("weather: forecast fetch failed: {e}");
@@ -264,7 +285,6 @@ pub fn app_resources() -> Vec<(&'static str, &'static str)> {
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -283,14 +303,7 @@ pub fn init_weather_deps(weather: Option<Arc<dyn WeatherProvider>>) {
 pub fn spawn_weather_server(reader: DuplexStream, writer: DuplexStream) {
     let deps = WEATHER_DEPS.get().expect("init_weather_deps() not called");
     let server = WeatherMcpServer::new(deps.weather.clone());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-weather MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-weather", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

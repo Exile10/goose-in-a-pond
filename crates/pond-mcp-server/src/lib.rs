@@ -207,4 +207,55 @@ pub use format::{
 pub use http::{build_http_client, traced_get, traced_get_with};
 
 // Re-export the direct tool dispatcher
+/// Serve one builtin MCP server on a duplex pair, and say something when it
+/// stops.
+///
+/// Every `spawn_*_server` had the same seven lines, and all seventeen of them
+/// dropped the exit on the floor: `Ok(running) => { let _ = running.waiting().await; }`.
+/// `waiting()` returns when the server has STOPPED — a handler that panicked,
+/// a transport that closed, a peer that went away — and nothing was logged, so
+/// a dead extension presented as "the model stopped using that tool".
+///
+/// This does not restart it, and cannot: the duplex halves are consumed by
+/// `serve`, and only goose's extension manager can hand out a fresh pair. What
+/// it does is make the death visible and greppable, which is the difference
+/// between a diagnosable failure and folklore.
+pub fn serve_builtin<S>(
+    extension: &'static str,
+    server: S,
+    reader: tokio::io::DuplexStream,
+    writer: tokio::io::DuplexStream,
+) where
+    S: rmcp::ServerHandler + Send + 'static,
+{
+    use rmcp::ServiceExt;
+    tokio::spawn(async move {
+        match server.serve((reader, writer)).await {
+            Ok(running) => match running.waiting().await {
+                Ok(reason) => tracing::warn!(
+                    target: "giap::trace",
+                    kind = "mcp_server_stopped",
+                    extension,
+                    ?reason,
+                    "builtin MCP server stopped; its tools now fail for the rest of this process"
+                ),
+                Err(e) => tracing::error!(
+                    target: "giap::trace",
+                    kind = "mcp_server_stopped",
+                    extension,
+                    error = %e,
+                    "builtin MCP server ended abnormally; its tools now fail for the rest of this process"
+                ),
+            },
+            Err(e) => tracing::error!(
+                target: "giap::trace",
+                kind = "mcp_server_failed",
+                extension,
+                error = %e,
+                "builtin MCP server failed to start"
+            ),
+        }
+    });
+}
+
 pub use dispatcher::McpToolDispatcher;

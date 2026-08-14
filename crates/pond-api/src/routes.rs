@@ -8367,6 +8367,7 @@ async fn create_schedule(
     }
 
     let req = CreateScheduleRequest {
+        fire_at: None,
         id: api_req
             .id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
@@ -8724,6 +8725,7 @@ async fn create_rule(
     // Duplicate ids and the cron are the scheduler's to judge, not this
     // handler's — see `SensorTriggerSpec::validate`.
     let create = CreateScheduleRequest {
+        fire_at: None,
         id: req.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
         label: req.name,
         cron: RULE_CRON.to_string(),
@@ -14743,6 +14745,7 @@ mod tests {
 
         fn schedule(id: &str, kind: TaskKind) -> Schedule {
             Schedule {
+                fire_at: None,
                 id: id.into(),
                 label: format!("label of {id}"),
                 cron: RULE_CRON.into(),

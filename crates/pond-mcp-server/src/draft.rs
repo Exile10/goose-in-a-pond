@@ -496,7 +496,6 @@ fn extract_draft_id(
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -538,14 +537,7 @@ pub fn spawn_draft_server(reader: DuplexStream, writer: DuplexStream) {
     let deps = DRAFT_DEPS.get().expect("init_draft_deps() not called");
     let server = DraftMcpServer::new(deps.draft_repo.clone())
         .with_authority(DRAFT_AUTHORITY.get().cloned().flatten());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-draft MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-draft", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
