@@ -21,6 +21,7 @@ import { SETTINGS } from "../hub/data/settingsConfig";
 import type { SettingsRowId } from "../hub/data/settingsConfig";
 import type { GuiSection } from "../desktopState";
 import { AppearanceView } from "../hub/views/settings/Appearance";
+import { SettingsCatalogueView } from "../settings/SettingsCatalogue";
 const WakeWordCalibration = lazy(() => import("../components/WakeWordCalibration").then(m => ({ default: m.WakeWordCalibration })));
 
 // ── Patch diffing ─────────────────────────────────────────────
@@ -920,6 +921,10 @@ export function Settings() {
   const dispatch = useAppDispatch();
 
   const [detail, setDetail]     = useState<SettingsRowId | null>(null);
+  // The full catalogue is its own destination rather than a `detail` panel: it
+  // is not one of the twelve topics, and it brings its own header, search and
+  // Save rather than borrowing this section's.
+  const [catalogue, setCatalogue] = useState(false);
   const [settings, setSettings] = useState<Partial<SettingsType>>({});
   // Last state the server told us about. Save PATCHes the difference against
   // this, never the whole object — see the diffing block at the top of the file.
@@ -1050,6 +1055,13 @@ export function Settings() {
     }
   }
 
+  // ── Catalogue ──
+  // Rendered bare: the page owns its own header, so wrapping it in this
+  // section's `view-head` would stack two titles.
+  if (catalogue) {
+    return <SettingsCatalogueView onBack={() => setCatalogue(false)} />;
+  }
+
   // ── Detail view ──
   if (detail) {
     return (
@@ -1107,6 +1119,20 @@ export function Settings() {
           </Button>
         </div>
       </header>
+      {/* Everything on one page, grouped by what it changes, with each control
+          marked according to whether anything actually reads it. Offered
+          alongside the topic screens below rather than replacing them — those
+          stay the quick route to one thing, this is the route to everything. */}
+      <button className="set__all" onClick={() => setCatalogue(true)} type="button">
+        <span className="set__allMain">
+          <span className="set__allLabel">All settings</span>
+          <span className="set__allSub">
+            Every setting in one place, grouped by what it changes.
+          </span>
+        </span>
+        <HubIco d={HP_PATHS.chevR} size={17} className="set__allChev" />
+      </button>
+
       <div className="set__groups">
         {/* ── You ── */}
         <div className="set__group">

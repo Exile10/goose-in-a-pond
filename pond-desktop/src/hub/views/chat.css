@@ -773,3 +773,1028 @@
   border-color: var(--pp-100);
   background: var(--pp-50);
 }
+
+/* ═══ Chat, reworked ══════════════════════════════════════════════════════
+ *
+ * Loaded after the rules above, so it settles by cascade order.
+ *
+ * THE IDEA: the conversation is the product and the composer is where the
+ * work happens; everything else is chrome and should get out of the way.
+ *
+ * The asymmetry is the whole design. What you said is a bubble — a discrete,
+ * bounded thing you authored. What Goose says is not: it runs at full measure
+ * with no container, like text being written onto the page rather than posted
+ * into a thread. That difference does the work an avatar and a coloured box
+ * used to do, without either.
+ */
+
+/* ── Header: the topic, and the way back to the others ──────────────────── */
+
+.chat2__head {
+  padding: var(--space-4) var(--space-6);
+  gap: var(--space-4);
+}
+
+.chat2__topic {
+  font-family: var(--font-heading);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.01em;
+  color: var(--color-text);
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat2__head-right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+
+.chat2__headbtn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--tap-min);
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.chat2__headbtn:hover {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+  background: var(--color-accent-subtle);
+}
+
+.chat2__headbtn--icon {
+  padding: 0;
+  width: var(--tap-min);
+  justify-content: center;
+}
+
+/* ── The thread ─────────────────────────────────────────────────────────── */
+
+.ch-row {
+  align-items: flex-start;
+  /* Rises as it lands. 14px is enough to read as arrival without the row
+     appearing to fly in from somewhere. */
+  animation: ch-arrive 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes ch-arrive {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* What you said: a bubble, hugging its content, aligned right. */
+.ch-row--user { justify-content: flex-end; }
+
+.ch-row--user .ch-bubble-wrap {
+  max-width: min(78%, 60ch);
+  align-items: flex-end;
+}
+
+.ch-row--user .ch-bubble {
+  background: var(--color-accent);
+  color: var(--color-text-on-accent);
+  /* Flat fill, no gradient and no glow: the old bubble carried both, which
+     made every line the user typed the loudest thing on screen. */
+  box-shadow: none;
+  border: 0;
+  border-radius: 18px 18px 6px 18px;
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--text-md);
+  line-height: var(--leading-base);
+}
+
+/* What Goose said: no bubble, no avatar, full measure. */
+.ch-row--goose { justify-content: flex-start; }
+
+.ch-row--goose .ch-bubble-wrap {
+  max-width: 100%;
+  width: 100%;
+}
+
+.ch-row--goose .ch-bubble {
+  background: none;
+  /* The container is what we are removing, so the border has to go with it —
+     `.ch-bubble--goose` still sets one. */
+  border: 0;
+  box-shadow: none;
+  padding: 0;
+  border-radius: 0;
+  color: var(--color-text);
+  font-size: var(--text-md);
+  /* Looser than the bubble: this is prose to be read, not a chat line to be
+     glanced at. */
+  line-height: 1.65;
+  max-width: 72ch;
+}
+
+/* Queued: visibly held rather than sent. */
+.ch-row--queued { animation: none; }
+.ch-row--queued .ch-bubble {
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+
+.ch-queued-note {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+  align-self: flex-end;
+}
+
+/* ── Empty state ────────────────────────────────────────────────────────── */
+
+.chat-empty { gap: var(--space-2); }
+
+.chat-empty__title {
+  font-family: var(--font-heading);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.02em;
+  color: var(--color-text);
+  margin: 0;
+}
+
+.chat-empty__hint {
+  font-size: var(--text-md);
+  color: var(--color-text-secondary);
+  margin: 0;
+}
+
+/* ── Composer: one surface ──────────────────────────────────────────────── */
+
+.chat2__composer {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-1);
+  margin: 0 var(--space-6);
+  padding: var(--space-2);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-strong);
+  border-radius: 22px;
+  box-shadow: var(--shadow-xs);
+  transition: border-color 0.18s, box-shadow 0.18s;
+  flex-shrink: 0;
+}
+
+/* The lift on focus is the one place this screen raises its voice. */
+.chat2__composer:focus-within {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 4px var(--color-accent-soft), var(--shadow-sm);
+}
+
+/* The textarea has no chrome of its own — the box around it is the control. */
+.chat2__composer .chat2__textarea {
+  flex: 1;
+  border: 0;
+  background: none;
+  box-shadow: none;
+  border-radius: 0;
+  padding: var(--space-3) var(--space-2);
+  min-height: 40px;
+  max-height: 168px;
+  font-size: var(--text-md);
+  line-height: 1.5;
+}
+
+.chat2__composer .chat2__textarea:focus {
+  border: 0;
+  box-shadow: none;
+}
+
+.ch-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: none;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.ch-icon-btn:hover:not(:disabled) {
+  background: var(--color-hover);
+  color: var(--color-text-secondary);
+}
+
+.ch-icon-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* The only filled thing in the composer, so there is never a question about
+   which control commits. */
+.ch-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: var(--color-accent);
+  color: var(--color-text-on-accent);
+  cursor: pointer;
+  transition: background 0.15s, transform 0.15s, opacity 0.15s;
+}
+
+.ch-send:hover:not(:disabled) { background: var(--color-accent-hover); }
+.ch-send:active:not(:disabled) { transform: scale(0.94); }
+
+.ch-send:disabled {
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+  cursor: not-allowed;
+}
+
+/* Answering: the send button keeps working (it queues) but the surface says
+   something is in flight. */
+.chat2__composer.is-busy { border-color: var(--color-accent-soft); }
+
+/* ── Quips, below the composer ──────────────────────────────────────────── */
+
+.chat2__chips {
+  padding: var(--space-3) var(--space-6) var(--space-2);
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  justify-content: center;
+}
+
+.ch-chip {
+  border-color: var(--color-border);
+  color: var(--color-text-secondary);
+  font-weight: var(--weight-medium);
+  font-size: var(--text-base);
+  animation: ch-arrive 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.ch-chip:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+  background: var(--color-accent-subtle);
+}
+
+/* ── One column ─────────────────────────────────────────────────────────
+ *
+ * The composer was spanning the full pane while the assistant's prose capped
+ * at 72ch, so the two never lined up and the screen read as two unrelated
+ * layouts stacked. Everything now shares one measure and one centre line:
+ * the header, the thread, the composer, the quips and the hint bar.
+ *
+ * 60rem ≈ 960px, comfortably wider than the 72ch text so long code and tool
+ * output still have room, while stopping the composer stretching to the width
+ * of an ultrawide window.
+ */
+
+.chat2 { --chat-measure: 60rem; }
+
+.chat2__head,
+.chat2__thread,
+.chat2__composer,
+.chat2__chips,
+.chat2__hint {
+  max-width: var(--chat-measure);
+  width: 100%;
+  margin-inline: auto;
+}
+
+/* The composer keeps its side margins inside the shared column. */
+.chat2__composer {
+  margin-inline: auto;
+  width: calc(100% - var(--space-12));
+}
+
+.chat2__chips,
+.chat2__hint {
+  padding-inline: var(--space-6);
+}
+
+/* Left-aligned rather than centred: five chips centre-wrap into a lone orphan
+   on the second row, which reads as a mistake. Flowing from the left makes the
+   wrap look like what it is. */
+.chat2__chips { justify-content: flex-start; }
+
+/* ── Message furniture: present, not shouting ────────────────────────────
+ *
+ * Copy / retry / thumbs and the model-role meta were painted at full strength
+ * under every message, so a four-turn conversation carried sixteen icons and
+ * four token counts competing with the words. They now fade in when you engage
+ * with a message.
+ *
+ * Opacity rather than `display: none`, for two reasons: the row does not
+ * reflow when they appear, and a hidden-by-opacity button is still focusable
+ * and still announced — `:focus-within` brings them up for a keyboard user at
+ * the moment they arrive.
+ */
+
+.ch-bubble__actions,
+.bubble__meta {
+  opacity: 0;
+  transition: opacity 0.16s ease;
+}
+
+.ch-row:hover .ch-bubble__actions,
+.ch-row:hover .bubble__meta,
+.ch-row:focus-within .ch-bubble__actions,
+.ch-row:focus-within .bubble__meta {
+  opacity: 1;
+}
+
+/* No hover to reveal them with, so they stay put. */
+@media (hover: none) {
+  .ch-bubble__actions,
+  .bubble__meta { opacity: 1; }
+}
+
+/* ── Rhythm ──────────────────────────────────────────────────────────────
+ * A reply and the message that prompted it belong together; the next exchange
+ * is a new beat. Tighter within a turn, looser between them.
+ */
+
+.chat2__thread { gap: var(--space-2); }
+.ch-row--user  { margin-top: var(--space-5); }
+.ch-row--user:first-child { margin-top: 0; }
+
+/* ── Reclaim the strip the hidden furniture was holding ──────────────────
+ *
+ * Measured: an assistant row was 61px tall for 25px of text, because the
+ * hover-revealed actions still occupied 24px of flow while invisible. Every
+ * reply carried a blank band under it.
+ *
+ * Lifting them out of flow puts the row back to the height of its words and
+ * lets the furniture appear inside the 28px gap that already separates turns —
+ * so nothing reflows on hover and nothing reserves space when idle.
+ */
+
+.ch-bubble-wrap { position: relative; }
+
+.ch-row--goose .ch-bubble__actions,
+.ch-row--goose .bubble__meta {
+  position: absolute;
+  top: 100%;
+  margin-top: 0;
+}
+
+.ch-row--goose .ch-bubble__actions { left: 0; }
+
+/* The meta sits after the four action buttons rather than under them. */
+.ch-row--goose .bubble__meta {
+  left: 132px;
+  line-height: 24px;
+}
+
+/* The last reply's furniture would otherwise hang into the composer. */
+.chat2__thread { padding-bottom: var(--space-6); }
+
+/* ═══ Fill the pane, one glow, room to breathe ════════════════════════════ */
+
+/* ── End to end ──────────────────────────────────────────────────────────
+ *
+ * The 60rem column left a wide empty margin down both sides of the pane. The
+ * chat now fills whatever it is given and adapts by PADDING rather than by a
+ * cap, so a narrow window loses gutter instead of losing content width.
+ */
+
+.chat2__head,
+.chat2__thread,
+.chat2__composer,
+.chat2__chips,
+.chat2__hint {
+  max-width: none;
+  /* Generous on a wide pane, tight on a phone-width one. */
+  padding-inline: clamp(var(--space-4), 3vw, var(--space-10));
+}
+
+.chat2__composer {
+  width: auto;
+  margin-inline: clamp(var(--space-4), 3vw, var(--space-10));
+  padding-inline: var(--space-2);
+}
+
+/* The reply runs the full measure too — a 72ch cap inside a filled pane just
+   reintroduces the margin we were asked to remove. */
+.ch-row--goose .ch-bubble { max-width: none; }
+
+/* The user bubble still hugs its text; it is a discrete object, not a column. */
+.ch-row--user .ch-bubble-wrap { max-width: min(80%, 68ch); }
+
+/* ── One glow ────────────────────────────────────────────────────────────
+ *
+ * The composer drew its own focus ring AND the textarea inside it drew the
+ * app-wide one from `base.css`, so focusing produced two nested purple
+ * rectangles. The surface owns the highlight; the control inside it does not.
+ */
+
+.chat2__composer .chat2__textarea:focus,
+.chat2__composer .chat2__textarea:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+  border: 0 !important;
+}
+
+/* A single soft ring — no second inset shadow stacked under it. */
+.chat2__composer:focus-within {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 4px var(--color-accent-soft);
+}
+
+/* ── Room to breathe ─────────────────────────────────────────────────────
+ * The model chip and shortcut were pressed against the composer.
+ */
+
+.chat2__hint {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding-top: var(--space-3);
+  padding-bottom: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.chat2__hint-sep { color: var(--color-text-tertiary); }
+
+.chat2__hint-kbd {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+}
+
+/* ── Thinking toggle ─────────────────────────────────────────────────────
+ * Sits beside the model chip and matches its weight: this is the other thing
+ * about the next turn you might want to change without leaving the chat.
+ */
+
+.think-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--tap-dense);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface);
+  color: var(--color-text-tertiary);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+  position: relative;
+}
+
+/* Reaches the touch floor without growing the hint bar. */
+.think-toggle::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  height: var(--tap-min);
+}
+
+.think-toggle:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+.think-toggle.is-on {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+  color: var(--color-accent);
+}
+
+.think-toggle:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.think-toggle__state {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  opacity: 0.85;
+}
+
+/* ═══ Edge to edge, and an empty state that reads like a page ═════════════ */
+
+/* ── The dead space ──────────────────────────────────────────────────────
+ *
+ * Measured at 1440px: 204px of gutter on each side, from three stacked
+ * sources — 32px on `.app-content`, 132px from `.chat2`'s own
+ * `max-width: 880px; margin: 0 auto`, and 40px of thread padding.
+ *
+ * The 880px cap was the real culprit and it is gone. The chat also reaches
+ * back through the section's padding so it owns its gutters outright, then
+ * sets one modest inset of its own — the assistant's first character now sits
+ * a comfortable distance from the sidebar rather than a screen away from it.
+ */
+
+.chat2 {
+  max-width: none;
+  /* Cancel `.app-content`'s 32px so the chat spans the section edge to edge. */
+  margin-inline: calc(var(--space-8) * -1);
+  width: calc(100% + var(--space-8) * 2);
+}
+
+.chat2__head,
+.chat2__thread,
+.chat2__chips,
+.chat2__hint {
+  padding-inline: var(--space-6);
+}
+
+.chat2__composer {
+  margin-inline: var(--space-6);
+  padding-inline: var(--space-2);
+}
+
+/* Narrow panes give the gutter up before they give up content. */
+@media (max-width: 900px) {
+  .chat2__head,
+  .chat2__thread,
+  .chat2__chips,
+  .chat2__hint { padding-inline: var(--space-4); }
+  .chat2__composer { margin-inline: var(--space-4); }
+}
+
+/* ── Empty state as a page header ────────────────────────────────────────
+ *
+ * Was centred in the middle of an empty pane, which made a new chat feel like
+ * a dialog waiting to be dismissed. It now opens the page the way the settings
+ * catalogue does: title, then one line of sub, aligned to the same left edge
+ * the conversation will use — so the first assistant reply lands exactly where
+ * the heading sat.
+ */
+
+.chat-empty {
+  align-items: flex-start;
+  text-align: left;
+  margin: 0;
+  padding: var(--space-8) 0 var(--space-6);
+  gap: var(--space-1);
+}
+
+.chat-empty__title {
+  font-family: var(--font-display);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.02em;
+  color: var(--color-text);
+  margin: 0;
+}
+
+.chat-empty__hint {
+  font-size: var(--text-base);
+  color: var(--color-text-secondary);
+  max-width: 52ch;
+  margin: 0;
+}
+
+/* ═══ Centred composition, composer that opens on focus ═══════════════════
+ *
+ * The previous pass stripped 204px of gutter, which was the right call for the
+ * gutter and the wrong call for the composition: flush-left is not the same as
+ * "not wasting space". The column is centred again — but at a width chosen so
+ * the pane still feels filled, rather than the 880px cap that produced the
+ * dead space in the first place.
+ */
+
+.chat2 {
+  max-width: 1080px;
+  /* Still reaches back through `.app-content`'s 32px, so the centring is
+     against the true pane rather than against an inherited inset. */
+  margin-inline: auto;
+  width: calc(100% + var(--space-8) * 2);
+  margin-left: calc(var(--space-8) * -1);
+  margin-right: calc(var(--space-8) * -1);
+}
+
+@media (min-width: 1180px) {
+  /* Wide enough to centre properly: give the negative reach up and let
+     `margin: auto` do the work. */
+  .chat2 {
+    width: 100%;
+    margin-left: auto;
+    margin-right: auto;
+  }
+}
+
+/* ── The composer opens ──────────────────────────────────────────────────
+ *
+ * Narrower than the thread at rest, so the eye reads it as an invitation
+ * rather than a wall, and it widens to the full column when you focus it.
+ * `max-width` is the animated property because both ends are real lengths —
+ * transitioning `width: auto` would not tween at all.
+ */
+
+.chat2__composer {
+  max-width: 640px;
+  margin-inline: auto;
+  transition:
+    max-width 280ms cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 0.18s,
+    box-shadow 0.18s;
+}
+
+.chat2__composer:focus-within {
+  max-width: 100%;
+}
+
+/* Reduced motion still gets the width change — it is a layout state, not
+   decoration — just without the tween. The global rule collapses the duration. */
+
+/* Quips sit under the composer, so they follow its resting measure. */
+.chat2__chips {
+  max-width: 640px;
+  margin-inline: auto;
+  justify-content: center;
+}
+
+.chat2__hint {
+  max-width: 640px;
+  margin-inline: auto;
+  justify-content: center;
+}
+
+/* ── Empty state: the settings-header treatment, centred ────────────────── */
+
+.chat-empty {
+  align-items: center;
+  text-align: center;
+  margin: auto 0;
+  padding: var(--space-8) var(--space-6);
+  gap: var(--space-2);
+}
+
+.chat-empty__title {
+  font-family: var(--font-display);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.02em;
+  color: var(--color-text);
+  margin: 0;
+}
+
+.chat-empty__hint {
+  font-size: var(--text-base);
+  color: var(--color-text-secondary);
+  max-width: 52ch;
+  margin: 0;
+}
+
+/* `.chat2` is a column flex container, so `margin-inline: auto` on a child
+ * cancels the default cross-axis stretch and leaves `width: auto` resolving to
+ * fit-content — the composer collapsed to 327px instead of its 640px cap. An
+ * explicit width restores the box so `max-width` is what actually governs. */
+
+.chat2__composer,
+.chat2__chips,
+.chat2__hint {
+  width: 100%;
+}
+
+/* Expanded state stops at the thread's own inset rather than the raw column
+   edge, so a focused composer lines up with the text above it. */
+.chat2__composer:focus-within {
+  max-width: calc(100% - var(--space-12));
+}
+
+/* ── The composer must not move under the pointer ────────────────────────
+ *
+ * Measured defect: the expansion was keyed to `:focus-within`, which fires for
+ * ANY focus inside the composer — including its own buttons. Pressing the mic
+ * gave it focus, the box grew, and the button slid 196px to the right between
+ * mousedown and mouseup. The click landed on the textarea instead, so the mic
+ * was unusable unless the field already had focus.
+ *
+ * Two changes, and both are needed:
+ *
+ * 1. Only the TEXT FIELD's focus changes the width. A button taking focus is
+ *    not a reason to reflow the thing containing it.
+ * 2. The buttons `preventDefault()` on mousedown (in Chat.tsx), so pressing one
+ *    while typing does not blur the field and contract the box mid-click —
+ *    the same bug in the opposite direction.
+ *
+ * The ring stays on `:focus-within`, because "this composer is engaged" is
+ * worth showing for any control inside it. Appearance can follow focus
+ * anywhere; layout may not.
+ */
+
+.chat2__composer:focus-within {
+  max-width: 640px;
+}
+
+.chat2__composer:has(.chat2__textarea:focus) {
+  max-width: calc(100% - var(--space-12));
+}
+
+/* ── Empty state: the settings-catalogue header, verbatim ────────────────
+ *
+ * Not centred. The reference is that page's opening block — title, then one
+ * line of secondary text, both flush to the same left edge the content below
+ * them uses. Centring it (an over-reading of "centre everything", which was
+ * about the column and the composer) made a new chat read as a dialog floating
+ * in an empty pane rather than a page you have arrived on.
+ *
+ * Sitting at the top and on the left also means the first assistant reply
+ * lands exactly where the heading was, instead of the content jumping from the
+ * middle of the pane to the left edge on the first message.
+ */
+
+.chat-empty {
+  align-items: flex-start;
+  text-align: left;
+  margin: 0;
+  padding: var(--space-8) 0 var(--space-6);
+  gap: var(--space-1);
+}
+
+/* Matches `.scat__title` / `.scat__sub` exactly. */
+.chat-empty__title {
+  font-family: var(--font-display);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.02em;
+  color: var(--color-text);
+  margin: 0 0 var(--space-1);
+}
+
+.chat-empty__hint {
+  font-size: var(--text-base);
+  color: var(--color-text-secondary);
+  max-width: 52ch;
+  margin: 0;
+}
+
+/* ── Empty state: the posture card, with a goose on it ───────────────────
+ *
+ * The container is the settings catalogue's "Right now" card — 2px ink border
+ * and the brand's hard offset shadow (`--shadow-ink`). That card is the one
+ * place either screen raises its voice, so a new chat gets the same treatment
+ * rather than a heading floating in an empty pane.
+ *
+ * Composition mirrors it too: copy on the left, a figure on the right, one
+ * mono eyebrow above.
+ */
+
+.chat-empty {
+  display: block;
+  align-self: flex-start;
+  width: 100%;
+  max-width: 640px;
+  margin: var(--space-6) 0 0;
+  padding: var(--space-6);
+  background: var(--color-surface);
+  border: 2px solid var(--color-text);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-ink);
+  text-align: left;
+  /* Arrives with the same rise the messages use, so the page settles as one. */
+  animation: ch-arrive 320ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.chat-empty__eyebrow {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-text-tertiary);
+  margin-bottom: var(--space-4);
+}
+
+.chat-empty__body {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+}
+
+.chat-empty__copy { min-width: 0; }
+
+.chat-empty__title {
+  font-family: var(--font-display);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.02em;
+  color: var(--color-text);
+  margin: 0 0 var(--space-2);
+  text-wrap: balance;
+}
+
+.chat-empty__hint {
+  font-size: var(--text-base);
+  color: var(--color-text-secondary);
+  max-width: 36ch;
+  margin: 0;
+}
+
+@media (max-width: 700px) {
+  .chat-empty__body { flex-direction: column-reverse; align-items: flex-start; }
+  .goose-idle { width: 108px; height: 86px; }
+}
+
+/* ── Empty state: centred, with room ─────────────────────────────────────
+ *
+ * Sits in the middle of the pane rather than pinned under the header — with
+ * no conversation yet there is nothing above it to anchor to, so centring is
+ * what stops it reading as a stranded first row.
+ *
+ * The padding is deliberately generous: this card is the only thing on screen,
+ * and the goose needs air around it to read as an illustration rather than an
+ * icon that wandered in.
+ */
+
+.chat-empty {
+  display: block;
+  align-self: center;
+  margin: auto 0;
+  width: 100%;
+  max-width: 620px;
+  padding: var(--space-8) var(--space-8) var(--space-6);
+}
+
+.chat-empty__body {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-6);
+}
+
+.chat-empty__eyebrow { margin-bottom: var(--space-5); }
+
+.chat-empty__title {
+  font-size: var(--text-xl);
+  margin: 0 0 var(--space-2);
+}
+
+.chat-empty__hint { max-width: 30ch; }
+
+@media (max-width: 720px) {
+  .chat-empty { padding: var(--space-6); }
+  .chat-empty__body { flex-direction: column-reverse; align-items: flex-start; gap: var(--space-4); }
+}
+
+/* ── Working indicator, docked to the composer ───────────────────────────
+ *
+ * Was a row in the thread with the old line-icon goose. It is a statement
+ * about the app's state rather than a message in the conversation, so it now
+ * sits directly above the composer — in view without the thread needing to
+ * stay scrolled to the bottom.
+ */
+
+.ch-working {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  max-width: 640px;
+  margin: 0 auto var(--space-2);
+  padding: 0 var(--space-2);
+  animation: ch-arrive 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.ch-working__quip {
+  font-size: var(--text-base);
+  color: var(--color-text-secondary);
+}
+
+.ch-working__dots {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.ch-working__dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--color-accent);
+  opacity: 0.35;
+  animation: ch-working-dot 1.2s ease-in-out infinite;
+}
+
+.ch-working__dots span:nth-child(2) { animation-delay: 0.15s; }
+.ch-working__dots span:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes ch-working-dot {
+  0%, 100% { opacity: 0.25; transform: translateY(0); }
+  50%      { opacity: 1;    transform: translateY(-3px); }
+}
+
+/* Follows the composer when it opens, so the two read as one cluster. */
+.chat2__composer:has(.chat2__textarea:focus) ~ .ch-working,
+.chat2:has(.chat2__textarea:focus) .ch-working {
+  max-width: calc(100% - var(--space-12));
+}
+
+/* ── Thinking, as one line you can open ──────────────────────────────────
+ *
+ * The old panel sat expanded above every answer, so several paragraphs of
+ * half-formed reasoning arrived before the reply did. Reasoning is worth
+ * keeping and rarely worth reading — it collapses to a line, and reports how
+ * long it took in the PAST tense once it is over. A "Thinking…" that never
+ * resolves is a spinner that lies.
+ */
+
+.think { margin-bottom: var(--space-2); }
+
+.think__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text-secondary);
+  transition: color 0.15s;
+}
+
+.think__toggle:hover { color: var(--color-text); }
+
+.think__chev {
+  color: var(--color-text-tertiary);
+  transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.think.is-open .think__chev { transform: rotate(90deg); }
+
+/* The sweep. A bright band travels left to right across the word while the
+   model reasons — the only moving thing in the thread at that moment, so it
+   does the job a separate spinner would have. */
+.think--active .think__label {
+  background: linear-gradient(
+    90deg,
+    var(--color-text-tertiary) 0%,
+    var(--color-text-tertiary) 35%,
+    var(--color-accent) 50%,
+    var(--color-text-tertiary) 65%,
+    var(--color-text-tertiary) 100%
+  );
+  background-size: 250% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: think-sweep 1.9s linear infinite;
+}
+
+.think--active .think__label::after {
+  content: "…";
+}
+
+@keyframes think-sweep {
+  from { background-position: 150% 0; }
+  to   { background-position: -50% 0; }
+}
+
+/* Reduced motion: the sweep is the only thing that says "still going", so it
+   is replaced with a steady accent rather than removed outright. */
+@media (prefers-reduced-motion: reduce) {
+  .think--active .think__label {
+    animation: none;
+    background: none;
+    -webkit-text-fill-color: currentColor;
+    color: var(--color-accent);
+  }
+}
+
+.think__body {
+  margin-top: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-left: 2px solid var(--color-border-strong);
+  background: var(--color-content);
+  border-radius: 0 var(--radius-md) var(--radius-md) 0;
+  font-size: var(--text-base);
+  line-height: var(--leading-base);
+  color: var(--color-text-secondary);
+  max-height: 320px;
+  overflow-y: auto;
+  animation: think-open 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.think__body p { margin: 0 0 var(--space-3); }
+.think__body p:last-child { margin-bottom: 0; }
+
+@keyframes think-open {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: none; }
+}
