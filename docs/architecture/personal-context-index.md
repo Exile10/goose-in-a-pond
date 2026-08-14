@@ -576,6 +576,31 @@ on turns that do not use it while a prompt block costs every turn.
 **Media captioning (F's other half) is not started**, and is blocked on the same thing 1.8 records:
 `find ~/.local/share/goose-in-a-pond/mmproj -type f` on the nano returns nothing.
 
+**Probed the whole chain against the live agent 2026-08-14** (`scripts/context_recall_probe.py`).
+It plants one fact per corpus and asks the running assistant a question whose answer is only
+obtainable from that fact. The design is what makes it informative: memories already reach the prompt
+through the OLD path (`topical_memories` injects them directly), so a memory is a CONTROL; context
+items and summaries are on no prompt path at all, so answering one of those is only possible via the
+`recall` tool over the index.
+
+It found a real defect immediately. **Context items had no embedding path whatsoever.** Adoption only
+copies vectors that already exist, and nothing ever embedded an item that arrived without one, so the
+entire corpus was silently unsearchable — the planted sensor event was never indexed and the
+assistant answered "there is no recorded activity", which is a WRONG answer rather than a missing
+one. Fixed with `needs_embedding_with_text` and a context pass in maintenance; re-probed, and all
+three corpora now index.
+
+**What remains is a model fact, not a wiring defect, and the probe separates the two.** With all three
+corpora indexed, `giap-context` registered (confirmed in the log: 16 extensions including it) and the
+`recall` tool offered, **gemma-4-E2B never calls it** — `recall_tool_seen=false` on every question. It
+answers "I do not have any information in my memory or context" while the answer sits indexed one tool
+call away. This is the same shape PAI-6 records for `delegate`: a 2B declines to call the tool, which
+is a model-floor decision rather than something to patch. It is also the strongest argument yet for
+G's passive prompt tier — but that remains a MEASUREMENT, and the probe is now the instrument for it.
+
+One thing the probe caught in passing: the assistant's answers still leak harness text ("The goal is
+not fully met"), which is the measured-bad prompt rule 6 recommended dropping, still live on `main`.
+
 **Owed, in priority order.** (1) A re-embed path for stale-width vectors (`search_stale_dimension`), since
 backfill cannot see them. (2) `embed_query`: nomic wants `search_query: ` on the query side and
 currently gets `search_document: `, a bounded ranking-quality loss on the three query call sites

@@ -414,6 +414,35 @@ impl VectorIndex for SqliteVectorIndex {
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
+    async fn needs_embedding_with_text(
+        &self,
+        corpus: Corpus,
+        model_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>> {
+        let (table, id_col) = source_table(corpus);
+        let rev = source_rev_sql(corpus);
+        let staleness = match rev {
+            Some(col) => format!("OR (v.source_rev IS NOT NULL AND v.source_rev IS NOT {col})"),
+            None => String::new(),
+        };
+        let extra = liveness_sql(corpus);
+        let text = text_sql(corpus);
+        let sql = format!(
+            "SELECT s.{id_col}, {text} FROM {table} s \
+             LEFT JOIN vectors v ON v.row_id = s.{id_col} AND v.corpus = ? \
+             WHERE (v.row_id IS NULL OR v.model_id != ? {staleness}) {extra} \
+             LIMIT ?"
+        );
+        let rows: Vec<(String, String)> = sqlx::query_as(&sql)
+            .bind(corpus.as_str())
+            .bind(model_id)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
+    }
+
     async fn backfill_from_source(
         &self,
         corpus: Corpus,
