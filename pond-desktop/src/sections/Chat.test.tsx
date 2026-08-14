@@ -24,14 +24,26 @@ vi.mock("../api/PondApiClient", () => ({
     }),
     sessionAttachmentUrl: vi.fn((sessionId: string, attachmentId: string) => `/api/v1/sessions/${sessionId}/attachments/${attachmentId}`),
     compactSession: vi.fn(),
+    retitleSession: vi.fn(),
+    renameSession: vi.fn(),
   },
 }));
+
+/**
+ * Mutable app state for the mock.
+ *
+ * `vi.hoisted` because `vi.mock` factories are lifted above the imports, so a
+ * plain `let` declared here would still be in its temporal dead zone when the
+ * factory is defined. Reset in `beforeEach`, so a test that opens a
+ * conversation cannot leak one into the next.
+ */
+const appState = vi.hoisted(() => ({ sessionId: null as string | null }));
 
 vi.mock("../state/AppContext", () => ({
   useAppState: () => ({
     serverOnline: true,
     sessionToken: "test-token",
-    sessionId: null,
+    sessionId: appState.sessionId,
   }),
   useAppDispatch: () => vi.fn(),
 }));
@@ -47,6 +59,7 @@ function makeStream(events: ChatEvent[]): AsyncGenerator<ChatEvent> {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  appState.sessionId = null;
   vi.mocked(api.listSessions).mockResolvedValue([]);
   vi.mocked(api.getSessionMessages).mockResolvedValue([]);
 });
@@ -594,5 +607,157 @@ describe("thinking toggle", () => {
     // Optimistic, but it does not lie: a failed write puts the switch back.
     await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
     expect(screen.getByText("Auto")).toBeTruthy();
+  });
+});
+
+describe("Chat — renaming this conversation", () => {
+  const SESSION = { id: "sess-1", title: "so i was wondering whether", created_at: "", updated_at: "" };
+
+  /**
+   * Chat opens on the wall, so a test that wants the thread has to walk the
+   * same route a person does: find the card, press it, land in the chat.
+   */
+  async function openConversation() {
+    appState.sessionId = "sess-1";
+    vi.mocked(api.listSessions).mockResolvedValue([SESSION] as never);
+    render(<Chat />);
+    fireEvent.click(await screen.findByRole("button", { name: /Open conversation/ }));
+    // The header carries the stored name once the thread is up.
+    await screen.findByRole("button", { name: /Rename this conversation/ });
+  }
+
+  /** The server renamed it, so every later listing carries the new name. */
+  function serverRenames(title: string) {
+    vi.mocked(api.listSessions).mockResolvedValue([{ ...SESSION, title }] as never);
+    return { session_id: "sess-1", outcome: "retitled", title };
+  }
+
+  it("asks the server for a better name and shows the one it gets", async () => {
+    const NEW = "Wake word fires twice on the Jetson";
+    await openConversation();
+    vi.mocked(api.retitleSession).mockImplementation(async () => serverRenames(NEW) as never);
+
+    fireEvent.click(screen.getByRole("button", { name: /Rename this conversation/ }));
+
+    await screen.findByText(NEW);
+    expect(vi.mocked(api.retitleSession)).toHaveBeenCalledWith("sess-1");
+    // The history list is refetched too, so the panel agrees with the header
+    // rather than the two drifting until the next reload.
+    await waitFor(() => expect(vi.mocked(api.listSessions).mock.calls.length).toBeGreaterThan(1));
+  });
+
+  it("cannot be pressed twice while it is working", async () => {
+    let release!: (v: unknown) => void;
+    vi.mocked(api.retitleSession).mockReturnValue(new Promise((r) => { release = r; }) as never);
+    await openConversation();
+
+    fireEvent.click(screen.getByRole("button", { name: /Rename this conversation/ }));
+
+    const busy = await screen.findByRole("button", { name: /Rename this conversation/ });
+    await waitFor(() => expect((busy as HTMLButtonElement).disabled).toBe(true));
+    fireEvent.click(busy);
+    expect(vi.mocked(api.retitleSession)).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      release(serverRenames("A settled name"));
+    });
+    await screen.findByText("A settled name");
+  });
+
+  it("keeps the old name when the rename fails", async () => {
+    vi.mocked(api.retitleSession).mockRejectedValue(new Error("No language model is configured"));
+    await openConversation();
+
+    fireEvent.click(screen.getByRole("button", { name: /Rename this conversation/ }));
+
+    // The failure is non-fatal: the conversation keeps the name it had, and the
+    // button becomes pressable again rather than sticking on "Renaming".
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: /Rename this conversation/ }) as HTMLButtonElement).disabled)
+        .toBe(false));
+    expect(screen.getByText("so i was wondering whether")).toBeTruthy();
+  });
+
+  it("is not offered when no conversation is open", async () => {
+    render(<Chat />);
+    await screen.findByRole("button", { name: /Rename this conversation/ });
+    const button = screen.getByRole("button", { name: /Rename this conversation/ }) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+  });
+});
+
+describe("Chat — the header's controls", () => {
+  const SESSION = { id: "sess-1", title: "so i was wondering whether", created_at: "", updated_at: "" };
+
+  async function openConversation() {
+    appState.sessionId = "sess-1";
+    vi.mocked(api.listSessions).mockResolvedValue([SESSION] as never);
+    render(<Chat />);
+    fireEvent.click(await screen.findByRole("button", { name: /Open conversation/ }));
+    await screen.findByRole("button", { name: /Rename this conversation/ });
+  }
+
+  /// The wall replaced it. Two routes to the same list, one of them cramped
+  /// behind a dropdown, is what the wall was built to end.
+  it("no longer offers a History dropdown beside New chat", async () => {
+    await openConversation();
+    expect(screen.queryByRole("button", { name: /history/i })).toBeNull();
+    expect(screen.getByRole("button", { name: "New chat" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /All conversations/ })).toBeTruthy();
+  });
+
+  /// Typing a name is the ONLY thing that marks a title as the user's, and a
+  /// user's title is the one kind no background pass will ever overwrite. With
+  /// the dropdown gone, this is the last route to it — if it breaks, that whole
+  /// protection becomes unreachable rather than merely inconvenient.
+  it("renames by typing into the title", async () => {
+    await openConversation();
+
+    fireEvent.click(screen.getByRole("button", { name: /Rename conversation:/ }));
+    const box = screen.getByLabelText("Conversation name") as HTMLInputElement;
+    expect(box.value).toBe("so i was wondering whether");
+
+    fireEvent.change(box, { target: { value: "  Jetson deploy notes  " } });
+    fireEvent.keyDown(box, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(vi.mocked(api.renameSession)).toHaveBeenCalledWith("sess-1", "Jetson deploy notes"));
+  });
+
+  it("abandons the edit on Escape", async () => {
+    await openConversation();
+    fireEvent.click(screen.getByRole("button", { name: /Rename conversation:/ }));
+    const box = screen.getByLabelText("Conversation name");
+
+    fireEvent.change(box, { target: { value: "Something else" } });
+    fireEvent.keyDown(box, { key: "Escape" });
+
+    expect(screen.queryByLabelText("Conversation name")).toBeNull();
+    expect(vi.mocked(api.renameSession)).not.toHaveBeenCalled();
+  });
+
+  /// Clearing the box and walking away is far likelier to be a slip than an
+  /// instruction to call the conversation nothing, and there is no undo for the
+  /// name it would replace.
+  it("treats an emptied name as a change of mind, not a rename", async () => {
+    await openConversation();
+    fireEvent.click(screen.getByRole("button", { name: /Rename conversation:/ }));
+    const box = screen.getByLabelText("Conversation name");
+
+    fireEvent.change(box, { target: { value: "   " } });
+    fireEvent.blur(box);
+
+    await waitFor(() => expect(screen.queryByLabelText("Conversation name")).toBeNull());
+    expect(vi.mocked(api.renameSession)).not.toHaveBeenCalled();
+  });
+
+  /// An unsaved conversation is called "New Chat", and a control with that name
+  /// sitting next to the actual New chat button is two things with one name.
+  it("does not make the placeholder title a control", async () => {
+    render(<Chat />);
+    await screen.findByRole("button", { name: "New chat" });
+    expect(screen.queryByRole("button", { name: /Rename conversation:/ })).toBeNull();
+    // Exactly one thing here answers to "New chat".
+    expect(screen.getAllByRole("button", { name: /new chat/i })).toHaveLength(1);
   });
 });

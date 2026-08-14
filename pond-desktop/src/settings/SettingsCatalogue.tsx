@@ -1,8 +1,8 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { Switch, Button } from "@heroui/react";
-import { Search, Crosshair, AlertCircle } from "lucide-react";
+import { Search, Crosshair, AlertCircle, Wand2 } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import type { ModelEntry, Settings } from "../api/types";
+import type { ModelEntry, RetitleResult, Settings } from "../api/types";
 import { diffSettings, foldServerState } from "../sections/Settings";
 import { ErrorBanner, SkeletonList } from "../components/shared";
 import {
@@ -23,6 +23,29 @@ const MARK_TITLE: Record<Consumer, string> = {
 
 function Mark({ consumer }: { consumer: Consumer }) {
   return <span className={`scat__dot scat__dot--${consumer}`} title={MARK_TITLE[consumer]} />;
+}
+
+// ─── Re-titling result ────────────────────────────────────────────────────
+
+/**
+ * One short line describing what a manual re-titling pass did.
+ *
+ * Sits beside the button in a narrow column, so it stays terse. The distinction
+ * worth spending words on is "nothing needed doing" versus "nothing was
+ * allowed" — a pond whose conversations are all named by hand would otherwise
+ * report the same blank result as a broken pass, and the person would press the
+ * button again expecting a different answer.
+ */
+export function summariseRetitle(r: RetitleResult): string {
+  if (r.renamed_count > 0) {
+    const many = r.renamed_count === 1 ? "1 conversation" : `${r.renamed_count} conversations`;
+    return r.capped ? `Renamed ${many} — press again for more` : `Renamed ${many}`;
+  }
+  if (r.considered === 0) return "No conversations to rename";
+  if (r.skipped.user_named === r.considered) return "All of these are named by hand";
+  if (r.unusable > 0 && r.unusable === r.considered) return "The model gave no usable name";
+  if (r.failed > 0 && r.renamed_count === 0) return "Could not rename any of them";
+  return "Nothing needed a new name";
 }
 
 // ─── Options from the model registry ──────────────────────────────────────
@@ -309,6 +332,28 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
   const [saveError, setSaveError] = useState<string | null>(null);
   const [categoryId, setCategoryId] = useState(CATALOGUE[0].id);
   const [query, setQuery] = useState("");
+  const [retitling, setRetitling] = useState(false);
+  const [retitleNote, setRetitleNote] = useState<string | null>(null);
+
+  /**
+   * Rename conversations on demand.
+   *
+   * One model call per conversation renamed, so this can run for a while on a
+   * small board — the button reports that rather than pretending to be instant.
+   * The reply is the only feedback; nothing on this page shows conversation
+   * names, so there is nothing to refresh here.
+   */
+  const runRetitle = useCallback(async () => {
+    setRetitling(true);
+    setRetitleNote(null);
+    try {
+      setRetitleNote(summariseRetitle(await api.retitleSessions()));
+    } catch (e) {
+      setRetitleNote(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRetitling(false);
+    }
+  }, []);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -431,15 +476,44 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
   const systemZone = detectTimezone();
   const zoneDiffers = systemZone != null && settings.timezone !== systemZone;
 
-  /** The one control with an action beside it: fill the zone from the device. */
+  /** The controls with an action beside them. */
   function extraFor(entry: Entry): React.ReactNode {
-    if (entry.key !== "timezone" || !zoneDiffers) return undefined;
-    return (
-      <button type="button" className="scat__detect" onClick={() => patch("timezone", systemZone)}>
-        <Crosshair size={12} aria-hidden="true" />
-        Use {systemZone}
-      </button>
-    );
+    if (entry.key === "timezone") {
+      if (!zoneDiffers) return undefined;
+      return (
+        <button type="button" className="scat__detect" onClick={() => patch("timezone", systemZone)}>
+          <Crosshair size={12} aria-hidden="true" />
+          Use {systemZone}
+        </button>
+      );
+    }
+
+    // Renaming on demand, rather than waiting for the pond to go quiet. Offered
+    // whatever the toggle says, because the toggle governs what happens
+    // unattended and this is not that.
+    if (entry.key === "session_titling_enabled") {
+      return (
+        <>
+          <button
+            type="button"
+            className="scat__detect"
+            onClick={runRetitle}
+            disabled={retitling}
+            aria-busy={retitling || undefined}
+          >
+            <Wand2 size={12} aria-hidden="true" />
+            {retitling ? "Renaming…" : "Rename now"}
+          </button>
+          {retitleNote && (
+            <span className="scat__actionNote" role="status">
+              {retitleNote}
+            </span>
+          )}
+        </>
+      );
+    }
+
+    return undefined;
   }
 
   let lastTier: string | null = null;

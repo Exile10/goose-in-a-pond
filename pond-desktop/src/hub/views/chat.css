@@ -795,17 +795,203 @@
   gap: var(--space-4);
 }
 
+/* The subject of the conversation, given the weight of a title rather than a
+   caption. Bigger, bolder and italic on purpose: it is the one piece of text in
+   the chrome that changes per conversation, and the italic is what stops a
+   heavier, larger line reading as a section heading for the messages below it. */
+/* The heading is now a wrapper: it carries the type, and the button inside it
+   inherits that and carries the target. */
 .chat2__topic {
+  display: flex;
+  align-items: center;
   font-family: var(--font-heading);
-  font-size: var(--text-md);
-  font-weight: var(--weight-semibold);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+  font-style: italic;
   letter-spacing: -0.01em;
+  line-height: 1.25;
   color: var(--color-text);
   margin: 0;
   min-width: 0;
   overflow: hidden;
+}
+
+/* ── Opening a conversation from the wall ────────────────────────────────
+ *
+ * The chat grows out of the card that was pressed. `--open-x` / `--open-y` are
+ * set from that card's centre, measured relative to the pane the wall and the
+ * chat both fill, so the expansion starts exactly where the finger left.
+ *
+ * Scale and fade only — no clone, no FLIP, no measuring the destination. The
+ * cheap version reads as the same gesture because the origin is right, and it
+ * cannot desynchronise from a layout that has not settled yet.
+ */
+.chat2[data-entering="true"] {
+  transform-origin: var(--open-x, 50%) var(--open-y, 50%);
+  animation: chat2-open 340ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes chat2-open {
+  from { opacity: 0; transform: scale(0.92); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* The way back, as a labelled pill rather than a bare arrow in a circle.
+ *
+ * It was a 36px transparent icon: small, easy to miss, and easy to miss with a
+ * thumb. Touch wants 44px and a word; the desktop look survives because the
+ * chrome stays light — one hairline border, a pill radius, secondary text —
+ * rather than because the target stays small. */
+.chat2__back {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--tap-min);
+  padding: 0 var(--space-4);
+  margin-right: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+  flex-shrink: 0;
+  white-space: nowrap;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.chat2__back:hover {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+  background: var(--color-accent-subtle);
+}
+
+/* ── The title, which renames itself ─────────────────────────────────────
+ *
+ * A button that looks like a heading until you approach it. It is the largest
+ * target in the header, which is what makes it the right place for the rename
+ * now that the history dropdown — the only other route to a hand-typed name —
+ * is gone. The negative margin keeps the text optically flush with the header's
+ * left edge despite the padding the target needs. */
+.chat2__topicBtn {
+  /* Block, not inline-flex. `text-overflow: ellipsis` has no effect in a flex
+     container — the text becomes an anonymous flex item and the box simply cuts
+     it mid-word — so a long title ended without the "…" that says it was cut.
+     `line-height` does the vertical centring a flex box was doing. */
+  display: block;
+  min-height: var(--tap-min);
+  line-height: var(--tap-min);
+  max-width: 100%;
+  padding: 0 var(--space-3);
+  /* No negative margin to pull the text optically flush. The heading clips its
+     overflow, so shifting the button left of its box cropped the title's first
+     characters — "Product lookup" rendered as "oduct lookup". Correct text
+     beats flush text. */
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  font: inherit;
+  color: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.chat2__topicBtn:hover:not(:disabled) {
+  border-color: var(--color-border);
+  background: var(--color-surface);
+}
+
+/* The same box without the affordance, for a conversation that has no name to
+   change yet. */
+.chat2__topicBtn--static {
+  cursor: default;
+  border-color: transparent;
+  background: transparent;
+}
+
+/* Typing a name. Set exactly like the title it replaces, so committing does not
+   move the text. */
+.chat2__topicEdit {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 480px;
+  min-height: var(--tap-min);
+  padding: 0 var(--space-3);
+  font-family: var(--font-heading);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-bold);
+  font-style: italic;
+  letter-spacing: -0.01em;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--focus-ring);
+  border-radius: var(--radius-md);
+  outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The expansion is the whole point of the transition, and its end frame is
+     the resting state, so collapsing it to a cut is correct. */
+  .chat2[data-entering="true"] { animation-duration: 1ms; }
+}
+
+/* Sits with the title, not with History and New chat, because it acts on the
+   title. `margin-right: auto` is what keeps it there: the header is
+   space-between, so without it this would be spread into the middle. */
+.chat2__retitle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-left: var(--space-3);
+  margin-right: auto;
+  /* Full target, like everything else in this header. */
+  min-height: var(--tap-min);
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-pill);
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-text-tertiary);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.chat2__retitle:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+  background: var(--color-accent-subtle);
+}
+
+.chat2__retitle:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.chat2__retitle[aria-busy="true"] {
+  cursor: progress;
+}
+
+.chat2__retitle-spin {
+  animation: chat2-retitle-spin 0.9s linear infinite;
+}
+
+@keyframes chat2-retitle-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The spinner's whole job is saying "still working". Freezing it mid-turn is
+     a sensible resting state, unlike a fade whose end frame is invisible. */
+  .chat2__retitle-spin { animation: none; }
 }
 
 .chat2__head-right {

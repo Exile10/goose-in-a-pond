@@ -527,11 +527,31 @@
 
 .scat__detect:hover { background: var(--color-accent-subtle); }
 
+.scat__detect:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+/* The outcome of an action, beside the button that caused it. Muted, because it
+   is a receipt rather than a control, and allowed to take its own line — which
+   is why `.scat__ctl` wraps. */
+.scat__actionNote {
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  color: var(--color-text-tertiary);
+  text-align: right;
+  max-width: 240px;
+}
+
 .scat__ctl {
   display: flex;
   align-items: center;
   gap: var(--space-3);
   justify-self: end;
+  /* An action's receipt can be longer than the control it sits beside. Without
+     this it would push the row wider than the page instead of dropping below. */
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .scat__field { font-family: var(--font-mono); font-size: var(--text-sm); }
