@@ -1810,6 +1810,15 @@ first, over Wolfram|Alpha's Full Results API, in a second `#[tool_router]` impl
 (`pond-mcp-server/src/wolfram.rs`) composed onto the same `KnowledgeMcpServer`. Tool count 64 -> 65,
 extension count unchanged at 17.
 
+**Corrected 2026-08-14 on merge: the count is 66, not 65.** Two tools out and two in nets zero, so
+the arithmetic above was right — against the tree the branch was looking at. That branch was 17
+commits behind a `main` which had gained `giap-context__recall` in the meantime, so the merge
+produced 66 while both sides believed 65, and `the_tool_inventory_parser_sees_the_tools_that_are_there`
+failed on the integrated tree having passed on each side. This is the stale-base failure the review
+procedure exists to catch, and it is worth recording because the guard did its job: the number is
+derived from source in a test, so the merge could not quietly ship a wrong count the way the prose
+did for months.
+
 **Run against 2.2, item by item.**
 
 - **Secret on `Settings`?** No. `WOLFRAM_APP_ID` is in the secret store via `secrets.rs`, the PAI-2
@@ -1878,7 +1887,7 @@ defect in a different costume.
 parses every `#[tool]` in the crate into an inventory and asserts each suggestion is in it — the
 sibling guard only ever checked that a name was *well-formed*, which
 `giap-discovery__search_web` still was. And `the_tool_inventory_parser_sees_the_tools_that_are_there`
-pins the count, which is how I found that **CLAUDE.md's "64 tools" had been wrong**: the number at
+pins the count, which is how I found that **AGENTS.md's "64 tools" had been wrong**: the number at
 `HEAD` before any of this session's work was 65. Prose nobody checks drifts; that line is now
 guarded and says so.
 

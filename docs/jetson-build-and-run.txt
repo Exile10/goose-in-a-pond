@@ -36,7 +36,7 @@ READ THIS FIRST - THREE TRAPS
 
    CORRECTION: the port fallback is 4000..4009, NOT 80 -> 8080 -> 4000 -> 5000.
    ports::API_SERVER = 4000 and ports::MAX_TRIES = 10, so serve without --port
-   starts at 4000 and walks upward. (CLAUDE.md claimed the other order and was
+   starts at 4000 and walks upward. (AGENTS.md claimed the other order and was
    wrong; it has been corrected.) The server writes the port it actually bound
    to <data_dir>/.runtime_api_port - read that instead of guessing.
 

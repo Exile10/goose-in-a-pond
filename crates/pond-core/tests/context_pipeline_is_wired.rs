@@ -29,7 +29,7 @@
 //! covers for PAI-7 P4.
 //!
 //! The registration half is NOT re-asserted here: `registration_matches_the_catalog.rs`
-//! already ties `giap_registration.rs`, `TOOL_GROUPS` and CLAUDE.md's sentence
+//! already ties `giap_registration.rs`, `TOOL_GROUPS` and AGENTS.md's sentence
 //! to each other and fails if any two disagree.
 
 const MAIN: &str = include_str!("../../pond-server/src/main.rs");

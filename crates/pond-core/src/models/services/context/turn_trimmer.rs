@@ -1058,7 +1058,7 @@ mod tests {
     /// with a fixture whose last message was the current turn's. Nothing in
     /// production ever built that input: `trim_goose_history` runs before
     /// `Agent::reply`. It was a green test for a state that could not occur,
-    /// which is the unreachable-fixture trap CLAUDE.md warns about.
+    /// which is the unreachable-fixture trap AGENTS.md warns about.
     #[test]
     fn every_user_message_is_stale_when_the_turn_has_not_been_appended_yet() {
         let wrapped =

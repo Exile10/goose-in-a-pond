@@ -172,7 +172,7 @@ fn every_registered_extension_is_in_the_catalog_and_the_reverse() {
     );
 }
 
-/// `CLAUDE.md` states the extension count in prose, and a number in prose is the
+/// `AGENTS.md` states the extension count in prose, and a number in prose is the
 /// thing that goes stale. It has been wrong twice in this programme — once at 14
 /// when the answer was 15, and once "corrected" from 15 back to 14 by a grep
 /// that could not see the const.
@@ -180,8 +180,8 @@ fn every_registered_extension_is_in_the_catalog_and_the_reverse() {
 /// This ties the sentence to the code. If the wording changes, this test fails
 /// asking for the claim to be re-verified rather than quietly stopping.
 #[test]
-fn the_extension_count_in_claude_md_is_the_real_one() {
-    let path = workspace_root().join("CLAUDE.md");
+fn the_extension_count_in_agents_md_is_the_real_one() {
+    let path = workspace_root().join("AGENTS.md");
     let doc = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
 
@@ -189,27 +189,27 @@ fn the_extension_count_in_claude_md_is_the_real_one() {
     const SUFFIX: &str = " `giap-*` builtin MCP extensions";
     let start = doc.find(PREFIX).unwrap_or_else(|| {
         panic!(
-            "CLAUDE.md no longer contains the sentence `{PREFIX}N{SUFFIX}`. If the claim was \
+            "AGENTS.md no longer contains the sentence `{PREFIX}N{SUFFIX}`. If the claim was \
              reworded, re-verify the number against giap_registration.rs and update this test to \
              match; do not delete it."
         )
     }) + PREFIX.len();
     let end = doc[start..].find(SUFFIX).unwrap_or_else(|| {
-        panic!("CLAUDE.md's extension-count sentence changed shape; re-verify and re-tie it.")
+        panic!("AGENTS.md's extension-count sentence changed shape; re-verify and re-tie it.")
     }) + start;
     let claimed: usize = doc[start..end]
         .trim()
         .parse()
-        .unwrap_or_else(|e| panic!("CLAUDE.md claims `{}` extensions: {e}", &doc[start..end]));
+        .unwrap_or_else(|e| panic!("AGENTS.md claims `{}` extensions: {e}", &doc[start..end]));
 
     // Compared against the REGISTRATION count rather than the catalog's length,
-    // because that is what the sentence in CLAUDE.md is a claim about — and
+    // because that is what the sentence in AGENTS.md is a claim about — and
     // because it is what the counting recipe next to it produces. The two are
     // pinned to each other by the test above.
     let registered = registered_extensions_from_source().len();
     assert_eq!(
         claimed, registered,
-        "CLAUDE.md says {claimed} builtin extensions; giap_registration.rs has {registered} \
+        "AGENTS.md says {claimed} builtin extensions; giap_registration.rs has {registered} \
          `register_builtin_extension(` call sites. Count the CALL SITES -- the import line has \
          no open paren, so nothing is subtracted from the grep, and two call sites pass a const \
          rather than a string literal."
