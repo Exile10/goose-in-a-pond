@@ -748,3 +748,40 @@ describe("foldServerState", () => {
     });
   });
 });
+
+// ── The full catalogue, reached from the classic Settings list ──────────────
+
+describe("all-settings catalogue", () => {
+  beforeEach(() => {
+    vi.mocked(api.getSettings).mockResolvedValue(serverSettings() as never);
+  });
+
+  // This file registers cleanup per describe block rather than globally; without
+  // it the previous render stays mounted and every getByText finds two.
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("opens from the settings list and comes back", async () => {
+    await renderSettings();
+
+    fireEvent.click(screen.getByRole("button", { name: /All settings/ }));
+
+    // The catalogue brings its own header, so the section's twelve topic rows
+    // are gone and the categories are in their place.
+    await screen.findByText("Everything this pond is, knows, hears, and is allowed to do.");
+    expect(screen.getByRole("button", { name: /Privacy & Security/ })).toBeTruthy();
+    expect(screen.queryByText("Your home, your assistant, and the models that power it.")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "← Back" }));
+    await screen.findByText("Your home, your assistant, and the models that power it.");
+  });
+
+  it("leaves the twelve topic screens reachable", async () => {
+    // The catalogue is a sibling of the existing panels, not a replacement —
+    // this asserts the classic route into one topic still works.
+    await renderSettings();
+    await navigateTo("Models");
+    expect(screen.getByText("← Back")).toBeTruthy();
+  });
+});

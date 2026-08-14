@@ -488,7 +488,6 @@ impl ServerHandler for VisionMcpServer {
 
 // ── Static deps + spawn function for the Goose builtin registry ───────────────
 
-use rmcp::ServiceExt;
 use tokio::io::DuplexStream;
 
 struct VisionDeps {
@@ -517,14 +516,7 @@ pub fn spawn_vision_server(reader: DuplexStream, writer: DuplexStream) {
         return;
     };
     let server = VisionMcpServer::new(deps.camera_storage.clone());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-vision MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-vision", server, reader, writer);
 }
 
 #[cfg(test)]

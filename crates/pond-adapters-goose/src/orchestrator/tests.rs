@@ -1656,14 +1656,37 @@ fn the_turn_authority_is_built_from_the_published_allow_set() {
          the shim; the two can now disagree"
     );
 
+    // The entitlement passes through the same subtraction, in the same branch,
+    // on the same condition — so "post-guest-subtraction" holds for the ceiling
+    // as well as for the allow-set. Asserted by ORDER, like the two above.
+    let subtract_entitlement = code
+        .find("entitled_tools.map(|tools|")
+        .expect("the delegation ceiling no longer goes through a guest subtraction at all");
+    assert!(
+        subtract_entitlement > subtract,
+        "the entitlement's guest subtraction runs before the allow-set's, so the two \
+         can disagree about who a Guest is"
+    );
+    assert!(
+        publish_authority > subtract_entitlement,
+        "the delegation authority is built BEFORE the entitlement is guest-subtracted, so \
+         a Guest turn would hand a subagent the personal-data groups it was denied"
+    );
+
     let call = &code[publish_authority..(publish_authority + 700).min(code.len())];
     assert!(
         call.contains("turn_scope.clone()"),
         "the child's profile scope no longer comes from the turn's resolved scope"
     );
+    // The ENTITLEMENT, falling back to the allow-set in "all" mode where the two
+    // are the same set. Narrowing is a decision about this turn's prompt budget;
+    // a child gets its own prompt, and the parent can reach any permitted group
+    // itself via `enable_tool_group`, so `allowed_tools` was never the boundary.
+    // What must never appear here is a set that skipped section 6d.
     assert!(
-        call.contains("allowed_tools.iter().map(String::as_str)"),
-        "the authority's tool set is no longer derived from the turn's allow-set: {call}"
+        call.contains("entitled_tools") && call.contains("unwrap_or(&allowed_tools)"),
+        "the authority's tool set is no longer the turn's entitlement falling back to its \
+         allow-set: {call}"
     );
     assert!(
         call.contains("cancel_token.clone()"),

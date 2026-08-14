@@ -378,7 +378,6 @@ fn parse_datetime(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 // ── Static deps + spawn function for the Goose builtin registry ───────────────
 
-use rmcp::ServiceExt;
 use tokio::io::DuplexStream;
 
 struct SensorDeps {
@@ -409,14 +408,7 @@ pub fn spawn_sensor_server(reader: DuplexStream, writer: DuplexStream) {
         return;
     };
     let server = SensorsMcpServer::new(deps.sensor_storage.clone(), deps.device_registry.clone());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-sensors MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-sensors", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────

@@ -1199,7 +1199,6 @@ async fn resolve_web_query(params: &WebSearchParams) -> String {
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -1227,14 +1226,7 @@ pub fn spawn_discovery_server(reader: DuplexStream, writer: DuplexStream) {
         .get()
         .expect("init_discovery_deps() not called");
     let server = DiscoveryMcpServer::new(deps.http_client.clone(), deps.settings_repo.clone());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-discovery MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-discovery", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

@@ -12,7 +12,8 @@ vi.mock("../api/PondApiClient", () => ({
     listSessions: vi.fn(),
     getSessionMessages: vi.fn(),
     setToken: vi.fn(),
-    getSettings: vi.fn().mockResolvedValue({ show_turn_stats: false }),
+    getSettings: vi.fn().mockResolvedValue({ show_turn_stats: false, thinking_mode: "auto" }),
+    updateSettings: vi.fn().mockResolvedValue({}),
     getModelCapabilities: vi.fn().mockResolvedValue({
       thinking: false,
       vision: true,
@@ -60,14 +61,17 @@ describe("Chat section", () => {
   it("renders empty state when no messages", async () => {
     render(<Chat />);
     await waitFor(() => {
-      expect(screen.getByText(/start a conversation/i)).toBeTruthy();
+      // The greeting rotates and personalises from `user_name`, so there is no
+      // fixed string to assert. The card itself is the stable signal that the
+      // thread is empty.
+      expect(document.querySelector(".chat-empty")).toBeTruthy();
     });
   });
 
   it("renders New chat button", async () => {
     render(<Chat />);
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /new conversation/i })).toBeTruthy();
+      expect(screen.getByRole("button", { name: /new chat/i })).toBeTruthy();
     });
   });
 
@@ -177,10 +181,13 @@ describe("Chat section", () => {
     await waitFor(() => expect(screen.getByText("Hi!")).toBeTruthy());
 
     // Click New chat
-    fireEvent.click(screen.getByRole("button", { name: /new conversation/i }));
+    fireEvent.click(screen.getByRole("button", { name: /new chat/i }));
 
     await waitFor(() => {
-      expect(screen.getByText(/start a conversation/i)).toBeTruthy();
+      // The greeting rotates and personalises from `user_name`, so there is no
+      // fixed string to assert. The card itself is the stable signal that the
+      // thread is empty.
+      expect(document.querySelector(".chat-empty")).toBeTruthy();
       expect(screen.queryByText("Hi!")).toBeNull();
     });
   });
@@ -324,6 +331,13 @@ describe("Chat history — persisted reasoning (PAI-5 P6)", () => {
   async function renderWithHistory(messages: unknown[]) {
     vi.resetModules();
     const getSessionMessages = vi.fn().mockResolvedValue(messages);
+    // `vi.resetModules()` + `doMock` + dynamic import does not always win the
+    // race: the component occasionally resolves the TOP-LEVEL mock instead,
+    // which `beforeEach` has pinned to []. When that happened the thread
+    // rendered its empty state and the assertion failed — roughly 1 run in 5,
+    // reproducible against HEAD. Pointing both registries at the same data
+    // makes the outcome independent of which one wins.
+    vi.mocked(api.getSessionMessages).mockResolvedValue(messages as never);
     const holder = { sessionId: null as string | null };
     vi.doMock("../api/PondApiClient", () => ({
       api: {
@@ -387,9 +401,20 @@ describe("Chat history — persisted reasoning (PAI-5 P6)", () => {
 
     await waitFor(() => expect(screen.getByText("The porch light is on.")).toBeTruthy());
 
-    // The panel itself, and BOTH passages. Asserting only the toggle would pass
-    // against a refill that kept the first block and dropped the rest.
-    expect(screen.getByText("Thinking")).toBeTruthy();
+    // Reasoning now collapses to a single line, so the disclosure has to be
+    // opened before the passages exist in the DOM. Queried by element rather
+    // than by the word "Thinking": the composer carries a thinking-mode toggle
+    // using the same word.
+    const disclosure = document.querySelector(".think");
+    expect(disclosure).toBeTruthy();
+    // Past tense once the turn is over — a replayed transcript is never "still
+    // thinking".
+    expect(disclosure!.textContent).toMatch(/thought for/i);
+
+    fireEvent.click(screen.getByRole("button", { expanded: false, name: /thought for/i }));
+
+    // BOTH passages. Asserting only the toggle would pass against a refill that
+    // kept the first block and dropped the rest.
     expect(screen.getByText("They said 'it' — probably the thermostat.")).toBeTruthy();
     expect(screen.getByText("No: the porch light.")).toBeTruthy();
   });
@@ -402,13 +427,172 @@ describe("Chat history — persisted reasoning (PAI-5 P6)", () => {
     await renderWithHistory([userRow, assistantRow()]);
 
     await waitFor(() => expect(screen.getByText("The porch light is on.")).toBeTruthy());
-    expect(screen.queryByText("Thinking")).toBeNull();
+    expect(document.querySelector(".think")).toBeNull();
   });
 
   it("shows no thinking panel when the server sends an empty list", async () => {
     await renderWithHistory([userRow, assistantRow([])]);
 
     await waitFor(() => expect(screen.getByText("The porch light is on.")).toBeTruthy());
-    expect(screen.queryByText("Thinking")).toBeNull();
+    expect(document.querySelector(".think")).toBeNull();
+  });
+});
+
+// ── Message queuing ───────────────────────────────────────────────────────────
+
+describe("message queuing", () => {
+  /**
+   * A stream the test can hold open, so "while Goose is still answering" is a
+   * real state rather than a race against an instant mock. `release()` ends it.
+   */
+  function heldStream(events: ChatEvent[]) {
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    const gen = (async function* () {
+      for (const ev of events) yield ev;
+      await held;
+      yield { done: true, session_id: "sess-q", type: "done" } as ChatEvent;
+    })();
+    return { gen, release: () => release() };
+  }
+
+  async function typeAndSend(text: string) {
+    fireEvent.change(screen.getByLabelText("Message input"), { target: { value: text } });
+    fireEvent.click(screen.getByLabelText(/send message|queue message/i));
+  }
+
+  it("keeps the composer live while a reply is streaming", async () => {
+    const first = heldStream([{ type: "text", content: "thinking…" }]);
+    vi.mocked(api.chatStream).mockReturnValueOnce(first.gen);
+
+    render(<Chat />);
+    await waitFor(() => expect(screen.getByLabelText("Message input")).toBeTruthy());
+    await typeAndSend("first");
+
+    // The old composer disabled itself here, which silently swallowed anything
+    // typed during a reply.
+    await waitFor(() => {
+      expect((screen.getByLabelText("Message input") as HTMLTextAreaElement).disabled).toBe(false);
+    });
+
+    await act(async () => { first.release(); });
+  });
+
+  it("queues a message typed mid-reply and shows it as queued", async () => {
+    const first = heldStream([{ type: "text", content: "working" }]);
+    vi.mocked(api.chatStream).mockReturnValueOnce(first.gen);
+
+    render(<Chat />);
+    await waitFor(() => expect(screen.getByLabelText("Message input")).toBeTruthy());
+    await typeAndSend("first");
+    await waitFor(() => expect(screen.getByText("working")).toBeTruthy());
+
+    await typeAndSend("second");
+
+    // Visible in the thread, marked, and not yet sent.
+    await waitFor(() => expect(screen.getByText("Queued")).toBeTruthy());
+    expect(vi.mocked(api.chatStream)).toHaveBeenCalledTimes(1);
+
+    await act(async () => { first.release(); });
+  });
+
+  it("drains the queue in order once the turn finishes", async () => {
+    const first = heldStream([{ type: "text", content: "one" }]);
+    vi.mocked(api.chatStream).mockReturnValueOnce(first.gen);
+
+    render(<Chat />);
+    await waitFor(() => expect(screen.getByLabelText("Message input")).toBeTruthy());
+    await typeAndSend("first");
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+
+    await typeAndSend("second");
+    await typeAndSend("third");
+    await waitFor(() => expect(screen.getAllByText("Queued")).toHaveLength(2));
+
+    // Each queued message gets its own turn, in the order it was typed.
+    vi.mocked(api.chatStream)
+      .mockReturnValueOnce(makeStream([{ type: "text", content: "two" }, { done: true, session_id: "s", type: "done" }]))
+      .mockReturnValueOnce(makeStream([{ type: "text", content: "three" }, { done: true, session_id: "s", type: "done" }]));
+
+    await act(async () => { first.release(); });
+
+    await waitFor(() => expect(vi.mocked(api.chatStream)).toHaveBeenCalledTimes(3), { timeout: 3000 });
+    const sent = vi.mocked(api.chatStream).mock.calls.map((c) => c[0] as string);
+    expect(sent).toEqual(["first", "second", "third"]);
+    await waitFor(() => expect(screen.queryByText("Queued")).toBeNull());
+  });
+
+  it("does not queue an empty message", async () => {
+    const first = heldStream([{ type: "text", content: "busy" }]);
+    vi.mocked(api.chatStream).mockReturnValueOnce(first.gen);
+
+    render(<Chat />);
+    await waitFor(() => expect(screen.getByLabelText("Message input")).toBeTruthy());
+    await typeAndSend("first");
+    await waitFor(() => expect(screen.getByText("busy")).toBeTruthy());
+
+    fireEvent.change(screen.getByLabelText("Message input"), { target: { value: "   " } });
+    fireEvent.click(screen.getByLabelText(/send message|queue message/i));
+    expect(screen.queryByText("Queued")).toBeNull();
+
+    await act(async () => { first.release(); });
+  });
+});
+
+// ── Thinking toggle ───────────────────────────────────────────────────────────
+
+describe("thinking toggle", () => {
+  async function renderChat() {
+    render(<Chat />);
+    await waitFor(() => expect(screen.getByLabelText("Message input")).toBeTruthy());
+    return screen.getByRole("switch", { name: /thinking mode/i });
+  }
+
+  it("reflects the stored thinking_mode", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue({ show_turn_stats: false, thinking_mode: "off" } as never);
+    const toggle = await renderChat();
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+    expect(screen.getByText("Off")).toBeTruthy();
+  });
+
+  it("persists the new mode to the server", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue({ show_turn_stats: false, thinking_mode: "auto" } as never);
+    const toggle = await renderChat();
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+
+    fireEvent.click(toggle);
+
+    // The setting the agent actually reads, not a display preference.
+    await waitFor(() =>
+      expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({ thinking_mode: "off" }));
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("false"));
+  });
+
+  it("restores the previous mode rather than collapsing it to auto", async () => {
+    // Someone who chose "on" explicitly should get "on" back when they switch
+    // thinking on again — not silently downgraded to the default.
+    vi.mocked(api.getSettings).mockResolvedValue({ show_turn_stats: false, thinking_mode: "on" } as never);
+    const toggle = await renderChat();
+    await waitFor(() => expect(screen.getByText("On")).toBeTruthy());
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(screen.getByText("Off")).toBeTruthy());
+
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(vi.mocked(api.updateSettings)).toHaveBeenLastCalledWith({ thinking_mode: "on" }));
+  });
+
+  it("reverts the control when the save fails", async () => {
+    vi.mocked(api.getSettings).mockResolvedValue({ show_turn_stats: false, thinking_mode: "auto" } as never);
+    vi.mocked(api.updateSettings).mockRejectedValueOnce(new Error("offline"));
+    const toggle = await renderChat();
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+
+    fireEvent.click(toggle);
+
+    // Optimistic, but it does not lie: a failed write puts the switch back.
+    await waitFor(() => expect(toggle.getAttribute("aria-checked")).toBe("true"));
+    expect(screen.getByText("Auto")).toBeTruthy();
   });
 });

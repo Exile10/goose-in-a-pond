@@ -1014,7 +1014,6 @@ impl KnowledgeMcpServer {
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -1035,14 +1034,7 @@ pub fn spawn_knowledge_server(reader: DuplexStream, writer: DuplexStream) {
         .get()
         .expect("init_knowledge_deps() not called");
     let server = KnowledgeMcpServer::new(deps.http_client.clone());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-knowledge MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-knowledge", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

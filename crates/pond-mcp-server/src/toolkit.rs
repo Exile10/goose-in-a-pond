@@ -19,7 +19,9 @@
 //! session regardless of selection.
 
 use pond_core::mcp::domain::tool_group::TOOLKIT_EXTENSION;
-use pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl;
+use pond_core::mcp::ports::tools::tool_selection_control::{
+    ToolSelectionControl, ToolSelectionError,
+};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -98,7 +100,7 @@ List the groups of tools available on this device and whether each is loaded now
 Use when a capability you need seems to be missing.")]
     async fn list_tool_groups(
         &self,
-        _ctx: RequestContext<RoleServer>,
+        ctx: RequestContext<RoleServer>,
         _params: Parameters<ListToolGroupsParams>,
     ) -> Result<CallToolResult, ErrorData> {
         crate::set_current_tool("list_tool_groups");
@@ -107,7 +109,14 @@ Use when a capability you need seems to be missing.")]
                 "All available tools are already loaded for this conversation.",
             )]));
         };
-        let session_id = crate::current_session_id();
+        // `_meta`, not `current_session_id()`. See `session_meta.rs`: the global
+        // is a `RwLock<String>` raced by four concurrent chat streams, so it can
+        // name a different member's conversation than the one that called.
+        let Some(session_id) = crate::session_from_meta(&ctx.meta) else {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "All available tools are already loaded for this conversation.",
+            )]));
+        };
         let groups = control.group_status(&session_id).await;
         if groups.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -142,7 +151,7 @@ Load a group of tools that is not currently available, by its exact name (e.g. \
 \"giap-schedule\"). Its tools can be called immediately afterwards.")]
     async fn enable_tool_group(
         &self,
-        _ctx: RequestContext<RoleServer>,
+        ctx: RequestContext<RoleServer>,
         params: Parameters<EnableToolGroupParams>,
     ) -> Result<CallToolResult, ErrorData> {
         crate::set_current_tool("enable_tool_group");
@@ -157,7 +166,15 @@ Load a group of tools that is not currently available, by its exact name (e.g. \
                  'group'.",
             )]));
         };
-        let session_id = crate::current_session_id();
+        // Widening is authorisation, so it reads the one channel that cannot be
+        // raced. An unattributable call widens nothing rather than widening
+        // whichever conversation happened to start a turn most recently.
+        let Some(session_id) = crate::session_from_meta(&ctx.meta) else {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Tool groups cannot be changed from here — every group already available \
+                 to you is loaded.",
+            )]));
+        };
         match control.enable_group(&session_id, &group).await {
             Ok(loaded) => {
                 tracing::info!(
@@ -171,6 +188,17 @@ Load a group of tools that is not currently available, by its exact name (e.g. \
                     "Loaded '{group}'. Its tools are available now — go ahead and call the one you \
                      need. Loaded groups: {}.",
                     loaded.join(", ")
+                ))]))
+            }
+            // The group IS loaded; its tools just are not callable yet. The
+            // catch-all below says "Could not load" and points at
+            // list_tool_groups, both of which would be wrong here and would send
+            // the model back round a loop it has already completed.
+            Err(ToolSelectionError::NotReady(_)) => {
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Loaded '{group}', but its tools only become callable on your next turn. \
+                     Do not call one yet — answer with what you have, or use a tool you \
+                     already had."
                 ))]))
             }
             // A failure is reported as tool SUCCESS carrying the explanation: an
@@ -204,7 +232,6 @@ impl ServerHandler for ToolkitMcpServer {
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -229,14 +256,7 @@ pub fn spawn_toolkit_server(reader: DuplexStream, writer: DuplexStream) {
     // missing handle is a legitimate transient state, not a bug.
     let control = TOOLKIT_DEPS.get().and_then(|d| d.control.clone());
     let server = ToolkitMcpServer::new(control);
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-toolkit MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-toolkit", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -244,6 +264,48 @@ pub fn spawn_toolkit_server(reader: DuplexStream, writer: DuplexStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Widening a session's tool surface is authorisation, so it may only ever
+    /// read the per-call channel.
+    ///
+    /// `crate::current_session_id()` is a process-global `RwLock<String>` written
+    /// once per turn, with `Semaphore::new(4)` concurrent chat streams racing it.
+    /// Both tools here used to read it, so one member's `enable_tool_group` could
+    /// widen a different member's allow-set — and `session_meta.rs` had already
+    /// written down why that is not acceptable: *"Correct authorisation on a
+    /// misattributed session is not correct."*
+    ///
+    /// A source scan because the alternative needs a live `RequestContext`, which
+    /// rmcp does not offer a constructor for. Comments are stripped so the note
+    /// explaining the ban does not itself trip it — without that, this guard
+    /// would have failed on the day it landed for reasons unrelated to the code.
+    #[test]
+    fn neither_tool_reads_the_process_global_session() {
+        let src = include_str!("toolkit.rs");
+        let production = src.split("mod tests").next().unwrap_or(src);
+        let code: String = production
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Vacuity control: the scan must be able to see the call it permits, or
+        // a rename would make this silently pass forever.
+        assert!(
+            code.contains("session_from_meta("),
+            "neither tool resolves a session from _meta — this guard is scanning \
+             the wrong thing"
+        );
+        assert!(
+            !code.contains("current_session_id("),
+            "toolkit.rs reads the process-global session id. Four chat streams \
+             race it, so this widens whichever conversation started a turn most \
+             recently rather than the one that called."
+        );
+    }
 
     #[test]
     fn group_comes_from_the_declared_param() {

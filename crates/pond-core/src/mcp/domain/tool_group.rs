@@ -106,7 +106,12 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
     },
     ToolGroup {
         extension: "giap-schedule",
-        description: "Reminders, alarms, timers, recurring routines and scheduled tasks: create a \
+        // This sentence promised "timers" for months while a one-shot was not
+        // expressible: `SchedulerPort` was cron-only, and a 6-field cron has no
+        // year field, so "in ten minutes" became an annual alarm or nothing at
+        // all. `set_timer` is what makes the first clause true.
+        description: "Reminders, alarms, timers, recurring routines and scheduled tasks: set a \
+                      one-shot timer for a few minutes or hours from now, create a repeating \
                       schedule, list or inspect what is scheduled, change or pause or delete one, \
                       run one now, and review past runs. Anything about doing something later or \
                       every day at a certain time.",
@@ -289,10 +294,19 @@ pub fn groups_denied_to_subagents() -> &'static [&'static str] {
         // `approve_draft`/`reject_draft` DECIDE, and the gate that would check
         // who decided cannot resolve a subagent (see above).
         "giap-draft",
-        // `enable_tool_group` WIDENS an allow-set keyed by the process-global
-        // `current_session_id()`, which a child does not own. A child holding
-        // this could widen its own narrowing -- or its parent's. This is the
-        // most direct breach of invariant 1 available anywhere in the tree.
+        // `enable_tool_group` WIDENS an allow-set. It now resolves the caller
+        // from `_meta` rather than the process-global `current_session_id()`, so
+        // the old reason for this entry -- a child widening its parent's
+        // narrowing -- is closed at the source, and a child calling it gets a
+        // refusal rather than somebody else's session.
+        //
+        // It stays denied for a different and simpler reason: a child has
+        // nothing to widen. Its allow-set is its whole grant, published up front
+        // by `narrow_child_groups`, and its grant is bounded by the parent's
+        // ENTITLEMENT rather than by whatever the parent happened to have
+        // loaded. So the hatch has no work to do here, and offering a 2-4B model
+        // a tool whose every call is a refusal is not a harmless schema -- see
+        // the note on ORCHESTRATOR_EXTENSION below, which is the same argument.
         TOOLKIT_EXTENSION,
         // Actuates the house. There is no approval path for a subagent, and the
         // one it would otherwise take -- staging a draft -- is denied above.

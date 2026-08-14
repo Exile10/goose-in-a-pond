@@ -1,15 +1,30 @@
 //! Shared formatting utilities for MCP tool results.
 //!
-//! All tool results must fit within a character budget to avoid
-//! overwhelming the LLM's context window.
+//! All tool results must fit within a BYTE budget to avoid overwhelming the
+//! LLM's context window. See [`truncate_to_budget`] for why bytes and not chars.
 
-/// Truncate text to a character budget, respecting UTF-8 char boundaries.
+/// Truncate text to a byte budget, respecting UTF-8 char boundaries.
 /// Appends a truncation notice if the text was cut.
-pub fn truncate_to_budget(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
+///
+/// **Bytes, deliberately, and the parameter used to be called `max_chars` while
+/// the body measured `text.len()`.** The name was the bug, not the arithmetic:
+/// this budget exists to bound PROMPT TOKENS, and for that bytes are the better
+/// proxy. A BPE tokenizer working over UTF-8 spends more tokens per character on
+/// non-Latin script than on ASCII, so charging by characters would hand a
+/// Cyrillic or Devanagari result roughly twice the token budget of an English
+/// one for the same nominal number. Charging by bytes tracks the real cost.
+///
+/// `pond-core` already had the honest version of this next door —
+/// `context_budget::truncate_at_byte_budget(content, max_bytes)` — doing exactly
+/// the same thing under a name that says so. This now agrees with it.
+///
+/// The cut still lands on a char boundary, so the output is always valid UTF-8;
+/// only the accounting is in bytes.
+pub fn truncate_to_budget(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
         return text.to_string();
     }
-    let mut cut = max_chars;
+    let mut cut = max_bytes;
     while cut > 0 && !text.is_char_boundary(cut) {
         cut -= 1;
     }
@@ -21,9 +36,12 @@ pub fn truncate_to_budget(text: &str, max_chars: usize) -> String {
 
 /// Format a list of items with a header, capped to budget.
 ///
+/// `max_bytes`, on the same reasoning as [`truncate_to_budget`] — the accumulator
+/// is compared with `String::len()`, which is bytes.
+///
 /// A header with no items underneath it is a miss, not a result — see
 /// [`format_no_results`] for why that distinction has to reach the model.
-pub fn format_list_result(items: &[String], header: &str, max_chars: usize) -> String {
+pub fn format_list_result(items: &[String], header: &str, max_bytes: usize) -> String {
     let mut result = if header.is_empty() {
         String::new()
     } else {
@@ -33,7 +51,7 @@ pub fn format_list_result(items: &[String], header: &str, max_chars: usize) -> S
     let mut wrote_item = false;
     for item in items {
         let line = format!("- {}\n", item);
-        if result.len() + line.len() > max_chars {
+        if result.len() + line.len() > max_bytes {
             result.push_str("...\n[More results available]");
             break;
         }
@@ -109,13 +127,76 @@ fn join_tool_names(names: &[&str]) -> String {
     }
 }
 
-/// Format a "not configured" guidance message for tools that need an API key.
+/// Format a "not configured" guidance message for tools that CANNOT work
+/// without an API key.
+///
 /// Returns a message the LLM can relay to the user with signup instructions.
+/// Only for a hard stop — `giap-wolfram` is the shape, since there is no keyless
+/// way to compute an answer. A tool that merely gets *worse* without a key wants
+/// [`format_degraded`]: telling the user a working tool "requires an API key to
+/// work" is false, and a false explanation for a real result is worse than no
+/// explanation.
 pub fn format_not_configured(feature: &str, signup_url: &str) -> String {
     format!(
         "{feature} requires an API key to work. Get one free at {signup_url} — \
          then add it in Settings under 'Knowledge & Discovery'."
     )
+}
+
+/// Note that a result came from a keyless fallback, and is therefore worse than
+/// the tool can do.
+///
+/// The counterpart to [`format_not_configured`], for the far more common case:
+/// `search_news` without a Guardian key still answers, from the Wikimedia
+/// featured feed rather than a keyword search; `get_stock_quote` without a
+/// Finnhub key still answers, from an unofficial Yahoo endpoint. Both are real
+/// answers and both are quietly worse, and nothing said so — the degradation was
+/// an `eprintln!` on the server's stderr, which no user sees.
+///
+/// Appended AFTER the result rather than replacing it, and phrased as a fact
+/// about the source rather than an instruction, because the answer is the
+/// answer: a model told to relay setup advice tends to lead with it.
+pub fn format_degraded(result: &str, what_is_missing: &str, signup_url: &str) -> String {
+    format!(
+        "{result}\n\n[Source note: this came from a free fallback because no \
+         {what_is_missing} is configured. Better results are available with one — \
+         free at {signup_url}, added in Settings. Mention this only if asked \
+         about the source or the quality.]"
+    )
+}
+
+/// Append [`format_degraded`]'s note to a tool result that already succeeded.
+///
+/// Takes and returns a `CallToolResult` so a degraded path is one line at the
+/// call site — the alternative is every caller unwrapping content, formatting,
+/// and rebuilding, which is how three call sites ended up saying nothing at all.
+///
+/// A result with no text content is returned untouched: there is nothing to
+/// annotate, and inventing a body to hang a note on would turn "no answer" into
+/// "an answer plus advice".
+pub fn degrade_result(
+    result: rmcp::model::CallToolResult,
+    what_is_missing: &str,
+    signup_url: &str,
+) -> rmcp::model::CallToolResult {
+    use rmcp::model::{Content, RawContent};
+    let existing: String = result
+        .content
+        .iter()
+        .filter_map(|c| match &c.raw {
+            RawContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if existing.trim().is_empty() {
+        return result;
+    }
+    rmcp::model::CallToolResult::success(vec![Content::text(format_degraded(
+        &existing,
+        what_is_missing,
+        signup_url,
+    ))])
 }
 
 /// Format an API error as a helpful message (not ErrorData — the LLM reads this).
@@ -156,6 +237,45 @@ mod tests {
         let result = truncate_to_budget(text, 5);
         // Should not panic or split mid-char
         assert!(result.contains("[Truncated"));
+    }
+
+    /// The budget is BYTES, and that is a decision rather than an accident.
+    ///
+    /// The parameter was called `max_chars` while the body compared
+    /// `text.len()`, so which unit it meant was anyone's guess and the module
+    /// doc asserted the wrong one. Bytes is right: the budget bounds prompt
+    /// TOKENS, and a BPE tokenizer over UTF-8 spends more tokens per character
+    /// on non-Latin script than on ASCII — so charging per character would hand
+    /// a Cyrillic result roughly twice the token budget of an English one for
+    /// the same nominal number. `pond-core`'s `truncate_at_byte_budget` had
+    /// already made the same choice under an honest name.
+    ///
+    /// Pinned with a string whose two counts differ by exactly 2x, so a silent
+    /// switch to `chars().count()` cannot pass.
+    #[test]
+    fn the_budget_is_counted_in_bytes_not_characters() {
+        let cyrillic = "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442} \u{43c}\u{438}\u{440}";
+        assert_eq!(cyrillic.chars().count(), 10, "fixture is not 10 chars");
+        assert_eq!(cyrillic.len(), 19, "fixture is not 19 bytes");
+
+        // Fits its byte budget exactly: returned untouched.
+        assert_eq!(truncate_to_budget(cyrillic, 19), cyrillic);
+
+        // Must be cut at 12 bytes. A char-counting implementation would see
+        // 10 <= 12 and hand the whole string back.
+        let cut = truncate_to_budget(cyrillic, 12);
+        assert!(
+            cut.contains("[Truncated"),
+            "a 19-byte string survived a 12-byte budget, so the budget is being \
+             counted in characters: {cut:?}"
+        );
+
+        // Bytes are the accounting, never the slicing — the cut still lands on a
+        // char boundary and the result is valid UTF-8.
+        assert!(
+            cut.starts_with("\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}"),
+            "cut mid-character: {cut:?}"
+        );
     }
 
     #[test]
@@ -229,6 +349,49 @@ mod tests {
         assert_eq!(join_tool_names(&["a", "b", "c"]), "a, b, or c");
     }
 
+    /// Every builtin server is served through the one supervised helper.
+    ///
+    /// All seventeen `spawn_*_server` functions carried the same seven lines,
+    /// and all seventeen dropped the exit: `Ok(running) => { let _ =
+    /// running.waiting().await; }`. `waiting()` returns when the server has
+    /// STOPPED — a panicked handler, a closed transport, a peer that went away —
+    /// and nothing was logged, so a dead extension presented to everyone
+    /// downstream as "the model stopped using that tool".
+    ///
+    /// A source scan because the alternative is asserting on seventeen spawn
+    /// sites individually, which is the duplication this replaced.
+    #[test]
+    fn no_server_is_spawned_outside_the_supervised_helper() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut served = 0usize;
+
+        for (name, src) in TOOL_SOURCES {
+            let code = strip_line_comments(src);
+            if code.contains("crate::serve_builtin(") {
+                served += 1;
+            }
+            // The shape that discards the exit, in any spacing.
+            if code.contains("running.waiting()") {
+                offenders.push((*name).to_string());
+            }
+            if code.contains("tokio::spawn(") && !code.contains("crate::serve_builtin(") {
+                offenders.push(format!("{name} (raw tokio::spawn)"));
+            }
+        }
+
+        // Vacuity control: if the helper were renamed, `served` would be 0 and
+        // an empty offender list would read as success.
+        assert!(
+            served >= 15,
+            "only {served} servers go through serve_builtin — the scan is looking \
+             for the wrong name, so an empty offender list proves nothing"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these spawn a server without supervision, so its death is silent: {offenders:?}"
+        );
+    }
+
     /// A bare suffix is not what the model sees in its schema — gemma-4-E2B
     /// apologised rather than mapping `search_wikipedia` onto
     /// `giap-knowledge__search_wikipedia`. Every suggestion must be callable verbatim,
@@ -298,27 +461,35 @@ mod tests {
     /// `wolfram.rs` maps to `giap-knowledge`, not to a `giap-wolfram`: its tools
     /// are a second router composed onto the knowledge server, so the file name
     /// is not the extension name.
+    /// Every MCP server source in this crate, keyed by the extension it
+    /// registers. Module-level so the tool inventory and the supervision guard
+    /// read one list — a second copy is the drift both of them exist to catch.
+    ///
+    /// `wolfram.rs` maps to `giap-knowledge`, not `giap-wolfram`: its tools are
+    /// a second router composed onto the knowledge server, so the file name is
+    /// not the extension name.
+    const TOOL_SOURCES: &[(&str, &str)] = &[
+        ("giap-audit", include_str!("audit.rs")),
+        ("giap-context", include_str!("context.rs")),
+        ("giap-device", include_str!("device.rs")),
+        ("giap-device-control", include_str!("device_control.rs")),
+        ("giap-discovery", include_str!("discovery.rs")),
+        ("giap-draft", include_str!("draft.rs")),
+        ("giap-finance", include_str!("finance.rs")),
+        ("giap-knowledge", include_str!("knowledge.rs")),
+        ("giap-knowledge", include_str!("wolfram.rs")),
+        ("giap-memory", include_str!("memory.rs")),
+        ("giap-news", include_str!("news.rs")),
+        ("giap-orchestrator", include_str!("orchestrator.rs")),
+        ("giap-schedule", include_str!("schedule.rs")),
+        ("giap-sensors", include_str!("sensors.rs")),
+        ("giap-system", include_str!("system.rs")),
+        ("giap-toolkit", include_str!("toolkit.rs")),
+        ("giap-vision", include_str!("vision.rs")),
+        ("giap-weather", include_str!("weather.rs")),
+    ];
+
     fn registered_tools() -> std::collections::BTreeSet<String> {
-        const TOOL_SOURCES: &[(&str, &str)] = &[
-            ("giap-audit", include_str!("audit.rs")),
-            ("giap-context", include_str!("context.rs")),
-            ("giap-device", include_str!("device.rs")),
-            ("giap-device-control", include_str!("device_control.rs")),
-            ("giap-discovery", include_str!("discovery.rs")),
-            ("giap-draft", include_str!("draft.rs")),
-            ("giap-finance", include_str!("finance.rs")),
-            ("giap-knowledge", include_str!("knowledge.rs")),
-            ("giap-knowledge", include_str!("wolfram.rs")),
-            ("giap-memory", include_str!("memory.rs")),
-            ("giap-news", include_str!("news.rs")),
-            ("giap-orchestrator", include_str!("orchestrator.rs")),
-            ("giap-schedule", include_str!("schedule.rs")),
-            ("giap-sensors", include_str!("sensors.rs")),
-            ("giap-system", include_str!("system.rs")),
-            ("giap-toolkit", include_str!("toolkit.rs")),
-            ("giap-vision", include_str!("vision.rs")),
-            ("giap-weather", include_str!("weather.rs")),
-        ];
         let mut out = std::collections::BTreeSet::new();
         for (ext, src) in TOOL_SOURCES {
             let code = strip_line_comments(src);
@@ -385,7 +556,7 @@ mod tests {
         assert!(!tools.contains("giap-discovery__search_web"), "{tools:?}");
         assert_eq!(
             tools.len(),
-            66,
+            67,
             "the tool inventory changed. Update the count in AGENTS.md in the same \
              commit — it read 64 for months while the real number was 65, and prose \
              nobody checks is how that happens. This assertion itself proved the \
@@ -452,6 +623,46 @@ mod tests {
         let msg = format_api_error("Finnhub", "connection timeout");
         assert!(msg.contains("another tool in your schema"));
         assert!(!msg.contains("Try again in a moment"));
+    }
+
+    /// A working tool that got a worse answer is not an unconfigured tool.
+    ///
+    /// `format_not_configured` says "requires an API key to work". For
+    /// `search_news` and `get_stock_quote` that is false — both answer without
+    /// one, from the Wikimedia feed and an unofficial Yahoo endpoint. Saying
+    /// they do not work would be a false explanation attached to a real result,
+    /// which is worse than the silence it replaced.
+    #[test]
+    fn a_degraded_result_keeps_its_answer_and_names_what_is_missing() {
+        let out = format_degraded(
+            "Top story: Kenya election",
+            "Guardian API key",
+            "https://x.test",
+        );
+        assert!(
+            out.starts_with("Top story: Kenya election"),
+            "the answer must come first — a note that displaces the result is a \
+             regression, not a warning: {out}"
+        );
+        assert!(out.contains("Guardian API key"), "{out}");
+        assert!(out.contains("https://x.test"), "{out}");
+        assert!(
+            !out.contains("requires an API key to work"),
+            "a degraded result must not claim the tool is non-functional: {out}"
+        );
+    }
+
+    /// Nothing to annotate means nothing is invented.
+    #[test]
+    fn degrading_an_empty_result_changes_nothing() {
+        use rmcp::model::CallToolResult;
+        let empty = CallToolResult::success(vec![]);
+        let out = degrade_result(empty, "Some key", "https://x.test");
+        assert!(
+            out.content.is_empty(),
+            "a note was hung on a result with no body, turning 'no answer' into \
+             'an answer plus advice'"
+        );
     }
 
     #[test]

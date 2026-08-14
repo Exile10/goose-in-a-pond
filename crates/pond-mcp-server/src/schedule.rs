@@ -30,6 +30,82 @@ use std::sync::Arc;
 
 // ── Parameter structs ──────────────────────────────────────────────────────
 
+/// Parameters for a one-shot timer.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct SetTimerParams {
+    /// How long from now, in natural language: "10 minutes", "1h30m", "90s".
+    #[serde(default)]
+    pub duration: String,
+    /// What to say or do when it fires. Defaults to announcing the timer.
+    #[serde(default)]
+    pub prompt: String,
+    /// Label shown in the schedule list. Defaults to the duration.
+    #[serde(default)]
+    pub name: String,
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Parse a human duration into a `chrono::Duration`.
+///
+/// Accepts "10 minutes", "10 min", "10m", "1h30m", "90 seconds", "2 hours".
+/// Returns `None` for anything it cannot read, because a timer set for the
+/// wrong moment is worse than one that was refused: the user finds out at the
+/// wrong time, by which point the thing they wanted reminding about has passed.
+pub fn parse_duration(text: &str) -> Option<chrono::Duration> {
+    let lower = text.trim().to_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    let mut total = chrono::Duration::zero();
+    let mut found = false;
+    let bytes: Vec<char> = lower.chars().collect();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        // A sign is never skipped past. Non-digits are otherwise ignored so
+        // "1h 30m" and "in 10 minutes" both read, but ignoring a MINUS turns
+        // "-5m" into five minutes from now — a nonsense input silently becoming
+        // a plausible one.
+        if i > 0 && bytes[i - 1] == '-' {
+            return None;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let n: i64 = bytes[start..i].iter().collect::<String>().parse().ok()?;
+        // Skip separators to reach the unit.
+        while i < bytes.len() && (bytes[i] == ' ' || bytes[i] == '-') {
+            i += 1;
+        }
+        let unit_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+            i += 1;
+        }
+        let unit: String = bytes[unit_start..i].iter().collect();
+        let seconds = match unit.as_str() {
+            u if u.starts_with('h') => n * 3600,
+            // "m" alone is minutes; "mo"/"month" is not a timer unit and is
+            // refused rather than guessed at.
+            u if u.starts_with("min") || u == "m" => n * 60,
+            u if u.starts_with('s') || u.is_empty() => n,
+            _ => return None,
+        };
+        total = total + chrono::Duration::seconds(seconds);
+        found = true;
+    }
+    if !found || total <= chrono::Duration::zero() {
+        return None;
+    }
+    Some(total)
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct CreateScheduleParams {
     #[serde(default)]
@@ -234,6 +310,79 @@ impl ScheduleMcpServer {
         }
     }
 
+    #[tool(description = "\
+Set a one-shot timer or reminder that fires ONCE after a delay, then deletes \
+itself. Use for \"in 10 minutes\", \"remind me in an hour\". For anything \
+repeating use create_schedule instead.")]
+    async fn set_timer(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<SetTimerParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        crate::set_current_tool("set_timer");
+        let p = params.0;
+
+        let raw = if p.duration.trim().is_empty() {
+            ["in", "delay", "after", "for", "time"]
+                .iter()
+                .find_map(|k| p.extra.get(*k).and_then(|v| v.as_str()))
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            p.duration.clone()
+        };
+
+        let Some(delta) = parse_duration(&raw) else {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "How long? Give a duration like \"10 minutes\", \"1h30m\" or \"90 seconds\" \
+                 as 'duration'. A timer set for the wrong moment is worse than one not set, \
+                 so this is not guessed.",
+            )]));
+        };
+
+        let fire_at = chrono::Utc::now() + delta;
+        let timezone = self
+            .settings_repo
+            .get()
+            .await
+            .map(|s| s.timezone)
+            .unwrap_or_else(|_| "UTC".to_string());
+
+        let label = if p.name.trim().is_empty() {
+            format!("Timer: {}", raw.trim())
+        } else {
+            p.name.trim().to_string()
+        };
+        let prompt = if p.prompt.trim().is_empty() {
+            format!("The timer \"{}\" has finished. Tell the user.", label)
+        } else {
+            p.prompt.trim().to_string()
+        };
+
+        let id = format!("timer-{}", uuid::Uuid::new_v4());
+        let req = pond_core::user_data::ports::scheduler::CreateScheduleRequest {
+            id: id.clone(),
+            label: label.clone(),
+            // Sentinel for display — a one-shot is never cron-registered, and a
+            // 6-field cron cannot express "once" anyway: it has no year field,
+            // so the nearest thing is an ANNUAL alarm.
+            cron: pond_core::user_data::domain::schedule::CRON_ONCE.to_string(),
+            fire_at: Some(fire_at),
+            timezone,
+            kind: TaskKind::AgentPrompt { prompt },
+        };
+
+        match self.scheduler.create_task(req).await {
+            Ok(_) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Timer set: \"{label}\" [{id}] — fires once at {}.",
+                fire_at.format("%H:%M:%S UTC")
+            ))])),
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Could not set the timer: {e}."
+            ))])),
+        }
+    }
+
     #[tool(
         description = "Create a scheduled task. Accepts natural language ('every morning at 8am') or 6-field cron: sec min hr dom mon dow."
     )]
@@ -351,6 +500,7 @@ impl ScheduleMcpServer {
 
         let id = uuid::Uuid::new_v4().to_string();
         let req = CreateScheduleRequest {
+            fire_at: None,
             id: id.clone(),
             label: name,
             cron: cron.clone(),
@@ -501,6 +651,7 @@ impl ScheduleMcpServer {
         let id = format!("rule-{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
         let req = pond_core::user_data::ports::scheduler::CreateScheduleRequest {
+            fire_at: None,
             id: id.clone(),
             label: label.clone(),
             // Sentinel for display — event rules are never cron-registered.
@@ -1196,7 +1347,6 @@ fn sensor_rule_summary(spec: &SensorTriggerSpec) -> String {
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -1224,14 +1374,7 @@ pub fn spawn_schedule_server(reader: DuplexStream, writer: DuplexStream) {
         .get()
         .expect("init_schedule_deps() not called");
     let server = ScheduleMcpServer::new(deps.scheduler.clone(), deps.settings_repo.clone());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-schedule MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-schedule", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -1330,5 +1473,69 @@ mod tests {
     #[test]
     fn no_pattern_returns_none() {
         assert_eq!(parse_cron_from_message("hello world"), None);
+    }
+    // ── One-shot timers ───────────────────────────────────────────────────
+
+    /// A 6-field cron CANNOT express "once", and that is why `fire_at` exists.
+    ///
+    /// The form is `<sec> <min> <hour> <dom> <month> <dow>` — no year. So even a
+    /// fully specified expression like `0 35 14 9 8 *` means *every* 9 August at
+    /// 14:35. A ten-minute timer written as cron is an annual alarm, and it looks
+    /// correct until roughly a year later.
+    ///
+    /// This pins the shape of the fix rather than the arithmetic: a timer must
+    /// carry `fire_at`, and must NOT be represented as a cron expression.
+    #[test]
+    fn a_timer_is_not_expressible_as_cron() {
+        use pond_core::user_data::domain::schedule::CRON_ONCE;
+        // The sentinel is not a parseable expression, on purpose — nothing
+        // should ever be tempted to evaluate it.
+        assert!(CRON_ONCE.starts_with('@'));
+        assert_eq!(CRON_ONCE.split_whitespace().count(), 1);
+        // And it is distinct from the event sentinel, so a list can tell a
+        // timer from a sensor rule.
+        assert_ne!(CRON_ONCE, "@event");
+    }
+
+    #[test]
+    fn durations_parse_in_the_forms_people_say_them() {
+        let cases = [
+            ("10 minutes", 600),
+            ("10 min", 600),
+            ("10m", 600),
+            ("1 hour", 3600),
+            ("2h", 7200),
+            ("90 seconds", 90),
+            ("90s", 90),
+            ("1h30m", 5400),
+            ("1 h 30 m", 5400),
+        ];
+        for (text, secs) in cases {
+            assert_eq!(
+                parse_duration(text).map(|d| d.num_seconds()),
+                Some(secs),
+                "failed on {text:?}"
+            );
+        }
+    }
+
+    /// Refused, not guessed. A timer set for the wrong moment is worse than one
+    /// that was never set: the user finds out at the wrong time, when whatever
+    /// they wanted reminding about has already passed.
+    #[test]
+    fn an_unreadable_duration_is_refused_rather_than_guessed() {
+        for text in ["", "   ", "soon", "later", "tomorrow", "0 minutes", "-5m"] {
+            assert_eq!(parse_duration(text), None, "guessed at {text:?}");
+        }
+    }
+
+    /// "m" is minutes; "month" is not a timer unit. Reading "3 months" as three
+    /// minutes would fire 43,000 times too early and look like a bug in the
+    /// scheduler rather than in the parser.
+    #[test]
+    fn month_is_not_silently_read_as_minutes() {
+        assert_eq!(parse_duration("3 months"), None);
+        assert_eq!(parse_duration("3 mo"), None);
+        assert_eq!(parse_duration("3 min").map(|d| d.num_seconds()), Some(180));
     }
 }

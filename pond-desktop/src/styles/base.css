@@ -166,7 +166,7 @@ button:disabled {
 }
 
 button:focus-visible {
-  outline: 2px solid var(--color-border-focus);
+  outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
 
@@ -202,7 +202,7 @@ textarea:focus-visible,
 select:focus-visible,
 [role="button"]:focus-visible,
 [tabindex]:focus-visible {
-  outline: 2px solid var(--color-border-focus) !important;
+  outline: 2px solid var(--focus-ring) !important;
   outline-offset: 2px !important;
 }
 
