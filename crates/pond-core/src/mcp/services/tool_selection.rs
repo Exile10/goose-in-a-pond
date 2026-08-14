@@ -274,6 +274,41 @@ where
         .collect()
 }
 
+/// The groups a speaker with this scope may EVER hold.
+///
+/// This is the PAI-1 boundary as a value, and it exists because two callers used
+/// to derive it independently and one of them got it wrong. `dormant_groups_note`
+/// was built from the full registered list, so an unidentified speaker was shown
+/// `giap-memory`, `giap-vision`, `giap-audit` and `giap-context` under a sentence
+/// telling it that enabling one makes its tools available immediately — the
+/// groups had been withheld from the selection and then advertised anyway. And
+/// the escape hatch checked catalog membership and registration only, so the
+/// speaker could take what the menu offered.
+///
+/// Applied to the candidates going INTO [`select_groups`] rather than subtracted
+/// after. That works because `select_groups` filters the core set by `available`;
+/// an older comment in the adapter claimed a pre-filter "would not stick because
+/// select_groups puts core groups back unconditionally", which has not been true
+/// for as long as that filter has existed.
+///
+/// A denylist, for the same reason `groups_denied_to_guests` is one: a new
+/// extension is not personal data by default, and the failure mode of the
+/// alternative is a capability silently missing rather than one silently granted.
+pub fn permitted_groups(
+    available: &[String],
+    scope: &crate::user_data::domain::profile::ProfileScope,
+) -> Vec<String> {
+    if !scope.excludes_everything() {
+        return available.to_vec();
+    }
+    let denied = crate::mcp::domain::tool_group::groups_denied_to_guests();
+    available
+        .iter()
+        .filter(|e| !denied.contains(&e.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// The `<tool-groups>` block for the user message's `<system-context>`.
 ///
 /// Lists the groups that are NOT loaded, so the model can reach for
@@ -436,6 +471,113 @@ mod tests {
         assert!(sel.groups.contains(&"giap-weather".to_string()));
         // giap-memory / giap-system are core but not registered here.
         assert!(!sel.groups.contains(&"giap-memory".to_string()));
+    }
+
+    // ── The PAI-1 boundary ────────────────────────────────────────────────
+
+    /// A guest may not hold a personal-data group, and may not be shown one.
+    ///
+    /// Both halves in one test because they were one bug. The groups were
+    /// withheld from the selection and then advertised by
+    /// `dormant_groups_note`, which was built from the full registered list —
+    /// under a sentence that tells the model enabling a group makes its tools
+    /// available immediately. Withholding a capability and then publishing a
+    /// menu of it is worse than not withholding it, because it reads as an
+    /// invitation.
+    #[test]
+    fn a_guest_is_neither_given_nor_offered_a_personal_group() {
+        use crate::user_data::domain::profile::ProfileScope;
+
+        let all = available();
+        let denied = crate::mcp::domain::tool_group::groups_denied_to_guests();
+        assert!(
+            !denied.is_empty(),
+            "the guest denylist is empty, so this test would pass against anything"
+        );
+
+        let permitted = permitted_groups(&all, &ProfileScope::Guest);
+
+        // Held: nothing denied survives into the ceiling.
+        for d in denied {
+            assert!(
+                !permitted.iter().any(|p| p == d),
+                "'{d}' is denied to guests but is in the permitted set"
+            );
+        }
+        assert!(
+            permitted.len() < all.len(),
+            "the guest ceiling is the whole catalog — the subtraction did nothing"
+        );
+
+        // Offered: the note may only name groups from the ceiling. Loaded is
+        // empty, which is the worst case — everything permitted is dormant.
+        let note = dormant_groups_note(&permitted, &[]);
+        assert!(
+            !note.is_empty(),
+            "no note rendered, so the assertions below prove nothing"
+        );
+        for d in denied {
+            assert!(
+                !note.contains(d),
+                "the dormant-groups note offers '{d}' to a guest:\n{note}"
+            );
+        }
+    }
+
+    /// An identified speaker loses nothing. The boundary is for guests only.
+    #[test]
+    fn an_identified_speaker_keeps_the_whole_catalog() {
+        use crate::user_data::domain::profile::ProfileScope;
+
+        let all = available();
+        for scope in [
+            ProfileScope::Household,
+            ProfileScope::Owner("member-1".to_string()),
+        ] {
+            let permitted = permitted_groups(&all, &scope);
+            assert_eq!(
+                permitted.len(),
+                all.len(),
+                "{scope:?} lost groups it is entitled to"
+            );
+        }
+    }
+
+    /// The ceiling bounds selection, including the core groups.
+    ///
+    /// This is what lets the boundary be applied once, going in, rather than
+    /// subtracted afterwards: `select_groups` filters `core_group_names()` by
+    /// `available`, so passing the guest ceiling as `available` keeps `giap-draft`
+    /// and `giap-memory` out even though both are core.
+    #[test]
+    fn selecting_from_the_guest_ceiling_drops_even_core_groups() {
+        use crate::mcp::domain::tool_group::core_group_names;
+        use crate::user_data::domain::profile::ProfileScope;
+
+        let permitted = permitted_groups(&available(), &ProfileScope::Guest);
+        let denied = crate::mcp::domain::tool_group::groups_denied_to_guests();
+
+        // Precondition the whole approach rests on: at least one core group is
+        // denied to guests. If that stopped being true this test would be
+        // measuring nothing.
+        let denied_core: Vec<&str> = core_group_names()
+            .into_iter()
+            .filter(|c| denied.contains(c))
+            .collect();
+        assert!(
+            !denied_core.is_empty(),
+            "no core group is denied to guests, so 'the pre-filter also bounds \
+             core groups' is untested"
+        );
+
+        // No embedder — the widening path, which is what a fresh Jetson takes.
+        let selection = select_groups(&permitted, None, DEFAULT_RELEVANCE_THRESHOLD);
+        for c in &denied_core {
+            assert!(
+                !selection.groups.iter().any(|g| g == c),
+                "core group '{c}' came back for a guest despite the ceiling"
+            );
+        }
     }
 
     /// A user-added MCP server is not in the catalog, so selection leaves it be.
