@@ -262,6 +262,49 @@ export interface Settings {
 
   // Inference stats display
   show_turn_stats?: boolean;
+
+  // ── Settings the server has always accepted but this type could not name ──
+  //
+  // Every one of these is a real `Settings` field on the Rust side, persisted
+  // and writable through `PUT /api/v1/settings` — `update_settings` merges the
+  // request body into the stored object with no field allowlist, so anything
+  // that round-trips through serde is settable. They were simply absent here,
+  // which meant the desktop app could not type a write to them even though a
+  // phone or a curl could send one. `catalogue.test.ts` fails if this type and
+  // the settings catalogue ever disagree again.
+  //
+  // Two of them — `network_mode` and `security_policy_mode` — decide whether
+  // the pond may reach the internet at all, so "reachable only from curl" was
+  // the wrong place for them to live.
+
+  /** How hard outbound HTTP is gated. Server rejects anything else with 422. */
+  network_mode?: "open" | "allowlist" | "offline";
+  /** How hard the security policy bites. */
+  security_policy_mode?: "off" | "audit" | "enforce";
+  /** Ask the model whether the request was actually met before ending a turn. */
+  goal_check_enabled?: boolean;
+  /** Start the private mesh transport (needs a `mesh`-feature server build). */
+  mesh_enabled?: boolean;
+  /** Turn what the pond's own sensors report into per-member context items. */
+  context_ingest_enabled?: boolean;
+  /** Let the model read the personal-context corpus (adds two tool schemas). */
+  ext_context_enabled?: boolean;
+
+  // Compaction — GIAP-owned history pruning
+  hybrid_compaction_enabled?: boolean;
+  summary_idle_secs?: number;
+  resume_compaction_idle_secs?: number;
+  compaction_verbatim_days?: number;
+
+  // Retention — the unified events log (#117)
+  retention_events_days?: number;
+  retention_events_by_category?: Record<string, number>;
+  retention_sensitive_days?: number;
+
+  /** Turn cap for VOICE requests; never raised above `agent_max_turns`. */
+  voice_max_turns?: number;
+  /** ONNX detector that labels motion events. Needs a `vision-onnx` build. */
+  vision_classifier_model?: string;
 }
 
 /** What the Matter integration is actually doing, as opposed to what was

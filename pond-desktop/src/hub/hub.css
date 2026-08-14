@@ -2143,3 +2143,44 @@ body,
   .privacy-hero__icon { width: 36px; height: 36px; }
   .privacy-hero__title { font-size: 15px; }
 }
+
+/* ─── Settings landing: the "All settings" entry ───────────────
+ * Sits above the per-topic groups. Styled as its own card rather than a row in
+ * one of them, because it is a different kind of destination — everything,
+ * not one topic. */
+.set__all {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  width: 100%;
+  text-align: left;
+  margin-bottom: var(--space-5);
+  padding: var(--space-4) var(--space-5);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition: border-color 0.13s, background 0.13s;
+}
+
+.set__all:hover {
+  border-color: var(--color-accent);
+  background: var(--color-accent-subtle);
+}
+
+.set__allMain { display: flex; flex-direction: column; gap: 2px; }
+
+.set__allLabel {
+  font-family: var(--font-heading);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text);
+}
+
+.set__allSub {
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+}
+
+.set__allChev { color: var(--color-text-tertiary); flex: 0 0 auto; }

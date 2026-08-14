@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import { Brain, Check, ChevronDown, Copy, Cpu, History, Loader2, Paperclip, Pencil, PenSquare, PlayCircle, RefreshCw, ThumbsDown, ThumbsUp, Wrench, X } from "lucide-react";
+import { ArrowUp, Brain, Check, ChevronDown, Copy, Cpu, History, Loader2, Paperclip, Pencil, PenSquare, PlayCircle, RefreshCw, ThumbsDown, ThumbsUp, Wrench, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { nextCardId } from "../state/reducer";
@@ -7,11 +7,12 @@ import type { ContextCard as ContextCardType } from "../state/reducer";
 import { ToolCallChip } from "../components/ToolCallChip";
 import { SessionDropdown } from "../components/SessionDropdown";
 import { ThinkingPlaceholder } from "../components/ThinkingPlaceholder";
+import { ThinkingDisclosure } from "../hub/views/chat/ThinkingDisclosure";
 import { AttachmentTray } from "../components/AttachmentTray";
-import { GooseAvatar } from "../hub/views/chat/GooseAvatar";
 import { TypingIndicator } from "../hub/views/chat/TypingIndicator";
+import { Goose } from "../components/Goose";
+import { greeting, subtitle } from "../components/quips";
 import { HubIco, micEl } from "../hub/primitives/HubIco";
-import { HP_PATHS } from "../hub/primitives/icons";
 import { CONTINUE_TURN_MESSAGE } from "../api/types";
 import type { ChatEvent, ContextWarning, ImageAttachment, ModelEntry, SessionMessage, SessionSummary, TurnStats } from "../api/types";
 import { TurnStatsFooter } from "../components/TurnStatsFooter";
@@ -57,6 +58,10 @@ interface Message {
   status?: string;
   cards?: ContextCardType[];
   thinkingBlocks?: string[];
+  /** Wall clock around the reasoning stream, so the disclosure can say how
+   *  long it took rather than showing an open-ended "Thinking…". */
+  thinkingStartedAt?: number;
+  thinkingEndedAt?: number;
   modelRole?: string;
   tokenUsage?: { prompt_tokens: number; completion_tokens: number };
   turnStats?: TurnStats;
@@ -153,6 +158,19 @@ export function Chat() {
   // it only disables once we've SUCCESSFULLY confirmed the model lacks vision.
   const [visionCapable, setVisionCapable]         = useState(true);
   const [capabilitiesKnown, setCapabilitiesKnown] = useState(false);
+  // Messages typed while a reply was still streaming. Drained in order once
+  // the turn finishes — see the effect below.
+  const [queued, setQueued]                       = useState<string[]>([]);
+  // `thinking_mode` is a server setting ("auto" | "on" | "off") the agent reads
+  // each turn, so this toggle changes real behaviour rather than just a label.
+  const [thinkingMode, setThinkingMode]           = useState<string>("auto");
+  const [thinkingSaving, setThinkingSaving]       = useState(false);
+  // What to restore when switching back on. Toggling off then on would
+  // otherwise collapse an explicit "on" into "auto" and quietly lose the
+  // distinction.
+  const lastThinkingOnRef                         = useRef<string>("auto");
+  // Used only to personalise the greeting; blank is fine and handled there.
+  const [userName, setUserName]                   = useState<string>("");
 
   const bottomRef        = useRef<HTMLDivElement>(null);
   const textareaRef      = useRef<HTMLTextAreaElement>(null);
@@ -332,6 +350,10 @@ export function Chat() {
     if (!state.serverOnline) return;
     api.getSettings().then((s) => {
       setShowTurnStats(s.show_turn_stats ?? false);
+      setUserName(s.user_name ?? "");
+      const mode = s.thinking_mode ?? "auto";
+      setThinkingMode(mode);
+      if (mode !== "off") lastThinkingOnRef.current = mode;
     }).catch(() => {});
   }, [state.serverOnline]);
 
@@ -363,6 +385,8 @@ export function Chat() {
   function newConversation() {
     setMessages([]);
     sessionIdRef.current = undefined;
+    setQueued([]);
+    setQuipSeed(Date.now());
     dispatch({ type: "SET_SESSION_ID", payload: null });
     dispatch({ type: "CLEAR_CONTEXT_CARDS" });
     clearAttachments();
@@ -399,13 +423,27 @@ export function Chat() {
 
   const sendMessage = useCallback(async (directText?: string) => {
     const text = (directText ?? input).trim();
-    if ((!text && attachments.length === 0) || busy || !state.serverOnline) return;
+    if ((!text && attachments.length === 0) || !state.serverOnline) return;
+
+    // A reply is still streaming: hold this one rather than dropping it. The
+    // composer stays live throughout, so a thought does not have to wait for
+    // the model. Attachments are NOT queued — they belong to the turn they
+    // were attached to, and silently re-binding them to a later message would
+    // send an image with the wrong question.
+    if (busy) {
+      if (!text) return;
+      setQueued((q) => [...q, text]);
+      setInput("");
+      if (textareaRef.current) textareaRef.current.style.height = "auto";
+      return;
+    }
 
     const pendingAttachments = attachments;
     const imagePayload: ImageAttachment[] = pendingAttachments.map((a) => ({ data: a.data, mime_type: a.mime_type }));
 
     setInput("");
     if (textareaRef.current) textareaRef.current.style.height = "auto";
+    setTurnSeed(Date.now());
     setBusy(true);
     inThinkBlockRef.current = false;
 
@@ -444,7 +482,16 @@ export function Chat() {
           setMessages((prev) => {
             const last = prev[prev.length - 1];
             if (!last || last.role !== "agent") return prev;
-            return [...prev.slice(0, -1), { ...last, thinkingBlocks: [...(last.thinkingBlocks ?? []), ev.content as string] }];
+            const now = Date.now();
+            return [...prev.slice(0, -1), {
+              ...last,
+              thinkingBlocks: [...(last.thinkingBlocks ?? []), ev.content as string],
+              // First chunk opens the span; every chunk moves the close, so the
+              // duration is how long reasoning actually streamed rather than
+              // how long the whole turn took.
+              thinkingStartedAt: last.thinkingStartedAt ?? now,
+              thinkingEndedAt: now,
+            }];
           });
         } else if (ev.type === "status" && ev.content) {
           setMessages((prev) => {
@@ -596,6 +643,16 @@ export function Chat() {
     }
   }, [input, attachments, busy, state.serverOnline, state.sessionToken, dispatch, refreshSessions]);
 
+  // Drain the queue one message at a time. Keyed on `busy` going false rather
+  // than draining inside `sendMessage`'s `finally`, which would capture a stale
+  // queue in its closure.
+  useEffect(() => {
+    if (busy || queued.length === 0 || !state.serverOnline) return;
+    const [next, ...rest] = queued;
+    setQueued(rest);
+    void sendMessage(next);
+  }, [busy, queued, state.serverOnline, sendMessage]);
+
   const copyMessageText = useCallback((text: string) => {
     void navigator.clipboard.writeText(text).catch(() => {});
   }, []);
@@ -672,6 +729,45 @@ export function Chat() {
     });
   }, []);
 
+  // Held in state so the greeting is chosen once per conversation: recomputing
+  // it on render would reshuffle the line while someone was reading it.
+  const [quipSeed, setQuipSeed] = useState(() => Date.now());
+  // Reseeded when a turn starts, so the working quip differs between turns but
+  // holds still while one is running.
+  const [turnSeed, setTurnSeed] = useState(() => Date.now());
+  const greetingLine = useMemo(() => greeting(userName, quipSeed), [userName, quipSeed]);
+  const subtitleLine = useMemo(() => subtitle(quipSeed), [quipSeed]);
+
+  // What this conversation is about. The server titles a session after the
+  // first exchange, so a brand-new chat has nothing to show yet.
+  // What the backend says it is doing, from the stream's `status` frames
+  // ("Agent working…", "Using tool: …"). Shown in the working strip, so the
+  // line under the composer is the server's account of itself rather than a
+  // client-side guess.
+  const lastMsg = messages[messages.length - 1];
+  const liveStatus =
+    lastMsg?.role === "agent" && lastMsg.streaming ? lastMsg.status : undefined;
+
+  const chatTitle =
+    sessions.find((sn) => sn.id === state.sessionId)?.title?.trim() || "New Chat";
+
+  /** Flip thinking on or off, persisting it. Optimistic, reverted on failure. */
+  async function toggleThinking() {
+    if (thinkingSaving) return;
+    const next = thinkingMode === "off" ? lastThinkingOnRef.current : "off";
+    const previous = thinkingMode;
+    if (previous !== "off") lastThinkingOnRef.current = previous;
+    setThinkingMode(next);
+    setThinkingSaving(true);
+    try {
+      await api.updateSettings({ thinking_mode: next as "auto" | "on" | "off" });
+    } catch {
+      setThinkingMode(previous);
+    } finally {
+      setThinkingSaving(false);
+    }
+  }
+
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
@@ -690,45 +786,31 @@ export function Chat() {
 
   return (
     <div className="chat2">
-      {/* Header */}
+      {/* Header — what this conversation is, and the way back to the others.
+          The assistant's name and status used to live here; neither told you
+          anything you could act on, and the status is already in the sidebar. */}
       <header className="chat2__head">
-        <div className="chat2__id">
-          <GooseAvatar size={40} />
-          <div>
-            <div className="chat2__name">Goose</div>
-            <div className="chat2__status">
-              <span className="chat2__dot" aria-hidden="true" />
-              {state.serverOnline ? "On-device · listening" : "Offline"}
-            </div>
-          </div>
-        </div>
+        <h1 className="chat2__topic" title={chatTitle}>{chatTitle}</h1>
         <div className="chat2__head-right">
           <button
-            className="chat2__voice-btn"
+            className="chat2__headbtn"
             onClick={() => { refreshSessions(); setShowSessions(!showSessions); }}
-            aria-label="Session history"
-            title="Session history"
+            aria-label="Chat history"
+            aria-expanded={showSessions}
+            title="Chat history"
             type="button"
           >
-            <History size={18} color="var(--pp)" />
+            <History size={16} aria-hidden="true" />
+            <span>History</span>
           </button>
           <button
-            className="chat2__voice-btn"
+            className="chat2__headbtn chat2__headbtn--icon"
             onClick={newConversation}
-            aria-label="New conversation"
-            title="New conversation"
+            aria-label="New chat"
+            title="New chat"
             type="button"
           >
-            <PenSquare size={18} color="var(--pp)" />
-          </button>
-          <button
-            className="chat2__voice-btn"
-            onClick={() => dispatch({ type: "SET_MODE", payload: "voice" })}
-            aria-label="Switch to voice mode"
-            title="Voice mode"
-            type="button"
-          >
-            <HubIco d={micEl} size={20} color="var(--pp)" />
+            <PenSquare size={16} aria-hidden="true" />
           </button>
           <SessionDropdown
             sessions={sessions}
@@ -758,9 +840,14 @@ export function Chat() {
 
         {!loadingSession && messages.length === 0 && (
           <div className="chat-empty">
-            <GooseAvatar size={52} />
-            <p className="chat-empty__title">Start a conversation</p>
-            <p className="chat-empty__hint">Ask Goose anything or pick a suggestion below.</p>
+            <div className="chat-empty__eyebrow">New chat</div>
+            <div className="chat-empty__body">
+              <div className="chat-empty__copy">
+                <p className="chat-empty__title">{greetingLine}</p>
+                <p className="chat-empty__hint">{subtitleLine}</p>
+              </div>
+              <Goose state={busy ? "working" : "idle"} size={150} />
+            </div>
           </div>
         )}
 
@@ -771,7 +858,6 @@ export function Chat() {
           if (msg.role === "agent" && !hasText && !hasCards && !hasThinking && !msg.streaming) return null;
           return (
             <div key={msg.id} className={`ch-row ${msg.role === "user" ? "ch-row--user" : "ch-row--goose"}`}>
-              {msg.role === "agent" && <GooseAvatar />}
               <div className="ch-bubble-wrap">
                 {/* Tool call chips */}
                 {msg.role === "agent" && msg.cards && msg.cards.length > 0 && !msg.streaming && (
@@ -793,15 +879,18 @@ export function Chat() {
                   </div>
                 )}
                 {/* Thinking block */}
-                {msg.role === "agent" && msg.thinkingBlocks && msg.thinkingBlocks.length > 0 && !msg.streaming && (
-                  <details className="thinking-block">
-                    <summary className="thinking-block__toggle">
-                      <Brain size={12} aria-hidden /> Thinking
-                    </summary>
-                    <div className="thinking-block__content">
-                      {msg.thinkingBlocks.map((block, i) => <p key={i}>{block}</p>)}
-                    </div>
-                  </details>
+                {msg.role === "agent" && msg.thinkingBlocks && msg.thinkingBlocks.length > 0 && (
+                  <ThinkingDisclosure
+                    blocks={msg.thinkingBlocks}
+                    // Reasoning is over once the answer starts arriving, even
+                    // though the turn itself is still streaming.
+                    active={Boolean(msg.streaming) && !msg.text}
+                    ms={
+                      msg.thinkingStartedAt !== undefined && msg.thinkingEndedAt !== undefined
+                        ? msg.thinkingEndedAt - msg.thinkingStartedAt
+                        : undefined
+                    }
+                  />
                 )}
                 {/* Delegation tree. Deliberately NOT gated on `!msg.streaming`:
                     the whole point is that a turn which is blocked inside a
@@ -949,51 +1038,44 @@ export function Chat() {
           );
         })}
 
-        {busy && messages[messages.length - 1]?.text === "" && <TypingIndicator />}
+
+        {/* Messages typed while Goose was still answering. Shown in place, muted,
+            so the queue is visible rather than a silent buffer. */}
+        {queued.map((q, i) => (
+          <div className="ch-row ch-row--user ch-row--queued" key={`q-${i}`}>
+            <div className="ch-bubble-wrap">
+              <div className="ch-bubble">{q}</div>
+              <span className="ch-queued-note">Queued</span>
+            </div>
+          </div>
+        ))}
         <div ref={bottomRef} />
       </div>
-
-      {/* Suggestion chips — only when thread is empty */}
-      {!loadingSession && messages.length === 0 && (
-        <div className="chat2__chips" role="group" aria-label="Quick suggestions">
-          {CHIPS.map((c) => (
-            <button
-              key={c}
-              className="ch-chip"
-              onClick={() => sendMessage(c)}
-              disabled={busy || !state.serverOnline}
-              type="button"
-            >
-              {c}
-            </button>
-          ))}
-        </div>
-      )}
 
       {/* Pending image attachments */}
       <AttachmentTray attachments={attachments} onRemove={removeAttachment} />
       {attachError && <p className="attach-error" role="alert">{attachError}</p>}
 
-      {/* Input row */}
-      <div className="chat2__input">
+      {/* Composer — one surface. The textarea, its two quiet actions and the
+          send button share a single bordered box that lifts on focus, so the
+          place you type is unmistakably the centre of the screen rather than
+          one control among four.
+
+          Deliberately NOT disabled while Goose is answering: typing during a
+          reply queues the message instead of being swallowed. */}
+      {busy && <TypingIndicator seed={turnSeed} />}
+
+      <div className={`chat2__composer${busy ? " is-busy" : ""}`}>
         <button
-          className="ch-mic"
-          onClick={() => dispatch({ type: "SET_MODE", payload: "voice" })}
-          aria-label="Switch to voice mode"
-          title="Voice input"
-          type="button"
-        >
-          <HubIco d={micEl} size={19} color="#fff" />
-        </button>
-        <button
-          className="ch-attach"
+          className="ch-icon-btn"
           onClick={onAttachClick}
-          disabled={!state.serverOnline || busy || attachDisabled}
+          disabled={!state.serverOnline || attachDisabled}
           aria-label="Attach image"
+          onMouseDown={(e) => e.preventDefault()}
           title={attachTitle}
           type="button"
         >
-          <Paperclip size={18} />
+          <Paperclip size={17} aria-hidden="true" />
         </button>
         <input
           ref={fileInputRef}
@@ -1010,21 +1092,51 @@ export function Chat() {
           onChange={onInput}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
-          placeholder="Message Goose…"
-          disabled={!state.serverOnline || busy}
+          placeholder={busy ? "Queue a message…" : "Message Goose…"}
+          disabled={!state.serverOnline}
           aria-label="Message input"
           rows={1}
         />
         <button
-          className="ch-send"
-          onClick={() => sendMessage()}
-          disabled={(!input.trim() && attachments.length === 0) || !state.serverOnline || busy}
-          aria-label="Send message"
+          className="ch-icon-btn"
+          onClick={() => dispatch({ type: "SET_MODE", payload: "voice" })}
+          aria-label="Switch to voice mode"
+          onMouseDown={(e) => e.preventDefault()}
+          title="Voice mode"
           type="button"
         >
-          <HubIco d={HP_PATHS.chevR} size={18} color="#fff" sw={2.5} />
+          <HubIco d={micEl} size={17} color="currentColor" />
+        </button>
+        <button
+          className="ch-send"
+          onClick={() => sendMessage()}
+          onMouseDown={(e) => e.preventDefault()}
+          disabled={(!input.trim() && attachments.length === 0) || !state.serverOnline}
+          aria-label={busy ? "Queue message" : "Send message"}
+          title={busy ? "Queue message" : "Send message"}
+          type="button"
+        >
+          <ArrowUp size={18} strokeWidth={2.5} aria-hidden="true" />
         </button>
       </div>
+
+      {/* Quips, below the composer — a starting point, not a header. */}
+      {!loadingSession && messages.length === 0 && (
+        <div className="chat2__chips" role="group" aria-label="Suggestions">
+          {CHIPS.map((c, i) => (
+            <button
+              key={c}
+              className="ch-chip"
+              style={{ animationDelay: `${60 + i * 45}ms` }}
+              onClick={() => sendMessage(c)}
+              disabled={!state.serverOnline}
+              type="button"
+            >
+              {c}
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Hint bar — model selector + keyboard shortcut */}
       <div className="chat2__hint">
@@ -1084,8 +1196,34 @@ export function Chat() {
             </div>
           )}
         </div>
-        <span>·</span>
-        <span>Cmd + Enter to send</span>
+
+        {/* Thinking. Writes `thinking_mode`, which the agent reads on the next
+            turn — so this is the real setting, not a display preference. */}
+        <button
+          type="button"
+          className={`think-toggle${thinkingMode !== "off" ? " is-on" : ""}`}
+          onClick={toggleThinking}
+          disabled={thinkingSaving || !state.serverOnline}
+          role="switch"
+          aria-checked={thinkingMode !== "off"}
+          aria-label="Thinking mode"
+          title={
+            thinkingMode === "off"
+              ? "Thinking off — Goose answers directly"
+              : thinkingMode === "on"
+                ? "Thinking on for every model"
+                : "Thinking on where the model supports it"
+          }
+        >
+          <Brain size={11} aria-hidden="true" />
+          <span className="think-toggle__label">Thinking</span>
+          <span className="think-toggle__state">
+            {thinkingMode === "off" ? "Off" : thinkingMode === "on" ? "On" : "Auto"}
+          </span>
+        </button>
+
+        <span className="chat2__hint-sep">·</span>
+        <span className="chat2__hint-kbd">Cmd + Enter to send</span>
       </div>
     </div>
   );
