@@ -535,7 +535,7 @@ pub struct Settings {
     /// PAI-4 P3. `0` disables age weighting entirely, and is the only way to;
     /// there is no separate boolean that could fall out of step with the
     /// number. The rung it controls
-    /// (`turn_trimmer::AGED_TOOL_RESULT_MAX_CHARS`) fires only when a
+    /// (`turn_trimmer::AGED_TOOL_RESULT_MAX_BYTES`) fires only when a
     /// conversation is already over budget, so a *large* value costs nothing
     /// beyond today's behaviour. Small is the damaging direction — a horizon
     /// inside the span of a live conversation would hard-truncate tool results

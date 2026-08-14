@@ -2458,7 +2458,7 @@ impl GooseAdapter {
             let original = &source[tm.index];
             if let Some(truncated) = truncate_tool_response_text(
                 original,
-                pond_core::models::services::context_budget::TOOL_RESULT_MAX_CHARS,
+                pond_core::models::services::context_budget::TOOL_RESULT_MAX_BYTES,
             ) {
                 rebuilt.push(truncated);
                 continue;
@@ -5158,7 +5158,7 @@ impl GooseAdapter {
 /// Shrink the text bodies of an oversized structured tool response, or `None`
 /// when the message carries no tool response over `max_chars`.
 ///
-/// GIAP's `TOOL_RESULT_MAX_CHARS` used to reach only the trimmer's token
+/// GIAP's `TOOL_RESULT_MAX_BYTES` used to reach only the trimmer's token
 /// ESTIMATE: the rebuild kept structured `ToolResponse` messages whole, so a
 /// 50K-char tool result was re-prefilled verbatim on every single turn until its
 /// entire turn aged out — the estimate said 1.5K, the engine paid for 50K.

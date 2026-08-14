@@ -40,7 +40,7 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
-use super::context_budget::{truncate_head_tail, CompactionProfile, TOOL_RESULT_MAX_CHARS};
+use super::context_budget::{truncate_head_tail, CompactionProfile, TOOL_RESULT_MAX_BYTES};
 use super::prefix_cache::CachePosture;
 use super::token_counting::PER_MESSAGE_TOKEN_OVERHEAD;
 use crate::models::ports::token_counter::TokenCounter;
@@ -69,12 +69,12 @@ pub const MIN_HISTORY_TOKENS: usize = 64;
 pub const DEFAULT_VERBATIM_DAYS: u32 = 3;
 
 /// Tool-result cap applied to material older than the verbatim horizon —
-/// a quarter of [`TOOL_RESULT_MAX_CHARS`].
+/// a quarter of [`TOOL_RESULT_MAX_BYTES`].
 ///
 /// This is the whole of PAI-4 P3's escalation rung: a three-day-old tool result
 /// is not worth the same tokens as one from five minutes ago, but it is still
 /// worth more than nothing, which is what dropping its turn would leave.
-pub const AGED_TOOL_RESULT_MAX_CHARS: usize = TOOL_RESULT_MAX_CHARS / 4;
+pub const AGED_TOOL_RESULT_MAX_BYTES: usize = TOOL_RESULT_MAX_BYTES / 4;
 
 /// Length at or below which a tool result is treated as already aged, and the
 /// P3 rung leaves it alone.
@@ -98,7 +98,7 @@ pub const AGED_TOOL_RESULT_MAX_CHARS: usize = TOOL_RESULT_MAX_CHARS / 4;
 /// marker ever outgrows it. Being generous costs at most 64 characters left
 /// uncut on an already-degraded result — which is precisely the "marginal token
 /// saving" invariant 4 says not to move a prefix for.
-const AGED_FIXED_POINT_CHARS: usize = AGED_TOOL_RESULT_MAX_CHARS + 64;
+const AGED_FIXED_POINT_BYTES: usize = AGED_TOOL_RESULT_MAX_BYTES + 64;
 
 /// Convert a stored `compaction_verbatim_days` into the horizon
 /// [`trim_history`] takes. Zero means age weighting is OFF, and that is the
@@ -144,7 +144,7 @@ pub struct TrimOutcome {
     pub messages: Vec<TrimMessage>,
     pub dropped_turns: usize,
     pub estimated_tokens: usize,
-    /// Tool results re-truncated at [`AGED_TOOL_RESULT_MAX_CHARS`] because they
+    /// Tool results re-truncated at [`AGED_TOOL_RESULT_MAX_BYTES`] because they
     /// fell outside the verbatim horizon. Zero whenever age weighting is off,
     /// no message carried an age, or the conversation already fit.
     pub aged_truncations: usize,
@@ -373,7 +373,7 @@ pub fn trim_history(
     //    while the estimate believed it was 1.5K.
     for m in msgs.iter_mut() {
         if m.role == TrimRole::ToolResult {
-            if let Some(truncated) = truncate_head_tail(&m.text, TOOL_RESULT_MAX_CHARS) {
+            if let Some(truncated) = truncate_head_tail(&m.text, TOOL_RESULT_MAX_BYTES) {
                 m.text = truncated;
                 changed = true;
             }
@@ -409,7 +409,7 @@ pub fn trim_history(
 
     // 4. Age-weighted degradation (PAI-4 P3). One rung, inserted between "leave
     //    it alone" and "drop the whole turn": a tool result older than the
-    //    verbatim horizon is re-truncated at AGED_TOOL_RESULT_MAX_CHARS, which
+    //    verbatim horizon is re-truncated at AGED_TOOL_RESULT_MAX_BYTES, which
     //    is a quarter of the flat cap step 2 already applied.
     //
     //    THREE GUARDS, and each is the narrowing direction on a different axis.
@@ -464,12 +464,12 @@ pub fn trim_history(
             for (i, m) in msgs.iter_mut().enumerate() {
                 if i >= keep_verbatim_from
                     || m.role != TrimRole::ToolResult
-                    || m.text.len() <= AGED_FIXED_POINT_CHARS
+                    || m.text.len() <= AGED_FIXED_POINT_BYTES
                     || !m.age_secs.is_some_and(|age| age > horizon_secs)
                 {
                     continue;
                 }
-                if let Some(truncated) = truncate_head_tail(&m.text, AGED_TOOL_RESULT_MAX_CHARS) {
+                if let Some(truncated) = truncate_head_tail(&m.text, AGED_TOOL_RESULT_MAX_BYTES) {
                     m.text = truncated;
                     aged_truncations += 1;
                     changed = true;
@@ -1134,7 +1134,7 @@ mod tests {
 
     #[test]
     fn truncates_oversized_tool_results() {
-        let big = format!("START{}END", "x".repeat(TOOL_RESULT_MAX_CHARS + 500));
+        let big = format!("START{}END", "x".repeat(TOOL_RESULT_MAX_BYTES + 500));
         let msgs = vec![user(0, "check"), tool(1, &big), assistant(2, "done")];
         let out = trim_history(
             msgs,
@@ -1146,7 +1146,7 @@ mod tests {
             None,
         );
         assert!(out.changed);
-        assert!(out.messages[1].text.len() < TOOL_RESULT_MAX_CHARS + 64);
+        assert!(out.messages[1].text.len() < TOOL_RESULT_MAX_BYTES + 64);
         // Head+tail: the conclusion at the end of a tool result survives.
         assert!(out.messages[1].text.starts_with("START"));
         assert!(out.messages[1].text.ends_with("END"));
@@ -1484,7 +1484,7 @@ mod tests {
             .filter(|m| m.role == TrimRole::ToolResult)
         {
             assert!(
-                m.text.len() <= AGED_TOOL_RESULT_MAX_CHARS + 64,
+                m.text.len() <= AGED_TOOL_RESULT_MAX_BYTES + 64,
                 "aged result was not re-truncated: {} chars",
                 m.text.len()
             );
@@ -1536,7 +1536,7 @@ mod tests {
             .expect("tool result kept")
             .text;
         assert!(
-            tool_text.len() > AGED_TOOL_RESULT_MAX_CHARS,
+            tool_text.len() > AGED_TOOL_RESULT_MAX_BYTES,
             "a fitting conversation was degraded anyway: {} chars",
             tool_text.len()
         );
@@ -1570,7 +1570,7 @@ mod tests {
         let last = out.messages.last().expect("last turn survives");
         assert_eq!(last.role, TrimRole::ToolResult);
         assert!(
-            last.text.len() > AGED_TOOL_RESULT_MAX_CHARS,
+            last.text.len() > AGED_TOOL_RESULT_MAX_BYTES,
             "the last turn's tool result was degraded: {} chars",
             last.text.len()
         );
@@ -1835,14 +1835,14 @@ mod tests {
             // Step 2's flat cap applied (the input was 4,000 chars) and
             // nothing more: both results are still far above the aged cap.
             assert!(
-                m.text.len() > AGED_FIXED_POINT_CHARS,
+                m.text.len() > AGED_FIXED_POINT_BYTES,
                 "a spared tool result was cut to the aged cap: {} chars",
                 m.text.len()
             );
         }
     }
 
-    /// The convergence guard behind [`AGED_FIXED_POINT_CHARS`]. If
+    /// The convergence guard behind [`AGED_FIXED_POINT_BYTES`]. If
     /// `truncate_head_tail`'s elision marker ever outgrows the 64-character
     /// allowance, the aged rung stops being a one-shot and starts nibbling a
     /// cold session's tool results away turn by turn. That would be invisible
@@ -1850,20 +1850,20 @@ mod tests {
     #[test]
     fn the_aged_cap_is_a_fixed_point_after_one_cut() {
         let huge = "y".repeat(100_000);
-        let once = truncate_head_tail(&huge, AGED_TOOL_RESULT_MAX_CHARS)
+        let once = truncate_head_tail(&huge, AGED_TOOL_RESULT_MAX_BYTES)
             .expect("100k chars must exceed the aged cap");
         assert!(
-            once.len() > AGED_TOOL_RESULT_MAX_CHARS,
+            once.len() > AGED_TOOL_RESULT_MAX_BYTES,
             "truncate_head_tail became a fixed point of itself; the allowance \
              below can be removed, but do not assume it"
         );
         assert!(
-            once.len() <= AGED_FIXED_POINT_CHARS,
+            once.len() <= AGED_FIXED_POINT_BYTES,
             "the elision marker outgrew the {} char allowance: one cut yields {} \
              chars against a cap of {}",
-            AGED_FIXED_POINT_CHARS - AGED_TOOL_RESULT_MAX_CHARS,
+            AGED_FIXED_POINT_BYTES - AGED_TOOL_RESULT_MAX_BYTES,
             once.len(),
-            AGED_TOOL_RESULT_MAX_CHARS
+            AGED_TOOL_RESULT_MAX_BYTES
         );
     }
 
