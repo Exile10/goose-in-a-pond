@@ -11177,8 +11177,14 @@ async fn get_prompt_template(
 #[derive(Deserialize)]
 struct UpsertTemplateRequest {
     content: String,
+    /// Absent means "leave it alone", not "clear it".
+    ///
+    /// It was `#[serde(default)] String`, so an omitted field arrived as `""`
+    /// and was written straight over the stored value. The desktop client sends
+    /// `{ content }` and nothing else, so every save from the Prompts tab wiped
+    /// the description of the template it was editing.
     #[serde(default)]
-    description: String,
+    description: Option<String>,
 }
 
 async fn upsert_prompt_template(
@@ -11209,20 +11215,36 @@ async fn upsert_prompt_template(
     // Preserve the built-in flag of an existing row — editing "balanced" must
     // not strip its system status (deletion protection) — and mark the row
     // customized so the startup factory reseed leaves the edit alone.
-    let existing_is_system = match repo.get(&name).await {
-        Ok(Some(t)) => t.is_system,
-        _ => false,
-    };
+    let existing = repo.get(&name).await.ok().flatten();
+    let existing_is_system = existing.as_ref().map(|t| t.is_system).unwrap_or(false);
+    let description = req
+        .description
+        .or_else(|| existing.as_ref().map(|t| t.description.clone()))
+        .unwrap_or_default();
     let template = PromptTemplate {
         name: name.clone(),
         content: req.content,
-        description: req.description,
+        description,
         is_system: existing_is_system,
         is_customized: true,
+        // The generation this edit was FORKED FROM, carried through unchanged.
+        // Stamping the current one here would mark every save as up to date and
+        // permanently suppress the notice that a newer built-in exists — the
+        // user's edit is based on whatever they were looking at when they
+        // opened the editor, which is what this number records.
+        factory_version: existing.as_ref().map(|t| t.factory_version).unwrap_or(0),
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
     match repo.upsert(&template).await {
-        Ok(()) => Json(json!({"name": name, "status": "ok"})).into_response(),
+        // The SAVED ROW, not a status stub.
+        //
+        // This returned `{"name","status":"ok"}` while the desktop client typed
+        // it `Promise<PromptTemplate>` and then did `setBodies(… updated.content)`.
+        // `updated.content` was `undefined`, so a SUCCESSFUL save blanked the
+        // editor — and the natural response to that is to hit Reset, which hands
+        // the row back to the factory. The bug quietly undid the edits it was
+        // reporting success for.
+        Ok(()) => Json(template).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -11298,6 +11320,11 @@ async fn reset_prompt_template(
         description: description.to_string(),
         is_system: true,
         is_customized: false,
+        // A reset takes the CURRENT built-in, so the row is current by
+        // definition and the "newer version available" notice must clear with
+        // it. Leaving the old number here would leave the notice up forever on
+        // a row that just adopted.
+        factory_version: pond_core::user_data::domain::prompt_template::FACTORY_VERSION,
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
     match repo.upsert(&template).await {
@@ -11932,7 +11959,7 @@ struct RunRecipeRequest {
 ///
 /// This used to be `goose::recipe::Recipe::from_content`, which was the only
 /// `goose::` reference in the whole of `pond-api` — a path dependency on the
-/// entire agent framework, in the crate CLAUDE.md defines as framework-free, for
+/// entire agent framework, in the crate AGENTS.md defines as framework-free, for
 /// two `Option<String>`s. `pond-api` also sits in CI's "fast crates" list, whose
 /// stated definition is "every crate that does not pull the Goose submodule", so
 /// the split the list encodes did not exist while that dependency was there.

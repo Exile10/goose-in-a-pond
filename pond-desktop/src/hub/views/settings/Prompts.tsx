@@ -4,6 +4,7 @@ import { HubIco } from "../../primitives/HubIco";
 import { DetailShell } from "./DetailShell";
 import { Card, Chip } from "./controls";
 import { api } from "../../../api/PondApiClient";
+import { promptTemplateIsOutdated } from "../../../api/types";
 import type { PromptTemplate } from "../../../api/types";
 
 const CPU_PATH =
@@ -20,17 +21,32 @@ const PRESET_LABELS: Record<string, string> = {
 /** Display order for the known presets. */
 const PRESET_ORDER = ["balanced", "concise", "warm", "technical"];
 
-/** Template variables the backend interpolates — purely documentation. */
+/**
+ * Template variables the backend interpolates — purely documentation.
+ *
+ * From `render_jinja_template` in `crates/pond-core/src/prompts.rs`.
+ * `current_date`/`current_time` are deliberately absent: `build_prompt_partition`
+ * blanks both in the static prefix to keep the KV cache stable, so a template
+ * using them renders an empty string. This list advertised `current_date`.
+ */
 const VARS = [
   "{{assistant_name}}",
   "{{user_name}}",
   "{{personality}}",
   "{{timezone}}",
   "{{location}}",
-  "{{current_date}}",
   "{{device_count}}",
   "{{online_device_names}}",
   "{{has_home_devices}}",
+  "{{has_tools}}",
+  "{{tools}}",
+  "{{native_tools_json}}",
+  "{{compact_prompt}}",
+  "{{thinking_enabled}}",
+  "{{reasoning_budget_words}}",
+  "{{voice_mode}}",
+  "{{canvas_mode}}",
+  "{{atypical_speech}}",
 ];
 
 /** Mock fallback — used when server is unreachable. */
@@ -231,6 +247,10 @@ export function PromptsDetail({ go }: PromptsDetailProps) {
   const dirty = body !== (originals[active] ?? "");
   const tokens = estimateTokens(body);
   const isBusy = saving || resetting;
+  const activeTemplate = prompts.find((p) => p.name === active);
+  const outdated = activeTemplate
+    ? promptTemplateIsOutdated(activeTemplate)
+    : false;
 
   return (
     <DetailShell
@@ -348,6 +368,15 @@ export function PromptsDetail({ go }: PromptsDetailProps) {
             disabled={isBusy}
             style={{ opacity: isBusy ? 0.6 : 1, transition: "opacity 150ms" }}
           />
+        )}
+        {outdated && (
+          <div className="prompt-outdated" role="status">
+            <span>
+              A newer built-in version of this prompt has shipped since you
+              edited it. Your version is kept — Reset adopts the new one and
+              discards your changes.
+            </span>
+          </div>
         )}
         <div className="prompt-foot">
           <span className="prompt-foot__tok">

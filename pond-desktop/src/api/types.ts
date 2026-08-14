@@ -464,10 +464,42 @@ export interface ModelCapabilities {
 export interface PromptTemplate {
   name: string;
   content: string;
+  description?: string;
   is_system: boolean;
   /** User-edited: the startup factory reseed leaves this template alone. */
   is_customized?: boolean;
+  /**
+   * Which generation of the built-in templates this row came from. The reseed
+   * stamps the current one on rows it owns; an edited row keeps the generation
+   * it was forked from, so `is_customized && factory_version < FACTORY_VERSION`
+   * means "there is a newer built-in you have not seen".
+   */
+  factory_version?: number;
   updated_at?: string;
+}
+
+/**
+ * Mirrors `FACTORY_VERSION` in
+ * `crates/pond-core/src/user_data/domain/prompt_template.rs`. Bump both together
+ * — `promptTemplateIsOutdated` compares against this, and a stale copy here
+ * means the update notice never appears.
+ */
+export const PROMPT_FACTORY_VERSION = 1;
+
+/**
+ * True when the user's edit predates the current built-in template.
+ *
+ * Only ever a NOTICE. The row is never adopted on the user's behalf:
+ * `is_customized` is the one honest record that somebody chose this text, and
+ * the settings adoption it would otherwise imitate (migration 0035) is explicit
+ * that a value moves only when the user never set it.
+ */
+export function promptTemplateIsOutdated(t: PromptTemplate): boolean {
+  return (
+    t.is_system === true &&
+    t.is_customized === true &&
+    (t.factory_version ?? 0) < PROMPT_FACTORY_VERSION
+  );
 }
 
 // ── Agent ─────────────────────────────────────────────────────

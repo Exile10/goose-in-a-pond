@@ -670,6 +670,7 @@ async fn run_setup(model: &str) -> Result<()> {
                 description: description.to_string(),
                 is_system: true,
                 is_customized: false,
+                factory_version: pond_core::user_data::domain::prompt_template::FACTORY_VERSION,
                 updated_at: String::new(),
             };
             if let Err(e) = template_repo.insert_if_absent(&t).await {
@@ -1682,6 +1683,7 @@ async fn run_server(
                 description: description.to_string(),
                 is_system: true,
                 is_customized: false,
+                factory_version: pond_core::user_data::domain::prompt_template::FACTORY_VERSION,
                 updated_at: String::new(),
             };
             if let Err(e) = prompt_template_repo.seed_system_template(&t).await {
@@ -4081,6 +4083,7 @@ async fn run_chat(
                 description: description.to_string(),
                 is_system: true,
                 is_customized: false,
+                factory_version: pond_core::user_data::domain::prompt_template::FACTORY_VERSION,
                 updated_at: String::new(),
             };
             if let Err(e) = template_repo.seed_system_template(&t).await {
@@ -7969,8 +7972,10 @@ async fn run_prompts_cmd(action: PromptAction) -> Result<()> {
                 content: content.to_string(),
                 description: description.to_string(),
                 is_system: true,
-                // An explicit reset returns the row to factory ownership.
+                // An explicit reset returns the row to factory ownership, which
+                // includes adopting the current generation.
                 is_customized: false,
+                factory_version: pond_core::user_data::domain::prompt_template::FACTORY_VERSION,
                 updated_at: String::new(),
             };
             repo.upsert(&t).await?;

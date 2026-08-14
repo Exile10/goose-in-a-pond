@@ -1,8 +1,9 @@
 import { useState, useEffect } from "react";
 import { Button, Card, CardContent, Chip, Tabs } from "@heroui/react";
-import { Cpu, RotateCcw, Save } from "lucide-react";
+import { Cpu, Info, RotateCcw, Save } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { PageHeader, ErrorBanner, SkeletonList } from "../components/shared";
+import { promptTemplateIsOutdated } from "../api/types";
 import type { PromptTemplate } from "../api/types";
 
 // ── Preset metadata ───────────────────────────────────────────
@@ -21,17 +22,35 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
-/** Template variables the backend interpolates. */
+/**
+ * Template variables the backend interpolates, from `render_jinja_template` in
+ * `crates/pond-core/src/prompts.rs`.
+ *
+ * `current_date` and `current_time` are deliberately absent even though the
+ * renderer supplies them: `build_prompt_partition` blanks both in the static
+ * prefix so the KV cache stays stable across turns, and they reach the model on
+ * the user message instead. A template using them renders an empty string, so
+ * advertising them here sent people to write a placeholder that silently does
+ * nothing.
+ */
 const TEMPLATE_VARS = [
   "assistant_name",
   "user_name",
   "personality",
   "timezone",
   "location",
-  "current_date",
   "device_count",
   "online_device_names",
   "has_home_devices",
+  "has_tools",
+  "tools",
+  "native_tools_json",
+  "compact_prompt",
+  "thinking_enabled",
+  "reasoning_budget_words",
+  "voice_mode",
+  "canvas_mode",
+  "atypical_speech",
 ];
 
 export function Prompts() {
@@ -99,6 +118,8 @@ export function Prompts() {
   const body = bodies[active] ?? "";
   const dirty = body !== (originals[active] ?? "");
   const tokens = estimateTokens(body);
+  const activeTemplate = prompts.find((p) => p.name === active);
+  const outdated = activeTemplate ? promptTemplateIsOutdated(activeTemplate) : false;
 
   async function save() {
     if (!active) return;
@@ -193,6 +214,16 @@ export function Prompts() {
             spellCheck={false}
             placeholder={`Write the ${PRESET_META[active]?.label?.toLowerCase() ?? active} system prompt…`}
           />
+          {outdated && (
+            <div className="prompt-outdated" role="status">
+              <Info size={13} />
+              <span>
+                A newer built-in version of this prompt has shipped since you
+                edited it. Your version is kept — Reset adopts the new one and
+                discards your changes.
+              </span>
+            </div>
+          )}
           <div className="prompt-foot">
             <div className="prompt-foot__tokens">
               <Cpu size={13} />
