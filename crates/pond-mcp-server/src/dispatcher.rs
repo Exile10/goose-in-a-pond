@@ -398,13 +398,6 @@ fn _tool_param_schema_removed(tool_name: &str) -> serde_json::Value {
             },
             "required": ["topic"]
         }),
-        "giap-knowledge__instant_answer" => json!({
-            "type": "object",
-            "properties": {
-                "topic": { "type": "string", "description": "The question or topic to get a quick answer for." }
-            },
-            "required": ["topic"]
-        }),
         "giap-knowledge__define_word" => json!({
             "type": "object",
             "properties": {
@@ -418,6 +411,21 @@ fn _tool_param_schema_removed(tool_name: &str) -> serde_json::Value {
                 "query": { "type": "string", "description": "Book title, author, or topic to search for." }
             },
             "required": ["query"]
+        }),
+        "giap-knowledge__compute_answer" => json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "The question to compute or look up." }
+            },
+            "required": ["query"]
+        }),
+        "giap-knowledge__explore_computation" => json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Id of the suggestion to open, as printed (e.g. \"w3\")." },
+                "query": { "type": "string", "description": "The original question. Only needed when there is no id." },
+                "assumption": { "type": "string", "description": "A Wolfram assumption code, used with 'query'." }
+            }
         }),
         // Memory
         "giap-memory__save_memory" => json!({
@@ -610,13 +618,6 @@ fn _tool_param_schema_removed(tool_name: &str) -> serde_json::Value {
                 "product": { "type": "string", "description": "Product name to get price for." }
             },
             "required": ["product"]
-        }),
-        "giap-discovery__search_web" => json!({
-            "type": "object",
-            "properties": {
-                "query": { "type": "string", "description": "Search query." }
-            },
-            "required": ["query"]
         }),
         // Draft
         "giap-draft__save_draft" => json!({

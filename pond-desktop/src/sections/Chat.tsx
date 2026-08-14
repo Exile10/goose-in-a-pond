@@ -776,7 +776,9 @@ export function Chat() {
                 {/* Tool call chips */}
                 {msg.role === "agent" && msg.cards && msg.cards.length > 0 && !msg.streaming && (
                   <div className="tool-call-chips" role="list" aria-label="Tools used">
-                    {msg.cards.map((card) => <ToolCallChip key={card.id} card={card} />)}
+                    {msg.cards.map((card) => (
+                      <ToolCallChip key={card.id} card={card} onAction={sendMessage} />
+                    ))}
                   </div>
                 )}
                 {/* History tool indicators */}

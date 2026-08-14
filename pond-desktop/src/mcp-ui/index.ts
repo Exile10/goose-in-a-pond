@@ -13,6 +13,7 @@ import "./cards/MapCard";
 import "./cards/MemoryCard";
 import "./cards/ScheduleListCard";
 import "./cards/KnowledgeCard";
+import "./cards/WolframCard";
 import "./cards/TimeCard";
 import "./cards/SystemInfoCard";
 import "./cards/DeviceCard";

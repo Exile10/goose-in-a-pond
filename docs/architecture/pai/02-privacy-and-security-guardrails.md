@@ -30,10 +30,23 @@ doc should not have implied a mechanism the authors consciously rejected.
 
 **Egress visibility.** `shared/services/egress.rs` is the best privacy primitive in the codebase: a
 process-global request context attributes every outbound call to a session and tool (`:25-53`), and
-host classification (`:126-161`) uses a curated 17-entry `KNOWN_PUBLIC_SUFFIXES` allowlist where
+host classification (`classify_host`) uses a curated 17-entry `KNOWN_PUBLIC_SUFFIXES` allowlist where
 loopback is `Internal`, allowlisted hosts are `Public`, and **everything else defaults to
 `Sensitive`**. Suffix matching is exact-or-dotted, with a test proving
-`notwikipedia.org.evil.com` does not match (`:233-237`).
+`notwikipedia.org.evil.com` does not match (`classifies_unknown_hosts_as_sensitive`).
+
+*Re-verified 2026-08-13: the two line ranges cited here had rotted — classification was quoted as
+`:126-161` when it lives at `:357-397`, and the suffix test as `:233-237` when it is at `:595-606`.
+Both now name the symbol instead, which does not rot. The membership changed the same day and the
+count did not: `duckduckgo.com` came off with the last two tools that called it (`giap-knowledge`'s
+`instant_answer` and `search_web`'s fallback), and `wolframalpha.com` went on with the
+`compute_answer` tool that replaced the first of them. Wolfram is keyed, which is a change of kind
+rather than of degree for this list — `finnhub.io`, `gnews.io` and `guardianapis.com` are already
+keyed, so the established reading of `Public` here is "a public informational API a built-in tool
+calls", not "an anonymous one". What the classification does NOT claim is that the far end cannot
+attribute the request: an AppID is an account, so Wolfram can profile a pond's questions in a way
+Wikipedia cannot. That belongs in the consent story for the key, not in the egress classifier,
+whose job is to say which hosts the pond was built to talk to.*
 
 **Sensitivity classification.** `PrivacySensitivity { Public < Internal < Sensitive < Secret }`
 (`security/domain/event.rs:56-67`) is ordered and queryable. The audit MCP server excludes `Secret`

@@ -121,8 +121,9 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
     ToolGroup {
         extension: "giap-knowledge",
         description: "General reference knowledge and factual lookup: encyclopedia and Wikipedia \
-                      articles, definitions of words, books and authors, and short factual answers \
-                      about history, science, geography, people and places.",
+                      articles, definitions of words, books and authors, short factual answers \
+                      about history, science, geography, people and places, and computed answers \
+                      such as arithmetic, unit and currency conversion, dates and statistics.",
         core: false,
     },
     ToolGroup {
@@ -154,9 +155,10 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
     },
     ToolGroup {
         extension: "giap-discovery",
-        description: "Looking things up about places and countries: facts about a country, nearby \
-                      places and points of interest, postcodes and locations, and general web \
-                      search when nothing else fits.",
+        description: "Reference data about countries and shop products: a country's population, \
+                      capital, currency, languages and region; a packaged food looked up by \
+                      barcode or name, with its ingredients and nutrition; and crowdsourced \
+                      prices for one. This group does NOT search the web.",
         core: false,
     },
     ToolGroup {
