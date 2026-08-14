@@ -55,6 +55,23 @@ interface JsonRpcRequest {
 const PROTOCOL_VERSION = "2026-01-26";
 const EXTENSION_ID = "io.modelcontextprotocol/ui";
 
+/**
+ * targetOrigin for every message sent INTO the app frame.
+ *
+ * The frame is sandboxed without `allow-same-origin`, so its origin is opaque
+ * and serialises to the literal string `"null"` — that is what a targetOrigin
+ * must match. `"*"` would work too, and is what this used to be, but it also
+ * means "deliver to whatever origin this frame has now", which is exactly the
+ * check worth keeping if the frame ever navigates or the sandbox is loosened.
+ *
+ * The inbound direction cannot use origin at all: `event.origin` is also
+ * `"null"` for an opaque-origin frame, and every such frame reports the same
+ * thing, so it distinguishes nothing. `handleMessage` therefore checks
+ * `event.source === iframeRef.current.contentWindow` — window identity, which
+ * is unforgeable from inside the frame.
+ */
+const APP_FRAME_ORIGIN = "null";
+
 // ── Component ──────────────────────────────────────────────────
 
 export function McpAppHost({
@@ -78,7 +95,7 @@ export function McpAppHost({
   const sendResponse = useCallback((id: number | string, result: unknown) => {
     iframeRef.current?.contentWindow?.postMessage(
       { jsonrpc: "2.0", id, result },
-      "*",
+      APP_FRAME_ORIGIN,
     );
   }, []);
 
@@ -86,7 +103,7 @@ export function McpAppHost({
   const sendError = useCallback((id: number | string, code: number, message: string) => {
     iframeRef.current?.contentWindow?.postMessage(
       { jsonrpc: "2.0", id, error: { code, message } },
-      "*",
+      APP_FRAME_ORIGIN,
     );
   }, []);
 
@@ -94,7 +111,7 @@ export function McpAppHost({
   const sendNotification = useCallback((method: string, params?: unknown) => {
     iframeRef.current?.contentWindow?.postMessage(
       { jsonrpc: "2.0", method, params },
-      "*",
+      APP_FRAME_ORIGIN,
     );
   }, []);
 
@@ -244,7 +261,7 @@ export function McpAppHost({
       if (initializedRef.current) {
         iframeRef.current?.contentWindow?.postMessage(
           { jsonrpc: "2.0", method: "ui/resource-teardown", params: { reason: "unmount" } },
-          "*",
+          APP_FRAME_ORIGIN,
         );
       }
     };
@@ -272,7 +289,27 @@ export function McpAppHost({
       <iframe
         ref={iframeRef}
         srcDoc={html}
-        sandbox="allow-scripts allow-same-origin"
+        /*
+         * `allow-scripts` ONLY. Never `allow-same-origin` here.
+         *
+         * A `srcdoc` iframe inherits the embedder's origin, and
+         * `allow-same-origin` hands that origin back to the guest — which means
+         * `parent.document`, `parent.localStorage` (where `PondApiClient` keeps
+         * `giap-session-token` and the refresh token), and the ability to strip
+         * this very `sandbox` attribute off the parent DOM. `html` comes from
+         * `api.getMcpResource(...)`, so it is whatever an MCP server chose to
+         * serve: attacker-controlled the moment any third-party server ships a
+         * `ui://` resource.
+         *
+         * Omitting it gives the frame an OPAQUE origin, which also satisfies
+         * MCP Apps (SEP-1865) "the Host and the Sandbox MUST have different
+         * origins" — the spec's two-layer form puts the guest on its own real
+         * origin and only then re-grants `allow-same-origin`. Until GIAP serves
+         * guest documents from a separate origin, opaque is the different
+         * origin, and the postMessage bridge below is the only channel in or
+         * out. That is the intended shape anyway.
+         */
+        sandbox="allow-scripts"
         className="mcp-app-host__frame"
         style={{
           width: width ?? "100%",
