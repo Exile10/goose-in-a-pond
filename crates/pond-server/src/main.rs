@@ -2211,6 +2211,226 @@ async fn run_server(
         );
     }
 
+    // ── Idle conversation re-titling ─────────────────────────────────────
+    //
+    // A conversation's first title is the first six words of the first thing
+    // said in it. That is reliable and unmemorable, and it is what the sidebar
+    // shows for the rest of that conversation's life. This pass replaces those
+    // with a name worth reading, and revisits one once its conversation has
+    // moved substantially past what the name describes.
+    //
+    // Same contract as memory consolidation, for the same reason — there is
+    // one on-device inference slot:
+    //   - never at startup: real user activity must have been seen since boot
+    //   - only after INACTIVITY_THRESHOLD_SECS of quiet, measured from EITHER
+    //     the in-process clock or the newest session row, so a voice turn in
+    //     the separate child process counts as somebody being here
+    //   - abandoned the instant anyone comes back, having written nothing
+    //
+    // It additionally stands down while consolidation holds the slot. Both are
+    // background chores and neither is worth making the other wait; two
+    // concurrent model calls on a six-core Orin is precisely the contention
+    // the speculative-ASR work spent a week measuring.
+    //
+    // Note that the two background title writers deliberately do NOT touch
+    // `sessions.updated_at`. That column is one of the two activity sources
+    // above, so a job that stamped it would read as a person returning:
+    // it would cancel itself partway through its own first pass, and push the
+    // idle clock forward every time it ran.
+    {
+        use pond_core::shared::domain::session_activity::SessionOrigin;
+        use pond_core::shared::services::session_title::{RetitleOutcome, SessionTitleService};
+        use pond_core::user_data::services::consolidation_schedule as sched;
+
+        // How often to consider a pass. The gate, not this, decides whether one
+        // actually runs.
+        const POLL_SECS: u64 = 5 * 60;
+        // Conversations renamed per pass. A pond with hundreds of them should
+        // not spend a whole idle window on titles, and the next pass is only
+        // five minutes away.
+        const MAX_PER_PASS: usize = 5;
+
+        let title_storage = session_storage.clone();
+        let title_provider = llm_provider.clone();
+        let title_activity = last_user_activity.clone();
+        let title_settings_repo = settings_repo.clone();
+        let title_consolidation_cancel = consolidation_cancel.clone();
+
+        // Baselines for the "never on startup" guard, captured before the
+        // server binds so no request can have been served yet.
+        let started_at = std::time::Instant::now();
+        let started_at_utc = chrono::Utc::now();
+
+        tokio::spawn(async move {
+            let idle_threshold = std::time::Duration::from_secs(sched::INACTIVITY_THRESHOLD_SECS);
+            let mut last_run: Option<std::time::Instant> = None;
+
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
+
+                let settings = match title_settings_repo.get().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!("titling scheduler: settings read failed: {e}");
+                        continue;
+                    }
+                };
+
+                let db_activity = newest_session_activity(title_storage.as_ref()).await;
+                let in_process_at = *title_activity.read().await;
+                let now = chrono::Utc::now();
+
+                let decision = sched::should_run(sched::GateInputs {
+                    // Re-read every tick, so the toggle takes effect without a
+                    // restart.
+                    enabled: settings.session_titling_enabled,
+                    saw_activity_since_start: sched::saw_activity_since_start(
+                        started_at,
+                        in_process_at,
+                        started_at_utc,
+                        db_activity,
+                    ),
+                    idle_for: sched::combined_idle_for(in_process_at, db_activity, now),
+                    idle_threshold,
+                    since_last_run: last_run.map(|t| t.elapsed()),
+                    // The tick IS the floor: a pass is bounded and cheap, so
+                    // there is no reason to space passes further apart than the
+                    // poll already does.
+                    interval_floor: std::time::Duration::from_secs(POLL_SECS),
+                });
+
+                if let sched::GateDecision::Skip(reason) = decision {
+                    tracing::trace!(
+                        reason = reason.as_str(),
+                        "titling scheduler: skipping tick"
+                    );
+                    continue;
+                }
+
+                // Stand down while consolidation is mid-run.
+                let consolidating = title_consolidation_cancel
+                    .read()
+                    .await
+                    .as_ref()
+                    .is_some_and(|t| !t.is_cancelled());
+                if consolidating {
+                    tracing::trace!("titling scheduler: consolidation holds the inference slot");
+                    continue;
+                }
+
+                let Some(provider) = title_provider.read().await.clone() else {
+                    continue;
+                };
+                let sessions = match title_storage.list_sessions().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!("titling scheduler: session list failed: {e}");
+                        continue;
+                    }
+                };
+
+                // One token for the whole pass: activity resuming should end
+                // the sweep, not just the conversation being named at the time.
+                let cancel = tokio_util::sync::CancellationToken::new();
+
+                let watcher_activity = title_activity.clone();
+                let watcher_storage = title_storage.clone();
+                let watcher_cancel = cancel.clone();
+                let watcher_baseline_in_process = in_process_at;
+                let watcher_baseline_db = db_activity;
+                let watcher = tokio::spawn(async move {
+                    // The in-process clock is a lock read, so poll it fast. The
+                    // DB check is a query, so sample it every Nth tick rather
+                    // than hammering SQLite for the length of the pass.
+                    const TICK_MS: u64 = 500;
+                    const DB_EVERY_N_TICKS: u32 = 4;
+                    let mut tick: u32 = 0;
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(TICK_MS)).await;
+                        if watcher_cancel.is_cancelled() {
+                            break;
+                        }
+                        tick = tick.wrapping_add(1);
+
+                        let resumed_in_process =
+                            *watcher_activity.read().await > watcher_baseline_in_process;
+
+                        let resumed_in_db = if tick % DB_EVERY_N_TICKS == 0 {
+                            match newest_session_activity(watcher_storage.as_ref()).await {
+                                // A transient read failure reads as None, which
+                                // must not be mistaken for activity.
+                                Some(latest) => match watcher_baseline_db {
+                                    Some(baseline) => latest > baseline,
+                                    None => true,
+                                },
+                                None => false,
+                            }
+                        } else {
+                            false
+                        };
+
+                        if resumed_in_process || resumed_in_db {
+                            tracing::info!(
+                                "user activity resumed — cancelling conversation re-titling"
+                            );
+                            watcher_cancel.cancel();
+                            break;
+                        }
+                    }
+                });
+
+                let service = SessionTitleService::new(provider, title_storage.clone());
+                let mut renamed = 0usize;
+
+                for session in sessions {
+                    if renamed >= MAX_PER_PASS {
+                        break;
+                    }
+                    // The pond opens conversations for its own background work
+                    // (a cron line firing at 3am mints one). Those are not
+                    // conversations anybody browses, so naming them would spend
+                    // the inference slot on a row nobody reads.
+                    if !SessionOrigin::of(&session.id).is_human() {
+                        continue;
+                    }
+
+                    match service.retitle(&session.id, &cancel).await {
+                        Ok(RetitleOutcome::Retitled { title, .. }) => {
+                            renamed += 1;
+                            tracing::info!(
+                                target: "giap::trace",
+                                kind = "session_retitled",
+                                session_id = %session.id,
+                                title = %title,
+                            );
+                        }
+                        Ok(RetitleOutcome::Cancelled) => {
+                            tracing::debug!("re-titling cancelled — somebody is back");
+                            break;
+                        }
+                        Ok(RetitleOutcome::Skipped(_)) | Ok(RetitleOutcome::Unusable) => {}
+                        Err(e) => {
+                            tracing::debug!("re-titling {} failed: {e}", session.id);
+                        }
+                    }
+                }
+
+                watcher.abort();
+
+                // An attempt consumes the interval budget whether or not it
+                // renamed anything, for the same reason consolidation does:
+                // retrying a fruitless pass every tick is the churn the floor
+                // exists to prevent.
+                last_run = Some(std::time::Instant::now());
+            }
+        });
+        tracing::info!(
+            "conversation re-titling active — runs after {} min idle, at most {} per pass (enable toggle is live)",
+            sched::INACTIVITY_THRESHOLD_SECS / 60,
+            MAX_PER_PASS,
+        );
+    }
+
     // Debug mode: tail pond_logs.db so new event_log rows are printed to the
     // terminal in real time. Polls every second and only surfaces rows added
     // after startup, so existing history is not replayed.

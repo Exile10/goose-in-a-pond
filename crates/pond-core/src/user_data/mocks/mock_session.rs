@@ -17,6 +17,13 @@ pub struct InMemorySessionStorage {
     engine_sessions: Arc<RwLock<HashMap<String, String>>>,
     /// GIAP session id -> selected tool groups (Phase D2).
     tool_groups: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    /// GIAP session id -> (title_source, title_through_message_id).
+    ///
+    /// Modelled here rather than left to the trait defaults because the
+    /// re-titling gate's whole job is telling these apart, and a mock that
+    /// always answered "unknown" would make the one rule worth testing —
+    /// never overwrite a name a person typed — untestable.
+    title_provenance: Arc<RwLock<HashMap<String, (Option<String>, Option<String>)>>>,
 }
 
 impl InMemorySessionStorage {
@@ -27,7 +34,37 @@ impl InMemorySessionStorage {
             rolling_summaries: Arc::new(RwLock::new(HashMap::new())),
             engine_sessions: Arc::new(RwLock::new(HashMap::new())),
             tool_groups: Arc::new(RwLock::new(HashMap::new())),
+            title_provenance: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Write a title the machine chose, recording who wrote it.
+    ///
+    /// Deliberately does NOT touch `updated_at`, matching the SQLite adapter:
+    /// that column is one of the two activity sources the idle gate reads, so
+    /// a background rename that stamped it would read as a person coming back.
+    async fn write_machine_title(
+        &self,
+        session_id: &str,
+        title: &str,
+        source: &str,
+        through_message_id: Option<&str>,
+    ) -> Result<(), SessionStorageError> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| SessionStorageError::SessionNotFound(session_id.to_string()))?;
+        session.title = Some(title.to_string());
+        drop(sessions);
+
+        self.title_provenance.write().await.insert(
+            session_id.to_string(),
+            (
+                Some(source.to_string()),
+                through_message_id.map(str::to_string),
+            ),
+        );
+        Ok(())
     }
 }
 
@@ -103,8 +140,46 @@ impl SessionStorage for InMemorySessionStorage {
             .get_mut(session_id)
             .ok_or_else(|| SessionStorageError::SessionNotFound(session_id.to_string()))?;
         session.title = Some(title);
+        // A person renaming a conversation IS activity, so this one bumps.
         session.updated_at = chrono::Utc::now();
+        drop(sessions);
+        self.title_provenance
+            .write()
+            .await
+            .insert(session_id.to_string(), (Some("user".to_string()), None));
         Ok(())
+    }
+
+    async fn get_title_provenance(
+        &self,
+        session_id: &str,
+    ) -> Result<(Option<String>, Option<String>), SessionStorageError> {
+        Ok(self
+            .title_provenance
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or((None, None)))
+    }
+
+    async fn set_derived_title(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<(), SessionStorageError> {
+        self.write_machine_title(session_id, title, "derived", None)
+            .await
+    }
+
+    async fn set_generated_title(
+        &self,
+        session_id: &str,
+        title: &str,
+        through_message_id: &str,
+    ) -> Result<(), SessionStorageError> {
+        self.write_machine_title(session_id, title, "model", Some(through_message_id))
+            .await
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<(), SessionStorageError> {

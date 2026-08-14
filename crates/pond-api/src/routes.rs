@@ -153,6 +153,8 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // PAI-4 P7 — the manual axis. The time axis (P4) and the pressure axis
         // (P6) both decide for the user; this is the one a person decides.
         .route("/sessions/{session_id}/compact", post(compact_session))
+        .route("/sessions/retitle", post(retitle_sessions))
+        .route("/sessions/{session_id}/retitle", post(retitle_session))
         // Delete a message and every later message in the same session — the
         // "edit"/"refresh" primitive: the client truncates from a user
         // message, then resubmits (same or edited text) as a normal new turn.
@@ -2130,6 +2132,11 @@ async fn list_sessions(
         // derive a short label from its first user message so the client
         // never has to render a raw session id. The stored title stays None —
         // this is a projection, not a mutation.
+        //
+        // Only queried when it is actually needed. A titled session — which is
+        // nearly all of them once the naming pass has run — skips it, and on a
+        // pond with hundreds of conversations this list is per-session queries
+        // all the way down.
         let effective_title: Option<String> = match &s.title {
             Some(t) if !t.trim().is_empty() => Some(t.clone()),
             _ => state
@@ -2138,13 +2145,28 @@ async fn list_sessions(
                 .await
                 .ok()
                 .flatten()
-                .map(|m| derived_session_label(&m))
+                .as_deref()
+                .map(derived_session_label)
                 .filter(|t| !t.is_empty()),
         };
+
+        // The card's preview is what the pond ANSWERED, not what it was asked.
+        // The title already carries the question, and a card whose heading and
+        // body paraphrase the same sentence reads as a rendering fault.
+        let preview: Option<String> = state
+            .session_storage
+            .first_assistant_message(&s.id)
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            .map(session_preview)
+            .filter(|p| !p.is_empty());
 
         session_list.push(json!({
             "id": s.id,
             "title": effective_title,
+            "preview": preview,
             "message_count": message_count,
             "total_prompt_tokens": s.total_prompt_tokens,
             "total_completion_tokens": s.total_completion_tokens,
@@ -2170,6 +2192,28 @@ fn derived_session_label(text: &str) -> String {
         let truncated: String = cleaned.chars().take(MAX_CHARS).collect();
         format!("{}…", truncated.trim_end())
     }
+}
+
+/// The pond's first answer in a conversation, for a history card.
+///
+/// Longer than [`derived_session_label`] because the two answer different
+/// questions: the label stands in for a missing title and says what the
+/// conversation was *about*, this sits underneath a title and says what came
+/// back. Deliberately the assistant's words rather than the user's — the title
+/// already carries the question, and a card whose heading and body paraphrase
+/// each other reads as a rendering fault.
+///
+/// Capped well past what any card shows so the client can fade the overflow
+/// out rather than ending on an ellipsis mid-card.
+fn session_preview(text: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let cleaned = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned = cleaned.trim();
+    if cleaned.chars().count() <= MAX_CHARS {
+        return cleaned.to_string();
+    }
+    let truncated: String = cleaned.chars().take(MAX_CHARS).collect();
+    format!("{}…", truncated.trim_end())
 }
 
 /// `GET /api/v1/usage/summary` — aggregate token usage across all sessions.
@@ -3219,6 +3263,191 @@ async fn compact_session(
         outcome_label,
         &after,
     ))
+}
+
+/// POST /api/v1/sessions/retitle — rename conversations now, without waiting
+/// for an idle window.
+///
+/// The attended counterpart to the background pass in `pond-server`. It skips
+/// the *scheduling* gate only: you asked for it, so the pond does not argue
+/// about whether now is a good moment, and it does not abandon the run when you
+/// keep typing. Every per-conversation rule still applies —
+///
+/// - a name somebody typed is never overwritten,
+/// - a conversation too short to describe is left to the six-word fallback,
+/// - a model-written name that still fits its conversation is not rebuilt just
+///   to spend a model call arriving at the same words.
+///
+/// Deliberately independent of `session_titling_enabled`. That setting governs
+/// whether the pond does this *unattended*; pressing a button is not that, and
+/// a control that silently does nothing because of a switch somewhere else is
+/// the worse surprise.
+async fn retitle_sessions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    use pond_core::shared::domain::session_activity::SessionOrigin;
+    use pond_core::shared::services::session_title::{
+        RetitleOutcome, SessionTitleService, SkipReason,
+    };
+
+    // A manual pass is bounded too. On a small board every rename is a model
+    // call, and a request that walks 400 conversations is a request that times
+    // out. `capped` tells the caller another press will pick up where this one
+    // stopped.
+    const MANUAL_MAX_RENAMES: usize = 20;
+
+    let Some(provider) = state.llm_provider.read().await.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "No language model is configured" })),
+        ));
+    };
+
+    let sessions = state.session_storage.list_sessions().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("list sessions: {e}") })),
+        )
+    })?;
+
+    let service = SessionTitleService::new(provider, state.session_storage.clone());
+    // Never cancelled: this run was asked for, so activity must not cut it short.
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let mut renamed: Vec<Value> = Vec::new();
+    let mut considered = 0usize;
+    let mut unusable = 0usize;
+    let mut failed = 0usize;
+    let (mut user_named, mut still_current, mut too_short, mut unknown) = (0, 0, 0, 0);
+    let mut capped = false;
+
+    for session in sessions {
+        // The pond's own background conversations are not things anybody
+        // browses, so naming them spends a model call on a row nobody reads.
+        if !SessionOrigin::of(&session.id).is_human() {
+            continue;
+        }
+        if renamed.len() >= MANUAL_MAX_RENAMES {
+            capped = true;
+            break;
+        }
+        considered += 1;
+
+        match service.retitle(&session.id, &cancel).await {
+            Ok(RetitleOutcome::Retitled { title, .. }) => {
+                tracing::info!(
+                    target: "giap::trace",
+                    kind = "session_retitled",
+                    trigger = "manual",
+                    session_id = %session.id,
+                    title = %title,
+                );
+                renamed.push(json!({ "session_id": session.id, "title": title }));
+            }
+            Ok(RetitleOutcome::Skipped(reason)) => match reason {
+                SkipReason::UserNamed => user_named += 1,
+                SkipReason::StillCurrent => still_current += 1,
+                SkipReason::TooShort => too_short += 1,
+                SkipReason::UnknownProvenance => unknown += 1,
+            },
+            Ok(RetitleOutcome::Unusable) => unusable += 1,
+            // One bad conversation must not sink the whole pass.
+            Ok(RetitleOutcome::Cancelled) => {}
+            Err(e) => {
+                tracing::debug!("manual re-title of {} failed: {e}", session.id);
+                failed += 1;
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "renamed": renamed,
+        "renamed_count": renamed.len(),
+        "considered": considered,
+        "capped": capped,
+        "unusable": unusable,
+        "failed": failed,
+        "skipped": {
+            "user_named": user_named,
+            "still_current": still_current,
+            "too_short": too_short,
+            "unknown_provenance": unknown,
+        },
+    })))
+}
+
+/// POST /api/v1/sessions/{session_id}/retitle — rename this one conversation.
+///
+/// Unlike the sweep, this one obeys rather than protects. The sweep's rules
+/// exist because it touches conversations nobody is looking at; a click on the
+/// conversation in front of you is consent about that conversation, so this
+/// replaces a name that still fits and a name typed by hand alike.
+///
+/// The one refusal it keeps is a conversation too short to describe, where the
+/// obstacle is that there is nothing to say rather than permission to say it.
+async fn retitle_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    use pond_core::shared::services::session_title::{RetitleOutcome, SessionTitleService};
+
+    state
+        .session_storage
+        .get_session(&session_id)
+        .await
+        .map_err(|e| {
+            let status = match &e {
+                SessionStorageError::SessionNotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json!({ "error": format!("{e}") })))
+        })?;
+
+    let Some(provider) = state.llm_provider.read().await.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "No language model is configured" })),
+        ));
+    };
+
+    let service = SessionTitleService::new(provider, state.session_storage.clone());
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let outcome = service
+        .retitle_now(&session_id, &cancel)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("{e}") })),
+            )
+        })?;
+
+    let body = match outcome {
+        RetitleOutcome::Retitled { title, .. } => {
+            tracing::info!(
+                target: "giap::trace",
+                kind = "session_retitled",
+                trigger = "manual_one",
+                session_id = %session_id,
+                title = %title,
+            );
+            json!({ "session_id": session_id, "outcome": "retitled", "title": title })
+        }
+        // Reported rather than swallowed: a button that declines must say so,
+        // or it is indistinguishable from one that is broken.
+        RetitleOutcome::Skipped(reason) => {
+            json!({ "session_id": session_id, "outcome": "skipped", "reason": reason.as_str(), "title": Value::Null })
+        }
+        RetitleOutcome::Unusable => {
+            json!({ "session_id": session_id, "outcome": "unusable", "title": Value::Null })
+        }
+        RetitleOutcome::Cancelled => {
+            json!({ "session_id": session_id, "outcome": "cancelled", "title": Value::Null })
+        }
+    };
+
+    Ok(Json(body))
 }
 
 /// Percent-encode the few characters that would break a path segment.

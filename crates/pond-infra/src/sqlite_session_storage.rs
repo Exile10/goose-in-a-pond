@@ -722,6 +722,12 @@ impl SessionStorage for SqliteSessionStorage {
         rows.into_iter().map(SessionMessage::try_from).collect()
     }
 
+    /// Rename a session on a person's behalf.
+    ///
+    /// Stamps `title_source = 'user'`, which puts the session permanently out
+    /// of the re-titling job's reach. Its only production caller is the rename
+    /// endpoint; the two machine writers have their own methods precisely so
+    /// this one can mean "somebody typed this" without ambiguity.
     async fn update_title(
         &self,
         session_id: &str,
@@ -729,12 +735,125 @@ impl SessionStorage for SqliteSessionStorage {
     ) -> Result<(), SessionStorageError> {
         self.get_session(session_id).await?; // guard: session must exist
 
-        sqlx::query("UPDATE sessions SET title = ?, updated_at = datetime('now') WHERE id = ?")
-            .bind(&title)
-            .bind(session_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+        sqlx::query(
+            "UPDATE sessions SET title = ?, title_source = 'user', \
+             title_through_message_id = NULL, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(&title)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Two indexed queries rather than a history load: find the anchor's sort
+    /// position, then count what sorts after it. The ordering pair matches
+    /// `get_messages` (`created_at ASC, rowid ASC`) so "after" means the same
+    /// thing here as it does when the conversation is read.
+    ///
+    /// The anchor is fetched separately rather than as a subquery because a
+    /// missing anchor must be distinguishable from an anchor with nothing
+    /// after it — as a subquery both answer `0`.
+    async fn messages_after(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Option<u64>, SessionStorageError> {
+        let anchor: Option<(String, i64)> = sqlx::query_as(
+            "SELECT created_at, rowid FROM session_messages WHERE id = ? AND session_id = ?",
+        )
+        .bind(message_id)
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        let Some((created_at, rowid)) = anchor else {
+            return Ok(None);
+        };
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM session_messages \
+             WHERE session_id = ? AND (created_at > ? OR (created_at = ? AND rowid > ?))",
+        )
+        .bind(session_id)
+        .bind(&created_at)
+        .bind(&created_at)
+        .bind(rowid)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        Ok(Some(count.max(0) as u64))
+    }
+
+    async fn get_title_provenance(
+        &self,
+        session_id: &str,
+    ) -> Result<(Option<String>, Option<String>), SessionStorageError> {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT title_source, title_through_message_id FROM sessions WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        Ok(row.unwrap_or((None, None)))
+    }
+
+    /// Write the deterministic fallback title, marked as such so the
+    /// re-titling job knows it may improve on it.
+    ///
+    /// Does NOT touch `updated_at`: this runs on the first turn of a session,
+    /// and the activity clock that gates every background job reads that
+    /// column. Bumping it here would be the pond reporting its own
+    /// bookkeeping as user activity.
+    async fn set_derived_title(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<(), SessionStorageError> {
+        self.get_session(session_id).await?; // guard: session must exist
+
+        sqlx::query(
+            "UPDATE sessions SET title = ?, title_source = 'derived', \
+             title_through_message_id = NULL WHERE id = ?",
+        )
+        .bind(title)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Write a model-generated title and record how far it reaches.
+    ///
+    /// Same reasoning on `updated_at` as [`set_derived_title`]: a background
+    /// rename is not activity, and treating it as such would let the job
+    /// reset the very idle clock that permitted it to run.
+    async fn set_generated_title(
+        &self,
+        session_id: &str,
+        title: &str,
+        through_message_id: &str,
+    ) -> Result<(), SessionStorageError> {
+        self.get_session(session_id).await?; // guard: session must exist
+
+        sqlx::query(
+            "UPDATE sessions SET title = ?, title_source = 'model', \
+             title_through_message_id = ? WHERE id = ?",
+        )
+        .bind(title)
+        .bind(through_message_id)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
 
         Ok(())
     }
@@ -897,6 +1016,29 @@ impl SessionStorage for SqliteSessionStorage {
         let content: Option<String> = sqlx::query_scalar(
             "SELECT content FROM session_messages \
              WHERE session_id = ? AND role = 'user' \
+             ORDER BY created_at ASC, rowid ASC \
+             LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SessionStorageError::StorageError(e.to_string()))?;
+
+        Ok(content)
+    }
+
+    async fn first_assistant_message(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, SessionStorageError> {
+        // Earliest assistant-authored message — the history card's preview.
+        // Ordered identically to get_messages so "first" is stable, and
+        // filtered to non-empty content because a turn that produced only tool
+        // calls stores an empty assistant row, which would render as a card
+        // with a blank body rather than no body.
+        let content: Option<String> = sqlx::query_scalar(
+            "SELECT content FROM session_messages \
+             WHERE session_id = ? AND role = 'assistant' AND TRIM(content) <> '' \
              ORDER BY created_at ASC, rowid ASC \
              LIMIT 1",
         )
@@ -1536,6 +1678,202 @@ mod tests {
             .unwrap();
         let session = s.get_session("sess-1").await.unwrap();
         assert_eq!(session.title, Some("Weather Chat".to_string()));
+    }
+
+    // ── Title provenance (migration 0049) ───────────────────────────────────
+
+    #[tokio::test]
+    async fn each_title_writer_stamps_its_own_provenance() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+
+        // A brand new row knows nothing about who named it.
+        assert_eq!(
+            s.get_title_provenance("sess-1").await.unwrap(),
+            (None, None)
+        );
+
+        s.set_derived_title("sess-1", "so i was wondering whether")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_title_provenance("sess-1").await.unwrap(),
+            (Some("derived".to_string()), None)
+        );
+
+        s.set_generated_title("sess-1", "Wake word fires twice", "msg-9")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_title_provenance("sess-1").await.unwrap(),
+            (Some("model".to_string()), Some("msg-9".to_string()))
+        );
+        assert_eq!(
+            s.get_session("sess-1").await.unwrap().title.as_deref(),
+            Some("Wake word fires twice")
+        );
+
+        // A human rename outranks everything, and clears the reach marker so a
+        // stale one can never be read as covering the new name.
+        s.update_title("sess-1", "Jetson deploy notes".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_title_provenance("sess-1").await.unwrap(),
+            (Some("user".to_string()), None)
+        );
+    }
+
+    /// The invariant that keeps the background job from sabotaging itself.
+    ///
+    /// `sessions.updated_at` is one of the two activity sources the idle gate
+    /// reads. If a background rename stamped it, the job would look exactly
+    /// like a person coming back: its own watcher would cancel the sweep
+    /// partway through, and every pass would shove the idle clock forward.
+    /// A human rename is real activity and *should* bump it.
+    #[tokio::test]
+    async fn background_title_writes_are_not_mistaken_for_user_activity() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        let before = s.get_session("sess-1").await.unwrap().updated_at;
+
+        // SQLite's datetime('now') has one-second resolution, so without this
+        // a bump inside the same second would be invisible and the test would
+        // pass against code that does bump.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        s.set_derived_title("sess-1", "so i was wondering whether")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_session("sess-1").await.unwrap().updated_at,
+            before,
+            "the deterministic fallback must not read as user activity"
+        );
+
+        s.set_generated_title("sess-1", "Wake word fires twice", "msg-9")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.get_session("sess-1").await.unwrap().updated_at,
+            before,
+            "a background rename must not read as user activity"
+        );
+
+        s.update_title("sess-1", "Jetson deploy notes".to_string())
+            .await
+            .unwrap();
+        assert!(
+            s.get_session("sess-1").await.unwrap().updated_at > before,
+            "a person renaming a conversation IS activity"
+        );
+    }
+
+    /// The cheap answer must agree with the expensive one, because the idle
+    /// re-titling pass trusts it to decide whether a conversation has outgrown
+    /// its name — and a wrong answer either freezes a stale title forever or
+    /// burns the inference slot renaming something that has not changed.
+    #[tokio::test]
+    async fn messages_after_agrees_with_walking_the_history() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        for i in 0..10 {
+            s.add_message(
+                "sess-1".to_string(),
+                SessionMessage::new(
+                    format!("m{i}"),
+                    "sess-1".to_string(),
+                    ChatMessage::user(format!("message {i}")),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+
+        let history = s.get_messages("sess-1").await.unwrap();
+        for (i, msg) in history.iter().enumerate() {
+            let expected = (history.len() - i - 1) as u64;
+            assert_eq!(
+                s.messages_after("sess-1", &msg.id).await.unwrap(),
+                Some(expected),
+                "disagreed at index {i}"
+            );
+        }
+        // The newest message has nothing after it — which is NOT the same
+        // answer as an anchor that no longer exists.
+        assert_eq!(s.messages_after("sess-1", "m9").await.unwrap(), Some(0));
+        assert_eq!(s.messages_after("sess-1", "gone").await.unwrap(), None);
+        // An anchor belonging to a different conversation is not this one's.
+        s.create_session("sess-2".to_string()).await.unwrap();
+        assert_eq!(s.messages_after("sess-2", "m0").await.unwrap(), None);
+    }
+
+    /// The card preview is the pond's answer, so an assistant row that carries
+    /// no words — a turn that only called tools — must not win the slot and
+    /// render a card with a blank body.
+    #[tokio::test]
+    async fn first_assistant_message_skips_a_wordless_turn() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+
+        let rows = [
+            ("m0", ChatMessage::user("what time is it")),
+            ("m1", ChatMessage::assistant("")),
+            ("m2", ChatMessage::assistant("   ")),
+            ("m3", ChatMessage::assistant("It is just past nine.")),
+        ];
+        for (id, msg) in rows {
+            s.add_message(
+                "sess-1".to_string(),
+                SessionMessage::new(id.to_string(), "sess-1".to_string(), msg),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            s.first_assistant_message("sess-1").await.unwrap().as_deref(),
+            Some("It is just past nine."),
+        );
+        // The user's opening line still belongs to the title fallback.
+        assert_eq!(
+            s.first_user_message("sess-1").await.unwrap().as_deref(),
+            Some("what time is it"),
+        );
+    }
+
+    #[tokio::test]
+    async fn first_assistant_message_is_none_before_a_reply_exists() {
+        let (s, _tmp) = make_storage().await;
+        s.create_session("sess-1".to_string()).await.unwrap();
+        s.add_message(
+            "sess-1".to_string(),
+            SessionMessage::new("m0".into(), "sess-1".into(), ChatMessage::user("hello")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(s.first_assistant_message("sess-1").await.unwrap(), None);
+        assert_eq!(s.first_assistant_message("missing").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn provenance_writers_guard_against_a_missing_session() {
+        let (s, _tmp) = make_storage().await;
+        assert!(matches!(
+            s.set_derived_title("missing", "x").await,
+            Err(SessionStorageError::SessionNotFound(_))
+        ));
+        assert!(matches!(
+            s.set_generated_title("missing", "x", "msg-1").await,
+            Err(SessionStorageError::SessionNotFound(_))
+        ));
+        // Reading provenance for a session that is not there is a question with
+        // a sensible answer, not an error.
+        assert_eq!(
+            s.get_title_provenance("missing").await.unwrap(),
+            (None, None)
+        );
     }
 
     #[tokio::test]

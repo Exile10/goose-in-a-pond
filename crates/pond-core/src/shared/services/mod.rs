@@ -5,5 +5,6 @@ pub mod in_process_event_bus;
 pub mod print_output;
 pub mod sensor_persisting_event_bus;
 pub mod session_summary;
+pub mod session_title;
 pub mod stdin_input;
 pub mod turn_authority;
