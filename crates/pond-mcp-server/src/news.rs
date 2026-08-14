@@ -928,7 +928,6 @@ async fn resolve_query(params: &SearchNewsParams) -> String {
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -950,14 +949,7 @@ pub fn init_news_deps(http_client: reqwest::Client) {
 pub fn spawn_news_server(reader: DuplexStream, writer: DuplexStream) {
     let deps = NEWS_DEPS.get().expect("init_news_deps() not called");
     let server = NewsMcpServer::new(deps.http_client.clone());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-news MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-news", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

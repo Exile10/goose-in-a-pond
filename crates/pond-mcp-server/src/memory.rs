@@ -569,7 +569,6 @@ pub fn auto_classify_segment(content: &str) -> MemorySegment {
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -599,14 +598,7 @@ pub fn init_memory_deps(
 pub fn spawn_memory_server(reader: DuplexStream, writer: DuplexStream) {
     let deps = MEMORY_DEPS.get().expect("init_memory_deps() not called");
     let server = MemoryMcpServer::new(deps.memory_repo.clone(), deps.embedding_provider.clone());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-memory MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-memory", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

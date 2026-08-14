@@ -1003,7 +1003,6 @@ fn format_price(price: f64) -> String {
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -1025,14 +1024,7 @@ pub fn init_finance_deps(http_client: reqwest::Client) {
 pub fn spawn_finance_server(reader: DuplexStream, writer: DuplexStream) {
     let deps = FINANCE_DEPS.get().expect("init_finance_deps() not called");
     let server = FinanceMcpServer::new(deps.http_client.clone());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-finance MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-finance", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

@@ -336,7 +336,6 @@ impl ServerHandler for DeviceControlMcpServer {
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────────
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -361,14 +360,7 @@ pub fn spawn_device_control_server(reader: DuplexStream, writer: DuplexStream) {
         .get()
         .expect("init_device_control_deps() not called");
     let server = DeviceControlMcpServer::new(deps.control.clone(), deps.registry.clone());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-device-control MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-device-control", server, reader, writer);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

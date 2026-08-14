@@ -450,7 +450,6 @@ impl ServerHandler for SystemMcpServer {
 
 // ── Spawn function for Goose builtin registry (stateless — no deps) ──────
 
-use rmcp::ServiceExt;
 use tokio::io::DuplexStream;
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
@@ -458,14 +457,7 @@ use tokio::io::DuplexStream;
 /// No `init_*` needed — `SystemMcpServer` is stateless.
 pub fn spawn_system_server(reader: DuplexStream, writer: DuplexStream) {
     let server = SystemMcpServer::default();
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-system MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-system", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
