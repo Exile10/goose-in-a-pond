@@ -1,15 +1,30 @@
 //! Shared formatting utilities for MCP tool results.
 //!
-//! All tool results must fit within a character budget to avoid
-//! overwhelming the LLM's context window.
+//! All tool results must fit within a BYTE budget to avoid overwhelming the
+//! LLM's context window. See [`truncate_to_budget`] for why bytes and not chars.
 
-/// Truncate text to a character budget, respecting UTF-8 char boundaries.
+/// Truncate text to a byte budget, respecting UTF-8 char boundaries.
 /// Appends a truncation notice if the text was cut.
-pub fn truncate_to_budget(text: &str, max_chars: usize) -> String {
-    if text.len() <= max_chars {
+///
+/// **Bytes, deliberately, and the parameter used to be called `max_chars` while
+/// the body measured `text.len()`.** The name was the bug, not the arithmetic:
+/// this budget exists to bound PROMPT TOKENS, and for that bytes are the better
+/// proxy. A BPE tokenizer working over UTF-8 spends more tokens per character on
+/// non-Latin script than on ASCII, so charging by characters would hand a
+/// Cyrillic or Devanagari result roughly twice the token budget of an English
+/// one for the same nominal number. Charging by bytes tracks the real cost.
+///
+/// `pond-core` already had the honest version of this next door —
+/// `context_budget::truncate_at_byte_budget(content, max_bytes)` — doing exactly
+/// the same thing under a name that says so. This now agrees with it.
+///
+/// The cut still lands on a char boundary, so the output is always valid UTF-8;
+/// only the accounting is in bytes.
+pub fn truncate_to_budget(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
         return text.to_string();
     }
-    let mut cut = max_chars;
+    let mut cut = max_bytes;
     while cut > 0 && !text.is_char_boundary(cut) {
         cut -= 1;
     }
@@ -21,9 +36,12 @@ pub fn truncate_to_budget(text: &str, max_chars: usize) -> String {
 
 /// Format a list of items with a header, capped to budget.
 ///
+/// `max_bytes`, on the same reasoning as [`truncate_to_budget`] — the accumulator
+/// is compared with `String::len()`, which is bytes.
+///
 /// A header with no items underneath it is a miss, not a result — see
 /// [`format_no_results`] for why that distinction has to reach the model.
-pub fn format_list_result(items: &[String], header: &str, max_chars: usize) -> String {
+pub fn format_list_result(items: &[String], header: &str, max_bytes: usize) -> String {
     let mut result = if header.is_empty() {
         String::new()
     } else {
@@ -33,7 +51,7 @@ pub fn format_list_result(items: &[String], header: &str, max_chars: usize) -> S
     let mut wrote_item = false;
     for item in items {
         let line = format!("- {}\n", item);
-        if result.len() + line.len() > max_chars {
+        if result.len() + line.len() > max_bytes {
             result.push_str("...\n[More results available]");
             break;
         }
@@ -156,6 +174,45 @@ mod tests {
         let result = truncate_to_budget(text, 5);
         // Should not panic or split mid-char
         assert!(result.contains("[Truncated"));
+    }
+
+    /// The budget is BYTES, and that is a decision rather than an accident.
+    ///
+    /// The parameter was called `max_chars` while the body compared
+    /// `text.len()`, so which unit it meant was anyone's guess and the module
+    /// doc asserted the wrong one. Bytes is right: the budget bounds prompt
+    /// TOKENS, and a BPE tokenizer over UTF-8 spends more tokens per character
+    /// on non-Latin script than on ASCII — so charging per character would hand
+    /// a Cyrillic result roughly twice the token budget of an English one for
+    /// the same nominal number. `pond-core`'s `truncate_at_byte_budget` had
+    /// already made the same choice under an honest name.
+    ///
+    /// Pinned with a string whose two counts differ by exactly 2x, so a silent
+    /// switch to `chars().count()` cannot pass.
+    #[test]
+    fn the_budget_is_counted_in_bytes_not_characters() {
+        let cyrillic = "\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442} \u{43c}\u{438}\u{440}";
+        assert_eq!(cyrillic.chars().count(), 10, "fixture is not 10 chars");
+        assert_eq!(cyrillic.len(), 19, "fixture is not 19 bytes");
+
+        // Fits its byte budget exactly: returned untouched.
+        assert_eq!(truncate_to_budget(cyrillic, 19), cyrillic);
+
+        // Must be cut at 12 bytes. A char-counting implementation would see
+        // 10 <= 12 and hand the whole string back.
+        let cut = truncate_to_budget(cyrillic, 12);
+        assert!(
+            cut.contains("[Truncated"),
+            "a 19-byte string survived a 12-byte budget, so the budget is being \
+             counted in characters: {cut:?}"
+        );
+
+        // Bytes are the accounting, never the slicing — the cut still lands on a
+        // char boundary and the result is valid UTF-8.
+        assert!(
+            cut.starts_with("\u{43f}\u{440}\u{438}\u{432}\u{435}\u{442}"),
+            "cut mid-character: {cut:?}"
+        );
     }
 
     #[test]

@@ -727,7 +727,17 @@ pub fn available_history_chars(
 }
 
 /// Maximum assistant tool-output size kept verbatim in history.
-pub const TOOL_RESULT_MAX_CHARS: usize = 1_500;
+///
+/// **Bytes**, and it was called `TOOL_RESULT_MAX_CHARS` until it was not. Every
+/// use compares against `String::len()` or feeds `truncate_at_byte_budget`, both
+/// of which are bytes, so the old name was wrong on its own terms.
+///
+/// It was also colliding: `shared::services::chat.rs` has its own
+/// `TOOL_RESULT_MAX_CHARS`, a different value (2000), a different unit
+/// (genuinely chars — it counts `char_indices`), and a different job (the NDJSON
+/// stream contract, not the model's context). Both were reachable from
+/// `pond-adapters-goose`. That one keeps its name because its name is true.
+pub const TOOL_RESULT_MAX_BYTES: usize = 1_500;
 
 /// Shrink an oversized tool result to `max_chars`-ish, keeping BOTH ends.
 ///
@@ -846,13 +856,13 @@ fn trim_to_char_budget(
 /// Truncate oversized assistant tool outputs before history trimming.
 ///
 /// This targets assistant messages that look like structured tool output
-/// payloads (JSON/code blocks) and keeps the first [`TOOL_RESULT_MAX_CHARS`]
+/// payloads (JSON/code blocks) and keeps the first [`TOOL_RESULT_MAX_BYTES`]
 /// characters plus a small marker.
 pub fn truncate_tool_outputs(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     messages
         .into_iter()
         .map(|msg| {
-            if msg.role != Role::Assistant || msg.content.len() <= TOOL_RESULT_MAX_CHARS {
+            if msg.role != Role::Assistant || msg.content.len() <= TOOL_RESULT_MAX_BYTES {
                 return msg;
             }
 
@@ -865,7 +875,7 @@ pub fn truncate_tool_outputs(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
                 return msg;
             }
 
-            let mut truncated = truncate_at_byte_budget(&msg.content, TOOL_RESULT_MAX_CHARS);
+            let mut truncated = truncate_at_byte_budget(&msg.content, TOOL_RESULT_MAX_BYTES);
             truncated.push_str("\n\n[tool output truncated]");
             ChatMessage {
                 content: truncated,
@@ -953,9 +963,9 @@ mod tests {
 
     #[test]
     fn text_within_budget_is_left_alone() {
-        assert!(truncate_head_tail("short", TOOL_RESULT_MAX_CHARS).is_none());
-        let exact = "x".repeat(TOOL_RESULT_MAX_CHARS);
-        assert!(truncate_head_tail(&exact, TOOL_RESULT_MAX_CHARS).is_none());
+        assert!(truncate_head_tail("short", TOOL_RESULT_MAX_BYTES).is_none());
+        let exact = "x".repeat(TOOL_RESULT_MAX_BYTES);
+        assert!(truncate_head_tail(&exact, TOOL_RESULT_MAX_BYTES).is_none());
     }
 
     /// The point of head+tail: the CONCLUSION at the end survives, which a
@@ -963,12 +973,12 @@ mod tests {
     #[test]
     fn both_ends_survive_and_the_marker_states_the_loss() {
         let text = format!("HEAD-MARKER{}TAIL-MARKER", "x".repeat(50_000));
-        let out = truncate_head_tail(&text, TOOL_RESULT_MAX_CHARS).unwrap();
+        let out = truncate_head_tail(&text, TOOL_RESULT_MAX_BYTES).unwrap();
         assert!(out.starts_with("HEAD-MARKER"), "{}", &out[..40]);
         assert!(out.ends_with("TAIL-MARKER"), "{}", &out[out.len() - 40..]);
         assert!(out.contains("[... truncated "));
         // Far smaller than the original, and close to the budget.
-        assert!(out.len() < TOOL_RESULT_MAX_CHARS + 64, "len {}", out.len());
+        assert!(out.len() < TOOL_RESULT_MAX_BYTES + 64, "len {}", out.len());
         // The stated loss is accurate.
         let dropped: usize = out
             .split("[... truncated ")
@@ -986,7 +996,7 @@ mod tests {
     fn multibyte_text_is_never_split_mid_char() {
         // Every char is 4 bytes, so naive byte slicing would panic.
         let text = "\u{1F600}".repeat(2_000);
-        let out = truncate_head_tail(&text, TOOL_RESULT_MAX_CHARS).unwrap();
+        let out = truncate_head_tail(&text, TOOL_RESULT_MAX_BYTES).unwrap();
         assert!(out.contains("[... truncated "));
         // Round-trips as valid UTF-8 with no replacement chars introduced.
         assert!(!out.contains('\u{FFFD}'));
@@ -1086,7 +1096,7 @@ mod tests {
                 role: Role::Assistant,
                 content: format!(
                     "{{\"tool\":\"weather\",\"result\":\"{}\"}}",
-                    "x".repeat(TOOL_RESULT_MAX_CHARS + 300)
+                    "x".repeat(TOOL_RESULT_MAX_BYTES + 300)
                 ),
                 images: Vec::new(),
                 tool_calls: Vec::new(),
@@ -1097,7 +1107,7 @@ mod tests {
 
         let result = truncate_tool_outputs(messages);
         assert_eq!(result.len(), 2);
-        assert!(result[0].content.len() <= TOOL_RESULT_MAX_CHARS + 40);
+        assert!(result[0].content.len() <= TOOL_RESULT_MAX_BYTES + 40);
         assert!(result[0].content.contains("[tool output truncated]"));
         assert_eq!(result[1].content, "normal user message");
     }
