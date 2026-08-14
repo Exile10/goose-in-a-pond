@@ -12,7 +12,9 @@ vi.mock("../../api/PondApiClient", () => ({
 }));
 
 import { api } from "../../api/PondApiClient";
-import { getHomeData, refreshHomeData, refreshWeather, __resetHubDataForTests } from "./hubDataStore";
+import { getHomeData, refreshHomeData, refreshWeather, refreshNowPlaying,
+         __resetHubDataForTests, __nowPlayingBackoffForTests,
+         __tickNowPlayingPollForTests, __BACKOFF_TICKS_FOR_TESTS } from "./hubDataStore";
 import { ROUTINES as MOCK_ROUTINES } from "../data/routines";
 
 const apiMock = api as unknown as {
@@ -272,5 +274,129 @@ describe("hubDataStore", () => {
     expect(home.scenes.length).toBe(2);
     expect(home.scenes[0].name).toBe("Wake Up");
     expect(home.scenes[1].name).toBe("Bedtime");
+  });
+});
+
+describe("now-playing polling", () => {
+  beforeEach(() => {
+    __resetHubDataForTests();
+    apiMock.getNowPlaying.mockReset();
+  });
+
+  /// The widget polls every ten seconds and the dashboard is left open for
+  /// days. An answer that cannot change without somebody doing something costs
+  /// ~8,600 requests a day, each one a round trip the server makes to Spotify.
+  it("backs off on an answer only a person can change", async () => {
+    for (const [response, reason] of [
+      [{ connected: true, error: "unauthorized" }, "unauthorized"],
+      [{ connected: true, error: "forbidden" }, "forbidden"],
+      [{ connected: false, error: "network_refused" }, "network_refused"],
+      [{ connected: false }, "not_connected"],
+    ] as const) {
+      __resetHubDataForTests();
+      apiMock.getNowPlaying.mockResolvedValue(response);
+      await refreshNowPlaying();
+      expect(__nowPlayingBackoffForTests()).toBe(reason);
+    }
+  });
+
+  /// Spotify's own words: rate limiting "should reappear shortly", and
+  /// `unavailable` is whatever it was doing at the time. Both clear themselves,
+  /// so giving up on them would strand a widget that was about to recover.
+  it("stays at full rate through failures that clear themselves", async () => {
+    for (const response of [
+      { connected: true, error: "rate_limited" },
+      { connected: true, error: "unavailable" },
+      { connected: true, playing: false },
+      { connected: true, playing: true, track: "Blue Train", artist: "John Coltrane" },
+    ]) {
+      __resetHubDataForTests();
+      apiMock.getNowPlaying.mockResolvedValue(response);
+      await refreshNowPlaying();
+      expect(__nowPlayingBackoffForTests()).toBeNull();
+    }
+  });
+
+  /// A throw is the server being unreachable, not Spotify refusing. Halting
+  /// here would leave the widget dead until the app was relaunched.
+  it("does not back off when the server itself is unreachable", async () => {
+    apiMock.getNowPlaying.mockRejectedValue(new Error("ECONNREFUSED"));
+    await refreshNowPlaying();
+    expect(__nowPlayingBackoffForTests()).toBeNull();
+  });
+
+  /// The halt gates the timer, not the function. Coming back to the dashboard,
+  /// refreshing, or pressing a control all route through here — which is what
+  /// makes the widget recover instead of staying stopped forever.
+  it("recovers when asked directly after the problem is fixed", async () => {
+    apiMock.getNowPlaying.mockResolvedValue({ connected: true, error: "unauthorized" });
+    await refreshNowPlaying();
+    expect(__nowPlayingBackoffForTests()).toBe("unauthorized");
+
+    apiMock.getNowPlaying.mockResolvedValue({ connected: true, playing: true, track: "Blue Train" });
+    await refreshNowPlaying();
+
+    expect(__nowPlayingBackoffForTests()).toBeNull();
+    expect(getHomeData().nowPlaying.track).toBe("Blue Train");
+  });
+});
+
+describe("now-playing backoff cadence", () => {
+  beforeEach(() => {
+    __resetHubDataForTests();
+    apiMock.getNowPlaying.mockReset();
+  });
+
+  it("asks on every tick while everything is healthy", () => {
+    for (let i = 0; i < 5; i++) expect(__tickNowPlayingPollForTests()).toBe(true);
+  });
+
+  /// The whole point of backing off rather than stopping: nobody has to press
+  /// anything for a fixed Spotify to be noticed. A hard stop was unrecoverable
+  /// in practice — a full reload only happens on app start or server reconnect,
+  /// visibilitychange is unreliable in a desktop webview, and the transport
+  /// controls are disabled in exactly the state that would need them.
+  it("skips most ticks while backed off, but always comes back", async () => {
+    apiMock.getNowPlaying.mockResolvedValue({ connected: true, error: "unauthorized" });
+    await refreshNowPlaying();
+    expect(__nowPlayingBackoffForTests()).toBe("unauthorized");
+
+    // Two full cycles, so this cannot pass by retrying once and giving up.
+    for (let cycle = 0; cycle < 2; cycle++) {
+      for (let i = 0; i < __BACKOFF_TICKS_FOR_TESTS - 1; i++) {
+        expect(__tickNowPlayingPollForTests()).toBe(false);
+      }
+      expect(__tickNowPlayingPollForTests()).toBe(true);
+    }
+  });
+
+  it("returns to full rate the moment the answer changes", async () => {
+    apiMock.getNowPlaying.mockResolvedValue({ connected: false });
+    await refreshNowPlaying();
+    expect(__tickNowPlayingPollForTests()).toBe(false);
+
+    apiMock.getNowPlaying.mockResolvedValue({ connected: true, playing: true, track: "Blue Train" });
+    await refreshNowPlaying();
+
+    expect(__nowPlayingBackoffForTests()).toBeNull();
+    expect(__tickNowPlayingPollForTests()).toBe(true);
+  });
+
+  /// Recovering and failing again must wait the full interval, not fire
+  /// immediately on a counter left part-way through the previous outage.
+  it("restarts the interval rather than resuming a half-spent one", async () => {
+    apiMock.getNowPlaying.mockResolvedValue({ connected: false });
+    await refreshNowPlaying();
+    for (let i = 0; i < 10; i++) __tickNowPlayingPollForTests();
+
+    apiMock.getNowPlaying.mockResolvedValue({ connected: true, playing: false });
+    await refreshNowPlaying();
+    apiMock.getNowPlaying.mockResolvedValue({ connected: false });
+    await refreshNowPlaying();
+
+    for (let i = 0; i < __BACKOFF_TICKS_FOR_TESTS - 1; i++) {
+      expect(__tickNowPlayingPollForTests()).toBe(false);
+    }
+    expect(__tickNowPlayingPollForTests()).toBe(true);
   });
 });
