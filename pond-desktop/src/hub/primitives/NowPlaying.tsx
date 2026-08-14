@@ -2,7 +2,7 @@ import { useState } from "react";
 import { HubIco } from "./HubIco";
 import { HP_PATHS } from "./icons";
 import { pauseEl } from "./HubIco";
-import { useHomeData, controlNowPlaying } from "../state/hubDataStore";
+import { useHomeData, controlNowPlaying, refreshNowPlaying } from "../state/hubDataStore";
 
 type NowPlayingVariant = "bar" | "tile";
 
@@ -60,20 +60,31 @@ export function NowPlaying({ variant = "bar" }: NowPlayingProps) {
         )}
       </div>
       <div className="np__ctrls">
-        <button aria-label="Previous" onClick={() => handleSkip("previous")} disabled={errored}>
-          <HubIco d={HP_PATHS.skipB} size={16} color="#64748B" />
-        </button>
-        <button
-          className="np__play"
-          onClick={handlePlayPause}
-          aria-label={playing ? "Pause" : "Play"}
-          disabled={errored}
-        >
-          <HubIco d={playing ? pauseEl : HP_PATHS.play} size={16} color="#fff" />
-        </button>
-        <button aria-label="Next" onClick={() => handleSkip("next")} disabled={errored}>
-          <HubIco d={HP_PATHS.skipF} size={16} color="#64748B" />
-        </button>
+        {errored ? (
+          /* Three dead transport buttons say nothing and do nothing. The one
+             useful action here is asking again. The poll does come back on its
+             own after a refusal, but slowly — this is how you skip the wait
+             once you have just fixed it. */
+          <button className="np__retry" onClick={() => void refreshNowPlaying()}>
+            Try again
+          </button>
+        ) : (
+          <>
+            <button aria-label="Previous" onClick={() => handleSkip("previous")}>
+              <HubIco d={HP_PATHS.skipB} size={16} color="#64748B" />
+            </button>
+            <button
+              className="np__play"
+              onClick={handlePlayPause}
+              aria-label={playing ? "Pause" : "Play"}
+            >
+              <HubIco d={playing ? pauseEl : HP_PATHS.play} size={16} color="#fff" />
+            </button>
+            <button aria-label="Next" onClick={() => handleSkip("next")}>
+              <HubIco d={HP_PATHS.skipF} size={16} color="#64748B" />
+            </button>
+          </>
+        )}
       </div>
     </div>
   );

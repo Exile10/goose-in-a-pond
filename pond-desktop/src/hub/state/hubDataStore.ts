@@ -267,6 +267,107 @@ function weatherFromApi(w: WeatherApiResponse | null): WeatherData {
   };
 }
 
+/**
+ * Why the now-playing poll has backed off, or `null` while it runs normally.
+ *
+ * Module state rather than store state: nothing renders it, and putting it in
+ * `state.data` would make every change an extra re-render of the whole
+ * dashboard.
+ */
+let nowPlayingBackoff: string | null = null;
+
+/** Ticks elapsed since the last attempt while backed off. */
+let backoffTicks = 0;
+
+/** How often the widget asks when everything is healthy. */
+const NOW_PLAYING_TICK_MS = 10_000;
+
+/**
+ * Ticks to skip while backed off — five minutes at the tick above.
+ *
+ * A flat slow retry rather than a hard stop, because a stop is not recoverable
+ * without somebody pressing something: a full reload only happens on app start
+ * or server reconnect, `visibilitychange` is unreliable in a desktop webview,
+ * and the transport controls are disabled in exactly the state that would need
+ * them. Backing off keeps the ~97% saving (8,640 requests a day down to 288)
+ * while a Spotify that gets fixed is noticed on its own within five minutes.
+ */
+const BACKOFF_TICKS = 30;
+
+/**
+ * Does this answer mean "stop asking so often"?
+ *
+ * The widget polls every ten seconds and a GIAP dashboard is typically left
+ * open for days, so an answer that cannot change without somebody doing
+ * something costs ~8,600 pointless requests a day — and every one of them is a
+ * round trip the server makes to Spotify on our behalf.
+ *
+ * The server's own messages draw the line. `unauthorized` says to sign in
+ * again, `forbidden` says to add the account to the app or set a client id,
+ * and `network_refused` needs the egress setting changed: all of them wait on
+ * a person. `rate_limited` says playback "should reappear shortly" and
+ * `unavailable` is whatever Spotify was doing at the time — those clear
+ * themselves, so they keep polling.
+ *
+ * A transport failure (`null` here) is NOT a refusal. The server may simply be
+ * restarting, and giving up on it would leave the widget dead until the app is
+ * relaunched.
+ */
+function unrecoverableReason(np: NowPlayingApiResponse | null): string | null {
+  if (!np) return null;
+  // Checked before `connected`, because `network_refused` arrives WITH
+  // `connected: false` and the specific reason is the more useful one to log.
+  if (np.error === "unauthorized" || np.error === "forbidden" || np.error === "network_refused") {
+    return np.error;
+  }
+  if (!np.connected) return "not_connected";
+  return null;
+}
+
+/**
+ * Should this tick actually ask Spotify?
+ *
+ * Slowed, not stopped: a tick while backed off is usually skipped, but one in
+ * every [`BACKOFF_TICKS`] goes through, so a Spotify that gets fixed is noticed
+ * without anybody pressing anything. The direct callers — visibility, a
+ * dashboard refresh, the widget's Try again — bypass this entirely and ask
+ * straight away.
+ *
+ * Advances the counter as a side effect, so it is the tick itself and must be
+ * called exactly once per tick.
+ */
+function dueForNowPlayingPoll(): boolean {
+  if (!nowPlayingBackoff) return true;
+  backoffTicks += 1;
+  if (backoffTicks < BACKOFF_TICKS) return false;
+  backoffTicks = 0;
+  return true;
+}
+
+/**
+ * Record the poll's cadence, and say so once when it changes.
+ *
+ * Logged on the transition only. "Why is my music widget slow to update" is
+ * otherwise a silent mystery, and repeating it every ten seconds would be the
+ * polling this exists to prevent, in the console.
+ */
+function setNowPlayingBackoff(np: NowPlayingApiResponse | null): void {
+  const reason = unrecoverableReason(np);
+  if (reason !== nowPlayingBackoff) {
+    if (reason) {
+      console.info(
+        `Now-playing polling slowed to every ${(BACKOFF_TICKS * NOW_PLAYING_TICK_MS) / 60_000} ` +
+          `minutes: ${reason}. Fixing it is noticed on its own, or immediately ` +
+          `via the widget's Try again.`,
+      );
+    }
+    // Reset the counter on any change, so a conversation that recovers and
+    // fails again waits the full interval rather than retrying instantly.
+    backoffTicks = 0;
+  }
+  nowPlayingBackoff = reason;
+}
+
 function nowPlayingFromApi(np: NowPlayingApiResponse | null): NowPlayingData {
   if (!np || !np.connected) return { ...MOCK_HOME.nowPlaying, connected: false };
   // Spotify answered but refused the request. This is NOT "nothing playing" —
@@ -320,6 +421,9 @@ async function load() {
     const rcOK = recipes.status === "fulfilled" ? recipes.value : [];
     const wOK = weather.status === "fulfilled" ? weather.value : null;
     const npOK = nowPlaying.status === "fulfilled" ? nowPlaying.value : null;
+    // A full dashboard load is a fresh verdict on whether the poll should run —
+    // it is the other route by which a fixed Spotify gets noticed.
+    setNowPlayingBackoff(npOK);
 
     // Partition devices into controllable + cameras
     const ctlDevices: DeviceData[] = [];
@@ -376,8 +480,8 @@ if (typeof window !== "undefined") {
   // unlike the rest of the dashboard — poll it so the widget catches up
   // without requiring a manual refresh action.
   setInterval(() => {
-    void refreshNowPlaying();
-  }, 10_000);
+    if (dueForNowPlayingPoll()) void refreshNowPlaying();
+  }, NOW_PLAYING_TICK_MS);
   // Weather changes on its own too, and a GIAP dashboard is typically left
   // open for days — without this the card keeps showing whatever the sky was
   // doing when the app started.
@@ -426,14 +530,23 @@ export async function refreshWeather(): Promise<void> {
   }
 }
 
-/** Re-fetches just the now-playing snapshot, without the full dashboard reload. */
+/**
+ * Re-fetches just the now-playing snapshot, without the full dashboard reload.
+ *
+ * Always runs when called directly — the halt only gates the timer. That is
+ * what makes coming back to the dashboard, refreshing it, or pressing a
+ * transport control the way to resume: each of them routes through here and
+ * re-evaluates.
+ */
 export async function refreshNowPlaying(): Promise<void> {
   try {
     const np = await api.getNowPlaying();
     state.data = { ...state.data, nowPlaying: nowPlayingFromApi(np) };
+    setNowPlayingBackoff(np);
     emit();
   } catch {
-    // keep whatever was last known
+    // Keep whatever was last known. A throw here is the server being
+    // unreachable, not Spotify refusing, so the poll deliberately continues.
   }
 }
 
@@ -453,7 +566,24 @@ export function __resetHubDataForTests(): void {
   state.routines = MOCK_ROUTINES;
   state.loaded = false;
   state.loading = false;
+  // Module state, so it outlives a test without this and the next test starts
+  // with the poll already halted.
+  nowPlayingBackoff = null;
+  backoffTicks = 0;
 }
+
+/** Test hook: why the now-playing poll is slowed, or null at full rate. */
+export function __nowPlayingBackoffForTests(): string | null {
+  return nowPlayingBackoff;
+}
+
+/** Test hook: run one poll tick's decision, counter and all. */
+export function __tickNowPlayingPollForTests(): boolean {
+  return dueForNowPlayingPoll();
+}
+
+/** Test hook: ticks skipped between attempts while backed off. */
+export const __BACKOFF_TICKS_FOR_TESTS = BACKOFF_TICKS;
 
 export function __getRoutinesForTests(): RoutineDetail[] {
   return state.routines;

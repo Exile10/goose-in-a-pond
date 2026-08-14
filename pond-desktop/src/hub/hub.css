@@ -1060,14 +1060,27 @@
   line-height: 1.35;
 }
 
-.np--error .np__ctrls button {
-  opacity: 0.4;
-  cursor: not-allowed;
+/* The greyed-out transport buttons that used to live here are gone: in the
+   error state they are no longer rendered at all, replaced by the one control
+   that can do anything. Left in place, the rule dimmed that one too. */
+.np__retry {
+  width: auto !important;
+  min-height: 32px;
+  padding: 0 14px;
+  border-radius: 999px !important;
+  border: 1px solid var(--pp) !important;
+  background: none;
+  color: var(--pp);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s;
 }
 
-.np--error .np__play {
-  background: var(--mut) !important;
-  box-shadow: none;
+.np__retry:hover {
+  background: rgba(140, 75, 255, 0.12);
 }
 
 /* ─── Hub greeting ─── */
