@@ -40,8 +40,10 @@ llama.log
 .claude/
 .vscode/
 
-# The shared, tracked agent guidance is AGENTS.md. CLAUDE.md is personal: keep a
-# local one for your own tooling and notes, but it never enters the tree.
+# Agent guidance is personal and stays out of the tree. Keep a local AGENTS.md
+# (and a CLAUDE.md if your tooling wants one) for your own notes and setup;
+# neither is ever committed.
+/AGENTS.md
 /CLAUDE.md
 
 # Playwright MCP / Vite dev caches
