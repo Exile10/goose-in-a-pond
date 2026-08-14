@@ -15,8 +15,16 @@ pub struct CreateScheduleRequest {
     pub id: String,
     pub label: String,
     /// 6-field cron expression with leading seconds field
-    /// (e.g. `"0 0 8 * * *"` = 08:00:00 daily).
+    /// (e.g. `"0 0 8 * * *"` = 08:00:00 daily), or a display sentinel for a
+    /// schedule that is never cron-registered (`"@event"`, `"@once"`).
     pub cron: String,
+    /// Fire ONCE at this instant, then delete. `None` for a recurring schedule.
+    ///
+    /// When set, `cron` is a sentinel and is never parsed — a 6-field cron has
+    /// no year field, so it cannot express "once" at all. See
+    /// [`crate::user_data::domain::schedule::Schedule::fire_at`].
+    #[serde(default)]
+    pub fire_at: Option<chrono::DateTime<chrono::Utc>>,
     /// IANA timezone (e.g. `"Africa/Nairobi"`).
     pub timezone: String,
     /// What to do on each fire.

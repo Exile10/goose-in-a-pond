@@ -106,7 +106,12 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
     },
     ToolGroup {
         extension: "giap-schedule",
-        description: "Reminders, alarms, timers, recurring routines and scheduled tasks: create a \
+        // This sentence promised "timers" for months while a one-shot was not
+        // expressible: `SchedulerPort` was cron-only, and a 6-field cron has no
+        // year field, so "in ten minutes" became an annual alarm or nothing at
+        // all. `set_timer` is what makes the first clause true.
+        description: "Reminders, alarms, timers, recurring routines and scheduled tasks: set a \
+                      one-shot timer for a few minutes or hours from now, create a repeating \
                       schedule, list or inspect what is scheduled, change or pause or delete one, \
                       run one now, and review past runs. Anything about doing something later or \
                       every day at a certain time.",

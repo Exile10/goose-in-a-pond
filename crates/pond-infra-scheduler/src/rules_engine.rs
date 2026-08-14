@@ -182,6 +182,7 @@ mod tests {
 
     fn rule(id: &str, device: Option<&str>, cooldown_secs: u64, paused: bool) -> Schedule {
         Schedule {
+            fire_at: None,
             id: id.into(),
             label: format!("rule {id}"),
             cron: "@event".into(),
@@ -477,6 +478,7 @@ mod tests {
             };
             scheduler
                 .create_task(CreateScheduleRequest {
+                    fire_at: None,
                     id: "rule-e2e".into(),
                     label: "Backyard motion".into(),
                     cron: "@event".into(),
@@ -562,6 +564,7 @@ mod tests {
                 let scheduler: Arc<dyn SchedulerPort> = Arc::new(new_adapter().await.unwrap());
                 scheduler
                     .create_task(CreateScheduleRequest {
+                        fire_at: None,
                         id: "hourly-rule".into(),
                         label: "Backyard motion".into(),
                         cron: "@event".into(),
@@ -628,6 +631,7 @@ mod tests {
             // so it has never fired. It proves the restarted engine is live.
             scheduler
                 .create_task(CreateScheduleRequest {
+                    fire_at: None,
                     id: "control-rule".into(),
                     label: "Control".into(),
                     cron: "@event".into(),

@@ -505,7 +505,7 @@ mod tests {
         assert!(!tools.contains("giap-discovery__search_web"), "{tools:?}");
         assert_eq!(
             tools.len(),
-            66,
+            67,
             "the tool inventory changed. Update the count in AGENTS.md in the same \
              commit — it read 64 for months while the real number was 65, and prose \
              nobody checks is how that happens. This assertion itself proved the \
