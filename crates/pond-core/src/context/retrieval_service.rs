@@ -212,6 +212,14 @@ mod tests {
         async fn needs_embedding(&self, _c: Corpus, _m: &str, _l: usize) -> Result<Vec<String>> {
             Ok(vec![])
         }
+        async fn needs_embedding_with_text(
+            &self,
+            _c: Corpus,
+            _m: &str,
+            _l: usize,
+        ) -> Result<Vec<(String, String)>> {
+            Ok(vec![])
+        }
         async fn backfill_from_source(&self, _c: Corpus, _m: &str, _d: usize) -> Result<u64> {
             Ok(0)
         }

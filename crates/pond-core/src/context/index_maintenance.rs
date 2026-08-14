@@ -43,8 +43,10 @@ use crate::user_data::ports::session_storage::SessionStorage;
 pub struct MaintenanceReport {
     /// Existing vectors taught to the index without re-embedding.
     pub adopted: u64,
-    /// Summaries embedded (the only step that costs inference).
+    /// Summaries embedded.
     pub summaries_indexed: usize,
+    /// Context items embedded that arrived without a vector.
+    pub context_indexed: usize,
     /// Index rows whose source row is gone.
     pub orphans_pruned: u64,
     /// Rows still lacking a usable vector when the pass finished.
@@ -93,6 +95,51 @@ pub async fn run_index_maintenance(
         .await;
     }
 
+    // 2b. Context items that arrived WITHOUT a vector. Adoption cannot help
+    //     them -- it only copies vectors that already exist -- and nothing else
+    //     ever embedded them, so the whole corpus was silently unsearchable. A
+    //     probe against the live agent is what found it: a planted sensor event
+    //     was never indexed and the assistant answered "no recorded activity",
+    //     which is a wrong answer rather than an absent one.
+    if !cancel.is_cancelled() {
+        match index
+            .needs_embedding_with_text(Corpus::Context, &model_id, 64)
+            .await
+        {
+            Ok(rows) => {
+                for (row_id, text) in rows {
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    match embedder.embed(&text).await {
+                        Ok(vector) => {
+                            let entry = crate::context::vector_index::VectorEntry {
+                                corpus: Corpus::Context,
+                                row_id,
+                                model_id: model_id.clone(),
+                                vector,
+                                // Left None: the adapter's own write-through
+                                // stamps the ingest time, and a rev invented here
+                                // could disagree with it and re-stale forever.
+                                source_rev: None,
+                            };
+                            if let Err(e) = index.upsert(&entry).await {
+                                tracing::warn!("[context-index] store failed: {e}");
+                            } else {
+                                report.context_indexed += 1;
+                            }
+                        }
+                        Err(e) => tracing::warn!("[context-index] embed failed: {e}"),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("[context-index] fetch failed: {e}"),
+        }
+    }
+
     // 3. Orphans. Deliberately AFTER the writes: pruning first would delete rows
     //    that step 1 is about to legitimately re-create, doing the same work
     //    twice on every pass.
@@ -126,10 +173,15 @@ pub async fn run_index_maintenance(
         Err(e) => tracing::warn!("index health read failed: {e:#}"),
     }
 
-    if report.adopted > 0 || report.summaries_indexed > 0 || report.orphans_pruned > 0 {
+    if report.adopted > 0
+        || report.summaries_indexed > 0
+        || report.context_indexed > 0
+        || report.orphans_pruned > 0
+    {
         tracing::info!(
             adopted = report.adopted,
             summaries = report.summaries_indexed,
+            context = report.context_indexed,
             orphans_pruned = report.orphans_pruned,
             "personal-context index maintenance pass complete"
         );
@@ -181,6 +233,14 @@ mod tests {
             Ok(vec![])
         }
         async fn needs_embedding(&self, _c: Corpus, _m: &str, _l: usize) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn needs_embedding_with_text(
+            &self,
+            _c: Corpus,
+            _m: &str,
+            _l: usize,
+        ) -> Result<Vec<(String, String)>> {
             Ok(vec![])
         }
         async fn backfill_from_source(&self, c: Corpus, _m: &str, _d: usize) -> Result<u64> {

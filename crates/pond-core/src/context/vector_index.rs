@@ -196,6 +196,21 @@ pub trait VectorIndex: Send + Sync {
         limit: usize,
     ) -> Result<Vec<String>>;
 
+    /// Like [`Self::needs_embedding`], but with each row's text, so a sweep can
+    /// embed without a second read through another port.
+    ///
+    /// Exists because **context items had no embedding path at all**: adoption
+    /// only copies vectors that already exist, and nothing ever embedded an item
+    /// that arrived without one. A probe against the live agent found it -- a
+    /// planted sensor event was never indexed and the assistant answered "no
+    /// recorded activity", which is a wrong answer rather than a missing one.
+    async fn needs_embedding_with_text(
+        &self,
+        corpus: Corpus,
+        model_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>>;
+
     /// Copy vectors that already exist in a source store into the index,
     /// without re-embedding anything. Returns how many were copied.
     ///
