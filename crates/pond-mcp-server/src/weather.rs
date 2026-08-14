@@ -264,7 +264,6 @@ pub fn app_resources() -> Vec<(&'static str, &'static str)> {
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -283,14 +282,7 @@ pub fn init_weather_deps(weather: Option<Arc<dyn WeatherProvider>>) {
 pub fn spawn_weather_server(reader: DuplexStream, writer: DuplexStream) {
     let deps = WEATHER_DEPS.get().expect("init_weather_deps() not called");
     let server = WeatherMcpServer::new(deps.weather.clone());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-weather MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-weather", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

@@ -1347,7 +1347,6 @@ fn sensor_rule_summary(spec: &SensorTriggerSpec) -> String {
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -1375,14 +1374,7 @@ pub fn spawn_schedule_server(reader: DuplexStream, writer: DuplexStream) {
         .get()
         .expect("init_schedule_deps() not called");
     let server = ScheduleMcpServer::new(deps.scheduler.clone(), deps.settings_repo.clone());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-schedule MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-schedule", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

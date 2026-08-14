@@ -232,7 +232,6 @@ impl ServerHandler for ToolkitMcpServer {
 
 // ── Static deps + spawn function for Goose builtin registry ──────────────
 
-use rmcp::ServiceExt;
 use std::sync::OnceLock;
 use tokio::io::DuplexStream;
 
@@ -257,14 +256,7 @@ pub fn spawn_toolkit_server(reader: DuplexStream, writer: DuplexStream) {
     // missing handle is a legitimate transient state, not a bug.
     let control = TOOLKIT_DEPS.get().and_then(|d| d.control.clone());
     let server = ToolkitMcpServer::new(control);
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-toolkit MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-toolkit", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

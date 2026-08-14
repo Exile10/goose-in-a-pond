@@ -349,6 +349,49 @@ mod tests {
         assert_eq!(join_tool_names(&["a", "b", "c"]), "a, b, or c");
     }
 
+    /// Every builtin server is served through the one supervised helper.
+    ///
+    /// All seventeen `spawn_*_server` functions carried the same seven lines,
+    /// and all seventeen dropped the exit: `Ok(running) => { let _ =
+    /// running.waiting().await; }`. `waiting()` returns when the server has
+    /// STOPPED — a panicked handler, a closed transport, a peer that went away —
+    /// and nothing was logged, so a dead extension presented to everyone
+    /// downstream as "the model stopped using that tool".
+    ///
+    /// A source scan because the alternative is asserting on seventeen spawn
+    /// sites individually, which is the duplication this replaced.
+    #[test]
+    fn no_server_is_spawned_outside_the_supervised_helper() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut served = 0usize;
+
+        for (name, src) in TOOL_SOURCES {
+            let code = strip_line_comments(src);
+            if code.contains("crate::serve_builtin(") {
+                served += 1;
+            }
+            // The shape that discards the exit, in any spacing.
+            if code.contains("running.waiting()") {
+                offenders.push((*name).to_string());
+            }
+            if code.contains("tokio::spawn(") && !code.contains("crate::serve_builtin(") {
+                offenders.push(format!("{name} (raw tokio::spawn)"));
+            }
+        }
+
+        // Vacuity control: if the helper were renamed, `served` would be 0 and
+        // an empty offender list would read as success.
+        assert!(
+            served >= 15,
+            "only {served} servers go through serve_builtin — the scan is looking \
+             for the wrong name, so an empty offender list proves nothing"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these spawn a server without supervision, so its death is silent: {offenders:?}"
+        );
+    }
+
     /// A bare suffix is not what the model sees in its schema — gemma-4-E2B
     /// apologised rather than mapping `search_wikipedia` onto
     /// `giap-knowledge__search_wikipedia`. Every suggestion must be callable verbatim,
@@ -418,27 +461,35 @@ mod tests {
     /// `wolfram.rs` maps to `giap-knowledge`, not to a `giap-wolfram`: its tools
     /// are a second router composed onto the knowledge server, so the file name
     /// is not the extension name.
+    /// Every MCP server source in this crate, keyed by the extension it
+    /// registers. Module-level so the tool inventory and the supervision guard
+    /// read one list — a second copy is the drift both of them exist to catch.
+    ///
+    /// `wolfram.rs` maps to `giap-knowledge`, not `giap-wolfram`: its tools are
+    /// a second router composed onto the knowledge server, so the file name is
+    /// not the extension name.
+    const TOOL_SOURCES: &[(&str, &str)] = &[
+        ("giap-audit", include_str!("audit.rs")),
+        ("giap-context", include_str!("context.rs")),
+        ("giap-device", include_str!("device.rs")),
+        ("giap-device-control", include_str!("device_control.rs")),
+        ("giap-discovery", include_str!("discovery.rs")),
+        ("giap-draft", include_str!("draft.rs")),
+        ("giap-finance", include_str!("finance.rs")),
+        ("giap-knowledge", include_str!("knowledge.rs")),
+        ("giap-knowledge", include_str!("wolfram.rs")),
+        ("giap-memory", include_str!("memory.rs")),
+        ("giap-news", include_str!("news.rs")),
+        ("giap-orchestrator", include_str!("orchestrator.rs")),
+        ("giap-schedule", include_str!("schedule.rs")),
+        ("giap-sensors", include_str!("sensors.rs")),
+        ("giap-system", include_str!("system.rs")),
+        ("giap-toolkit", include_str!("toolkit.rs")),
+        ("giap-vision", include_str!("vision.rs")),
+        ("giap-weather", include_str!("weather.rs")),
+    ];
+
     fn registered_tools() -> std::collections::BTreeSet<String> {
-        const TOOL_SOURCES: &[(&str, &str)] = &[
-            ("giap-audit", include_str!("audit.rs")),
-            ("giap-context", include_str!("context.rs")),
-            ("giap-device", include_str!("device.rs")),
-            ("giap-device-control", include_str!("device_control.rs")),
-            ("giap-discovery", include_str!("discovery.rs")),
-            ("giap-draft", include_str!("draft.rs")),
-            ("giap-finance", include_str!("finance.rs")),
-            ("giap-knowledge", include_str!("knowledge.rs")),
-            ("giap-knowledge", include_str!("wolfram.rs")),
-            ("giap-memory", include_str!("memory.rs")),
-            ("giap-news", include_str!("news.rs")),
-            ("giap-orchestrator", include_str!("orchestrator.rs")),
-            ("giap-schedule", include_str!("schedule.rs")),
-            ("giap-sensors", include_str!("sensors.rs")),
-            ("giap-system", include_str!("system.rs")),
-            ("giap-toolkit", include_str!("toolkit.rs")),
-            ("giap-vision", include_str!("vision.rs")),
-            ("giap-weather", include_str!("weather.rs")),
-        ];
         let mut out = std::collections::BTreeSet::new();
         for (ext, src) in TOOL_SOURCES {
             let code = strip_line_comments(src);

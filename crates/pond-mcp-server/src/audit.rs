@@ -380,7 +380,6 @@ fn read_error(what: &str, err: &anyhow::Error) -> CallToolResult {
 
 // ── Static deps + spawn function for the Goose builtin registry ───────────────
 
-use rmcp::ServiceExt;
 use tokio::io::DuplexStream;
 
 struct AuditDeps {
@@ -409,14 +408,7 @@ pub fn spawn_audit_server(reader: DuplexStream, writer: DuplexStream) {
         return;
     };
     let server = AuditMcpServer::new(deps.event_log.clone());
-    tokio::spawn(async move {
-        match server.serve((reader, writer)).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => tracing::error!("giap-audit MCP server failed: {e}"),
-        }
-    });
+    crate::serve_builtin("giap-audit", server, reader, writer);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────--
