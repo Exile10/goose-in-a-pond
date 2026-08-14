@@ -359,7 +359,11 @@ pub struct GooseAdapter {
     /// Embeddings of the scorable group descriptions, computed on first use.
     /// The descriptions are `&'static str` constants, so one pass is enough for
     /// the process lifetime.
-    group_embeddings: tokio::sync::OnceCell<Option<Vec<(String, Vec<f32>)>>>,
+    /// Deliberately NOT `OnceCell<Option<_>>`. See
+    /// [`GooseAdapter::group_description_embeddings`] — an `Option` inside the
+    /// cell means a failed first attempt is a value the cell keeps forever, which
+    /// on the Jetson silently disabled narrowing for the whole process.
+    group_embeddings: tokio::sync::OnceCell<Vec<(String, Vec<f32>)>>,
 }
 
 /// Hard ceiling on a single buffered reasoning passage, in bytes.
@@ -2627,10 +2631,25 @@ impl GooseAdapter {
     /// Computed once per process. `None` means the work could not be done at all
     /// (no embedder, or every embed failed) — which callers must treat as "do not
     /// narrow", never as "no groups matched".
+    /// The group-description vectors, computed on first SUCCESSFUL use.
+    ///
+    /// `get_or_try_init`, not `get_or_init`, and that is the whole point: a
+    /// `OnceCell<Option<_>>` initialised to `None` keeps that `None` for the
+    /// lifetime of the process, so one failed attempt disabled narrowing until
+    /// the server was restarted.
+    ///
+    /// That is not a hypothetical on the target hardware. The Jetson's embedding
+    /// model is downloaded in a task `main.rs` deliberately does not await, so
+    /// the first session of a fresh install embeds against a file that has not
+    /// arrived. Under `get_or_init` that install then ran with all 66 tool
+    /// schemas in every prompt, for every session, with the trace still
+    /// reporting `mode = "relevant"`. `get_or_try_init` leaves the cell empty on
+    /// `Err`, so the next session tries again and picks the model up as soon as
+    /// it lands.
     async fn group_description_embeddings(&self) -> Option<&Vec<(String, Vec<f32>)>> {
         self.group_embeddings
-            .get_or_init(|| async {
-                let provider = self.embedding_provider.as_ref()?;
+            .get_or_try_init(|| async {
+                let provider = self.embedding_provider.as_ref().ok_or(())?;
                 let available: Vec<String> = registered_extensions().to_vec();
                 let scorable =
                     pond_core::mcp::services::tool_selection::scorable_groups(&available);
@@ -2648,10 +2667,15 @@ impl GooseAdapter {
                         }
                     }
                 }
-                (!out.is_empty()).then_some(out)
+                // Empty is a FAILURE, not a result. Returning `Err` is what keeps
+                // the cell uninitialised so a later session retries.
+                if out.is_empty() {
+                    return Err(());
+                }
+                Ok(out)
             })
             .await
-            .as_ref()
+            .ok()
     }
 
     /// The tool groups for this session, resolving (and persisting) them on first
@@ -2857,6 +2881,24 @@ impl GooseAdapter {
             );
         }
         kept
+    }
+
+    /// Engine session id → GIAP session id.
+    ///
+    /// The escape hatch is keyed by the GIAP session, but the only trustworthy
+    /// thing an MCP tool can learn about its caller is goose's `agent-session-id`
+    /// from `_meta` (see `session_meta.rs`, which rejects the alternatives by
+    /// name). So the translation happens here rather than the tool guessing.
+    ///
+    /// A linear scan: the map holds live conversations, `sse_semaphore` caps
+    /// those at 4, and this runs only when the model calls `enable_tool_group`.
+    fn giap_session_for_engine(&self, engine_session_id: &str) -> Option<String> {
+        self.goose_session_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(_, goose_sid)| goose_sid.as_str() == engine_session_id)
+            .map(|(giap_sid, _)| giap_sid.clone())
     }
 
     async fn remember_permitted(&self, giap_session_id: &str, permitted: &[String]) {
@@ -5422,11 +5464,17 @@ fn canonical_model_stem(model_name: &str, gguf_dir: &std::path::Path) -> String 
 impl pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl for GooseAdapter {
     async fn group_status(
         &self,
-        session_id: &str,
+        engine_session_id: &str,
     ) -> Vec<pond_core::mcp::ports::tools::tool_selection_control::ToolGroupStatus> {
         use pond_core::mcp::domain::tool_group::{find_group, group_of_tool};
         use pond_core::mcp::ports::tools::tool_selection_control::ToolGroupStatus;
 
+        // The caller can only know goose's session; the maps are keyed by GIAP's.
+        let session_id = match self.giap_session_for_engine(engine_session_id) {
+            Some(s) => s,
+            None => String::new(),
+        };
+        let session_id = session_id.as_str();
         let settings = self.settings_repo.get().await.unwrap_or_default();
         // Not narrowing? Then every registered group is loaded, and saying so
         // truthfully is better than implying there is something to enable.
@@ -5471,12 +5519,21 @@ impl pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl 
 
     async fn enable_group(
         &self,
-        session_id: &str,
+        engine_session_id: &str,
         group: &str,
     ) -> Result<Vec<String>, pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionError>
     {
         use pond_core::mcp::domain::tool_group::is_catalog_extension;
         use pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionError;
+
+        // Resolve the caller's own session before anything is widened. A tool
+        // that cannot be attributed must not widen ANY session -- the previous
+        // code read a process-global, so an unattributed call widened whichever
+        // session last started a turn.
+        let Some(session_id) = self.giap_session_for_engine(engine_session_id) else {
+            return Err(ToolSelectionError::NotActive);
+        };
+        let session_id = session_id.as_str();
 
         let group = group.trim();
         if !is_catalog_extension(group) {
@@ -5551,11 +5608,23 @@ impl pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl 
                 None => Vec::new(),
             };
             if newly_allowed.is_empty() {
+                // A cold cache means the widen does not take effect this turn,
+                // and `giap-toolkit` has already told the model "its tools are
+                // available now — go ahead and call the one you need". It calls,
+                // the guard suppresses, and a turn of a 4-turn budget is gone.
+                //
+                // Say so instead. `NotReady` is a tool SUCCESS carrying the
+                // explanation (see `toolkit.rs`), so the model can spend the turn
+                // on something else and try again — which is the difference
+                // between a wasted turn and a wasted sentence.
                 tracing::warn!(
+                    target: "giap::trace",
+                    kind = "tool_group_enable_deferred",
+                    session_id = %session_id,
                     group,
-                    "tool selection: enabled a group but the tool cache is cold — \
-                     its tools land on the next turn"
+                    "enabled a group while the tool cache was cold"
                 );
+                return Err(ToolSelectionError::NotReady(group.to_string()));
             }
             self.shim_controls
                 .session(&goose_sid)
