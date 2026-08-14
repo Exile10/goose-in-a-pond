@@ -15,7 +15,7 @@ Protected routes require a Bearer token in the `Authorization` header:
 Authorization: Bearer <token>
 ```
 
-Obtain a token via `POST /api/v1/handshake`. The token format is validated by middleware, but semantics are not yet enforced — any well-formed Bearer string passes. This is a known gap (see Known Bugs in CLAUDE.md).
+Obtain a token via `POST /api/v1/handshake`. The token format is validated by middleware, but semantics are not yet enforced — any well-formed Bearer string passes. This is a known gap (see Known Bugs in AGENTS.md).
 
 ### Onboarding Gate
 

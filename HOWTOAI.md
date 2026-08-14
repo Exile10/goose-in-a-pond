@@ -1,7 +1,7 @@
 # HOWTOAI.md — AI Agent Navigation Guide
 
 This file is for AI agents (Claude Code, Gemini, Goose, etc.) working in this repository.
-It documents *how* to navigate effectively — not what the code does (that's `CLAUDE.md`),
+It documents *how* to navigate effectively — not what the code does (that's `AGENTS.md`),
 but how to move through it without wasting context, hitting known traps, or violating
 architectural constraints.
 
@@ -17,10 +17,10 @@ Cloud APIs are optional fallbacks, never requirements. Before adding any AI feat
 
 ```
 .ai/scratchpad.md          — current progress, pending tasks, lessons learned
-CLAUDE.md                  — architecture, commands, ports table, known bugs
+AGENTS.md                  — architecture, commands, ports table, known bugs
 ```
 
-`scratchpad.md` tells you *where the project is*. `CLAUDE.md` tells you *how it's structured*.
+`scratchpad.md` tells you *where the project is*. `AGENTS.md` tells you *how it's structured*.
 Without both, you will repeat decisions that have already been made — or unmade.
 
 ---
@@ -119,7 +119,7 @@ Then, with `<quadrant>` chosen:
 2. **Port trait** → `crates/pond-core/src/<quadrant>/ports/<name>.rs` (add `#[async_trait]` and the import manually — the code generator omits it)
 3. **Mock** → `crates/pond-core/src/<quadrant>/mocks/mock_<name>.rs` (gated `#[cfg(any(test, feature = "test-mocks"))]`) — write tests against the mock *before* building the real adapter
 4. **Register the port** → `crates/pond-core/src/<quadrant>/ports/mod.rs` (`pub mod <name>;`)
-5. **Real adapter** → new crate or existing adapter crate (check if Goose already has it — see `CLAUDE.md` §Goose Built-in Providers)
+5. **Real adapter** → new crate or existing adapter crate (check if Goose already has it — see `AGENTS.md` §Goose Built-in Providers)
 6. **Wire** → `crates/pond-server/src/main.rs` via `Arc<dyn Port>`
 7. **Add to `AppState`** if the REST API needs access → `crates/pond-api/src/lib.rs`
 
@@ -133,7 +133,7 @@ Then, with `<quadrant>` chosen:
 |---|---|
 | The current task list | `.ai/scratchpad.md` |
 | Port trait definitions | `crates/pond-core/src/<quadrant>/ports/` (e.g. `models/ports/`, `user_data/ports/`) |
-| Which adapter implements which port | `CLAUDE.md` §Existing Ports table |
+| Which adapter implements which port | `AGENTS.md` §Existing Ports table |
 | Where a port is wired up | `crates/pond-server/src/main.rs` |
 | REST route definitions | `crates/pond-api/src/routes.rs` |
 | SQLite schema / migrations | `crates/pond-infra/migrations/` |
@@ -334,4 +334,4 @@ Current memory stack (in order of access speed):
 
 `GEMINI.md` describes the upstream `goose/` submodule — not GIAP itself. References to `crates/goose-mcp`, `crates/goose-server`, `ui/desktop`, `just generate-openapi`, and `.goosehints` describe the Goose project, not GIAP. Disregard those sections when working in GIAP's own code.
 
-The accurate architecture is the hexagonal layout in `CLAUDE.md`. When `GEMINI.md` and `CLAUDE.md` conflict, `CLAUDE.md` is authoritative for this repository.
+The accurate architecture is the hexagonal layout in `AGENTS.md`. When `GEMINI.md` and `AGENTS.md` conflict, `AGENTS.md` is authoritative for this repository.

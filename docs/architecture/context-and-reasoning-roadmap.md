@@ -45,7 +45,7 @@ quarantined PondAgent loop (Q2-05) is out of scope.
 > Superseded by Phase D below (landed). Kept as the measured baseline.
 
 - **No relevance selection anywhere.** 14 `giap-*` extensions (57 tools when
-  all enabled; CLAUDE.md's "12" is stale) are registered at startup from
+  all enabled; AGENTS.md's "12" is stale) are registered at startup from
   settings toggles; every session loads all of them; `allowed_tools` per turn
   is the full cached union (`goose_agent.rs:1452-1547`); goose's
   `prepare_tools_and_prompt` sends `list_tools(None)` wholesale. The shim's

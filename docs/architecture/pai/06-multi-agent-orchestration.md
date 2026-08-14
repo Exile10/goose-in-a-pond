@@ -118,7 +118,7 @@ which is callable directly." It is not. P2 must choose, **before writing code**,
 
 1. **A sixth GIAP fork patch** — two `pub(crate)` → `pub` plus a re-export — staged on
    `jarida-io/Goose` per `docs/goose-patch-management.md`, with the CI fork-branch-tip bump. Note
-   that `goose-patch-management.md` already carries **five** rows while `CLAUDE.md` still describes
+   that `goose-patch-management.md` already carries **five** rows while `AGENTS.md` still describes
    the patch set as two; that staleness is P2's to clear if it takes this route.
 2. **Reimplementing the child loop** over the public `Agent` API (`Agent::with_config`,
    `update_provider`, `add_extension`, `apply_recipe_components`, `override_system_prompt`,
@@ -407,9 +407,9 @@ whose `parent_session_id` is not the caller's — otherwise one household member
 read back another's result by quoting an id. A foreign task and a nonexistent one get the same words
 and different traces, exactly as the four unauthorised inputs do.
 
-`CLAUDE.md`'s "62 tools when every toggle is on" became **63** when `check_task` landed. The
+`AGENTS.md`'s "62 tools when every toggle is on" became **63** when `check_task` landed. The
 registration cross-check (`registration_matches_the_catalog.rs`) ties the EXTENSION count, not the
-tool count, so nothing fails; the sentence is stale and `CLAUDE.md` is outside this change's
+tool count, so nothing fails; the sentence is stale and `AGENTS.md` is outside this change's
 footprint.
 
 Two things this extension must NOT do. It must not appear in `dispatcher.rs` or in
@@ -579,7 +579,7 @@ mutation was run.
   introduces itself as "a specialized subagent within the goose AI framework, created by AAIF",
   and the provider shim would not catch it — `GOOSE_DEFAULT_MARKER` is not in that template. The
   owned loop is about 120 lines and cost less than the patch would have, once the CI fork-branch
-  bump and the rebase burden are counted. **The patch set stays at five**; `CLAUDE.md` said "two"
+  bump and the rebase burden are counted. **The patch set stays at five**; `AGENTS.md` said "two"
   and now says five, because I counted the rows while deciding this.
 
   **Respecified against the phase text, and why.** The bullet said "render `subagent_system.md`".
@@ -881,7 +881,7 @@ mutation was run.
   deliberately never narrows. A builtin the catalog does not carry therefore becomes the one
   extension that can never be selected away, is never subtracted for a guest, and is never withheld
   from a subagent — for `giap-orchestrator` that inverts the entire intent.
-  `crates/pond-core/tests/registration_matches_the_catalog.rs` now ties `CLAUDE.md`'s count, the
+  `crates/pond-core/tests/registration_matches_the_catalog.rs` now ties `AGENTS.md`'s count, the
   registration list and `TOOL_GROUPS` to each other and fails if any two disagree. **It lives in
   `pond-core` rather than in the adapter** because CI runs `cargo test -p pond-core` and only
   `cargo check`s `pond-adapters-goose`, and a guard CI never executes is a guard that fails for the
@@ -893,7 +893,7 @@ mutation was run.
   that. `giap-orchestrator__delegate` is on `MUST_NEVER_BE_DIRECTLY_DISPATCHABLE`;
   `DIRECT_DISPATCH_ALLOWLIST` is untouched.
 
-  `CLAUDE.md` is 16 now, and its counting recipe is fixed: it said to subtract the import, but the
+  `AGENTS.md` is 16 now, and its counting recipe is fixed: it said to subtract the import, but the
   import has no open paren so the grep never counted it, and the recipe yielded 14 — the exact wrong
   number this programme had already recorded twice. The instruction now reads "do not subtract
   anything".

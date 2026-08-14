@@ -18,7 +18,7 @@
 #   2. Build pond-server in release with RUSTFLAGS explicitly EMPTIED.
 #      .cargo/config.toml sets `-C target-cpu=native`, which bakes host-CPU
 #      instructions into the binary. A distributable binary built that way can
-#      SIGILL on a different CPU (per CLAUDE.md, the same landmine CI overrides).
+#      SIGILL on a different CPU (per AGENTS.md, the same landmine CI overrides).
 #      For a shippable sidecar we must NOT specialise to this build host's CPU.
 #      SQLX_OFFLINE=true keeps the build hermetic (no DB connection needed;
 #      session/settings storage uses runtime sqlx::query, so there is no .sqlx/).

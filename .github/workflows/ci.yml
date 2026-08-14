@@ -134,7 +134,7 @@ jobs:
         run: cargo check -p pond-server -p pond-adapters-goose --all-targets
 
       # The quarantined PondAgent stack (Q2-05). It is no longer in pond-server's
-      # default features, so the gate above stops reaching it — and CLAUDE.md's
+      # default features, so the gate above stops reaching it — and AGENTS.md's
       # promise is that the code "compiles and can be enabled when the engine is
       # production-ready". A quarantined crate whose own unit tests no longer
       # compile has quietly broken that promise, which is why this one is
