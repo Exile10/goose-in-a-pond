@@ -1,11 +1,11 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-import { ArrowUp, Brain, Check, ChevronDown, Copy, Cpu, History, Loader2, Paperclip, Pencil, PenSquare, PlayCircle, RefreshCw, ThumbsDown, ThumbsUp, Wrench, X } from "lucide-react";
+import { ArrowLeft, ArrowUp, Brain, Check, ChevronDown, Copy, Cpu, Loader2, Paperclip, Pencil, PenSquare, PlayCircle, RefreshCw, ThumbsDown, ThumbsUp, Wand2, Wrench, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
 import { nextCardId } from "../state/reducer";
 import type { ContextCard as ContextCardType } from "../state/reducer";
 import { ToolCallChip } from "../components/ToolCallChip";
-import { SessionDropdown } from "../components/SessionDropdown";
+import { ChatHistory, type OpenOrigin } from "./ChatHistory";
 import { ThinkingPlaceholder } from "../components/ThinkingPlaceholder";
 import { ThinkingDisclosure } from "../hub/views/chat/ThinkingDisclosure";
 import { AttachmentTray } from "../components/AttachmentTray";
@@ -144,7 +144,19 @@ export function Chat() {
   const [busy, setBusy]                     = useState(false);
   const [loadingSession, setLoadingSession] = useState(false);
   const [sessions, setSessions]             = useState<SessionSummary[]>([]);
-  const [showSessions, setShowSessions]     = useState(false);
+  const [retitling, setRetitling]           = useState(false);
+  const [editingTitle, setEditingTitle]     = useState(false);
+  const [titleDraft, setTitleDraft]         = useState("");
+  const titleInputRef                       = useRef<HTMLInputElement>(null);
+  /* Mirrors of render values, so the title callbacks can stay stable without
+     depending on things declared further down the component. */
+  const chatTitleRef                        = useRef("");
+  const titleDraftRef                       = useRef("");
+  const renameSessionRef                    = useRef<(id: string, title: string) => void>(() => {});
+  /** `null` until the session list says which screen this should be. */
+  const [view, setView]                     = useState<"history" | "thread" | null>(null);
+  /** Where in the pane the opened card was, so the chat grows out of it. */
+  const [openOrigin, setOpenOrigin]         = useState<OpenOrigin | null>(null);
   const [showModelSelector, setShowModelSelector] = useState(false);
   const [availableModels, setAvailableModels]     = useState<ModelEntry[]>([]);
   const [modelSwitching, setModelSwitching]       = useState(false);
@@ -357,41 +369,139 @@ export function Chat() {
     }).catch(() => {});
   }, [state.serverOnline]);
 
-  // Load most recent session on mount
+  /**
+   * Decide what this section opens on.
+   *
+   * The wall, not the last conversation. Resuming whatever happened to be most
+   * recent answers a question nobody asked — you came here to pick something —
+   * and it made the newest conversation the only one with a route to it.
+   *
+   * The one exception is a pond with no conversations at all: an empty wall is
+   * a dead end, so a first-time visit lands in a new chat, which is an
+   * invitation to type.
+   *
+   * A conversation already open in app state does NOT override this. Coming
+   * back to Chat lands on the wall even mid-conversation, and the card for the
+   * open one is one press away. That costs a click when you were only passing
+   * through another section, and it buys a section that always opens somewhere
+   * you can steer from.
+   */
   useEffect(() => {
-    if (!state.serverOnline || messages.length > 0) return;
+    if (!state.serverOnline || view !== null) return;
     setLoadingSession(true);
     api.listSessions()
-      .then((sessions) => {
-        if (sessions.length === 0) return;
-        const latest = sessions[0];
-        dispatch({ type: "SET_SESSION_ID", payload: latest.id });
-        sessionIdRef.current = latest.id;
-        return api.getSessionMessages(latest.id);
+      .then((list) => {
+        setSessions(list);
+        setView(list.length > 0 ? "history" : "thread");
       })
-      .then((msgs) => {
-        if (!msgs || msgs.length === 0) return;
-        setMessages(sessionMessagesToMessages(msgs));
+      .catch((err) => {
+        console.warn("Could not list conversations (non-fatal):", err);
+        setView("thread");
       })
-      .catch((err) => console.warn("Could not load session history (non-fatal):", err))
-      .finally(() => { setLoadingSession(false); refreshSessions(); });
+      .finally(() => setLoadingSession(false));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.serverOnline]);
+
+  /** Open one conversation from the wall, growing it out of the card pressed. */
+  const openConversation = useCallback((id: string, origin: OpenOrigin) => {
+    setOpenOrigin(origin);
+    setView("thread");
+    setMessages([]);
+    setQueued([]);
+    sessionIdRef.current = id;
+    dispatch({ type: "SET_SESSION_ID", payload: id });
+    dispatch({ type: "CLEAR_CONTEXT_CARDS" });
+    setLoadingSession(true);
+    api.getSessionMessages(id)
+      .then((msgs) => setMessages(sessionMessagesToMessages(msgs ?? [])))
+      .catch((err) => console.warn("Could not open conversation (non-fatal):", err))
+      .finally(() => setLoadingSession(false));
+  }, [dispatch]);
+
+  /** Start typing a name for this conversation. */
+  const beginTitleEdit = useCallback(() => {
+    if (!sessionIdRef.current) return;
+    setTitleDraft(chatTitleRef.current);
+    setEditingTitle(true);
+  }, []);
+
+  /**
+   * Store the typed name, or abandon it if nothing changed.
+   *
+   * An empty box is treated as "I changed my mind", not as "call it nothing":
+   * clearing a title and walking away is far more likely to be a slip than an
+   * instruction, and there is no undo for the name it would replace.
+   */
+  const commitTitle = useCallback(() => {
+    const id = sessionIdRef.current;
+    setEditingTitle(false);
+    const next = titleDraftRef.current.trim();
+    if (!id || !next || next === chatTitleRef.current) return;
+    renameSessionRef.current(id, next);
+  }, []);
+
+  /** Back to the wall. */
+  const showHistory = useCallback(() => {
+    setOpenOrigin(null);
+    setView("history");
+    refreshSessions();
+  }, [refreshSessions]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // Select the whole name when editing starts: the common case is replacing it,
+  // and a caret parked at the end makes that a delete-and-retype.
+  useEffect(() => {
+    if (editingTitle) {
+      titleInputRef.current?.focus();
+      titleInputRef.current?.select();
+    }
+  }, [editingTitle]);
 
   function newConversation() {
     setMessages([]);
     sessionIdRef.current = undefined;
     setQueued([]);
     setQuipSeed(Date.now());
+    // A new chat is not opened from a card, so it has no point to grow out of.
+    setOpenOrigin(null);
+    setView("thread");
     dispatch({ type: "SET_SESSION_ID", payload: null });
     dispatch({ type: "CLEAR_CONTEXT_CARDS" });
     clearAttachments();
     textareaRef.current?.focus();
   }
+
+  /**
+   * Ask the model to name this conversation, now.
+   *
+   * Distinct from `renameSession`, which stores a name you typed. This one
+   * obeys rather than protects — the server replaces a name that still fits and
+   * one typed by hand, because asking for the conversation in front of you is
+   * consent about that conversation.
+   *
+   * The refresh afterwards is the feedback: the header title and the history
+   * list both read from `sessions`, so both catch up in one go.
+   */
+  const retitleCurrent = useCallback(async () => {
+    const id = sessionIdRef.current;
+    if (!id || retitling) return;
+    setRetitling(true);
+    try {
+      const result = await api.retitleSession(id);
+      if (result.outcome === "retitled" && result.title) {
+        setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, title: result.title! } : s)));
+      }
+    } catch (err) {
+      // Non-fatal: the old name stands, and the refresh below reconciles.
+      console.warn("Rename failed (non-fatal):", err);
+    } finally {
+      setRetitling(false);
+      refreshSessions();
+    }
+  }, [retitling, refreshSessions]);
 
   const renameSession = useCallback(async (id: string, title: string) => {
     // Optimistically update the row, then persist. Refresh reconciles with the
@@ -751,6 +861,14 @@ export function Chat() {
   const chatTitle =
     sessions.find((sn) => sn.id === state.sessionId)?.title?.trim() || "New Chat";
 
+  // Mirror the current render values so the title callbacks can read them
+  // without listing them as dependencies — `renameSession` is declared above
+  // but `chatTitle` is not, and a stale closure here would rename a
+  // conversation to the name it had two renders ago.
+  chatTitleRef.current = chatTitle;
+  titleDraftRef.current = titleDraft;
+  renameSessionRef.current = renameSession;
+
   /** Flip thinking on or off, persisting it. Optimistic, reverted on failure. */
   async function toggleThinking() {
     if (thinkingSaving) return;
@@ -785,43 +903,121 @@ export function Chat() {
   const modelLabel = state.lastResponseMeta?.modelName ?? "local model";
 
   return (
-    <div className="chat2">
+    // `null` means the session list has not answered yet. Showing the wall's
+    // skeleton rather than the composer avoids a flash of new-chat for someone
+    // who is about to land on the wall.
+    view !== "thread" ? (
+      <ChatHistory
+        sessions={sessions}
+        loading={view === null || loadingSession}
+        onOpen={openConversation}
+        onNewChat={newConversation}
+        onDelete={deleteSession}
+      />
+    ) : (
+    <div
+      className="chat2"
+      data-entering={openOrigin ? "true" : undefined}
+      style={openOrigin
+        ? ({ "--open-x": `${openOrigin.x}px`, "--open-y": `${openOrigin.y}px` } as React.CSSProperties)
+        : undefined}
+    >
       {/* Header — what this conversation is, and the way back to the others.
           The assistant's name and status used to live here; neither told you
-          anything you could act on, and the status is already in the sidebar. */}
+          anything you could act on, and the status is already in the sidebar.
+
+          Every control is a 44px target with a word on it. A bare icon in a
+          transparent circle is small, ambiguous and hard to hit; a labelled
+          pill is none of those, and at this size it still reads as desktop
+          chrome rather than a phone toolbar. */}
       <header className="chat2__head">
-        <h1 className="chat2__topic" title={chatTitle}>{chatTitle}</h1>
+        <button
+          className="chat2__back"
+          onClick={showHistory}
+          aria-label="All conversations"
+          title="All conversations"
+          type="button"
+        >
+          <ArrowLeft size={17} aria-hidden="true" />
+          <span>All chats</span>
+        </button>
+
+        {/* The title renames itself. It is the biggest target in the header and
+            the thing the name belongs to, so it carries the edit rather than a
+            separate control — and it is the ONLY way to set a name by hand now
+            that the history dropdown is gone. That matters more than it looks:
+            a hand-typed name is the one kind the background pass will never
+            overwrite, and without a route to it that protection could never be
+            asked for. */}
+        {editingTitle ? (
+          <input
+            ref={titleInputRef}
+            className="chat2__topicEdit"
+            aria-label="Conversation name"
+            value={titleDraft}
+            onChange={(e) => setTitleDraft(e.target.value)}
+            onBlur={commitTitle}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") { e.preventDefault(); commitTitle(); }
+              if (e.key === "Escape") { e.preventDefault(); setEditingTitle(false); }
+            }}
+          />
+        ) : (
+          <h1 className="chat2__topic" title={chatTitle}>
+            {/* Only a control once there is something to name. An unsaved
+                conversation is titled "New Chat", and a disabled button saying
+                that sits in the accessibility tree competing with the actual
+                New chat control beside it — two things with one name, one of
+                which does nothing. */}
+            {state.sessionId ? (
+              <button
+                type="button"
+                className="chat2__topicBtn"
+                onClick={beginTitleEdit}
+                /* Names the action AND the current title. Announced as its own
+                   text alone, this is a heading that happens to be focusable
+                   and nothing says it can be edited. */
+                aria-label={`Rename conversation: ${chatTitle}`}
+                title="Click to rename"
+              >
+                {chatTitle}
+              </button>
+            ) : (
+              <span className="chat2__topicBtn chat2__topicBtn--static">{chatTitle}</span>
+            )}
+          </h1>
+        )}
+        {/* Ask for a better name for this conversation. Sits with the title
+            rather than in the header's right-hand cluster, because it acts on
+            the title and nothing else there does. */}
+        <button
+          className="chat2__retitle"
+          onClick={retitleCurrent}
+          disabled={!state.sessionId || retitling}
+          aria-label="Rename this conversation"
+          aria-busy={retitling || undefined}
+          title="Rename this conversation"
+          type="button"
+        >
+          {retitling
+            ? <Loader2 size={14} className="chat2__retitle-spin" aria-hidden="true" />
+            : <Wand2 size={14} aria-hidden="true" />}
+          <span>{retitling ? "Renaming…" : "Rename"}</span>
+        </button>
+        {/* One control here, not three. The History dropdown was a second,
+            worse copy of the wall the back button already returns to — same
+            list, less room, and it hid the one action this corner is for. */}
         <div className="chat2__head-right">
           <button
             className="chat2__headbtn"
-            onClick={() => { refreshSessions(); setShowSessions(!showSessions); }}
-            aria-label="Chat history"
-            aria-expanded={showSessions}
-            title="Chat history"
-            type="button"
-          >
-            <History size={16} aria-hidden="true" />
-            <span>History</span>
-          </button>
-          <button
-            className="chat2__headbtn chat2__headbtn--icon"
             onClick={newConversation}
             aria-label="New chat"
             title="New chat"
             type="button"
           >
-            <PenSquare size={16} aria-hidden="true" />
+            <PenSquare size={17} aria-hidden="true" />
+            <span>New chat</span>
           </button>
-          <SessionDropdown
-            sessions={sessions}
-            currentSessionId={sessionIdRef.current ?? null}
-            onSelect={(id) => dispatch({ type: "SET_SESSION_ID", payload: id })}
-            onNewChat={newConversation}
-            onRename={renameSession}
-            onDelete={deleteSession}
-            isOpen={showSessions}
-            onClose={() => setShowSessions(false)}
-          />
         </div>
       </header>
 
@@ -1226,5 +1422,6 @@ export function Chat() {
         <span className="chat2__hint-kbd">Cmd + Enter to send</span>
       </div>
     </div>
+    )
   );
 }

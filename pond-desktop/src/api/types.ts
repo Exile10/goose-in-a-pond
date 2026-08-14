@@ -143,6 +143,8 @@ export interface Settings {
   memory_extraction_enabled?: boolean;
   memory_cleanup_enabled?: boolean;
   memory_consolidation_enabled?: boolean;
+  /** Let the pond rename conversations while idle. Never touches a name you typed. */
+  session_titling_enabled?: boolean;
   memory_graph_enabled?: boolean;
 
   // Memory tuning
@@ -328,6 +330,38 @@ export type ConsolidationEventType =
   | "completed"
   | "error"
   | "cancelled";
+
+/** What renaming one named conversation did. */
+export interface RetitleOneResult {
+  session_id: string;
+  outcome: "retitled" | "skipped" | "unusable" | "cancelled";
+  /** The new name, or null when nothing was written. */
+  title: string | null;
+  /** Present on "skipped" — why, in a stable slug. */
+  reason?: string;
+}
+
+/** What one manual re-titling pass did. */
+export interface RetitleResult {
+  renamed: { session_id: string; title: string }[];
+  renamed_count: number;
+  /** Conversations the pass looked at, excluding the pond's own background ones. */
+  considered: number;
+  /** True when the pass hit its own bound — pressing again picks up from there. */
+  capped: boolean;
+  /** The model answered with something unusable; the old name was kept. */
+  unusable: number;
+  failed: number;
+  skipped: {
+    /** Named by hand. Never overwritten. */
+    user_named: number;
+    /** Already has a model-written name that still fits. */
+    still_current: number;
+    too_short: number;
+    /** Predates the provenance column and is not the six-word fallback. */
+    unknown_provenance: number;
+  };
+}
 
 export interface ConsolidationEvent {
   type: ConsolidationEventType;
@@ -763,6 +797,8 @@ export interface ModelActiveRoles {
 export interface SessionSummary {
   id: string;
   title?: string;
+  /** How the conversation opened, for a history card. Absent on older servers. */
+  preview?: string;
   created_at: string;
   updated_at: string;
   message_count?: number;

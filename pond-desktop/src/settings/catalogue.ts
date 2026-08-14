@@ -520,6 +520,10 @@ export const CATALOGUE: CatalogueCategory[] = [
         name: "Thinking unprompted",
         entries: [
           { key: "proactive_review_enabled", label: "Review the day on its own", control: { kind: "toggle" }, consumer: "live" },
+          // Only ever touches names the pond wrote itself. A title typed by
+          // hand is left alone whatever this is set to, so the control does not
+          // need to warn about losing one.
+          { key: "session_titling_enabled", label: "Give conversations better names", control: { kind: "toggle" }, consumer: "live" },
         ],
       },
     ],

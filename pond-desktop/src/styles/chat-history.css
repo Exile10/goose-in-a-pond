@@ -1,0 +1,359 @@
+/* ─── Conversations: the history wall ──────────────────────────────────────
+ *
+ * The screen the sidebar's Chat entry lands on. Every conversation the pond has
+ * had, as a wall of cards you scan rather than a list you read.
+ *
+ * # The edge
+ *
+ * Cards carry the pond's one loud treatment: a 2px ink border and the hard
+ * offset shadow (`--shadow-ink`), the same edge the new-chat card wears. It is
+ * used here for the same reason it is used there — this is the screen's
+ * content, not its chrome — and it is the only place on this screen that
+ * raises its voice. Everything else is quiet on purpose.
+ *
+ * The interaction is built from that edge rather than added on top of it. At
+ * rest the card floats 4px above its shadow. Hovering lifts it to 7px, toward
+ * the light. Pressing drives it down INTO the shadow: the card translates by
+ * exactly the offset it loses, so it lands in the space its own shadow
+ * occupied, and the whole thing reads as a physical key rather than a
+ * rectangle that got darker.
+ *
+ * # The heights
+ *
+ * Three, from `cardWeight` — a card is as tall as its conversation was long.
+ * Row spans rather than CSS columns, because columns would put the newest half
+ * of the history in the left column and the rest in the right.
+ */
+
+/* No height and no scroller of its own.
+ *
+ * This used to be `height: 100%; overflow-y: auto`, which put a scroll
+ * container inside the shell's scroll container. The shell carries a 64px
+ * bottom padding, so the inner scroller stopped 64px short of the window and
+ * left a permanently blank strip under a list that was still scrolling —
+ * dead space that no amount of content could ever reach.
+ *
+ * Letting the shell do the scrolling turns that 64px into ordinary trailing
+ * room after the last row, which is what it was for.
+ */
+.chist {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  padding: var(--space-6) var(--space-6) 0;
+}
+
+/* ── Header ─────────────────────────────────────────────────────────────── */
+
+.chist__head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.chist__title {
+  font-family: var(--font-heading);
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-bold);
+  font-style: italic;
+  letter-spacing: -0.02em;
+  color: var(--color-text);
+  margin: 0;
+}
+
+.chist__sub {
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  color: var(--color-text-tertiary);
+  margin: var(--space-1) 0 0;
+}
+
+.chist__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.chist__search {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--tap-min);
+  padding: 0 var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface);
+  color: var(--color-text-tertiary);
+  transition: border-color 0.15s;
+}
+
+/* One ring, and it belongs to the pill rather than the box inside it.
+ *
+ * base.css gives every input a 3px focus glow AND an !important focus-visible
+ * outline — a deliberate safety net so no control can end up with no indicator
+ * at all. This control already has one: the whole pill lights up. Left alone,
+ * focusing the field drew the pill's ring, the input's glow and the net's
+ * outline on the same event, three rings deep.
+ *
+ * The net is overridden here, with the same !important it uses, because what
+ * it exists to prevent — zero feedback — is satisfied by the parent. Anything
+ * that removes the rule below must put a ring back on the pill.
+ */
+/* `--focus-ring`, not `--color-accent`: the accent measured 2.97:1 against the
+   pill's own fill, just under the 3:1 a focus indicator owes its adjacent
+   colours. The focus token is the lighter one the app reserves for this. */
+.chist__search:focus-within {
+  border-color: var(--focus-ring);
+  box-shadow: 0 0 0 3px var(--color-accent-subtle);
+}
+
+.chist__searchInput {
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--color-text);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  width: 140px;
+}
+
+.chist__searchInput:focus,
+.chist__searchInput:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+  border-color: transparent;
+}
+
+.chist__searchInput::placeholder { color: var(--color-text-tertiary); }
+
+.chist__new {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--tap-min);
+  padding: 0 var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.chist__new:hover {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+  background: var(--color-accent-subtle);
+}
+
+.chist__new--lg {
+  min-height: 48px;
+  padding: 0 var(--space-5);
+  font-size: var(--text-md);
+}
+
+/* ── The wall ───────────────────────────────────────────────────────────── */
+
+.chist__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(248px, 1fr));
+  /* A short row unit, so three spans give three genuinely different heights
+     without needing a measurement pass or a resize observer.
+     48, not 56: at the larger unit a two-line card stood 200px tall and opened
+     a hole between its preview and its footer. The variance still reads; the
+     shortest card just stops pretending it has more to say. */
+  grid-auto-rows: 48px;
+  gap: var(--space-4);
+  align-content: start;
+}
+
+.chist__card {
+  --ink-lift: 4px;
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  overflow: hidden;
+
+  background: var(--color-surface);
+  border: 2px solid var(--color-text);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--ink-lift) var(--ink-lift) 0 var(--border-ink);
+
+  cursor: pointer;
+  text-align: left;
+  /* The card moves by exactly what the shadow loses, so pressing lands it in
+     the space the shadow was occupying. */
+  transform: translate(calc(4px - var(--ink-lift)), calc(4px - var(--ink-lift)));
+  transition: transform 160ms cubic-bezier(0.22, 1, 0.36, 1),
+              box-shadow 160ms cubic-bezier(0.22, 1, 0.36, 1),
+              border-color 160ms ease;
+}
+
+.chist__card[data-weight="tile"]   { grid-row: span 3; }
+.chist__card[data-weight="card"]   { grid-row: span 4; }
+.chist__card[data-weight="column"] { grid-row: span 5; }
+
+.chist__card:hover  { --ink-lift: 7px; border-color: var(--color-accent); }
+.chist__card:active { --ink-lift: 0px; }
+
+.chist__card:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+}
+
+/* Loading placeholders: the wall's shape before its contents, so the layout
+   does not jump when the real cards arrive. */
+.chist__card--ghost {
+  cursor: default;
+  border-color: var(--color-border);
+  box-shadow: none;
+  transform: none;
+  opacity: 0.45;
+}
+
+/* ── Card contents ──────────────────────────────────────────────────────── */
+
+/* The mono eyebrow, set exactly as the new-chat card sets "NEW CHAT". */
+.chist__when {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-text-tertiary);
+}
+
+.chist__cardTitle {
+  font-family: var(--font-heading);
+  font-size: var(--text-md);
+  font-weight: var(--weight-bold);
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+  color: var(--color-text);
+  margin: 0;
+  /* Three lines is where a ten-word title stops fitting one column. */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* The preview runs out rather than stopping: a hard ellipsis at a fixed line
+   count reads as truncation, a fade reads as more conversation below. */
+.chist__preview {
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  line-height: 1.45;
+  color: var(--color-text-tertiary);
+  margin: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 55%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 55%, transparent 100%);
+}
+
+.chist__count {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--color-text-tertiary);
+  margin-top: auto;
+  flex: 0 0 auto;
+}
+
+/* ── Delete ─────────────────────────────────────────────────────────────── */
+
+.chist__del {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  /* Hidden until the card is engaged with, so the wall stays quiet — but
+     always reachable by keyboard, which is why this is opacity and not
+     display. */
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+}
+
+.chist__card:hover .chist__del,
+.chist__del:focus-visible {
+  opacity: 1;
+}
+
+.chist__del:hover {
+  color: var(--color-destructive);
+  background: var(--color-destructive-soft);
+}
+
+.chist__confirm {
+  position: absolute;
+  inset: auto var(--space-2) var(--space-2) auto;
+  display: flex;
+  gap: var(--space-2);
+}
+
+.chist__confirmYes,
+.chist__confirmNo {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-pill);
+  padding: var(--space-1) var(--space-3);
+  background: var(--color-surface);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+}
+
+.chist__confirmYes { color: var(--color-destructive); border-color: currentColor; }
+.chist__confirmNo  { color: var(--color-text-secondary); }
+
+/* ── Empty ──────────────────────────────────────────────────────────────── */
+
+.chist__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-4);
+  padding: var(--space-6) 0;
+}
+
+.chist__emptyLine {
+  font-family: var(--font-body);
+  font-size: var(--text-md);
+  color: var(--color-text-secondary);
+  margin: 0;
+}
+
+/* ── Narrow panes ───────────────────────────────────────────────────────── */
+
+@media (max-width: 560px) {
+  .chist { padding: var(--space-4); }
+  .chist__head { align-items: stretch; }
+  .chist__actions { justify-content: space-between; }
+  .chist__searchInput { width: 100%; }
+  .chist__search { flex: 1 1 auto; }
+  .chist__grid { grid-template-columns: 1fr; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* The lift is the whole affordance, so it stays — instantly rather than
+     eased. Removing it outright would leave a card with no pressed state. */
+  .chist__card { transition-duration: 1ms; }
+}

@@ -60,7 +60,11 @@
 
   /* Ink style — signature Jarida outlined look */
   --border-ink:  #5D23C2;
-  --shadow-ink:  4px 4px 0 #5D23C2;
+  /* Composed from --border-ink rather than repeating the hex: anything that
+     animates the offset (a card pressing into its own shadow) has to write the
+     shadow itself, and a second literal is how the outline and the shadow drift
+     to different purples. */
+  --shadow-ink:  4px 4px 0 var(--border-ink);
   --bg-brand-soft: #F4ECFF;  /* alias: --purple-50 */
 
   /* Text — Jarida Charcoal */

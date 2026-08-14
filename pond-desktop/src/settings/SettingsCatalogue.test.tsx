@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
-import { SettingsCatalogueView } from "./SettingsCatalogue";
+import { SettingsCatalogueView, summariseRetitle } from "./SettingsCatalogue";
 import { api } from "../api/PondApiClient";
 
 // ── Mocks ─────────────────────────────────────────────────────
@@ -41,6 +41,7 @@ vi.mock("../api/PondApiClient", () => ({
     getSettings: vi.fn(),
     updateSettings: vi.fn(),
     listModels: vi.fn(),
+    retitleSessions: vi.fn(),
   },
 }));
 
@@ -48,7 +49,22 @@ const mockApi = api as unknown as {
   getSettings: ReturnType<typeof vi.fn>;
   updateSettings: ReturnType<typeof vi.fn>;
   listModels: ReturnType<typeof vi.fn>;
+  retitleSessions: ReturnType<typeof vi.fn>;
 };
+
+/** A re-titling reply with the boring fields filled in. */
+function retitleReply(over: Record<string, unknown> = {}) {
+  return {
+    renamed: [],
+    renamed_count: 0,
+    considered: 0,
+    capped: false,
+    unusable: 0,
+    failed: 0,
+    skipped: { user_named: 0, still_current: 0, too_short: 0, unknown_provenance: 0 },
+    ...over,
+  };
+}
 
 /** Render and wait for the first paint after settings load. */
 async function renderPage(overrides: Record<string, unknown> = {}) {
@@ -227,5 +243,114 @@ describe("SettingsCatalogue", () => {
     mockApi.getSettings.mockResolvedValue(serverSettings());
     fireEvent.click(retry);
     await screen.findByText("Who lives here");
+  });
+});
+
+describe("summariseRetitle", () => {
+  it("counts what it renamed, and says when there is more to do", () => {
+    expect(summariseRetitle(retitleReply({ renamed_count: 1 }))).toBe("Renamed 1 conversation");
+    expect(summariseRetitle(retitleReply({ renamed_count: 4 }))).toBe("Renamed 4 conversations");
+    expect(summariseRetitle(retitleReply({ renamed_count: 20, capped: true })))
+      .toBe("Renamed 20 conversations — press again for more");
+  });
+
+  /// The distinction the copy exists for: "nothing needed doing" and "nothing
+  /// was allowed" look identical from a count alone, and a person told the
+  /// first would press the button again expecting a different answer.
+  it("separates nothing-to-do from nothing-allowed", () => {
+    expect(summariseRetitle(retitleReply({ considered: 0 })))
+      .toBe("No conversations to rename");
+    expect(summariseRetitle(retitleReply({
+      considered: 3, skipped: { user_named: 3, still_current: 0, too_short: 0, unknown_provenance: 0 },
+    }))).toBe("All of these are named by hand");
+    expect(summariseRetitle(retitleReply({
+      considered: 3, skipped: { user_named: 0, still_current: 3, too_short: 0, unknown_provenance: 0 },
+    }))).toBe("Nothing needed a new name");
+  });
+
+  it("reports a model that gave nothing usable, and an outright failure", () => {
+    expect(summariseRetitle(retitleReply({ considered: 2, unusable: 2 })))
+      .toBe("The model gave no usable name");
+    expect(summariseRetitle(retitleReply({ considered: 2, failed: 2 })))
+      .toBe("Could not rename any of them");
+  });
+
+  it("never claims success when nothing was renamed", () => {
+    for (const over of [
+      { considered: 5, failed: 5 },
+      { considered: 5, unusable: 5 },
+      { considered: 5, skipped: { user_named: 5, still_current: 0, too_short: 0, unknown_provenance: 0 } },
+    ]) {
+      expect(summariseRetitle(retitleReply(over))).not.toMatch(/^Renamed/);
+    }
+  });
+});
+
+describe("the rename-now button", () => {
+  async function openAutomation() {
+    await renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /Automation & Proactivity/ }));
+  }
+
+  it("renames on demand and reports what happened", async () => {
+    mockApi.retitleSessions.mockResolvedValue(retitleReply({
+      renamed_count: 2,
+      renamed: [
+        { session_id: "a", title: "Wake word fires twice" },
+        { session_id: "b", title: "Jetson build stamp is lying" },
+      ],
+      considered: 5,
+    }));
+    await openAutomation();
+
+    fireEvent.click(screen.getByRole("button", { name: /Rename now/ }));
+
+    await screen.findByText("Renamed 2 conversations");
+    expect(mockApi.retitleSessions).toHaveBeenCalledTimes(1);
+    // Renaming is not a settings change; it must not dirty the save button.
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+  });
+
+  /// One model call per conversation, so a pass is slow on a small board. The
+  /// button has to say so and refuse to be pressed twice.
+  it("says it is working and cannot be pressed again mid-run", async () => {
+    let release!: (v: unknown) => void;
+    mockApi.retitleSessions.mockReturnValue(new Promise((r) => { release = r; }));
+    await openAutomation();
+
+    fireEvent.click(screen.getByRole("button", { name: /Rename now/ }));
+
+    const busy = await screen.findByRole("button", { name: /Renaming/ });
+    expect((busy as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(busy);
+    expect(mockApi.retitleSessions).toHaveBeenCalledTimes(1);
+
+    release(retitleReply({ renamed_count: 1, considered: 1 }));
+    await screen.findByText("Renamed 1 conversation");
+  });
+
+  it("shows the failure rather than a silent no-op", async () => {
+    mockApi.retitleSessions.mockRejectedValue(new Error("No language model is configured"));
+    await openAutomation();
+
+    fireEvent.click(screen.getByRole("button", { name: /Rename now/ }));
+
+    await screen.findByText("No language model is configured");
+    // Recoverable: the button comes back rather than staying stuck on "Renaming".
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: /Rename now/ }) as HTMLButtonElement).disabled)
+        .toBe(false));
+  });
+
+  /// The toggle governs what happens unattended. A button that silently did
+  /// nothing because of a switch elsewhere on the same page is the worse
+  /// surprise, so it is offered either way.
+  it("is offered even when the automatic pass is switched off", async () => {
+    mockApi.retitleSessions.mockResolvedValue(retitleReply());
+    await renderPage({ session_titling_enabled: false });
+    fireEvent.click(screen.getByRole("button", { name: /Automation & Proactivity/ }));
+
+    const button = screen.getByRole("button", { name: /Rename now/ }) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
   });
 });

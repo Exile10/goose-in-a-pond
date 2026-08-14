@@ -32,6 +32,8 @@ import {
   type OllamaModel,
   type PairingCodeResponse,
   type PromptTemplate,
+  type RetitleOneResult,
+  type RetitleResult,
   type Schedule,
   type ScheduleRun,
   type SecretRequirement,
@@ -643,6 +645,30 @@ export class PondApiClient {
   /** Stop an in-progress consolidation. */
   stopConsolidation(): Promise<void> {
     return this.post("/api/v1/memory/consolidate/stop", {});
+  }
+
+  // ── Conversation titles ───────────────────────────────────
+
+  /**
+   * Rename conversations now rather than waiting for the pond to be idle.
+   *
+   * Runs to completion before it answers — one model call per conversation
+   * renamed — so callers should expect this to be slow on a small board and
+   * show it. Names typed by hand are never touched.
+   */
+  retitleSessions(): Promise<RetitleResult> {
+    return this.post("/api/v1/sessions/retitle", {});
+  }
+
+  /**
+   * Rename one named conversation, now.
+   *
+   * Obeys rather than protects: unlike the sweep, this replaces a name that
+   * still fits and one typed by hand, because asking for a specific
+   * conversation is consent about that conversation.
+   */
+  retitleSession(sessionId: string): Promise<RetitleOneResult> {
+    return this.post(`/api/v1/sessions/${encodeURIComponent(sessionId)}/retitle`, {});
   }
 
   // ── Skills ────────────────────────────────────────────────
