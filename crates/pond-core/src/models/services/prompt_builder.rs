@@ -32,7 +32,6 @@
 
 use crate::prompts::{
     render_jinja_template, sanitize_field, ProfileContext, PromptState, PROMPT_BALANCED,
-    PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM,
 };
 use crate::user_data::domain::settings::Settings;
 use std::collections::hash_map::DefaultHasher;
@@ -255,12 +254,13 @@ pub fn compute_prefix_hash_fast(
 /// This does NOT consult the DB template repository — callers should pass
 /// the DB template content as an override when available.
 pub fn resolve_builtin_template(settings: &Settings) -> &'static str {
-    match settings.prompt_style.as_str() {
-        "concise" => PROMPT_CONCISE,
-        "technical" => PROMPT_TECHNICAL,
-        "warm" => PROMPT_WARM,
-        _ => PROMPT_BALANCED,
-    }
+    // Derived from the one built-in table rather than matching on names here,
+    // so a style added to `BUILTIN_PROMPT_TEMPLATES` is resolvable without a
+    // second edit. The fallback is NOT the table's business and stays local: an
+    // unrecognised style must yield balanced, never an error or an empty prompt.
+    crate::prompts::builtin_template_content(&settings.prompt_style)
+        .map(|(content, _)| content)
+        .unwrap_or(PROMPT_BALANCED)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -268,7 +268,7 @@ pub fn resolve_builtin_template(settings: &Settings) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prompts::PROMPT_BALANCED;
+    use crate::prompts::{PROMPT_BALANCED, PROMPT_CONCISE, PROMPT_TECHNICAL, PROMPT_WARM};
 
     fn default_state() -> PromptState {
         PromptState {
