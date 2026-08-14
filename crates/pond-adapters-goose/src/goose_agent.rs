@@ -163,6 +163,20 @@ fn goose_env_knobs(
     ]
 }
 
+/// What a session's tool groups are, and what they are allowed to become.
+///
+/// Two lists rather than one because the difference is the PAI-1 boundary, and
+/// collapsing them is how a guest came to be shown a menu of the groups that had
+/// just been withheld from it. `loaded` is what is in the prompt now; `permitted`
+/// is the ceiling `enable_tool_group` may raise it to and the only list
+/// `dormant_groups_note` may advertise from.
+struct SessionGroups {
+    /// In the prompt for this turn.
+    loaded: Vec<String>,
+    /// The ceiling. Never widened by anything the model can say.
+    permitted: Vec<String>,
+}
+
 /// Adapter: GooseAdapter
 ///
 /// Full-capability implementation of the `Agent` port using the Goose framework.
@@ -318,6 +332,30 @@ pub struct GooseAdapter {
     /// `session_tool_groups` in `pond_system.db` so a restart mid-conversation
     /// does not silently drop a group the model enabled for itself.
     session_tool_groups: tokio::sync::RwLock<HashMap<String, Vec<String>>>,
+    /// PAI-1: the groups a session may EVER hold, as distinct from the ones it
+    /// holds now. GIAP session id -> permitted extension groups.
+    ///
+    /// The boundary has to exist as its own value because two things read it and
+    /// both used to read the wrong list:
+    ///
+    /// * `dormant_groups_note` was built from `registered_extensions()`, so an
+    ///   unidentified speaker was shown `giap-memory`, `giap-vision`,
+    ///   `giap-audit` and `giap-context` on a menu that says "call
+    ///   enable_tool_group with its name and its tools become available
+    ///   immediately". The groups had been withheld from the selection and then
+    ///   advertised anyway.
+    /// * `enable_group` checked catalog membership and registration only — no
+    ///   scope, no denylist. `giap-toolkit` is deliberately NOT on the guest
+    ///   denylist (`a_guest_keeps_the_neutral_groups`), so the guest could read
+    ///   the menu and take the item.
+    ///
+    /// Deriving it once, at selection, and letting the hatch widen only *within*
+    /// it makes the boundary structural rather than a second check somebody has
+    /// to remember. Not persisted: it is a pure function of the registered
+    /// extensions and the turn's scope, so it is recomputed on a restore rather
+    /// than trusted from disk — a stored boundary is a boundary that can go
+    /// stale against a scope that changed.
+    session_permitted_groups: tokio::sync::RwLock<HashMap<String, Vec<String>>>,
     /// Embeddings of the scorable group descriptions, computed on first use.
     /// The descriptions are `&'static str` constants, so one pass is enough for
     /// the process lifetime.
@@ -525,6 +563,7 @@ impl GooseAdapter {
             cached_tools: tokio::sync::RwLock::new(None),
             defaults_stripped: Mutex::new(HashSet::new()),
             session_tool_groups: tokio::sync::RwLock::new(HashMap::new()),
+            session_permitted_groups: tokio::sync::RwLock::new(HashMap::new()),
             group_embeddings: tokio::sync::OnceCell::new(),
         })
     }
@@ -2627,8 +2666,19 @@ impl GooseAdapter {
         first_message: &str,
         memories: &str,
         scope: &ProfileScope,
-    ) -> Vec<String> {
+    ) -> SessionGroups {
         use pond_core::mcp::services::tool_selection as sel;
+
+        // The boundary, derived before anything is selected or restored.
+        //
+        // Applied to the candidates going IN rather than subtracted after, which
+        // works because `select_groups` filters the core set by `available`
+        // (`tool_selection.rs`) — the comment that used to sit here claimed a
+        // pre-filter "would not stick because select_groups puts core groups back
+        // unconditionally", and that has not been true for as long as the filter
+        // has been there. Doing it once means `permitted` is the single fact both
+        // the dormant note and the escape hatch read.
+        let permitted = self.permitted_groups(scope);
 
         if let Some(cached) = self
             .session_tool_groups
@@ -2637,27 +2687,43 @@ impl GooseAdapter {
             .get(giap_session_id)
             .cloned()
         {
-            return cached;
+            self.remember_permitted(giap_session_id, &permitted).await;
+            return SessionGroups {
+                loaded: cached,
+                permitted,
+            };
         }
 
         if let Some(storage) = &self.giap_session_storage {
             if let Ok(Some(groups)) = storage.get_session_tool_groups(giap_session_id).await {
                 if !groups.is_empty() {
+                    // Clamp what was persisted to what is permitted NOW. A group
+                    // is stored per session and the speaker's scope is resolved
+                    // per turn, so a session that was identified when it was
+                    // saved and is not now must not get its groups back.
+                    let groups: Vec<String> = groups
+                        .into_iter()
+                        .filter(|g| permitted.iter().any(|p| p == g))
+                        .collect();
                     self.session_tool_groups
                         .write()
                         .await
                         .insert(giap_session_id.to_string(), groups.clone());
+                    self.remember_permitted(giap_session_id, &permitted).await;
                     tracing::debug!(
                         session_id = %giap_session_id,
                         groups = ?groups,
                         "tool selection: restored persisted groups"
                     );
-                    return groups;
+                    return SessionGroups {
+                        loaded: groups,
+                        permitted,
+                    };
                 }
             }
         }
 
-        let available: Vec<String> = registered_extensions().to_vec();
+        let available: Vec<String> = permitted.clone();
         // Two signals, scored independently and merged with max. Concatenating
         // them let a kilobyte of memories drown a short question — see
         // `selection_signals`.
@@ -2702,33 +2768,37 @@ impl GooseAdapter {
             _ => None,
         };
 
-        let mut selection = sel::select_groups(
+        let selection = sel::select_groups(
             &available,
             scores.as_deref(),
             sel::DEFAULT_RELEVANCE_THRESHOLD,
         );
 
-        // PAI-1 P5. An unidentified speaker never gets the personal-data
-        // groups, whatever the scorer decided. Subtracted AFTER selection on
-        // purpose: `giap-memory` and `giap-draft` are core, so filtering the
-        // candidates going in would not stick -- `select_groups` puts core
-        // groups back unconditionally.
+        // The narrowing SILENTLY DID NOT HAPPEN, and that has to be visible.
         //
-        // This is the layer that actually closes the hole. Suppressing memory
-        // injection stops a guest being TOLD anything; removing the tools stops
-        // the model being ABLE to look. `recall_memories` and `forget_memory`
-        // carry no session of their own, so there is nowhere lower to check.
-        if scope.excludes_everything() {
-            let denied = pond_core::mcp::domain::tool_group::groups_denied_to_guests();
-            let before = selection.groups.len();
-            selection.groups.retain(|g| !denied.contains(&g.as_str()));
-            if selection.groups.len() != before {
-                tracing::info!(
-                    session_id = %giap_session_id,
-                    removed = before - selection.groups.len(),
-                    "unidentified speaker: personal-data tool groups withheld"
-                );
-            }
+        // `SelectionBasis::NoEmbedder` widens to every permitted group, which is
+        // the right call (a missing tool is a wrong answer; a surplus one is
+        // tokens). What was wrong is that the trace below still reported
+        // `mode = "relevant"`, so the only tell was `groups_total ==
+        // tools_total`. On the Jetson the embedding model is fetched in a
+        // deliberately un-awaited task, so the first session of a fresh install
+        // embeds against a file that is not there yet — and
+        // `group_description_embeddings` used to latch that failure into a
+        // `OnceCell` for the whole process. An operator who set "relevant" got
+        // all 66 tools for the lifetime of the server and no line said so.
+        if matches!(selection.basis, sel::SelectionBasis::NoEmbedder) {
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "tool_selection_widened",
+                session_id = %giap_session_id,
+                reason = if self.embedding_provider.is_none() {
+                    "no_embedder"
+                } else {
+                    "embed_failed"
+                },
+                groups = permitted.len(),
+                "tool selection asked for narrowing and could not narrow"
+            );
         }
 
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -2753,6 +2823,7 @@ impl GooseAdapter {
             .write()
             .await
             .insert(giap_session_id.to_string(), selection.groups.clone());
+        self.remember_permitted(giap_session_id, &permitted).await;
         if let Some(storage) = &self.giap_session_storage {
             if let Err(e) = storage
                 .set_session_tool_groups(giap_session_id, &selection.groups)
@@ -2763,7 +2834,36 @@ impl GooseAdapter {
                 tracing::warn!("tool selection: persisting groups failed: {e}");
             }
         }
-        selection.groups
+        SessionGroups {
+            loaded: selection.groups,
+            permitted,
+        }
+    }
+
+    /// The groups this scope may ever hold, per PAI-1.
+    ///
+    /// The rule itself is `tool_selection::permitted_groups`, in pond-core beside
+    /// `groups_denied_to_guests`, because it is a domain boundary rather than an
+    /// adapter concern — and because a pure function of (available, scope) can be
+    /// unit-tested, which a method reaching for a process-global `OnceLock`
+    /// cannot. This wrapper only supplies the registered list and the log line.
+    fn permitted_groups(&self, scope: &ProfileScope) -> Vec<String> {
+        let available = registered_extensions();
+        let kept = pond_core::mcp::services::tool_selection::permitted_groups(available, scope);
+        if kept.len() != available.len() {
+            tracing::info!(
+                withheld = available.len() - kept.len(),
+                "unidentified speaker: personal-data tool groups withheld"
+            );
+        }
+        kept
+    }
+
+    async fn remember_permitted(&self, giap_session_id: &str, permitted: &[String]) {
+        self.session_permitted_groups
+            .write()
+            .await
+            .insert(giap_session_id.to_string(), permitted.to_vec());
     }
 
     /// Attach the embedding provider used by per-turn memory retrieval.
@@ -3599,14 +3699,18 @@ impl GooseAdapter {
             let selected: HashSet<String> =
                 pond_core::mcp::services::tool_selection::filter_tools_by_groups(
                     allowed_tools.iter(),
-                    &groups,
+                    &groups.loaded,
                 )
                 .into_iter()
                 .collect();
 
+            // PERMITTED, not registered. Dormant = permitted minus loaded, so a
+            // group withheld from this speaker is not on the menu either — it
+            // used to be, under a line that tells the model enabling it makes its
+            // tools available immediately.
             dormant_groups_note = pond_core::mcp::services::tool_selection::dormant_groups_note(
-                registered_extensions(),
-                &groups,
+                &groups.permitted,
+                &groups.loaded,
             );
 
             tracing::info!(
@@ -3614,8 +3718,9 @@ impl GooseAdapter {
                 kind = "tool_selection",
                 session_id = %session_id,
                 mode = "relevant",
-                groups = ?groups,
-                groups_total = registered_extensions().len(),
+                groups = ?groups.loaded,
+                groups_total = groups.permitted.len(),
+                groups_registered = registered_extensions().len(),
                 tools = selected.len(),
                 tools_total = allowed_tools.len(),
             );
@@ -3645,8 +3750,13 @@ impl GooseAdapter {
         //
         // This set is what gets published to the shim, so it is the only place
         // every mode converges. Subtracting here is idempotent with the
-        // group-level pass, which stays because it also keeps withheld groups
-        // out of the dormant-groups note.
+        // group-level pass, which stays because it is what bounds
+        // `enable_tool_group` and what the dormant-groups note is built from.
+        //
+        // The sentence that used to end this paragraph said the group pass "keeps
+        // withheld groups out of the dormant-groups note". It did the opposite:
+        // the note was built from `registered_extensions()`, so every withheld
+        // group appeared on it. `permitted_groups` is what makes the claim true.
         let allowed_tools = if turn_scope.excludes_everything() {
             let before = allowed_tools.len();
             let kept: HashSet<String> =
@@ -5374,6 +5484,29 @@ impl pond_core::mcp::ports::tools::tool_selection_control::ToolSelectionControl 
         }
         if !registered_extensions().iter().any(|e| e == group) {
             return Err(ToolSelectionError::GroupNotRegistered(group.to_string()));
+        }
+
+        // The PAI-1 boundary, checked where the widening happens.
+        //
+        // Catalog membership and registration were the only two checks here, and
+        // neither knows who is asking. `giap-toolkit` is deliberately not on the
+        // guest denylist — a guest is meant to be able to load neutral groups —
+        // so an unidentified speaker could name `giap-memory` and be handed the
+        // household's memory tools. Refused as GroupNotRegistered rather than a
+        // new variant: from the caller's side a group it may not have is
+        // indistinguishable from one that is not there, and a distinct error
+        // would tell it the group exists and is being kept from it.
+        if let Some(permitted) = self.session_permitted_groups.read().await.get(session_id) {
+            if !permitted.iter().any(|p| p == group) {
+                tracing::warn!(
+                    target: "giap::trace",
+                    kind = "tool_group_widen_refused",
+                    session_id = %session_id,
+                    group,
+                    "enable_tool_group named a group outside this session's boundary"
+                );
+                return Err(ToolSelectionError::GroupNotRegistered(group.to_string()));
+            }
         }
 
         let groups = {
