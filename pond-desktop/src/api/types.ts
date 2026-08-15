@@ -510,6 +510,8 @@ export interface ModelEntry {
    * heuristic is a copy of a backend rule that has already moved on.
    */
   context_length?: number;
+  /** Quantisation scheme, e.g. "Q4_K_M" — read from the model file's own header. */
+  quantization?: string;
   downloaded?: boolean;
   description?: string;
   size_mb?: number;
@@ -875,7 +877,12 @@ export interface DownloadEntry {
   category: string;
   downloaded_bytes: number;
   total_bytes: number | null;
-  status: "downloading" | "done" | "error";
+  /**
+   * `paused` keeps the partial file and can be resumed; `cancelled` threw it
+   * away. Both arrive from the same stop — the transfer checks a flag between
+   * chunks, the only moment it is not blocked inside a read.
+   */
+  status: "downloading" | "paused" | "done" | "error" | "cancelled";
   error?: string;
 }
 
