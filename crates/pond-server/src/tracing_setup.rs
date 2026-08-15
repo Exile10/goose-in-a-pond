@@ -211,6 +211,16 @@ pub fn init_tracing_with_console(
     // user cannot act on and did not ask about: a Metal capability notice,
     // llama.cpp's opinion of a model's token types, ggml's tensor tables.
     // Anything genuinely wrong with GIAP is logged by GIAP.
+    //
+    // TARGETS THAT MUST NOT BE CARVED: `giap::trace` and `giap::kv`. Both are
+    // raised with an explicit `target:` from inside crates silenced here —
+    // `giap::kv` narrates the on-disk prompt-snapshot lifecycle from
+    // `goose_local_inference`, which this list pins at ERROR. `EnvFilter`
+    // matches the TARGET rather than the module, so naming one is what lets a
+    // GIAP event escape a carve aimed at its host crate. An earlier version of
+    // that logging used the default target and was invisible on every pond it
+    // was written for. Adding a `giap*=...` directive below would silently
+    // restore that.
     const NOISY: &str = "llama-cpp-2=error,llama_cpp_2=error,ggml=error,\
                          whisper=error,whisper_rs=error,ort=warn,\
                          goose=error,goose_providers=error,\
