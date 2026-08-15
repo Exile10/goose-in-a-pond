@@ -848,6 +848,7 @@ export class PondApiClient {
             ram_estimate_mb: item.ram_estimate_mb as number | undefined,
             recommended_role: item.recommended_role as string | undefined,
             context_length: (item.context_length as number | null | undefined) ?? undefined,
+            quantization: (item.quantization as string | null | undefined) ?? undefined,
             downloaded: item.downloaded as boolean | undefined,
             description: item.description as string | undefined,
             size_mb: item.size_mb as number | undefined,
@@ -1206,6 +1207,18 @@ export class PondApiClient {
 
   downloadModelFromUrl(url: string, category: string, filename: string): Promise<{ status: string }> {
     return this.post("/api/v1/models/download/url", { url, category, filename });
+  }
+
+  /**
+   * Pause, resume or cancel a transfer in flight.
+   *
+   * Pause and cancel are the same stop, differing in what happens to the
+   * partial file: pause leaves it so resuming continues from there, cancel
+   * throws it away. Resume starts the same transfer again — the Hugging Face
+   * cache finds the partial and re-requests with a range header.
+   */
+  controlDownload(filename: string, action: "pause" | "resume" | "cancel"): Promise<{ status: string }> {
+    return this.post("/api/v1/models/download/control", { filename, action });
   }
 
   getDownloadProgress(): Promise<{ downloads: DownloadEntry[] }> {
