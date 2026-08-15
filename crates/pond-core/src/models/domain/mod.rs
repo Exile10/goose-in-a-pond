@@ -1,3 +1,4 @@
+pub mod gguf;
 pub mod image_limits;
 pub mod message;
 pub mod mic_gate;

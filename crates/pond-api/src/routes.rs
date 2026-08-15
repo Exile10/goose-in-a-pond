@@ -208,6 +208,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/models/search/llamafile", get(search_llamafile_models))
         .route("/models/download/url", post(download_model_from_url))
         .route("/models/download/progress", get(get_download_progress))
+        .route("/models/download/control", post(download_control))
         .route("/models/scan", post(scan_models))
         .route("/models/cleanup", post(cleanup_models))
         .route("/models/disk-usage", get(disk_usage))
@@ -4813,6 +4814,47 @@ fn record_to_dto(m: &ModelRecord, assignments: &[ModelRoleAssignment]) -> ModelS
 
 /// Scans model directories for files on disk not yet in the catalog,
 /// inserts them as custom entries via the model repository, and returns
+/// Read a GGUF file's header, without reading the file.
+///
+/// The header sits at the front, so a bounded read of the opening megabyte
+/// carries every key worth having even for a model of many gigabytes. Anything
+/// that is not GGUF, or is truncated, simply yields `None` — this runs inside
+/// a filesystem sweep over arbitrary files and must never be the reason the
+/// sweep stops.
+fn read_gguf_head(path: &std::path::Path) -> Option<pond_core::models::domain::gguf::GgufInfo> {
+    use std::io::Read as _;
+    const HEAD_BYTES: usize = 1024 * 1024;
+
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; HEAD_BYTES];
+    let n = f.read(&mut buf).ok()?;
+    buf.truncate(n);
+    pond_core::models::domain::gguf::parse_gguf_header(&buf)
+}
+
+/// What a whisper filename admits: `ggml-base.en.bin` is the English base
+/// model, `ggml-large-v3-turbo.bin` is multilingual large.
+///
+/// Filename parsing, which is usually the wrong move — but a ggml `.bin` has
+/// no self-describing header to ask instead, and this naming is whisper.cpp's
+/// own published convention rather than a guess about someone's habits.
+/// Returns `(language, size)`.
+fn whisper_facts_from_name(name: &str) -> (Option<String>, Option<String>) {
+    let lower = name.to_lowercase();
+    let size = ["large", "medium", "small", "base", "tiny"]
+        .iter()
+        .find(|s| lower.contains(*s))
+        .map(|s| (*s).to_string());
+    // ".en" marks the English-only builds; everything else whisper ships is
+    // multilingual. Only claimed when the size is recognised, so an unrelated
+    // .bin in the folder is not labelled a whisper model.
+    let language = size
+        .as_ref()
+        .map(|_| if lower.contains(".en") || lower.ends_with("-en") { "en" } else { "multilingual" })
+        .map(str::to_string);
+    (language, size)
+}
+
 /// the newly discovered records.
 async fn scan_filesystem_extras(
     data_dir: &std::path::Path,
@@ -4839,28 +4881,74 @@ async fn scan_filesystem_extras(
                     if known.contains(&fname) {
                         continue;
                     }
-                    let size_mb = entry.metadata().map(|m| m.len() / 1_048_576).unwrap_or(0);
+                    // `std::fs::metadata`, NOT `entry.metadata()`. The latter
+                    // does not follow symlinks, and the Hugging Face cache
+                    // stores every model as a snapshot symlink pointing at a
+                    // blob — so the size read was the link's own few dozen
+                    // bytes, which integer-divides to 0 and reached the page
+                    // as "Size unknown" on exactly the models that came from
+                    // Hugging Face.
+                    let path = entry.path();
+                    let size_mb = std::fs::metadata(&path)
+                        .map(|m| m.len() / 1_048_576)
+                        .unwrap_or(0);
+
+                    // What the file says about itself. GGUF opens with a
+                    // key/value header, so this is one short read rather than
+                    // a load — and it is the difference between a card headed
+                    // "(detected on disk)" and one that names the
+                    // architecture, quantisation and context window.
+                    let gguf = if fname.ends_with(".gguf") {
+                        read_gguf_head(&path)
+                    } else {
+                        None
+                    };
+
                     let name = fname
                         .trim_end_matches(".gguf")
                         .trim_end_matches(".llamafile")
                         .trim_end_matches(".onnx")
                         .trim_end_matches(".bin")
                         .to_string();
+
+                    let whisper = if matches!(category, ModelCategory::Whisper) {
+                        whisper_facts_from_name(&name)
+                    } else {
+                        (None, None)
+                    };
+
+                    // The publisher's own name for it, when the header carries
+                    // one. NOT the summary: the client maps `description` to a
+                    // model's display name, so putting "Gemma3 · 4.3B · Q4_K_M"
+                    // there would replace the name with its own facts. The
+                    // facts travel in the structured fields below, where the
+                    // page can lay them out. The placeholder stays the
+                    // placeholder — the client already knows to fall back to
+                    // the filename when it sees it.
+                    let description = gguf
+                        .as_ref()
+                        .and_then(|g| g.name.clone())
+                        .filter(|n| !n.trim().is_empty())
+                        .unwrap_or_else(|| "(detected on disk)".to_string());
+
                     found.push(ModelRecord {
                         id: ModelRecord::id_for(&category, &name),
                         category: category.clone(),
                         name,
                         filename: Some(fname),
-                        description: "(detected on disk)".to_string(),
+                        description,
                         size_mb,
                         url: None,
                         hf_id: None,
-                        ram_estimate_mb: None,
+                        // Weights plus the room a run needs around them. The
+                        // catalogue's own estimates are ~25% over the file
+                        // size, which is the same rule applied by hand.
+                        ram_estimate_mb: (size_mb > 0).then(|| size_mb + size_mb / 4),
                         recommended_role: None,
-                        context_length: None,
-                        quantization: None,
-                        asr_language: None,
-                        asr_size: None,
+                        context_length: gguf.as_ref().and_then(|g| g.context_length),
+                        quantization: gguf.as_ref().and_then(|g| g.quantization.clone()),
+                        asr_language: whisper.0,
+                        asr_size: whisper.1,
                         tts_engine: None,
                         tts_voice_name: None,
                         config_filename: None,
@@ -4908,6 +4996,116 @@ async fn scan_filesystem_extras(
     extras_from_disk
 }
 
+/// Where a downloaded model file lands, by category.
+///
+/// Extracted so a resume computes the same path the original download used.
+/// Two copies of this match is one rename away from a resumed download writing
+/// beside the partial file it was supposed to be finishing.
+fn model_dest_path(
+    data_dir: &std::path::Path,
+    category: &str,
+    filename: &str,
+) -> std::path::PathBuf {
+    match category {
+        "whisper" => data_dir.join("models").join(filename),
+        "llamafile" => data_dir.join("models").join("llm").join(filename),
+        "gguf" => data_dir.join("models").join("gguf").join(filename),
+        "tts" => data_dir.join("models").join("tts").join(filename),
+        _ => data_dir.join("models").join(filename),
+    }
+}
+
+/// `POST /api/v1/models/download/control` — pause, resume or cancel a transfer.
+///
+/// The filename travels in the body rather than the path: model filenames carry
+/// dots and slashes, and a path segment would have to be encoded at every call
+/// site to survive the router.
+///
+/// Pause and cancel are the same stop — the transfer checks a flag between
+/// chunks, which is the only moment it is not blocked inside a read. They
+/// differ in what happens to the partial file: pause leaves it, so a resume
+/// picks up where it stopped; cancel deletes it.
+async fn download_control(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let Ok(Json(body)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid request body"})),
+        );
+    };
+
+    let filename = body["filename"].as_str().unwrap_or_default().to_string();
+    let action = body["action"].as_str().unwrap_or_default().to_string();
+    if filename.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "filename is required"})),
+        );
+    }
+
+    let (category, url) = {
+        let t = state.download_tracker.read().await;
+        let Some(entry) = t.get(&filename) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("no download named {filename}")})),
+            );
+        };
+        match action.as_str() {
+            "pause" => {
+                entry
+                    .control
+                    .store(crate::DL_PAUSE, std::sync::atomic::Ordering::Relaxed);
+                return (StatusCode::OK, Json(json!({"status": "pausing"})));
+            }
+            "cancel" => {
+                entry
+                    .control
+                    .store(crate::DL_CANCEL, std::sync::atomic::Ordering::Relaxed);
+                return (StatusCode::OK, Json(json!({"status": "cancelling"})));
+            }
+            "resume" => (entry.category.clone(), entry.url.clone()),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "action must be pause, resume or cancel"})),
+                )
+            }
+        }
+    };
+
+    // Resume is a fresh transfer of the same file. The Hugging Face cache keeps
+    // a `.incomplete` alongside the blob and re-requests with a Range header
+    // when it finds one, so starting again IS continuing.
+    let Some(url) = url else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "this download cannot be resumed — its source was not recorded"})),
+        );
+    };
+    let Some(data_dir) = state.data_dir.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "data_dir not configured"})),
+        );
+    };
+
+    let dest = model_dest_path(&data_dir, &category, &filename);
+    let tracker = Arc::clone(&state.download_tracker);
+    let client = state.http_client.clone();
+
+    tokio::spawn(async move {
+        spawn_tracked_download(
+            url, dest, filename, category, tracker, client, data_dir, async {},
+        )
+        .await;
+    });
+
+    (StatusCode::OK, Json(json!({"status": "resuming"})))
+}
+
 /// GET /api/v1/models — returns all catalog models with downloaded/active flags.
 async fn list_models(
     State(state): State<Arc<AppState>>,
@@ -4918,9 +5116,38 @@ async fn list_models(
         ));
     };
 
-    // Discover any files on disk not yet in the catalog
+    // Discover any files on disk not yet in the catalog — in the background.
+    //
+    // This used to be awaited, so every load of the Models page paid for a
+    // database read, several directory walks and a round of upserts before a
+    // single byte came back. That is the page's whole latency, and it is spent
+    // finding files that are almost never there: the catalog already knows
+    // about anything downloaded through the app.
+    //
+    // Detached instead, so the response returns the rows immediately and a file
+    // dropped into the folder by hand shows up on the next load rather than
+    // this one. `POST /models/scan` is still the way to demand it now.
+    //
+    // The flag stops concurrent loads from stacking scans on top of each other:
+    // the page fetches this on mount and again after every download.
     if let Some(data_dir) = &state.data_dir {
-        let _ = scan_filesystem_extras(data_dir, model_repo).await;
+        static SCANNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if SCANNING
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let dir = data_dir.clone();
+            let repo = Arc::clone(model_repo);
+            tokio::spawn(async move {
+                let _ = scan_filesystem_extras(&dir, &repo).await;
+                SCANNING.store(false, std::sync::atomic::Ordering::Release);
+            });
+        }
     }
 
     let records = model_repo.list_all().await.map_err(|e| {
@@ -5933,13 +6160,7 @@ async fn download_model_from_url(
         );
     };
 
-    let dest = match category.as_str() {
-        "whisper" => data_dir.join("models").join(&filename),
-        "llamafile" => data_dir.join("models").join("llm").join(&filename),
-        "gguf" => data_dir.join("models").join("gguf").join(&filename),
-        "tts" => data_dir.join("models").join("tts").join(&filename),
-        _ => data_dir.join("models").join(&filename),
-    };
+    let dest = model_dest_path(&data_dir, &category, &filename);
 
     let tracker = Arc::clone(&state.download_tracker);
     let resp_filename = filename.clone();
@@ -6000,6 +6221,8 @@ async fn spawn_tracked_download<F>(
                 total_bytes: None,
                 status: "downloading".to_string(),
                 finished_at: None,
+                control: Arc::new(std::sync::atomic::AtomicU8::new(crate::DL_RUN)),
+                url: Some(url.clone()),
             },
         );
     }
@@ -6106,9 +6329,20 @@ async fn download_via_hf_cache_tracked(
         .with_revision(revision.to_string());
     let fetch = repo.file(fname.to_string());
 
+    // Taken once, up front. The callback runs per chunk and must answer
+    // synchronously, so it cannot take the tracker's async lock to find out
+    // whether it has been asked to stop — the atomic is shared instead.
+    let control = {
+        let t = tracker.read().await;
+        t.get(tracker_key)
+            .map(|e| Arc::clone(&e.control))
+            .unwrap_or_default()
+    };
+
     let tracker_owned = Arc::clone(tracker);
     let tracker_key_owned = tracker_key.to_string();
-    let progress = move |downloaded: u64, total: u64| {
+    let progress_control = Arc::clone(&control);
+    let progress = move |downloaded: u64, total: u64| -> bool {
         let tracker_owned = Arc::clone(&tracker_owned);
         let key = tracker_key_owned.clone();
         tokio::spawn(async move {
@@ -6120,12 +6354,29 @@ async fn download_via_hf_cache_tracked(
                 }
             }
         });
+        progress_control.load(std::sync::atomic::Ordering::Relaxed) == crate::DL_RUN
     };
 
-    let blob_path = fetch
+    let blob_path = match fetch
         .download_to_blob(&client, token.as_deref(), progress)
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(p) => p,
+        Err(e) if pond_hf_cache::is_stopped(&e) => {
+            // Expected, not a failure. The `.incomplete` file is still there,
+            // which is what a later call resumes from — so a pause needs
+            // nothing further, and a cancel is the same stop plus a delete.
+            let cancelled =
+                control.load(std::sync::atomic::Ordering::Relaxed) == crate::DL_CANCEL;
+            let mut t = tracker.write().await;
+            if let Some(entry) = t.get_mut(tracker_key) {
+                entry.status = if cancelled { "cancelled" } else { "paused" }.to_string();
+                entry.finished_at = Some(std::time::Instant::now());
+            }
+            return Err(if cancelled { "cancelled" } else { "paused" }.to_string());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
 
     if let Some(parent) = dest.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
@@ -14888,6 +15139,42 @@ async fn clear_session_user_handler(
 
 #[cfg(test)]
 mod tests {
+
+    /// Whisper `.bin` files have no self-describing header, so the filename is
+    /// the only source — but it is whisper.cpp's own published convention
+    /// rather than a guess, and it must not label unrelated `.bin` files.
+    mod whisper_names {
+        use super::super::whisper_facts_from_name;
+
+        #[test]
+        fn reads_size_and_language_off_the_published_convention() {
+            assert_eq!(
+                whisper_facts_from_name("ggml-base.en"),
+                (Some("en".into()), Some("base".into()))
+            );
+            assert_eq!(
+                whisper_facts_from_name("ggml-large-v3-turbo"),
+                (Some("multilingual".into()), Some("large".into()))
+            );
+            assert_eq!(
+                whisper_facts_from_name("ggml-tiny"),
+                (Some("multilingual".into()), Some("tiny".into()))
+            );
+            assert_eq!(
+                whisper_facts_from_name("ggml-small.en"),
+                (Some("en".into()), Some("small".into()))
+            );
+        }
+
+        /// The guard that matters: a stray `.bin` in the models folder is not a
+        /// whisper model, and labelling it one puts it under Listening with a
+        /// size it does not have.
+        #[test]
+        fn claims_nothing_about_a_file_it_does_not_recognise() {
+            assert_eq!(whisper_facts_from_name("some-random-weights"), (None, None));
+            assert_eq!(whisper_facts_from_name(""), (None, None));
+        }
+    }
     use super::*;
 
     // ── direct tool dispatch allowlist ───────────────────────────
