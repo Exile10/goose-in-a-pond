@@ -76,6 +76,7 @@ pub trait LlamafileManager: Send + Sync {
 
 use axum::{middleware::Next, Router};
 use pond_adapters_weather::WeatherProvider;
+use pond_core::context::vector_index::VectorIndex;
 use pond_core::mcp::ports::extension_manager::ExtensionManagerPort;
 use pond_core::mcp::ports::extension_marketplace::ExtensionMarketplace;
 use pond_core::mcp::ports::mcp_knowledge::McpKnowledgePort;
@@ -165,6 +166,25 @@ pub struct AppState {
     /// Embedding provider — `None` until a real embedding model is configured.
     /// Retained for Phase 3 memory vector search.
     pub embedding_provider: Option<Arc<dyn EmbeddingProvider + Send + Sync>>,
+    /// The shared personal-context index — the one surface retrieval reads.
+    ///
+    /// `None` on the CLI paths and in tests, which serve no retrieval at all;
+    /// a route asked about the health of an index that does not exist has to
+    /// say so rather than invent one.
+    ///
+    /// It is here so that **coverage can leave the process**. `IndexHealth` has
+    /// been computed since phase A and written to a `tracing` line, which is not
+    /// a surface: an index populated at roughly 2% survived six landed phases
+    /// because nothing rendered the number and nobody reads a log that says
+    /// everything is fine the rest of the time.
+    ///
+    /// The model that stamped those vectors is deliberately NOT a second field.
+    /// [`Self::embedding_provider`] above already answers `model_id()` and
+    /// `dimensions()`, and it is the same provider whose id the writers stamp
+    /// onto every row — a copy kept here could disagree with it, and a health
+    /// figure computed against the wrong model reads as a catastrophically
+    /// broken index when nothing is wrong at all.
+    pub vector_index: Option<Arc<dyn VectorIndex>>,
     /// IoT sensor reading storage (uses logs DB).
     pub sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
     /// Camera event storage (uses logs DB).

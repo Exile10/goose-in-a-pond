@@ -111,10 +111,75 @@ pub struct ResolvedHit {
     pub text: String,
 }
 
+/// How much of ONE corpus is usable for a given model.
+///
+/// The three totals on [`IndexHealth`] cannot show a corpus that is structurally
+/// at zero, and that is not hypothetical. On a live pond the global figure read
+/// about 2% missing while the summary corpus could never populate at all — its
+/// liveness predicate requires an attributed session and every session's
+/// `profile_id` was NULL — because two healthy corpora averaged the dead one
+/// away. An average over corpora is the wrong shape for a question that is
+/// really "is each of these three working"; a row per corpus is the right one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorpusHealth {
+    pub corpus: Corpus,
+    /// Source rows that **qualify** — that pass this corpus's liveness
+    /// predicate — not the raw table count.
+    ///
+    /// This choice is the whole point of the type, so it is stated rather than
+    /// left to be discovered: coverage here means "of the rows that COULD be
+    /// indexed, how many are". Counting raw table rows instead would report
+    /// every archived memory and every unattributed session as permanently
+    /// missing, so a perfectly healthy pond could never reach full coverage and
+    /// the number would rightly be ignored.
+    ///
+    /// The cost of the choice is that a corpus whose predicate excludes
+    /// everything reports `rows == 0` rather than a large missing count. That
+    /// is the signal wanted, not a loss of one: zero qualifying rows against a
+    /// table full of sessions says "nothing here can ever be indexed", which is
+    /// a different defect from "nothing here has been indexed yet" and needs a
+    /// different fix.
+    ///
+    /// That argument only works if the reader can SEE the table is full, which
+    /// is what [`source_rows`](Self::source_rows) is for. Without it this field
+    /// reproduces the very blindness it was added to remove — measured on a live
+    /// pond, `rows == 0` for the summary corpus while 27 sessions carried a real
+    /// rolling summary, and the surface reported the index 100% covered.
+    pub rows: u64,
+    /// Every row in the source table, ignoring the liveness predicate.
+    ///
+    /// The denominator of coverage is [`rows`](Self::rows), never this. It
+    /// exists for one question that `rows` alone cannot answer: **is this
+    /// corpus empty, or is it excluded?** Both report zero qualifying rows, and
+    /// they need opposite fixes — one waits for data, the other is a predicate
+    /// bug that no amount of embedding will repair.
+    ///
+    /// `source_rows > rows` is normal and healthy in itself: archived and merged
+    /// memories are meant to fall out. It is `rows == 0 && source_rows > 0` that
+    /// says something is structurally wrong.
+    pub source_rows: u64,
+    /// Of `rows`, those carrying a vector from the model asked about — the only
+    /// ones retrieval can actually return.
+    pub indexed_rows: u64,
+    /// Of `rows`, those with no vector at all. Repaired by embedding.
+    pub missing_rows: u64,
+    /// Of `rows`, those whose vector came from a DIFFERENT model: present,
+    /// excluded from retrieval by design, and repaired by RE-embedding. Kept
+    /// apart from `missing_rows` because "absent" and "present but unusable"
+    /// look identical in a coverage percentage and are not the same problem.
+    pub mismatched: u64,
+}
+
 /// How much of the index is usable for a given model.
 ///
 /// Exists so "the index is silently incomplete" is a number somebody can read
 /// rather than a thing that has to be inferred from bad answers.
+///
+/// The three totals are the sums of [`per_corpus`](Self::per_corpus), so they
+/// describe rows that qualify for indexing — an orphaned vector, or one hanging
+/// off an archived memory, is counted nowhere here. That is deliberate: those
+/// are the prune sweep's business, and adding them to a coverage figure makes it
+/// describe the index file rather than what retrieval can reach.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct IndexHealth {
     /// Vectors produced by the model currently configured.
@@ -124,6 +189,12 @@ pub struct IndexHealth {
     pub mismatched: u64,
     /// Rows in the source stores with no vector at all.
     pub missing: u64,
+    /// The same counts again, one row per corpus, in [`Corpus::ALL`] order.
+    ///
+    /// Alongside the totals rather than instead of them: the totals are what a
+    /// maintenance pass logs and what a caller compares between runs, and the
+    /// rows are what tells anybody WHICH corpus moved.
+    pub per_corpus: Vec<CorpusHealth>,
 }
 
 /// Driven port: the shared vector index.
@@ -240,6 +311,11 @@ pub trait VectorIndex: Send + Sync {
     /// Delete index rows whose source row is gone. Returns how many.
     async fn prune_orphans(&self) -> Result<u64>;
 
-    /// Counts for a health surface. See [`IndexHealth`].
+    /// Counts for a health surface, globally and per corpus. See
+    /// [`IndexHealth`] and [`CorpusHealth`].
+    ///
+    /// Every corpus must be represented, including one with no qualifying rows:
+    /// a corpus that is absent from the answer is a corpus nobody can see is
+    /// broken, which is the failure the per-corpus shape exists to end.
     async fn health(&self, model_id: &str) -> Result<IndexHealth>;
 }

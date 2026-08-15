@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
 use pond_core::context::vector_index::{
-    Corpus, IndexHealth, ResolvedHit, VectorEntry, VectorHit, VectorIndex,
+    Corpus, CorpusHealth, IndexHealth, ResolvedHit, VectorEntry, VectorHit, VectorIndex,
 };
 use pond_core::user_data::domain::profile::ProfileScope;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -514,43 +514,102 @@ impl VectorIndex for SqliteVectorIndex {
         Ok(removed)
     }
 
+    /// Counted per corpus, FROM the source side, with the totals derived as the
+    /// sums.
+    ///
+    /// The previous version asked the index file two whole-table questions
+    /// ("how many vectors carry this model", "how many carry another") and then
+    /// summed `missing` across corpora into a third. Three global numbers cannot
+    /// express a corpus that is at zero: on a live pond that reported roughly 2%
+    /// missing while the summary corpus was structurally empty and could never
+    /// populate, because the two working corpora were large enough to swamp it.
+    ///
+    /// Counting from the source side is what makes the difference. An index-side
+    /// count can only ever describe rows that already have a vector, so it can
+    /// tell you the index is small but never that it is missing something — and
+    /// "of the rows that qualify, how many are indexed" is the only question a
+    /// coverage figure can honestly answer.
+    ///
+    /// The totals therefore no longer include index rows with no qualifying
+    /// source row (orphans, archived memories, unattributed sessions). Those are
+    /// [`prune_orphans`](VectorIndex::prune_orphans)'s business; counting them
+    /// as coverage describes the file rather than what retrieval can reach.
     async fn health(&self, model_id: &str) -> Result<IndexHealth> {
-        let (matching,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM vectors WHERE model_id = ?")
-            .bind(model_id)
-            .fetch_one(&self.pool)
-            .await?;
-        let (mismatched,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM vectors WHERE model_id != ?")
-                .bind(model_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let mut totals = IndexHealth::default();
+        let mut per_corpus = Vec::with_capacity(Corpus::ALL.len());
 
-        let mut missing = 0i64;
         for corpus in Corpus::ALL {
             let (table, id_col) = source_table(corpus);
-            let extra = liveness_sql(corpus);
+            let live = liveness_sql(corpus);
+            // `WHERE 1 = 1` because `liveness_sql` yields a leading `AND` and is
+            // empty for a corpus with no predicate.
+            //
+            // The corpus filter belongs in the JOIN condition, never the WHERE:
+            // moved into the WHERE it turns this LEFT JOIN into an inner one and
+            // every un-indexed row silently drops out of the count -- which
+            // would report a corpus with no vectors at all as perfectly healthy,
+            // the exact blindness this rewrite is here to remove.
+            //
+            // Bind order follows the order the `?`s appear in the SQL text, so
+            // `model_id` (inside the SELECT list) is bound BEFORE the corpus.
             let sql = format!(
-                "SELECT COUNT(*) FROM {table} s \
+                "SELECT COUNT(*), \
+                 COALESCE(SUM(CASE WHEN v.model_id = ? THEN 1 ELSE 0 END), 0), \
+                 COALESCE(SUM(CASE WHEN v.row_id IS NULL THEN 1 ELSE 0 END), 0) \
+                 FROM {table} s \
                  LEFT JOIN vectors v ON v.row_id = s.{id_col} AND v.corpus = ? \
-                 WHERE v.row_id IS NULL {extra}"
+                 WHERE 1 = 1 {live}"
             );
-            let (n,): (i64,) = sqlx::query_as(&sql)
+            let (rows, indexed, missing): (i64, i64, i64) = sqlx::query_as(&sql)
+                .bind(model_id)
                 .bind(corpus.as_str())
                 .fetch_one(&self.pool)
                 .await?;
-            missing += n;
+
+            // A second, deliberately separate count: the whole table, with no
+            // liveness predicate. It cannot ride the query above, whose
+            // predicate lives in the WHERE, and it is what tells a reader
+            // whether `rows == 0` means "this corpus is empty" or "this corpus
+            // is excluded". On a live pond the summary corpus reported zero
+            // qualifying rows while 27 sessions held a real rolling summary, and
+            // with only the first number the surface called that 100% covered.
+            let (source,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table} s"))
+                .fetch_one(&self.pool)
+                .await?;
+
+            let rows = rows.max(0) as u64;
+            let source_rows = source.max(0) as u64;
+            let indexed_rows = indexed.max(0) as u64;
+            let missing_rows = missing.max(0) as u64;
+            // Subtracted rather than counted by a fourth CASE, so the parts can
+            // never fail to add up to `rows`. `(corpus, row_id)` is the vectors
+            // primary key, so a source row joins at most one vector and every
+            // qualifying row falls into exactly one of the three buckets.
+            let mismatched = rows
+                .saturating_sub(indexed_rows)
+                .saturating_sub(missing_rows);
+
+            totals.matching += indexed_rows;
+            totals.mismatched += mismatched;
+            totals.missing += missing_rows;
+            per_corpus.push(CorpusHealth {
+                corpus,
+                rows,
+                source_rows,
+                indexed_rows,
+                missing_rows,
+                mismatched,
+            });
         }
 
-        Ok(IndexHealth {
-            matching: matching.max(0) as u64,
-            mismatched: mismatched.max(0) as u64,
-            missing: missing.max(0) as u64,
-        })
+        totals.per_corpus = per_corpus;
+        Ok(totals)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::tests_support::add_session;
     use super::*;
     use tempfile::TempDir;
 
@@ -721,6 +780,189 @@ mod tests {
         let health = index.health("nomic-embed-text-v1.5").await.unwrap();
         assert_eq!(health.matching, 0);
         assert_eq!(health.mismatched, 1);
+    }
+
+    /// The per-corpus row for `corpus`, failing loudly if it is absent.
+    ///
+    /// Absence is itself the defect: a corpus that reports nothing is a corpus
+    /// nobody can see is broken, which is exactly how the summary corpus stayed
+    /// invisible behind a single global percentage.
+    fn corpus_health(health: &IndexHealth, corpus: Corpus) -> &CorpusHealth {
+        health
+            .per_corpus
+            .iter()
+            .find(|c| c.corpus == corpus)
+            .unwrap_or_else(|| panic!("{corpus:?} is missing from the health surface entirely"))
+    }
+
+    /// A corpus with rows that QUALIFY and no vectors at all must report
+    /// `rows > 0` beside `indexed_rows == 0`.
+    ///
+    /// This is the exact shape the single global number could not express, so it
+    /// is asserted directly rather than inferred from a percentage. On the live
+    /// pond the global figure read about 2% missing while one whole corpus sat
+    /// at zero coverage: the two healthy corpora averaged the dead one away, the
+    /// operator saw a number that looked fine, and retrieval was quietly
+    /// answering from two thirds of what it was supposed to have.
+    #[tokio::test]
+    async fn a_corpus_with_qualifying_rows_and_no_vectors_reports_zero_coverage() {
+        let (tmp, index) = wire().await;
+        let db = crate::db::Database::init(tmp.path()).await.unwrap();
+        add_memory(&db.system, "m1", None).await;
+        add_memory(&db.system, "m2", None).await;
+
+        let health = index.health("nomic-embed-text-v1.5").await.unwrap();
+        let memory = corpus_health(&health, Corpus::Memory);
+        assert_eq!(
+            memory.rows, 2,
+            "the qualifying source rows were not counted, so coverage has no denominator"
+        );
+        assert_eq!(
+            memory.indexed_rows, 0,
+            "nothing was ever embedded, yet the corpus claims coverage"
+        );
+        assert_eq!(memory.missing_rows, 2);
+        assert_eq!(memory.mismatched, 0);
+    }
+
+    /// A vector written by ANOTHER model is `mismatched`, never `indexed_rows`.
+    ///
+    /// Counting it as coverage is the failure this surface exists to prevent:
+    /// the row is present, it is excluded from retrieval by design, and calling
+    /// it indexed would report a corpus as healthy at the precise moment it
+    /// stopped working. It is kept out of `missing_rows` too, because the repair
+    /// differs -- one needs an embed, the other a re-embed of something already
+    /// sitting there.
+    #[tokio::test]
+    async fn a_vector_from_another_model_counts_as_mismatched_not_indexed() {
+        let (tmp, index) = wire().await;
+        let db = crate::db::Database::init(tmp.path()).await.unwrap();
+        add_memory(&db.system, "mine", None).await;
+        add_memory(&db.system, "theirs", None).await;
+
+        index.upsert(&entry("mine", vec![1.0, 0.0])).await.unwrap();
+        let mut foreign = entry("theirs", vec![1.0, 0.0]);
+        foreign.model_id = "all-MiniLM-L6-v2".into();
+        index.upsert(&foreign).await.unwrap();
+
+        let health = index.health("nomic-embed-text-v1.5").await.unwrap();
+        let memory = corpus_health(&health, Corpus::Memory);
+        assert_eq!(memory.rows, 2);
+        assert_eq!(
+            memory.indexed_rows, 1,
+            "a foreign-model vector was counted as coverage"
+        );
+        assert_eq!(memory.mismatched, 1);
+        assert_eq!(
+            memory.missing_rows, 0,
+            "a row that HAS a vector was reported as never embedded"
+        );
+    }
+
+    /// The per-corpus rows must ADD UP to the totals the maintenance pass still
+    /// reads, over a store deliberately full of the awkward cases.
+    ///
+    /// The orphan and the archived memory are the reason this is not trivial:
+    /// both are index rows a whole-file `COUNT` would add to the totals, and
+    /// neither is a row retrieval can ever return, so neither may appear in a
+    /// coverage figure. A total that counts them describes the index FILE rather
+    /// than what the assistant can reach.
+    #[tokio::test]
+    async fn the_per_corpus_numbers_sum_to_the_global_totals() {
+        let (tmp, index) = wire().await;
+        let db = crate::db::Database::init(tmp.path()).await.unwrap();
+
+        // Memory: one indexed, one from another model, one bare.
+        add_memory(&db.system, "indexed", None).await;
+        add_memory(&db.system, "foreign", None).await;
+        add_memory(&db.system, "bare", None).await;
+        index
+            .upsert(&entry("indexed", vec![1.0, 0.0]))
+            .await
+            .unwrap();
+        let mut foreign = entry("foreign", vec![1.0, 0.0]);
+        foreign.model_id = "all-MiniLM-L6-v2".into();
+        index.upsert(&foreign).await.unwrap();
+
+        // An archived memory that IS indexed, and an orphan with no source row.
+        add_memory(&db.system, "archived", None).await;
+        index
+            .upsert(&entry("archived", vec![1.0, 0.0]))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE memory_fragments SET lifecycle = 'archived' WHERE id = 'archived'")
+            .execute(&db.system)
+            .await
+            .unwrap();
+        index.upsert(&entry("ghost", vec![1.0, 0.0])).await.unwrap();
+
+        // A summary that qualifies, and one the predicate refuses because nobody
+        // was identified in the session.
+        add_session(
+            &db.system,
+            "owned",
+            Some("we discussed the garden"),
+            "2026-08-13 10:00:00",
+        )
+        .await;
+        add_session(
+            &db.system,
+            "guest",
+            Some("a guest chatted"),
+            "2026-08-13 10:00:00",
+        )
+        .await;
+        sqlx::query("UPDATE sessions SET profile_id = NULL WHERE id = 'guest'")
+            .execute(&db.system)
+            .await
+            .unwrap();
+
+        let health = index.health("nomic-embed-text-v1.5").await.unwrap();
+        assert_eq!(
+            health.per_corpus.len(),
+            Corpus::ALL.len(),
+            "a corpus vanished from the health surface"
+        );
+
+        let sum = |f: fn(&CorpusHealth) -> u64| health.per_corpus.iter().map(f).sum::<u64>();
+        assert_eq!(
+            health.matching,
+            sum(|c| c.indexed_rows),
+            "the matching total is not the sum of the per-corpus coverage"
+        );
+        assert_eq!(health.mismatched, sum(|c| c.mismatched));
+        assert_eq!(health.missing, sum(|c| c.missing_rows));
+
+        // And each corpus's parts add up to its own qualifying row count, which
+        // is what makes `indexed_rows / rows` a percentage rather than a ratio
+        // of two unrelated numbers.
+        for c in &health.per_corpus {
+            assert_eq!(
+                c.rows,
+                c.indexed_rows + c.missing_rows + c.mismatched,
+                "{:?} does not add up: {c:?}",
+                c.corpus
+            );
+        }
+
+        // Pinned values, so the sums above cannot be satisfied by three zeros.
+        let memory = corpus_health(&health, Corpus::Memory);
+        assert_eq!(
+            (
+                memory.rows,
+                memory.indexed_rows,
+                memory.mismatched,
+                memory.missing_rows
+            ),
+            (3, 1, 1, 1),
+            "the archived memory or the orphan leaked into the memory corpus"
+        );
+        let summary = corpus_health(&health, Corpus::Summary);
+        assert_eq!(
+            summary.rows, 1,
+            "the unattributed session was counted as indexable"
+        );
+        assert_eq!(summary.missing_rows, 1);
     }
 
     /// The SQL predicate is pinned DIRECTLY, because the behavioural test below

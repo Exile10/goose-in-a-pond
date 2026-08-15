@@ -3605,6 +3605,14 @@ async fn run_server(
         device_registry,
         memory_repo,
         embedding_provider,
+        // The SAME handle the memory and context repositories write through and
+        // the maintenance sweep repairs, cloned rather than constructed again.
+        // A second construction here would be a second place to keep in step:
+        // the day this handle is wrapped in a decorator -- as the memory repo
+        // already is, twice -- the health route would be reporting on something
+        // the writers had stopped using, and would say so in a number that
+        // looked entirely plausible.
+        vector_index: Some(vector_index.clone()),
         sensor_storage,
         camera_storage,
         prompt_template_dir: Some(data_dir.join("prompts")),
@@ -4263,11 +4271,30 @@ async fn run_chat(
     // `build_goose_backend`, which registers `giap-memory` -- so a CLI or voice
     // session writes memories exactly like the server does, and leaving the
     // repo raw here would be a hole in the chokepoint that nothing warns about.
+    //
+    // The index side of that same chokepoint, with the model id deliberately
+    // `None`. `db.vectors` exists on every entry point, but the embedder does
+    // not: this path passes `None` for `embedding_provider` to
+    // `build_goose_backend` below, so nothing here can say which model produced
+    // a vector. `None` is the honest answer rather than a guess --
+    // `SqliteMemoryRepository::mirror` reads it as "leave any attributed entry
+    // alone and let the sweep own it", which is exactly right for a process that
+    // cannot attribute. What the handle still buys on an embedder-less path is
+    // `delete`: the `giap-memory` tool this backend registers can forget a
+    // memory, and without the index the row went and its vector stayed behind as
+    // an orphan until someone ran `prune_orphans`.
     let memory_repo: Arc<
         dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync,
     > = Arc::new(
         pond_core::user_data::services::redacting_memory_repository::RedactingMemoryRepository::new(
-            Arc::new(SqliteMemoryRepository::new(db.system.clone())),
+            Arc::new(
+                SqliteMemoryRepository::new(db.system.clone()).with_vector_index(
+                    Arc::new(pond_infra::sqlite_vector_index::SqliteVectorIndex::new(
+                        db.vectors.clone(),
+                    )),
+                    None,
+                ),
+            ),
             Arc::new(pond_infra::rule_redactor::RuleRedactor::new()),
         ),
     );
@@ -7877,11 +7904,23 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     > = Arc::new(SqliteSettingsRepository::new(db.system.clone()));
     // Chokepoint 1 again, for the same reason as the voice path: all three
     // arms below reach `build_goose_backend`, so all three can write a memory.
+    //
+    // Index handle with no model id, for the reason spelled out at the same
+    // wiring in `run_chat`: every arm calls `build_goose_backend` with
+    // `embedding_provider: None`, so this process can delete an indexed memory
+    // through `giap-memory` but can never attribute a vector it wrote.
     let memory_repo: Arc<
         dyn pond_core::user_data::ports::memory_repository::MemoryRepository + Send + Sync,
     > = Arc::new(
         pond_core::user_data::services::redacting_memory_repository::RedactingMemoryRepository::new(
-            Arc::new(SqliteMemoryRepository::new(db.system.clone())),
+            Arc::new(
+                SqliteMemoryRepository::new(db.system.clone()).with_vector_index(
+                    Arc::new(pond_infra::sqlite_vector_index::SqliteVectorIndex::new(
+                        db.vectors.clone(),
+                    )),
+                    None,
+                ),
+            ),
             Arc::new(pond_infra::rule_redactor::RuleRedactor::new()),
         ),
     );
@@ -8394,9 +8433,23 @@ async fn run_memories_cmd(action: MemoryAction) -> Result<()> {
     // Chokepoint 1: `memories add` is a direct write path into the same store
     // the server writes to, and it takes its content straight from argv --
     // which is where a shell-history copy of a credential comes from.
+    //
+    // `memories remove` is the delete that most needs the index handle: it is
+    // the one command whose entire job is to take a memory out, and unwired it
+    // took the row and left the vector sitting in `pond_vectors.db`. No embedder
+    // in this process either, so the model id is `None` -- the case `mirror`
+    // documents by name, and the reason it returns rather than removing when a
+    // fragment arrives carrying a vector it cannot attribute.
     let repo =
         pond_core::user_data::services::redacting_memory_repository::RedactingMemoryRepository::new(
-            Arc::new(SqliteMemoryRepository::new(db.system.clone())),
+            Arc::new(
+                SqliteMemoryRepository::new(db.system.clone()).with_vector_index(
+                    Arc::new(pond_infra::sqlite_vector_index::SqliteVectorIndex::new(
+                        db.vectors.clone(),
+                    )),
+                    None,
+                ),
+            ),
             Arc::new(pond_infra::rule_redactor::RuleRedactor::new()),
         );
 

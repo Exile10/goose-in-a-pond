@@ -46,6 +46,12 @@ export interface NowPlayingApiResponse {
    * response, including the genuine "connected but nothing playing" case.
    */
   error?: string;
+  /**
+   * The literal HTTP status Spotify answered with, when it answered at all.
+   * Absent on a healthy response and on transport failures — which is the
+   * point: only a real 4XX counts toward the stop rule below.
+   */
+  upstream_status?: number;
   /** Human-readable explanation for `error`, safe to show as-is. */
   message?: string;
 }
@@ -82,6 +88,7 @@ export interface Settings {
   active_whisper_model?: string;
   active_tts_model?: string;
   voice_tts_voice?: string;
+  voice_thinking_tone_enabled?: boolean;
 
   // Model roles
   chat_provider?: string;
@@ -482,6 +489,101 @@ export interface MemoryFragment {
   access_count: number;
   last_accessed_at?: string;
   superseded_by?: string;
+}
+
+// ── Semantic index coverage ───────────────────────────────────
+//
+// Mirrors `context_index_health` and `rebuild_context_index` in
+// `crates/pond-api/src/routes.rs`. Both answer **200 with `indexed: false`**
+// when the pond has no vector index or no embedder, because embeddings switched
+// off is a working configuration — retrieval falls back to recency and the pond
+// answers fine — and an error there would make a healthy pond indistinguishable
+// from a broken one at exactly the moment somebody is trying to tell them apart.
+//
+// So `indexed` is the discriminator and nothing else is: the counts are absent,
+// not zero, in that answer, and reading a missing count as 0 would report an
+// empty index for a pond that simply never had one.
+
+/** The three stores the index covers, spelled as the server spells them. */
+export type ContextCorpus = "memory" | "context" | "summary";
+
+/**
+ * One store's share of the index.
+ *
+ * `coverage` is `null` rather than a number when `rows` is 0, because 0/0 is
+ * neither 0% nor 100% and both readings actively mislead — zero paints a
+ * permanent red figure on a pond that has simply never stored a memory, and one
+ * paints a green 100% on a corpus that is structurally unable to answer
+ * anything. Render the `null` as "nothing to index", never as a percentage.
+ */
+export interface ContextCorpusCoverage {
+  corpus: ContextCorpus;
+  /** Live rows in the source store that qualify for indexing. */
+  rows: number;
+  /**
+   * Every row in the source table, ignoring the qualifying filter.
+   *
+   * Never the denominator of coverage. It answers the one question `rows`
+   * cannot: is this corpus EMPTY, or is everything in it being excluded? Both
+   * read as zero qualifying rows and they need opposite fixes.
+   */
+  source_rows: number;
+  /**
+   * `rows === 0` while the table is not empty — a filter is excluding
+   * everything, and no amount of embedding repairs it.
+   *
+   * Measured on a live pond: 27 sessions carried a rolling summary, none
+   * qualified, and the index reported itself 100% covered because zero of zero
+   * cannot pull an average down.
+   */
+  structurally_excluded: boolean;
+  /** Of those, the ones carrying a vector from the model currently configured. */
+  indexed_rows: number;
+  missing_rows: number;
+  /**
+   * Rows holding a vector from some OTHER embedder. They score plausibly and
+   * are wrong, so they are unreachable in practice until re-embedded — which is
+   * what the rebuild route exists for.
+   */
+  mismatched: number;
+  coverage: number | null;
+}
+
+/** How much of what the pond knows retrieval can currently reach. */
+export interface ContextIndexHealth {
+  indexed: boolean;
+  /** Why there is nothing to report. Sent only when `indexed` is false. */
+  reason?: string;
+  model_id: string | null;
+  dims: number | null;
+  /** The three totals, summed across corpora. Absent when `indexed` is false. */
+  rows?: number;
+  matching?: number;
+  mismatched?: number;
+  missing?: number;
+  coverage: number | null;
+  corpora: ContextCorpusCoverage[];
+}
+
+export interface ContextCorpusCleared {
+  corpus: ContextCorpus;
+  cleared: number;
+}
+
+/**
+ * The result of emptying the index. Every corpus is listed, including the ones
+ * at zero, so a corpus that was never populated is still visible afterwards.
+ */
+export interface ContextIndexRebuild {
+  indexed: boolean;
+  reason?: string;
+  /**
+   * Vectors dropped. Taken from the DELETE rather than summed from `corpora`,
+   * so rows written under a corpus name a later build stopped using are still
+   * counted here.
+   */
+  cleared: number;
+  corpora: ContextCorpusCleared[];
 }
 
 // ── User Skills ───────────────────────────────────────────────
@@ -1061,3 +1163,35 @@ export class ApiError extends Error {
     this.name = "ApiError";
   }
 }
+
+/**
+ * A suggestion the pond has made and is waiting on an answer for.
+ *
+ * Shape mirrors `proposal_json` in `crates/pond-api/src/routes.rs`. Every field
+ * the server sends is here; `trigger` is what the pond noticed, which is what
+ * makes a suggestion explicable rather than uncanny.
+ */
+export interface Proposal {
+  id: string;
+  summary: string;
+  rationale: string;
+  confidence: number;
+  profile_id: string | null;
+  created_at: string;
+  expires_at: string;
+  proposed_action: string;
+  trigger: {
+    kind: string;
+    source_id: string;
+    signal: string;
+    observed_at: string;
+  };
+}
+
+export interface ProposalList {
+  profile_id: string | null;
+  proposals: Proposal[];
+}
+
+/** Approve or reject. The server accepts no third value. */
+export type ProposalDecision = "approve" | "reject";

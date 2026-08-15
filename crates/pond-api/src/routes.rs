@@ -270,6 +270,13 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(list_context_sources).post(connect_context_source),
         )
         .route("/context/sources/{id}", delete(disconnect_context_source))
+        // ── The index's own health, and the way to repair it ───────────────
+        // Protected, and deliberately absent from `middleware::PUBLIC_ROUTES`:
+        // these counts say how much of a household's memory exists and how
+        // much of it retrieval can currently reach, which is a description of
+        // that household, and the rebuild throws work at the machine.
+        .route("/context/index/health", get(context_index_health))
+        .route("/context/index/rebuild", post(rebuild_context_index))
         .route("/proposals/{id}/decide", post(decide_proposal))
         // Foreground push: per-device notification stream (#99).
         .route("/notifications/stream", get(notifications_stream))
@@ -4850,7 +4857,13 @@ fn whisper_facts_from_name(name: &str) -> (Option<String>, Option<String>) {
     // .bin in the folder is not labelled a whisper model.
     let language = size
         .as_ref()
-        .map(|_| if lower.contains(".en") || lower.ends_with("-en") { "en" } else { "multilingual" })
+        .map(|_| {
+            if lower.contains(".en") || lower.ends_with("-en") {
+                "en"
+            } else {
+                "multilingual"
+            }
+        })
         .map(str::to_string);
     (language, size)
 }
@@ -5098,7 +5111,14 @@ async fn download_control(
 
     tokio::spawn(async move {
         spawn_tracked_download(
-            url, dest, filename, category, tracker, client, data_dir, async {},
+            url,
+            dest,
+            filename,
+            category,
+            tracker,
+            client,
+            data_dir,
+            async {},
         )
         .await;
     });
@@ -6366,8 +6386,7 @@ async fn download_via_hf_cache_tracked(
             // Expected, not a failure. The `.incomplete` file is still there,
             // which is what a later call resumes from — so a pause needs
             // nothing further, and a cancel is the same stop plus a delete.
-            let cancelled =
-                control.load(std::sync::atomic::Ordering::Relaxed) == crate::DL_CANCEL;
+            let cancelled = control.load(std::sync::atomic::Ordering::Relaxed) == crate::DL_CANCEL;
             let mut t = tracker.write().await;
             if let Some(entry) = t.get_mut(tracker_key) {
                 entry.status = if cancelled { "cancelled" } else { "paused" }.to_string();
@@ -11522,6 +11541,12 @@ async fn music_now_playing_handler(State(state): State<Arc<AppState>>) -> axum::
             "playing": false,
             "error": error,
             "message": message,
+            // The literal upstream status, not just the code derived from it.
+            // The widget stops polling after a run of 4XX answers, and only a
+            // 4XX may count: `unavailable` covers 5xx too, and a Spotify
+            // outage — or this pond restarting — must not permanently silence
+            // a widget whose recovery needs somebody to press something.
+            "upstream_status": status.as_u16(),
         }))
         .into_response();
     }
@@ -14716,6 +14741,216 @@ async fn disconnect_context_source(
         })?;
 
     Ok(Json(json!({"id": id, "items_removed": removed})))
+}
+
+// ── The coverage number leaves the process ─────────────────────────────────
+//
+// `IndexHealth` has been computed since phase A and written to a `tracing` line
+// and nowhere else -- no route, no TypeScript type, nothing rendered. That is
+// how an index populated at roughly 2% survived six landed phases: the pond
+// answered every question, slightly worse, and the one place that knew was a log
+// nobody reads while things look fine.
+//
+// Two routes, because a number nobody can act on is only a better-informed kind
+// of stuck: one to read what retrieval can reach, one to force the re-embed that
+// repairs it.
+
+/// Said by both routes below, so they cannot tell different stories about the
+/// same pond. "No index" from one and a cleared count from the other would leave
+/// a reader unable to say which was true.
+const NO_VECTOR_INDEX: &str = "this pond has no vector index, so nothing is embedded and \
+                               retrieval falls back to recency";
+const NO_EMBEDDING_MODEL: &str = "no embedding model is configured, so nothing has been indexed \
+                                  and retrieval falls back to recency";
+
+/// Coverage as a fraction, or `null` when there is nothing to cover.
+///
+/// `0/0` is neither 0% nor 100%, and BOTH readings actively mislead. Rendered as
+/// zero, a pond that has simply never stored a memory shows a permanent red
+/// figure and the number gets ignored, which is the state this whole surface
+/// exists to leave. Rendered as one, a corpus whose liveness predicate excludes
+/// every row -- the summary corpus on a pond where no session has been
+/// attributed, a real state on real hardware -- shows a green 100% while being
+/// structurally unable to answer anything. `null` says "no qualifying rows",
+/// which is the same thing the row's own `rows: 0` says.
+fn index_coverage(indexed: u64, rows: u64) -> Option<f64> {
+    (rows > 0).then(|| indexed as f64 / rows as f64)
+}
+
+/// `GET /api/v1/context/index/health` -- how much of each corpus retrieval can
+/// actually reach, for the model currently configured.
+///
+/// Answers **200 with `indexed: false`** rather than an error when this pond has
+/// no index or no embedder. Embeddings switched off is a legitimate
+/// configuration -- retrieval falls back to recency and the pond works -- so the
+/// UI has to be able to render it, and a 500 would make a healthy state
+/// indistinguishable from a fault at exactly the moment somebody is trying to
+/// tell those two apart.
+///
+/// The per-corpus rows are the point, not decoration. Averaged into one figure,
+/// two healthy corpora hid a third that could never populate at all; the shape
+/// that makes that visible is a row each, which is what
+/// [`pond_core::context::vector_index::CorpusHealth`] is for.
+async fn context_index_health(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let no_index = |reason: &str| {
+        Json(json!({
+            "indexed": false,
+            "reason": reason,
+            "model_id": Value::Null,
+            "dims": Value::Null,
+            "coverage": Value::Null,
+            "corpora": [],
+        }))
+    };
+
+    let Some(index) = state.vector_index.as_ref() else {
+        return Ok(no_index(NO_VECTOR_INDEX));
+    };
+    // The health query asks "how many rows carry a vector from THIS model", so
+    // with no embedder there is no model to ask about. Reporting every row as
+    // missing instead would be true and useless: it describes a pond that has
+    // switched embeddings off exactly as it describes one whose index has been
+    // wiped, and those need opposite responses.
+    let Some(embedder) = state.embedding_provider.as_ref() else {
+        return Ok(no_index(NO_EMBEDDING_MODEL));
+    };
+
+    let model_id = embedder.model_id();
+    let health = index.health(&model_id).await.map_err(|e| {
+        tracing::warn!(error = %e, "could not read personal-context index health");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "could not read index health"})),
+        )
+    })?;
+
+    // Summed from the rows rather than tracked separately: the three totals are
+    // already defined as the per-corpus sums, so deriving the denominator the
+    // same way is the only way the overall fraction and the rows can agree.
+    let rows: u64 = health.per_corpus.iter().map(|c| c.rows).sum();
+
+    Ok(Json(json!({
+        "indexed": true,
+        "model_id": model_id,
+        "dims": embedder.dimensions(),
+        "rows": rows,
+        "matching": health.matching,
+        "mismatched": health.mismatched,
+        "missing": health.missing,
+        "coverage": index_coverage(health.matching, rows),
+        "corpora": health
+            .per_corpus
+            .iter()
+            .map(|c| json!({
+                "corpus": c.corpus.as_str(),
+                "rows": c.rows,
+                "source_rows": c.source_rows,
+                "indexed_rows": c.indexed_rows,
+                "missing_rows": c.missing_rows,
+                "mismatched": c.mismatched,
+                "coverage": index_coverage(c.indexed_rows, c.rows),
+                // The one flag worth deriving here rather than in every client:
+                // rows exist in the table and NONE of them qualify. That is not
+                // an empty corpus waiting for data, it is a predicate excluding
+                // everything, and no amount of embedding repairs it. Measured on
+                // a live pond: 27 sessions carried a rolling summary, zero
+                // qualified, and coverage read 100%.
+                "structurally_excluded": c.rows == 0 && c.source_rows > 0,
+            }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+/// `POST /api/v1/context/index/rebuild` -- empty the index so the maintenance
+/// sweep fills it again, and say what went.
+///
+/// This is the operator affordance behind every one-way door in this workstream.
+/// A changed embedder, a changed width, a changed task prefix: each leaves rows
+/// that score plausibly and are wrong, and each is repaired by re-embedding
+/// rather than by anything the sweep will notice on its own, because the sweep
+/// is driven by a row's vector being ABSENT. Emptying the table is what makes
+/// them absent.
+///
+/// Nothing is lost. Migration `0001_vectors.sql` says it in the schema: this
+/// file is derived data, every row recomputable from the authoritative stores,
+/// and being deletable-and-rebuildable is the property it was designed around.
+///
+/// Unlike the health route this does **not** require an embedder. Health cannot
+/// ask "how many vectors came from this model" without a model; clearing is
+/// about the table, and a pond that has just switched embeddings off is
+/// precisely one that may want the now-unreadable vectors gone.
+async fn rebuild_context_index(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    use pond_core::context::vector_index::Corpus;
+
+    if state.vector_index.is_none() {
+        return Ok(Json(json!({
+            "indexed": false,
+            "reason": NO_VECTOR_INDEX,
+            "cleared": 0,
+            "corpora": [],
+        })));
+    }
+
+    let db_error = |e: sqlx::Error| {
+        tracing::warn!(error = %e, "could not clear the personal-context index");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "could not clear the index"})),
+        )
+    };
+
+    // Raw SQL against the vectors pool, and this is the one thing here worth
+    // justifying: `VectorIndex` can drop ONE row by id and can prune orphans,
+    // and neither empties an index whose source rows are all still present --
+    // which is every rebuild there will ever be. Rather than widen the port for
+    // a single caller, the route deletes from the table the port owns, which is
+    // the same pool `AppState` already holds for every other adapter built here.
+    let mut tx = state.db.vectors.begin().await.map_err(db_error)?;
+
+    // Counted BEFORE the delete and inside the same transaction, because the
+    // count IS the answer: read afterwards it is always zero, and read outside
+    // the transaction a concurrent sweep write can land between the two
+    // statements and the report describes a state that never existed.
+    let counted: Vec<(String, i64)> =
+        sqlx::query_as("SELECT corpus, COUNT(*) FROM vectors GROUP BY corpus")
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(db_error)?;
+    let cleared = sqlx::query("DELETE FROM vectors")
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?
+        .rows_affected();
+    tx.commit().await.map_err(db_error)?;
+
+    // Every corpus is listed even at zero, mirroring the port's own rule that a
+    // corpus absent from an answer is a corpus nobody can see is broken. The
+    // total comes from the DELETE rather than from summing these, so a row
+    // written under some corpus name a later build stopped using is still
+    // counted as cleared instead of vanishing from both numbers.
+    let corpora: Vec<Value> = Corpus::ALL
+        .iter()
+        .map(|corpus| {
+            let n = counted
+                .iter()
+                .find(|(name, _)| name == corpus.as_str())
+                .map(|(_, n)| (*n).max(0) as u64)
+                .unwrap_or(0);
+            json!({"corpus": corpus.as_str(), "cleared": n})
+        })
+        .collect();
+
+    tracing::info!(cleared, "personal-context index cleared for rebuild");
+
+    Ok(Json(json!({
+        "indexed": true,
+        "cleared": cleared,
+        "corpora": corpora,
+    })))
 }
 
 /// PAI-1 P9's attribution repository, built from the pool `AppState` already
