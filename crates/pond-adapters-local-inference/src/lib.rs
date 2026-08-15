@@ -28,6 +28,15 @@
 //! # }
 //! ```
 
+/// Whether this build can reach CUDA at all.
+///
+/// The one fact `pond-server` cannot work out for itself: `cuda` is a feature of
+/// THIS crate, passed on the command line by `scripts/jetson/deploy.sh`, so a
+/// `cfg!` in the binary would always read false. Exported as a const rather than
+/// a function so it is a compile-time constant at the call site and cannot drift
+/// from the feature that produced it.
+pub const CUDA_ENABLED: bool = cfg!(feature = "cuda");
+
 pub mod scheduler;
 pub mod tool_caller;
 pub use scheduler::{

@@ -590,6 +590,10 @@ async fn run_setup(model: &str) -> Result<()> {
     println!("  ║   🦆  Goose In A Pond — Setup         ║");
     println!("  ╚═══════════════════════════════════════╝");
 
+    // Before anything loads a model, so the line is above the noise rather than
+    // buried under provider init.
+    report_acceleration();
+
     let data_dir = default_data_dir();
 
     println!("\n  📂 Data directory: {}", data_dir.display());
@@ -982,6 +986,43 @@ impl LlamafileManagerImpl {
 /// enough for a boot to settle and short enough that a pond left alone is
 /// repaired within the minute.
 const INDEX_MAINTENANCE_DELAY_SECS: u64 = 60;
+
+
+/// Say so, loudly, when this binary cannot reach the accelerator this host has.
+///
+/// Called at startup for its side effect only. The check is cheap and the case
+/// it catches is otherwise invisible: a CPU build on a Jetson compiles, starts,
+/// loads the model and answers correctly at roughly a thirtieth of the speed,
+/// with no error anywhere. See `pond_core::models::domain::acceleration`.
+fn report_acceleration() {
+    use pond_core::models::domain::acceleration::{classify, host_is_accelerated, warning};
+
+    // `cuda` is a feature of `pond-adapters-local-inference`, so a `cfg!` here
+    // would always be false. Without the feature there is no accelerated build
+    // to have, which is itself the answer.
+    #[cfg(feature = "local-inference")]
+    let cuda_build = pond_adapters_local_inference::CUDA_ENABLED;
+    #[cfg(not(feature = "local-inference"))]
+    let cuda_build = false;
+
+    let model = std::fs::read_to_string("/proc/device-tree/model").ok();
+    // The device tree pads with NULs; a trailing NUL would defeat a `contains`
+    // on some readers and costs nothing to strip.
+    let model = model.as_deref().map(|m| m.trim_end_matches('\0').trim());
+    let accelerated = host_is_accelerated(
+        model,
+        std::path::Path::new("/etc/nv_tegra_release").exists(),
+    );
+
+    match warning(classify(accelerated, cuda_build)) {
+        Some(w) => tracing::error!("{w}"),
+        None => tracing::debug!(
+            cuda_build,
+            accelerated_host = accelerated,
+            "acceleration check passed"
+        ),
+    }
+}
 
 async fn run_server(
     static_dir: std::path::PathBuf,

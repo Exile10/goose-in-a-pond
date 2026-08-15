@@ -426,15 +426,41 @@ doctor() {
   if [ "$D_IS_JETSON" = true ]; then
     if [ "$D_BIN_REL" != "present" ]; then
       warn "no release server binary yet"; DOC_WARN=$((DOC_WARN+1))
-    elif [ -n "$D_STAMP" ]; then
-      case "$D_STAMP" in
-        *"local-inference/cuda"*) ok "build stamp records a CUDA build" ;;
-        *) bad "build stamp has no cuda feature — this binary runs on CPU"; DOC_FAIL=$((DOC_FAIL+1)) ;;
-      esac
     else
-      unk "no build stamp — provenance of target/release/pond-server is unknown"
-      note "rebuild via menu 12 to record one"
-      DOC_UNK=$((DOC_UNK+1))
+      # Ask the BINARY, not a string somebody wrote next to it.
+      #
+      # This used to grep the build stamp for "local-inference/cuda" and it was
+      # wrong on a healthy pond: the stamp is written as "pond-server/cuda", so
+      # the pattern never matched and doctor reported [FAIL] "this binary runs
+      # on CPU" against a binary that links libcuda.so.1 and carries 225 CUDA
+      # symbols. A check that is always wrong is worse than no check — it is
+      # learned and ignored, and then a genuine CPU build slips past it.
+      #
+      # The feature spelling drifts (five crates can enable this chain, each
+      # under its own name); what cannot drift is whether ggml's CUDA backend
+      # was compiled in. ldd covers the dynamic link, strings covers a static
+      # one, and either is sufficient.
+      _cuda_linked=false
+      if ldd target/release/pond-server 2>/dev/null | grep -qiE 'libcuda|libcudart'; then
+        _cuda_linked=true
+      elif strings -a target/release/pond-server 2>/dev/null | grep -q 'ggml_backend_cuda'; then
+        _cuda_linked=true
+      fi
+
+      if [ "$_cuda_linked" = true ]; then
+        ok "release binary links the CUDA backend"
+        case "$D_STAMP" in
+          *cuda*) : ;;
+          "")     note "no build stamp, but the binary itself is CUDA — trust the binary" ;;
+          *)      warn "build stamp does not mention cuda though the binary is CUDA — stale stamp"
+                  DOC_WARN=$((DOC_WARN+1)) ;;
+        esac
+      else
+        bad "release binary has no CUDA backend — inference will run on the CPU"
+        note "measured on this board: 26 tok/s prefill without CUDA, 696 with"
+        note "rebuild: scripts/jetson.sh deploy (build-docker.sh does NOT enable cuda)"
+        DOC_FAIL=$((DOC_FAIL+1))
+      fi
     fi
     case "$D_ENGINE" in
       CUDA)   ok "last run used the CUDA path" ;;
