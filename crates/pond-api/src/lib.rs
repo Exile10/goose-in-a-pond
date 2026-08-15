@@ -383,6 +383,13 @@ impl AppState {
     }
 }
 
+/// Keep going.
+pub const DL_RUN: u8 = 0;
+/// Stop, but leave the partial file so it can be picked up again.
+pub const DL_PAUSE: u8 = 1;
+/// Stop and throw the partial file away.
+pub const DL_CANCEL: u8 = 2;
+
 /// State of a single in-progress (or recently completed) model download.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DownloadEntry {
@@ -390,12 +397,26 @@ pub struct DownloadEntry {
     pub category: String,
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
-    /// "downloading" | "done" | "error"
+    /// "downloading" | "paused" | "done" | "error" | "cancelled"
     pub status: String,
     /// When the download finished (status became "done" or "error").
     /// `None` while still downloading. Used to evict stale entries.
     #[serde(skip)]
     pub finished_at: Option<std::time::Instant>,
+    /// What this download has been told to do — [`DL_RUN`], [`DL_PAUSE`] or
+    /// [`DL_CANCEL`].
+    ///
+    /// Shared with the transfer, which reads it between chunks. That is the
+    /// only place a download that is already streaming can be stopped: the
+    /// task is inside `resp.chunk().await` the rest of the time, and nothing
+    /// outside it can interrupt that without dropping the connection.
+    #[serde(skip)]
+    pub control: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// The source, so a paused transfer can be asked for again. Hugging Face
+    /// downloads resume from a `.incomplete` file, so re-requesting is all a
+    /// resume needs.
+    #[serde(skip)]
+    pub url: Option<String>,
 }
 
 /// Snapshot of one model's availability, sent over the REST API.

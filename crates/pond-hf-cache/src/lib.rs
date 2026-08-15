@@ -8,6 +8,29 @@
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
+/// A download that stopped because its progress callback asked it to.
+///
+/// Its own type rather than a string, because the caller has to tell this
+/// apart from a real failure: a stop is expected and leaves a resumable
+/// `.incomplete` file behind, while a failure is not and may not. Match it
+/// with [`is_stopped`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stopped;
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "download stopped by caller")
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+/// Did this error come from a caller stopping the download, rather than a
+/// transfer that went wrong?
+pub fn is_stopped(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<Stopped>().is_some()
+}
+
 /// Env vars consulted (in order) for an HF access token.
 const HF_TOKEN_ENV_VARS: &[&str] = &["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"];
 
@@ -265,6 +288,18 @@ impl<'a> HfFetch<'a> {
     ///    into `{blob}.incomplete`. Call `progress(downloaded, total)` per chunk.
     /// 4. Atomic rename to `blobs/{etag}`.
     /// 5. Write `refs/main` and create the snapshot symlink.
+    ///
+    /// # Stopping
+    ///
+    /// `progress` returns whether to keep going. Answering `false` stops the
+    /// stream and returns [`Stopped`], leaving `{blob}.incomplete` where it is
+    /// — which is exactly what step 3 resumes from, so a stopped download is a
+    /// paused one and calling this again picks up where it left off. Deleting
+    /// that file instead turns the same stop into a cancel.
+    ///
+    /// The signal rides the progress callback rather than a separate parameter
+    /// because the callback is already invoked per chunk: there is no second
+    /// place to check, and no way for the two to disagree about when.
     pub async fn download_to_blob<F>(
         &self,
         client: &reqwest::Client,
@@ -272,7 +307,7 @@ impl<'a> HfFetch<'a> {
         mut progress: F,
     ) -> Result<PathBuf>
     where
-        F: FnMut(u64, u64),
+        F: FnMut(u64, u64) -> bool,
     {
         use tokio::io::AsyncWriteExt as _;
 
@@ -397,7 +432,10 @@ impl<'a> HfFetch<'a> {
             .with_context(|| format!("open {}", incomplete_path.display()))?;
 
         let mut downloaded: u64 = existing_size;
-        progress(downloaded, total);
+        if !progress(downloaded, total) {
+            file.flush().await.ok();
+            return Err(anyhow!(Stopped));
+        }
 
         let mut resp = resp;
         while let Some(chunk) = resp
@@ -409,7 +447,14 @@ impl<'a> HfFetch<'a> {
                 .await
                 .with_context(|| format!("write {}", incomplete_path.display()))?;
             downloaded += chunk.len() as u64;
-            progress(downloaded, total);
+            if !progress(downloaded, total) {
+                // Flushed and left in place, NOT removed: `.incomplete` is what
+                // the range request at the top of this function resumes from,
+                // so stopping here is a pause. A caller that meant cancel
+                // deletes the file itself.
+                file.flush().await.ok();
+                return Err(anyhow!(Stopped));
+            }
         }
         file.flush().await.ok();
         drop(file);
@@ -462,7 +507,11 @@ async fn acquire_blob_lock<F>(
     progress: &mut F,
 ) -> Result<LockOutcome>
 where
-    F: FnMut(u64, u64),
+    // Same signal as the download loop; the return is ignored here because
+    // this only mirrors another process's progress while waiting for a lock.
+    // Stopping is the download's decision, and it makes it as soon as this
+    // returns.
+    F: FnMut(u64, u64) -> bool,
 {
     use fs2::FileExt as _;
     use std::fs::OpenOptions;

@@ -293,9 +293,11 @@ async fn download_via_hf_cache(
         } else {
             total
         };
-        // Throttle stdout updates to ~256 KiB to avoid flooding.
+        // Throttle stdout updates to ~256 KiB to avoid flooding. Returning
+        // `true` here as well as at the end: the value is "keep going", not
+        // "I printed something".
         if downloaded < effective_total && downloaded.saturating_sub(last_printed) < 262_144 {
-            return;
+            return true;
         }
         last_printed = downloaded;
         let pct = (downloaded * 100) / effective_total.max(1);
@@ -307,6 +309,9 @@ async fn download_via_hf_cache(
             pct
         );
         std::io::stderr().flush().ok();
+        // The CLI download has no way to be asked to stop — there is no UI
+        // holding it — so it always continues.
+        true
     };
 
     let blob_path = fetch
