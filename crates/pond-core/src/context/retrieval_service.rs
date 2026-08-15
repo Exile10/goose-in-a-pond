@@ -133,7 +133,7 @@ impl PersonalContextRetrieval {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::vector_index::{IndexHealth, VectorEntry, VectorHit};
+    use crate::context::vector_index::{CorpusHealth, IndexHealth, VectorEntry, VectorHit};
     use async_trait::async_trait;
 
     /// The tie-break IS the declaration order of `Corpus`, so this pins the
@@ -227,7 +227,24 @@ mod tests {
             Ok(0)
         }
         async fn health(&self, _m: &str) -> Result<IndexHealth> {
-            Ok(IndexHealth::default())
+            // An empty index, but still one row per corpus: the port requires
+            // every corpus to be represented so that a dead one is visible, and
+            // a stub that quietly skips a contract is how the contract stops
+            // being true everywhere else.
+            Ok(IndexHealth {
+                per_corpus: Corpus::ALL
+                    .into_iter()
+                    .map(|corpus| CorpusHealth {
+                        corpus,
+                        rows: 0,
+                        source_rows: 0,
+                        indexed_rows: 0,
+                        missing_rows: 0,
+                        mismatched: 0,
+                    })
+                    .collect(),
+                ..IndexHealth::default()
+            })
         }
     }
 

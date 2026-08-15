@@ -22,10 +22,22 @@ import {
   Radio,
   Sparkles,
   Brain,
+  Radar,
+  AlertTriangle,
+  Check,
+  Minus,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { PageHeader, useConfirm, SkeletonList } from "../components/shared";
-import type { MemoryFragment, MemorySegment, MemoryTier, Settings } from "../api/types";
+import type {
+  ContextCorpus,
+  ContextCorpusCoverage,
+  ContextIndexHealth,
+  MemoryFragment,
+  MemorySegment,
+  MemoryTier,
+  Settings,
+} from "../api/types";
 
 // ── Segment metadata ──────────────────────────────────────────
 
@@ -731,6 +743,297 @@ function MemorySettingsCard({ settings, onToggle }: {
   );
 }
 
+// ── Semantic index coverage ───────────────────────────────────
+//
+// This screen has always shown what the pond has STORED. It has never shown how
+// much of that the assistant can actually find, and those are different numbers:
+// retrieval reaches a memory only through a vector stamped with the embedding
+// model currently configured, and everything else falls back to recency. An
+// index sitting at roughly 2% populated survived six landed phases precisely
+// because the figure lived in a log line — the pond answered every question,
+// slightly worse, and nothing on any screen disagreed.
+//
+// So the panel's whole job is to make a corpus at zero impossible to scroll
+// past. A percentage alone does not do that: averaged into one figure, two
+// healthy corpora hid a third that could never populate at all. A row each,
+// with the empty one tinted and named in words, is the shape that shows it.
+
+const CORPUS_META: Record<ContextCorpus, { label: string; holds: string }> = {
+  memory:  { label: "Memories",   holds: "facts the assistant extracted from conversation" },
+  context: { label: "Context",    holds: "items ingested from sensors and sources" },
+  summary: { label: "Summaries",  holds: "the rolling summary of each conversation" },
+};
+
+/**
+ * What a corpus's two numbers mean, as four cases rather than a percentage.
+ *
+ * `vacant` and `unindexed` both read 0 indexed and must never be shown the same
+ * way: one is a store nobody has written to yet, which is fine and will fix
+ * itself, and the other is a store full of rows the assistant cannot reach,
+ * which is the defect this panel exists to surface.
+ */
+export type CoverageState = "vacant" | "excluded" | "unindexed" | "partial" | "complete";
+
+export function coverageState(row: {
+  rows: number;
+  indexed_rows: number;
+  source_rows?: number;
+}): CoverageState {
+  // Checked BEFORE "vacant", because both are zero qualifying rows and only one
+  // of them is fine. A corpus holding rows that all fail the filter is broken in
+  // a way embedding cannot touch, and calling that "nothing stored yet" is the
+  // sentence that let it hide.
+  if (row.rows === 0 && (row.source_rows ?? 0) > 0) return "excluded";
+  if (row.rows === 0) return "vacant";
+  if (row.indexed_rows === 0) return "unindexed";
+  if (row.indexed_rows >= row.rows) return "complete";
+  return "partial";
+}
+
+/**
+ * A coverage fraction as a percentage a person can read.
+ *
+ * `null` is the server saying "no qualifying rows", which is not 0% and not
+ * 100% — see `ContextCorpusCoverage` — so it prints as a dash and the row's own
+ * counts carry the meaning instead.
+ *
+ * Anything above nothing floors at "<1%" rather than rounding to zero. Rounding
+ * would print the same "0%" for an index with a handful of vectors and one with
+ * none at all, and telling those apart is the reason this number is on screen.
+ */
+export function formatCoverage(coverage: number | null | undefined): string {
+  if (coverage === null || coverage === undefined) return "—";
+  const pct = coverage * 100;
+  if (pct > 0 && pct < 1) return "<1%";
+  return `${Math.round(pct)}%`;
+}
+
+/** The row's state said in words, because a bar at zero is easy to read as a bar. */
+export function coverageNote(row: ContextCorpusCoverage): string {
+  const stale = row.mismatched > 0
+    ? ` ${row.mismatched} carry a vector from another model.`
+    : "";
+  switch (coverageState(row)) {
+    case "vacant":
+      return "Nothing stored yet.";
+    case "excluded":
+      return `${row.source_rows} stored, none reachable — a filter excludes every one. Embedding will not fix this.`;
+    case "unindexed":
+      return `Not searchable — the assistant can only reach these by recency.${stale}`;
+    case "partial":
+      return `${row.missing_rows} still to embed.${stale}`;
+    case "complete":
+      return `Fully searchable.${stale}`;
+  }
+}
+
+const STATE_TONE: Record<CoverageState, { fg: string; tint: string; icon: React.ReactNode }> = {
+  excluded:  { fg: "var(--color-destructive)",  tint: "color-mix(in srgb, var(--color-destructive) 9%, transparent)", icon: <AlertTriangle size={13} strokeWidth={2} /> },
+  vacant:    { fg: "var(--grey-400)",          tint: "transparent",                                                 icon: <Minus size={13} strokeWidth={2} /> },
+  unindexed: { fg: "var(--color-destructive)",  tint: "color-mix(in srgb, var(--color-destructive) 9%, transparent)", icon: <AlertTriangle size={13} strokeWidth={2} /> },
+  partial:   { fg: "var(--color-warning-fg)",   tint: "color-mix(in srgb, var(--color-warning) 9%, transparent)",     icon: <AlertTriangle size={13} strokeWidth={2} /> },
+  complete:  { fg: "var(--color-success-fg)",   tint: "transparent",                                                 icon: <Check size={13} strokeWidth={2.2} /> },
+};
+
+function CorpusCoverageRow({ row }: { row: ContextCorpusCoverage }) {
+  const state = coverageState(row);
+  const tone = STATE_TONE[state];
+  const meta = CORPUS_META[row.corpus];
+
+  // A sliver rather than an honest 2% bar: at this width two percent draws less
+  // than one pixel and reads as empty, which is the exact confusion the panel is
+  // here to end. The counts beside it stay exact.
+  const pct = (row.coverage ?? 0) * 100;
+  const barWidth = pct > 0 ? Math.max(3, pct) : 0;
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 10,
+        padding: "7px 8px",
+        borderRadius: 8,
+        background: tone.tint,
+      }}
+    >
+      <span style={{ color: tone.fg, display: "flex", flexShrink: 0 }} aria-hidden="true">
+        {tone.icon}
+      </span>
+
+      <div style={{ flex: 1, minWidth: 0 }}>
+        {/* Falls back to the raw name because the server owns the corpus list:
+            a fourth store added there should show up here unlabelled rather
+            than blank, which is the failure mode this panel is about. */}
+        <div className="mem-settings__toggle-label">{meta?.label ?? row.corpus}</div>
+        <div
+          className="mem-settings__toggle-desc"
+          title={meta?.holds}
+          // The words are the loudest part of the row, so the one state worth
+          // alarm gets to keep the alarm colour instead of the muted grey.
+          style={{ color: state === "unindexed" || state === "excluded" ? tone.fg : undefined }}
+        >
+          {coverageNote(row)}
+        </div>
+      </div>
+
+      <span className="mem-importance__track" style={{ flex: "0 0 84px", maxWidth: 84 }}>
+        <span
+          className="mem-importance__fill"
+          style={{ width: `${barWidth}%`, background: tone.fg }}
+        />
+      </span>
+
+      <span
+        className="mem-importance__label"
+        style={{ color: tone.fg, minWidth: 62, fontWeight: 600 }}
+      >
+        {row.indexed_rows} / {row.rows}
+      </span>
+    </div>
+  );
+}
+
+export function IndexCoveragePanel() {
+  const confirm = useConfirm();
+  const [health, setHealth] = useState<ContextIndexHealth | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [rebuilding, setRebuilding] = useState(false);
+  const [notice, setNotice] = useState("");
+
+  function load() {
+    setLoading(true);
+    setError(null);
+    api
+      .getContextIndexHealth()
+      .then(setHealth)
+      .catch((e) => setError(String(e)))
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => { load(); }, []);
+
+  async function handleRebuild() {
+    const ok = await confirm(
+      "Clear every stored vector and embed each row again? Nothing is lost — they are all recomputable — but until the pond catches up, retrieval falls back to recency.",
+      { title: "Reindex", confirmLabel: "Reindex" },
+    );
+    if (!ok) return;
+    setRebuilding(true);
+    setNotice("");
+    try {
+      const result = await api.rebuildContextIndex();
+      // Said explicitly, because the figures below drop to near zero the instant
+      // this returns: the route clears the table and the sweep re-embeds in the
+      // background, so a reader who was not told would take the repair for the
+      // damage.
+      setNotice(
+        result.indexed
+          ? `Cleared ${result.cleared} ${result.cleared === 1 ? "vector" : "vectors"}. The pond embeds them again in the background, so the figures start near zero and climb.`
+          : result.reason ?? "There was no index to clear.",
+      );
+      load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRebuilding(false);
+    }
+  }
+
+  const overall = health?.indexed
+    ? coverageState({ rows: health.rows ?? 0, indexed_rows: health.matching ?? 0 })
+    : null;
+
+  return (
+    <Card className="card">
+      <CardContent>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+          <span
+            className="mem-settings__header"
+            style={{ marginBottom: 0, display: "inline-flex", alignItems: "center", gap: 6 }}
+          >
+            <Radar size={14} strokeWidth={1.8} />
+            What the assistant can find
+          </span>
+          <span style={{ flex: 1 }} />
+          {health?.indexed && health.model_id && (
+            <Chip size="sm" variant="soft" title="Every stored vector has to match this model to be reachable">
+              {health.model_id}
+              {health.dims ? ` · ${health.dims}d` : ""}
+            </Chip>
+          )}
+          <Button
+            size="sm"
+            variant="secondary"
+            onPress={handleRebuild}
+            isDisabled={rebuilding || loading}
+          >
+            <RefreshCw size={14} strokeWidth={1.8} style={{ opacity: rebuilding ? 0.4 : 1 }} />
+            {rebuilding ? "Reindexing…" : "Reindex"}
+          </Button>
+        </div>
+
+        {error && <p className="inline-error">{error}</p>}
+        {notice && (
+          <p className="mem-settings__toggle-desc" role="status" style={{ marginBottom: 8 }}>
+            {notice}
+          </p>
+        )}
+
+        {loading ? (
+          <div className="mem-card__meta-item">Reading the index…</div>
+        ) : !health ? null : !health.indexed ? (
+          // Embeddings switched off is a working pond, not a fault — the server
+          // answers 200 for it deliberately — so this state gets the server's own
+          // sentence and no percentages at all. A 0% here would read as breakage.
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "4px 8px" }}>
+            <span style={{ color: "var(--color-warning-fg)", display: "flex", flexShrink: 0, marginTop: 2 }} aria-hidden="true">
+              <AlertTriangle size={14} strokeWidth={2} />
+            </span>
+            <div>
+              <div className="mem-settings__toggle-label">Nothing is indexed</div>
+              <div className="mem-settings__toggle-desc">
+                {health.reason ?? "This pond has no semantic index."}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginBottom: 8 }}>
+              <span
+                style={{
+                  fontSize: 22,
+                  fontWeight: 600,
+                  fontFamily: "var(--font-mono)",
+                  color: overall ? STATE_TONE[overall].fg : "var(--fg)",
+                }}
+              >
+                {formatCoverage(health.coverage)}
+              </span>
+              <span className="mem-card__meta-item">
+                {health.matching ?? 0} of {health.rows ?? 0} rows searchable
+              </span>
+              {(health.mismatched ?? 0) > 0 && (
+                <span className="mem-card__meta-item" style={{ color: "var(--color-warning-fg)" }}>
+                  <Layers size={10} strokeWidth={2} />
+                  {health.mismatched} from another model
+                </span>
+              )}
+            </div>
+
+            <div className="mem-settings__list">
+              {health.corpora.map((row) => (
+                <CorpusCoverageRow key={row.corpus} row={row} />
+              ))}
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 // ── Main Memory component ─────────────────────────────────────
 
 export function Memory() {
@@ -1056,6 +1359,11 @@ export function Memory() {
           </div>
         </CardContent>
       </Card>
+
+      {/* What retrieval can reach — sits above the list because a coverage
+          figure below twenty memories is a coverage figure nobody scrolls to,
+          which is how the 2% index stayed unnoticed in the first place. */}
+      <IndexCoveragePanel />
 
       {/* Stats row */}
       {!loading && visibleItems.length > 0 && (

@@ -9,6 +9,8 @@ import {
   type ChatStreamRequest,
   type CleanupResponse,
   type CompactionReport,
+  type ContextIndexHealth,
+  type ContextIndexRebuild,
   type Device,
   type DiskUsage,
   type DownloadEntry,
@@ -39,6 +41,8 @@ import {
   type SecretRequirement,
   type SessionMessage,
   type SessionMessageToolCall,
+  type ProposalDecision,
+  type ProposalList,
   type SessionSummary,
   type MusicControlAction,
   type NowPlayingApiResponse,
@@ -647,6 +651,37 @@ export class PondApiClient {
     return this.post("/api/v1/memory/consolidate/stop", {});
   }
 
+  // ── Semantic index ────────────────────────────────────────
+
+  /**
+   * How much of what the pond knows retrieval can actually reach.
+   *
+   * Never rejects for a pond with no index or no embedder — it answers with
+   * `indexed: false` and a reason, because switching embeddings off is a
+   * working configuration rather than a fault. Branch on `indexed` before
+   * reading any count: they are absent, not zero, in that answer.
+   */
+  getContextIndexHealth(): Promise<ContextIndexHealth> {
+    return this.get<ContextIndexHealth>("/api/v1/context/index/health");
+  }
+
+  /**
+   * Empty the index so the maintenance sweep embeds every row again.
+   *
+   * Answers when the table is cleared, NOT when the re-embed finishes: health
+   * read straight afterwards is near zero and climbs in the background, so a
+   * caller that refreshes immediately has to say so or it looks like the
+   * rebuild broke something. Nothing is lost either way — every vector is
+   * recomputable from the store it was derived from.
+   *
+   * This is the repair for the one-way doors: a changed embedder, width or task
+   * prefix leaves rows that score plausibly and are wrong, and the sweep cannot
+   * notice them on its own because it is driven by a vector being ABSENT.
+   */
+  rebuildContextIndex(): Promise<ContextIndexRebuild> {
+    return this.post<ContextIndexRebuild>("/api/v1/context/index/rebuild", {});
+  }
+
   // ── Conversation titles ───────────────────────────────────
 
   /**
@@ -902,6 +937,30 @@ export class PondApiClient {
 
   activateModel(provider: string, name: string, role: string): Promise<void> {
     return this.post(`/api/v1/models/${encodeURIComponent(provider)}/${encodeURIComponent(name)}/activate`, { role });
+  }
+
+  // ── Suggestions (proactive proposals) ─────────────────────
+  //
+  // Both routes require a session id and neither defaults it: the session is
+  // how the server learns who is asking, and a defaulted one would resolve to
+  // the whole household — so a suggestion meant for one person would be shown
+  // to, and answerable by, anyone.
+
+  listProposals(sessionId: string): Promise<ProposalList> {
+    return this.get<ProposalList>(
+      `/api/v1/proposals?session_id=${encodeURIComponent(sessionId)}`,
+    );
+  }
+
+  decideProposal(
+    id: string,
+    sessionId: string,
+    decision: ProposalDecision,
+  ): Promise<unknown> {
+    return this.post(`/api/v1/proposals/${encodeURIComponent(id)}/decide`, {
+      session_id: sessionId,
+      decision,
+    });
   }
 
   // ── Sessions ──────────────────────────────────────────────

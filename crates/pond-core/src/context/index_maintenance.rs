@@ -192,7 +192,9 @@ pub async fn run_index_maintenance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::vector_index::{IndexHealth, ResolvedHit, VectorEntry, VectorHit};
+    use crate::context::vector_index::{
+        CorpusHealth, IndexHealth, ResolvedHit, VectorEntry, VectorHit,
+    };
     use crate::user_data::domain::profile::ProfileScope;
     use anyhow::Result;
     use async_trait::async_trait;
@@ -256,10 +258,44 @@ mod tests {
         }
         async fn health(&self, _m: &str) -> Result<IndexHealth> {
             self.calls.lock().unwrap().push("health".into());
+            // The totals are the per-corpus sums, as a real index reports them,
+            // and Summary is the wholly-dead corpus: qualifying rows zero
+            // against a table full of sessions. A stub whose numbers did not add
+            // up would let a caller that quietly stopped reading one of them
+            // still pass.
             Ok(IndexHealth {
                 matching: 5,
                 mismatched: 3,
                 missing: 1,
+                per_corpus: vec![
+                    CorpusHealth {
+                        corpus: Corpus::Memory,
+                        rows: 7,
+                        source_rows: 9,
+                        indexed_rows: 4,
+                        missing_rows: 1,
+                        mismatched: 2,
+                    },
+                    CorpusHealth {
+                        corpus: Corpus::Context,
+                        rows: 2,
+                        source_rows: 2,
+                        indexed_rows: 1,
+                        missing_rows: 0,
+                        mismatched: 1,
+                    },
+                    CorpusHealth {
+                        corpus: Corpus::Summary,
+                        // Zero qualifying against a non-empty table: the
+                        // structurally-dead shape this whole surface exists to
+                        // make legible.
+                        rows: 0,
+                        source_rows: 11,
+                        indexed_rows: 0,
+                        missing_rows: 0,
+                        mismatched: 0,
+                    },
+                ],
             })
         }
     }

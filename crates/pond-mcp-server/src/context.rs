@@ -435,6 +435,21 @@ pub fn spawn_context_server(reader: DuplexStream, writer: DuplexStream) {
 
 #[cfg(test)]
 mod tests {
+    //! `the_extension_is_read_only` at the bottom of this module was dead from
+    //! the day it was written until 2026-08. A merge left its `#[test]` stacked
+    //! above the NEXT test's doc comment, so the attribute bound to
+    //! `the_recall_tool_is_actually_handed_its_retrieval` instead: that test ran
+    //! twice and reported two passes, while the read-only guard compiled as an
+    //! ordinary private fn nothing ever called. The only signal was a
+    //! `dead_code` warning among the crate's others, and the test count went UP,
+    //! not down -- both of which read as healthy at a glance.
+    //!
+    //! Attributes and doc comments are both attributes to the parser and it
+    //! accepts them in any order, so `#[test]` separated from its `fn` by prose
+    //! is not an error. When editing here, check that every `#[test]` sits
+    //! immediately above the `fn` it names, and that the run lists each test
+    //! exactly once.
+
     use super::*;
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
@@ -751,15 +766,6 @@ mod tests {
         assert!(items.len() <= MAX_LIMIT);
     }
 
-    /// The extension has no write tool, and must not grow one: a tool that let
-    /// the model add to the corpus would let a prompt injection plant something
-    /// the assistant later quotes as fact.
-    ///
-    /// It reads the PRODUCTION half of this file only. The test module below
-    /// contains the same needle in string literals, and counting those made the
-    /// first version of this guard report two handlers that do not exist -- a
-    /// parser reading itself is the shape that turns a source guard into noise.
-    #[test]
     /// `recall` must actually be wired, not merely registered.
     ///
     /// A tool that is offered to the model and always answers nothing is worse
@@ -781,6 +787,15 @@ mod tests {
         );
     }
 
+    /// The extension has no write tool, and must not grow one: a tool that let
+    /// the model add to the corpus would let a prompt injection plant something
+    /// the assistant later quotes as fact.
+    ///
+    /// It reads the PRODUCTION half of this file only. The test module below
+    /// contains the same needle in string literals, and counting those made the
+    /// first version of this guard report two handlers that do not exist -- a
+    /// parser reading itself is the shape that turns a source guard into noise.
+    #[test]
     fn the_extension_is_read_only() {
         const SRC: &str = include_str!("context.rs");
         let production = SRC

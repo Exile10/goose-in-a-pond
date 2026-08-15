@@ -122,6 +122,7 @@ async fn make_memory_app() -> (axum::Router, Arc<MockMemoryRepository>, tempfile
         matter: None,
         memory_repo: memory_repo.clone(),
         embedding_provider: None,
+        vector_index: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,
