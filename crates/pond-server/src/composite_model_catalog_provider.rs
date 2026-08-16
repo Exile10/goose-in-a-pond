@@ -73,7 +73,7 @@ impl ModelCatalogProvider for StaticModelCatalogProvider {
 fn static_models() -> Vec<ModelRecord> {
     let mut out = Vec::new();
     out.extend(whisper_models());
-    out.extend(piper_tts_models());
+    out.extend(kokoro_tts_voices());
     out.extend(llamafile_models());
     out.extend(gguf_models());
     out.extend(embedding_models());
@@ -130,116 +130,116 @@ fn whisper_models() -> Vec<ModelRecord> {
     ]
 }
 
-// ── Piper TTS ─────────────────────────────────────────────────────────────────
+// ── Kokoro TTS ────────────────────────────────────────────────────────────────
 
-const PIPER_BASE: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/";
+const KOKORO_BASE: &str =
+    "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/";
 
-struct PiperVoice {
-    name: &'static str,
-    model_filename: &'static str,
-    config_filename: &'static str,
-    hf_path: &'static str, // path inside the HF repo (lang/lang_full/voice/quality/)
-    size_mb: u64,
-    description: &'static str,
-}
+/// Every voice Kokoro publishes.
+///
+/// All of them, not just the English ones: the picker groups by accent, so a
+/// household that wants a Japanese voice finds it behind its own tab instead
+/// of being told to copy a file in by hand, and nobody choosing an English
+/// voice ever sees the rest.
+///
+/// A row here costs nothing until it is chosen — the `.bin` is fetched on
+/// selection, which is why offering all of them is not the same as shipping
+/// 28 MB of style tables.
+///
+/// Ids are Kokoro's own: `<lang><gender>_<name>`. The desktop derives the
+/// display name and grouping from that, so there is nothing to keep in step
+/// here beyond the id itself.
+const KOKORO_VOICES: &[(&str, &str)] = &[
+    ("af_heart", "American female — Heart"),
+    ("af_alloy", "American female — Alloy"),
+    ("af_aoede", "American female — Aoede"),
+    ("af_bella", "American female — Bella"),
+    ("af_jessica", "American female — Jessica"),
+    ("af_kore", "American female — Kore"),
+    ("af_nicole", "American female — Nicole"),
+    ("af_nova", "American female — Nova"),
+    ("af_river", "American female — River"),
+    ("af_sarah", "American female — Sarah"),
+    ("af_sky", "American female — Sky"),
+    ("am_adam", "American male — Adam"),
+    ("am_echo", "American male — Echo"),
+    ("am_eric", "American male — Eric"),
+    ("am_fenrir", "American male — Fenrir"),
+    ("am_liam", "American male — Liam"),
+    ("am_michael", "American male — Michael"),
+    ("am_onyx", "American male — Onyx"),
+    ("am_puck", "American male — Puck"),
+    ("am_santa", "American male — Santa"),
+    ("bf_alice", "British female — Alice"),
+    ("bf_emma", "British female — Emma"),
+    ("bf_isabella", "British female — Isabella"),
+    ("bf_lily", "British female — Lily"),
+    ("bm_daniel", "British male — Daniel"),
+    ("bm_fable", "British male — Fable"),
+    ("bm_george", "British male — George"),
+    ("bm_lewis", "British male — Lewis"),
+    ("jf_alpha", "Japanese female — Alpha"),
+    ("jf_gongitsune", "Japanese female — Gongitsune"),
+    ("jf_nezumi", "Japanese female — Nezumi"),
+    ("jf_tebukuro", "Japanese female — Tebukuro"),
+    ("jm_kumo", "Japanese male — Kumo"),
+    ("zf_xiaobei", "Mandarin female — Xiaobei"),
+    ("zf_xiaoni", "Mandarin female — Xiaoni"),
+    ("zf_xiaoxiao", "Mandarin female — Xiaoxiao"),
+    ("zf_xiaoyi", "Mandarin female — Xiaoyi"),
+    ("zm_yunjian", "Mandarin male — Yunjian"),
+    ("zm_yunxi", "Mandarin male — Yunxi"),
+    ("zm_yunxia", "Mandarin male — Yunxia"),
+    ("zm_yunyang", "Mandarin male — Yunyang"),
+    ("ef_dora", "Spanish female — Dora"),
+    ("em_alex", "Spanish male — Alex"),
+    ("em_santa", "Spanish male — Santa"),
+    ("ff_siwis", "French female — Siwis"),
+    ("hf_alpha", "Hindi female — Alpha"),
+    ("hf_beta", "Hindi female — Beta"),
+    ("hm_omega", "Hindi male — Omega"),
+    ("hm_psi", "Hindi male — Psi"),
+    ("if_sara", "Italian female — Sara"),
+    ("im_nicola", "Italian male — Nicola"),
+    ("pf_dora", "Portuguese female — Dora"),
+    ("pm_alex", "Portuguese male — Alex"),
+    ("pm_santa", "Portuguese male — Santa"),
+];
 
-fn piper_record(v: &PiperVoice) -> ModelRecord {
-    let model_url = format!("{PIPER_BASE}{}/{}", v.hf_path, v.model_filename);
-    let config_url = format!("{PIPER_BASE}{}/{}", v.hf_path, v.config_filename);
-    ModelRecord {
-        id: ModelRecord::id_for(&ModelCategory::TtsPiper, v.name),
-        category: ModelCategory::TtsPiper,
-        name: v.name.to_string(),
-        filename: Some(v.model_filename.to_string()),
-        description: v.description.to_string(),
-        size_mb: v.size_mb,
-        url: Some(model_url),
-        hf_id: None,
-        ram_estimate_mb: None,
-        recommended_role: Some("tts".to_string()),
-        context_length: None,
-        quantization: None,
-        asr_language: None,
-        asr_size: None,
-        tts_engine: Some("piper".to_string()),
-        tts_voice_name: None,
-        config_filename: Some(v.config_filename.to_string()),
-        config_url: Some(config_url),
-        tts_url: None,
-        sample_rate: Some(22050),
-        downloaded: false,
-        is_custom: false,
-    }
-}
-
-fn piper_tts_models() -> Vec<ModelRecord> {
-    let voices = vec![
-        PiperVoice {
-            name: "en-lessac-medium",
-            model_filename: "en_US-lessac-medium.onnx",
-            config_filename: "en_US-lessac-medium.onnx.json",
-            hf_path: "en/en_US/lessac/medium",
-            size_mb: 63,
-            description: "Piper en_US-lessac medium female (~63 MB) — recommended",
-        },
-        PiperVoice {
-            name: "en-lessac-high",
-            model_filename: "en_US-lessac-high.onnx",
-            config_filename: "en_US-lessac-high.onnx.json",
-            hf_path: "en/en_US/lessac/high",
-            size_mb: 254,
-            description: "Piper en_US-lessac high quality female (~254 MB)",
-        },
-        PiperVoice {
-            name: "en-ryan-medium",
-            model_filename: "en_US-ryan-medium.onnx",
-            config_filename: "en_US-ryan-medium.onnx.json",
-            hf_path: "en/en_US/ryan/medium",
-            size_mb: 63,
-            description: "Piper en_US-ryan medium male (~63 MB)",
-        },
-        PiperVoice {
-            name: "en-ryan-high",
-            model_filename: "en_US-ryan-high.onnx",
-            config_filename: "en_US-ryan-high.onnx.json",
-            hf_path: "en/en_US/ryan/high",
-            size_mb: 254,
-            description: "Piper en_US-ryan high quality male (~254 MB)",
-        },
-        PiperVoice {
-            name: "en-jenny-dioco-medium",
-            model_filename: "en_GB-jenny_dioco-medium.onnx",
-            config_filename: "en_GB-jenny_dioco-medium.onnx.json",
-            hf_path: "en/en_GB/jenny_dioco/medium",
-            size_mb: 63,
-            description: "Piper en_GB-jenny_dioco medium British female (~63 MB)",
-        },
-        PiperVoice {
-            name: "fr-siwis-medium",
-            model_filename: "fr_FR-siwis-medium.onnx",
-            config_filename: "fr_FR-siwis-medium.onnx.json",
-            hf_path: "fr/fr_FR/siwis/medium",
-            size_mb: 63,
-            description: "Piper fr_FR-siwis medium female (~63 MB)",
-        },
-        PiperVoice {
-            name: "de-thorsten-medium",
-            model_filename: "de_DE-thorsten-medium.onnx",
-            config_filename: "de_DE-thorsten-medium.onnx.json",
-            hf_path: "de/de_DE/thorsten/medium",
-            size_mb: 63,
-            description: "Piper de_DE-thorsten medium male (~63 MB)",
-        },
-        PiperVoice {
-            name: "sw-biblia-medium",
-            model_filename: "sw_CD-biblia_takatifu-medium.onnx",
-            config_filename: "sw_CD-biblia_takatifu-medium.onnx.json",
-            hf_path: "sw/sw_CD/biblia_takatifu/medium",
-            size_mb: 63,
-            description: "Piper sw_CD-biblia_takatifu medium Swahili (~63 MB)",
-        },
-    ];
-    voices.iter().map(piper_record).collect()
+/// One catalogue row per Kokoro voice.
+///
+/// A voice is a 522 KB style table, not a model — every voice shares the same
+/// engine weights. `size_mb: 1` is that half-megabyte rounded up, and it is why
+/// switching voice is cheap enough for the settings screen to preview on every
+/// change.
+fn kokoro_tts_voices() -> Vec<ModelRecord> {
+    KOKORO_VOICES
+        .iter()
+        .map(|(id, description)| ModelRecord {
+            id: ModelRecord::id_for(&ModelCategory::TtsKokoro, id),
+            category: ModelCategory::TtsKokoro,
+            name: id.to_string(),
+            filename: Some(format!("{id}.bin")),
+            description: description.to_string(),
+            size_mb: 1,
+            url: Some(format!("{KOKORO_BASE}{id}.bin")),
+            hf_id: None,
+            ram_estimate_mb: None,
+            recommended_role: Some("tts".to_string()),
+            context_length: None,
+            quantization: None,
+            asr_language: None,
+            asr_size: None,
+            tts_engine: Some("kokoro".to_string()),
+            tts_voice_name: Some(id.to_string()),
+            config_filename: None,
+            config_url: None,
+            tts_url: None,
+            sample_rate: Some(24_000),
+            downloaded: false,
+            is_custom: false,
+        })
+        .collect()
 }
 
 // ── Llamafile ─────────────────────────────────────────────────────────────────

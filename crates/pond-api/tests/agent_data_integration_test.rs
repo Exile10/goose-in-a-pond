@@ -169,6 +169,7 @@ async fn make_app_full(
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".into(),
         tts: None,
+        tts_control: None,
         // Real repository, not the mock: these tests assert that deleting the
         // primary member clears the settings row that names them, and an
         // in-memory settings store cannot show that.
@@ -181,6 +182,7 @@ async fn make_app_full(
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         vector_index: None,
+        index_reindex: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -466,6 +468,7 @@ async fn prompt_template_delete_system_returns_403() {
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".into(),
         tts: None,
+        tts_control: None,
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(NoDevices),
@@ -473,6 +476,7 @@ async fn prompt_template_delete_system_returns_403() {
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         vector_index: None,
+        index_reindex: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -950,6 +954,7 @@ async fn returns_501_when_repos_not_configured() {
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".into(),
         tts: None,
+        tts_control: None,
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(NoDevices),
@@ -957,6 +962,7 @@ async fn returns_501_when_repos_not_configured() {
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         vector_index: None,
+        index_reindex: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,

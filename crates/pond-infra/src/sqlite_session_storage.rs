@@ -1832,7 +1832,10 @@ mod tests {
         }
 
         assert_eq!(
-            s.first_assistant_message("sess-1").await.unwrap().as_deref(),
+            s.first_assistant_message("sess-1")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("It is just past nine."),
         );
         // The user's opening line still belongs to the title fallback.

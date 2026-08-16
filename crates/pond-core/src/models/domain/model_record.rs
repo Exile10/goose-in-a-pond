@@ -21,8 +21,21 @@ pub enum ModelCategory {
     Ollama,
     /// Whisper GGUF for speech-to-text.
     Whisper,
-    /// Piper TTS — ONNX binary + config file, spawned as subprocess.
+    /// Piper TTS — ONNX binary + config file. **Legacy.**
+    ///
+    /// Kokoro replaced Piper as the engine and nothing seeds these any more.
+    /// The variant stays so installs that predate the swap can still read their
+    /// existing catalogue rows and the voices sitting in `models/tts/`:
+    /// dropping it would make `from_str("tts_piper")` return `None` and those
+    /// rows would fail to load rather than simply being unused.
     TtsPiper,
+    /// Kokoro TTS voice — a 522 KB style vector (`<voice>.bin`).
+    ///
+    /// Unlike Piper, a Kokoro "voice" is not a model: every voice shares one
+    /// set of engine weights and differs only by a style table. That is why a
+    /// voice here costs half a megabyte, and why the quality tier (which picks
+    /// the shared `.onnx`) is a separate setting rather than another voice.
+    TtsKokoro,
     /// HTTP TTS server (OpenAI-compatible /v1/audio/speech).
     TtsHttp,
     /// Sentence embedding model (ONNX, e.g. all-MiniLM-L6-v2 via fastembed).
@@ -37,6 +50,7 @@ impl ModelCategory {
             Self::Ollama => "ollama",
             Self::Whisper => "whisper",
             Self::TtsPiper => "tts_piper",
+            Self::TtsKokoro => "tts_kokoro",
             Self::TtsHttp => "tts_http",
             Self::Embedding => "embedding",
         }
@@ -49,6 +63,7 @@ impl ModelCategory {
             "ollama" => Some(Self::Ollama),
             "whisper" => Some(Self::Whisper),
             "tts_piper" | "tts" => Some(Self::TtsPiper),
+            "tts_kokoro" => Some(Self::TtsKokoro),
             "tts_http" => Some(Self::TtsHttp),
             "embedding" => Some(Self::Embedding),
             _ => None,
@@ -87,7 +102,7 @@ impl ModelCategory {
 
     /// True for text-to-speech models.
     pub fn is_tts(&self) -> bool {
-        matches!(self, Self::TtsPiper | Self::TtsHttp)
+        matches!(self, Self::TtsPiper | Self::TtsKokoro | Self::TtsHttp)
     }
 
     /// True for sentence embedding models.

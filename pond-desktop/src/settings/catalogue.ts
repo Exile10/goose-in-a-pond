@@ -238,7 +238,16 @@ export const CATALOGUE: CatalogueCategory[] = [
         name: "Speaking",
         entries: [
           { key: "voice_tts_voice", label: "Voice", control: { kind: "lookup", source: "tts-voices", placeholder: "Choose a downloaded voice" }, consumer: "live" },
-          { key: "active_tts_model", label: "Speech model", control: { kind: "text", placeholder: "piper-lessac" }, consumer: "live" },
+          // Pace is the engine's `speed` multiplier, not a percentage — stored
+          // exactly as the model takes it so there is no conversion to get
+          // backwards between here and the synthesiser.
+          { key: "voice_tts_speed", label: "Speaking pace", control: { kind: "number", step: 0.05, min: 0.5, max: 2 }, consumer: "live", validate: range(0.5, 2) },
+          { key: "voice_tts_quality", label: "Voice quality", control: { kind: "text", placeholder: "q8" }, consumer: "live" },
+          // No `note`: notes are reserved for controls that are not connected,
+          // and this one is. What the tone is for is said in the Voice view's
+          // row subtitle, where an explanation does not double as a warning.
+          { key: "voice_thinking_tone_enabled", label: "Sound while it thinks", control: { kind: "toggle" }, consumer: "live" },
+          { key: "active_tts_model", label: "Speech model", control: { kind: "text", placeholder: "af_heart" }, consumer: "live" },
           { key: "voice_max_turns", label: "Steps before answering aloud", control: { kind: "number", min: 0, max: 50 }, consumer: "live", proposed: true, validate: all(integer, range(0, 50)) },
         ],
       },

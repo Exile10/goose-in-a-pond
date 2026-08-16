@@ -14,7 +14,7 @@ import type {
 } from "./VoiceBackend";
 import {
   encodeWav, calculateRms, downsampleTo16k, getAudioContext, closeAudioContext,
-  playPingTone, splitSentences, stripMarkdown, normalizeForSpeech,
+  playPingTone, playThinkingTone, splitSentences, stripMarkdown, normalizeForSpeech,
   isWhisperArtifact, checkDismissal, getToolAnnouncement, getQuip,
   filterThinkingFull, createVadState, advanceVad, DEFAULT_VAD_CONFIG,
   registerTtsSource, clearTtsSource, stopTtsPlayback, isTtsInterrupted, resetTtsInterrupt,
@@ -72,6 +72,12 @@ export class WebVoiceBackend implements VoiceBackend {
   private pipelineActive = false;
   private abortController: AbortController | null = null;
   private ttsSource: AudioBufferSourceNode | null = null;
+  /**
+   * Stop function for the ambient working tone, or null when no tone is
+   * playing — which covers both "not started yet" and "switched off in
+   * settings", so every teardown path can call it the same way.
+   */
+  private stopThinkingFn: (() => void) | null = null;
   private recording: RecordingContext | null = null;
   private wakeActive = false;
   private wakeDetecting = false;
@@ -265,16 +271,22 @@ export class WebVoiceBackend implements VoiceBackend {
       this.onTranscript?.(text);
       this.onStateChange?.("thinking");
 
-      // Concurrent quip while the LLM streams
+      // Concurrent quip + thinking tone while the LLM streams
       let quipDone = false;
       void this.playTtsSentence(getQuip(), ac.signal).catch(() => {}).then(() => { quipDone = true; });
+      // `!== false` rather than a truthiness test: an absent flag means the
+      // settings load has not resolved, and that should sound normal, not mute.
+      const stopThink = opts.thinkingTone !== false ? playThinkingTone() : null;
+      this.stopThinkingFn = stopThink;
 
       // Step 2: SSE chat stream (passes pre-started speculative response if any)
       await this.streamChat(text, opts, ac, () => {
+        stopThink?.(); this.stopThinkingFn = null;
         // Stop quip if still playing so first real sentence starts immediately
         if (!quipDone) { stopTtsPlayback(); resetTtsInterrupt(); }
       }, preStartedLlm);
 
+      if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
       if (!this.cancelled) this.onStateChange?.("idle");
     } catch (err) {
       if (this.cancelled || (err as Error).name === "AbortError") return;
@@ -285,6 +297,7 @@ export class WebVoiceBackend implements VoiceBackend {
       this.pipelineActive = false;
       this.wakeDetecting = false;
       this.abortController = null;
+      if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
       // Restart the wake listener (it was killed when detection fired).
       if (this._wakeWord && !this.cancelled) {
         this.startWakeListener(this._wakeWord, this._wakeNorm.slice(1));
@@ -300,6 +313,7 @@ export class WebVoiceBackend implements VoiceBackend {
     // which fires onWakeDetected → runPipeline, and finally restarts the listener.
     this.abortController?.abort(); this.abortController = null;
     if (this.speculativeLlm) { this.speculativeLlm.abort.abort(); this.speculativeLlm = null; }
+    if (this.stopThinkingFn) { this.stopThinkingFn(); this.stopThinkingFn = null; }
     // Stop any in-progress TTS: kills the active source, resolves pending
     // promises, and sets the interrupted flag so queued sentences are skipped.
     stopTtsPlayback();

@@ -67,6 +67,7 @@ async fn make_harness() -> Harness {
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".into(),
         tts: None,
+        tts_control: None,
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(MockDeviceRegistry),
@@ -82,6 +83,7 @@ async fn make_harness() -> Harness {
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         vector_index: None,
+        index_reindex: None,
         // The real store, so the aggregate SQL and the TEXT range comparison
         // are what the assertions actually exercise.
         sensor_storage: Arc::new(SqliteSensorStorage::new(logs.clone())),

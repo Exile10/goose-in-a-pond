@@ -31,7 +31,7 @@ function describeVoice(entry: ModelEntry): { label: string; sub: string } {
 
 /**
  * Quick voice-switcher popover for the voice-mode header. Lists the real
- * Piper catalog (not the fictional onboarding TTS_VOICES list) via
+ * model catalog (real installed voices, not a hardcoded list) via
  * api.listModels(); only entries already downloaded are selectable — picking
  * one activates it exactly as Models.tsx's TTS panel does. Follows
  * SessionDropdown.tsx's convention: trigger-owned open state, outside-click
@@ -60,7 +60,11 @@ export function VoiceSwitcher({ isOpen, onClose }: Props) {
       .then(([models, settings]) => {
         setVoices(
           models.filter(
-            (m) => m.provider === "tts" || m.provider === "tts_piper" || m.provider === "tts_http",
+            (m) =>
+              m.provider === "tts" ||
+              m.provider === "tts_piper" ||
+              m.provider === "tts_kokoro" ||
+              m.provider === "tts_http",
           ),
         );
         setActiveFilename(settings.voice_tts_voice ?? null);
@@ -73,7 +77,8 @@ export function VoiceSwitcher({ isOpen, onClose }: Props) {
     setSwitching(entry.name);
     setError(null);
     try {
-      await api.activateModel(entry.provider, entry.name, "tts");
+      // `category`, not `provider` — see the note in sections/Models.tsx.
+      await api.activateModel(entry.category ?? entry.provider, entry.name, "tts");
       setActiveFilename(entry.filename ?? null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

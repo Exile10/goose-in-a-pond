@@ -16,8 +16,10 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { Button } from "@heroui/react";
-import { ChevronLeft, ChevronUp, ChevronDown, Mic, Square, Trash2, Radio, Volume2, RotateCcw } from "lucide-react";
+import { ChevronLeft, Mic, Square, Trash2, Radio, Volume2, RotateCcw } from "lucide-react";
 import { VoiceOrb } from "../../components/VoiceOrb";
+import { VoiceStream } from "./VoiceStream";
+import { api } from "../../api/PondApiClient";
 import { TranscriptFeed } from "../../components/TranscriptFeed";
 import { VoiceSwitcher } from "../../components/VoiceSwitcher";
 import { useAppState, useAppDispatch } from "../../state/AppContext";
@@ -84,7 +86,6 @@ function VoiceModeChildProcess() {
   const isError     = voiceState === "error";
   const serverDown  = !state.serverOnline;
   const [isSwitcherOpen, setSwitcherOpen] = useState(false);
-  const [transcriptOpen, setTranscriptOpen] = useState(false);
 
   // Fire a one-shot flash on the orb the moment the child confirms it heard
   // the wake word (wait -> recording), so wake-word detection has a visible
@@ -108,6 +109,32 @@ function VoiceModeChildProcess() {
   // undefined), and too fast for any session to survive long enough to do
   // anything.
   const pendingStopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ── Conversation name ──────────────────────────────────────
+  // The heading answers "which conversation is this?", so it has to be the
+  // name a person would use. A truncated uuid answered "which row is this?" —
+  // a question nobody in a voice conversation is asking.
+  //
+  // The server names a session a turn or two in, so this refetches as the
+  // conversation grows rather than only on mount. Until a name exists the
+  // fallback states the truth plainly instead of inventing one.
+  const [title, setTitle] = useState<string | null>(null);
+  const turnCount = state.transcript.filter((m) => m.role === "user").length;
+
+  useEffect(() => {
+    const sid = state.sessionId;
+    if (!sid) { setTitle(null); return; }
+    let cancelled = false;
+    api.listSessions()
+      .then((sessions) => {
+        if (cancelled) return;
+        const mine = sessions.find((s) => s.id === sid);
+        const named = mine?.title?.trim();
+        setTitle(named ? named : null);
+      })
+      .catch(() => { /* offline — the fallback heading still reads correctly */ });
+    return () => { cancelled = true; };
+  }, [state.sessionId, turnCount]);
 
   useEffect(() => {
     if (pendingStopRef.current !== null) {
@@ -140,13 +167,6 @@ function VoiceModeChildProcess() {
     ? STATE_COLORS.connecting
     : STATE_COLORS[voiceState] ?? "#8E8E93";
 
-  const lastMsg = state.transcript.length > 0
-    ? state.transcript[state.transcript.length - 1]
-    : null;
-  const showCaption =
-    lastMsg !== null &&
-    (voiceState === "recording" || voiceState === "thinking" || voiceState === "speaking");
-
   function backToGui() {
     dispatch({ type: "SET_MODE", payload: "gui" });
   }
@@ -154,83 +174,62 @@ function VoiceModeChildProcess() {
   return (
     <div className="vm-root">
 
-      {/* Header */}
+      {/* Header — no rule beneath it. The screen is one continuous field, and
+          a divider here cut the conversation into stacked panels. */}
       <div className="vm-header">
         <Button variant="ghost" size="sm" onPress={backToGui} aria-label="Back">
           <ChevronLeft size={14} /> Back
         </Button>
-        {state.sessionId && (
-          <span className="vm-session-hint">Session {state.sessionId.slice(0, 6)}</span>
-        )}
-        <Button
-          variant="ghost" size="sm"
-          onPress={() => setSwitcherOpen((o) => !o)}
-          aria-label="Switch voice"
-        >
-          <Volume2 size={13} />
-        </Button>
-        <VoiceSwitcher isOpen={isSwitcherOpen} onClose={() => setSwitcherOpen(false)} />
-        <Button
-          variant="ghost" size="sm"
-          onPress={session.clearConversation}
-          isDisabled={state.transcript.length === 0}
-          aria-label="Clear conversation"
-        >
-          <Trash2 size={13} />
-        </Button>
+        <div className="vm-header__actions">
+          <Button
+            variant="ghost" size="sm"
+            onPress={() => setSwitcherOpen((o) => !o)}
+            aria-label="Switch voice"
+          >
+            <Volume2 size={13} />
+          </Button>
+          <VoiceSwitcher isOpen={isSwitcherOpen} onClose={() => setSwitcherOpen(false)} />
+          <Button
+            variant="ghost" size="sm"
+            onPress={session.clearConversation}
+            isDisabled={state.transcript.length === 0}
+            aria-label="Clear conversation"
+          >
+            <Trash2 size={13} />
+          </Button>
+        </div>
       </div>
 
-      {/* Stage: orb + state label + live caption. Full scrollback lives in
-          the drawer below, collapsed by default — it pushes this stage's
-          available height when open (the orb recenters) rather than
-          overlaying or resizing the orb itself. */}
-      <div className="vm-stage">
-        <VoiceOrb
-          state={isConnecting ? "idle" : voiceState}
-          size="xl"
-          audioLevel={session.audioLevel}
-          pulseKey={pulseKey}
-        />
+      <h1 className="vm-title" title={title ?? undefined}>
+        {title ?? "New conversation"}
+      </h1>
 
-        <div className="vm-state-row">
-          {isConnecting && (
-            <Radio size={14} style={{ color: "var(--color-accent)", opacity: 0.8 }} />
-          )}
-          <span className="vm-state-label" style={{ color: stateColor }}>
-            {stateLabel}
-          </span>
+      {/* The field: the conversation the orb sits in. One scroll container,
+          three columns — what the pond said on the left, what you said on the
+          right, and a reserved channel down the middle the orb occupies. The
+          conversation parts around it instead of being filed away in a drawer. */}
+      <div className="vm-field">
+        <div className="vm-orb-layer" aria-hidden={false}>
+          <VoiceOrb
+            state={isConnecting ? "idle" : voiceState}
+            size="xl"
+            audioLevel={session.audioLevel}
+            pulseKey={pulseKey}
+          />
+
+          <div className="vm-state-row">
+            {isConnecting && (
+              <Radio size={14} style={{ color: "var(--color-accent)", opacity: 0.8 }} />
+            )}
+            <span className="vm-state-label" style={{ color: stateColor }}>
+              {stateLabel}
+            </span>
+          </div>
         </div>
 
-        {showCaption && (
-          <p className={`vm-live-caption vm-live-caption--${lastMsg!.role}`}>
-            {lastMsg!.text || "…"}
-          </p>
-        )}
-      </div>
-
-      {/* Transcript drawer: tap to reveal scrollback, capped height so it
-          can never crowd the orb out. */}
-      {state.transcript.length > 0 && (
-        <button
-          type="button"
-          className="vm-transcript-tab"
-          onClick={() => setTranscriptOpen((o) => !o)}
-          aria-expanded={transcriptOpen}
-          aria-controls="vm-transcript-panel"
-        >
-          {transcriptOpen ? <ChevronDown size={13} /> : <ChevronUp size={13} />}
-          Transcript
-        </button>
-      )}
-      <div
-        id="vm-transcript-panel"
-        className={`vm-transcript-drawer${transcriptOpen ? " is-open" : ""}`}
-      >
-        <TranscriptFeed
+        <VoiceStream
           messages={state.transcript}
           contextCards={state.contextCards}
-          fillHeight
-          compact
         />
       </div>
 

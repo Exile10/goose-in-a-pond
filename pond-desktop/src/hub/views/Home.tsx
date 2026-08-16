@@ -1,143 +1,128 @@
-import { useState } from "react";
+// ────────────────────────────────────────────────────────────
+// Home — what needs me, then what's on.
+//
+// This screen answers two questions in that order and nothing else. The
+// suggestion is the only element that asks for anything; devices, weather and
+// music report. The voice entry sits last because it is how you say something
+// back, and the things you might say something about are above it.
+//
+// What used to be here and is deliberately gone: the sticky note, the to-do
+// widget, the routines row, the camera strip, the room pills, the category
+// dock, the ask-Goose bar and the header clock. Each was a reasonable thing to
+// want; together they made a screen you had to read rather than glance at.
+// Cameras, rooms and routines all still have their own destinations, reachable
+// from the rail — Home stopped being a copy of them.
+// ────────────────────────────────────────────────────────────
+
+import { useEffect } from "react";
+import { Mic } from "lucide-react";
 import { HubIco } from "../primitives/HubIco";
-import { HP_PATHS } from "../primitives/icons";
 import { DeviceTile } from "../primitives/DeviceTile";
-import { CameraFeed } from "../primitives/CameraFeed";
-import { RoomPills } from "../primitives/RoomPills";
-import { CategoryDock } from "../primitives/CategoryDock";
 import { WeatherWidget } from "../primitives/WeatherWidget";
-import { StickyNote } from "../primitives/StickyNote";
-import { TodoWidget } from "../primitives/TodoWidget";
-import { Scenes } from "../primitives/Scenes";
 import { NowPlaying } from "../primitives/NowPlaying";
-import { HubClock } from "../primitives/HubClock";
-import { PanelHead } from "../primitives/PanelHead";
-import { AskGoose } from "../primitives/AskGoose";
+import { resumeNowPlayingPolling } from "../state/hubDataStore";
+import { Suggestion } from "../primitives/Suggestion";
 import { useHomeData } from "../state/hubDataStore";
 import { formatHubDate, greetingForHour, useNow } from "../state/useNow";
+import { useAppState, useAppDispatch } from "../../state/AppContext";
 
-// Extra icons used only in the Home view header
+// Icons used only in this header.
 const HX = {
   chat: "M21 12a8 8 0 0 1-11.5 7.2L4 21l1.8-5.4A8 8 0 1 1 21 12z",
   bell: "M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9M10.3 21a1.94 1.94 0 0 0 3.4 0",
 };
+
+/** Devices shown at a glance. More than this is a device list, not a glance. */
+const GLANCE_LIMIT = 6;
 
 interface HomeViewProps {
   go?: (route: string) => void;
 }
 
 export function HomeView({ go }: HomeViewProps) {
-  const [room, setRoom] = useState("home");
   const home = useHomeData();
   const now = useNow();
+  const state = useAppState();
+  const dispatch = useAppDispatch();
 
-  const roomName = home.rooms.find((r) => r.id === room)?.name ?? "Home";
-  const favorites =
-    room === "home"
-      ? home.devices.slice(0, 6)
-      : home.devices.filter((d) => d.room === roomName);
+  // The second of the two ways a stopped now-playing poll comes back: the pond
+  // itself just used the music service, so whatever was refusing may not be any
+  // more. Lives here rather than in the widget because the reducer is pure and
+  // the widget is deliberately provider-free (its own tests mount it bare).
+  const musicToolCalls = state.contextCards.filter((c) =>
+    /music|spotify/i.test(c.tool),
+  ).length;
+  useEffect(() => {
+    if (musicToolCalls > 0) resumeNowPlayingPolling();
+  }, [musicToolCalls]);
 
   const greeting = greetingForHour(now.getHours());
+  const glance = home.devices.slice(0, GLANCE_LIMIT);
 
   return (
-    <div className="home2">
-      {/* header */}
-      <header className="home2__head">
+    <div className="home">
+      <header className="home__head">
         <div>
-          <div className="hub-greet">
+          <h1 className="home__greet">
             {greeting}, <span>{home.user}</span>
-          </div>
-          <div className="home2__sub">
+          </h1>
+          <p className="home__sub">
             {formatHubDate(now)} · {home.weather.cond}, {home.weather.temp}°
-          </div>
+          </p>
         </div>
-        <div className="home2__head-actions">
+        <div className="home__head-actions">
           <button
-            className="home2__iconbtn"
+            className="home__iconbtn"
             onClick={() => go?.("chat")}
             aria-label="Open chat"
           >
             <HubIco d={HX.chat} size={20} color="var(--pp)" />
           </button>
           <button
-            className="home2__iconbtn"
-            aria-label="Notifications"
+            className="home__iconbtn"
             onClick={() => go?.("notifications")}
+            aria-label="Notifications"
           >
             <HubIco d={HX.bell} size={20} color="var(--pp)" />
           </button>
-          <HubClock />
         </div>
       </header>
 
-      {/* ask goose */}
-      <AskGoose go={go} />
+      {/* The one thing that asks. */}
+      <Suggestion sessionId={state.sessionId} />
 
-      {/* room pills */}
-      <RoomPills value={room} onChange={setRoom} />
-
-      {/* main grid: content + ambient sidebar */}
-      <div className="home2__grid">
-        <div className="home2__main">
-          {/* favorites */}
-          <section className="gpanel">
-            <PanelHead
-              title={room === "home" ? "Favorites" : roomName}
-              action={
-                <button className="ghost-btn" onClick={() => go?.("rooms")}>
-                  <HubIco d={HP_PATHS.sliders} size={13} color="var(--pp)" /> Manage
-                </button>
-              }
-            />
-            {favorites.length > 0 ? (
-              <div className="home2__tiles">
-                {favorites.map((d) => (
-                  <DeviceTile key={d.id} device={d} />
-                ))}
-              </div>
-            ) : (
-              <div className="home2__empty">No devices in {roomName} yet.</div>
-            )}
-          </section>
-
-          {/* cameras */}
-          <section className="gpanel">
-            <PanelHead
-              title="Cameras"
-              action={
-                <button className="ghost-btn" onClick={() => go?.("cameras")}>
-                  All <HubIco d={HP_PATHS.chevR} size={13} color="var(--pp)" />
-                </button>
-              }
-            />
-            <div className="home2__cams">
-              {home.cameras.map((c) => (
-                <CameraFeed key={c.id} cam={c} h={132} big />
+      <div className="home__grid">
+        <section className="home__devices">
+          <h2 className="home__label">Devices</h2>
+          {glance.length > 0 ? (
+            <div className="home__tiles">
+              {glance.map((d) => (
+                <DeviceTile key={d.id} device={d} />
               ))}
             </div>
-          </section>
+          ) : (
+            // An empty screen is an invitation: name the next move rather than
+            // report that a list is empty.
+            <button className="home__empty" onClick={() => go?.("rooms")}>
+              Add your first device
+            </button>
+          )}
+        </section>
 
-          {/* routines */}
-          <section>
-            <div className="home2__sectlabel">Routines</div>
-            <Scenes layout="row" />
-          </section>
-        </div>
-
-        {/* ambient sidebar */}
-        <aside className="home2__aside">
+        <aside className="home__aside">
           <WeatherWidget />
-          <div className="gpanel gpanel--padded">
-            <PanelHead title="Now Playing" />
-            <NowPlaying variant="tile" />
-          </div>
-          <StickyNote />
-          <TodoWidget />
+          <NowPlaying variant="tile" />
         </aside>
       </div>
 
-      {/* category dock */}
-      <CategoryDock />
+      {/* Last, because it is how you answer everything above it. */}
+      <button
+        className="home__talk"
+        onClick={() => dispatch({ type: "SET_MODE", payload: "voice" })}
+      >
+        <Mic size={16} strokeWidth={2.2} />
+        Start talking
+      </button>
     </div>
   );
 }

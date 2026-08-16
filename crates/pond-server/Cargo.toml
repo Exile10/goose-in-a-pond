@@ -56,6 +56,19 @@ face-onnx = ["dep:pond-adapters-face-onnx"]
 # face-onnx (ORT_DYLIB_PATH). Off = events stay plain "motion".
 # cargo run -p pond-server --features vision-onnx -- serve
 vision-onnx = ["dep:pond-adapters-vision-onnx"]
+# There is deliberately no `system-ort` feature here to dlopen the ONNX Runtime
+# rather than link it. One was written and reverted: this binary depends on
+# pond-infra, pond-infra depends on fastembed, and the root Cargo.toml gives
+# fastembed `ort-load-dynamic` — so `ort-sys/disable-linking` is already on in
+# every build of pond-server. `cargo tree -p pond-server -e features -i ort`
+# resolves the same 17 ort features with and without such a switch; it would
+# have promised a change it cannot make.
+#
+# This does NOT generalise to the adapter crates. `cargo test -p
+# pond-adapters-kokoro` on its own has no fastembed in the graph and therefore
+# statically links a prebuilt ONNX Runtime — which fails outright on JetPack 6.
+# That is what pond-adapters-kokoro's own `system-ort` feature is for; its
+# Cargo.toml carries the full note.
 # Enable the private mesh transport (#132 Milestone 2): real libp2p
 # MeshTransport, gated behind settings.mesh_enabled at runtime. Kept optional
 # — full-feature libp2p (kad+gossipsub+relay+dcutr) is a materially heavier
@@ -104,7 +117,7 @@ pond-adapters-weather      = { workspace = true }
 pond-adapters-llamafile = { path = "../../crates/pond-adapters-llamafile" }
 pond-adapters-ollama = { path = "../../crates/pond-adapters-ollama" }
 pond-adapters-whisper = { path = "../../crates/pond-adapters-whisper" }
-pond-adapters-piper = { path = "../../crates/pond-adapters-piper" }
+pond-adapters-kokoro = { path = "../../crates/pond-adapters-kokoro" }
 pond-audio = { path = "../pond-audio" }
 cpal = "0.15"
 pond-mcp-server    = { path = "../pond-mcp-server" }

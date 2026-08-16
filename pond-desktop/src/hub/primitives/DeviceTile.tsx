@@ -34,7 +34,16 @@ export function DeviceTile({ device, size = "md" }: DeviceTileProps) {
   const k = device.kind;
   const { on, locked, target = 70 } = st;
 
-  // Resolve visual state
+  // Resolve visual state.
+  //
+  // One material, two states. An active tile is INK — the same near-black on
+  // every kind — and an inactive one is paper. The four saturated gradients
+  // this replaced (amber lights, blue locks, orange thermostat, teal plugs)
+  // encoded kind, which the icon and the name already say, while leaving the
+  // thing you actually scan for — is it on? — to be inferred from which hue
+  // happened to be showing. Inversion reads at a glance and needs nothing
+  // learned, and it hands the page's only colour back to the one control that
+  // asks for a decision.
   let active = false;
   let bg = "var(--tile-bg,#fff)";
   let fg = "var(--tile-fg,#18181B)";
@@ -47,38 +56,26 @@ export function DeviceTile({ device, size = "md" }: DeviceTileProps) {
   if (k === "light") {
     active = on;
     if (on) {
-      bg = "linear-gradient(150deg,#FBBF24,#F59E0B)";
-      fg = "#fff";
-      sub = "rgba(255,255,255,.9)";
-      accentIcon = "#fff";
+      accentIcon = "var(--pp)";
     }
     iconEl = on ? HP_PATHS.bulb : HP_PATHS.bulbOff;
     statusText = on ? `On · ${st.brightness}%` : "Off";
   } else if (k === "lock") {
     active = locked;
     if (locked) {
-      bg = "linear-gradient(150deg,#3B82F6,#2563EB)";
-      fg = "#fff";
-      sub = "rgba(255,255,255,.9)";
-      accentIcon = "#fff";
+      accentIcon = "var(--pp)";
     }
     iconEl = locked ? lockEl : unlockEl;
     statusText = locked ? "Locked" : "Unlocked";
   } else if (k === "thermo") {
     active = true;
-    bg = "linear-gradient(150deg,#FB923C,#EA580C)";
-    fg = "#fff";
-    sub = "rgba(255,255,255,.92)";
-    accentIcon = "#fff";
+    accentIcon = "var(--pp)";
     iconEl = HP_PATHS.flame;
     statusText = `${st.mode} to ${target}°`;
   } else if (k === "plug") {
     active = on;
     if (on) {
-      bg = "linear-gradient(150deg,#2DD4BF,#0D9488)";
-      fg = "#fff";
-      sub = "rgba(255,255,255,.9)";
-      accentIcon = "#fff";
+      accentIcon = "var(--pp)";
     }
     iconEl = HP_PATHS.plug;
     statusText = on ? `On · ${st.watts}W` : "Off";

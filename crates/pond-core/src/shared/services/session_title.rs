@@ -435,7 +435,9 @@ impl SessionTitleService {
         // that is the difference between a cheap call and an expensive one.
         let (summary, _) = self.storage.get_rolling_summary(session_id).await?;
         let evidence = match summary {
-            Some(s) if !s.trim().is_empty() => format!("Summary of the conversation:\n{}", s.trim()),
+            Some(s) if !s.trim().is_empty() => {
+                format!("Summary of the conversation:\n{}", s.trim())
+            }
             _ => transcript_evidence(&messages),
         };
 
@@ -927,12 +929,7 @@ mod tests {
             assert_eq!(provider.calls(), 1);
         }
 
-        async fn seed_more(
-            storage: &InMemorySessionStorage,
-            session: &str,
-            from: usize,
-            n: usize,
-        ) {
+        async fn seed_more(storage: &InMemorySessionStorage, session: &str, from: usize, n: usize) {
             for i in from..from + n {
                 storage
                     .add_message(

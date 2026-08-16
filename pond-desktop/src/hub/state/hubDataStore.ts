@@ -295,48 +295,57 @@ const NOW_PLAYING_TICK_MS = 10_000;
 const BACKOFF_TICKS = 30;
 
 /**
- * Does this answer mean "stop asking so often"?
+ * Consecutive 4XX answers before the poll stops entirely.
  *
- * The widget polls every ten seconds and a GIAP dashboard is typically left
- * open for days, so an answer that cannot change without somebody doing
- * something costs ~8,600 pointless requests a day — and every one of them is a
- * round trip the server makes to Spotify on our behalf.
- *
- * The server's own messages draw the line. `unauthorized` says to sign in
- * again, `forbidden` says to add the account to the app or set a client id,
- * and `network_refused` needs the egress setting changed: all of them wait on
- * a person. `rate_limited` says playback "should reappear shortly" and
- * `unavailable` is whatever Spotify was doing at the time — those clear
- * themselves, so they keep polling.
- *
- * A transport failure (`null` here) is NOT a refusal. The server may simply be
- * restarting, and giving up on it would leave the widget dead until the app is
- * relaunched.
+ * A 4XX from Spotify is a refusal that waits on a person: sign in again, add
+ * the account to the app, set a client id. Retrying it on a timer cannot fix
+ * it, and a dashboard left open for days spends ~8,600 requests a day finding
+ * that out.
  */
-function unrecoverableReason(np: NowPlayingApiResponse | null): string | null {
-  if (!np) return null;
-  // Checked before `connected`, because `network_refused` arrives WITH
-  // `connected: false` and the specific reason is the more useful one to log.
-  if (np.error === "unauthorized" || np.error === "forbidden" || np.error === "network_refused") {
-    return np.error;
-  }
-  if (!np.connected) return "not_connected";
-  return null;
+const STOP_AFTER_4XX = 5;
+
+/** Consecutive 4XX answers seen so far. */
+let fourXxRun = 0;
+
+/** True once the run hit the limit; only an interaction clears it. */
+let nowPlayingStopped = false;
+
+/**
+ * Is this answer a real 4XX?
+ *
+ * Deliberately narrower than "did it fail". `upstream_status` is only present
+ * when Spotify actually answered, so a transport failure (`np === null`), a
+ * refused egress call, or a 5xx outage all return false and leave the counter
+ * where it is. Stopping on those would mean a pond restarting mid-poll
+ * silences its own music widget until somebody notices and taps it.
+ */
+function isClientRefusal(np: NowPlayingApiResponse | null): boolean {
+  const status = np?.upstream_status;
+  return typeof status === "number" && status >= 400 && status < 500;
 }
 
 /**
- * Should this tick actually ask Spotify?
+ * Resume polling, and forget the run that stopped it.
  *
- * Slowed, not stopped: a tick while backed off is usually skipped, but one in
- * every [`BACKOFF_TICKS`] goes through, so a Spotify that gets fixed is noticed
- * without anybody pressing anything. The direct callers — visibility, a
- * dashboard refresh, the widget's Try again — bypass this entirely and ask
- * straight away.
- *
- * Advances the counter as a side effect, so it is the tick itself and must be
- * called exactly once per tick.
+ * Two callers, and they are the two the stop rule depends on existing: the
+ * widget's own controls (somebody touched it, so they are watching and can see
+ * the result) and a Music MCP tool call (the pond just engaged the service, so
+ * whatever was refusing may not be any more). Without both of these a stop is
+ * unrecoverable — the transport controls are disabled in exactly the state
+ * that would need them, and a webview reload only happens on app start.
  */
+export function resumeNowPlayingPolling(): void {
+  fourXxRun = 0;
+  nowPlayingStopped = false;
+  nowPlayingBackoff = null;
+  backoffTicks = 0;
+}
+
 function dueForNowPlayingPoll(): boolean {
+  // Stopped is stopped. Unlike the backoff below this never lets a tick
+  // through, because the condition cannot clear on its own — see
+  // `resumeNowPlayingPolling`.
+  if (nowPlayingStopped) return false;
   if (!nowPlayingBackoff) return true;
   backoffTicks += 1;
   if (backoffTicks < BACKOFF_TICKS) return false;
@@ -345,28 +354,29 @@ function dueForNowPlayingPoll(): boolean {
 }
 
 /**
- * Record the poll's cadence, and say so once when it changes.
+ * Record what this answer did to the poll, and say so once when it changes.
  *
- * Logged on the transition only. "Why is my music widget slow to update" is
- * otherwise a silent mystery, and repeating it every ten seconds would be the
- * polling this exists to prevent, in the console.
+ * A run of 4XX stops it; anything else resets the run, so five refusals spread
+ * across a week of healthy polling never accumulate into a stop.
  */
 function setNowPlayingBackoff(np: NowPlayingApiResponse | null): void {
-  const reason = unrecoverableReason(np);
-  if (reason !== nowPlayingBackoff) {
-    if (reason) {
+  if (isClientRefusal(np)) {
+    fourXxRun += 1;
+    if (fourXxRun >= STOP_AFTER_4XX && !nowPlayingStopped) {
+      nowPlayingStopped = true;
+      nowPlayingBackoff = np?.error ?? "client_refusal";
       console.info(
-        `Now-playing polling slowed to every ${(BACKOFF_TICKS * NOW_PLAYING_TICK_MS) / 60_000} ` +
-          `minutes: ${reason}. Fixing it is noticed on its own, or immediately ` +
-          `via the widget's Try again.`,
+        `Now-playing polling stopped after ${STOP_AFTER_4XX} consecutive ` +
+          `${np?.upstream_status} answers: ${np?.error}. It resumes when you use the ` +
+          `widget, or when the pond next talks to the music service.`,
       );
     }
-    // Reset the counter on any change, so a conversation that recovers and
-    // fails again waits the full interval rather than retrying instantly.
-    backoffTicks = 0;
+    return;
   }
-  nowPlayingBackoff = reason;
+  // Any non-4XX answer — healthy, transport failure, 5xx — breaks the run.
+  fourXxRun = 0;
 }
+
 
 function nowPlayingFromApi(np: NowPlayingApiResponse | null): NowPlayingData {
   if (!np || !np.connected) return { ...MOCK_HOME.nowPlaying, connected: false };
@@ -538,7 +548,16 @@ export async function refreshWeather(): Promise<void> {
  * transport control the way to resume: each of them routes through here and
  * re-evaluates.
  */
-export async function refreshNowPlaying(): Promise<void> {
+/**
+ * Fetch the playback snapshot.
+ *
+ * `userInitiated` must be true ONLY when a person asked — the widget's Try
+ * again. It resumes a stopped poll, and the automatic tick calls this same
+ * function: resuming unconditionally here reset the 4XX counter on every tick,
+ * so the breaker could never trip at all. The tests caught exactly that.
+ */
+export async function refreshNowPlaying(userInitiated = false): Promise<void> {
+  if (userInitiated) resumeNowPlayingPolling();
   try {
     const np = await api.getNowPlaying();
     state.data = { ...state.data, nowPlaying: nowPlayingFromApi(np) };
@@ -552,6 +571,9 @@ export async function refreshNowPlaying(): Promise<void> {
 
 /** Sends a playback control action, then re-syncs from Spotify's actual state. */
 export async function controlNowPlaying(action: MusicControlAction): Promise<void> {
+  // Pressing play/next is the clearest "I am here and I want this working"
+  // there is — one of the two signals the stop rule depends on.
+  resumeNowPlayingPolling();
   try {
     await api.controlMusic(action);
   } catch {
@@ -570,6 +592,9 @@ export function __resetHubDataForTests(): void {
   // with the poll already halted.
   nowPlayingBackoff = null;
   backoffTicks = 0;
+  // The 4XX counter and the stopped flag are module state too; a test that
+  // left them set would leak a stopped poll into the next one.
+  resumeNowPlayingPolling();
 }
 
 /** Test hook: why the now-playing poll is slowed, or null at full rate. */

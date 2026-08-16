@@ -52,6 +52,7 @@ impl ModelStorage for MockModelStorage {
                     ModelCategory::Llamafile => "models/llm",
                     ModelCategory::Gguf => "models/gguf",
                     ModelCategory::TtsPiper => "models/tts",
+                    ModelCategory::TtsKokoro => "models/kokoro/voices",
                     ModelCategory::Ollama | ModelCategory::TtsHttp | ModelCategory::Embedding => {
                         return None
                     }

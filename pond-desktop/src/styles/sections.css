@@ -5400,14 +5400,18 @@
   66%       { transform: translate(-12%, 14%) scale(0.85); }
 }
 
-/* Header */
+/* Header — deliberately ruleless. The voice screen is ONE field the orb sits
+   in, and every horizontal rule on it (under the header, over the transcript,
+   over the action bar) chopped that field into stacked panels. Spacing does
+   the separating now. */
 .vm-header {
   position: relative; /* anchors .voice-switcher */
-  height: 48px; flex-shrink: 0;
-  border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
   display: flex; align-items: center; justify-content: space-between;
-  padding: 0 var(--space-4);
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4) 0;
 }
+.vm-header__actions { display: flex; align-items: center; gap: 2px; }
 
 /* Voice switcher popover — same trigger+outside-click convention as
    .session-dropdown, anchored to .vm-header. */
@@ -5441,29 +5445,155 @@
 .voice-switcher__label { font-size: 13px; font-weight: 500; }
 .voice-switcher__sub { font-size: 11px; color: var(--color-text-tertiary); }
 .voice-switcher__hint { display: inline-flex; align-items: center; gap: 3px; }
+/* The conversation's name. Large, bold, left — a heading, not a caption, so
+   it reads from across the room and anchors the ragged-left edge the rest of
+   the screen hangs from. Replaces a truncated session uuid, which answered a
+   question nobody talking to an assistant was asking. */
+.vm-title {
+  flex-shrink: 0; margin: 0;
+  padding: 2px var(--space-5) var(--space-3);
+  font-family: var(--font-display);
+  font-size: clamp(19px, 2.4vw, 30px);
+  font-weight: 700; letter-spacing: -0.022em; line-height: 1.14;
+  color: var(--color-text);
+  /* One line. A long name ellipses rather than stealing height from the
+     conversation — on a 480px-tall kiosk panel that height is the screen. */
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* ── The field ──────────────────────────────────────────────
+   The orb no longer sits on a stage above a drawer; it sits IN the
+   conversation. `.vm-field` is the positioning context, `.vm-stream` is the
+   scroller, and the orb is a layer pinned to its centre. */
+.vm-field { position: relative; flex: 1 1 auto; min-height: 0; }
+
+/* Width of the channel reserved down the middle for the orb. Messages are
+   placed either side of it, so nothing can ever run underneath the orb —
+   which is why the orb needs no scrim, no backdrop, and no z-index fight. */
+.vm-root { --vm-channel: clamp(196px, 26vw, 300px); }
+
+.vm-orb-layer {
+  position: absolute; left: 50%; top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2;
+  width: var(--vm-channel);
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  /* The LAYER is transparent to the pointer so the conversation still scrolls
+     when the cursor is over the middle of the screen. */
+  pointer-events: none;
+}
+/* ...but the orb itself is not. It carries a `title` tooltip, and switching
+   that off would be a change to the orb's own behaviour rather than to this
+   layout. Targeted by the orb's own class so the component is untouched. */
+.vm-orb-layer .orb-glass { pointer-events: auto; }
+.vm-state-row { display: flex; align-items: center; gap: 8px; }
+.vm-state-label {
+  font-family: var(--font-display); font-weight: 600; font-size: 15px;
+  transition: color 0.3s; text-align: center;
+}
+
+/* ── The stream ─────────────────────────────────────────────
+   Three columns: the pond on the left, the reserved channel, you on the
+   right. Position is the whole attribution — with exactly two participants,
+   a name chip on every line is a label that repeats what the layout already
+   said. */
+.vm-stream {
+  position: absolute; inset: 0;
+  overflow-y: auto; overscroll-behavior: contain;
+  display: grid;
+  grid-template-columns: 1fr var(--vm-channel) 1fr;
+  /* Grows up from the bottom, like every conversation log: the newest line
+     sits nearest the controls, and a short conversation leaves its empty
+     space above rather than stranding two lines at the top of the screen. */
+  align-content: end;
+  gap: var(--space-2) var(--space-4);
+  padding: var(--space-3) var(--space-5) var(--space-4);
+}
+.vm-stream--empty {
+  display: flex; align-items: flex-end; justify-content: center;
+  padding-bottom: var(--space-6);
+}
+.vm-stream__empty {
+  margin: 0; font-size: 12.5px; color: var(--color-text-tertiary);
+}
+
+.vm-said { max-width: min(44ch, 100%); min-width: 0; }
+.vm-said--agent { grid-column: 1; justify-self: start; }
+.vm-said--user  { grid-column: 3; justify-self: end; }
+
+.vm-said__text {
+  margin: 0; padding: 7px 12px;
+  font-size: 13px; line-height: 1.55;
+  border-radius: 15px;
+  overflow-wrap: anywhere;
+  animation: vm-said-in 0.32s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+/* The squared-off corner points at the side the line came from — the one
+   piece of decoration here that states something the layout doesn't. */
+.vm-said--agent .vm-said__text {
+  background: color-mix(in srgb, var(--color-text) 6%, transparent);
+  /* Full-strength text, not the secondary grey: this is the answer, and the
+     screen is read from across a room. Side and tint carry the attribution. */
+  color: var(--color-text);
+  border-bottom-left-radius: 5px;
+}
+.vm-said--user .vm-said__text {
+  background: color-mix(in srgb, var(--color-accent) 13%, transparent);
+  color: var(--color-text);
+  border-bottom-right-radius: 5px;
+}
+.vm-said__cards {
+  display: flex; flex-direction: column; gap: 6px;
+  margin-top: 6px;
+}
+
+@keyframes vm-said-in {
+  from { opacity: 0; transform: translateY(7px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* Narrow windows cannot afford a reserved channel AND two readable columns,
+   so the orb stops floating and takes the top of the field, with one column
+   under it. Still no rules — the conversation stays one field. */
+@media (max-width: 700px) {
+  .vm-root { --vm-channel: 0px; }
+  .vm-orb-layer {
+    position: static; transform: none;
+    width: 100%; padding-top: var(--space-3);
+  }
+  .vm-field { display: flex; flex-direction: column; gap: var(--space-3); }
+  .vm-stream {
+    position: relative; inset: auto; flex: 1 1 auto; min-height: 0;
+    grid-template-columns: 1fr;
+  }
+  .vm-said--agent, .vm-said--user { grid-column: 1; }
+  .vm-said { max-width: 88%; }
+}
+
+/* Short panels (the 800x480 kiosk): buy the conversation back the height the
+   heading would otherwise take. */
+@media (max-height: 560px) {
+  .vm-title { font-size: 18px; padding-bottom: var(--space-2); }
+  .vm-header { padding-top: 2px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vm-said__text { animation: none; }
+}
+
+/* ── Browser voice path (VoiceModePipeline) ─────────────────
+   The non-Tauri fallback keeps the older stage-over-transcript layout. It is
+   a development surface, not the shipped desktop screen, so it is not worth
+   a second maintained design — but it does need its own classes rather than
+   inheriting the field layout above, which assumes the child-process events. */
 .vm-session-hint {
   font-size: 11px; color: var(--color-text-tertiary); flex: 1; text-align: center;
 }
-
-/* Stage */
 .vm-stage {
   flex: 1; display: flex; flex-direction: column;
   align-items: center; justify-content: center;
   gap: 14px; padding: var(--space-6) var(--space-4) var(--space-4);
-  min-height: 0;
-  /* Guards against WKWebView letting non-shrinkable content (the fixed-size
-     orb) push/overflow past this flex item's allotted height instead of
-     clipping — the same containment pattern already used on .vm-root and
-     .vm-transcript-drawer. Without it, mounting the transcript tab (which
-     shrinks this stage's budget) could shove the header off-screen. */
-  overflow: hidden;
-}
-.vm-state-row {
-  display: flex; align-items: center; gap: 8px;
-}
-.vm-state-label {
-  font-family: var(--font-display); font-weight: 600; font-size: 15px;
-  transition: color 0.3s; text-align: center;
+  min-height: 0; overflow: hidden;
 }
 .vm-live-caption {
   margin: 0; max-width: 340px; text-align: center;
@@ -5475,40 +5605,14 @@
 }
 .vm-live-caption--user { color: var(--color-text); }
 .vm-live-caption--agent { color: var(--color-text-secondary); font-style: italic; }
-
-/* Transcript panel */
 .vm-transcript {
   flex-shrink: 0; max-height: 38%; overflow-y: auto;
-  padding: 0 var(--space-5) var(--space-2);
-  border-top: 1px solid var(--color-border);
-}
-
-/* Transcript drawer (child-process voice screen) — tap-to-toggle, capped
-   height so it pushes the orb's stage rather than ever covering or
-   resizing the orb itself. */
-.vm-transcript-tab {
-  flex-shrink: 0; width: 100%; height: 30px;
-  display: flex; align-items: center; justify-content: center; gap: 6px;
-  border: none; border-top: 1px solid var(--color-border);
-  background: transparent; cursor: pointer;
-  font-size: 11px; color: var(--color-text-tertiary);
-}
-.vm-transcript-tab:hover { background: var(--color-border); color: var(--color-text-secondary); }
-
-.vm-transcript-drawer {
-  flex-shrink: 0; max-height: 0; overflow: hidden;
-  transition: max-height 0.28s ease;
-}
-.vm-transcript-drawer.is-open {
-  max-height: 38vh; overflow-y: auto;
-  border-top: 1px solid var(--color-border);
   padding: 0 var(--space-5) var(--space-2);
 }
 
 /* Action bar */
 .vm-action-bar {
   flex-shrink: 0; height: 64px;
-  border-top: 1px solid var(--color-border);
   display: flex; align-items: center; justify-content: center;
   gap: var(--space-3); padding: 0 var(--space-5); position: relative;
 }

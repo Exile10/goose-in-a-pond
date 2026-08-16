@@ -15,7 +15,11 @@ import {
   isInFlight, fitReading, downloadedOnly, availableToDownload, rolesFor, modelLabel,
   groupByJob, modelFacts,
 } from "./models/modelsView";
+import { VoicePicker } from "../hub/views/settings/VoicePicker";
+import { useVoicePreview } from "../voice/useVoicePreview";
+import { clampPace, DEFAULT_VOICE, DEFAULT_PACE, DEFAULT_QUALITY } from "../voice/voiceCatalogue";
 import "../styles/models.css";
+import "../hub/views/settings/voice-picker.css";
 
 /**
  * Models — what this pond runs on.
@@ -434,15 +438,154 @@ export function Models() {
     if (downloads.some((d) => d.status === "downloading")) pollDownloads();
   }, [downloads, pollDownloads]);
 
+  // ── Voice, for the Speaking group ──
+  //
+  // Choosing a voice is not the same act as managing a model file, so the
+  // Speaking group gets the picker instead of a row list. The catalogue below
+  // still lists voices to download: this is for choosing among the ones you
+  // have, that one is for getting more.
+  const preview = useVoicePreview();
+  const [voice, setVoice] = useState<string>(DEFAULT_VOICE);
+  const [pace, setPace] = useState<number>(DEFAULT_PACE);
+  const [quality, setQuality] = useState<string>(DEFAULT_QUALITY);
+  /** True while the engine is being fetched/reconfigured, so the UI can say so. */
+  const [applying, setApplying] = useState(false);
+  const paceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    api
+      .getSettings()
+      .then((s) => {
+        if (!s || typeof s !== "object") return;
+        if (s.voice_tts_voice) setVoice(s.voice_tts_voice);
+        if (typeof s.voice_tts_speed === "number") setPace(clampPace(s.voice_tts_speed));
+        if (s.voice_tts_quality) setQuality(s.voice_tts_quality);
+      })
+      .catch(() => {
+        /* offline: the picker still works against whatever is on disk */
+      });
+    return () => { if (paceTimer.current) clearTimeout(paceTimer.current); };
+  }, []);
+
+  async function chooseVoice(id: string) {
+    const previous = voice;
+    setVoice(id);
+    setApplying(true);
+    try {
+      await api.updateSettings({ voice_tts_voice: id });
+      // Apply to the RUNNING engine — fetching the voice first when this is
+      // the household's first time choosing it. Without this the change waits
+      // for a restart, which on a shelf device reads as the setting not
+      // working.
+      pollDownloads();
+      await api.applyTtsSettings({ voice: id });
+      void loadModels();
+      // Speak straight away: a list of names is a guess until you hear it.
+      void preview.play();
+    } catch {
+      setVoice(previous);
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  // Debounced — a slider drag emits a value per pixel, and each one would
+  // otherwise be a settings write and a synthesis.
+  function choosePace(next: number) {
+    const value = clampPace(next);
+    setPace(value);
+    if (paceTimer.current) clearTimeout(paceTimer.current);
+    paceTimer.current = setTimeout(() => {
+      api
+        .updateSettings({ voice_tts_speed: value })
+        .then(() => api.applyTtsSettings({ speed: value }))
+        .then(() => preview.play())
+        .catch(() => {});
+    }, 500);
+  }
+
+  async function chooseQuality(value: string) {
+    const previous = quality;
+    setQuality(value);
+    setApplying(true);
+    try {
+      await api.updateSettings({ voice_tts_quality: value });
+      // Start polling BEFORE the apply: the fetch happens inside it, and a
+      // poll that only starts afterwards would show a finished transfer.
+      pollDownloads();
+      // Fetches the tier if it is new, then drops the session so the next
+      // utterance loads it. No restart.
+      await api.applyTtsSettings({ quality: value });
+    } catch {
+      setQuality(previous);
+    } finally {
+      setApplying(false);
+    }
+  }
+
   const onDisk = useMemo(() => downloadedOnly(models), [models]);
   const groups = useMemo(() => groupByJob(onDisk), [onDisk]);
-  const availableGroups = useMemo(() => groupByJob(availableToDownload(models)), [models]);
-  const inFlight = useMemo(() => downloads.filter(isInFlight), [downloads]);
+
+  // Every voice the catalogue knows, downloaded or not. A voice is a 522 KB
+  // style table fetched on selection, so hiding the ones not yet installed
+  // would be hiding most of the choice to save a wait the household never
+  // asked to avoid.
+  const allVoices = useMemo(
+    () => models.filter((m) => (m.category ?? m.provider) === "tts_kokoro").map((m) => m.name),
+    [models],
+  );
+  const installedVoices = useMemo(
+    () => new Set(onDisk.filter((m) => (m.category ?? m.provider) === "tts_kokoro").map((m) => m.name)),
+    [onDisk],
+  );
+  // Voices are deliberately absent from "Ready to download".
+  //
+  // The picker above offers every voice Kokoro publishes and fetches the one
+  // you choose, so listing 39 of them again with their own Download buttons
+  // was the same choice twice — and the two disagreed about what selecting a
+  // voice means. Speech models are chosen by hearing them, not by downloading
+  // them first.
+  const availableGroups = useMemo(
+    () => groupByJob(availableToDownload(models)).filter((g) => g.key !== "tts"),
+    [models],
+  );
+  // "Coming down" deliberately excludes voice fetches: the picker shows those
+  // itself, next to the voice that caused them, and a transfer listed in two
+  // places is the same duplication that put voices in "Ready to download".
+  // Pause and stop stay with the big transfers, where they are worth having.
+  const inFlight = useMemo(
+    () => downloads.filter(isInFlight).filter((d) => d.category !== "tts_kokoro"),
+    [downloads],
+  );
+  const voiceInFlight = useMemo(
+    () => downloads.filter(isInFlight).filter((d) => d.category === "tts_kokoro"),
+    [downloads],
+  );
+
+  // Voice/engine fetches, for the picker's own progress row. Read from the
+  // same feed as `inFlight` so the two can never disagree about what is
+  // happening — they are the same transfers, shown where each is relevant.
+  const voiceTransfers = useMemo(
+    () =>
+      voiceInFlight
+        .map((d) => ({
+          filename: d.filename,
+          downloaded: d.downloaded_bytes ?? 0,
+          total: d.total_bytes ?? null,
+        })),
+    [voiceInFlight],
+  );
 
   async function useFor(model: ModelEntry, role: RoleKey) {
     setBusy(true);
     try {
-      await api.activateModel(model.provider, model.name, role);
+      // `category`, not `provider`. `provider` is the group key the list
+      // endpoint buckets under ("tts"), while the record's real category is
+      // e.g. "tts_kokoro" — and the server builds the lookup id from it. Sending
+      // the group key made every Kokoro voice fail with
+      // "Model 'af_heart' not found in 'tts'". Piper only worked because its
+      // group key and category happen to be the same word.
+      await api.activateModel(model.category ?? model.provider, model.name, role);
       await loadRoles();
       say(`${modelLabel(model)} now handles ${ROLES.find((r) => r.key === role)?.label.toLowerCase()}.`);
     } catch (e) { say(e instanceof Error ? e.message : String(e), false); }
@@ -457,7 +600,7 @@ export function Models() {
     if (!ok) return;
     setBusy(true);
     try {
-      await api.deleteModel(model.provider, model.name);
+      await api.deleteModel(model.category ?? model.provider, model.name);
       await loadModels();
       void api.getDiskUsage().then(setDisk).catch(() => {});
       say(`${modelLabel(model)} deleted.`);
@@ -579,16 +722,41 @@ export function Models() {
             <header className="mdl-group__head">
               <h3 className="mdl-group__title">{g.label}</h3>
               <span className="mdl-group__count">
-                {g.models.length} {g.models.length === 1 ? "model" : "models"}
+                {g.key === "tts"
+                  ? // The picker offers every voice Kokoro publishes, not just
+                    // the downloaded ones, so a plain count of what is on disk
+                    // contradicted the list right under it. Say both, and call
+                    // them voices — "3 models" was never the right word for a
+                    // style table either.
+                    `${installedVoices.size} of ${allVoices.length} voices installed`
+                  : `${g.models.length} ${g.models.length === 1 ? "model" : "models"}`}
               </span>
             </header>
-            <div className="mdl-group__rows">
-              {g.models.map((m) => (
-                <ModelRow key={`${m.provider}/${m.name}`} model={m} memory={memory}
-                  activeRoles={roles} busy={busy}
-                  onUse={(role) => void useFor(m, role)} onDelete={() => void remove(m)} />
-              ))}
-            </div>
+            {g.key === "tts" ? (
+              <VoicePicker
+                voices={allVoices.length ? allVoices : g.models.map((m) => m.name)}
+                installed={installedVoices}
+                applying={applying}
+                transfers={voiceTransfers}
+                selected={voice}
+                onSelect={(id) => void chooseVoice(id)}
+                pace={pace}
+                onPaceChange={choosePace}
+                preview={preview}
+                loading={modelsLoading}
+                quality={quality}
+                onQualityChange={(v) => void chooseQuality(v)}
+                availableMb={memory?.available_for_llm_mb ?? null}
+              />
+            ) : (
+              <div className="mdl-group__rows">
+                {g.models.map((m) => (
+                  <ModelRow key={`${m.provider}/${m.name}`} model={m} memory={memory}
+                    activeRoles={roles} busy={busy}
+                    onUse={(role) => void useFor(m, role)} onDelete={() => void remove(m)} />
+                ))}
+              </div>
+            )}
           </section>
         ))}
       </section>
@@ -601,7 +769,7 @@ export function Models() {
         <section className="mdl-band">
           <h2 className="mdl-band__title">Ready to download</h2>
           <p className="mdl-band__sub">
-            Known to this pond and not here yet. Speech models live here.
+            Known to this pond and not here yet. Voices are chosen above.
           </p>
           {availableGroups.map((g) => (
             <section key={g.key} className="mdl-group">

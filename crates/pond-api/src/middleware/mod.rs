@@ -281,6 +281,11 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
     // PondApiClient.ts, which DOES attach the bearer token when it has one --
     // checked, not assumed, because that is the difference between this entry
     // and the /tts entry above.
+    // Onboarding's voice step chooses a voice before there is a device token,
+    // and choosing one now applies it to the running engine (and fetches it if
+    // the household does not have it yet). Same window as calibration: open
+    // until onboarding completes, closed after.
+    (Method::POST, "/voice/tts/apply", Exposure::UntilOnboarded),
     (Method::POST, "/voice/calibrate", Exposure::UntilOnboarded),
     (Method::DELETE, "/voice/calibrate", Exposure::UntilOnboarded),
     // Diagnostics. These are NOT onboarding holes -- none of them is public
@@ -947,6 +952,15 @@ mod tests {
             "POST /onboard/step/{name} = UntilOnboarded".to_string(),
             "POST /profiles = UntilOnboarded".to_string(),
             "POST /voice/calibrate = UntilOnboarded".to_string(),
+            // Added when choosing a voice started taking effect immediately
+            // rather than on the next restart. Onboarding's voice step runs
+            // before there is a device token, and the alternative was letting
+            // the wizard write a voice setting it could not apply — a control
+            // that appears to work and does not. It reads and applies the
+            // household's own saved voice settings and returns which files it
+            // fetched; it exposes nothing else, and closes with the rest of
+            // this list the moment onboarding completes.
+            "POST /voice/tts/apply = UntilOnboarded".to_string(),
             "PUT /settings = UntilOnboarded".to_string(),
         ];
 

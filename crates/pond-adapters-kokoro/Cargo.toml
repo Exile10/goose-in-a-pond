@@ -1,0 +1,101 @@
+[package]
+name = "pond-adapters-kokoro"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# ── Build note ────────────────────────────────────────────────────────────────
+# Kokoro-82M (StyleTTS2, Apache 2.0) run directly through `ort`. There is no
+# wrapper crate in the way — the model takes three tensors and returns a
+# waveform, so the whole engine is phonemize → tokenize → run → f32 samples.
+#
+# ── ort linkage: this crate does NOT decide it ────────────────────────────────
+# What was written here before — "do NOT add `load-dynamic`, the ort defaults
+# (`download-binaries` + `copy-dylibs`) are the only reason TTS works on a
+# machine with no system ONNX Runtime" — was already false when it was written,
+# and in the direction that wastes the most time: it describes a linkage this
+# crate has never had.
+#
+# Two ort-sys features decide it, and they are not both set here:
+#
+#   download-binaries   fetch a prebuilt ONNX Runtime and link it STATICALLY
+#   disable-linking     link nothing; dlopen `ORT_DYLIB_PATH` at runtime
+#
+# ort-sys's build script tests `disable-linking` first and returns before the
+# download (`build/main.rs:23`), so when both are on, dlopen wins.
+#
+# This crate supplies only the first: `ort = "=2.0.0-rc.12"` takes ort's default
+# features, and `default` contains `download-binaries`. `disable-linking` comes
+# from somewhere else entirely — the root Cargo.toml's
+#
+#     fastembed = { …, features = ["ort-load-dynamic", …] }
+#
+# where `ort-load-dynamic` → `ort/load-dynamic` → `ort-sys/disable-linking`.
+# fastembed is a non-optional dependency of pond-infra.
+#
+# So the linkage depends on what else is in the same cargo invocation:
+#
+#   pond-server, or the CI fast-crate set   pond-infra present → dlopen
+#   cargo test -p pond-adapters-kokoro      fastembed absent   → STATIC LINK
+#
+# That second row is a real failure, not a theoretical one. Building this crate
+# alone on the Jetson Orin (JetPack 6, glibc 2.35) dies at link with
+# `undefined reference to __isoc23_strtoll` and `__cxa_call_terminate` out of
+# `libort_sys-*.rlib` — pyke's prebuilt is built against glibc 2.38+, and rustc
+# bundles a static lib's objects into the rlib, which is why the archive named
+# in the error is ort-sys's rather than libonnxruntime.a.
+#
+# Hence `system-ort` below. It is NOT a Jetson-only switch and NOT redundant: it
+# is how you build or test THIS CRATE ON ITS OWN with the linkage the shipped
+# binary actually uses.
+#
+#   cargo test -p pond-adapters-kokoro --features system-ort
+#
+# What gets dlopened is `ORT_DYLIB_PATH`, read lazily by ort's `setup_api()`
+# behind a process-global `OnceLock` — first consumer to initialise picks the
+# library and the other inherits it. `ensure_onnx_runtime()` in pond-server sets
+# it (system paths, then a local copy, then downloading Microsoft's release) and
+# runs in `setup`, `serve` and `chat` before any session exists. It is not
+# optional infrastructure; it is the linkage.
+#
+# On the Jetson that resolves to Microsoft's onnxruntime-linux-aarch64 1.24.2,
+# which needs only GLIBC_2.27, carries zero `__isoc23_*` symbols, and dlopens on
+# the board with `OrtGetApiBase` resolving — all three checked on the device.
+#
+# espeak-rs is a direct dependency because its `text_to_phonemes` emits IPA (it
+# hardcodes espeakINITIALIZE_PHONEME_IPA), which is exactly the alphabet
+# Kokoro's 115-symbol vocab is built from. That is the whole reason this adapter
+# is small.
+
+[features]
+default = []
+# Redundant while fastembed forces `ort/load-dynamic` workspace-wide — enabling
+# this changes nothing (`cargo tree -e features -i ort` resolves the same 17
+# features either way). Kept as the switch that would matter if fastembed ever
+# goes optional. See the linkage note above before assuming it does anything.
+system-ort = ["ort/load-dynamic"]
+
+[dependencies]
+pond-core      = { workspace = true }
+pond-voice     = { path = "../pond-voice" }
+pond-audio-out = { path = "../pond-audio-out" }
+anyhow      = { workspace = true }
+async-trait = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+serde_json  = { workspace = true }
+# Default features, but they are not what decides linkage — `load-dynamic`
+# arrives from fastembed and wins. Read the linkage note above before changing
+# this line expecting it to move anything.
+# `ndarray` is deliberately absent — tensors are built as (shape, Vec) tuples
+# because ort resolves ndarray 0.17 while the workspace is on 0.16.
+ort = "=2.0.0-rc.12"
+espeak-rs = "0.2"
+# Only for the `OutputStreamHandle` type held by the adapter; playback itself
+# lives in pond-audio-out.
+rodio = "0.19"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -258,9 +258,47 @@ pub struct Settings {
     #[serde(default)]
     pub voice_wake_word_transcriptions: Vec<String>,
 
-    /// Piper TTS voice model filename (e.g. "en_US-lessac-medium.onnx")
+    /// Selected TTS voice.
+    ///
+    /// Kokoro voice id (`af_heart`, `bm_george`, …) since the engine swap; a
+    /// Piper `.onnx` filename on installs that predate it. Resolution accepts
+    /// both, so an upgrade does not silence a pond whose stored value is still
+    /// a Piper filename.
     #[serde(default = "Settings::default_tts_voice")]
     pub voice_tts_voice: String,
+
+    /// Speaking pace, as the multiplier the synthesiser's `speed` input takes.
+    ///
+    /// 1.0 is the voice as trained; the engine clamps to 0.5..=2.0. Stored as
+    /// the multiplier rather than a percentage so there is no conversion
+    /// between this row and the tensor — the UI converts at its own edge,
+    /// where getting it backwards is visible.
+    #[serde(default = "Settings::default_tts_speed")]
+    pub voice_tts_speed: f32,
+
+    /// Voice quality tier — a Kokoro quantisation (`q8` | `q8f16` | `q4f16` |
+    /// `fp16` | `fp32`).
+    ///
+    /// Picking a tier picks an `.onnx` file and nothing else. Defaults to `q8`
+    /// (92 MB), the only tier that sits comfortably beside an LLM on an 8 GB
+    /// Jetson. An unknown value resolves to the default rather than failing —
+    /// a mistyped tier must not leave the pond unable to speak.
+    #[serde(default = "Settings::default_tts_quality")]
+    pub voice_tts_quality: String,
+
+    /// Whether the soft ambient tone plays while the model is working.
+    ///
+    /// The tone is the only signal that a spoken request was heard and is being
+    /// worked on — without it a slow turn is indistinguishable from a turn that
+    /// was never heard at all. It was deleted outright once for reading as "an
+    /// annoying background beep"; that is a preference, not a defect, so it is
+    /// a setting rather than a decision made for every household.
+    ///
+    /// Defaults ON: the silence it fills is a real gap, and a household that
+    /// dislikes the tone can find this switch, whereas one that never hears the
+    /// tone has nothing to go looking for.
+    #[serde(default = "Settings::default_voice_thinking_tone_enabled")]
+    pub voice_thinking_tone_enabled: bool,
 
     /// Microphone recording duration in seconds for each whisper capture
     #[serde(default = "Settings::default_recording_duration")]
@@ -1077,6 +1115,9 @@ impl Default for Settings {
             voice_kws_cooldown_ms: Self::default_kws_cooldown_ms(),
             voice_wake_word_transcriptions: Vec::new(),
             voice_tts_voice: Self::default_tts_voice(),
+            voice_tts_speed: Self::default_tts_speed(),
+            voice_tts_quality: Self::default_tts_quality(),
+            voice_thinking_tone_enabled: Self::default_voice_thinking_tone_enabled(),
             voice_recording_duration_secs: Self::default_recording_duration(),
             voice_whisper_url: Self::default_whisper_url(),
             active_llm_model: Self::default_active_llm_model(),
@@ -1244,6 +1285,19 @@ impl Settings {
     }
     fn default_tts_voice() -> String {
         "".to_string()
+    }
+    /// 1.0 — the voice at the pace it was trained on.
+    fn default_tts_speed() -> f32 {
+        1.0
+    }
+    /// `q8`. See the field docs: the tier that fits beside the language model.
+    fn default_tts_quality() -> String {
+        "q8".to_string()
+    }
+    /// ON. See the field docs: a household that dislikes the tone can switch it
+    /// off, but one that never hears it has nothing to go looking for.
+    fn default_voice_thinking_tone_enabled() -> bool {
+        true
     }
     fn default_recording_duration() -> u32 {
         3
@@ -2434,6 +2488,9 @@ mod tests {
             "voice_kws_post_trigger_silence_ms",
             "voice_kws_whisper_url",
             "voice_recording_duration_secs",
+            "voice_thinking_tone_enabled",
+            "voice_tts_quality",
+            "voice_tts_speed",
             "voice_tts_voice",
             "voice_wake_word",
             "voice_wake_word_transcriptions",

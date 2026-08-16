@@ -6,6 +6,8 @@ members = [
     "crates/pond-voice",
     # Single microphone owner (cpal). Depends on pond-voice.
     "crates/pond-audio",
+    # Speaker-side counterpart: playback, output device, working tone (rodio).
+    "crates/pond-audio-out",
     "crates/pond-core",
     "crates/pond-api",
     "crates/pond-hf-cache",
@@ -15,7 +17,8 @@ members = [
     "crates/pond-adapters-llamafile",
     "crates/pond-adapters-ollama",
     "crates/pond-adapters-whisper",
-    "crates/pond-adapters-piper",
+    # Kokoro-82M — the default TTS engine.
+    "crates/pond-adapters-kokoro",
     "crates/pond-adapters-face-onnx",
     "crates/pond-adapters-matter",
     "crates/pond-adapters-vision",

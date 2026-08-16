@@ -77,11 +77,7 @@ impl LlmProvider for StubProvider {
 
 async fn make_app(
     provider: Option<Arc<dyn LlmProvider>>,
-) -> (
-    axum::Router,
-    Arc<SqliteSessionStorage>,
-    tempfile::TempDir,
-) {
+) -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
     let pool = db.system.clone();
@@ -104,6 +100,7 @@ async fn make_app(
         llm_provider: Arc::new(tokio::sync::RwLock::new(provider)),
         llamafile_url: "http://127.0.0.1:8080".into(),
         tts: None,
+        tts_control: None,
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(MockDeviceRegistry),
@@ -111,6 +108,7 @@ async fn make_app(
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         vector_index: None,
+        index_reindex: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -180,7 +178,10 @@ async fn make_app(
 
 /// A conversation long enough to be worth naming.
 async fn seed(storage: &SqliteSessionStorage, session_id: &str, count: usize) {
-    storage.create_session(session_id.to_string()).await.unwrap();
+    storage
+        .create_session(session_id.to_string())
+        .await
+        .unwrap();
     for i in 0..count {
         let msg = if i % 2 == 0 {
             ChatMessage::user(format!("so i was wondering whether {i}"))
@@ -230,10 +231,18 @@ async fn a_press_renames_a_conversation_still_on_its_fallback_name() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body["renamed_count"], 1);
     assert_eq!(body["renamed"][0]["session_id"], "sess-1");
-    assert_eq!(body["renamed"][0]["title"], "Wake word fires twice on the Jetson");
+    assert_eq!(
+        body["renamed"][0]["title"],
+        "Wake word fires twice on the Jetson"
+    );
 
     assert_eq!(
-        storage.get_session("sess-1").await.unwrap().title.as_deref(),
+        storage
+            .get_session("sess-1")
+            .await
+            .unwrap()
+            .title
+            .as_deref(),
         Some("Wake word fires twice on the Jetson"),
         "the new name must actually be persisted, not just reported"
     );
@@ -267,7 +276,12 @@ async fn a_press_never_overwrites_a_name_somebody_typed() {
         "a protected conversation must cost no inference"
     );
     assert_eq!(
-        storage.get_session("sess-1").await.unwrap().title.as_deref(),
+        storage
+            .get_session("sess-1")
+            .await
+            .unwrap()
+            .title
+            .as_deref(),
         Some("Jetson deploy notes")
     );
 }
@@ -302,7 +316,10 @@ async fn the_pond_does_not_name_its_own_background_conversations() {
 
     let (status, body) = retitle(&app).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["considered"], 0, "it should not even have been looked at");
+    assert_eq!(
+        body["considered"], 0,
+        "it should not even have been looked at"
+    );
     assert_eq!(provider.calls(), 0);
 }
 
@@ -364,7 +381,12 @@ async fn asking_for_one_conversation_replaces_even_a_name_typed_by_hand() {
     assert_eq!(body["outcome"], "retitled");
     assert_eq!(body["title"], "Wake word fires twice on the Jetson");
     assert_eq!(
-        storage.get_session("sess-1").await.unwrap().title.as_deref(),
+        storage
+            .get_session("sess-1")
+            .await
+            .unwrap()
+            .title
+            .as_deref(),
         Some("Wake word fires twice on the Jetson")
     );
 }

@@ -187,6 +187,7 @@ impl SchedulerPort for RecordingScheduler {
             id: req.id,
             label: req.label,
             cron: req.cron,
+            fire_at: req.fire_at,
             timezone: req.timezone,
             kind: req.kind,
             paused: false,

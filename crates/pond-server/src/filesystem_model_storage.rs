@@ -42,6 +42,15 @@ impl ModelStorage for FilesystemModelStorage {
             }
             ModelCategory::Gguf => self.data_dir.join("models").join("gguf").join(filename),
             ModelCategory::TtsPiper => self.data_dir.join("models").join("tts").join(filename),
+            // Voices sit under the engine dir: they are useless without the
+            // shared weights, and keeping them together means one directory
+            // to check when TTS goes quiet.
+            ModelCategory::TtsKokoro => self
+                .data_dir
+                .join("models")
+                .join("kokoro")
+                .join("voices")
+                .join(filename),
             ModelCategory::Embedding => self
                 .data_dir
                 .join("models")

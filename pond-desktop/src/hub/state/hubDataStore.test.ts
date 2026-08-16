@@ -13,8 +13,8 @@ vi.mock("../../api/PondApiClient", () => ({
 
 import { api } from "../../api/PondApiClient";
 import { getHomeData, refreshHomeData, refreshWeather, refreshNowPlaying,
-         __resetHubDataForTests, __nowPlayingBackoffForTests,
-         __tickNowPlayingPollForTests, __BACKOFF_TICKS_FOR_TESTS } from "./hubDataStore";
+         resumeNowPlayingPolling,
+         __resetHubDataForTests, __tickNowPlayingPollForTests } from "./hubDataStore";
 import { ROUTINES as MOCK_ROUTINES } from "../data/routines";
 
 const apiMock = api as unknown as {
@@ -284,119 +284,74 @@ describe("now-playing polling", () => {
   });
 
   /// The widget polls every ten seconds and the dashboard is left open for
-  /// days. An answer that cannot change without somebody doing something costs
-  /// ~8,600 requests a day, each one a round trip the server makes to Spotify.
-  it("backs off on an answer only a person can change", async () => {
-    for (const [response, reason] of [
-      [{ connected: true, error: "unauthorized" }, "unauthorized"],
-      [{ connected: true, error: "forbidden" }, "forbidden"],
-      [{ connected: false, error: "network_refused" }, "network_refused"],
-      [{ connected: false }, "not_connected"],
-    ] as const) {
-      __resetHubDataForTests();
-      apiMock.getNowPlaying.mockResolvedValue(response);
-      await refreshNowPlaying();
-      expect(__nowPlayingBackoffForTests()).toBe(reason);
-    }
-  });
+  /// days, so an answer that cannot change without somebody doing something
+  /// costs ~8,600 requests a day — each one a round trip the server makes to
+  /// Spotify on our behalf. After five consecutive 4XX answers it stops
+  /// asking entirely, and only an interaction brings it back.
 
-  /// Spotify's own words: rate limiting "should reappear shortly", and
-  /// `unavailable` is whatever it was doing at the time. Both clear themselves,
-  /// so giving up on them would strand a widget that was about to recover.
-  it("stays at full rate through failures that clear themselves", async () => {
-    for (const response of [
-      { connected: true, error: "rate_limited" },
-      { connected: true, error: "unavailable" },
-      { connected: true, playing: false },
-      { connected: true, playing: true, track: "Blue Train", artist: "John Coltrane" },
-    ]) {
-      __resetHubDataForTests();
-      apiMock.getNowPlaying.mockResolvedValue(response);
-      await refreshNowPlaying();
-      expect(__nowPlayingBackoffForTests()).toBeNull();
-    }
-  });
+  const REFUSAL = { connected: true, error: "forbidden", upstream_status: 403 };
 
-  /// A throw is the server being unreachable, not Spotify refusing. Halting
-  /// here would leave the widget dead until the app was relaunched.
-  it("does not back off when the server itself is unreachable", async () => {
-    apiMock.getNowPlaying.mockRejectedValue(new Error("ECONNREFUSED"));
-    await refreshNowPlaying();
-    expect(__nowPlayingBackoffForTests()).toBeNull();
-  });
+  async function answer(np: unknown, times = 1) {
+    apiMock.getNowPlaying.mockResolvedValue(np);
+    for (let i = 0; i < times; i += 1) await refreshNowPlaying();
+  }
 
-  /// The halt gates the timer, not the function. Coming back to the dashboard,
-  /// refreshing, or pressing a control all route through here — which is what
-  /// makes the widget recover instead of staying stopped forever.
-  it("recovers when asked directly after the problem is fixed", async () => {
-    apiMock.getNowPlaying.mockResolvedValue({ connected: true, error: "unauthorized" });
-    await refreshNowPlaying();
-    expect(__nowPlayingBackoffForTests()).toBe("unauthorized");
-
-    apiMock.getNowPlaying.mockResolvedValue({ connected: true, playing: true, track: "Blue Train" });
-    await refreshNowPlaying();
-
-    expect(__nowPlayingBackoffForTests()).toBeNull();
-    expect(getHomeData().nowPlaying.track).toBe("Blue Train");
-  });
-});
-
-describe("now-playing backoff cadence", () => {
-  beforeEach(() => {
-    __resetHubDataForTests();
-    apiMock.getNowPlaying.mockReset();
-  });
-
-  it("asks on every tick while everything is healthy", () => {
-    for (let i = 0; i < 5; i++) expect(__tickNowPlayingPollForTests()).toBe(true);
-  });
-
-  /// The whole point of backing off rather than stopping: nobody has to press
-  /// anything for a fixed Spotify to be noticed. A hard stop was unrecoverable
-  /// in practice — a full reload only happens on app start or server reconnect,
-  /// visibilitychange is unreliable in a desktop webview, and the transport
-  /// controls are disabled in exactly the state that would need them.
-  it("skips most ticks while backed off, but always comes back", async () => {
-    apiMock.getNowPlaying.mockResolvedValue({ connected: true, error: "unauthorized" });
-    await refreshNowPlaying();
-    expect(__nowPlayingBackoffForTests()).toBe("unauthorized");
-
-    // Two full cycles, so this cannot pass by retrying once and giving up.
-    for (let cycle = 0; cycle < 2; cycle++) {
-      for (let i = 0; i < __BACKOFF_TICKS_FOR_TESTS - 1; i++) {
-        expect(__tickNowPlayingPollForTests()).toBe(false);
-      }
-      expect(__tickNowPlayingPollForTests()).toBe(true);
-    }
-  });
-
-  it("returns to full rate the moment the answer changes", async () => {
-    apiMock.getNowPlaying.mockResolvedValue({ connected: false });
-    await refreshNowPlaying();
-    expect(__tickNowPlayingPollForTests()).toBe(false);
-
-    apiMock.getNowPlaying.mockResolvedValue({ connected: true, playing: true, track: "Blue Train" });
-    await refreshNowPlaying();
-
-    expect(__nowPlayingBackoffForTests()).toBeNull();
+  it("keeps polling through the first four refusals", async () => {
+    // Four is not five. Stopping early would give up on a service that was
+    // about to answer.
+    await answer(REFUSAL, 4);
     expect(__tickNowPlayingPollForTests()).toBe(true);
   });
 
-  /// Recovering and failing again must wait the full interval, not fire
-  /// immediately on a counter left part-way through the previous outage.
-  it("restarts the interval rather than resuming a half-spent one", async () => {
-    apiMock.getNowPlaying.mockResolvedValue({ connected: false });
-    await refreshNowPlaying();
-    for (let i = 0; i < 10; i++) __tickNowPlayingPollForTests();
+  it("stops asking after five consecutive 4XX answers", async () => {
+    await answer(REFUSAL, 5);
+    expect(__tickNowPlayingPollForTests()).toBe(false);
+    // Still stopped on later ticks: unlike the old slow-retry, no tick leaks
+    // through, because the condition cannot clear on its own.
+    expect(__tickNowPlayingPollForTests()).toBe(false);
+    expect(__tickNowPlayingPollForTests()).toBe(false);
+  });
 
-    apiMock.getNowPlaying.mockResolvedValue({ connected: true, playing: false });
-    await refreshNowPlaying();
-    apiMock.getNowPlaying.mockResolvedValue({ connected: false });
-    await refreshNowPlaying();
+  it("only counts real 4XX answers", async () => {
+    // `unavailable` covers 5xx, and a transport failure has no status at all.
+    // Counting either would let a Spotify outage — or this pond restarting
+    // mid-poll — permanently silence a widget whose recovery needs a person.
+    await answer({ connected: true, error: "unavailable", upstream_status: 502 }, 5);
+    expect(__tickNowPlayingPollForTests()).toBe(true);
 
-    for (let i = 0; i < __BACKOFF_TICKS_FOR_TESTS - 1; i++) {
-      expect(__tickNowPlayingPollForTests()).toBe(false);
-    }
+    __resetHubDataForTests();
+    await answer(null, 5);
+    expect(__tickNowPlayingPollForTests()).toBe(true);
+  });
+
+  it("needs the five to be consecutive", async () => {
+    // Five refusals spread across a week of healthy polling are not a reason
+    // to stop; one good answer means the service is reachable.
+    await answer(REFUSAL, 4);
+    await answer({ connected: true, playing: true, track: "x" });
+    await answer(REFUSAL, 4);
+    expect(__tickNowPlayingPollForTests()).toBe(true);
+  });
+
+  it("resumes when the widget is used", async () => {
+    // The stop rule is only safe because this exists. `refreshNowPlaying` is
+    // the widget's own Try again, and pressing it means somebody is watching.
+    await answer(REFUSAL, 5);
+    expect(__tickNowPlayingPollForTests()).toBe(false);
+
+    // The widget's own Try again — the `userInitiated` path. The automatic
+    // tick calls the same function and must NOT resume, or the breaker could
+    // never trip.
+    apiMock.getNowPlaying.mockResolvedValue({ connected: true, playing: true, track: "x" });
+    await refreshNowPlaying(true);
+    expect(__tickNowPlayingPollForTests()).toBe(true);
+  });
+
+  it("resumes when the music service is engaged directly", async () => {
+    await answer(REFUSAL, 5);
+    expect(__tickNowPlayingPollForTests()).toBe(false);
+
+    resumeNowPlayingPolling();
     expect(__tickNowPlayingPollForTests()).toBe(true);
   });
 });

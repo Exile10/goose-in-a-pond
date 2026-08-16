@@ -385,6 +385,70 @@ describe("Settings save payload", () => {
     await clickSave();
     expect(vi.mocked(api.updateSettings).mock.calls.length).toBe(1);
   });
+
+  // ── The thinking tone's switch ──────────────────────────────
+  //
+  // The tone was deleted outright in 0136f8c5 and restored behind this
+  // setting. The deletion is the reason these assert the rendered STATE as
+  // well as the patch key: a switch wired to nothing looks exactly like a
+  // working one, which is how a whole feature went missing inside a commit
+  // about copy buttons.
+
+  it("the thinking-tone switch reads ON when the key is absent", async () => {
+    // The field defaults ON in Rust, so an old stored settings row has no such
+    // key. Rendering that as OFF would tell a household the pond is silent
+    // while it is in fact pulsing at them.
+    vi.mocked(api.getSettings).mockResolvedValue(
+      serverSettings({ voice_thinking_tone_enabled: undefined }) as never,
+    );
+    await renderSettings();
+    await navigateTo("Voice");
+
+    const el = screen.getByRole("switch", { name: "Sound while it thinks" }) as HTMLInputElement;
+    expect(el.checked).toBe(true);
+  });
+
+  it("the thinking-tone switch reads OFF when the setting is off", async () => {
+    // The control for the case above: a switch hardcoded to `true`, or bound to
+    // the wrong key, passes that test and fails this one.
+    vi.mocked(api.getSettings).mockResolvedValue(
+      serverSettings({ voice_thinking_tone_enabled: false }) as never,
+    );
+    await renderSettings();
+    await navigateTo("Voice");
+
+    const el = screen.getByRole("switch", { name: "Sound while it thinks" }) as HTMLInputElement;
+    expect(el.checked).toBe(false);
+  });
+
+  it("the thinking-tone switch is reachable without opening Advanced", async () => {
+    // The rest of the speech settings live behind "Advanced voice settings".
+    // This one must not: the household most likely to want the tone off is the
+    // least likely to go looking in there.
+    //
+    // Dev mode is forced off rather than assumed: it persists in localStorage,
+    // so an earlier test in this file leaves the advanced sections expanded and
+    // the assertion below would pass for the wrong reason.
+    localStorage.setItem("settings-dev-mode", "false");
+    await renderSettings();
+    await navigateTo("Voice");
+
+    expect(screen.queryByText("Speech Synthesis")).toBeNull();
+    expect(screen.getByRole("switch", { name: "Sound while it thinks" })).toBeTruthy();
+  });
+
+  it("the thinking-tone switch writes voice_thinking_tone_enabled and nothing else", async () => {
+    await renderSettings();
+    await navigateTo("Voice");
+
+    const el = screen.getByRole("switch", { name: "Sound while it thinks" }) as HTMLInputElement;
+    expect(el.checked).toBe(true);
+
+    fireEvent.click(el);
+    await clickSave();
+
+    expect(sentPatch()).toEqual({ voice_thinking_tone_enabled: false });
+  });
 });
 
 // ── PAI-7 P4 and P6: speaking and acting unprompted ───────────

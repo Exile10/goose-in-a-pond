@@ -160,10 +160,10 @@ impl<'a> Reader<'a> {
 /// can be stepped over without interpreting it.
 fn scalar_width(kind: u32) -> Option<usize> {
     Some(match kind {
-        0 | 1 | 7 => 1,      // u8, i8, bool
-        2 | 3 => 2,          // u16, i16
-        4 | 5 | 6 => 4,      // u32, i32, f32
-        10 | 11 | 12 => 8,   // u64, i64, f64
+        0 | 1 | 7 => 1,    // u8, i8, bool
+        2 | 3 => 2,        // u16, i16
+        4 | 5 | 6 => 4,    // u32, i32, f32
+        10 | 11 | 12 => 8, // u64, i64, f64
         _ => return None,
     })
 }
@@ -241,16 +241,12 @@ pub fn parse_gguf_header(head: &[u8]) -> Option<GgufInfo> {
                 info.quantization = file_type_name(v).map(str::to_string)
             }
             ("general.parameter_count", Value::U64(v)) => info.parameter_count = Some(v),
-            ("general.parameter_count", Value::U32(v)) => {
-                info.parameter_count = Some(u64::from(v))
-            }
+            ("general.parameter_count", Value::U32(v)) => info.parameter_count = Some(u64::from(v)),
             // Architecture-scoped keys: "gemma3.context_length",
             // "llama.block_count". Matched by suffix rather than by building
             // the prefix from `general.architecture`, because the two do not
             // always agree and the suffix is unambiguous either way.
-            (k, Value::U32(v)) if k.ends_with(".context_length") => {
-                info.context_length = Some(v)
-            }
+            (k, Value::U32(v)) if k.ends_with(".context_length") => info.context_length = Some(v),
             (k, Value::U32(v)) if k.ends_with(".embedding_length") => {
                 info.embedding_length = Some(v)
             }
@@ -315,7 +311,10 @@ mod tests {
 
     impl HeaderBuilder {
         fn new() -> Self {
-            Self { kvs: Vec::new(), count: 0 }
+            Self {
+                kvs: Vec::new(),
+                count: 0,
+            }
         }
         fn raw_string(out: &mut Vec<u8>, s: &str) {
             out.extend_from_slice(&(s.len() as u64).to_le_bytes());
@@ -348,7 +347,8 @@ mod tests {
             Self::raw_string(&mut self.kvs, k);
             self.kvs.extend_from_slice(&9u32.to_le_bytes());
             self.kvs.extend_from_slice(&8u32.to_le_bytes());
-            self.kvs.extend_from_slice(&(items.len() as u64).to_le_bytes());
+            self.kvs
+                .extend_from_slice(&(items.len() as u64).to_le_bytes());
             for it in items {
                 Self::raw_string(&mut self.kvs, it);
             }
@@ -394,7 +394,10 @@ mod tests {
     #[test]
     fn summarises_in_the_order_a_model_name_is_read() {
         let info = parse_gguf_header(&gemma_header()).unwrap();
-        assert_eq!(info.summary().as_deref(), Some("Gemma3 · 4.3B · Q4_K_M · 8,192 ctx"));
+        assert_eq!(
+            info.summary().as_deref(),
+            Some("Gemma3 · 4.3B · Q4_K_M · 8,192 ctx")
+        );
     }
 
     /// Real headers carry a token vocabulary — tens of thousands of strings
@@ -420,7 +423,10 @@ mod tests {
             let bytes = HeaderBuilder::new()
                 .u32_kv(&format!("{arch}.context_length"), 4096)
                 .build();
-            assert_eq!(parse_gguf_header(&bytes).unwrap().context_length, Some(4096));
+            assert_eq!(
+                parse_gguf_header(&bytes).unwrap().context_length,
+                Some(4096)
+            );
         }
     }
 
@@ -471,7 +477,9 @@ mod tests {
 
     #[test]
     fn leaves_an_unrecognised_quantisation_unnamed() {
-        let bytes = HeaderBuilder::new().u32_kv("general.file_type", 9999).build();
+        let bytes = HeaderBuilder::new()
+            .u32_kv("general.file_type", 9999)
+            .build();
         assert_eq!(parse_gguf_header(&bytes).unwrap().quantization, None);
     }
 

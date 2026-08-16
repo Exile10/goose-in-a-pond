@@ -44,7 +44,7 @@ describe("desktopState", () => {
     // (canvas, faces, hub are routable but hidden from the sidebar, so they are
     // in GUI_SECTIONS and not here — see HIDDEN_SECTIONS in desktopState.ts)
     expect(DESKTOP_SECTIONS).toHaveLength(13);
-    expect(DESKTOP_SECTIONS[0]).toEqual({ section: "dashboard", label: "Dashboard" });
+    expect(DESKTOP_SECTIONS[0]).toEqual({ section: "dashboard", label: "Home" });
     expect(DESKTOP_SECTIONS[1]).toEqual({ section: "chat", label: "Chat" });
     const sectionKeys = DESKTOP_SECTIONS.map((s) => s.section);
     expect(sectionKeys).toContain("devices");
@@ -66,7 +66,10 @@ describe("desktopState", () => {
   });
 
   it("derives consistent desktop section labels", () => {
-    expect(getDesktopSectionLabel("dashboard")).toBe("Dashboard");
+    // The route id stays `dashboard` — it is persisted as `giap-section`, so
+    // renaming it would strand anyone whose app reopens on this screen. Only
+    // the label people read changed.
+    expect(getDesktopSectionLabel("dashboard")).toBe("Home");
     expect(getDesktopSectionLabel("chat")).toBe("Chat");
     expect(getDesktopSectionLabel("settings")).toBe("Settings");
     expect(getDesktopSectionLabel("models")).toBe("Models");

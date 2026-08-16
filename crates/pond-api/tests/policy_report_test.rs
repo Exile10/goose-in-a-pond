@@ -78,6 +78,7 @@ async fn make_app() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempD
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".into(),
         tts: None,
+        tts_control: None,
         // Real settings, so `security_policy_mode` is whatever the product
         // actually ships as its default rather than whatever a mock returns.
         settings_repo: Arc::new(SqliteSettingsRepository::new(pool.clone())),
@@ -88,6 +89,7 @@ async fn make_app() -> (axum::Router, Arc<SqliteSessionStorage>, tempfile::TempD
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         vector_index: None,
+        index_reindex: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,

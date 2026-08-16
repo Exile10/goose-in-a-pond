@@ -4,6 +4,7 @@ import { HubIco } from "../../primitives/HubIco";
 import { DetailShell } from "./DetailShell";
 import { Card } from "./controls";
 import { api } from "../../../api/PondApiClient";
+import { voiceTitle } from "../../../voice/voiceCatalogue";
 import type { ModelEntry, ModelActiveRoles } from "../../../api/types";
 
 // ─── Icon path strings for this view ─────────────────────────
@@ -43,7 +44,7 @@ const MOCK_ROLES: ModelActiveRoles = {
   embedding: null,
 };
 
-const NON_LLM_PROVIDERS = new Set(["whisper", "tts", "tts_piper", "tts_http", "embedding"]);
+const NON_LLM_PROVIDERS = new Set(["whisper", "tts", "tts_piper", "tts_kokoro", "tts_http", "embedding"]);
 
 function isLlmModel(m: ModelEntry): boolean {
   return !NON_LLM_PROVIDERS.has(m.provider) && m.category !== "embedding";
@@ -54,7 +55,7 @@ function isAsrModel(m: ModelEntry): boolean {
 }
 
 function isTtsModel(m: ModelEntry): boolean {
-  return m.provider === "tts" || m.provider === "tts_piper" || m.provider === "tts_http" || m.category === "tts";
+  return m.provider === "tts" || m.provider === "tts_piper" || m.provider === "tts_kokoro" || m.provider === "tts_http" || m.category === "tts";
 }
 
 // ─── Skeleton row ─────────────────────────────────────────────
@@ -272,7 +273,7 @@ export function ModelsDetail({ go }: ModelsDetailProps) {
                     <HubIco d={SICN.cpu} size={16} color={active ? "#7C3AED" : "var(--color-text-tertiary)"} />
                   </span>
                   <div className="mrow__text">
-                    <span className="mrow__name">{m.display_name ?? m.name}</span>
+                    <span className="mrow__name">{m.display_name ?? (m.provider === "tts_kokoro" ? voiceTitle(m.name) : m.name)}</span>
                     <span className="mrow__file">
                       {m.provider} / {m.name}
                       {m.size_mb != null ? ` · ${(m.size_mb / 1024).toFixed(1)} GB` : ""}
@@ -330,7 +331,7 @@ export function ModelsDetail({ go }: ModelsDetailProps) {
                       <HubIco d={SICN.ear} size={16} color={active ? "#7C3AED" : "var(--color-text-tertiary)"} />
                     </span>
                     <div className="mrow__text">
-                      <span className="mrow__name">{m.display_name ?? m.name}</span>
+                      <span className="mrow__name">{m.display_name ?? (m.provider === "tts_kokoro" ? voiceTitle(m.name) : m.name)}</span>
                       <span className="mrow__file">
                         Speech-to-text · {m.provider} / {m.name}
                       </span>
@@ -344,7 +345,7 @@ export function ModelsDetail({ go }: ModelsDetailProps) {
                         className="mrow__btn"
                         type="button"
                         disabled={isActivating}
-                        onClick={() => handleActivate(m.provider, m.name, "asr")}
+                        onClick={() => handleActivate(m.category ?? m.provider, m.name, "asr")}
                         aria-label={`Use ${m.name} as speech-to-text model`}
                       >
                         {isActivating ? <Loader2 size={12} style={{ animation: "spin 1s linear infinite" }} /> : "Use"}
@@ -364,7 +365,7 @@ export function ModelsDetail({ go }: ModelsDetailProps) {
                       <HubIco d={SICN.speaker} size={16} color={active ? "#7C3AED" : "var(--color-text-tertiary)"} />
                     </span>
                     <div className="mrow__text">
-                      <span className="mrow__name">{m.display_name ?? m.name}</span>
+                      <span className="mrow__name">{m.display_name ?? (m.provider === "tts_kokoro" ? voiceTitle(m.name) : m.name)}</span>
                       <span className="mrow__file">
                         Text-to-speech · {m.provider} / {m.name}
                       </span>
@@ -378,7 +379,7 @@ export function ModelsDetail({ go }: ModelsDetailProps) {
                         className="mrow__btn"
                         type="button"
                         disabled={isActivating}
-                        onClick={() => handleActivate(m.provider, m.name, "tts")}
+                        onClick={() => handleActivate(m.category ?? m.provider, m.name, "tts")}
                         aria-label={`Use ${m.name} as text-to-speech voice`}
                       >
                         {isActivating ? <Loader2 size={12} style={{ animation: "spin 1s linear infinite" }} /> : "Use"}

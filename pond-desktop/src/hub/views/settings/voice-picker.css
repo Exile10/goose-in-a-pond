@@ -1,0 +1,408 @@
+/* ── Voice picker ──────────────────────────────────────────────
+   Apple's Siri voice picker as a pattern — orb, a row of voices, a pace
+   slider — rebuilt in the house material. Paper, a 2px ink outline, and the
+   hard offset in --border-ink.
+
+   The rule the device tiles set holds here: STATE IS ELEVATION, not hue. A
+   selected voice is raised on its offset; the rest lie flat with a hairline.
+   That leaves the page's one real colour to the control that actually asks a
+   question — the play button — instead of spending it on decoration.
+
+   The offset is spent exactly twice, and both times it means something: the
+   voice you have chosen, and the button that speaks it. The stage is a quiet
+   inset with a border and no shadow — it carried one too, which stacked a
+   third copy of the same signal inside a card that already wears it, and
+   three levels of the same treatment is how a signal stops being one.
+
+   No colour codes the voices. They differ by name, accent and grade, and
+   inventing a hue per voice would say something the data does not.
+   ═══════════════════════════════════════════════════════════════ */
+
+.vpick {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* Inside the classic Models page the picker is the Speaking group's body, so
+   it takes that card's own padding rather than sitting flush against a border
+   the header respects. */
+.mdl-group .vpick { padding: var(--space-4, 16px); }
+
+/* ── Stage: the orb and what it just said ── */
+.vpick__stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 24px 16px 20px;
+  background: var(--pp-50, #FAF5FF);
+  border: 2px solid var(--color-text, #171616);
+  border-radius: var(--radius-lg, 16px);
+}
+
+/* The statement is the point of the stage, so it is set as prose — not a
+   caption. Reserved height stops the panel jumping between lines of
+   different length as the rotation advances. */
+.vpick__said {
+  margin: 0;
+  max-width: 42ch;
+  min-height: 2.9em;
+  text-align: center;
+  font-family: var(--font-body, inherit);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.45;
+  letter-spacing: -0.01em;
+  color: var(--color-text, #171616);
+  text-wrap: balance;
+}
+
+.vpick__err {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 7px 11px;
+  border: 1.5px solid #FDE68A;
+  border-radius: 8px;
+  background: #FFFBEB;
+  color: #92400E;
+  font-size: 12.5px;
+}
+
+/* ── Field scaffolding ── */
+.vpick__field {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+/* Micro-labels are mono and set wide — the one place the type does the
+   structural work, so the fields need no rules or boxes to separate them. */
+.vpick__label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-family: var(--font-mono, monospace);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-text-tertiary, #7C8A9C);
+}
+
+/* The reading beside the label: what is selected, and its grade. Sentence
+   case against the label's caps, so it reads as a value not a heading. */
+.vpick__gradeline {
+  font-family: var(--font-body, inherit);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--color-text-secondary, #475569);
+}
+
+/* ── Accent tabs ── */
+.vpick__tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.vpick__tab {
+  padding: 7px 15px;
+  border: 2px solid var(--line, #ECECF1);
+  border-radius: 999px;
+  background: var(--color-surface, #fff);
+  color: var(--color-text-secondary, #475569);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color 0.16s, box-shadow 0.16s, color 0.16s, transform 0.16s;
+}
+.vpick__tab:hover:not(:disabled) { border-color: var(--color-text, #171616); }
+.vpick__tab[data-on="true"] {
+  border-color: var(--color-text, #171616);
+  color: var(--color-text, #171616);
+  box-shadow: var(--shadow-ink);
+}
+.vpick__tab[data-on="true"]:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 var(--border-ink); }
+.vpick__tab:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ── Voices ──
+   A wrapping row rather than a scroller: eleven American voices fit, and a
+   horizontal scroller hides exactly the low-graded ones a household would
+   want to see before choosing. */
+.vpick__voices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.vpick__voice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  min-width: 84px;
+  padding: 10px 13px;
+  border: 2px solid var(--line, #ECECF1);
+  border-radius: var(--radius-md, 12px);
+  background: var(--color-surface, #fff);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.16s, box-shadow 0.16s, transform 0.16s;
+}
+.vpick__voice:hover:not(:disabled) { border-color: var(--color-text, #171616); }
+.vpick__voice[data-on="true"] {
+  border-color: var(--color-text, #171616);
+  box-shadow: var(--shadow-ink);
+}
+.vpick__voice[data-on="true"]:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 var(--border-ink); }
+.vpick__voice:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.vpick__vname {
+  font-family: var(--font-body, inherit);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--color-text, #171616);
+}
+
+/* The grade is set in mono at label size: it is data, and reading it as data
+   is what stops it competing with the name. */
+.vpick__vgrade {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--color-text-tertiary, #7C8A9C);
+}
+.vpick__voice[data-on="true"] .vpick__vgrade { color: var(--border-ink, #5D23C2); }
+
+/* ── Pace ── */
+.vpick__slider {
+  width: 100%;
+  height: 26px;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+.vpick__slider::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--line, #ECECF1);
+  border: 1.5px solid var(--color-text, #171616);
+}
+.vpick__slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 20px;
+  height: 20px;
+  margin-top: -9px;
+  border-radius: 50%;
+  background: var(--color-surface, #fff);
+  border: 2px solid var(--color-text, #171616);
+  box-shadow: 2px 2px 0 var(--border-ink);
+}
+.vpick__slider::-moz-range-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--line, #ECECF1);
+  border: 1.5px solid var(--color-text, #171616);
+}
+.vpick__slider::-moz-range-thumb {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--color-surface, #fff);
+  border: 2px solid var(--color-text, #171616);
+  box-shadow: 2px 2px 0 var(--border-ink);
+}
+.vpick__slider:disabled { opacity: 0.5; cursor: not-allowed; }
+.vpick__slider:focus-visible { outline: 2px solid var(--border-ink); outline-offset: 4px; }
+
+/* ── The one control that asks ── */
+.vpick__play {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  width: 100%;
+  padding: 13px 18px;
+  border: 2px solid var(--color-text, #171616);
+  border-radius: var(--radius-md, 12px);
+  background: var(--color-accent, #8C4BFF);
+  color: var(--color-text-on-accent, #fff);
+  font: inherit;
+  font-size: 14.5px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  box-shadow: var(--shadow-ink);
+  transition: transform 0.12s, box-shadow 0.12s, filter 0.16s;
+}
+.vpick__play:hover:not(:disabled) { filter: brightness(1.06); }
+.vpick__play:active:not(:disabled) { transform: translate(2px, 2px); box-shadow: 2px 2px 0 var(--border-ink); }
+.vpick__play:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.vpick__spin { animation: vpick-spin 1s linear infinite; }
+@keyframes vpick-spin { to { transform: rotate(360deg); } }
+
+/* Focus is visible on every control, on the ink outline's own colour. */
+.vpick__tab:focus-visible,
+.vpick__voice:focus-visible,
+.vpick__play:focus-visible {
+  outline: 2px solid var(--border-ink, #5D23C2);
+  outline-offset: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vpick__spin { animation: none; }
+  .vpick__tab,
+  .vpick__voice,
+  .vpick__play { transition: none; }
+}
+
+/* Narrow panes: the stage keeps its presence, the voices keep wrapping. */
+@media (max-width: 520px) {
+  .vpick__stage { padding: 18px 12px 16px; }
+  .vpick__said { font-size: 14px; }
+  .vpick__voice { min-width: 0; flex: 1 1 calc(50% - 5px); }
+}
+
+/* ── Quality tiers ──
+   Deliberately quieter than the voices: this is a decision about the engine
+   and what gets downloaded, not about how the pond sounds to you. Same
+   elevation rule, smaller type, no grade — a tier has a size, not a grade. */
+.vpick__tiers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.vpick__tier {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 12px;
+  border: 2px solid var(--line, #ECECF1);
+  border-radius: var(--radius-md, 12px);
+  background: var(--color-surface, #fff);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.16s, box-shadow 0.16s, transform 0.16s;
+}
+.vpick__tier:hover:not(:disabled) { border-color: var(--color-text, #171616); }
+.vpick__tier[data-on="true"] {
+  border-color: var(--color-text, #171616);
+  box-shadow: var(--shadow-ink);
+}
+.vpick__tier[data-on="true"]:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 var(--border-ink); }
+.vpick__tier:disabled { opacity: 0.5; cursor: not-allowed; }
+.vpick__tier:focus-visible { outline: 2px solid var(--border-ink, #5D23C2); outline-offset: 3px; }
+
+.vpick__tname {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--color-text, #171616);
+}
+.vpick__tsize {
+  font-family: var(--font-mono, monospace);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--color-text-tertiary, #7C8A9C);
+}
+.vpick__tier[data-on="true"] .vpick__tsize { color: var(--border-ink, #5D23C2); }
+
+/* The advice is prose, not a caption — it is the sentence that decides
+   whether someone spends 326 MB, so it is set to be read. */
+.vpick__advice {
+  margin: 2px 0 0;
+  max-width: 62ch;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--color-text-secondary, #475569);
+}
+
+/* A voice not yet on disk. The mark sits with the grade rather than on the
+   name, because it is a fact about the file, not about how it sounds — and
+   selecting it is still one click, so it must not read as a barrier. */
+.vpick__vgrade { display: inline-flex; align-items: center; gap: 5px; }
+.vpick__dl { color: var(--color-accent, #8C4BFF); flex-shrink: 0; }
+
+/* ── What is downloading ──
+   Above the stage, not inside it: the stage is what the voice sounds like,
+   and a transfer is a fact about getting there. Uses the same accent as the
+   download marks on the voices themselves, so the two read as one story. */
+.vpick__xfer {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 11px 13px;
+  border: 2px solid var(--color-text, #171616);
+  border-radius: var(--radius-md, 12px);
+  background: var(--color-surface, #fff);
+}
+
+.vpick__xrow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(80px, 2fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.vpick__xname {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-family: var(--font-mono, monospace);
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--color-text, #171616);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vpick__xname svg { color: var(--color-accent, #8C4BFF); flex-shrink: 0; }
+
+.vpick__xtrack {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--line, #ECECF1);
+  border: 1.5px solid var(--color-text, #171616);
+  overflow: hidden;
+}
+.vpick__xfill {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--color-accent, #8C4BFF);
+  transition: width 0.25s linear;
+}
+/* Before the server has reported a total there is no honest percentage, so
+   the bar paces instead of claiming one. */
+.vpick__xfill[data-indeterminate="true"] {
+  width: 35%;
+  animation: vpick-pace 1.1s ease-in-out infinite alternate;
+}
+@keyframes vpick-pace { from { transform: translateX(-100%); } to { transform: translateX(285%); } }
+
+.vpick__xpct {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-secondary, #475569);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vpick__xfill[data-indeterminate="true"] { animation: none; }
+  .vpick__xfill { transition: none; }
+}
