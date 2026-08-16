@@ -7734,6 +7734,35 @@ async fn sync_assignments_to_settings(
                     .await;
             }
             "tts" => {
+                // A `tts_piper` assignment is now always stale, and syncing it
+                // is actively harmful. Piper is gone as an engine; what this
+                // branch writes into `voice_tts_voice` is a `.onnx` FILENAME,
+                // and Kokoro takes a voice NAME, so the value can only ever be
+                // one the engine rejects.
+                //
+                // Measured on the Orin, which still carries
+                // `tts|tts_piper/en-lessac-medium` from before the swap: this
+                // sync wrote `en_US-lessac-medium.onnx` about four seconds into
+                // every boot, the Kokoro bootstrap noticed it was not a Kokoro
+                // id and healed it back to `af_heart` about eighty seconds
+                // later, and the next boot did it again. The heal's own comment
+                // says it "makes this a one-time event" — it could not, because
+                // it repaired the setting while this repaired the setting back
+                // from an assignment nobody had migrated.
+                //
+                // Skipped rather than migrated here: this function's job is to
+                // mirror assignments into settings, not to decide what the
+                // household's voice should be. Leaving the row alone and
+                // declining to mirror it lets the Kokoro bootstrap establish
+                // the truth once, and it stays.
+                if category == "tts_piper" {
+                    tracing::info!(
+                        model = %model_name,
+                        "ignoring a Piper TTS assignment left over from before the \
+                         engine swap; Kokoro will choose the voice"
+                    );
+                    continue;
+                }
                 // The TTS engine gate elsewhere checks active_tts_model.starts_with("piper")
                 // — a bare catalog slug (e.g. "en-lessac-medium") never satisfies that, so
                 // it must be stored prefixed for piper voices.
