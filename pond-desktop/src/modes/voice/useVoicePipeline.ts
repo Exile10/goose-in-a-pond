@@ -45,6 +45,11 @@ export function useVoicePipeline(): VoicePipelineAPI {
   const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wakeVariantsRef = useRef<string[]>([]);
+  // `voice_thinking_tone_enabled`. A ref, not state, for the same reason as
+  // `wakeVariantsRef`: the runPipeline calls below live in effect closures, and
+  // a re-render is not wanted for a value nothing renders. `undefined` until the
+  // settings load resolves — the backends read that as ON.
+  const thinkingToneRef = useRef<boolean | undefined>(undefined);
 
   // Keep latest state accessible without stale closures
   const stateRef = useRef(state);
@@ -144,6 +149,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
           sessionId: s.sessionId ?? undefined,
           authToken: s.sessionToken ?? undefined,
           serverUrl,
+          thinkingTone: thinkingToneRef.current,
         });
       };
 
@@ -181,6 +187,12 @@ export function useVoicePipeline(): VoicePipelineAPI {
 
       const ww = (s as Record<string, unknown>).voice_wake_word;
       if (typeof ww === "string" && ww.trim()) setWakeWord(ww.trim());
+
+      // Typed on Settings, so read directly rather than through the untyped
+      // cast the older reads above still use.
+      if (typeof s.voice_thinking_tone_enabled === "boolean") {
+        thinkingToneRef.current = s.voice_thinking_tone_enabled;
+      }
     }).catch(() => {});
   }, []);
 
@@ -239,6 +251,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
             sessionId: s.sessionId ?? undefined,
             authToken: s.sessionToken ?? undefined,
             serverUrl: s.serverUrl || "http://127.0.0.1:4000",
+            thinkingTone: thinkingToneRef.current,
           });
         } else {
           // No speech detected — return to wake listening or idle
@@ -321,6 +334,7 @@ export function useVoicePipeline(): VoicePipelineAPI {
           sessionId: s.sessionId ?? undefined,
           authToken: s.sessionToken ?? undefined,
           serverUrl: s.serverUrl || "http://127.0.0.1:4000",
+          thinkingTone: thinkingToneRef.current,
         });
       } else {
         dispatch({ type: "SET_VOICE_STATE", payload: wakeWord ? "wait" : "idle" });

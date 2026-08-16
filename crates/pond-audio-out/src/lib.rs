@@ -1,30 +1,21 @@
-//! Piper TTS adapter for Goose In A Pond.
+//! Speaker-side audio for GIAP's TTS engines.
 //!
-//! Exports:
-//! - `PiperRsOutput` — in-process `VoiceOutput` port (piper-rs / ort, default)
+//! One persistent output device ([`AudioKeeper`]), one interruptible playback
+//! routine ([`play_wav`]), and the ambient working tone ([`start_thinking_tone_thread`]).
 //!
-//! ## Default — in-process (`PiperRsOutput`)
+//! Every TTS adapter shares these. The engine differs; what it means to play a
+//! turn's audio and stop when the user cuts in does not.
 //!
-//! Loads a Piper `.onnx` voice + `.onnx.json` config directly via the
-//! piper-rs bindings (ONNX Runtime + espeak-rs phonemizer). No subprocess,
-//! no per-utterance fork+exec cost.
-//!
-//! ## Shared infrastructure
-//!
-//! Both backends reuse the same backend-agnostic helpers from this module:
-//! - `pcm_to_wav` — wraps int16 PCM into a minimal RIFF/WAV header
-//! - `play_wav_interruptible` — rodio playback with 50 ms interrupt polling
-//! - `start_thinking_tone_thread` — the soft working tone
+//! Moved out of `pond-adapters-piper` when a second engine (Kokoro) needed the
+//! same behaviour. The turn-generation logic in [`play_wav`] in particular is
+//! the product of two real bugs — read its comments before changing it.
 
 use anyhow::{Context, Result};
 use pond_core::shared::domain::agent::ThrottledAudioLevelSink;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-mod in_process;
-pub use in_process::PiperRsOutput;
-
-// ── Shared helpers (backend-agnostic) ─────────────────────────────────────────
+// ── Working tone ──────────────────────────────────────────────────────────────
 
 /// Sample rate of the generated working tone.
 const TONE_RATE: u32 = 22_050;
@@ -32,6 +23,11 @@ const TONE_RATE: u32 = 22_050;
 const TONE_CYCLE_MS: u64 = 2_600;
 /// How long the chime itself rings before the silence.
 const TONE_CHIME_MS: u64 = 1_100;
+
+/// `thinking_for` value meaning "no tone should be playing".
+///
+/// Generations start at 1, so zero can never collide with a real turn.
+pub const TONE_OFF: u64 = 0;
 
 /// Build one cycle of the working tone: a chime followed by silence.
 ///
@@ -68,11 +64,6 @@ fn working_tone_cycle() -> Vec<f32> {
     out
 }
 
-/// `thinking_for` value meaning "no tone should be playing".
-///
-/// Generations start at 1, so zero can never collide with a real turn.
-pub(crate) const TONE_OFF: u64 = 0;
-
 /// Spawn the background working-tone thread for turn `mine`.
 ///
 /// `thinking_for` names the turn the tone belongs to. The thread exits as soon
@@ -89,7 +80,7 @@ pub(crate) const TONE_OFF: u64 = 0;
 /// poll window could revive a thread that had already been told to stop,
 /// leaving a tone playing with no turn behind it. A generation is owned by
 /// exactly one turn, so neither is expressible.
-pub(crate) fn start_thinking_tone_thread(thinking_for: Arc<AtomicU64>, mine: u64) {
+pub fn start_thinking_tone_thread(thinking_for: Arc<AtomicU64>, mine: u64) {
     std::thread::spawn(move || {
         use rodio::{OutputStream, Sink};
 
@@ -132,23 +123,16 @@ pub(crate) fn start_thinking_tone_thread(thinking_for: Arc<AtomicU64>, mine: u64
     });
 }
 
-// ── WAV encoder (shared) ──────────────────────────────────────────────────────
-
-/// Wrap raw 16-bit mono PCM in a minimal RIFF/WAV container.
-///
-/// Used by both backends — the legacy subprocess emits raw int16 PCM bytes
-/// directly; the in-process backend converts piper-rs's f32 samples to int16
-/// first via `f32_samples_to_pcm_le_bytes`.
-pub(crate) use pond_voice::dsp::encode_wav_pcm16 as pcm_to_wav;
-
-/// Convert piper-rs's f32 mono samples (normalised to roughly [-1, 1]) to
-/// signed 16-bit little-endian PCM bytes ready for `pcm_to_wav`.
-///
-/// Clamps to avoid wraparound when the model emits the rare out-of-range
-/// sample. Mirrors the conversion used in `piper-rs/examples/wav.rs`.
-pub(crate) use pond_voice::dsp::f32_to_pcm16 as f32_samples_to_pcm_le_bytes;
-
 // ── Persistent audio output ───────────────────────────────────────────────────
+
+/// `rodio::OutputStream` is `!Send` due to cpal's CoreAudio property-listener
+/// callbacks. We move it to a dedicated keeper thread and never access it from
+/// any other thread, so the transfer is safe.
+#[allow(dead_code)] // kept alive for its Drop (closes the audio device); never read
+struct SendableStream(rodio::OutputStream);
+// SAFETY: the stream is moved into the keeper thread exactly once and lives
+// there until the keeper is dropped. No other thread touches it.
+unsafe impl Send for SendableStream {}
 
 /// Keeps a `rodio::OutputStream` alive on a dedicated background thread.
 ///
@@ -160,29 +144,24 @@ pub(crate) use pond_voice::dsp::f32_to_pcm16 as f32_samples_to_pcm_le_bytes;
 /// Reusing one `OutputStreamHandle` across all TTS calls avoids the repeated
 /// CoreAudio AudioUnit open/close cycle that causes progressive audio
 /// degradation after several voice turns on macOS.
-/// `rodio::OutputStream` is `!Send` due to cpal's CoreAudio property-listener
-/// callbacks. We move it to a dedicated keeper thread and never access it from
-/// any other thread, so the transfer is safe.
-#[allow(dead_code)] // kept alive for its Drop (closes the audio device); never read
-struct SendableStream(rodio::OutputStream);
-// SAFETY: the stream is moved into the keeper thread exactly once and lives
-// there until the keeper is dropped. No other thread touches it.
-unsafe impl Send for SendableStream {}
-
-pub(crate) struct AudioKeeper {
-    pub(crate) handle: rodio::OutputStreamHandle,
+pub struct AudioKeeper {
+    pub handle: rodio::OutputStreamHandle,
     stop: Arc<AtomicBool>,
 }
 
 impl AudioKeeper {
-    pub(crate) fn try_new() -> Result<Self> {
+    /// Open the default output device and park it on a keeper thread.
+    ///
+    /// `thread_name` is only for diagnostics — pass something that names the
+    /// engine so a stuck thread in a backtrace says which one.
+    pub fn try_new(thread_name: &str) -> Result<Self> {
         let (stream, handle) =
             rodio::OutputStream::try_default().context("audio output device unavailable")?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
         let sendable = SendableStream(stream);
         std::thread::Builder::new()
-            .name("piper-audio-keeper".into())
+            .name(thread_name.to_string())
             .spawn(move || {
                 let _stream = sendable; // keep OutputStream alive on this thread
                 while !stop_clone.load(Ordering::Relaxed) {
@@ -200,15 +179,9 @@ impl Drop for AudioKeeper {
     }
 }
 
-// ── Audio playback (shared) ───────────────────────────────────────────────────
+// ── Playback ──────────────────────────────────────────────────────────────────
 
-/// Play WAV audio with interrupt support and AEC gating.
-///
-/// Opens a fresh `OutputStream` on each call. Used only by the legacy
-/// subprocess backend (`PiperOutput`) — the in-process backend's TTS playback
-/// uses `play_wav_on_handle` with a persistent `OutputStreamHandle` instead.
-
-/// Per-window RMS amplitude envelope from a `pcm_to_wav`-produced buffer
+/// Per-window RMS amplitude envelope from an `encode_wav_pcm16`-produced buffer
 /// (44-byte header + 16-bit LE mono PCM), one value per `window_ms`.
 ///
 /// rodio's `Sink`/cpal callback offers no per-sample hook once `append()` is
@@ -248,15 +221,15 @@ fn compute_audio_envelope(wav: &[u8], window_ms: u64) -> Vec<f32> {
 
 /// Play WAV audio on an already-open `OutputStreamHandle` with interrupt support.
 ///
-/// Same semantics as `play_wav_interruptible` but reuses the caller's stream
-/// instead of opening a new `OutputStream`. Used by `PiperRsOutput` to avoid
-/// repeated CoreAudio AudioUnit churn across voice turns.
+/// Reuses the caller's stream instead of opening a new `OutputStream`, which
+/// avoids the repeated CoreAudio AudioUnit churn that degrades audio across
+/// voice turns.
 ///
 /// `audio_level_sink`, if given, is fed one amplitude reading per poll tick
 /// from `wav`'s own precomputed envelope (see `compute_audio_envelope`) —
 /// the `speaking` state's UI-facing analog of the mic-input RMS reported
 /// during `wait`/`recording`.
-pub(crate) fn play_wav_on_handle(
+pub fn play_wav(
     wav: Vec<u8>,
     handle: &rodio::OutputStreamHandle,
     interrupted: &AtomicBool,
@@ -310,17 +283,13 @@ pub(crate) fn play_wav_on_handle(
     Ok(())
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
-    fn pcm_to_wav_header_is_correct() {
+    fn wav_header_is_correct() {
         // 2 bytes of PCM (one 16-bit sample at 22050 Hz mono)
         let pcm = vec![0x01u8, 0x00u8];
-        let wav = pcm_to_wav(&pcm, 22_050);
+        let wav = pond_voice::dsp::encode_wav_pcm16(&pcm, 22_050);
 
         // RIFF magic
         assert_eq!(&wav[0..4], b"RIFF");
@@ -342,7 +311,7 @@ mod tests {
         // 0.0 → 0; 1.0 → i16::MAX; -2.0 clamps to -1.0 → -i16::MAX (-32767).
         // Note: -i16::MAX, not i16::MIN — multiplying -1.0 * i16::MAX gives
         // -32767, which is the symmetric counterpart of the positive peak.
-        let bytes = f32_samples_to_pcm_le_bytes(&[0.0, 1.0, -2.0]);
+        let bytes = pond_voice::dsp::f32_to_pcm16(&[0.0, 1.0, -2.0]);
         assert_eq!(bytes.len(), 6);
         assert_eq!(i16::from_le_bytes([bytes[0], bytes[1]]), 0);
         assert_eq!(i16::from_le_bytes([bytes[2], bytes[3]]), i16::MAX);
@@ -592,6 +561,33 @@ mod utterance_generation_tests {
             first_ever.load(Ordering::SeqCst),
             TONE_OFF,
             "generations start at 1"
+        );
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    #[test]
+    fn envelope_is_empty_for_a_header_only_wav() {
+        assert!(compute_audio_envelope(&[0u8; 44], 50).is_empty());
+        assert!(compute_audio_envelope(&[], 50).is_empty());
+    }
+
+    /// The envelope is what the UI's speaking-amplitude readout is drawn from,
+    /// so full-scale PCM has to read as full-scale.
+    #[test]
+    fn envelope_tracks_amplitude() {
+        let mut wav = pond_voice::dsp::encode_wav_pcm16(&[], 24_000);
+        let one_window = 24_000 * 50 / 1000;
+        wav.extend((0..one_window).flat_map(|_| i16::MAX.to_le_bytes()));
+        let env = compute_audio_envelope(&wav, 50);
+        assert_eq!(env.len(), 1);
+        assert!(
+            env[0] > 0.9,
+            "full-scale PCM should read near 1.0, got {}",
+            env[0]
         );
     }
 }

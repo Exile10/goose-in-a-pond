@@ -151,6 +151,7 @@ async fn app_with_repo(
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".to_string(),
         tts: None,
+        tts_control: None,
         // The real repository, not the mock. `MockSettingsRepository` silently
         // drops `chat_model` -- it stores a hand-written subset of the struct --
         // and `complete_onboarding` refuses with 400 when `chat_model` is
@@ -165,6 +166,7 @@ async fn app_with_repo(
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         vector_index: None,
+        index_reindex: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,

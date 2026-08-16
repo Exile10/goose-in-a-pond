@@ -66,12 +66,6 @@ export interface PromptStyle {
   desc: string;
 }
 
-export interface TtsVoice {
-  value: string;
-  label: string;
-  accent: string;
-  file: string;
-}
 
 export interface WakePreset {
   value: string;

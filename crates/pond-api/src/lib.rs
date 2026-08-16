@@ -149,6 +149,10 @@ pub struct AppState {
     pub llamafile_url: String,
     /// TTS engine for the `/api/v1/test/speak` dev endpoint. `None` → print only.
     pub tts: Option<Arc<dyn VoiceOutput>>,
+    /// Reconfiguring the LIVE speech engine — voice, pace, quality — without
+    /// restarting the pond. Separate from `tts`, which is only ever asked to
+    /// speak. `None` when no engine is running.
+    pub tts_control: Option<Arc<dyn pond_core::models::ports::tts_control::TtsControl>>,
     /// Persistent settings repository (assistant identity, LLM, voice, retention).
     pub settings_repo: Arc<dyn SettingsRepository + Send + Sync>,
     /// Profile repository for household members.
@@ -185,6 +189,19 @@ pub struct AppState {
     /// figure computed against the wrong model reads as a catastrophically
     /// broken index when nothing is wrong at all.
     pub vector_index: Option<Arc<dyn VectorIndex>>,
+    /// Fired when somebody asks for the index to be rebuilt.
+    ///
+    /// The rebuild route only CLEARS; refilling is the maintenance sweep's job,
+    /// and the sweep is idle-gated so it will not normally run while the person
+    /// who pressed the button is still there pressing buttons. Without this the
+    /// honest description of the feature would be "empties the index, refills it
+    /// within the quarter-hour, maybe" — so the route wakes the sweep instead,
+    /// and a requested pass skips the quiet it would otherwise wait for.
+    ///
+    /// `None` on a pond with no sweep to wake (no embedder, or a CLI process).
+    /// The route still clears, because clearing is what makes the next process
+    /// rebuild from scratch.
+    pub index_reindex: Option<Arc<tokio::sync::Notify>>,
     /// IoT sensor reading storage (uses logs DB).
     pub sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
     /// Camera event storage (uses logs DB).

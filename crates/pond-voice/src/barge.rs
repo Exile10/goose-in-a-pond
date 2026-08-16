@@ -4,7 +4,7 @@
 //!
 //! `VoiceOutput` used to carry `start_barge_in_listener` /
 //! `stop_barge_in_listener`, which put the *microphone* on the *output* port —
-//! and that is why `PiperRsOutput` opened `default_input_device()` itself, a
+//! and that is why the TTS adapter opened `default_input_device()` itself, a
 //! third independent claim on a device only one thing can own. Those methods
 //! are gone. Barge-in is now a property of the turn: it reads energy from
 //! whatever owns the microphone, and TTS knows nothing about it.

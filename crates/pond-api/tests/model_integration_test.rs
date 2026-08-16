@@ -131,6 +131,7 @@ async fn make_app_with_settings_repo() -> (
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".into(),
         tts: None,
+        tts_control: None,
         settings_repo: settings_repo.clone(),
         profile_repo: Arc::new(MockProfileRepository::new()),
         device_registry: Arc::new(MockDeviceRegistry),
@@ -138,6 +139,7 @@ async fn make_app_with_settings_repo() -> (
         memory_repo: Arc::new(MockMemoryRepository::new()),
         embedding_provider: None,
         vector_index: None,
+        index_reindex: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -408,4 +410,124 @@ async fn activate_whisper_model_for_asr_role() {
 
     let assignment = repo.get_assignment("asr").await.unwrap();
     assert_eq!(assignment.unwrap().model_id, "whisper/base");
+}
+
+// ── Kokoro voices, reached through the "tts" group key ────────────────────────
+
+fn kokoro_voice_record(name: &str) -> ModelRecord {
+    ModelRecord {
+        id: ModelRecord::id_for(&ModelCategory::TtsKokoro, name),
+        category: ModelCategory::TtsKokoro,
+        name: name.to_string(),
+        filename: Some(format!("{name}.bin")),
+        description: "American female, warm and unhurried".into(),
+        size_mb: 1,
+        url: Some("https://example.com/af_heart.bin".into()),
+        hf_id: None,
+        ram_estimate_mb: None,
+        recommended_role: Some("tts".into()),
+        context_length: None,
+        quantization: None,
+        asr_language: None,
+        asr_size: None,
+        tts_engine: Some("kokoro".into()),
+        tts_voice_name: Some(name.to_string()),
+        config_filename: None,
+        config_url: None,
+        tts_url: None,
+        sample_rate: Some(24_000),
+        downloaded: true,
+        is_custom: false,
+    }
+}
+
+/// The reported bug, exactly.
+///
+/// The models list buckets every TTS engine under one `tts` group, and callers
+/// reached for that group key instead of the record's own category. The lookup
+/// then built `tts_piper/af_heart` and answered
+/// "Model 'af_heart' not found in 'tts'" — every Kokoro voice was unusable from
+/// the Models page. Piper was unaffected only because its group key and its
+/// category happen to be the same word.
+#[tokio::test]
+async fn activate_kokoro_voice_via_the_tts_group_key() {
+    let (app, repo, _tmp) = make_app().await;
+    repo.upsert(&kokoro_voice_record("af_heart")).await.unwrap();
+
+    let req = auth_req(
+        "POST",
+        "/api/v1/models/tts/af_heart/activate",
+        Some(serde_json::json!({ "role": "tts" })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a Kokoro voice must be reachable through the group key the list endpoint hands out"
+    );
+}
+
+/// The precise category must of course still work.
+#[tokio::test]
+async fn activate_kokoro_voice_via_its_own_category() {
+    let (app, repo, _tmp) = make_app().await;
+    repo.upsert(&kokoro_voice_record("bm_george"))
+        .await
+        .unwrap();
+
+    let req = auth_req(
+        "POST",
+        "/api/v1/models/tts_kokoro/bm_george/activate",
+        Some(serde_json::json!({ "role": "tts" })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Forgiveness is scoped to TTS. A GGUF lookup must never resolve to some other
+/// category's record that happens to share a name.
+#[tokio::test]
+async fn a_missing_non_tts_model_is_still_a_404() {
+    let (app, repo, _tmp) = make_app().await;
+    repo.upsert(&kokoro_voice_record("af_heart")).await.unwrap();
+
+    let req = auth_req(
+        "POST",
+        "/api/v1/models/gguf/af_heart/activate",
+        Some(serde_json::json!({ "role": "chat" })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Activating a Kokoro voice must set the key the engine actually reads.
+///
+/// `active_tts_model` names the catalogue row; `voice_tts_voice` is what
+/// `KokoroOutput` resolves `<voice>.bin` from and what the Voice screen shows.
+/// Writing only the former left a household able to pick a voice in Models
+/// while `voice_tts_voice` still held the Piper filename from before the engine
+/// swap — the picker showed one voice and the pond spoke in another.
+#[tokio::test]
+async fn activating_a_kokoro_voice_sets_voice_tts_voice() {
+    let (app, repo, settings, _tmp) = make_app_with_settings_repo().await;
+    repo.upsert(&kokoro_voice_record("bf_emma")).await.unwrap();
+
+    // Start from the stale Piper spelling a real install carries.
+    settings
+        .set_key("voice_tts_voice", "en_US-ryan-high.onnx".into())
+        .await
+        .unwrap();
+
+    let req = auth_req(
+        "POST",
+        "/api/v1/models/tts/bf_emma/activate",
+        Some(serde_json::json!({ "role": "tts" })),
+    );
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Only `voice_tts_voice` is asserted: `MockSettingsRepository` does not
+    // project `active_tts_model` back out of its store, and that key was never
+    // the broken one — it was already being written.
+    let s = settings.get().await.unwrap();
+    assert_eq!(s.voice_tts_voice, "bf_emma");
 }

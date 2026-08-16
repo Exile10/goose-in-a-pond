@@ -58,7 +58,7 @@ export function summariseRetitle(r: RetitleResult): string {
 const PROVIDERS: Record<Exclude<OptionSource, "llm-providers">, (m: ModelEntry) => boolean> = {
   "llm-models": (m) => ["gguf", "llamafile", "ollama"].includes(m.provider),
   "whisper-models": (m) => m.provider === "whisper",
-  "tts-voices": (m) => ["tts", "tts_piper", "tts_http"].includes(m.provider),
+  "tts-voices": (m) => ["tts", "tts_piper", "tts_kokoro", "tts_http"].includes(m.provider),
   "embedding-models": (m) => m.provider === "embedding" || m.category === "embedding",
 };
 

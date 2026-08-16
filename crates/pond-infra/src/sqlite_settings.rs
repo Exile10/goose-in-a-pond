@@ -120,6 +120,8 @@ impl SettingsRepository for SqliteSettingsRepository {
                 .unwrap_or_else(|_| "[]".to_string())
         );
         upsert!("voice_tts_voice", &settings.voice_tts_voice);
+        upsert!("voice_tts_speed", settings.voice_tts_speed.to_string());
+        upsert!("voice_tts_quality", &settings.voice_tts_quality);
         upsert!(
             "voice_recording_duration_secs",
             settings.voice_recording_duration_secs.to_string()
@@ -594,6 +596,14 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
+        upsert!(
+            "voice_thinking_tone_enabled",
+            if settings.voice_thinking_tone_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
         // PAI-7 P6. Without these four lines the fields deserialize, apply and
         // then vanish on the next read -- the failure mode the roundtrip test
         // below exists for.
@@ -770,6 +780,21 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
             }
         }
         "voice_tts_voice" => s.voice_tts_voice = value.to_string(),
+        // Stored faithfully, NOT clamped. Clamping here would make a write and
+        // the following read disagree, which is exactly what
+        // `roundtrip_persists_every_field` exists to catch — and it did.
+        // The range belongs to whoever uses the value: the API validates it and
+        // `KokoroOutput::set_speed` clamps defensively at synthesis time.
+        // NaN is still refused, because it would round-trip as `null` and read
+        // back as the default with no way to tell it ever failed.
+        "voice_tts_speed" => {
+            if let Ok(v) = value.parse::<f32>() {
+                if v.is_finite() {
+                    s.voice_tts_speed = v;
+                }
+            }
+        }
+        "voice_tts_quality" => s.voice_tts_quality = value.to_string(),
         "voice_recording_duration_secs" => {
             if let Ok(v) = value.parse() {
                 s.voice_recording_duration_secs = v;
@@ -1051,6 +1076,12 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         // parse-with-fallback: anything unreadable in that column is not "true",
         // so a corrupt row leaves delegation OFF.
         "ext_orchestrator_enabled" => s.ext_orchestrator_enabled = value == "true",
+        // `value == "true"` rather than a parse-with-fallback, but note the bias
+        // runs the OTHER way from the ext_* flags above: the field defaults ON,
+        // so a corrupt row silences the working tone rather than enabling
+        // something. That is the safe direction for audio -- an unreadable row
+        // can never make the speaker start pulsing on its own.
+        "voice_thinking_tone_enabled" => s.voice_thinking_tone_enabled = value == "true",
         // PAI-7 P6. `value == "true"` for the same reason as the line above:
         // anything unreadable in that column is not "true", so a corrupt row
         // leaves the pond quiet rather than talking.

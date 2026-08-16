@@ -56,7 +56,7 @@ export function WeatherWidget({ variant = "card" }: WeatherWidgetProps) {
           <HubIco
             d={getForecastIcon(w.icon) || HP_PATHS.cloudSun}
             size={variant === "hero" ? 44 : 34}
-            color="#fff"
+            color="var(--color-text)"
             sw={1.7}
           />
         </span>
@@ -70,7 +70,7 @@ export function WeatherWidget({ variant = "card" }: WeatherWidgetProps) {
         {w.forecast.map((f) => (
           <div key={f.d} className="wx__fday">
             <span>{f.d}</span>
-            <HubIco d={getForecastIcon(f.i)} size={16} color="rgba(255,255,255,.92)" sw={1.7} />
+            <HubIco d={getForecastIcon(f.i)} size={16} color="var(--color-text-secondary)" sw={1.7} />
             <strong>{f.t}°</strong>
           </div>
         ))}

@@ -860,3 +860,67 @@ describe("useVoiceSession — full contract event sequence", () => {
     expect(doneActions).toHaveLength(1);
   });
 });
+
+// ── Startup failure: the child's own reason must reach the user ──────────────
+//
+// Regression: a sidecar staged weeks before the database was migrated exited 1
+// having emitted ZERO NDJSON lines. The shell called that "crashed" and the UI
+// said "Voice session exited (code 1, reason: crashed)" — true, and useless.
+// The actual cause was on the child's stderr, which the shell logged at debug.
+
+describe("useVoiceSession — failed_to_start", () => {
+  it("surfaces the child's stderr reason instead of an exit code", async () => {
+    const useVoiceSession = await getHook();
+    _invoke = vi.fn().mockResolvedValue("s-fail");
+
+    renderHook(() => useVoiceSession(), { wrapper });
+    await act(async () => { await Promise.resolve(); });
+
+    // No voice-ready: the child died during startup.
+    clearDispatched();
+    act(() => {
+      emitTauriEvent("voice-session-ended", {
+        code: 1,
+        reason: "failed_to_start",
+        session_id: null,
+        detail:
+          "  Goose in a Pond 0.1.0 — voice\n" +
+          "Error: migration 29 was previously applied but is missing in the resolved migrations",
+      });
+    });
+
+    const errors = dispatchedOfType("SET_VOICE_ERROR").filter((a) => a.payload !== null);
+    expect(errors).toHaveLength(1);
+    const msg = String(errors[0].payload);
+    // The cause, not the exit code, is what tells anyone what to do next.
+    expect(msg).toContain("migration 29");
+    expect(msg).not.toContain("reason: failed_to_start");
+
+    cleanup();
+  });
+
+  it("says so plainly when the child died without explaining itself", async () => {
+    const useVoiceSession = await getHook();
+    _invoke = vi.fn().mockResolvedValue("s-quiet");
+
+    renderHook(() => useVoiceSession(), { wrapper });
+    await act(async () => { await Promise.resolve(); });
+
+    clearDispatched();
+    act(() => {
+      emitTauriEvent("voice-session-ended", {
+        code: 1,
+        reason: "failed_to_start",
+        session_id: null,
+        detail: null,
+      });
+    });
+
+    const errors = dispatchedOfType("SET_VOICE_ERROR").filter((a) => a.payload !== null);
+    expect(errors).toHaveLength(1);
+    // Absent detail must not render as a message that trails off into nothing.
+    expect(String(errors[0].payload)).toContain("without reporting a reason");
+
+    cleanup();
+  });
+});

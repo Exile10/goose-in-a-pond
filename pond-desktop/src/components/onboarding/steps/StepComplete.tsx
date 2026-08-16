@@ -7,7 +7,8 @@ import { motion } from "framer-motion";
 import { CloudSun, Brain, Home, CalendarDays } from "lucide-react";
 import { useOnboarding } from "../OnboardingContext";
 import { ToggleRow } from "../primitives/ToggleRow";
-import { PROMPT_STYLES, TTS_VOICES } from "../onboarding.constants";
+import { PROMPT_STYLES } from "../onboarding.constants";
+import { describeVoice } from "../../../voice/voiceCatalogue";
 
 const ICON_PROPS = { size: 18, strokeWidth: 1.8 } as const;
 
@@ -23,7 +24,7 @@ export function StepComplete({ onFinish }: Props) {
       { k: "You",        v: `${draft.avatar} ${draft.preferredName || draft.userName || "friend"}` },
       { k: "Locale",     v: `${draft.language.toUpperCase()} \u00b7 ${draft.timezone}` },
       { k: "Style",      v: PROMPT_STYLES.find((p) => p.value === draft.promptStyle)?.label ?? "Balanced" },
-      { k: "Assistant",  v: `${draft.assistantName} \u00b7 ${TTS_VOICES.find((v) => v.value === draft.ttsVoice)?.label ?? "Amy"}` },
+      { k: "Assistant",  v: `${draft.assistantName} \u00b7 ${describeVoice(draft.ttsVoice).name}` },
       { k: "Wake word",  v: draft.wakeWord === "custom" ? `"${draft.wakeWordCustom}"` : `"${draft.wakeWord}"` },
       { k: "Model",      v: "Auto (downloads on first run)" },
     ],

@@ -13,6 +13,13 @@ export interface PipelineOpts {
   sessionId?: string;
   authToken?: string;
   serverUrl: string;
+  /**
+   * `settings.voice_thinking_tone_enabled` — whether the ambient working tone
+   * plays between the quip and the first spoken sentence. Omitted means ON:
+   * the orchestrator loads settings asynchronously, and a turn that fires
+   * before that resolves should sound like the pond normally does.
+   */
+  thinkingTone?: boolean;
 }
 
 export interface ResponseMeta {
@@ -82,14 +89,19 @@ export function isTauriEnv(): boolean {
 }
 
 /**
- * Create the right VoiceBackend for the current runtime.
- * Lazy-imports to avoid bundling Tauri deps in browser builds.
+ * Create the VoiceBackend for the current runtime.
+ *
+ * Only ever the browser one. Inside Tauri the voice screen runs the persistent
+ * child-process session (`useVoiceSession`) instead, so this per-turn HTTP
+ * pipeline is the non-Tauri path exclusively. The Tauri implementation of this
+ * interface was removed once that became true — it had no reachable caller, and
+ * a second copy of the pipeline that nothing exercised was a copy that could
+ * only drift.
+ *
+ * Still lazy-imported: it pulls in the whole Web Audio pipeline, which the
+ * desktop build never runs.
  */
-export async function createVoiceBackend(serverUrl: string): Promise<VoiceBackend> {
-  if (isTauriEnv()) {
-    const { TauriVoiceBackend } = await import("./TauriVoiceBackend");
-    return new TauriVoiceBackend(serverUrl);
-  }
+export async function createVoiceBackend(_serverUrl: string): Promise<VoiceBackend> {
   const { WebVoiceBackend } = await import("./WebVoiceBackend");
-  return new WebVoiceBackend(serverUrl);
+  return new WebVoiceBackend(_serverUrl);
 }

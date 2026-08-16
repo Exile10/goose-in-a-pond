@@ -30,7 +30,7 @@ export const SIDEBAR_GROUPS: SidebarGroup[] = [
   {
     label: "MAIN",
     sections: [
-      { section: "dashboard", label: "Dashboard", icon: "dashboard" },
+      { section: "dashboard", label: "Home", icon: "dashboard" },
       { section: "chat",      label: "Chat",      icon: "chat" },
     ],
   },

@@ -21,6 +21,8 @@ mod asset_root;
 mod composite_model_catalog_provider;
 mod filesystem_model_storage;
 mod http_model_downloader;
+mod inference_lane_runner;
+mod kokoro_control;
 mod llamafile_process;
 mod llm_memory_consolidator;
 mod llm_memory_extractor;
@@ -43,7 +45,6 @@ use pond_adapters_llamafile::LlamafileProvider;
 #[cfg(feature = "mesh")]
 use pond_adapters_mesh_libp2p::{Libp2pMeshTransport, Libp2pMeshTransportConfig};
 use pond_adapters_ollama::OllamaProvider;
-use pond_adapters_piper::PiperRsOutput;
 use pond_adapters_weather::{OpenMeteoWeatherAdapter, WeatherProvider};
 use pond_adapters_whisper::{WhisperKeywordDetector, WhisperRsInput};
 use pond_api::{AppState, LlamafileManager};
@@ -168,10 +169,6 @@ enum Commands {
         /// Defaults to the active TTS model stored in Settings.
         #[arg(long)]
         tts: Option<String>,
-
-        /// Path to the Piper voice model (.onnx file). Defaults to $DATA_DIR/models/tts/en_US-lessac-medium.onnx
-        #[arg(long)]
-        tts_model: Option<std::path::PathBuf>,
 
         /// Session id for conversation continuity + history. Defaults to
         /// "default-session". The desktop shell passes a per-session uuid so
@@ -515,7 +512,6 @@ async fn async_main() -> Result<()> {
             wake_word,
             no_wake_word,
             tts,
-            tts_model,
             session_id,
             json_events,
         }) => {
@@ -537,7 +533,6 @@ async fn async_main() -> Result<()> {
                 wake_word.as_deref(),
                 no_wake_word,
                 tts.as_deref(),
-                tts_model,
                 session_id.as_deref(),
                 json_events,
             )
@@ -569,18 +564,7 @@ async fn async_main() -> Result<()> {
         None => {
             // Default: run interactive chat (backward compat) — provider comes from Settings
             let _log = tracing_setup::init_tracing(false, &data_dir);
-            run_chat(
-                None,
-                None,
-                "stdin",
-                None,
-                true,
-                Some("none"),
-                None,
-                None,
-                false,
-            )
-            .await
+            run_chat(None, None, "stdin", None, true, Some("none"), None, false).await
         }
     }
 }
@@ -656,8 +640,10 @@ async fn run_setup(model: &str) -> Result<()> {
     }
 
     let setup_model_repo = SqliteModelRepository::new(db_setup.system.clone());
+    let settings_repo_setup = SqliteSettingsRepository::new(db_setup.system.clone());
     println!("  📋 Fetching model catalog from upstream sources...");
     seed_model_catalog(&setup_model_repo, &data_dir).await;
+    ensure_tts_is_set_up(&setup_model_repo, &settings_repo_setup).await;
 
     // Seed built-in prompt templates (INSERT OR IGNORE — never overwrites user edits)
     {
@@ -978,7 +964,7 @@ impl LlamafileManagerImpl {
     }
 }
 
-/// How long after boot the personal-context index repairs itself.
+/// How long after boot the personal-context index first considers a pass.
 ///
 /// Not zero: the design's rule is that backfill is deferred to idle rather than
 /// run at startup, because a household's first turn after an upgrade must not be
@@ -987,6 +973,14 @@ impl LlamafileManagerImpl {
 /// repaired within the minute.
 const INDEX_MAINTENANCE_DELAY_SECS: u64 = 60;
 
+/// How often a pass is CONSIDERED after that. The lane decides whether one runs.
+///
+/// This used to be a one-shot: the sweep fired once, sixty seconds after boot,
+/// and never again for the life of the process. A pond left running for a week
+/// indexed nothing it learned during that week, and the only way to repair the
+/// index was to restart the server — which is not something a member of a
+/// household does, or should have to.
+const INDEX_MAINTENANCE_POLL_SECS: u64 = 15 * 60;
 
 /// Say so, loudly, when this binary cannot reach the accelerator this host has.
 ///
@@ -1224,58 +1218,17 @@ async fn run_server(
             }
         });
 
-    // Piper voice path — None when no voice is configured (skips all piper startup).
-    // When voice_tts_voice is empty the user has not yet picked a piper voice in Settings;
-    // do not fall back to a hardcoded default.
-    let piper_model: Option<std::path::PathBuf> =
-        voice_models.piper.as_ref().map(|v| v.onnx.clone());
-
-    // Only download/install piper components when piper is the configured active TTS
-    // AND a specific voice model has been chosen by the user.
+    // espeak-ng-data, unconditionally.
     //
-    // In-process build (default): download the .onnx + .onnx.json voice model
-    // and the espeak-ng-data directory. No `piper` binary needed any more —
-    // piper-rs loads the ONNX model directly via ort.
-    // Gate on whether a voice resolved. `active_tts_model.starts_with("piper")`
-    // is never true for a catalog name like `en-lessac-medium`, so this block —
-    // including `ensure_espeak_ng_data`, without which piper cannot phonemize —
-    // was skipped on every boot.
-    let piper_is_primary = voice_models.tts_is_piper();
-    if piper_is_primary {
-        if let Some(ref piper_model_path) = piper_model {
-            if !piper_model_path.exists() {
-                match voice_models
-                    .piper
-                    .as_ref()
-                    .and_then(|v| v.download.as_ref())
-                {
-                    Some(dl) => {
-                        let _ = model_download::download_piper_model_entry(
-                            &data_dir,
-                            &dl.onnx_filename,
-                            &dl.config_filename,
-                            &dl.onnx_url,
-                            &dl.config_url,
-                            dl.size_mb,
-                        )
-                        .await;
-                    }
-                    None => println!(
-                        "  ⚠  Piper voice '{}' has no catalog download — cannot fetch",
-                        settings.voice_tts_voice
-                    ),
-                }
-            }
-            model_download::ensure_espeak_ng_data(&data_dir).await;
-        } else {
-            println!("  ⏭  Piper: active_tts_model=piper but no voice model configured — configure one in Settings");
-        }
-    }
+    // This used to sit inside a `if piper_is_primary` block. Kokoro phonemizes
+    // through the same espeak-ng, so gating the data on Piper being the engine
+    // would leave the new engine unable to turn text into phonemes at all —
+    // the removal of Piper would have taken the phonemizer with it.
+    model_download::ensure_espeak_ng_data(&data_dir).await;
 
-    // espeak-ng phoneme data directory. Used by both backends:
-    // - Legacy subprocess: passed to piper as `--espeak_data <dir>`.
-    // - In-process: set as the `PIPER_ESPEAKNG_DATA_DIRECTORY` env var that
-    //   espeak-rs consults during its lazy init.
+    // Where espeak-rs looks for its phoneme tables. The env var keeps its
+    // historical `PIPER_` name because that literal is what the espeak-rs crate
+    // reads — it names the reader, not the engine that used to own it.
     let espeak_data = {
         let p = model_download::piper_espeak_data_path(&data_dir);
         if p.exists() {
@@ -1285,82 +1238,123 @@ async fn run_server(
         }
     };
 
-    // ── Construct the TTS backend ──
-    //
-    // Default: in-process `PiperRsOutput`. Loads the .onnx + .onnx.json once
-    // and synthesises with zero subprocess overhead.
-    //
-    // Legacy: `PiperOutput` (subprocess) plus a `piper_http` HTTP wrapper on a
-    // background port for backwards compatibility with the old `piper_http_port`
-    // status report.
-    #[allow(unused_mut)]
-    let mut piper_http_port: Option<u16> = None;
+    // Kept only for the status report's `piper_http_port` field, which is now
+    // always absent. The legacy subprocess and its HTTP wrapper are gone.
+    let piper_http_port: Option<u16> = None;
 
-    let piper_tts: Option<Arc<dyn pond_core::models::ports::voice_output::VoiceOutput>> =
-        match &piper_model {
-            Some(model_path) if model_path.exists() => {
-                let config_path =
-                    std::path::PathBuf::from(format!("{}.json", model_path.display()));
-                if !config_path.exists() {
-                    println!(
-                        "  ⚠  Piper voice config (.onnx.json) missing at {}",
-                        config_path.display()
-                    );
-                    None
-                } else {
-                    let model_path_owned = model_path.clone();
-                    let config_path_owned = config_path.clone();
-                    let piper_result = tokio::time::timeout(
-                        std::time::Duration::from_secs(15),
-                        tokio::task::spawn_blocking(move || {
-                            PiperRsOutput::new(model_path_owned, config_path_owned)
-                        }),
-                    )
-                    .await;
-                    match piper_result {
-                        Ok(Ok(Ok(out))) => {
-                            let out = match espeak_data.clone() {
-                                Some(d) => out.with_espeak_data(d),
-                                None => out,
-                            };
-                            println!("  ✅ Piper TTS: in-process (piper-rs / ort)");
-                            Some(Arc::new(out)
-                                as Arc<
-                                    dyn pond_core::models::ports::voice_output::VoiceOutput,
-                                >)
-                        }
-                        Ok(Ok(Err(e))) => {
-                            tracing::warn!("PiperRsOutput failed to load voice: {e}");
-                            None
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!("PiperRsOutput spawn_blocking panicked: {e}");
-                            None
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                "PiperRsOutput timed out after 15 s — ONNX Runtime may be \
-                                 version-incompatible (need ORT 1.24.2)"
-                            );
-                            None
+    // Shared with the TTS control below, so a voice or tier fetch appears in
+    // the same progress feed as every other download on the Models page.
+    let download_tracker: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, pond_api::DownloadEntry>>,
+    > = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
+    // ── Kokoro: the TTS engine ──
+    //
+    // Constructed BEFORE anything is spoken but WITHOUT loading the weights —
+    // `KokoroOutput::new` reads the vocab and opens the audio device, and the
+    // ~92 MB session is loaded on the first utterance and can be dropped again.
+    // A pond that never speaks never pays for the model.
+    //
+    // There is no second engine any more. A failure here is text-only output,
+    // said out loud in the log rather than left as silence.
+    // Fetch the engine before constructing it. espeak data is already ensured
+    // above for Piper, and Kokoro uses the same phonemizer.
+    //
+    // Resolved before the fetch, not after: a tier that cannot produce audio on
+    // this host should not be downloaded either. Onboarding writes the tier
+    // straight to settings, so a stored value that is silent here is reachable
+    // and has to be handled every start, not only when someone opens the picker.
+    let quality = pond_adapters_kokoro::usable_quality(&settings.voice_tts_quality).to_string();
+    model_download::ensure_kokoro_engine(&data_dir, &quality, &settings.voice_tts_voice).await;
+
+    let kokoro_dir = model_download::kokoro_dir(&data_dir);
+    let kokoro_engine: Option<Arc<pond_adapters_kokoro::KokoroOutput>> = {
+        let quality = quality.as_str();
+        let model_path = kokoro_dir.join(pond_adapters_kokoro::model_filename(quality));
+        let tokenizer_path = kokoro_dir.join("tokenizer.json");
+        if !tokenizer_path.exists() {
+            None
+        } else {
+            let cfg = pond_adapters_kokoro::KokoroConfig {
+                model_path,
+                voices_dir: kokoro_dir.join("voices"),
+                tokenizer_path,
+                // Still bounded so ONNX Runtime's pool does not take the whole
+                // machine from the language model — but derived rather than
+                // pinned, because the old pin of 2 could not hit real time on
+                // the Jetson at any tier. See `default_intra_threads`.
+                intra_threads: Some(pond_adapters_kokoro::default_intra_threads()),
+                espeak_data: espeak_data.clone(),
+            };
+            match pond_adapters_kokoro::KokoroOutput::new(cfg) {
+                Ok(out) => {
+                    // Voice and pace are hot — neither touches the session.
+                    let voice = settings.voice_tts_voice.trim();
+                    if !voice.is_empty() && out.set_voice(voice).await.is_err() {
+                        // Heal the setting rather than diverging from it.
+                        //
+                        // An install from before the engine swap holds a Piper
+                        // filename here. The adapter falls back to its default
+                        // and speaks fine, but the stored value never changes —
+                        // so the Voice screen keeps showing a voice that is not
+                        // the one talking, and every restart repeats this
+                        // warning. Writing back what is actually in use makes
+                        // the picker honest and makes this a one-time event.
+                        let actual = out.voice().await;
+                        tracing::warn!(
+                            configured = voice,
+                            using = %actual,
+                            "configured Kokoro voice is not installed; \
+                             rewriting voice_tts_voice to the voice in use"
+                        );
+                        if let Err(e) = settings_repo_early
+                            .set_key("voice_tts_voice", actual.clone())
+                            .await
+                        {
+                            tracing::warn!("could not heal voice_tts_voice: {e}");
                         }
                     }
+                    out.set_speed(settings.voice_tts_speed);
+                    println!(
+                        "  ✅ Kokoro TTS: {} @ {:.2}x (weights load on first utterance)",
+                        out.voice().await,
+                        out.speed()
+                    );
+                    Some(Arc::new(out))
+                }
+                Err(e) => {
+                    // No second engine to fall back to — say so plainly, and
+                    // let the `tts: None` path below make it text-only.
+                    tracing::warn!("Kokoro TTS unavailable: {e}");
+                    None
                 }
             }
-            _ => None,
-        };
-
-    let tts: Option<Arc<dyn pond_core::models::ports::voice_output::VoiceOutput>> = match piper_tts
-    {
-        Some(piper) => {
-            println!("  ✅ TTS: piper");
-            Some(piper)
-        }
-        None => {
-            println!("  ⚠  TTS: no engine available — responses will be text-only");
-            None
         }
     };
+
+    let tts: Option<Arc<dyn pond_core::models::ports::voice_output::VoiceOutput>> =
+        match &kokoro_engine {
+            Some(kokoro) => {
+                println!("  ✅ TTS: kokoro");
+                Some(kokoro.clone() as Arc<dyn pond_core::models::ports::voice_output::VoiceOutput>)
+            }
+            None => {
+                println!("  ⚠  TTS: unavailable — responses will be text-only");
+                None
+            }
+        };
+
+    // The other half of the engine: reconfiguring it while it runs. Held apart
+    // from `tts` because the chat loop is only ever asked to speak, and has no
+    // business knowing that voices have files behind them.
+    let tts_control: Option<Arc<dyn pond_core::models::ports::tts_control::TtsControl>> =
+        kokoro_engine.as_ref().map(|engine| {
+            Arc::new(kokoro_control::KokoroTtsControl::new(
+                engine.clone(),
+                data_dir.clone(),
+                download_tracker.clone(),
+            )) as Arc<dyn pond_core::models::ports::tts_control::TtsControl>
+        });
 
     // ── Persistent model catalog & ModelService ────────────────────────────────
     let model_repo: Arc<dyn ModelRepository + Send + Sync> =
@@ -1627,6 +1621,11 @@ async fn run_server(
     );
     // A member's first turn must not queue behind the pond indexing itself.
     let index_maintenance_cancel = tokio_util::sync::CancellationToken::new();
+    // Somebody asked for a reindex. Held here rather than inside the sweep so
+    // the route can reach it: clearing the index without a way to refill it on
+    // demand leaves a member staring at an empty panel until the next scheduled
+    // pass, which is the shape of "the button did nothing".
+    let index_reindex_requested = Arc::new(tokio::sync::Notify::new());
     let vector_model_id = embedding_provider.as_ref().map(|p| {
         use pond_core::models::ports::embedding::EmbeddingProvider as _;
         p.model_id()
@@ -1945,6 +1944,12 @@ async fn run_server(
         pond_core::user_data::ports::memory_consolidator::ConsolidationEvent,
     >(64);
 
+    // The single inference slot every background job takes turns on. Each job
+    // keeps its own poll cadence and body; what it no longer keeps is a private
+    // answer to "may I run now?", which could only ever account for the jobs its
+    // author happened to know about. See `inference_lane_runner`.
+    let inference_lane = crate::inference_lane_runner::InferenceLane::new();
+
     // Build the ConsolidationRunner closure that pond-api will call from the
     // POST /api/v1/memory/consolidate endpoint. Captures repo, provider, and
     // the broadcast channel so pond-api never imports the consolidator crate.
@@ -2013,6 +2018,7 @@ async fn run_server(
     //      child bumps through ChatService on every turn it persists.
     {
         use pond_core::user_data::services::consolidation_schedule as sched;
+        use pond_core::user_data::services::inference_lane::LaneJob;
 
         let inact_repo = memory_repo.clone();
         let inact_provider = llm_provider.clone();
@@ -2021,6 +2027,7 @@ async fn run_server(
         let inact_event_tx = consolidation_event_tx.clone();
         let inact_settings_repo = settings_repo.clone();
         let inact_storage = session_storage.clone();
+        let inact_lane = inference_lane.clone();
 
         // Baselines for the "never on startup" guard. Captured before the
         // server binds, so no request can have been served yet.
@@ -2030,7 +2037,6 @@ async fn run_server(
         tokio::spawn(async move {
             const POLL_SECS: u64 = 60;
             let idle_threshold = std::time::Duration::from_secs(sched::INACTIVITY_THRESHOLD_SECS);
-            let mut last_run: Option<std::time::Instant> = None;
 
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
@@ -2058,25 +2064,25 @@ async fn run_server(
                 let idle_for =
                     sched::combined_idle_for(in_process_at, db_activity, chrono::Utc::now());
 
-                let decision = sched::should_run(sched::GateInputs {
-                    enabled: settings.memory_consolidation_enabled,
-                    saw_activity_since_start,
-                    idle_for,
-                    idle_threshold,
-                    since_last_run: last_run.map(|t| t.elapsed()),
-                    interval_floor: sched::interval_floor_from_hours(
-                        settings.memory_consolidation_interval_hours,
-                    ),
-                });
-
-                if let sched::GateDecision::Skip(reason) = decision {
-                    tracing::trace!(
-                        reason = reason.as_str(),
-                        idle_secs = idle_for.as_secs(),
-                        "consolidation scheduler: skipping tick"
-                    );
+                // The lane owns the gate now: it applies the same
+                // activity/interval rules this block used to apply alone, but
+                // decides against EVERY registered job rather than this one, and
+                // hands back the slot itself so nothing else can be mid-run.
+                let Some(slot) = inact_lane
+                    .acquire(
+                        LaneJob::Consolidation,
+                        settings.memory_consolidation_enabled,
+                        sched::interval_floor_from_hours(
+                            settings.memory_consolidation_interval_hours,
+                        ),
+                        saw_activity_since_start,
+                        idle_for,
+                        idle_threshold,
+                    )
+                    .await
+                else {
                     continue;
-                }
+                };
 
                 tracing::info!(
                     mode = %settings.memory_consolidation_mode,
@@ -2158,7 +2164,11 @@ async fn run_server(
                 // this phase set out to remove. Consolidation is a best-effort
                 // background chore, so on a contended device it is better to
                 // miss a pass than to keep trying.
-                last_run = Some(std::time::Instant::now());
+                //
+                // Dropping the guard is what spends the budget and releases the
+                // slot; every path out of this iteration does it, including the
+                // early returns above.
+                drop(slot);
             }
         });
         tracing::info!(
@@ -2282,6 +2292,7 @@ async fn run_server(
         use pond_core::shared::domain::session_activity::SessionOrigin;
         use pond_core::shared::services::session_title::{RetitleOutcome, SessionTitleService};
         use pond_core::user_data::services::consolidation_schedule as sched;
+        use pond_core::user_data::services::inference_lane::LaneJob;
 
         // How often to consider a pass. The gate, not this, decides whether one
         // actually runs.
@@ -2295,7 +2306,7 @@ async fn run_server(
         let title_provider = llm_provider.clone();
         let title_activity = last_user_activity.clone();
         let title_settings_repo = settings_repo.clone();
-        let title_consolidation_cancel = consolidation_cancel.clone();
+        let title_lane = inference_lane.clone();
 
         // Baselines for the "never on startup" guard, captured before the
         // server binds so no request can have been served yet.
@@ -2304,7 +2315,6 @@ async fn run_server(
 
         tokio::spawn(async move {
             let idle_threshold = std::time::Duration::from_secs(sched::INACTIVITY_THRESHOLD_SECS);
-            let mut last_run: Option<std::time::Instant> = None;
 
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
@@ -2321,43 +2331,39 @@ async fn run_server(
                 let in_process_at = *title_activity.read().await;
                 let now = chrono::Utc::now();
 
-                let decision = sched::should_run(sched::GateInputs {
-                    // Re-read every tick, so the toggle takes effect without a
-                    // restart.
-                    enabled: settings.session_titling_enabled,
-                    saw_activity_since_start: sched::saw_activity_since_start(
-                        started_at,
-                        in_process_at,
-                        started_at_utc,
-                        db_activity,
-                    ),
-                    idle_for: sched::combined_idle_for(in_process_at, db_activity, now),
-                    idle_threshold,
-                    since_last_run: last_run.map(|t| t.elapsed()),
-                    // The tick IS the floor: a pass is bounded and cheap, so
-                    // there is no reason to space passes further apart than the
-                    // poll already does.
-                    interval_floor: std::time::Duration::from_secs(POLL_SECS),
-                });
+                let saw_activity_since_start = sched::saw_activity_since_start(
+                    started_at,
+                    in_process_at,
+                    started_at_utc,
+                    db_activity,
+                );
+                let idle_for = sched::combined_idle_for(in_process_at, db_activity, now);
 
-                if let sched::GateDecision::Skip(reason) = decision {
-                    tracing::trace!(
-                        reason = reason.as_str(),
-                        "titling scheduler: skipping tick"
-                    );
-                    continue;
-                }
-
-                // Stand down while consolidation is mid-run.
-                let consolidating = title_consolidation_cancel
-                    .read()
+                // The pairwise "stand down while consolidation is mid-run" check
+                // that used to live here is gone, and deliberately so: it only
+                // ever ran in ONE direction — consolidation never learned to
+                // yield to titling — and every job added after it would have
+                // needed its own check against every existing job. The lane
+                // holds one slot, so exclusion is now a property of asking
+                // rather than a list of jobs to remember.
+                let Some(slot) = title_lane
+                    .acquire(
+                        LaneJob::Titling,
+                        // Re-read every tick, so the toggle takes effect
+                        // without a restart.
+                        settings.session_titling_enabled,
+                        // The tick IS the floor: a pass is bounded and cheap,
+                        // so there is no reason to space passes further apart
+                        // than the poll already does.
+                        std::time::Duration::from_secs(POLL_SECS),
+                        saw_activity_since_start,
+                        idle_for,
+                        idle_threshold,
+                    )
                     .await
-                    .as_ref()
-                    .is_some_and(|t| !t.is_cancelled());
-                if consolidating {
-                    tracing::trace!("titling scheduler: consolidation holds the inference slot");
+                else {
                     continue;
-                }
+                };
 
                 let Some(provider) = title_provider.read().await.clone() else {
                     continue;
@@ -2461,8 +2467,10 @@ async fn run_server(
                 // An attempt consumes the interval budget whether or not it
                 // renamed anything, for the same reason consolidation does:
                 // retrying a fruitless pass every tick is the churn the floor
-                // exists to prevent.
-                last_run = Some(std::time::Instant::now());
+                // exists to prevent. Dropping the guard does both, on every
+                // path out — including the two early returns above, which is
+                // what stopped this loop starving the lane.
+                drop(slot);
             }
         });
         tracing::info!(
@@ -2635,19 +2643,112 @@ async fn run_server(
     // Deferred by `index_maintenance_delay_secs` rather than run at boot: a
     // household's first turn after an upgrade must not be slow because the pond
     // chose that moment to index itself. It is cancellable for the same reason.
+    // Whether the sweep below exists at all. Read by `AppState` so the rebuild
+    // route can say honestly whether anything will refill what it cleared.
+    let index_sweep_running = embedding_provider.is_some() && vector_model_id.is_some();
     if let (Some(provider), Some(_)) = (embedding_provider.clone(), vector_model_id.clone()) {
+        use pond_core::user_data::services::inference_lane::LaneJob;
+
         let index = vector_index.clone();
         let storage = session_storage.clone();
         let cancel = index_maintenance_cancel.clone();
+        let sweep_lane = inference_lane.clone();
+        let sweep_activity = last_user_activity.clone();
+        let sweep_storage = session_storage.clone();
+        let reindex = index_reindex_requested.clone();
+
+        let started_at = std::time::Instant::now();
+        let started_at_utc = chrono::Utc::now();
+
         tokio::spawn(async move {
             use pond_core::context::index_maintenance::run_index_maintenance;
+            // Same alias the other three schedule blocks in this file use. The
+            // sweep reads the shared inactivity threshold so it waits on the
+            // same definition of "idle" as consolidation, rather than a second
+            // one that could drift.
+            use pond_core::user_data::services::consolidation_schedule as sched;
+
+            let poll = std::time::Duration::from_secs(INDEX_MAINTENANCE_POLL_SECS);
+            let chore_idle = std::time::Duration::from_secs(sched::INACTIVITY_THRESHOLD_SECS);
+
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(
                     INDEX_MAINTENANCE_DELAY_SECS,
                 )) => {}
             }
-            run_index_maintenance(&index, storage.as_ref(), provider.as_ref(), &cancel).await;
+
+            loop {
+                // Woken either by the clock or by somebody asking. Which one it
+                // was changes the gate below, so it is remembered rather than
+                // collapsed into "something happened".
+                let asked = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(poll) => false,
+                    _ = reindex.notified() => true,
+                };
+
+                let db_activity = newest_session_activity(sweep_storage.as_ref()).await;
+                let in_process_at = *sweep_activity.read().await;
+                let now = chrono::Utc::now();
+                let saw_activity_since_start = sched::saw_activity_since_start(
+                    started_at,
+                    in_process_at,
+                    started_at_utc,
+                    db_activity,
+                );
+                let idle_for = sched::combined_idle_for(in_process_at, db_activity, now);
+
+                // A requested pass is not background work, so it does not wait
+                // for quiet. Somebody pressed Reindex and is watching an empty
+                // panel; the idle gate exists to stop chores stealing the slot
+                // from a person, and here the person IS the reason to run.
+                //
+                // Exclusion is untouched by this: the lane holds one slot and
+                // that is what serialises jobs. The floor drops too, or a manual
+                // pass would be refused for the sole reason that the scheduled
+                // one had just happened.
+                let (floor, idle_threshold) = if asked {
+                    (std::time::Duration::ZERO, std::time::Duration::ZERO)
+                } else {
+                    (poll, chore_idle)
+                };
+
+                let Some(_slot) = sweep_lane
+                    .acquire(
+                        LaneJob::IndexMaintenance,
+                        // No toggle of its own: an index nobody asked to stop
+                        // maintaining is an index quietly going stale, which is
+                        // the failure this whole surface exists to end. Whether
+                        // there is anything to embed is already answered by the
+                        // embedding provider being present at all.
+                        true,
+                        floor,
+                        // A person asking is itself the activity this guard
+                        // wants to have seen, and on a pond that has served no
+                        // turn since boot it would otherwise refuse forever.
+                        saw_activity_since_start || asked,
+                        idle_for,
+                        idle_threshold,
+                    )
+                    .await
+                else {
+                    continue;
+                };
+
+                let report =
+                    run_index_maintenance(&index, storage.as_ref(), provider.as_ref(), &cancel)
+                        .await;
+                if asked {
+                    tracing::info!(
+                        adopted = report.adopted,
+                        summaries = report.summaries_indexed,
+                        context = report.context_indexed,
+                        still_missing = report.still_missing,
+                        "requested personal-context reindex finished"
+                    );
+                }
+            }
         });
     }
 
@@ -3629,6 +3730,7 @@ async fn run_server(
     }
 
     let state = Arc::new(AppState {
+        tts_control: tts_control.clone(),
         db,
         onboarding_repo,
         handshake: handshake.clone(),
@@ -3654,6 +3756,11 @@ async fn run_server(
         // the writers had stopped using, and would say so in a number that
         // looked entirely plausible.
         vector_index: Some(vector_index.clone()),
+        // Some only when the sweep above actually spawned. Handing the route a
+        // notify with nothing listening would have it answer `refilling: true`
+        // on a pond where nothing is going to refill, which is a lie that reads
+        // as success -- the caller waits for a rebuild that never happens.
+        index_reindex: index_sweep_running.then(|| index_reindex_requested.clone()),
         sensor_storage,
         camera_storage,
         prompt_template_dir: Some(data_dir.join("prompts")),
@@ -3669,9 +3776,7 @@ async fn run_server(
         tool_dispatcher,
         marketplace: Some(marketplace),
         secret_repo,
-        download_tracker: std::sync::Arc::new(tokio::sync::RwLock::new(
-            std::collections::HashMap::new(),
-        )),
+        download_tracker: download_tracker.clone(),
         piper_http_port,
         model_catalog_provider: Some(Arc::new(
             crate::composite_model_catalog_provider::CompositeModelCatalogProvider::new(
@@ -4041,7 +4146,6 @@ async fn run_chat(
     wake_word: Option<&str>,
     no_wake_word: bool,
     tts: Option<&str>,
-    tts_model: Option<std::path::PathBuf>,
     session_id_arg: Option<&str>,
     json_events: bool,
 ) -> Result<()> {
@@ -4197,11 +4301,14 @@ async fn run_chat(
     let effective_tts: &str = match tts {
         Some(t) => t,
         None => {
-            effective_tts_owned = if voice_models.tts_is_piper() {
-                "piper".to_string()
-            } else {
-                settings.active_tts_model.clone()
-            };
+            // Kokoro is the engine. Nothing else is.
+            //
+            // This used to fall through to `active_tts_model`, which since the
+            // engine swap holds a Kokoro VOICE name ("af_heart"). That matched
+            // no arm below, so voice mode selected the catch-all and went
+            // text-only — the session looked healthy over NDJSON and simply
+            // never made a sound.
+            effective_tts_owned = "kokoro".to_string();
             &effective_tts_owned
         }
     };
@@ -4517,8 +4624,9 @@ async fn run_chat(
         }
     }
 
-    let mut chat_service =
-        ChatService::new(agent, session_id.clone(), storage).with_system_prompt(system_prompt);
+    let mut chat_service = ChatService::new(agent, session_id.clone(), storage)
+        .with_system_prompt(system_prompt)
+        .with_thinking_tone(settings.voice_thinking_tone_enabled);
     if let Some(model_name) = model {
         chat_service = chat_service.with_model_name(model_name);
     }
@@ -4790,112 +4898,67 @@ async fn run_chat(
         text_fallback()
     };
     let voice_out: Arc<dyn VoiceOutput> = match effective_tts {
-        "piper" => {
-            // CLI arg wins; otherwise take whatever actually resolved.
-            let resolved_voice = voice_models.piper.clone();
-            let model_path_opt: Option<std::path::PathBuf> = match (&tts_model, &resolved_voice) {
-                (Some(p), _) => Some(p.clone()),
-                (None, Some(v)) => Some(v.onnx.clone()),
-                (None, None) => {
-                    out!("  Speak    no voice installed — pick one in Settings, then restart.");
-                    None
-                }
+        // Kokoro — the same engine `serve` builds, wired here because voice
+        // mode runs in THIS process, not through the HTTP server. Wiring one
+        // and not the other is why voice mode stayed on Piper (and then on
+        // nothing) while the Settings preview spoke correctly.
+        "kokoro" => {
+            // Deliberately does NOT download. `serve` ensures the engine; this
+            // child only uses it.
+            //
+            // Fetching here would put a 92 MB download in front of `ready`,
+            // and the desktop keys the whole voice session on `ready` being the
+            // first line out. A missing engine is reported as a diagnostic the
+            // UI can show, which is a far better failure than a session that
+            // appears to hang at startup.
+            let kdir = model_download::kokoro_dir(&data_dir);
+            let espeak_data_dir = {
+                let p = model_download::piper_espeak_data_path(&data_dir);
+                p.exists().then_some(p)
             };
-            match model_path_opt {
-                None => tts_unavailable("piper requested but no voice model resolved"),
-                Some(model_path) => {
-                    // Piper requires both the .onnx weights AND the .onnx.json config.
-                    // Check both — the JSON is often missing even when the onnx was
-                    // downloaded in an earlier version that didn't fetch the config.
-                    // Prefer the resolved pair's config path: the catalog names it,
-                    // and it is not always the `<onnx>.json` sibling.
-                    let config_path = resolved_voice
-                        .as_ref()
-                        .map(|v| v.config.clone())
-                        .unwrap_or_else(|| {
-                            std::path::PathBuf::from(format!("{}.json", model_path.display()))
-                        });
-                    let installed = resolved_voice
-                        .as_ref()
-                        .map(|v| v.is_installed())
-                        .unwrap_or_else(|| model_path.exists() && config_path.exists());
-                    if !installed {
-                        if model_path.exists() {
-                            out!("  Speak    voice config missing — downloading...");
-                        } else {
-                            out!("  Speak    voice missing — downloading...");
+            let cfg = pond_adapters_kokoro::KokoroConfig {
+                // Same resolution `serve` does — the voice child reads the same
+                // settings row and must not load a tier that is silent here.
+                model_path: kdir.join(pond_adapters_kokoro::model_filename(
+                    pond_adapters_kokoro::usable_quality(&settings.voice_tts_quality),
+                )),
+                voices_dir: kdir.join("voices"),
+                tokenizer_path: kdir.join("tokenizer.json"),
+                intra_threads: Some(pond_adapters_kokoro::default_intra_threads()),
+                espeak_data: espeak_data_dir,
+            };
+
+            if !cfg.tokenizer_path.exists() || !cfg.model_path.exists() {
+                out!("  Speak    voice engine not installed — start the pond once to fetch it");
+                tts_unavailable("kokoro engine is not installed in this data dir")
+            } else {
+                match pond_adapters_kokoro::KokoroOutput::new(cfg) {
+                    Ok(out) => {
+                        let voice = settings.voice_tts_voice.trim();
+                        if !voice.is_empty() && out.set_voice(voice).await.is_err() {
+                            // The default voice is always fetched, so this
+                            // degrades to a different voice, never to silence.
+                            out!(
+                                "  Speak    voice '{}' unavailable — using the default",
+                                voice
+                            );
                         }
-                        match resolved_voice.as_ref().and_then(|v| v.download.as_ref()) {
-                            Some(dl) => {
-                                let _ = model_download::download_piper_model_entry(
-                                    &data_dir,
-                                    &dl.onnx_filename,
-                                    &dl.config_filename,
-                                    &dl.onnx_url,
-                                    &dl.config_url,
-                                    dl.size_mb,
-                                )
-                                .await;
-                            }
-                            None => out!(
-                                "  ⚠  Piper voice '{}' has no catalog download — cannot fetch",
-                                settings.voice_tts_voice
-                            ),
-                        }
+                        out.set_speed(settings.voice_tts_speed);
+                        let out = match &audio_level_sink {
+                            Some(sink) => out.with_audio_level_sink(sink.clone()),
+                            None => out,
+                        };
+                        out!("  Speak    {} @ {:.2}x", out.voice().await, out.speed());
+                        Arc::new(out) as Arc<dyn VoiceOutput>
                     }
-
-                    // espeak-ng-data: in-process backend uses the env var
-                    // path; legacy subprocess passes it as --espeak_data.
-                    let espeak_data_dir = {
-                        let p = model_download::piper_espeak_data_path(&data_dir);
-                        if p.exists() {
-                            Some(p)
-                        } else {
-                            None
-                        }
-                    };
-
-                    // Default: in-process. Loads the .onnx + .onnx.json via
-                    // piper-rs and synthesises with zero subprocess overhead.
-                    {
-                        if !model_path.exists() || !config_path.exists() {
-                            out!("  Speak    voice unavailable — printing replies instead");
-                            tts_unavailable("piper model or config missing")
-                        } else {
-                            match PiperRsOutput::new(model_path.clone(), config_path) {
-                                Ok(out) => {
-                                    let out = match espeak_data_dir {
-                                        Some(d) => out.with_espeak_data(d),
-                                        None => out,
-                                    };
-                                    let out = match &audio_level_sink {
-                                        Some(sink) => out.with_audio_level_sink(sink.clone()),
-                                        None => out,
-                                    };
-                                    out!(
-                                        "  Speak    {}",
-                                        model_path
-                                            .file_stem()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                    );
-                                    Arc::new(out) as Arc<dyn VoiceOutput>
-                                }
-                                Err(e) => {
-                                    out!(
-                                        "  Speak    voice failed to load ({}) — printing replies instead",
-                                        e
-                                    );
-                                    tts_unavailable(&format!("piper load failed: {e}"))
-                                }
-                            }
-                        }
+                    Err(e) => {
+                        out!("  Speak    voice failed to load ({e}) — printing replies instead");
+                        tts_unavailable(&format!("kokoro load failed: {e}"))
                     }
-
-                    // Legacy: subprocess `piper` binary.
                 }
             }
         }
+
         // `--tts none` is a documented choice, not a failure. Stay quiet.
         "none" => {
             out!("  Speak    off (--tts none) — replies are printed");
@@ -6821,18 +6884,7 @@ async fn run_main_menu() -> Result<()> {
 
         match choice.trim() {
             "1" => {
-                run_chat(
-                    None,
-                    None,
-                    "stdin",
-                    None,
-                    true,
-                    Some("none"),
-                    None,
-                    None,
-                    false,
-                )
-                .await?;
+                run_chat(None, None, "stdin", None, true, Some("none"), None, false).await?;
             }
             "2" => {
                 let data_dir = default_data_dir();
@@ -7467,6 +7519,81 @@ async fn build_goose_backend(
 /// Upserts all returned records (preserving `is_custom` rows) and sets `downloaded`
 /// by checking the filesystem.  A failure to fetch is non-fatal — the server starts
 /// with whatever models are already in the DB.
+/// Give the speech engine a voice on first run, so the pond can talk out of
+/// the box.
+///
+/// Everything else about TTS bootstraps itself — `ensure_kokoro_engine` fetches
+/// the tokenizer, the weights and the default voice, and the 54 voice rows come
+/// from a static list that seeds even with no network. The one thing that did
+/// not was the *assignment*: a fresh install had a working engine, a downloaded
+/// voice, and `SPEAKING — Nothing assigned` on the Models page, because
+/// choosing the voice was left to the household.
+///
+/// Only ever fills a hole. An existing assignment is never touched, so this
+/// cannot overwrite a voice someone picked.
+async fn ensure_tts_is_set_up(
+    repo: &dyn ModelRepository,
+    settings_repo: &dyn pond_core::user_data::ports::settings::SettingsRepository,
+) {
+    let assignments = repo.list_assignments().await.unwrap_or_default();
+    if assignments.iter().any(|a| a.role == "tts") {
+        return;
+    }
+
+    // Prefer whatever the household already has in settings — an upgrade from
+    // before roles existed carries a voice there — and fall back to Kokoro's
+    // own reference voice.
+    let stored = settings_repo.get().await.ok();
+    let configured = stored
+        .as_ref()
+        .map(|s| s.voice_tts_voice.clone())
+        .unwrap_or_default();
+    let voice =
+        if pond_adapters_kokoro::voices::voice_path(std::path::Path::new("/"), configured.trim())
+            .is_ok()
+        {
+            configured.trim().to_string()
+        } else {
+            pond_adapters_kokoro::DEFAULT_VOICE.to_string()
+        };
+
+    let model_id = ModelRecord::id_for(&ModelCategory::TtsKokoro, &voice);
+    if let Err(e) = repo.set_assignment("tts", &model_id).await {
+        tracing::warn!("could not assign a default voice: {e}");
+        return;
+    }
+    let _ = settings_repo
+        .set_key("voice_tts_voice", voice.clone())
+        .await;
+    let _ = settings_repo
+        .set_key("active_tts_model", voice.clone())
+        .await;
+    println!("  ✅ Voice: {voice} assigned (first run)");
+
+    // The quality tier is a hardware question on some boards, not a taste one —
+    // `host_default_quality` carries the measurements. pond-core cannot make
+    // this call: it is pure domain and must not sniff the machine, so the
+    // composition root does it once, here, on the same first run that assigns
+    // the voice.
+    //
+    // Only when the household has not already chosen. An upgrade from before
+    // roles existed reaches this function with a tier it set deliberately, and
+    // overwriting that would be the pond arguing with someone who has already
+    // decided.
+    let host_tier = pond_adapters_kokoro::host_default_quality();
+    let untouched = pond_core::user_data::domain::settings::Settings::default().voice_tts_quality;
+    let stored_tier = stored
+        .as_ref()
+        .map(|s| s.voice_tts_quality.trim())
+        .unwrap_or("");
+    if host_tier != stored_tier && (stored_tier.is_empty() || stored_tier == untouched) {
+        let _ = settings_repo
+            .set_key("voice_tts_quality", host_tier.to_string())
+            .await;
+        println!("  ✅ Voice quality: {host_tier} (chosen for this machine)");
+    }
+}
+
 async fn seed_model_catalog(repo: &dyn ModelRepository, data_dir: &std::path::Path) {
     use crate::composite_model_catalog_provider::CompositeModelCatalogProvider;
     use crate::filesystem_model_storage::FilesystemModelStorage;

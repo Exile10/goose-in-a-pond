@@ -117,6 +117,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // Transcription proxy (public — local test tool)
         .route("/transcribe", post(transcribe))
         // Wake-word phrase calibration (public — used during onboarding WakeWord step)
+        .route("/voice/tts/apply", post(apply_tts_settings))
         .route("/voice/calibrate", post(calibrate_wake_word))
         .route("/voice/calibrate", delete(reset_wake_word_calibration))
         .route("/system/info", get(system_info))
@@ -1100,6 +1101,75 @@ async fn chat(
     })))
 }
 
+// ── Applying voice settings to the running engine ─────────────────────────────
+
+#[derive(Deserialize)]
+struct ApplyTtsRequest {
+    voice: Option<String>,
+    /// Pace multiplier. Clamped by the engine, not here.
+    speed: Option<f32>,
+    quality: Option<String>,
+}
+
+/// Bring the live speech engine in line with the saved settings.
+///
+/// Everything the voice picker changes used to take effect only on the next
+/// start, because the engine was built once at boot. For a device that lives on
+/// a shelf, that made choosing a voice look like it did nothing.
+///
+/// Anything missing is fetched first, so selecting a voice the household does
+/// not have yet is a download rather than an error telling them to install it
+/// somewhere else. Fields omitted from the body fall back to what is saved,
+/// which lets the picker send only what changed.
+async fn apply_tts_settings(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<ApplyTtsRequest>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(control) = state.tts_control.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "No speech engine is running"})),
+        ));
+    };
+
+    let saved = state.settings_repo.get().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    let req = body.map(|Json(b)| b);
+    let voice = req
+        .as_ref()
+        .and_then(|b| b.voice.clone())
+        .unwrap_or(saved.voice_tts_voice);
+    let speed = req
+        .as_ref()
+        .and_then(|b| b.speed)
+        .unwrap_or(saved.voice_tts_speed);
+    let quality = req
+        .as_ref()
+        .and_then(|b| b.quality.clone())
+        .unwrap_or(saved.voice_tts_quality);
+
+    let applied = control.apply(&voice, speed, &quality).await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+
+    Ok(Json(json!({
+        "voice": applied.voice,
+        "speed": applied.speed_milli as f32 / 1000.0,
+        "quality": applied.quality,
+        "downloaded_voice": applied.downloaded_voice,
+        "downloaded_weights": applied.downloaded_weights,
+        "engine_reloaded": applied.engine_reloaded,
+        "installed_voices": control.installed_voices().await,
+    })))
+}
+
 // ── TTS request ───────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1111,7 +1181,7 @@ struct TtsRequest {
 ///
 /// Priority order:
 /// 1. In-process `VoiceOutput` (`AppState.tts` — the default build's
-///    `PiperRsOutput`, no subprocess or extra port involved).
+///    `KokoroOutput`, no subprocess or extra port involved).
 /// 2. Legacy Piper HTTP server (if running — see `AppState.piper_http_port`),
 ///    for `--features legacy-subprocess` builds.
 async fn tts_synthesise(
@@ -4797,6 +4867,43 @@ async fn get_memory_status(State(state): State<Arc<AppState>>) -> Json<Value> {
 ///
 /// `assignments` is the list of current role assignments; used to determine
 /// the `active` flag (true when any role points to this model).
+/// Find a model by category + name, tolerating a TTS category that names the
+/// wrong engine.
+///
+/// The models list buckets every TTS engine under one `tts` group, so a caller
+/// that reaches for the group key instead of the record's own category asks for
+/// `tts_piper/af_heart` and is told the model does not exist. `"tts"` is
+/// already a legacy alias for `tts_piper` in `ModelCategory::from_str`, which
+/// makes this an easy mistake to make and a confusing one to read.
+///
+/// Only TTS categories are retried, and only against other TTS categories, so
+/// this cannot make a GGUF lookup resolve to something it did not ask for.
+async fn find_model_forgiving_tts(
+    repo: &dyn pond_core::models::ports::model_repository::ModelRepository,
+    cat: &ModelCategory,
+    name: &str,
+) -> Result<Option<ModelRecord>, anyhow::Error> {
+    if let Some(m) = repo.get_by_id(&ModelRecord::id_for(cat, name)).await? {
+        return Ok(Some(m));
+    }
+    if !cat.is_tts() {
+        return Ok(None);
+    }
+    for alt in [
+        ModelCategory::TtsKokoro,
+        ModelCategory::TtsPiper,
+        ModelCategory::TtsHttp,
+    ] {
+        if &alt == cat {
+            continue;
+        }
+        if let Some(m) = repo.get_by_id(&ModelRecord::id_for(&alt, name)).await? {
+            return Ok(Some(m));
+        }
+    }
+    Ok(None)
+}
+
 fn record_to_dto(m: &ModelRecord, assignments: &[ModelRoleAssignment]) -> ModelStatusEntry {
     let active = assignments.iter().any(|a| a.model_id == m.id);
     ModelStatusEntry {
@@ -4996,6 +5103,14 @@ async fn scan_filesystem_extras(
             ModelCategory::TtsPiper,
             &[".onnx"],
         ));
+        // Voices dropped in by hand. The catalogue lists the English ones; the
+        // model repo ships 50-odd, and copying a `.bin` in is the supported way
+        // to get the rest.
+        extras.extend(scan_dir(
+            data_dir_owned.join("models").join("kokoro").join("voices"),
+            ModelCategory::TtsKokoro,
+            &[".bin"],
+        ));
         extras
     })
     .await
@@ -5023,7 +5138,15 @@ fn model_dest_path(
         "whisper" => data_dir.join("models").join(filename),
         "llamafile" => data_dir.join("models").join("llm").join(filename),
         "gguf" => data_dir.join("models").join("gguf").join(filename),
-        "tts" => data_dir.join("models").join("tts").join(filename),
+        "tts" | "tts_piper" => data_dir.join("models").join("tts").join(filename),
+        // Must agree with the download destination, or a resumed download
+        // writes somewhere other than beside its own partial file — which is
+        // the exact failure this function was extracted to prevent.
+        "tts_kokoro" => data_dir
+            .join("models")
+            .join("kokoro")
+            .join("voices")
+            .join(filename),
         _ => data_dir.join("models").join(filename),
     }
 }
@@ -5190,7 +5313,9 @@ async fn list_models(
         match m.category {
             ModelCategory::Whisper => whisper.push(v),
             ModelCategory::Llamafile => llamafile.push(v),
-            ModelCategory::TtsPiper | ModelCategory::TtsHttp => tts.push(v),
+            ModelCategory::TtsPiper | ModelCategory::TtsKokoro | ModelCategory::TtsHttp => {
+                tts.push(v)
+            }
             ModelCategory::Gguf => gguf.push(v),
             ModelCategory::Ollama => ollama.push(v),
             ModelCategory::Embedding => embedding.push(v),
@@ -5324,6 +5449,18 @@ async fn refresh_model_registry(
                             pond_core::models::domain::model_record::ModelCategory::TtsPiper => {
                                 data_dir.join("models").join("tts").join(f).exists()
                             }
+                            // Without this arm Kokoro voices fell through to
+                            // `_ => false` and reported "not downloaded" even
+                            // with the file on disk — so the GUI offered the
+                            // download again after every successful one.
+                            pond_core::models::domain::model_record::ModelCategory::TtsKokoro => {
+                                data_dir
+                                    .join("models")
+                                    .join("kokoro")
+                                    .join("voices")
+                                    .join(f)
+                                    .exists()
+                            }
                             _ => false,
                         })
                         .unwrap_or(matches!(
@@ -5385,10 +5522,7 @@ async fn download_model(
             Json(json!({"error": format!("Unknown category '{}'", category)})),
         )
     })?;
-    let model_id = ModelRecord::id_for(&cat, &name);
-
-    let m = model_repo
-        .get_by_id(&model_id)
+    let m = find_model_forgiving_tts(model_repo.as_ref(), &cat, &name)
         .await
         .map_err(|e| {
             (
@@ -5402,6 +5536,10 @@ async fn download_model(
                 Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)})),
             )
         })?;
+    // From the record actually found, not from the requested category — a
+    // forgiving TTS lookup can resolve a different one, and every write below
+    // keys off this id.
+    let model_id = m.id.clone();
 
     if m.downloaded {
         return Ok(Json(json!({"status": "already_downloaded", "name": name})));
@@ -5449,6 +5587,15 @@ async fn download_model(
         ModelCategory::TtsPiper | ModelCategory::TtsHttp => {
             data_dir.join("models").join("tts").join(&filename)
         }
+        // NOT models/tts/. A Kokoro voice is a style table that the engine
+        // loads from its own directory; putting it beside the Piper voices
+        // makes the download report success while TTS stays broken, because
+        // the adapter is reading somewhere else entirely.
+        ModelCategory::TtsKokoro => data_dir
+            .join("models")
+            .join("kokoro")
+            .join("voices")
+            .join(&filename),
         ModelCategory::Ollama => data_dir.join("models").join(&filename),
         ModelCategory::Embedding => data_dir.join("models").join("embedding").join(&filename),
     };
@@ -5535,10 +5682,7 @@ async fn delete_model(
             Json(json!({"error": format!("Unknown category '{}'", category)})),
         )
     })?;
-    let model_id = ModelRecord::id_for(&cat, &name);
-
-    let m = model_repo
-        .get_by_id(&model_id)
+    let m = find_model_forgiving_tts(model_repo.as_ref(), &cat, &name)
         .await
         .map_err(|e| {
             (
@@ -5552,6 +5696,10 @@ async fn delete_model(
                 Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)})),
             )
         })?;
+    // From the record actually found, not from the requested category — a
+    // forgiving TTS lookup can resolve a different one, and every write below
+    // keys off this id.
+    let model_id = m.id.clone();
 
     // Block deletion if model is assigned to any active role
     let assignments = model_repo.list_assignments().await.unwrap_or_default();
@@ -5573,6 +5721,13 @@ async fn delete_model(
             ModelCategory::TtsPiper | ModelCategory::TtsHttp => {
                 data_dir.join("models").join("tts").join(filename)
             }
+            // Must mirror the download destination above, or "delete" leaves
+            // the file on disk and the row keeps coming back as installed.
+            ModelCategory::TtsKokoro => data_dir
+                .join("models")
+                .join("kokoro")
+                .join("voices")
+                .join(filename),
             ModelCategory::Ollama => data_dir.join("models").join(filename),
             ModelCategory::Embedding => data_dir.join("models").join("embedding").join(filename),
         };
@@ -5742,9 +5897,7 @@ async fn activate_model(
         ));
     }
 
-    let model_id = ModelRecord::id_for(&cat, &name);
-    let record = model_repo
-        .get_by_id(&model_id)
+    let record = find_model_forgiving_tts(model_repo.as_ref(), &cat, &name)
         .await
         .map_err(|e| {
             (
@@ -5758,6 +5911,10 @@ async fn activate_model(
                 Json(json!({"error": format!("Model '{}' not found in '{}'", name, category)})),
             )
         })?;
+    // From the record actually found, not from the requested category — a
+    // forgiving TTS lookup can resolve a different one, and every write below
+    // keys off this id.
+    let model_id = record.id.clone();
 
     // Persist provider keys using runtime provider names (not category names).
     // GGUF category maps to the "local" provider in runtime routing.
@@ -5767,6 +5924,7 @@ async fn activate_model(
         ModelCategory::Ollama => "ollama",
         ModelCategory::Whisper => "asr",
         ModelCategory::TtsPiper => "tts",
+        ModelCategory::TtsKokoro => "tts",
         ModelCategory::TtsHttp => "tts",
         ModelCategory::Embedding => "embedding",
     };
@@ -5803,6 +5961,27 @@ async fn activate_model(
             let _ = settings_repo
                 .set_key("active_tts_model", name.clone())
                 .await;
+            // Also write the voice the engine actually reads.
+            //
+            // `active_tts_model` names the catalogue row; `voice_tts_voice` is
+            // what `KokoroOutput` resolves `<voice>.bin` from and what the
+            // Voice settings screen shows. Writing only the former left the two
+            // disagreeing — a household could activate a voice in Models and
+            // still have `voice_tts_voice` holding the Piper filename from
+            // before the engine swap, so the picker showed one voice and the
+            // pond spoke in another.
+            //
+            // Piper is deliberately excluded: its `voice_tts_voice` is a
+            // filename (`en_US-ryan-high.onnx`), not a catalogue name, and the
+            // resolver in `voice_models.rs` accepts either — writing the name
+            // here would be a third spelling for it to guess at.
+            // `record.category`, not `cat`. `cat` is what the CALLER asked for,
+            // and the forgiving lookup means a request for "tts" resolves a
+            // `tts_kokoro` record — so keying off the request would skip this
+            // for exactly the callers that need it most.
+            if record.category == ModelCategory::TtsKokoro {
+                let _ = settings_repo.set_key("voice_tts_voice", name.clone()).await;
+            }
         }
         "embedding" => {
             let _ = settings_repo
@@ -14946,9 +15125,31 @@ async fn rebuild_context_index(
 
     tracing::info!(cleared, "personal-context index cleared for rebuild");
 
+    // Clearing without this is a button that empties the panel and leaves it
+    // empty: the sweep that refills is idle-gated, and the person who just
+    // pressed Reindex is by definition not idle. Waking it here is what makes
+    // the two halves one action -- and a requested pass skips the quiet it would
+    // otherwise wait for, because the person asking IS the reason to run.
+    //
+    // `notify_one` rather than `notify_waiters`: there is one sweep, and this
+    // variant also holds a permit if the sweep happens to be mid-pass, so a
+    // rebuild landing during a pass still gets a fresh one afterwards instead of
+    // being silently dropped.
+    let refilling = match state.index_reindex.as_ref() {
+        Some(notify) => {
+            notify.notify_one();
+            true
+        }
+        // No sweep in this process to wake. Clearing still did something: the
+        // next process rebuilds from an empty file, which is the documented way
+        // out of a changed embedder.
+        None => false,
+    };
+
     Ok(Json(json!({
         "indexed": true,
         "cleared": cleared,
+        "refilling": refilling,
         "corpora": corpora,
     })))
 }

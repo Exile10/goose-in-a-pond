@@ -2,13 +2,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
-mod canvas_feed;
 mod chat_process;
 mod commands;
 mod hotkey;
 mod notifications;
 mod process;
-mod thought_filter;
 mod tray;
 
 use audio::{AudioState, WakeListenerState};
@@ -114,8 +112,6 @@ fn main() {
         .manage(hotkey::HotkeyState::new())
         .manage(audio_cmd::AudioKillSwitch::new())
         .manage(audio_cmd::PipelineActive::new())
-        .manage(audio_cmd::SpeculativeLlmSlot::new())
-        .manage(audio_cmd::SharedAudioOutput::new())
         // ── Commands ─────────────────────────────────────────────────────────
         .invoke_handler(tauri::generate_handler![
             server_cmd::get_server_url,
@@ -125,10 +121,6 @@ fn main() {
             audio_cmd::start_recording,
             audio_cmd::stop_recording,
             audio_cmd::abort_recording,
-            audio_cmd::record_with_vad,
-            audio_cmd::play_ping,
-            audio_cmd::run_voice_pipeline,
-            audio_cmd::start_wake_listener,
             audio_cmd::stop_wake_listener,
             voice_cmd::start_voice_session,
             voice_cmd::stop_voice_session,

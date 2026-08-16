@@ -65,7 +65,7 @@ export function NowPlaying({ variant = "bar" }: NowPlayingProps) {
              useful action here is asking again. The poll does come back on its
              own after a refusal, but slowly — this is how you skip the wait
              once you have just fixed it. */
-          <button className="np__retry" onClick={() => void refreshNowPlaying()}>
+          <button className="np__retry" onClick={() => void refreshNowPlaying(true)}>
             Try again
           </button>
         ) : (

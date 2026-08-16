@@ -52,6 +52,7 @@ import {
   type UserSkill,
   type WeatherApiResponse,
 } from "./types";
+import { voiceTitle } from "../voice/voiceCatalogue";
 
 // ────────────────────────────────────────────────────────────
 // PondApiClient — single API port for the pond-desktop app.
@@ -878,7 +879,14 @@ export class PondApiClient {
             id: `${category}/${item.name as string}`,
             provider: category,
             name: item.name as string,
-            display_name: (item.description as string | undefined) ?? (item.name as string),
+            // A Kokoro voice's description is a sentence, not a name, so it
+            // must not become the row title the way an LLM's short description
+            // legitimately does. Title from the id instead: `af_heart` →
+            // `Af_Heart`, with the description left for the row's subtitle.
+            display_name:
+              ((item.category as string | undefined) ?? category) === "tts_kokoro"
+                ? voiceTitle(item.name as string)
+                : ((item.description as string | undefined) ?? (item.name as string)),
             is_active: (item.active as boolean | undefined) ?? false,
             ram_estimate_mb: item.ram_estimate_mb as number | undefined,
             recommended_role: item.recommended_role as string | undefined,
@@ -899,6 +907,30 @@ export class PondApiClient {
       }
       return entries;
     });
+  }
+
+  /**
+   * Bring the RUNNING speech engine in line with the saved voice settings,
+   * fetching anything missing first.
+   *
+   * Without this, every voice change waited for the next restart — the engine
+   * is built once at boot. Selecting a voice the household does not have is a
+   * download here, not an error telling them to install it elsewhere.
+   */
+  applyTtsSettings(patch?: {
+    voice?: string;
+    speed?: number;
+    quality?: string;
+  }): Promise<{
+    voice: string;
+    speed: number;
+    quality: string;
+    downloaded_voice: boolean;
+    downloaded_weights: boolean;
+    engine_reloaded: boolean;
+    installed_voices: string[];
+  }> {
+    return this.post("/api/v1/voice/tts/apply", patch ?? {});
   }
 
   getModelCapabilities(): Promise<import("./types").ModelCapabilities> {

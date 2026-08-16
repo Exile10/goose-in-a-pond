@@ -151,52 +151,6 @@
 
 /* ════════ HOME VIEW ════════ */
 
-.home2 {
-  padding: 24px 28px 22px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  max-width: 1320px;
-  margin: 0 auto;
-}
-
-.home2__head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-}
-
-.home2__sub {
-  font-size: 13.5px;
-  font-weight: 600;
-  color: var(--mut);
-  margin-top: 4px;
-}
-
-.home2__iconbtn {
-  width: 42px;
-  height: 42px;
-  border-radius: 13px;
-  border: 1px solid var(--line);
-  background: var(--color-surface);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-
-.home2__iconbtn:hover {
-  border-color: var(--pp-100);
-  background: var(--pp-50);
-}
-
-.home2__head-actions {
-  display: flex;
-  align-items: center;
-  gap: 18px;
-}
-
 /* Ask Goose */
 .askgoose {
   display: flex;
@@ -277,54 +231,6 @@
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-}
-
-.home2__grid {
-  display: grid;
-  grid-template-columns: 1fr 326px;
-  gap: 18px;
-  align-items: start;
-}
-
-.home2__main {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  min-width: 0;
-}
-
-.home2__tiles {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 12px;
-}
-
-.home2__cams {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 12px;
-}
-
-.home2__sectlabel {
-  font-size: 12.5px;
-  font-weight: 700;
-  color: #64748B;
-  text-transform: uppercase;
-  letter-spacing: 0.6px;
-  margin-bottom: 10px;
-}
-
-.home2__aside {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-
-.home2__empty {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--mut);
-  padding: 16px 0;
 }
 
 .ghost-btn {
@@ -1102,8 +1008,6 @@
 
 /* ─── Responsive: narrow viewport collapses aside ─── */
 @media (max-width: 1080px) {
-  .home2__grid { grid-template-columns: 1fr; }
-  .home2__tiles { grid-template-columns: repeat(2, 1fr); }
   .rt__grid { grid-template-columns: repeat(2, 1fr); }
 }
 
@@ -1354,21 +1258,6 @@ body,
 
 /* Components that need explicit dark-mode overrides */
 :root[data-theme="dark"] .irail,
-:root[data-theme="dark"] .home2__iconbtn,
-:root[data-theme="dark"] .todo,
-:root[data-theme="dark"] .np,
-:root[data-theme="dark"] .cdock__pill,
-:root[data-theme="dark"] .rpill,
-:root[data-theme="dark"] .scene,
-:root[data-theme="dark"] .set__list,
-:root[data-theme="dark"] .mrow__btn,
-:root[data-theme="dark"] .preset-chip,
-:root[data-theme="dark"] .hseg__opt[data-active="true"],
-:root[data-theme="dark"] .setcard {
-  background: var(--panel);
-  border-color: var(--line);
-}
-
 :root[data-theme="dark"] .hseg {
   background: var(--hub-bg);
   border-color: var(--line);
@@ -1385,16 +1274,10 @@ body,
 /* ════════ DENSITY ════════
    Ported from goose-hub-settings.css density block.
    ════════ */
-:root[data-density="compact"] .home2 {
-  gap: 11px;
-  padding: 18px 22px;
-}
-:root[data-density="compact"] .home2__tiles { gap: 9px; }
 :root[data-density="compact"] .dtile {
   min-height: 92px;
   padding: 11px;
 }
-:root[data-density="compact"] .home2__cams { gap: 9px; }
 :root[data-density="compact"] .setd { padding: 16px 22px 28px; }
 :root[data-density="compact"] .srow { padding: 10px 12px; }
 :root[data-density="compact"] .set-row { padding: 11px 14px; }
@@ -1980,11 +1863,6 @@ body,
 @media (max-height: 640px) {
 
   /* Hub home padding */
-  .home2 {
-    padding: 14px 18px 14px;
-    gap: 10px;
-  }
-
   /* Ask Goose CTA: reduce padding */
   .askgoose {
     padding: 11px 16px;
@@ -1995,13 +1873,7 @@ body,
   .askgoose__say { font-size: 14px; }
 
   /* Home grid: already single-col at <=1080px; ensure gap is tight */
-  .home2__grid { gap: 12px; }
-  .home2__main { gap: 12px; }
-  .home2__aside { gap: 10px; }
-
   /* Section labels */
-  .home2__sectlabel { margin-bottom: 6px; }
-
   /* View head (sub-view headers) */
   .view-head { margin-bottom: 14px; }
   .view-title { font-size: 22px; }
@@ -2087,10 +1959,6 @@ body,
   .irail__icobox { width: 34px; height: 28px; border-radius: 10px; }
 
   /* Home view collapses to single column (override existing 1080px rule) */
-  .home2__grid { grid-template-columns: 1fr; }
-  .home2__tiles { grid-template-columns: repeat(2, 1fr); }
-  .home2__cams  { grid-template-columns: repeat(2, 1fr); }
-
   /* Routines: 2 col */
   .rt__grid { grid-template-columns: repeat(2, 1fr); }
 
@@ -2110,22 +1978,12 @@ body,
 @media (max-height: 500px) {
 
   /* Home: ultra-compact */
-  .home2 {
-    padding: 10px 14px 10px;
-    gap: 8px;
-  }
-
   .askgoose { padding: 9px 14px; }
   .askgoose__mic { width: 32px; height: 32px; }
   .askgoose__say { font-size: 13px; }
 
   /* Collapse aside on 480px height: not enough room */
-  .home2__grid { grid-template-columns: 1fr; }
-  .home2__aside { display: none; }
-
   /* Tiles: keep 2 col */
-  .home2__tiles { grid-template-columns: repeat(2, 1fr); }
-
   /* Icon rail: minimal */
   .irail { width: 60px; padding: 8px 0; }
   .irail__brand { margin-bottom: 10px; }
@@ -2197,3 +2055,301 @@ body,
 }
 
 .set__allChev { color: var(--color-text-tertiary); flex: 0 0 auto; }
+
+/* ══ Home ══════════════════════════════════════════════════════
+   Two questions in order: what needs me, then what's on.
+
+   The whole page is quiet on purpose so that ONE element can be loud without
+   raising its voice — the suggestion's Approve button is the only filled
+   control here, and that is what marks it as the thing that asks. Everything
+   else reports, so everything else is flat.
+   ═══════════════════════════════════════════════════════════════ */
+
+.home {
+  padding: 24px 28px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  max-width: 1180px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.home__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.home__greet {
+  margin: 0;
+  font-family: var(--font-display, inherit);
+  font-size: clamp(21px, 2.3vw, 29px);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  color: var(--ink, #1a1a2e);
+}
+.home__greet span { color: var(--pp); }
+.home__sub {
+  margin: 5px 0 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--mut);
+}
+.home__head-actions { display: flex; align-items: center; gap: 10px; }
+.home__iconbtn {
+  width: 42px; height: 42px;
+  border-radius: 13px;
+  border: 1px solid var(--line);
+  background: var(--color-surface);
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.home__iconbtn:hover { border-color: var(--pp-100); background: var(--pp-50); }
+
+/* ── The suggestion ──────────────────────────────────────────
+   The card itself is the signal. When nothing needs answering there is no
+   card at all — just a line — so the page is visibly calmer, and a card
+   appearing is something you notice from across the room without an alert. */
+.sugg {
+  border: 1px solid var(--pp-100, #E9D5FF);
+  background: var(--color-surface);
+  border-radius: 16px;
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  animation: sugg-in 0.34s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.sugg--quiet {
+  border: none;
+  background: none;
+  padding: 4px 2px;
+  animation: none;
+}
+.sugg__quiet-text {
+  margin: 0;
+  font-size: 13.5px;
+  color: var(--color-text-tertiary, #94A3B8);
+}
+/* The card spans the page because it is the hero, but the words must not: a
+   rationale set across 1300px is a line you lose your place in. Capped to a
+   readable measure and left ragged, so the eye returns to the same edge. */
+.sugg__summary,
+.sugg__why { max-width: 68ch; }
+
+.sugg__summary {
+  margin: 0;
+  font-family: var(--font-display, inherit);
+  font-size: clamp(16px, 1.5vw, 19px);
+  font-weight: 650;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+  color: var(--ink, #1a1a2e);
+}
+/* Why the pond thinks so. A suggestion without this is just an instruction,
+   and an instruction from software is one you turn off. */
+.sugg__why {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--mut);
+}
+.sugg__error {
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  color: var(--color-destructive, #DC2626);
+}
+.sugg__actions { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.sugg__go {
+  border: none;
+  background: var(--pp);
+  color: #fff;
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  padding: 8px 18px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: filter 0.15s;
+}
+.sugg__go:hover:not(:disabled) { filter: brightness(1.08); }
+.sugg__no {
+  border: none;
+  background: none;
+  color: var(--mut);
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 500;
+  padding: 8px 8px;
+  border-radius: 10px;
+  cursor: pointer;
+}
+.sugg__no:hover:not(:disabled) { color: var(--ink, #1a1a2e); }
+.sugg__go:disabled, .sugg__no:disabled { opacity: 0.5; cursor: default; }
+
+@keyframes sugg-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* ── At a glance ─────────────────────────────────────────────── */
+.home__grid {
+  display: grid;
+  grid-template-columns: 1fr 312px;
+  gap: 18px;
+  align-items: start;
+}
+.home__devices { min-width: 0; }
+.home__label {
+  margin: 0 0 10px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--mut);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+.home__tiles {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+.home__empty {
+  border: 1px dashed var(--line);
+  background: none;
+  border-radius: 12px;
+  padding: 20px;
+  width: 100%;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--pp);
+  cursor: pointer;
+}
+.home__empty:hover { border-color: var(--pp-100); background: var(--pp-50); }
+.home__aside { display: flex; flex-direction: column; gap: 14px; }
+
+/* ── Talk ────────────────────────────────────────────────────
+   Tinted, not filled: it must invite without competing with Approve, which
+   is the only decision on this screen that cannot wait. */
+.home__talk {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 2px;
+  padding: 11px 26px;
+  border-radius: 999px;
+  border: 1px solid var(--pp-100, #E9D5FF);
+  background: var(--pp-50, #FAF5FF);
+  color: var(--pp);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.home__talk:hover { background: var(--pp-100, #E9D5FF); }
+
+.home__iconbtn:focus-visible,
+.home__empty:focus-visible,
+.home__talk:focus-visible,
+.sugg__go:focus-visible,
+.sugg__no:focus-visible {
+  outline: 2px solid var(--pp);
+  outline-offset: 2px;
+}
+
+@media (max-width: 900px) {
+  .home__grid { grid-template-columns: 1fr; }
+  .home__tiles { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* Short kiosk panels: the conversation-starter and the suggestion both have to
+   survive on 480px of height, so the greeting gives up its size first. */
+@media (max-height: 560px) {
+  .home { padding: 14px 18px 12px; gap: 12px; }
+  .home__greet { font-size: 19px; }
+  .home__sub { font-size: 12px; }
+  .sugg { padding: 13px 15px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sugg { animation: none; }
+}
+
+/* ── Ink cards ─────────────────────────────────────────────────
+   The house card: paper, a 2px ink outline, and the hard 4px offset in
+   --border-ink. Same construction as the new-chat card — `--shadow-ink` is
+   already the design system's name for it, so this reuses the token rather
+   than describing the look again in numbers.
+
+   The four saturated gradients this replaced (amber lights, blue locks,
+   orange thermostat, teal plugs) encoded KIND, which the icon and the name
+   already say — while the thing you actually scan for, is it on, had to be
+   inferred from which hue happened to be showing.
+
+   So state moves to elevation. An active tile is raised on its offset; an
+   inactive one lies flat with a hairline border. That reads across a room
+   without learning four colours, and it hands the page's only real colour
+   back to the one control that asks for a decision.
+   ═══════════════════════════════════════════════════════════════ */
+.dtile {
+  background: var(--color-surface, #fff) !important;
+  color: var(--color-text) !important;
+  border: 2px solid var(--line, #ECECF1) !important;
+  border-radius: var(--radius-lg, 16px);
+  transition: box-shadow 0.16s, border-color 0.16s, transform 0.16s;
+}
+.dtile[data-active="true"] {
+  border-color: var(--color-text) !important;
+  box-shadow: var(--shadow-ink);
+}
+.dtile:hover { border-color: var(--color-text) !important; }
+.dtile[data-active="true"]:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 var(--border-ink); }
+.dtile__name, .dtile__temp { color: var(--color-text) !important; }
+
+/* The weather card joins the same material. This overrides its four
+   time-of-day skies — dawn, day, dusk, night, derived from real sunrise and
+   sunset. That was a genuine signal, not decoration, and it is the one thing
+   lost here: the card no longer says roughly what time it is by its colour.
+   The date line under the greeting says so in words. Delete this rule and the
+   sky comes back exactly. */
+.wx,
+.wx--hero,
+.wx--dawn,
+.wx--dusk,
+.wx--night {
+  background: var(--color-surface, #fff);
+  color: var(--color-text);
+  border: 2px solid var(--color-text);
+  border-radius: var(--radius-lg, 16px);
+  box-shadow: var(--shadow-ink);
+}
+.wx__fday { background: var(--pp-50, #FAF5FF); color: var(--color-text); }
+
+/* The suggestion is the one card allowed to differ, because it is the one
+   that asks: it keeps the accent outline so it reads as unanswered. */
+.sugg { border-width: 2px; box-shadow: var(--shadow-ink); }
+
+/* More than one can be waiting once personal context is feeding it. Only the
+   top card is open; the rest collapse behind one line, so the screen says
+   "there is more" without becoming a queue to work through. */
+.sugg-stack { display: flex; flex-direction: column; gap: 10px; }
+.sugg--stacked { padding: 13px 16px; gap: 4px; animation: none; }
+.sugg__summary--small { font-size: 14.5px; font-weight: 600; }
+.sugg__more {
+  align-self: flex-start;
+  border: none;
+  background: none;
+  padding: 2px 2px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--pp);
+  cursor: pointer;
+}
+.sugg__more:hover { text-decoration: underline; }
+.sugg__more:focus-visible { outline: 2px solid var(--pp); outline-offset: 2px; }

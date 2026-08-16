@@ -21,6 +21,7 @@
 //! `PoisonError` instead, so a panic in one code path can never cascade into an
 //! abort here.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -192,7 +193,21 @@ mod end_reason {
     /// the generation first, so that reader returns early and never labels an
     /// end reason here; this const therefore covers only genuine abnormal exits.
     pub const CRASHED: &str = "crashed";
+    /// The child died during startup — it never emitted `ready`, so no session
+    /// existed to crash. Distinct from [`CRASHED`] because the causes are
+    /// different in kind (a binary that cannot run against this machine's
+    /// state: stale sidecar, failed DB migration, missing dylib) and because
+    /// the child's own explanation is on stderr, not in any NDJSON line. This
+    /// is the only end reason whose payload carries `detail`.
+    pub const FAILED_TO_START: &str = "failed_to_start";
 }
+
+/// How many trailing stderr lines to retain for a startup failure's `detail`.
+///
+/// The child's stderr is a full tracing stream; only the tail matters, and the
+/// fatal line is almost always last. Bounded so a chatty session cannot grow
+/// this without limit over its lifetime.
+const STDERR_TAIL_LINES: usize = 20;
 
 /// Handle to the (optionally) spawned terminal-voice child process.
 ///
@@ -363,14 +378,31 @@ impl VoiceChatProcess {
         lock(&self.session_id).replace(session_id.clone());
         self.active.store(true, Ordering::SeqCst);
 
-        // stderr → tracing at debug level (contract: human diagnostics only).
+        // stderr → tracing at debug level (contract: human diagnostics only),
+        // AND into a bounded ring buffer.
+        //
+        // The ring is what makes a startup failure explicable. A child that dies
+        // before `ready` writes its reason ONLY here — `out!` is compiled to a
+        // no-op under `--json-events`, so stdout carries nothing at all. Before
+        // this, that reason existed solely in a `debug!` record nobody had
+        // enabled, and the UI could say no more than "exited (code 1)". The
+        // lines are still logged at debug for a live tail; the ring exists so
+        // the reader can attach the tail to `voice-session-ended`.
+        let stderr_tail: Arc<Mutex<VecDeque<String>>> =
+            Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
         if let Some(stderr) = stderr {
             let reader = BufReader::new(stderr);
+            let tail = stderr_tail.clone();
             std::thread::spawn(move || {
                 for line in reader.lines() {
                     match line {
                         Ok(l) if !l.trim().is_empty() => {
                             tracing::debug!(target: "voice_child_stderr", "{l}");
+                            let mut ring = lock(&tail);
+                            if ring.len() == STDERR_TAIL_LINES {
+                                ring.pop_front();
+                            }
+                            ring.push_back(l);
                         }
                         Ok(_) => {}
                         Err(e) => {
@@ -400,6 +432,7 @@ impl VoiceChatProcess {
                 active: active_flag,
                 generation: generation_slot,
                 my_generation: generation,
+                stderr_tail,
             });
         });
 
@@ -517,6 +550,41 @@ struct ReaderContext {
     /// The generation this reader was spawned for. It only reaps/tears down the
     /// shared slots while this still equals the live generation.
     my_generation: u64,
+    /// Trailing stderr lines, for explaining a startup failure. Shared with the
+    /// stderr thread.
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
+}
+
+/// Decide the end reason for a child that closed stdout, and what to say about
+/// it. Split out of [`run_stdout_reader`] so it is testable without an
+/// `AppHandle` or a real process.
+///
+/// * `clean_reason` — the reason from the child's own `exit` line, if it sent
+///   one. Its presence IS the definition of a clean shutdown.
+/// * `saw_ready` — whether `ready` ever arrived. Distinguishes a session that
+///   ran and then died from one that never started.
+///
+/// `detail` is populated only for a startup failure, and only from stderr:
+/// after `ready` the child reports its own troubles as NDJSON `error` events,
+/// so a stderr dump there would be noise duplicating a better signal.
+fn classify_end(
+    clean_reason: Option<&str>,
+    saw_ready: bool,
+    stderr_tail: &VecDeque<String>,
+) -> (String, Option<String>) {
+    if let Some(reason) = clean_reason {
+        return (reason.to_string(), None);
+    }
+    if saw_ready {
+        return (end_reason::CRASHED.to_string(), None);
+    }
+    let joined = stderr_tail
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let detail = (!joined.trim().is_empty()).then_some(joined);
+    (end_reason::FAILED_TO_START.to_string(), detail)
 }
 
 /// Drive the child's stdout: parse each NDJSON line, emit the mapped Tauri
@@ -540,10 +608,15 @@ fn run_stdout_reader(ctx: ReaderContext) {
         active,
         generation,
         my_generation,
+        stderr_tail,
     } = ctx;
 
     // The child's last `exit` line, if any, carries the clean reason.
     let mut clean_reason: Option<String> = None;
+    // Whether the child ever announced itself. Everything before `ready` is
+    // startup; dying in that window is a different failure from a session that
+    // ran and then crashed, and only the former can be explained by stderr.
+    let mut saw_ready = false;
 
     for line in reader.lines() {
         let line = match line {
@@ -558,6 +631,9 @@ fn run_stdout_reader(ctx: ReaderContext) {
         // exit reason from one `classify_line` call.
         match classify_line(&line) {
             Ok(LineClass::Event(event)) => {
+                if event.name == "voice-ready" {
+                    saw_ready = true;
+                }
                 if let Err(e) = app.emit(event.name, event.payload) {
                     tracing::warn!("failed to emit {}: {e}", event.name);
                 }
@@ -612,7 +688,15 @@ fn run_stdout_reader(ctx: ReaderContext) {
     // generation, so its reader returned early above and never reaches here.
     // Everything that lands here is therefore an abnormal exit: report "crashed"
     // (matching the frontend, which expects `crashed` for a code=null child).
-    let reason = clean_reason.unwrap_or_else(|| end_reason::CRASHED.to_string());
+    let (reason, detail) = {
+        let ring = lock(&stderr_tail);
+        classify_end(clean_reason.as_deref(), saw_ready, &ring)
+    };
+    if let Some(detail) = &detail {
+        // At warn, not debug: this is the whole explanation for a voice mode
+        // that will not start, and the debug-level stream is what hid it.
+        tracing::warn!("voice child failed to start; child stderr tail:\n{detail}");
+    }
 
     // Clear derived state and drop the pidfile now that the child is reaped.
     lock(&session_id).take();
@@ -625,6 +709,7 @@ fn run_stdout_reader(ctx: ReaderContext) {
             "code": code,
             "reason": reason,
             "session_id": ended_session_id,
+            "detail": detail,
         }),
     ) {
         tracing::warn!("failed to emit voice-session-ended: {e}");
@@ -904,6 +989,65 @@ mod tests {
             classify_line(r#"{"event":"exit"}"#).unwrap(),
             LineClass::Exit("stdin_eof".to_string())
         );
+    }
+
+    // ── End classification: a child that never started must say why ────────
+    //
+    // The bug these cover: a sidecar staged weeks earlier was rejected by a
+    // newer database ("migration 29 was previously applied but is missing in
+    // the resolved migrations"), exited 1, and emitted ZERO NDJSON lines. The
+    // shell reported "crashed" with an exit code and dropped the one line that
+    // explained it, because `out!` is a no-op under `--json-events` and the
+    // stderr stream was logged at debug.
+
+    fn tail(lines: &[&str]) -> VecDeque<String> {
+        lines.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_child_that_never_readied_failed_to_start_and_carries_stderr() {
+        let (reason, detail) = classify_end(
+            None,
+            false,
+            &tail(&[
+                "  Goose in a Pond 0.1.0 — voice",
+                "Error: migration 29 was previously applied but is missing in the resolved migrations",
+            ]),
+        );
+        assert_eq!(reason, end_reason::FAILED_TO_START);
+        let detail = detail.expect("a startup failure must carry the child's own explanation");
+        assert!(
+            detail.contains("migration 29"),
+            "the cause must survive into the payload, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_readied_session_that_dies_is_crashed_and_carries_no_stderr() {
+        // After `ready` the child reports troubles as NDJSON `error` events, so
+        // attaching stderr here would duplicate a better signal with noise.
+        let (reason, detail) = classify_end(None, true, &tail(&["some later log line"]));
+        assert_eq!(reason, end_reason::CRASHED);
+        assert_eq!(detail, None);
+    }
+
+    #[test]
+    fn a_clean_exit_line_wins_over_both() {
+        // Sending `exit` IS the definition of a clean shutdown; a child that
+        // says so before ever readying still exited cleanly, not fatally.
+        let (reason, detail) = classify_end(Some("stdin_eof"), false, &tail(&["noise"]));
+        assert_eq!(reason, "stdin_eof");
+        assert_eq!(detail, None);
+    }
+
+    #[test]
+    fn a_silent_startup_failure_reports_no_detail_rather_than_empty_string() {
+        // An empty/blank tail must not become `detail: ""` — the frontend
+        // branches on absence to choose its "without reporting a reason"
+        // wording, and "" would render as a message with nothing after it.
+        let (reason, detail) = classify_end(None, false, &tail(&["   ", ""]));
+        assert_eq!(reason, end_reason::FAILED_TO_START);
+        assert_eq!(detail, None);
     }
 
     // ── Robustness: bad lines never crash, they error for the caller to log ─

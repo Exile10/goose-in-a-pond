@@ -95,6 +95,9 @@ function buildSettingsPatch(stepId: string, draft: OnboardingDraft): Partial<Set
         assistant_personality: draft.personality,
         assistant_name: draft.assistantName.trim(),
         voice_tts_voice: draft.ttsVoice,
+        // Was collected by the slider and never written — the pace a household
+        // chose during setup was discarded the moment onboarding finished.
+        voice_tts_speed: draft.ttsRate / 100,
       };
 
     case "wake-word":

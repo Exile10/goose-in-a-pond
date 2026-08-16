@@ -7,7 +7,6 @@ import type {
   OnboardingDraft,
   LangOption,
   PromptStyle,
-  TtsVoice,
   WakePreset,
 } from "./onboarding.types";
 
@@ -103,12 +102,6 @@ export const PROMPT_STYLES: PromptStyle[] = [
 
 // ── TTS voices ─────────────────────────────────────────────
 
-export const TTS_VOICES: TtsVoice[] = [
-  { value: "amy",      label: "Amy",      accent: "British \u00b7 Female",  file: "piper-amy.onnx" },
-  { value: "ryan",     label: "Ryan",     accent: "American \u00b7 Male",   file: "piper-ryan.onnx" },
-  { value: "kathleen", label: "Kathleen", accent: "Irish \u00b7 Female",    file: "piper-kathleen.onnx" },
-  { value: "libritts", label: "LibriTTS", accent: "Neutral \u00b7 Mixed",   file: "libritts-r.onnx" },
-];
 
 // ── Wake word presets ──────────────────────────────────────
 
@@ -137,8 +130,10 @@ export const DEFAULT_DRAFT: OnboardingDraft = {
   promptStyle: "balanced",
   personality: "friendly and helpful",
   assistantName: "Goose",
-  ttsVoice: "amy",
-  ttsRate: 50,
+  ttsVoice: "af_heart",
+  // Percent of the voice's natural pace, matching the settings screen so the
+  // two surfaces mean the same thing by the same number.
+  ttsRate: 100,
   wakeWord: "goose",
   wakeWordCustom: "",
   enableMcpMemory: true,

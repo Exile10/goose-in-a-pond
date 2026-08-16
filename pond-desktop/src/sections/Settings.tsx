@@ -328,6 +328,21 @@ function VoiceTab({
           <input type="range" min={5} max={120} step={5} value={recDur} onChange={(e) => patch("voice_recording_duration_secs", Number(e.target.value))} className="range-full" />
         </Row>
       </Section>
+      {/* Deliberately NOT inside the Advanced block below with the rest of the
+          speech settings. This one is about what the pond sounds like, not how
+          it is configured, and the household most likely to want it off is the
+          one least likely to open "Advanced voice settings".
+
+          `!== false`, not `=== true`: the field defaults ON, so an absent key
+          must render ON — the other reading shows the switch off while the tone
+          is in fact playing. */}
+      <Section title="Sound">
+        <Row label="Sound while it thinks" hint="A soft pulse between your question and the answer, so a slow reply is not mistaken for one that was never heard.">
+          <Switch aria-label="Sound while it thinks" isSelected={s.voice_thinking_tone_enabled !== false} onChange={(v) => patch("voice_thinking_tone_enabled", v)}>
+            <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content>
+          </Switch>
+        </Row>
+      </Section>
       {!devMode && (
         <button className="advanced-toggle" onClick={() => setShowAdvanced((v) => !v)} aria-expanded={showAdvanced}>
           {showAdvanced ? "▾" : "▸"} Advanced voice settings

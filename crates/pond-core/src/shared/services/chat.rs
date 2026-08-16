@@ -341,12 +341,15 @@ struct WorkingTone {
 }
 
 impl WorkingTone {
-    fn start(output: Arc<dyn VoiceOutput>) -> Self {
-        // The ambient tone was removed — it read as an annoying background
-        // beep rather than a helpful cue. The guard itself stays: `stop()`/
-        // `Drop` on a never-started tone is a safe no-op, and keeping the
-        // RAII shape means a future replacement signal (if any) gets the
-        // same "always stopped, never outlives the turn" guarantee for free.
+    /// `enabled` is `settings.voice_thinking_tone_enabled`. When it is false the
+    /// guard is still constructed and still runs `stop()` on drop: stopping a
+    /// tone that never started is a no-op on every `VoiceOutput`, and building
+    /// the disabled case out of the same guard means switching the tone back on
+    /// cannot reintroduce a path where it outlives the turn.
+    fn start(output: Arc<dyn VoiceOutput>, enabled: bool) -> Self {
+        if enabled {
+            output.start_thinking_tone();
+        }
         Self {
             output,
             stopped: false,
@@ -470,6 +473,12 @@ pub struct ChatService {
     model_name: Option<String>,
     /// Whose turns these are. See [`with_profile_scope`](Self::with_profile_scope).
     profile_scope: ProfileScope,
+    /// Whether the ambient working tone plays while inference runs. Mirrors
+    /// `settings.voice_thinking_tone_enabled`; the composition root reads the
+    /// setting and passes it via [`with_thinking_tone`](Self::with_thinking_tone).
+    /// Defaults TRUE to match the settings default, so a caller that predates
+    /// the switch behaves the way the pond did before it existed.
+    thinking_tone: bool,
     /// PAI-5 P6. Whether reasoning text may be written to storage at all.
     /// FALSE unless [`with_thinking`](Self::with_thinking) says otherwise, so a
     /// handler that never heard of this feature persists nothing.
@@ -538,9 +547,21 @@ impl ChatService {
             telemetry: None,
             model_name: None,
             profile_scope: ProfileScope::Household,
+            thinking_tone: true,
             persist_thinking: false,
             thinking_blocks: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Play (or suppress) the ambient working tone for this service's turns.
+    ///
+    /// Takes the setting rather than being an opt-out marker method, for the
+    /// same reason as [`with_thinking`](Self::with_thinking): the call site
+    /// reads as "whatever the household chose", and switching the tone off does
+    /// not depend on a composition root remembering to stop calling something.
+    pub fn with_thinking_tone(mut self, enabled: bool) -> Self {
+        self.thinking_tone = enabled;
+        self
     }
 
     /// PAI-5 P6. Allow this turn's reasoning text to be persisted.
@@ -1343,7 +1364,10 @@ impl ChatService {
         // said the same thing the tone says, but took a full synthesis and
         // playback to say it — delaying the answer to announce that the
         // answer was coming. One signal, and the cheaper one.
-        let mut tone = WorkingTone::start(self.voice_output.clone());
+        //
+        // Households that would rather have silence here switch it off with
+        // `voice_thinking_tone_enabled`; the guard is built either way.
+        let mut tone = WorkingTone::start(self.voice_output.clone(), self.thinking_tone);
 
         let mut stream = self.agent.chat_stream(request).await?;
         let mut turn_usage: Option<crate::models::ports::provider::UsageStats> = None;
@@ -3116,6 +3140,90 @@ mod tests {
             self.spoken.lock().unwrap().push(text.to_string());
             Ok(())
         }
+    }
+
+    /// Counts thinking-tone starts and stops. `speak` is irrelevant here.
+    #[derive(Default)]
+    struct CountingTone {
+        starts: std::sync::atomic::AtomicUsize,
+        stops: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl VoiceOutput for CountingTone {
+        async fn speak(&self, _text: &str) -> Result<()> {
+            Ok(())
+        }
+        fn start_thinking_tone(&self) {
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn stop_thinking_tone(&self) {
+            self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl CountingTone {
+        fn counts(&self) -> (usize, usize) {
+            (
+                self.starts.load(std::sync::atomic::Ordering::SeqCst),
+                self.stops.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        }
+    }
+
+    /// The switch is the whole feature: `voice_thinking_tone_enabled = false`
+    /// must reach `start_thinking_tone` and stop it being called at all. A tone
+    /// that starts and is immediately stopped is not "off" -- it is a click.
+    #[test]
+    fn a_disabled_tone_never_starts() {
+        let out = Arc::new(CountingTone::default());
+        {
+            let _tone = WorkingTone::start(out.clone(), false);
+        }
+        assert_eq!(
+            out.counts().0,
+            0,
+            "the tone started despite the setting being off"
+        );
+    }
+
+    /// The half that was deleted in 0136f8c5 and is being restored: with the
+    /// setting ON the tone must actually play. Asserting the count rather than
+    /// "no panic" is the point -- the regression this guards was a silent
+    /// no-op, which every looser assertion would have passed.
+    #[test]
+    fn an_enabled_tone_starts_once_and_stops_once() {
+        let out = Arc::new(CountingTone::default());
+        {
+            let mut tone = WorkingTone::start(out.clone(), true);
+            assert_eq!(out.counts(), (1, 0), "tone did not start when enabled");
+            // The first speakable sentence can arrive down several paths, so
+            // stop() is called more than once in practice.
+            tone.stop();
+            tone.stop();
+            assert_eq!(out.counts(), (1, 1), "stop() is not idempotent");
+        }
+        assert_eq!(
+            out.counts(),
+            (1, 1),
+            "Drop stopped an already-stopped tone a second time"
+        );
+    }
+
+    /// Dropping without an explicit `stop()` -- the `?`-on-stream-error path
+    /// that motivated the guard -- must still silence the tone.
+    #[test]
+    fn dropping_the_guard_stops_a_running_tone() {
+        let out = Arc::new(CountingTone::default());
+        {
+            let _tone = WorkingTone::start(out.clone(), true);
+        }
+        assert_eq!(
+            out.counts(),
+            (1, 1),
+            "an early return left the tone playing for the life of the process"
+        );
     }
 
     /// A thread-safe collector for the event sink.

@@ -59,6 +59,48 @@ function isCleanExit(code: number | null, reason: string): boolean {
   return false;
 }
 
+// ── Startup-failure messages ─────────────────────────────────────────────────
+// `failed_to_start` means the child died before emitting `ready` — it never
+// became a session. The shell attaches the child's stderr tail as `detail`,
+// because that is the ONLY place the cause is written: under `--json-events`
+// the child's human-facing banner macro is compiled to a no-op, so stdout
+// carries nothing at all when startup fails.
+//
+// Without this the message was "Voice session exited (code 1, reason: crashed)"
+// — true, and useless. The real line was "migration 29 was previously applied
+// but is missing in the resolved migrations", i.e. a staged sidecar older than
+// the database, which no exit code could ever have suggested.
+
+/** Longest `detail` excerpt to put in a user-facing message. */
+const DETAIL_MAX_CHARS = 300;
+
+/**
+ * The line worth showing from a stderr tail: the last non-blank one, which is
+ * where a fatal error lands. Truncated so a stack trace cannot fill the screen.
+ */
+export function lastMeaningfulLine(detail: string | null | undefined): string | null {
+  if (!detail) return null;
+  const lines = detail.split("\n").map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return null;
+  const last = lines[lines.length - 1];
+  return last.length > DETAIL_MAX_CHARS ? `${last.slice(0, DETAIL_MAX_CHARS)}…` : last;
+}
+
+/** The user-facing message for an abnormal `voice-session-ended`. */
+export function endedErrorMessage(
+  code: number | null,
+  reason: string,
+  detail?: string | null,
+): string {
+  if (reason !== "failed_to_start") {
+    return `Voice session exited (code ${code ?? "none"}, reason: ${reason})`;
+  }
+  const line = lastMeaningfulLine(detail);
+  return line
+    ? `Voice mode could not start: ${line}`
+    : `Voice mode could not start — the voice process exited during startup (code ${code ?? "none"}) without reporting a reason.`;
+}
+
 // ── Public API ───────────────────────────────────────────────────────────────
 
 export interface VoiceSessionAPI {
@@ -282,7 +324,7 @@ export function useVoiceSession(): VoiceSessionAPI {
     // Finding 14-consumer also: call stop_voice_session best-effort so the
     // shell restores the wake listener when the child exits on its own.
     register(
-      listen<{ code: number | null; reason: string; session_id?: string }>("voice-session-ended", (e) => {
+      listen<{ code: number | null; reason: string; session_id?: string; detail?: string | null }>("voice-session-ended", (e) => {
         const incomingId = e.payload?.session_id ?? null;
         // If the event carries a session_id that does not match the active one,
         // drop it — it belongs to a previous child.
@@ -303,8 +345,7 @@ export function useVoiceSession(): VoiceSessionAPI {
         const reason = e.payload?.reason ?? "unknown";
         if (!isCleanExit(code, reason)) {
           // Abnormal exit — surface error; stays until dismissed/retried.
-          const msg = `Voice session exited (code ${code ?? "none"}, reason: ${reason})`;
-          flashError(msg);
+          flashError(endedErrorMessage(code, reason, e.payload?.detail));
         } else {
           // Clean exit (stdin_eof / dismissed) — return to idle.
           dispatch({ type: "SET_VOICE_STATE", payload: "idle" });

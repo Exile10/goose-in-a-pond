@@ -88,6 +88,18 @@ export interface Settings {
   active_whisper_model?: string;
   active_tts_model?: string;
   voice_tts_voice?: string;
+  /**
+   * Speaking pace as a multiplier, 0.5–2.0. 1.0 is the voice as trained.
+   * Stored as a multiplier rather than a percentage because that is exactly
+   * what the engine's `speed` tensor takes — no conversion, nothing to get
+   * backwards between the slider and the model.
+   */
+  voice_tts_speed?: number;
+  /**
+   * Quality tier — a Kokoro quantization (`q8` | `q8f16` | `q4f16` | `fp16` |
+   * `fp32`). Picking a tier picks an `.onnx` file; there is nothing else to it.
+   */
+  voice_tts_quality?: string;
   voice_thinking_tone_enabled?: boolean;
 
   // Model roles

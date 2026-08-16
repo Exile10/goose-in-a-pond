@@ -113,6 +113,7 @@ struct Harness {
     app: axum::Router,
     system: Pool<Sqlite>,
     index: Arc<SqliteVectorIndex>,
+    reindex: Arc<tokio::sync::Notify>,
     profiles: Arc<SqliteProfileRepository>,
     _tmp: tempfile::TempDir,
 }
@@ -129,6 +130,10 @@ async fn make_app(wire_index: bool, wire_embedder: bool) -> Harness {
     // Built whether or not it is wired into `AppState`, so a test can seed
     // vectors into a pond whose route is expected to report no index.
     let index = Arc::new(SqliteVectorIndex::new(db.vectors.clone()));
+    // Held by the harness as well as the state, so a test can wait on it and
+    // prove the route actually wakes the sweep rather than merely holding a
+    // handle it never uses.
+    let reindex = Arc::new(tokio::sync::Notify::new());
     let hs = MockHandshake::new();
     hs.add_valid_token("test-token".to_string()).await;
 
@@ -146,6 +151,7 @@ async fn make_app(wire_index: bool, wire_embedder: bool) -> Harness {
         llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
         llamafile_url: "http://127.0.0.1:8080".to_string(),
         tts: None,
+        tts_control: None,
         settings_repo: Arc::new(MockSettingsRepository::new()),
         profile_repo: profiles.clone(),
         device_registry: Arc::new(NoDevices),
@@ -154,6 +160,11 @@ async fn make_app(wire_index: bool, wire_embedder: bool) -> Harness {
         embedding_provider: wire_embedder
             .then(|| Arc::new(StubEmbedder) as Arc<dyn EmbeddingProvider + Send + Sync>),
         vector_index: wire_index.then(|| index.clone() as Arc<dyn VectorIndex>),
+        // Present only when a sweep would exist to wake, which in production
+        // means an embedder: `main.rs` spawns the sweep inside the same
+        // `if let Some(provider)`. Wiring it whenever the index is present would
+        // make this harness claim a refill on a pond where nothing can refill.
+        index_reindex: (wire_index && wire_embedder).then(|| reindex.clone()),
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -221,6 +232,7 @@ async fn make_app(wire_index: bool, wire_embedder: bool) -> Harness {
         app: build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
         system,
         index,
+        reindex,
         profiles,
         _tmp: tmp,
     }
@@ -429,6 +441,57 @@ async fn the_coverage_number_leaves_the_process() {
          structurally unable to answer anything: {body}"
     );
     assert_eq!(corpus_row(&body, "context")["rows"], 0);
+}
+
+/// Clearing the index is only half of "reindex". The other half is refilling it,
+/// and the sweep that does that is idle-gated — so it will not normally run
+/// while the person who just pressed the button is still there.
+///
+/// Without the wake this route is a button that empties the panel and leaves it
+/// empty until the next scheduled pass, which on a pond nobody restarts is
+/// indistinguishable from the button doing nothing.
+#[tokio::test]
+async fn rebuilding_wakes_the_sweep_that_refills_it() {
+    let h = make_app(true, true).await;
+
+    // Subscribed BEFORE the request. `Notify` only holds a permit for a
+    // `notify_one` with no waiter, so a test that starts listening afterwards
+    // can pass on the stored permit alone and would keep passing if the route
+    // fired at the wrong moment.
+    let listener = h.reindex.clone();
+    let woken = tokio::spawn(async move { listener.notified().await });
+    tokio::task::yield_now().await;
+
+    let (status, body) = rebuild(&h).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["refilling"], true,
+        "the answer has to say the refill was asked for, or a caller cannot tell this pond \
+         apart from one with no sweep to wake: {body}"
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), woken)
+        .await
+        .expect("the sweep was never woken, so the index stays empty until the next pass")
+        .expect("waiter task panicked");
+}
+
+/// A pond with no sweep to wake still clears, and says it did not refill.
+///
+/// This is the CLI shape, and reporting `refilling: true` there would be a lie
+/// that reads as success — the caller would wait for a rebuild that nothing in
+/// the process is going to perform.
+#[tokio::test]
+async fn a_pond_with_no_sweep_clears_and_admits_nothing_will_refill_it() {
+    let h = make_app(true, false).await;
+    let (status, body) = rebuild(&h).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["indexed"], true);
+    assert_eq!(
+        body["refilling"], false,
+        "no embedder means no sweep in this process; claiming a refill would be a lie that \
+         reads as success: {body}"
+    );
 }
 
 /// An empty corpus and an EXCLUDED corpus both report zero qualifying rows, and

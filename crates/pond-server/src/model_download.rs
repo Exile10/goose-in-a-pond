@@ -73,6 +73,147 @@ pub async fn download_piper_model_entry(
 /// dead code.
 const PIPER_GITHUB_BASE: &str = "https://github.com/rhasspy/piper/releases/download/2023.11.14-2";
 
+/// Somewhere to send byte-level progress while a file is being fetched.
+///
+/// Called as `(filename, downloaded, total)`. Exists so the Kokoro setup path
+/// can report into the same tracker the Models page already polls, instead of
+/// the UI growing a second, parallel idea of what "downloading" means.
+pub type DlProgress = std::sync::Arc<dyn Fn(&str, u64, u64) + Send + Sync>;
+
+// ── Kokoro engine ─────────────────────────────────────────────────────────────
+
+const KOKORO_REPO_BASE: &str =
+    "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/";
+
+/// `<data_dir>/models/kokoro/` — engine weights, tokenizer, and `voices/`.
+pub fn kokoro_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("models").join("kokoro")
+}
+
+/// Which voices a start-up must have on disk, given the configured setting.
+///
+/// **Always includes the default**, then the configured voice when it is a
+/// different, resolvable Kokoro id.
+///
+/// An install that predates the engine swap carries a Piper filename in
+/// `voice_tts_voice` (`en_US-ryan-high.onnx`), which is not a Kokoro voice id
+/// and never will be. This used to bail on that name and fetch nothing at all,
+/// so a fresh install had no style table, the first utterance failed, and every
+/// turn fell back to Piper — with the logs showing only "skipping download".
+/// The adapter already falls back to the default voice; what it cannot do is
+/// conjure the file.
+fn voices_to_fetch(configured: &str) -> Vec<String> {
+    let mut wanted = vec![pond_adapters_kokoro::DEFAULT_VOICE.to_string()];
+    let configured = configured.trim();
+    if configured.is_empty() || configured == pond_adapters_kokoro::DEFAULT_VOICE {
+        return wanted;
+    }
+    // Validated against a throwaway root: this asks "is this a usable voice
+    // id", which is a property of the name, not of where it would be written.
+    if pond_adapters_kokoro::voices::voice_path(Path::new("/"), configured).is_ok() {
+        wanted.push(configured.to_string());
+    } else {
+        tracing::info!(
+            voice = configured,
+            "configured voice is not a Kokoro id (likely a Piper filename from before \
+             the engine swap); fetching the default voice instead"
+        );
+    }
+    wanted
+}
+
+/// Ensure the Kokoro engine can start: the tokenizer, one set of weights, and
+/// the default voice.
+///
+/// The catalogue lists voices (522 KB each) but not these — a voice is useless
+/// without the shared weights, and nothing else would ever fetch them. Without
+/// this, `KokoroOutput::new` fails on the missing tokenizer and TTS silently
+/// stays on Piper, which looks exactly like the engine swap never happening.
+///
+/// Best-effort: every failure leaves Piper as the engine rather than leaving
+/// the pond mute. `quality` picks which `.onnx` to fetch.
+pub async fn ensure_kokoro_engine(data_dir: &Path, quality: &str, voice: &str) {
+    ensure_kokoro_engine_reporting(data_dir, quality, voice, None).await
+}
+
+/// `ensure_kokoro_engine`, reporting byte progress for whatever it fetches.
+///
+/// The settings screen uses this so a 326 MB tier change shows a real bar
+/// instead of a spinner that could mean anything.
+pub async fn ensure_kokoro_engine_reporting(
+    data_dir: &Path,
+    quality: &str,
+    voice: &str,
+    report: Option<DlProgress>,
+) {
+    // Progress goes to STDERR, not stdout. Under `--json-events` — which is the
+    // only mode the desktop's voice child runs in — stdout carries NDJSON and
+    // nothing else, so a `println!` here is a contract violation that breaks
+    // the session before it starts. `json_events_contract_test` caught exactly
+    // that. `download_file` writes its own status to stderr for the same reason.
+    let dir = kokoro_dir(data_dir);
+    let voices = dir.join("voices");
+    if let Err(e) = std::fs::create_dir_all(&voices) {
+        tracing::warn!("could not create {}: {e}", voices.display());
+        return;
+    }
+
+    // Tokenizer: 3 KB, and the one file whose absence stops the engine dead.
+    let tokenizer = dir.join("tokenizer.json");
+    if !tokenizer.exists() {
+        eprintln!("  📥 Kokoro tokenizer...");
+        if let Err(e) = download_file_reporting(
+            &format!("{KOKORO_REPO_BASE}tokenizer.json"),
+            &tokenizer,
+            1,
+            report.clone(),
+        )
+        .await
+        {
+            tracing::warn!("Kokoro tokenizer download failed: {e}");
+            return;
+        }
+    }
+
+    let filename = pond_adapters_kokoro::model_filename(quality);
+    let weights = dir.join(filename);
+    if !weights.exists() {
+        let mb = pond_adapters_kokoro::model_size_mb(quality);
+        eprintln!("  📥 Kokoro voice engine ({quality}, ~{mb} MB) — one time...");
+        if let Err(e) = download_file_reporting(
+            &format!("{KOKORO_REPO_BASE}onnx/{filename}"),
+            &weights,
+            mb,
+            report.clone(),
+        )
+        .await
+        {
+            tracing::warn!("Kokoro weights download failed: {e}");
+            return;
+        }
+    }
+
+    for name in voices_to_fetch(voice) {
+        let Ok(voice_file) = pond_adapters_kokoro::voices::voice_path(&voices, &name) else {
+            continue;
+        };
+        if voice_file.exists() {
+            continue;
+        }
+        eprintln!("  📥 Kokoro voice \"{name}\"...");
+        if let Err(e) = download_file_reporting(
+            &format!("{KOKORO_REPO_BASE}voices/{name}.bin"),
+            &voice_file,
+            1,
+            report.clone(),
+        )
+        .await
+        {
+            tracing::warn!("Kokoro voice {name} download failed: {e}");
+        }
+    }
+}
+
 /// Returns the path where espeak-ng-data should live: `<data_dir>/bin/espeak-ng-data/`.
 pub fn piper_espeak_data_path(data_dir: &Path) -> PathBuf {
     data_dir.join("bin").join("espeak-ng-data")
@@ -270,6 +411,7 @@ async fn download_via_hf_cache(
     filename: &str,
     dest: &Path,
     approx_size_mb: u64,
+    report: Option<DlProgress>,
 ) -> Result<()> {
     let data_dir = resolve_data_dir();
     let cache = pond_hf_cache::HfCache::new(&data_dir);
@@ -287,12 +429,23 @@ async fn download_via_hf_cache(
     // Progress closure: reuses the verbatim CLI progress line from the legacy path.
     let approx_total = approx_size_mb * 1_048_576;
     let mut last_printed = 0u64;
+    let reported_name = dest
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     let progress = |downloaded: u64, total: u64| {
         let effective_total = if total == 0 {
             approx_total.max(1)
         } else {
             total
         };
+        // Every chunk, not throttled like the console line below: the tracker
+        // is polled on its own cadence and a throttle here would only make the
+        // bar lag behind the transfer.
+        if let Some(r) = report.as_ref() {
+            r(&reported_name, downloaded, effective_total);
+        }
         // Throttle stdout updates to ~256 KiB to avoid flooding. Returning
         // `true` here as well as at the end: the value is "keep going", not
         // "I printed something".
@@ -352,6 +505,16 @@ async fn link_or_copy(src: &Path, dest: &Path) -> Result<()> {
 }
 
 pub async fn download_file(url: &str, dest: &Path, approx_size_mb: u64) -> Result<()> {
+    download_file_reporting(url, dest, approx_size_mb, None).await
+}
+
+/// `download_file`, with somewhere to send progress.
+pub async fn download_file_reporting(
+    url: &str,
+    dest: &Path,
+    approx_size_mb: u64,
+    report: Option<DlProgress>,
+) -> Result<()> {
     // Progress/status output goes to stderr: this downloader is reachable from the
     // `--json-events` chat path (first-run model fetch), where stdout is reserved
     // exclusively for NDJSON. Interactive callers still see it on the terminal.
@@ -363,7 +526,8 @@ pub async fn download_file(url: &str, dest: &Path, approx_size_mb: u64) -> Resul
 
     // ── HF dispatch: route HF URLs through the hardened cache path ───────────
     if let Some((repo_id, revision, filename)) = pond_hf_cache::parse_hf_url(url) {
-        return download_via_hf_cache(&repo_id, &revision, &filename, dest, approx_size_mb).await;
+        return download_via_hf_cache(&repo_id, &revision, &filename, dest, approx_size_mb, report)
+            .await;
     }
 
     let client = reqwest::Client::builder().build()?;
@@ -1020,5 +1184,61 @@ mod tests {
             .await
             .expect("offline still permits loopback");
         assert_eq!(std::fs::read(&allowed).unwrap(), b"payload");
+    }
+}
+
+#[cfg(test)]
+mod kokoro_engine_tests {
+    use super::*;
+
+    const DEFAULT: &str = pond_adapters_kokoro::DEFAULT_VOICE;
+
+    /// The reported case, from a real log line:
+    ///
+    /// ```text
+    /// WARN invalid Kokoro voice name; skipping download voice="en_US-ryan-high.onnx"
+    /// ```
+    ///
+    /// A stale Piper filename made start-up fetch NOTHING, so a fresh install
+    /// had no style table and fell back to Piper on every turn. The default
+    /// must be fetched regardless of what the stale setting says.
+    #[test]
+    fn a_legacy_piper_filename_still_fetches_the_default_voice() {
+        let v = voices_to_fetch("en_US-ryan-high.onnx");
+        assert!(
+            v.contains(&DEFAULT.to_string()),
+            "the default voice must be fetched even when the setting is unusable, got {v:?}"
+        );
+        assert!(
+            !v.iter().any(|n| n.contains(".onnx")),
+            "a Piper filename must never be treated as a Kokoro voice id, got {v:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_setting_fetches_the_default() {
+        assert_eq!(voices_to_fetch(""), vec![DEFAULT.to_string()]);
+        assert_eq!(voices_to_fetch("   "), vec![DEFAULT.to_string()]);
+    }
+
+    /// A real, different voice is fetched alongside the default — the default
+    /// is the safety net, not a replacement for what was asked for.
+    #[test]
+    fn a_valid_voice_is_fetched_alongside_the_default() {
+        let v = voices_to_fetch("bm_george");
+        assert_eq!(v, vec![DEFAULT.to_string(), "bm_george".to_string()]);
+    }
+
+    /// Asking for the default names it once, not twice.
+    #[test]
+    fn the_default_is_not_requested_twice() {
+        assert_eq!(voices_to_fetch(DEFAULT), vec![DEFAULT.to_string()]);
+    }
+
+    /// Voice names reach this from settings and are joined onto a path.
+    #[test]
+    fn a_traversal_attempt_is_refused_and_leaves_the_default() {
+        let v = voices_to_fetch("../../etc/passwd");
+        assert_eq!(v, vec![DEFAULT.to_string()]);
     }
 }
