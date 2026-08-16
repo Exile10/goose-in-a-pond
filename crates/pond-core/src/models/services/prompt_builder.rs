@@ -41,10 +41,10 @@ use std::hash::{Hash, Hasher};
 ///
 /// The `static_prefix` contains everything that stays the same between
 /// conversation turns (identity, personality, tool descriptions, behavioral
-/// rules, device context, thinking/voice mode sections).
+/// rules, how many devices are registered, thinking/voice mode sections).
 ///
-/// The `dynamic_suffix` contains per-turn content: current date/time,
-/// profile context lines, and the prompt addendum.
+/// The `dynamic_suffix` contains per-turn content: current date/time, which
+/// devices are online, profile context lines, and the prompt addendum.
 ///
 /// `prefix_hash` is a 64-bit hash of the static prefix content, allowing
 /// callers to skip expensive `override_system_prompt()` calls when the
@@ -52,9 +52,12 @@ use std::hash::{Hash, Hasher};
 #[derive(Debug, Clone)]
 pub struct PromptPartition {
     /// Stable portion of the system prompt — identity, capabilities, rules.
-    /// Changes only when settings, model capabilities, or device state change.
+    /// Changes when settings, model capabilities, the selected tools, or the
+    /// set of *registered* devices change — never when a device merely goes
+    /// quiet, which is a clock, not a fact about the pond.
     pub static_prefix: String,
-    /// Per-turn dynamic content — date/time, profile lines, addendum.
+    /// Per-turn dynamic content — date/time, live device list, profile lines,
+    /// addendum.
     pub dynamic_suffix: String,
     /// Hash of `static_prefix` for cheap equality checks.
     pub prefix_hash: u64,
@@ -76,17 +79,20 @@ fn hash_string(s: &str) -> u64 {
 ///
 /// The template is rendered with all stable context variables:
 /// - `assistant_name`, `user_name`, `personality`, `timezone`, `location`
-/// - `device_count`, `has_home_devices`, `online_device_names`
+/// - `device_count`, `has_home_devices`
 /// - `has_tools`, `tools` (tool descriptions are static)
 /// - `thinking_enabled`, `voice_mode`
 ///
-/// The `current_date` and `current_time` variables are set to empty strings
-/// during static rendering so they do not bake time into the prefix.
+/// `current_date`, `current_time` and `online_device_names` are set to empty
+/// strings during static rendering. The first two are obviously temporal; the
+/// third is temporal in disguise, since `is_online` is recomputed on every read
+/// from a 300-second heartbeat window rather than stored.
 ///
 /// ## Dynamic suffix
 ///
 /// Contains lines that change per turn:
 /// - Current date and time
+/// - Which devices are reachable right now
 /// - Profile context (preferred name, language, birthday, atypical speech)
 /// - Prompt addendum from settings
 pub fn build_prompt_partition(
@@ -102,7 +108,16 @@ pub fn build_prompt_partition(
         // Carry all non-temporal fields from the caller's state
         device_count: state.device_count,
         has_home_devices: state.has_home_devices,
-        online_device_names: state.online_device_names.clone(),
+        // Blanked for the same reason as the clock, and it is the same kind of
+        // field: `is_online` is not a stored column at all — `list_devices` does
+        // not even select it. It is derived at read time as
+        // `now - last_seen < ONLINE_THRESHOLD_SECS` (300s), so this string
+        // changes on a five-minute wall-clock timer with nobody touching
+        // anything. Left in the prefix it truncates KV reuse at the
+        // `<home-devices>` block every time a phone stops heartbeating.
+        // `device_count` and `has_home_devices` stay: they move only when a
+        // device is registered or removed.
+        online_device_names: String::new(),
         voice_mode: state.voice_mode,
         canvas_mode: state.canvas_mode,
         available_tools: state.available_tools.clone(),
@@ -140,6 +155,18 @@ pub fn build_prompt_partition(
         }
         temporal.push_str(" Answer time/date questions directly from this — no tools needed.");
         dynamic_parts.push(temporal);
+    }
+
+    // Which devices are reachable right now. The template's `<home-devices>`
+    // block still states how many are registered — that is stable — but the
+    // live list is restated here, because it expires on a timer and the prefix
+    // has to survive that. Costs nothing when nothing is online, which on a
+    // real pond is most of the time.
+    if !state.online_device_names.is_empty() {
+        dynamic_parts.push(format!(
+            "Online right now: {}.",
+            sanitize_field(&state.online_device_names, 300)
+        ));
     }
 
     // Profile context lines (same logic as build_system_prompt_from_template_full)
@@ -229,7 +256,10 @@ pub fn compute_prefix_hash_fast(
     // State fields that are baked into the static prefix
     state.device_count.hash(&mut hasher);
     state.has_home_devices.hash(&mut hasher);
-    state.online_device_names.hash(&mut hasher);
+    // `online_device_names` is deliberately NOT here: it no longer renders into
+    // the static prefix (see `build_prompt_partition`). Hashing it would make
+    // this path report "prefix changed" every five minutes for a prefix that
+    // did not change, which costs a full re-prefill for nothing.
     state.voice_mode.hash(&mut hasher);
     state.canvas_mode.hash(&mut hasher);
     state.thinking_enabled.hash(&mut hasher);
@@ -240,8 +270,13 @@ pub fn compute_prefix_hash_fast(
     state.compact_prompt.hash(&mut hasher);
     // Gates the "Available tools:" listing inside <tool-usage>
     state.native_tools_json.hash(&mut hasher);
-    // Tool descriptions are static, but hash their count as a sanity check
-    state.available_tools.len().hash(&mut hasher);
+    // The tool LINES, not their count. Hashing only the length was wrong in the
+    // one direction that matters: under `tool_selection_mode = "relevant"` the
+    // selection is rescored every turn, so swapping one tool for another —
+    // same count, different prose in `<tool-usage>` — left this hash unchanged
+    // and told the provider to reuse a KV prefix for a prompt it never saw.
+    // Order is part of the identity here because it is part of the render.
+    state.available_tools.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -405,6 +440,111 @@ mod tests {
         assert_ne!(
             p1.prefix_hash, p2.prefix_hash,
             "Prefix hash must change when assistant name changes"
+        );
+    }
+
+    /// Registering a device changes the prompt. A device merely *heartbeating*
+    /// must not.
+    ///
+    /// `is_online` is not stored — it is recomputed on every read as
+    /// `now - last_seen < 300s`. So the online set turns over on a five-minute
+    /// wall-clock timer with nobody doing anything, and if that string rides
+    /// the static prefix then the KV cache is truncated at `<home-devices>`
+    /// several times an hour for no reason a user could name. Both hashes are
+    /// asserted, because they are two independent renderings of the same
+    /// question and a fast path that disagrees with the real one is worse than
+    /// no fast path.
+    #[test]
+    fn a_device_going_quiet_does_not_move_the_static_prefix() {
+        let settings = Settings::default();
+
+        let registered = PromptState {
+            has_home_devices: true,
+            device_count: 3,
+            online_device_names: "Speaker, Hub, Washer".to_string(),
+            ..default_state()
+        };
+        let all_quiet = PromptState {
+            online_device_names: String::new(),
+            ..registered.clone()
+        };
+
+        let busy = build_prompt_partition(&settings, None, &registered, PROMPT_BALANCED);
+        let quiet = build_prompt_partition(&settings, None, &all_quiet, PROMPT_BALANCED);
+
+        assert_eq!(
+            busy.static_prefix, quiet.static_prefix,
+            "the heartbeat window must not reach the cacheable prefix"
+        );
+        assert_eq!(
+            compute_prefix_hash_fast(&settings, &registered, PROMPT_BALANCED),
+            compute_prefix_hash_fast(&settings, &all_quiet, PROMPT_BALANCED),
+            "the fast hash must agree that nothing cacheable changed"
+        );
+    }
+
+    /// …and the model is still told, because moving it out of the prefix would
+    /// otherwise be a silent capability loss: "turn on the speaker" needs to
+    /// know the speaker is reachable.
+    #[test]
+    fn the_online_list_still_reaches_the_model_through_the_dynamic_suffix() {
+        let settings = Settings::default();
+        let state = PromptState {
+            has_home_devices: true,
+            device_count: 3,
+            online_device_names: "Speaker, Hub, Washer".to_string(),
+            ..default_state()
+        };
+
+        let p = build_prompt_partition(&settings, None, &state, PROMPT_BALANCED);
+
+        assert!(
+            p.dynamic_suffix.contains("Speaker, Hub, Washer"),
+            "the live device list must survive somewhere: {}",
+            p.dynamic_suffix
+        );
+        assert!(
+            !p.static_prefix.contains("Washer"),
+            "and it must not also be in the prefix"
+        );
+    }
+
+    /// The failure this catches is the silent one. Under
+    /// `tool_selection_mode = "relevant"` the selection is rescored every turn,
+    /// so a swap that keeps the count is the *common* shape of change — and a
+    /// hash over `.len()` alone called it unchanged, handing the provider a
+    /// reuse decision for a prompt it had never seen.
+    #[test]
+    fn swapping_one_tool_for_another_moves_the_fast_hash() {
+        let settings = Settings::default();
+
+        let before = PromptState {
+            available_tools: vec!["giap-home__set_light".into(), "giap-memory__recall".into()],
+            ..default_state()
+        };
+        let swapped = PromptState {
+            available_tools: vec![
+                "giap-home__set_light".into(),
+                "giap-weather__forecast".into(),
+            ],
+            ..default_state()
+        };
+        let reordered = PromptState {
+            available_tools: vec!["giap-memory__recall".into(), "giap-home__set_light".into()],
+            ..default_state()
+        };
+
+        let h = |s: &PromptState| compute_prefix_hash_fast(&settings, s, PROMPT_BALANCED);
+
+        assert_ne!(
+            h(&before),
+            h(&swapped),
+            "same count, different tools — this is the case that was wrong"
+        );
+        assert_ne!(
+            h(&before),
+            h(&reordered),
+            "order is part of the render, so it is part of the identity"
         );
     }
 
