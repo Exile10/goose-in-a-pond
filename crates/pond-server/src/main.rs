@@ -6092,9 +6092,33 @@ async fn run_status() -> Result<()> {
 
 // ── ONNX Runtime version pinned for auto-download ────────────────────────────
 //
-// v1.21.0 is the latest release with pre-built tarballs for all four
-// platform/arch combos we support (macOS arm64/x86_64, Linux x64/aarch64).
-// Bump this when upgrading — the archive layout is stable across releases.
+// 1.24.2 is here because fastembed takes `ort`'s default features, which include
+// `api-24`. The previous pin (1.22.0) does not expose that API level, and the
+// resulting failure was first seen on the Jetson and written up as a Jetson
+// problem; it was not. With this pin the Orin embeds normally.
+//
+// The cost, checked against GitHub Releases on 2026-08-16 rather than assumed:
+//
+//            osx-arm64   osx-x86_64   linux-x64   linux-aarch64
+//   1.23.2      yes          yes          yes           yes
+//   1.24.0      yes          NO           yes           NO
+//   1.24.2      yes          NO           yes           yes
+//
+// So 1.23.2 was the last release carrying all four, and this pin gives up the
+// Intel Mac: `ort_platform_tags()` builds `onnxruntime-osx-x86_64-1.24.2.tgz`,
+// which 404s, and `ensure_onnx_runtime` treats that as non-fatal — the server
+// starts with face recognition and embeddings silently absent. An Intel Mac
+// needs a system ONNX Runtime (`brew install onnxruntime`) or an explicit
+// `ORT_DYLIB_PATH`; both are checked before the download is attempted.
+//
+// Do NOT bump to 1.24.0: it drops linux-aarch64, which is the Jetson.
+//
+// Re-run the check before changing this — availability has moved in both
+// directions across three releases, so it is not a property to reason about:
+//   for a in osx-arm64 osx-x86_64 linux-x64 linux-aarch64; do
+//     curl -sIL -o /dev/null -w "$a %{http_code}\n" \
+//       "https://github.com/microsoft/onnxruntime/releases/download/vX/onnxruntime-$a-X.tgz"
+//   done
 const ORT_VERSION: &str = "1.24.2";
 
 /// Approximate size of the platform library in MB (for the progress message).
