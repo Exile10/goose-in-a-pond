@@ -421,6 +421,40 @@ pub fn host_default_quality() -> &'static str {
     }
 }
 
+/// The tier this host should adopt, or `None` to leave the stored one alone.
+///
+/// Separated from the caller because the rule is the whole subtlety and it was
+/// previously expressed inline, inside a function that returns early for an
+/// unrelated reason — so on every pond that had ever assigned a voice, the tier
+/// decision was simply never reached. Measured consequence on an Orin Nano:
+/// the board kept `q8` and synthesised at **RTF 1.335**, i.e. slower than
+/// playback, when `q4f16` runs it at 0.780.
+///
+/// Adopt only when the household has not chosen. `stored` being empty is a
+/// pond that has never had a tier; `stored == untouched` is a pond still
+/// carrying the struct default, which is a default rather than a decision.
+/// Anything else — including a tier this host must substitute — is somebody's
+/// choice and is left exactly as it is, because overwriting it would be the
+/// pond arguing with a person who has already decided.
+pub fn tier_to_adopt(stored: &str, untouched: &str) -> Option<&'static str> {
+    tier_to_adopt_for(host_default_quality(), stored, untouched)
+}
+
+/// The rule itself, with the host's tier passed in.
+///
+/// Split out because `host_default_quality()` reads the machine, so on an arm64
+/// Mac it returns the same `q8` that is the struct default — which makes the
+/// interesting clause (`stored == untouched`, host tier differs) unreachable,
+/// and a test written against [`tier_to_adopt`] there passes with that clause
+/// deleted. Verified: removing `|| stored == untouched` did not fail anything
+/// on macOS. The Jetson case has to be expressible without a Jetson, or the
+/// guard is decoration on every machine that runs CI.
+pub fn tier_to_adopt_for<'a>(host: &'a str, stored: &str, untouched: &str) -> Option<&'a str> {
+    let stored = stored.trim();
+    let unchosen = stored.is_empty() || stored == untouched;
+    (unchosen && host != stored).then_some(host)
+}
+
 /// Swap out a tier that cannot work on this host, leaving every other choice
 /// alone.
 ///
@@ -573,6 +607,58 @@ mod tests {
             assert_eq!(usable_quality("q8f16"), "q4f16");
         } else {
             assert_eq!(usable_quality("q8f16"), "q8f16");
+        }
+    }
+
+    /// A pond still carrying the struct default has not chosen anything, so the
+    /// host default is an upgrade rather than an override. This is the case
+    /// that was unreachable in practice: the real Orin Nano sat on `q8` at
+    /// RTF 1.335 because the only caller returned before asking.
+    /// THE case this exists for, written so it runs on any machine: a pond
+    /// still carrying the struct default, on a host whose tier differs. On the
+    /// real Orin Nano that is `q8` stored against a `q4f16` host, and it is why
+    /// the board synthesised at RTF 1.335 instead of 0.780.
+    #[test]
+    fn a_default_tier_is_replaced_by_a_host_that_needs_a_different_one() {
+        assert_eq!(tier_to_adopt_for("q4f16", "q8", "q8"), Some("q4f16"));
+        assert_eq!(tier_to_adopt_for("q4f16", "", "q8"), Some("q4f16"));
+        assert_eq!(tier_to_adopt_for("q4f16", "  ", "q8"), Some("q4f16"));
+    }
+
+    /// The other half, and the reason this cannot simply always write: a tier
+    /// somebody picked is a decision, and a pond that overwrites it every boot
+    /// is a settings screen that does not work. Asserted against a host tier
+    /// that differs from all of them, so "left alone" means something.
+    #[test]
+    fn a_chosen_tier_is_never_overwritten() {
+        for chosen in ["fp32", "fp16", "q4", "q8f16"] {
+            assert_eq!(
+                tier_to_adopt_for("q4f16", chosen, "q8"),
+                None,
+                "{chosen} is a choice, not a default"
+            );
+        }
+    }
+
+    /// Nothing to do when the stored value already is the host default —
+    /// otherwise every boot writes a row for no reason, and `updated_at` starts
+    /// lying about when the household last changed anything.
+    #[test]
+    fn adopting_is_a_no_op_once_it_has_happened() {
+        assert_eq!(tier_to_adopt_for("q4f16", "q4f16", "q8"), None);
+        assert_eq!(tier_to_adopt(host_default_quality(), "q8"), None);
+    }
+
+    /// The host-reading wrapper still agrees with the rule it delegates to, so
+    /// the split cannot drift into two different answers.
+    #[test]
+    fn the_wrapper_passes_this_hosts_tier_through() {
+        for stored in ["", "q8", "fp32", "q4f16"] {
+            assert_eq!(
+                tier_to_adopt(stored, "q8"),
+                tier_to_adopt_for(host_default_quality(), stored, "q8"),
+                "wrapper disagreed for stored={stored:?}"
+            );
         }
     }
 }

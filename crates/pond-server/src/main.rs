@@ -1264,7 +1264,19 @@ async fn run_server(
     // this host should not be downloaded either. Onboarding writes the tier
     // straight to settings, so a stored value that is silent here is reachable
     // and has to be handled every start, not only when someone opens the picker.
-    let quality = pond_adapters_kokoro::usable_quality(&settings.voice_tts_quality).to_string();
+    // Adopt the host's tier BEFORE resolving one, or the pond downloads and
+    // runs the wrong engine for a whole session and only picks the right one up
+    // on the next start. This used to live in `ensure_tts_is_set_up`, which
+    // `serve` never calls — it is the `setup` subcommand's — so on a board that
+    // had been through setup once, nothing ever revisited the tier.
+    ensure_host_tts_tier(&settings_repo_early).await;
+    let tier = settings_repo_early
+        .get()
+        .await
+        .map(|s| s.voice_tts_quality)
+        .unwrap_or_else(|_| settings.voice_tts_quality.clone());
+
+    let quality = pond_adapters_kokoro::usable_quality(&tier).to_string();
     model_download::ensure_kokoro_engine(&data_dir, &quality, &settings.voice_tts_voice).await;
 
     let kokoro_dir = model_download::kokoro_dir(&data_dir);
@@ -7593,29 +7605,44 @@ async fn ensure_tts_is_set_up(
         .set_key("active_tts_model", voice.clone())
         .await;
     println!("  ✅ Voice: {voice} assigned (first run)");
+}
 
-    // The quality tier is a hardware question on some boards, not a taste one —
-    // `host_default_quality` carries the measurements. pond-core cannot make
-    // this call: it is pure domain and must not sniff the machine, so the
-    // composition root does it once, here, on the same first run that assigns
-    // the voice.
-    //
-    // Only when the household has not already chosen. An upgrade from before
-    // roles existed reaches this function with a tier it set deliberately, and
-    // overwriting that would be the pond arguing with someone who has already
-    // decided.
-    let host_tier = pond_adapters_kokoro::host_default_quality();
-    let untouched = pond_core::user_data::domain::settings::Settings::default().voice_tts_quality;
+/// Give this machine the speech tier it can actually keep up with.
+///
+/// Deliberately NOT part of `ensure_tts_is_set_up`, which is where it used to
+/// live and where it did nothing. That function returns early when a TTS
+/// assignment already exists — a question about the *voice* — and the tier
+/// decision sat after the return, so every pond that had ever assigned a voice
+/// skipped it. That is every upgraded pond, including the Jetson the
+/// measurements were taken on: it kept `q8` and synthesised at **RTF 1.335**,
+/// slower than playback, while `q4f16` runs the same sentence at 0.780. The
+/// code was right and unreachable, which is the worst of both.
+///
+/// So it is its own step, run on every start, and idempotent by construction —
+/// `tier_to_adopt` returns `None` once the stored tier is the host default or
+/// anything the household picked. pond-core cannot make this call: it is pure
+/// domain and must not sniff the machine, so the composition root does it.
+async fn ensure_host_tts_tier(
+    settings_repo: &dyn pond_core::user_data::ports::settings::SettingsRepository,
+) {
+    let stored = settings_repo.get().await.ok();
     let stored_tier = stored
         .as_ref()
-        .map(|s| s.voice_tts_quality.trim())
+        .map(|s| s.voice_tts_quality.as_str())
         .unwrap_or("");
-    if host_tier != stored_tier && (stored_tier.is_empty() || stored_tier == untouched) {
-        let _ = settings_repo
-            .set_key("voice_tts_quality", host_tier.to_string())
-            .await;
-        println!("  ✅ Voice quality: {host_tier} (chosen for this machine)");
+    let untouched = pond_core::user_data::domain::settings::Settings::default().voice_tts_quality;
+
+    let Some(host_tier) = pond_adapters_kokoro::tier_to_adopt(stored_tier, &untouched) else {
+        return;
+    };
+    if let Err(e) = settings_repo
+        .set_key("voice_tts_quality", host_tier.to_string())
+        .await
+    {
+        tracing::warn!("could not set the speech tier for this machine: {e}");
+        return;
     }
+    println!("  ✅ Voice quality: {host_tier} (chosen for this machine)");
 }
 
 async fn seed_model_catalog(repo: &dyn ModelRepository, data_dir: &std::path::Path) {
