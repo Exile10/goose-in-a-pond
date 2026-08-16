@@ -204,6 +204,40 @@ pub const TOOL_GROUPS: &[ToolGroup] = &[
     },
 ];
 
+/// Sort key that puts the tools every turn carries before the ones it might not.
+///
+/// # Why the ORDER of the tool list matters
+///
+/// The tool schemas are rendered into the prompt after the system text, and they
+/// are the bulk of it. Two turns share a prompt prefix only up to their first
+/// difference, so a single tool that differs early truncates everything after it
+/// — including tools the two turns agree on completely.
+///
+/// That is what decides whether an on-disk KV snapshot can serve chat at all.
+/// With `tool_selection_mode = "relevant"` the selected set differs per
+/// conversation (30 distinct sets across 84 sessions on my own pond), so an
+/// arbitrary order leaves almost nothing in common. Measured against the real
+/// Gemma template: two chats differing in half their tools shared 70% of the
+/// preamble when the differing tools came early, and 85% when they came last —
+/// the difference between falling under the snapshot threshold and clearing it.
+///
+/// Core groups are the stable block: `core` means always loaded, never scored,
+/// never removable, so every turn has them. Putting them first makes them a
+/// genuine common prefix. Within each tier the sort is by name, because a
+/// deterministic order is the other half of the property — a set that renders in
+/// a different order on two turns shares nothing either.
+pub fn prefix_sort_key(tool_name: &str) -> (u8, &str) {
+    // Tool names are `<extension>__<tool>`; the extension is what maps to a
+    // group. An unknown prefix (a user-added MCP server) ranks with the
+    // non-core tools, which is right: nothing guarantees it is there next turn.
+    let extension = tool_name.split("__").next().unwrap_or("");
+    let tier = match find_group(extension) {
+        Some(group) if group.core => 0,
+        _ => 1,
+    };
+    (tier, tool_name)
+}
+
 /// Look up a group by extension name.
 pub fn find_group(extension: &str) -> Option<&'static ToolGroup> {
     TOOL_GROUPS.iter().find(|g| g.extension == extension)
@@ -402,6 +436,86 @@ mod tests {
     fn only_catalog_extensions_are_recognised() {
         assert!(is_catalog_extension("giap-vision"));
         assert!(!is_catalog_extension("some-user-mcp-server"));
+    }
+}
+
+#[cfg(test)]
+mod prefix_order_tests {
+    use super::*;
+
+    fn ordered(mut names: Vec<&str>) -> Vec<&str> {
+        names.sort_by_key(|n| prefix_sort_key(n));
+        names
+    }
+
+    /// The property the on-disk KV snapshot depends on: the tools every turn
+    /// carries come first, so they form a prefix two turns can share even when
+    /// the rest of their selection differs.
+    #[test]
+    fn core_tools_come_before_the_ones_a_turn_might_not_have() {
+        let got = ordered(vec![
+            "giap-weather__get_current_weather",
+            "giap-draft__list_drafts",
+            "giap-news__headlines",
+            "giap-toolkit__enable_tool_group",
+        ]);
+        let first_two: Vec<&str> = got.iter().take(2).copied().collect();
+        assert_eq!(
+            first_two,
+            vec!["giap-draft__list_drafts", "giap-toolkit__enable_tool_group"],
+            "core groups must lead, or a turn that drops weather truncates the shared \
+             prefix at the first tool"
+        );
+    }
+
+    /// Two turns whose selections differ must still agree for the whole core
+    /// block. This is the measurement that motivated the change, as a property.
+    #[test]
+    fn two_different_selections_agree_for_their_whole_core_block() {
+        let a = ordered(vec![
+            "giap-weather__get_current_weather",
+            "giap-draft__list_drafts",
+            "giap-toolkit__enable_tool_group",
+        ]);
+        let b = ordered(vec![
+            "giap-news__headlines",
+            "giap-draft__list_drafts",
+            "giap-toolkit__enable_tool_group",
+        ]);
+        let shared = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+        assert_eq!(
+            shared, 2,
+            "the two core tools must be a common prefix of both selections; got {a:?} vs {b:?}"
+        );
+    }
+
+    /// Deterministic within a tier. A set rendered in a different order on two
+    /// turns shares nothing, whatever the tiering does.
+    #[test]
+    fn the_order_is_stable_whatever_order_the_selection_arrives_in() {
+        let forward = ordered(vec![
+            "giap-draft__list_drafts",
+            "giap-weather__get_current_weather",
+            "giap-news__headlines",
+        ]);
+        let backward = ordered(vec![
+            "giap-news__headlines",
+            "giap-weather__get_current_weather",
+            "giap-draft__list_drafts",
+        ]);
+        assert_eq!(forward, backward);
+    }
+
+    /// A user-added MCP server ranks with the removable tools. Nothing promises
+    /// it is there next turn, so leading with it would truncate the prefix for
+    /// every turn that lacks it.
+    #[test]
+    fn an_unknown_extension_does_not_lead() {
+        let got = ordered(vec![
+            "some-user-server__do_thing",
+            "giap-draft__list_drafts",
+        ]);
+        assert_eq!(got.first(), Some(&"giap-draft__list_drafts"));
     }
 }
 

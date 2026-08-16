@@ -667,10 +667,35 @@ impl Provider for GiapProviderShim {
         let vetoed_tools = enforce_tools(tools, &allowed);
         // Minify AFTER the veto so we never pay for tools about to be dropped.
         let minified_tools = self.minify_tools_cached(vetoed_tools.as_deref().unwrap_or(tools));
-        let final_tools: &[Tool] = minified_tools
+        let selected: &[Tool] = minified_tools
             .as_deref()
             .or(vetoed_tools.as_deref())
             .unwrap_or(tools);
+        // Order the tools so a KV prefix can survive a changed selection.
+        //
+        // The schemas are the bulk of the preamble and the template renders them
+        // in the order given, so two turns share a prompt prefix only up to their
+        // first differing tool. Under `tool_selection_mode = "relevant"` the
+        // selection differs per conversation, and in an arbitrary order that
+        // truncates the shared run at the first difference -- discarding tools
+        // the two turns agreed on completely.
+        //
+        // Sorting core-first makes the always-loaded groups a genuine common
+        // prefix. Measured against the real Gemma template: two chats differing
+        // in half their tools shared 70% of the preamble with the differing ones
+        // early and 85% with them last, which is the difference between falling
+        // under the on-disk snapshot threshold and clearing it. See
+        // `tool_group::prefix_sort_key`.
+        let ordered_tools = {
+            let mut v = selected.to_vec();
+            v.sort_by(|a, b| {
+                pond_core::mcp::domain::tool_group::prefix_sort_key(a.name.as_ref()).cmp(
+                    &pond_core::mcp::domain::tool_group::prefix_sort_key(b.name.as_ref()),
+                )
+            });
+            (v != selected).then_some(v)
+        };
+        let final_tools: &[Tool] = ordered_tools.as_deref().unwrap_or(selected);
 
         if enforced_system.is_some()
             || stripped_messages.is_some()
