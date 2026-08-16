@@ -28,8 +28,21 @@ use pond_core::models::ports::model_scheduler::{MemoryStatus, ModelScheduler};
 
 // ── Jetson / Linux memory constants ──────────────────────────────────────────
 
-/// Total device RAM on a Jetson Orin Nano 8 GB (MB).
-pub const JETSON_TOTAL_RAM_MB: u64 = 8192;
+/// Total device RAM on a Jetson Orin Nano 8 GB (MB), as the KERNEL reports it.
+///
+/// The board is sold as 8 GB and this said 8192 for a long time, but `free -m`
+/// on the Orin reports **7620** total: the carveouts (framebuffer, firmware
+/// reservations) are taken before Linux ever sees the memory. Naming the
+/// marketing figure here handed every derivation built on `LLM_BUDGET_MB` a
+/// phantom 572 MB, and that phantom is spent silently -- an over-large context
+/// does not fail to allocate, it swaps, so the symptom is a model that feels
+/// slow rather than one that reports being out of memory.
+///
+/// Measured on the device 2026-08-16: E4B Q4_K_M at n_ctx 2048 already peaks at
+/// 7,133 MB of 7,620 with the service stopped. Under the old 8192 the
+/// derivation awarded it 16384, whose KV is a further 784 MiB -- i.e. past
+/// physical RAM, served out of the 12 GB swap.
+pub const JETSON_TOTAL_RAM_MB: u64 = 7620;
 /// Approximate headroom used by OS + GIAP server + UI at idle (MB).
 const SYSTEM_OVERHEAD_MB: u64 = 1500;
 /// Whisper base model resident size (MB).
