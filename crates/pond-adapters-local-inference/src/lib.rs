@@ -441,8 +441,10 @@ impl LocalInferenceLlmAdapter {
     /// Derived rather than tabulated so a model we have never seen is still
     /// safe: KV budget is the LLM budget minus the weights and the compute
     /// buffers, divided by a per-token cost chosen for the widest attention
-    /// geometry we ship. Rounded down to a power of two and clamped, because
-    /// being a little conservative costs history and being wrong costs the box.
+    /// geometry we ship. Rounded DOWN to a multiple of `CTX_GRANULARITY` and
+    /// clamped, because being a little conservative costs history and being
+    /// wrong costs the box -- but only a little, which is why that granularity
+    /// is 1024 and no longer a power of two.
     ///
     /// The deeper fix belongs in the engine: `context_cap` gives a pinned
     /// `context_size` and a host `GOOSE_CONTEXT_LIMIT` priority over its own
@@ -488,6 +490,23 @@ impl LocalInferenceLlmAdapter {
         const COMPUTE_BUFFER_MB: u64 = 600;
         const MIN_CTX: u32 = 2048;
         const MAX_CTX: u32 = 16384;
+        /// Round the answer DOWN to a multiple of this.
+        ///
+        /// This was a power of two until 2026-08-16, and the difference is not
+        /// cosmetic: powers of two are 2x apart, so flooring to one discards up
+        /// to HALF of a window the budget has already proved affordable. E4B
+        /// IQ4_XS (4,496 MB) is allowed 13,220 tokens and was handed 8,192 --
+        /// 5,028 tokens thrown away, which is the difference between a window
+        /// that holds a conversation and one that compacts from turn one.
+        ///
+        /// Nothing needed the power of two. `n_ctx` has no such constraint in
+        /// llama.cpp (it pads to `n_ubatch` internally), both KV caches simply
+        /// carry `n_ctx` cells, and the safety here has never come from the
+        /// rounding -- it comes from `KV_KIB_PER_TOKEN`, `COMPUTE_BUFFER_MB` and
+        /// the budget, all of which are untouched. Flooring to 1024 is the same
+        /// "round down, stay under" rule at a resolution that does not throw
+        /// away what the board can afford.
+        const CTX_GRANULARITY: u32 = 1024;
 
         let model_mb = model_bytes / (1024 * 1024);
         let kv_mb = crate::scheduler::LLM_BUDGET_MB
@@ -495,12 +514,12 @@ impl LocalInferenceLlmAdapter {
             .saturating_sub(COMPUTE_BUFFER_MB);
         let tokens = (kv_mb * 1024) / KV_KIB_PER_TOKEN;
 
-        // Largest power of two that fits, clamped.
-        let mut ctx = MIN_CTX;
-        while (ctx as u64) * 2 <= tokens && ctx < MAX_CTX {
-            ctx *= 2;
-        }
-        ctx.clamp(MIN_CTX, MAX_CTX)
+        // Largest multiple of CTX_GRANULARITY that fits, clamped. Saturating at
+        // MAX_CTX before the cast keeps a huge allowance (E2B's is ~41k) from
+        // wrapping u32.
+        let granularity = CTX_GRANULARITY as u64;
+        let floored = (tokens / granularity) * granularity;
+        floored.min(MAX_CTX as u64).max(MIN_CTX as u64) as u32
     }
 
     #[cfg(feature = "cuda")]
@@ -787,19 +806,63 @@ mod tests {
     /// earns its place as defence in depth, and as the guard that survives
     /// somebody changing which models ship.
     ///
-    /// A model around 4.8 GB sits where the BUDGET decides the answer below the
-    /// ceiling, so the slope stays observable: 8,192 at the measured cost,
-    /// 16,384 at the Mac's.
+    /// A model around 4.5 GB sits where the BUDGET decides the answer below the
+    /// ceiling, so the slope stays observable: 12,288 at the measured cost,
+    /// 16,384 (the clamp) at the Mac's.
+    ///
+    /// The size is chosen to land MID-BAND -- it affords 12,800 tokens, 512
+    /// clear of both 12,288 and 13,312. The previous 4_770_000_000 sat 19
+    /// tokens from a boundary and flipped the expected value the moment the
+    /// rounding granularity changed, which is a test measuring the floor rather
+    /// than the slope it is named for.
     #[test]
     fn the_per_token_slope_is_observable_on_a_model_the_ceiling_does_not_cap() {
-        let ctx = LocalInferenceLlmAdapter::jetson_context_size(4_770_000_000);
+        let ctx = LocalInferenceLlmAdapter::jetson_context_size(4_739_563_520);
         assert_eq!(
-            ctx, 8192,
-            "a 4.8 GB model got {ctx} tokens. At the device-measured cost it should get 8192; \
+            ctx, 12288,
+            "a 4.5 GB model got {ctx} tokens. At the device-measured cost it should get 12288; \
              16384 means the slope has been lowered towards the Mac's 16 KiB/token, which \
              describes a newer llama.cpp than the one this device ships and understates the real \
              allocation by roughly three times."
         );
+    }
+
+    /// The granularity itself, because throwing away affordable context is what
+    /// this function did for weeks without any test noticing.
+    ///
+    /// E4B IQ4_XS is the case that exposed it: 4,496 MB of weights leave a KV
+    /// budget that affords 13,220 tokens, and the old power-of-two floor handed
+    /// back 8,192 -- under the 4,678-token preamble plus growth, so compaction
+    /// fired on turn one. Any rounding coarser than this reintroduces that.
+    #[test]
+    fn rounding_does_not_discard_context_the_budget_affords() {
+        // The real IQ4_XS file on the device: 4,715,416,704 bytes.
+        let ctx = LocalInferenceLlmAdapter::jetson_context_size(4_715_416_704);
+        assert_eq!(
+            ctx, 12288,
+            "E4B IQ4_XS got {ctx}. Its budget affords 13,220 tokens, so anything at or below \
+             8192 means the rounding went back to powers of two and is discarding a third of \
+             the window the board can actually hold."
+        );
+
+        // And the floor still rounds DOWN, never up, at every offset.
+        for bytes in [4_600_000_000u64, 4_700_000_000, 4_800_000_000] {
+            let ctx = LocalInferenceLlmAdapter::jetson_context_size(bytes) as u64;
+            let model_mb = bytes / (1024 * 1024);
+            let kv_mb = crate::scheduler::LLM_BUDGET_MB
+                .saturating_sub(model_mb)
+                .saturating_sub(600);
+            let affords = (kv_mb * 1024) / 56;
+            assert!(
+                ctx <= affords.max(2048),
+                "{bytes} bytes: handed {ctx} tokens against an affordable {affords}"
+            );
+            assert_eq!(
+                ctx % 1024,
+                0,
+                "{bytes} bytes: {ctx} is not a multiple of 1024"
+            );
+        }
     }
 
     #[test]
