@@ -384,7 +384,7 @@ export class Controller {
         }
       } catch (error) {
         if (error instanceof OpError) throw error;
-        throw new OpError("device_unreachable", describeError(error));
+        throw refusalOrFault(deviceId, error);
       }
     }
 
@@ -626,6 +626,49 @@ async function settledOperation(
 ): Promise<string | undefined> {
   const wanted = requested === undefined ? undefined : INTENDED_STATE[requested.toLowerCase()];
   return settleTo(wanted, () => observedOperation(snapshotOf(peer, nodeId)));
+}
+
+/**
+ * Matter status codes a device answers a write with, rather than a fault.
+ *
+ * A device saying no is not a device that cannot be reached, and calling it
+ * unreachable sends the reader looking at the network for a fault that is not
+ * there. A thermostat answering "Constraint error" to a setpoint it will not take
+ * was reported as `device_unreachable` while sitting on the same machine,
+ * responding in milliseconds.
+ */
+const REFUSALS: ReadonlyMap<string, string> = new Map([
+  ["constraint error", "the value is outside what it will accept right now"],
+  ["invalid action", "it will not do that in its current state"],
+  ["invalid command", "it does not accept that command"],
+  ["unsupported attribute", "it has no such setting"],
+  ["unsupported write", "that setting cannot be written"],
+  ["invalid in state", "it will not do that in its current state"],
+  ["needs timed interaction", "it requires a timed interaction"],
+  ["write ignored", "it ignored the write"],
+]);
+
+/**
+ * Tell a refusal from a fault, and word it as one.
+ *
+ * The distinction is the whole diagnostic value: a refusal means ask for something
+ * else, a fault means look at the network. Anything unrecognised stays a fault
+ * carrying the device's own words, because guessing that an unfamiliar error was a
+ * refusal would hide a real outage.
+ */
+export function refusalOrFault(deviceId: string, error: unknown): OpError {
+  const said = describeError(error);
+  const lowered = said.toLowerCase();
+
+  for (const [needle, meaning] of REFUSALS) {
+    if (lowered.includes(needle)) {
+      return new OpError(
+        "device_refused",
+        `Matter device '${deviceId}' refused that: ${meaning} (it said: ${said})`,
+      );
+    }
+  }
+  return new OpError("device_unreachable", said);
 }
 
 /** ErrorStateEnum, for a device that sends an id without a label. */

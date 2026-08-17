@@ -120,4 +120,69 @@ describe("device description", () => {
     const fallback = describeNode(assumed).sensors.find(s => s.sensor_type === "carbon_dioxide");
     expect(fallback?.unit).toBe("ppm");
   });
+  it("reports the ceiling the deadband imposes, not the one the limits advertise", () => {
+    // Measured on Google's Matter Virtual Device: it advertised 7 to 30, accepted
+    // 23, and answered "Constraint error" from 24 up. In Auto a thermostat keeps
+    // its two setpoints minSetpointDeadBand apart, so the heating setpoint cannot
+    // come within that of the cooling one -- a ceiling that appears in no limit
+    // attribute. Advertising 30 is how a model comes to try 30.
+    const auto = node(90, [
+      named("Thermostat"),
+      endpoint(1, {
+        thermostat: {
+          absMinHeatSetpointLimit: 700,
+          absMaxHeatSetpointLimit: 3000,
+          occupiedCoolingSetpoint: 2600,
+          // Whole degrees, where the setpoints are hundredths.
+          minSetpointDeadBand: 3,
+          occupiedHeatingSetpoint: 2000,
+        },
+      }),
+    ]);
+
+    expect(capability(auto, "target_temp")?.value).toEqual({
+      kind: "number",
+      unit: "C",
+      min: 7,
+      max: 23,
+    });
+  });
+
+  it("prefers the limits a device is configured with over what it could ever do", () => {
+    const configured = node(91, [
+      named("Thermostat"),
+      endpoint(1, {
+        thermostat: {
+          absMinHeatSetpointLimit: 700,
+          absMaxHeatSetpointLimit: 3000,
+          minHeatSetpointLimit: 1000,
+          maxHeatSetpointLimit: 2500,
+        },
+      }),
+    ]);
+
+    expect(capability(configured, "target_temp")?.value).toEqual({
+      kind: "number",
+      unit: "C",
+      min: 10,
+      max: 25,
+    });
+  });
+
+  it("keeps the setpoints from crossing when no deadband is stated", () => {
+    // An absent deadband means zero, not "no rule": heating still may not pass
+    // cooling.
+    const noDeadband = node(92, [
+      named("Thermostat"),
+      endpoint(1, {
+        thermostat: { absMaxHeatSetpointLimit: 3000, occupiedCoolingSetpoint: 2400 },
+      }),
+    ]);
+
+    expect(capability(noDeadband, "target_temp")?.value).toEqual({
+      kind: "number",
+      unit: "C",
+      max: 24,
+    });
+  });
 });
