@@ -125,33 +125,46 @@ fn is_standard_state(state: &str) -> bool {
     )
 }
 
+/// What an operation did, kept apart from what it was asked to do.
+enum OperationNote {
+    /// The device reached the state the verb asks for.
+    Reached(String),
+    /// It did not, and this says so.
+    Missed(String),
+}
+
 /// How an operation's result reads.
 ///
 /// The state the device ended up in, which need not be the one that was asked for:
 /// a device may accept Start and stay Stopped -- Google's Matter Virtual Device
 /// washer does exactly that -- and reporting "operation=start" there states the
-/// request as the result. A device that did not reach the state its verb asks for
-/// is said so plainly, because a bare "stopped" cannot be told from an error.
+/// request as the result.
+///
+/// A miss is returned separately rather than as another item in the applied list.
+/// Flattened in with the settings, "asked it to start, but it reports being
+/// stopped" trails a comma list of things that did work and reads as though it
+/// qualifies all of them, which is how a reader ends up doubting a temperature
+/// that was set correctly.
 ///
 /// A device wording a state its own way ("washing" rather than "running") is taken
-/// at that word and not called a mismatch: only a state contradicting the verb is.
-fn render_operation(requested: &str, became: Option<&str>) -> String {
+/// at that word: only a state the cluster itself defines can contradict a verb.
+fn render_operation(requested: &str, became: Option<&str>) -> OperationNote {
     let Some(became) = became else {
         // Nothing said about where it ended up: the request is all that is known.
-        return format!("operation={requested}");
+        return OperationNote::Reached(format!("operation={requested}"));
     };
 
     let contradicted = match state_intended_by(requested) {
-        // A state the cluster defines, and not the one this verb asks for.
         Some(wanted) => is_standard_state(became) && !became.eq_ignore_ascii_case(wanted),
-        // A verb with no state of its own to check against.
         None => false,
     };
 
     if contradicted {
-        format!("asked it to {requested}, but it reports being {became}")
+        OperationNote::Missed(format!(
+            "It was asked to {requested}, but reports being {became}."
+        ))
     } else {
-        format!("operation={became}")
+        OperationNote::Reached(format!("operation={became}"))
     }
 }
 
@@ -351,6 +364,8 @@ impl DeviceControlMcpServer {
         let device_id = device_id.as_str();
 
         let mut applied: Vec<String> = Vec::new();
+        // Anything the device declined to do, said in its own sentence.
+        let mut notes: Vec<String> = Vec::new();
 
         if let Some(on) = p.power {
             match self.control.set_power(device_id, on).await {
@@ -455,10 +470,12 @@ impl DeviceControlMcpServer {
                 // saying "operation=start" there reports the request as the result.
                 // Said plainly, because a model told only "stopped" after asking to
                 // start has to guess whether that is the answer or an error.
-                Ok(outcome) => applied.push(render_operation(
-                    operation,
-                    outcome.applied.operation.as_deref(),
-                )),
+                Ok(outcome) => {
+                    match render_operation(operation, outcome.applied.operation.as_deref()) {
+                        OperationNote::Reached(text) => applied.push(text),
+                        OperationNote::Missed(text) => notes.push(text),
+                    }
+                }
                 Err(e) => return Ok(guidance(format!("Couldn't {operation} '{device_id}': {e}"))),
             }
         }
@@ -474,10 +491,29 @@ impl DeviceControlMcpServer {
             }
         }
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Set {device_id}: {}.",
-            applied.join(", ")
-        ))]))
+        if applied.is_empty() && notes.is_empty() {
+            // Nothing was asked for. Previously this answered "Set <device>: .",
+            // which reads as a successful change that cannot be named.
+            return Ok(guidance(format!(
+                "Nothing to set on '{device_id}' — no state was given. \
+                 describe_device lists what it accepts."
+            )));
+        }
+
+        // Separate sentences: what took effect, then anything the device did not do.
+        let mut message = if applied.is_empty() {
+            String::new()
+        } else {
+            format!("Set {device_id}: {}.", applied.join(", "))
+        };
+        for note in notes {
+            if !message.is_empty() {
+                message.push(' ');
+            }
+            message.push_str(&note);
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(message)]))
     }
 }
 
@@ -604,6 +640,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use pond_core::user_data::ports::device_control::{DeviceControlOutcome, DeviceStatePatch};
+    use OperationNote::{Missed, Reached};
 
     use pond_core::user_data::ports::device_control::{Capability, SensorSpec};
 
@@ -763,40 +800,39 @@ mod tests {
     #[test]
     fn an_operation_reports_the_state_reached_not_the_one_requested() {
         // What the Matter Virtual Device washer actually does: Start is accepted,
-        // and the state stays Stopped.
-        assert_eq!(
-            render_operation("start", Some("stopped")),
-            "asked it to start, but it reports being stopped"
-        );
-        assert_eq!(
-            render_operation("pause", Some("running")),
-            "asked it to pause, but it reports being running"
-        );
+        // and the state stays Stopped. Kept out of the applied list so it cannot
+        // read as a caveat on the settings that did take effect.
+        let Missed(text) = render_operation("start", Some("stopped")) else {
+            panic!("a washer that stayed stopped is not a reached state");
+        };
+        assert_eq!(text, "It was asked to start, but reports being stopped.");
+
+        let Missed(text) = render_operation("pause", Some("running")) else {
+            panic!("still running is not a completed pause");
+        };
+        assert_eq!(text, "It was asked to pause, but reports being running.");
 
         // A verb and the state it produces are different words for one success, so
-        // neither of these is a mismatch.
-        assert_eq!(
-            render_operation("start", Some("running")),
-            "operation=running"
-        );
-        assert_eq!(
-            render_operation("stop", Some("stopped")),
-            "operation=stopped"
-        );
-        assert_eq!(
-            render_operation("resume", Some("running")),
-            "operation=running"
-        );
-
-        // A device wording a state its own way is taken at its word rather than
-        // accused of disobeying.
-        assert_eq!(
-            render_operation("start", Some("washing")),
-            "operation=washing"
-        );
+        // none of these is a miss.
+        for (verb, state, expected) in [
+            ("start", "running", "operation=running"),
+            ("stop", "stopped", "operation=stopped"),
+            ("resume", "running", "operation=running"),
+            // A device wording a state its own way is taken at its word rather
+            // than accused of disobeying.
+            ("start", "washing", "operation=washing"),
+        ] {
+            let Reached(text) = render_operation(verb, Some(state)) else {
+                panic!("{verb} -> {state} should read as reached");
+            };
+            assert_eq!(text, expected);
+        }
 
         // Nothing said about where it ended up: the request is all that is known.
-        assert_eq!(render_operation("stop", None), "operation=stop");
+        let Reached(text) = render_operation("stop", None) else {
+            panic!("an unstated result is not a miss");
+        };
+        assert_eq!(text, "operation=stop");
     }
 
     struct StubControl;
