@@ -14,6 +14,7 @@ import { nodeToDevice } from "./mapping/devices.js";
 import { planControl, type Verb } from "./mapping/control.js";
 import { observedOperation } from "./mapping/settings.js";
 import { describeNode } from "./mapping/describe.js";
+import { stateOf } from "./mapping/state.js";
 import { readingFor, sensorClusters } from "./mapping/sensors.js";
 import {
   type ClusterState,
@@ -26,6 +27,7 @@ import {
   nodeIdFromDeviceId,
   type Device,
   type DeviceDescription,
+  type DeviceState,
   type DeviceStatePatch,
   type Reading,
 } from "./protocol.js";
@@ -316,6 +318,26 @@ export class Controller {
       );
     }
     return describeNode(snapshotOf(peer, nodeId));
+  }
+
+  /**
+   * What the device currently is.
+   *
+   * The counterpart to `describe`: that says what a device can be told to do, this
+   * says what it is doing, in the same names. Read from the same snapshot the
+   * controller keeps current from subscription reports, so it costs no fabric
+   * traffic and reflects the last thing the device said about itself.
+   */
+  state(deviceId: string): DeviceState {
+    const peer = this.#peerFor(deviceId);
+    const nodeId = peer === undefined ? undefined : peerNodeId(peer);
+    if (peer === undefined || nodeId === undefined) {
+      throw new OpError(
+        "device_unknown",
+        `Matter device '${deviceId}' is not commissioned on this fabric`,
+      );
+    }
+    return stateOf(snapshotOf(peer, nodeId));
   }
 
   /** Drive a device. Returns what the device state became. */

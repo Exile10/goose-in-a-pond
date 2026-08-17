@@ -7,7 +7,7 @@
 //! port (logging stub today; MQTT/HTTP/IR or a Home-Assistant MCP-client later).
 
 use pond_core::user_data::ports::device_control::{
-    DeviceControlPort, DeviceDescription, ValueSpec,
+    DeviceControlPort, DeviceDescription, DeviceState, ValueSpec,
 };
 use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry};
 use rmcp::{
@@ -98,6 +98,63 @@ pub struct DeviceControlMcpServer {
 
 /// The description as a sentence a model can act on. JSON would be smaller and
 /// worse: the point is that the next tool call is obvious from reading it.
+/// Device-reference resolution, shared by every tool that takes a `device_id`.
+impl DeviceControlMcpServer {
+    /// The registered id for a caller's reference, or the guidance to send instead.
+    ///
+    /// Callers name devices the way people do — "the fan", a room name, a partial
+    /// title — and every tool has to answer the same three questions: which device,
+    /// which of several, or none of them. Kept in one place so a third tool cannot
+    /// answer them slightly differently from the first two.
+    async fn resolve_or_explain(
+        &self,
+        reference: &str,
+        tool: &str,
+    ) -> Result<String, CallToolResult> {
+        match self.registry.list_devices().await {
+            Ok(devices) => match resolve_device(reference, &devices) {
+                DeviceResolution::Resolved(id) => Ok(id),
+                DeviceResolution::Ambiguous(names) => Err(guidance(format!(
+                    "'{reference}' matches several devices: {}. Which one?",
+                    names.join(", ")
+                ))),
+                DeviceResolution::NotFound => {
+                    let known: Vec<String> = devices.iter().map(|d| d.name.clone()).collect();
+                    Err(guidance(if known.is_empty() {
+                        "No devices are registered yet.".to_string()
+                    } else {
+                        format!(
+                            "No device matches '{reference}'. Registered devices: {}.",
+                            known.join(", ")
+                        )
+                    }))
+                }
+            },
+            // The registry being unavailable is not the caller's problem: pass the
+            // reference through so a backend that understands it can still act.
+            Err(e) => {
+                tracing::warn!(error = %e, tool, "device list unavailable");
+                Ok(reference.to_string())
+            }
+        }
+    }
+}
+
+/// A device's current state, as the model reads it.
+fn render_state(state: &DeviceState) -> String {
+    if state.values.is_empty() {
+        // Distinct from "it is off": the device reported nothing at all, and saying
+        // so is more useful than an empty list the reader has to interpret.
+        return format!("{} reports nothing about its state.", state.device_id);
+    }
+
+    let mut out = format!("{} is:", state.device_id);
+    for value in &state.values {
+        out.push_str(&format!("\n    {}: {}", value.name, value.value));
+    }
+    out
+}
+
 /// The state each operation is asking the device to reach.
 ///
 /// A verb and the state it produces are different words for the same success:
@@ -257,31 +314,9 @@ impl DeviceControlMcpServer {
         let Parameters(p) = params;
         let device_id = p.device_id.trim();
 
-        let device_id = match self.registry.list_devices().await {
-            Ok(devices) => match resolve_device(device_id, &devices) {
-                DeviceResolution::Resolved(id) => id,
-                DeviceResolution::Ambiguous(names) => {
-                    return Ok(guidance(format!(
-                        "'{device_id}' matches several devices: {}. Which one?",
-                        names.join(", ")
-                    )));
-                }
-                DeviceResolution::NotFound => {
-                    let known: Vec<String> = devices.iter().map(|d| d.name.clone()).collect();
-                    return Ok(guidance(if known.is_empty() {
-                        "No devices are registered yet.".to_string()
-                    } else {
-                        format!(
-                            "No device matches '{device_id}'. Registered devices: {}.",
-                            known.join(", ")
-                        )
-                    }));
-                }
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, "describe_device: device list unavailable");
-                device_id.to_string()
-            }
+        let device_id = match self.resolve_or_explain(device_id, "describe_device").await {
+            Ok(id) => id,
+            Err(explanation) => return Ok(explanation),
         };
 
         match self.control.describe(&device_id).await {
@@ -289,6 +324,37 @@ impl DeviceControlMcpServer {
                 render_description(&description),
             )])),
             Err(e) => Ok(guidance(format!("Couldn't describe '{device_id}': {e}"))),
+        }
+    }
+
+    #[tool(
+        description = "What a device currently is: whether it is on, what each of its \
+                       settings is set to, and whether it is running. Use this to answer \
+                       questions about a device's state rather than driving it to find out. \
+                       Names match describe_device, so a reading names what changes it. \
+                       device_id: id, name, or natural ref like \"the washer\"."
+    )]
+    async fn get_device_state(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<DescribeDeviceParams>,
+    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("get_device_state");
+        let Parameters(p) = params;
+
+        let device_id = match self
+            .resolve_or_explain(p.device_id.trim(), "get_device_state")
+            .await
+        {
+            Ok(id) => id,
+            Err(explanation) => return Ok(explanation),
+        };
+
+        match self.control.state(&device_id).await {
+            Ok(state) => Ok(CallToolResult::success(vec![Content::text(render_state(
+                &state,
+            ))])),
+            Err(e) => Ok(guidance(format!("Couldn't read '{device_id}': {e}"))),
         }
     }
 
@@ -639,7 +705,9 @@ pub fn spawn_device_control_server(reader: DuplexStream, writer: DuplexStream) {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use pond_core::user_data::ports::device_control::{DeviceControlOutcome, DeviceStatePatch};
+    use pond_core::user_data::ports::device_control::{
+        DeviceControlOutcome, DeviceStatePatch, StateValue,
+    };
     use OperationNote::{Missed, Reached};
 
     use pond_core::user_data::ports::device_control::{Capability, SensorSpec};
@@ -791,6 +859,49 @@ mod tests {
         // And it says plainly that there is nothing to drive, rather than leaving
         // the model to infer it from an empty list.
         assert!(rendered.contains("Cannot be controlled"), "{rendered}");
+    }
+
+    /// The gap this closes: asked "what is the state of the laundry washer?", the
+    /// only honest answer was "I do not have a tool to report that" -- the state was
+    /// in the controller the whole time, with nothing to ask for it.
+    #[test]
+    fn a_state_reads_as_names_that_can_be_set() {
+        let rendered = render_state(&DeviceState {
+            device_id: "matter-1".into(),
+            values: vec![
+                StateValue {
+                    name: "power".into(),
+                    value: "on".into(),
+                },
+                StateValue {
+                    name: "spin speed".into(),
+                    value: "High".into(),
+                },
+                StateValue {
+                    name: "operation".into(),
+                    value: "running".into(),
+                },
+            ],
+        });
+
+        assert!(rendered.contains("power: on"), "{rendered}");
+        // Named exactly as describe_device names it, so the call that changes it
+        // follows from the reading without a second lookup.
+        assert!(rendered.contains("spin speed: High"), "{rendered}");
+        assert!(rendered.contains("operation: running"), "{rendered}");
+    }
+
+    /// A device that reported nothing is not the same as a device that is off.
+    #[test]
+    fn a_silent_device_says_so_rather_than_rendering_an_empty_list() {
+        let rendered = render_state(&DeviceState {
+            device_id: "matter-9".into(),
+            values: vec![],
+        });
+        assert!(
+            rendered.contains("reports nothing about its state"),
+            "{rendered}"
+        );
     }
 
     /// The last place the request was being reported as the result. GIAP said the

@@ -260,6 +260,11 @@ async function dispatch(controller: Controller, request: Request): Promise<unkno
       return { description: controller.describe(deviceId) };
     }
 
+    case "state": {
+      const deviceId = requireDeviceId(params.device_id);
+      return { state: controller.state(deviceId) };
+    }
+
     default:
       throw new OpError("bad_request", `'${String(request.op)}' is not an op`);
   }

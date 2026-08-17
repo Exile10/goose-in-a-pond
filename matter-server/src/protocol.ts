@@ -139,6 +139,7 @@ export type OpName =
   | "decommission"
   | "control"
   | "describe"
+  | "state"
   | "ping";
 
 export interface Request {
@@ -183,6 +184,23 @@ export type ErrorCode =
   | "bad_request"
   | "internal";
 
+
+/**
+ * One thing a device currently is: `{name: "spin speed", value: "High"}`.
+ *
+ * `name` is always a name `describe` also uses -- a control verb for a scalar, a
+ * setting name for a selectable -- so a reading names the thing that changes it.
+ */
+export interface StateValue {
+  name: string;
+  value: string;
+}
+
+/** Everything a device currently reports. */
+export interface DeviceState {
+  device_id: string;
+  values: StateValue[];
+}
 
 /** An error carrying a wire code, so the dispatcher does not have to guess one. */
 export class OpError extends Error {
