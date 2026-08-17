@@ -12,6 +12,7 @@ import { Endpoint, Environment, Seconds, ServerNode, type ClientNode } from "@ma
 import { log, describeError, setupCodeKind } from "./log.js";
 import { nodeToDevice } from "./mapping/devices.js";
 import { planControl, type Verb } from "./mapping/control.js";
+import { observedOperation } from "./mapping/settings.js";
 import { describeNode } from "./mapping/describe.js";
 import { readingFor, sensorClusters } from "./mapping/sensors.js";
 import {
@@ -351,7 +352,11 @@ export class Controller {
           // while the cluster schema for these commands forbids one.
           const invoke = command as (args?: Record<string, unknown>) => Promise<unknown>;
           const hasFields = Object.keys(action.payload).length > 0;
-          await (hasFields ? invoke(action.payload) : invoke());
+          assertAccepted(
+            deviceId,
+            action.command,
+            await (hasFields ? invoke(action.payload) : invoke()),
+          );
         } else {
           await endpoint.setStateOf(action.cluster, { [action.attribute]: action.value });
         }
@@ -359,6 +364,13 @@ export class Controller {
         if (error instanceof OpError) throw error;
         throw new OpError("device_unreachable", describeError(error));
       }
+    }
+
+    // What the device is now, not what it was asked to be. The command response
+    // above proves it accepted the command; this is how it describes the result.
+    if (verb === "operation") {
+      const observed = observedOperation(snapshotOf(peer, nodeId));
+      if (observed !== undefined) plan.applied.operation = observed;
     }
 
     return plan.applied;
@@ -534,6 +546,60 @@ function snapshotOf(peer: ClientNode, nodeId: bigint): NodeSnapshot {
     });
   }
   return { nodeId, online: peer.lifecycle.isOnline, endpoints };
+}
+
+/** ErrorStateEnum, for a device that sends an id without a label. */
+const OPERATIONAL_ERRORS: Record<number, string> = {
+  1: "it could not start or resume",
+  2: "it could not complete the operation",
+  3: "that command is not valid in its current state",
+};
+
+/**
+ * Fail if the device refused the command it just answered.
+ *
+ * Matter commands do not only succeed or throw. Operational State answers every
+ * Start/Stop/Pause/Resume with an `ErrorStateID`, and ModeBase answers
+ * `changeToMode` with a `status` — and a refusal comes back as a perfectly
+ * successful invocation carrying a non-zero code. Discarding that response is why
+ * a washer that never started was reported as running: nothing threw, so nothing
+ * looked. The device's own `errorStateLabel` or `statusText` is preferred over
+ * anything we could word ourselves, because it knows why it said no.
+ */
+export function assertAccepted(deviceId: string, command: string, response: unknown): void {
+  if (typeof response !== "object" || response === null) return;
+
+  const state = (response as { commandResponseState?: unknown }).commandResponseState;
+  if (typeof state === "object" && state !== null) {
+    const id = (state as { errorStateId?: unknown }).errorStateId;
+    const label = (state as { errorStateLabel?: unknown }).errorStateLabel;
+    const details = (state as { errorStateDetails?: unknown }).errorStateDetails;
+    if (typeof id === "number" && id !== 0) {
+      const said =
+        typeof details === "string" && details !== ""
+          ? details
+          : typeof label === "string" && label !== ""
+            ? label
+            : OPERATIONAL_ERRORS[id] ?? `it answered with error state ${id}`;
+      throw new OpError(
+        "device_refused",
+        `Matter device '${deviceId}' refused ${command}: ${said}`,
+      );
+    }
+  }
+
+  const status = (response as { status?: unknown }).status;
+  const statusText = (response as { statusText?: unknown }).statusText;
+  if (typeof status === "number" && status !== 0) {
+    const said =
+      typeof statusText === "string" && statusText !== ""
+        ? statusText
+        : `it answered with status ${status}`;
+    throw new OpError(
+      "device_refused",
+      `Matter device '${deviceId}' refused ${command}: ${said}`,
+    );
+  }
 }
 
 function readClusters(endpoint: Endpoint): ClusterState {

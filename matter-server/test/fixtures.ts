@@ -92,7 +92,17 @@ export function laundryWasherNode(): NodeSnapshot {
           numberOfRinses: 1,
           supportedRinses: ["None", "Normal", "Extra", "Max"],
         },
-        operationalState: { operationalState: 0 },
+        operationalState: {
+          operationalState: 0,
+          // A real washer publishes the states it has; the spec ties those to the
+          // commands it accepts.
+          operationalStateList: [
+            { operationalStateId: 0, operationalStateLabel: "Stopped" },
+            { operationalStateId: 1, operationalStateLabel: "Running" },
+            { operationalStateId: 2, operationalStateLabel: "Paused" },
+            { operationalStateId: 3, operationalStateLabel: "Error" },
+          ],
+        },
       },
       [0x0073],
     ),
