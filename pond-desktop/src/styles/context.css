@@ -116,6 +116,15 @@
   width: 100%;
 }
 
+/* The focus ring belongs on the WRAPPER, which is what looks like the control.
+   Putting it on the inner input drew a second rounded rectangle inside the
+   border that was already there. */
+.ctx__search:focus-within {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+  border-color: var(--color-accent);
+}
+
 .ctx__add { display: flex; gap: var(--space-3); flex-wrap: wrap; }
 .ctx__addInput {
   font: inherit;
@@ -143,15 +152,27 @@
 }
 .ctx__addBtn:disabled { opacity: 0.5; cursor: not-allowed; }
 .ctx__addInput:focus-visible,
-.ctx__addBtn:focus-visible,
-.ctx__searchInput:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
+.ctx__addBtn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 
 /* ── The wall ───────────────────────────────────────────────────────────── */
 
+/* Cards are as tall as their memory needs.
+ *
+ * This used to pin heights with `grid-row: span N` over 34px rows, choosing N
+ * from the content's CHARACTER COUNT — a guess that is wrong whenever wrapping
+ * disagrees with it, which is most of the time. Paired with `overflow: hidden`
+ * it amputated memories mid-sentence, and left holes under every card whose
+ * guess ran long.
+ *
+ * Conversations can pin heights because its cards hold a title and a clipped
+ * preview, where cutting off IS the design. Here the text is the whole content,
+ * and it has to be readable and editable, so the wall gives up an even bottom
+ * edge to keep every word. `start` alignment stops a short card stretching to
+ * match its tallest neighbour. */
 .ctx__wall {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-  grid-auto-rows: 34px;
+  align-items: start;
   gap: var(--space-4);
 }
 
@@ -163,7 +184,6 @@
   flex-direction: column;
   gap: var(--space-2);
   padding: var(--space-4);
-  overflow: hidden;
 
   background: var(--color-surface);
   border: 2px solid var(--color-text);
@@ -173,18 +193,21 @@
   transition: box-shadow 120ms ease, transform 120ms ease, border-color 120ms ease;
 }
 
-.ctx__card[data-weight="tile"]   { grid-row: span 3; }
-.ctx__card[data-weight="card"]   { grid-row: span 4; }
-.ctx__card[data-weight="column"] { grid-row: span 5; }
 
 .ctx__card:hover { --ink-lift: 7px; border-color: var(--color-accent); }
 
+/* The skeletons DO need fixed heights -- they have no content to be tall for,
+   and the point of them is holding the wall's shape before the real cards
+   arrive so the layout does not jump. */
 .ctx__card--ghost {
-  border-color: var(--color-border, #dcd9e4);
+  border-color: var(--color-border);
   box-shadow: none;
   transform: none;
   opacity: 0.5;
 }
+.ctx__card--ghost[data-weight="tile"]   { min-height: 104px; }
+.ctx__card--ghost[data-weight="card"]   { min-height: 140px; }
+.ctx__card--ghost[data-weight="column"] { min-height: 176px; }
 
 .ctx__cardTop {
   display: flex;
