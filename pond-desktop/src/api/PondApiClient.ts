@@ -11,6 +11,7 @@ import {
   type CompactionReport,
   type ContextIndexHealth,
   type ContextIndexRebuild,
+  type ContextSource,
   type Device,
   type DiskUsage,
   type DownloadEntry,
@@ -681,6 +682,61 @@ export class PondApiClient {
    */
   rebuildContextIndex(): Promise<ContextIndexRebuild> {
     return this.post<ContextIndexRebuild>("/api/v1/context/index/rebuild", {});
+  }
+
+  // ── Connected accounts ────────────────────────────────────
+
+  /**
+   * The sources this session's speaker may see.
+   *
+   * Scoped on the server from the session, not filtered here: one member never
+   * sees another's accounts, and that is decided where the rows are.
+   */
+  listContextSources(sessionId: string): Promise<{ sources: ContextSource[] }> {
+    return this.get(
+      `/api/v1/context/sources?session_id=${encodeURIComponent(sessionId)}`,
+    );
+  }
+
+  /**
+   * Connect an account.
+   *
+   * The owner is NOT sent: the server resolves it from the session and the
+   * paired device this request arrived on. A caller-supplied owner would be a
+   * hole, and every item the source ever produces inherits it.
+   */
+  connectContextSource(input: {
+    kind: string;
+    provider: string;
+    sessionId: string;
+    credentials?: { username: string; password: string; baseUrl?: string };
+  }): Promise<{ id: string; kind: string; profile_id: string }> {
+    return this.post("/api/v1/context/sources", {
+      kind: input.kind,
+      provider: input.provider,
+      session_id: input.sessionId,
+      ...(input.credentials
+        ? {
+            credentials: {
+              username: input.credentials.username,
+              password: input.credentials.password,
+              ...(input.credentials.baseUrl
+                ? { base_url: input.credentials.baseUrl }
+                : {}),
+            },
+          }
+        : {}),
+    });
+  }
+
+  /** Disconnect a source. Its items go with it, and the reply says how many. */
+  disconnectContextSource(
+    id: string,
+    sessionId: string,
+  ): Promise<{ removed: number }> {
+    return this.del(
+      `/api/v1/context/sources/${encodeURIComponent(id)}?session_id=${encodeURIComponent(sessionId)}`,
+    );
   }
 
   // ── Conversation titles ───────────────────────────────────

@@ -586,6 +586,22 @@ export interface ContextCorpusCleared {
  * The result of emptying the index. Every corpus is listed, including the ones
  * at zero, so a corpus that was never populated is still visible afterwards.
  */
+/** A connected personal-context source, as the sources API reports it. */
+export interface ContextSource {
+  id: string;
+  /** `calendar`, `mail`, `camera`, `sensor`. */
+  kind: string;
+  /** `google`, `icloud`, `fastmail`, `nextcloud`, `custom`, or a device id. */
+  provider: string;
+  profile_id: string;
+  /** `connected` | `needs_reauth` | `error` | `paused` */
+  status: string;
+  /** RFC3339, or null when the pond has not reached this account yet. */
+  last_sync: string | null;
+  /** Whether this kind signs in to an account, as opposed to being on-pond. */
+  needs_credentials: boolean;
+}
+
 export interface ContextIndexRebuild {
   indexed: boolean;
   reason?: string;
