@@ -5,8 +5,14 @@
 //! are added by migration `0004_devices_enhanced.sql`.
 //!
 //! `is_online` is derived at read-time by comparing `last_seen` to `now - 5 min`
-//! (heartbeat threshold). The stored `is_online` column is used as a fallback
-//! for devices that have never sent a heartbeat.
+//! (heartbeat threshold), and nothing else. The stored `is_online` column is
+//! written but never read back — `row_to_device` does not even select it — so a
+//! device is online exactly as long as something keeps saying so.
+//!
+//! That makes the freshness the whole contract, and it is a contract every source
+//! of devices has to keep: a subsystem that only touches `last_seen` when something
+//! happens will show its devices going offline while they sit there working. The
+//! Matter bridge did precisely that until it grew a periodic tick.
 
 use anyhow::Result;
 use async_trait::async_trait;
