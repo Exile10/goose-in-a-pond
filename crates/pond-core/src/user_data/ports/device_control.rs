@@ -44,6 +44,19 @@ pub struct DeviceStatePatch {
     /// Covering position as a 0–100 percentage **open** (100 = fully open).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<u8>,
+    /// The named setting that changed, and what it became.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ModeChange>,
+    /// The operation that was run: start, stop, pause or resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+}
+
+/// A named setting and its new value, both in the device's own words.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModeChange {
+    pub setting: String,
+    pub value: String,
 }
 
 /// Outcome of a control action.
@@ -168,6 +181,30 @@ pub trait DeviceControlPort: Send + Sync {
     /// rather than as it was when it was paired.
     async fn describe(&self, device_id: &str) -> Result<DeviceDescription> {
         anyhow::bail!("device '{device_id}' does not describe itself")
+    }
+
+    /// Choose a named setting — a wash cycle, a spin speed, a temperature level.
+    ///
+    /// One verb rather than one per appliance: Matter's appliance controls are
+    /// nearly all the same shape, a list of choices the device publishes. The
+    /// setting name and the value both come from [`Self::describe`], so what is
+    /// describable is callable.
+    async fn set_mode(
+        &self,
+        device_id: &str,
+        _setting: &str,
+        _value: &str,
+    ) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' has no settings that can be chosen")
+    }
+
+    /// Start, stop, pause or resume a device that runs cycles.
+    async fn set_operation(
+        &self,
+        device_id: &str,
+        _operation: &str,
+    ) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' does not run cycles")
     }
 
     /// Set a covering (blind/curtain/shade) position, as a 0–100 percentage

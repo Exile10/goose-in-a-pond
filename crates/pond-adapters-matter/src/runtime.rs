@@ -609,6 +609,29 @@ impl DeviceControlPort for SwitchableDeviceControl {
             .await
     }
 
+    async fn set_mode(
+        &self,
+        device_id: &str,
+        setting: &str,
+        value: &str,
+    ) -> Result<DeviceControlOutcome> {
+        self.backend_for(device_id)
+            .await?
+            .set_mode(device_id, setting, value)
+            .await
+    }
+
+    async fn set_operation(
+        &self,
+        device_id: &str,
+        operation: &str,
+    ) -> Result<DeviceControlOutcome> {
+        self.backend_for(device_id)
+            .await?
+            .set_operation(device_id, operation)
+            .await
+    }
+
     async fn set_position(
         &self,
         device_id: &str,

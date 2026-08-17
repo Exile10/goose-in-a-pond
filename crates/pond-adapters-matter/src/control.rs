@@ -156,6 +156,28 @@ impl DeviceControlPort for MatterDeviceControl {
         self.control(device_id, "fan_mode", json!(mode)).await
     }
 
+    async fn set_mode(
+        &self,
+        device_id: &str,
+        setting: &str,
+        value: &str,
+    ) -> Result<DeviceControlOutcome> {
+        self.control(
+            device_id,
+            "mode",
+            json!({ "setting": setting, "value": value }),
+        )
+        .await
+    }
+
+    async fn set_operation(
+        &self,
+        device_id: &str,
+        operation: &str,
+    ) -> Result<DeviceControlOutcome> {
+        self.control(device_id, "operation", json!(operation)).await
+    }
+
     async fn set_position(
         &self,
         device_id: &str,
