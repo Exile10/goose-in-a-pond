@@ -36,12 +36,12 @@ const VIEWS: Array<{ id: View; label: string; blurb: string }> = [
   { id: "lineage", label: "Lineage", blurb: "How it all connects" },
 ];
 
-/** Cards are as tall as their memory is long, the way conversation cards are. */
-function weightOf(content: string): "tile" | "card" | "column" {
-  if (content.length < 90) return "tile";
-  if (content.length < 240) return "card";
-  return "column";
-}
+/** The skeleton shapes shown while the wall loads.
+ *
+ * Only the placeholders need a size: a real card is as tall as its memory,
+ * because guessing a height from character count and clipping the overflow
+ * amputated memories mid-sentence. */
+const GHOST_SHAPES = ["tile", "card", "column", "card", "tile", "card"] as const;
 
 function relativeWhen(iso?: string): string {
   if (!iso) return "";
@@ -226,7 +226,7 @@ export function Context() {
 
           {loading ? (
             <div className="ctx__wall" aria-busy="true" aria-label="Loading">
-              {["tile", "card", "column", "card", "tile", "card"].map((w, i) => (
+              {GHOST_SHAPES.map((w, i) => (
                 <div key={i} className="ctx__card ctx__card--ghost" data-weight={w} />
               ))}
             </div>
@@ -239,7 +239,7 @@ export function Context() {
           ) : (
             <div className="ctx__wall">
               {shown.map((m) => (
-                <article key={m.id} className="ctx__card" data-weight={weightOf(m.content)}>
+                <article key={m.id} className="ctx__card">
                   <div className="ctx__cardTop">
                     {m.tier && <span className="ctx__tier" data-tier={m.tier}>{m.tier}</span>}
                     <span className="ctx__when">{relativeWhen(m.created_at)}</span>
