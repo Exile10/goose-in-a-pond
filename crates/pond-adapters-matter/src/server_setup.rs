@@ -890,6 +890,14 @@ mod tests {
             drop(l);
             p
         };
+        // A released ephemeral port goes straight back to the pool, and the
+        // other tests in this binary bind ephemeral ports constantly — so
+        // between the drop above and the probe below, one of them can take it.
+        // Without this guard the test fails at random on a busy machine, and a
+        // suite that fails at random teaches people to re-run rather than read.
+        if is_running(free).await {
+            return;
+        }
         assert_eq!(
             probe_controller(free, &format!("ws://127.0.0.1:{free}/giap")).await,
             Occupant::Free

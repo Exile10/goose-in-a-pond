@@ -817,6 +817,45 @@ fn runtime_for() -> Arc<MatterRuntime> {
     )
 }
 
+/// A runtime nobody has asked for anything sits still.
+///
+/// The regression this pins: the reconciler's first pass ran with an empty URL,
+/// failed to connect to it, and parked in `Unreachable` before any `apply`. That
+/// is a lie about a subsystem nobody had configured yet, and startup's bounded
+/// wait read it as "settled" and stopped waiting — which is why the Matter log
+/// lines appeared before the banner on some runs and after it on others.
+#[tokio::test]
+async fn a_runtime_that_has_been_asked_for_nothing_does_nothing() {
+    let runtime = runtime_for();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let status = runtime.status().await;
+    assert!(
+        matches!(status.state, MatterState::Disabled),
+        "reconciled before being asked: {:?}",
+        status.state
+    );
+    assert!(!status.enabled, "claimed to be enabled before any apply");
+    assert!(runtime.commissioner().await.is_none());
+}
+
+/// And the wait waits for THIS request, rather than for any state that happens
+/// to look settled.
+#[tokio::test]
+async fn settle_waits_for_the_apply_that_was_just_made() {
+    let (url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
+    let runtime = runtime_for();
+
+    runtime.apply(url.clone());
+    let settled = runtime.settle(Duration::from_secs(10)).await;
+
+    assert!(
+        settled.state.is_connected(),
+        "returned before the request it was waiting on landed: {:?}",
+        settled.state
+    );
+}
+
 #[tokio::test]
 async fn enabling_connects_and_exposes_a_commissioner() {
     let (url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
