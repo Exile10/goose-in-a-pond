@@ -20,12 +20,18 @@
 }
 
 /* ── Reset ──────────────────────────────────────────────────── */
-*,
-*::before,
-*::after {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
+/* In the "reset" layer (registered first in design-tokens.css, before
+   HeroUI's import) so it's the lowest-priority layer — HeroUI's own layered
+   component styles (button/chip padding, etc.) win over it instead of the
+   reverse, which is what an unlayered reset would otherwise force. */
+@layer reset {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
 }
 
 /* heroui switch thumb position is driven by margin-inline-start.

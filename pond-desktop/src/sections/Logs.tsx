@@ -180,7 +180,12 @@ export function Logs() {
       api.listActivity({ limit: 150 }),
       api.getActivitySummary(window_),
     ])
-      .then(([res, sum]) => { setEvents(res.events); setSummary(sum); })
+      .then(([res, sum]) => {
+        // The scheduler's hourly heartbeat — noise in a human-facing activity
+        // feed, not something the user did or that touched their data.
+        setEvents(res.events.filter((e) => e.action !== "time.tick"));
+        setSummary(sum);
+      })
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
   }, [window_]);

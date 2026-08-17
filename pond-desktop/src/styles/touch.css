@@ -453,9 +453,9 @@ label:has(> .native-checkbox) {
 
 .sidebar.is-collapsed .sidebar__nav .sidebar__item,
 .sidebar.is-collapsed .sidebar__bottom-nav .sidebar__item {
-  padding-left: 0;
+  padding-left: 6px;
   padding-right: 0;
-  justify-content: center;
+  justify-content: flex-start;
 }
 
 /* Footer: stack instead of holding a two-column row in 52px, so the avatar
@@ -496,12 +496,6 @@ label:has(> .native-checkbox) {
 .sidebar__bottom-nav .sidebar__item {
   padding-left: 6px;
   padding-right: 6px;
-}
-
-.sidebar.is-collapsed .sidebar__nav .sidebar__item,
-.sidebar.is-collapsed .sidebar__bottom-nav .sidebar__item {
-  padding-left: 0;
-  padding-right: 0;
 }
 
 /* ── Focus ring: the two cases the global rule cannot cover ──────────────

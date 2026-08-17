@@ -83,6 +83,7 @@ export function Pairing() {
           <Button
             size="sm"
             variant="secondary"
+            className="page-header-btn"
             isDisabled={loading}
             onPress={() => loadPairingInfo(true)}
           >
@@ -114,6 +115,7 @@ export function Pairing() {
               size="sm"
               color={timeLeft === "expired" ? "danger" : "success"}
               variant="soft"
+              className="header-status-chip"
             >
               {timeLeft === "expired" ? "Expired — refreshing…" : `Expires in ${timeLeft}`}
             </Chip>
