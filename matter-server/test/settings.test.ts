@@ -239,4 +239,37 @@ describe("appliance settings", () => {
     expect(() => assertAccepted("matter-50", "changeToMode", { status: 0 })).not.toThrow();
     expect(() => assertAccepted("matter-50", "off", undefined)).not.toThrow();
   });
+  it("takes the cluster's name for a setting when only one can be meant", () => {
+    // What Goose actually sent: the setting reads "temperature level", but the
+    // cluster is called TemperatureControl, so it asked for "temperature control"
+    // first and had to be told no before retrying -- which is why one answer both
+    // denied setting it and reported it set.
+    const plan = planControl(laundryWasherNode(), "matter-50", "mode", {
+      setting: "temperature control",
+      value: "Hot",
+    });
+    expect(plan.applied.mode).toEqual({ setting: "temperature level", value: "Hot" });
+  });
+
+  it("still refuses a name that could mean two settings", () => {
+    // "mode" alone is not an answer on a device with two of them: picking one is
+    // how a wash ends up on the wrong cycle.
+    const twoModes = node(72, [
+      named("Combo"),
+      endpoint(1, {
+        laundryWasherMode: {
+          currentMode: 0,
+          supportedModes: [{ label: "Normal", mode: 0 }],
+        },
+        dryerMode: {
+          currentMode: 0,
+          supportedModes: [{ label: "Timed", mode: 0 }],
+        },
+      }),
+    ]);
+
+    expect(() =>
+      planControl(twoModes, "matter-72", "mode", { setting: "mode", value: "Normal" }),
+    ).toThrowError(/is not a setting/);
+  });
 });

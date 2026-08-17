@@ -201,7 +201,16 @@ export function settingsOf(node: NodeSnapshot): Setting[] {
   return settings;
 }
 
-/** The setting matching a name the user said, if exactly one does. */
+/**
+ * The setting matching a name the user said, if exactly one does.
+ *
+ * Widening from exact match to shared words, in that order, because a device's own
+ * vocabulary is not the one people use for it: "temperature control" is what the
+ * cluster is called, but the setting reads "temperature level", and a caller that
+ * says the former has still named it unambiguously. "Exactly one" is the guard
+ * throughout — a name matching two settings is answered as unknown rather than
+ * guessed at, since guessing puts a wash on the wrong cycle.
+ */
 export function settingNamed(node: NodeSnapshot, name: string): Setting | undefined {
   const settings = settingsOf(node);
   const exact = settings.find(s => looseEquals(s.name, name));
@@ -211,7 +220,13 @@ export function settingNamed(node: NodeSnapshot, name: string): Setting | undefi
   // distinguishes it, not the cluster's full title.
   const wanted = name.trim().toLowerCase();
   const partial = settings.filter(s => s.name.includes(wanted) || wanted.includes(s.name));
-  return partial.length === 1 ? partial[0] : undefined;
+  if (partial.length === 1) return partial[0];
+
+  // "temperature control" for "temperature level": the caller named it by its
+  // cluster rather than by the setting, which is a reasonable thing to do.
+  const words = new Set(wanted.split(/\s+/).filter(w => w !== ""));
+  const shared = settings.filter(s => s.name.split(" ").some(w => words.has(w)));
+  return shared.length === 1 ? shared[0] : undefined;
 }
 
 /**
