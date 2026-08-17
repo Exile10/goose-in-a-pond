@@ -287,6 +287,27 @@ async fn reconcile_loop(mut rx: watch::Receiver<Desired>, r: Reconciler) {
             return;
         }
 
+        // Nothing has been asked for yet.
+        //
+        // `nonce` is zero only in the channel's initial value, and every `apply`
+        // increments it — so this is the one reliable way to tell "no request"
+        // from "a request that happens to look like the default". Without it the
+        // first pass ran with an EMPTY url: `changed` is false (""=="") and
+        // `healthy` is false, so the guard below fired, `connect` bailed with
+        // "no Matter controller address is set", and the runtime sat in
+        // `Unreachable` before anyone had asked it for anything. Startup's wait
+        // then saw that as a settled state and returned instantly, which is why
+        // the Matter lines landed after the banner on some runs and before it on
+        // others — a race against a cycle that should never have happened.
+        if want.nonce == 0 {
+            if rx.changed().await.is_err() {
+                teardown(&mut running, &r).await;
+                r.stopped.notify_waiters();
+                return;
+            }
+            continue;
+        }
+
         // Idempotent by comparison, not by flag: identical values while
         // connected are a no-op, but the same values while unreachable are a
         // retry — which is what the UI's retry affordance sends.
