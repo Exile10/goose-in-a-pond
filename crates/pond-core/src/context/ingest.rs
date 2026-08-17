@@ -398,8 +398,12 @@ mod tests {
                         message.contains(kind.as_str()),
                         "the refusal does not say which kind: {message}"
                     );
+                    // See the sibling guard in `producer.rs`: this asserts the
+                    // mechanism that is missing, not the phase that was going to
+                    // supply it, because the phase citation for the connector
+                    // kinds expired while the refusal stayed correct.
                     assert!(
-                        message.contains("PAI-8 P3") || message.contains("PAI-2 P6b"),
+                        message.contains("ingest route") || message.contains("connector"),
                         "the refusal does not name what has to land first: {message}"
                     );
                 }
