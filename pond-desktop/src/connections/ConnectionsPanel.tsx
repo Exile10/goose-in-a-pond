@@ -109,6 +109,41 @@ export function ConnectionsPanel({ sessionId }: Props) {
     }
   }
 
+  /** Ask the pond to read every connected account now. */
+  async function syncNow() {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const r = await api.syncContextSources();
+      // Every outcome gets its own sentence. "Done" would be the one answer
+      // that tells somebody nothing, and this button exists precisely because
+      // they could not tell whether it had worked.
+      if (r.sources === 0) {
+        setNotice("Nothing to check yet — no accounts are connected.");
+      } else if (r.needs_reauth > 0) {
+        setError(
+          "The password was refused. Check it is an app password, not your normal one, and connect again.",
+        );
+      } else if (r.paused > 0) {
+        setNotice("This pond is offline, so it did not reach out.");
+      } else if (r.failed > 0) {
+        setError("The pond could not reach that account. It will try again on its own.");
+      } else if (r.ingested > 0) {
+        setNotice(
+          r.ingested === 1 ? "Read one new thing." : `Read ${r.ingested} new things.`,
+        );
+      } else {
+        setNotice("Checked. Nothing new since last time.");
+      }
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "The sync could not run.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function disconnect(source: ContextSource) {
     setBusy(true);
     setError(null);
@@ -131,7 +166,18 @@ export function ConnectionsPanel({ sessionId }: Props) {
   return (
     <div className="connections">
       <section className="connections-intro">
-        <h3>Your accounts</h3>
+        <div className="connections-introHead">
+          <h3>Your accounts</h3>
+          <button
+            type="button"
+            className="connections-sync"
+            onClick={() => void syncNow()}
+            disabled={busy}
+          >
+            <RefreshCw size={15} className={busy ? "connections-spin" : undefined} />
+            <span>{busy ? "Checking" : "Check now"}</span>
+          </button>
+        </div>
         <p>
           The pond reads your calendar, and the subject lines of your mail, so it knows what
           your week looks like. It never sends, replies, deletes, or reads the body of a
@@ -146,7 +192,7 @@ export function ConnectionsPanel({ sessionId }: Props) {
       ) : (
         <ul className="connections-list">
           {sources.map((source) => {
-            const status = describeStatus(source.status);
+            const status = describeStatus(source.status, source.last_sync);
             const label =
               PROVIDERS.find((p) => p.id === source.provider && p.kind === source.kind)
                 ?.label ?? `${source.provider} ${source.kind}`;

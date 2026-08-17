@@ -28,7 +28,7 @@ use pond_adapters_caldav::{CalDavAdapter, CalDavConfig, CalDavProvider};
 use pond_adapters_imap::{ImapAdapter, ImapConfig, ImapProvider};
 use pond_core::context::domain::{secret_key_for, ContextSource, SourceKind, SourceStatus};
 use pond_core::context::ingest::IngestPipeline;
-use pond_core::context::ports::ContextRepository;
+use pond_core::context::ports::{AccountSync, AccountSyncSummary, ContextRepository};
 use pond_core::security::ports::secret::SecretRepository;
 use pond_core::shared::services::egress::{network_mode, NetworkMode};
 use pond_core::user_data::domain::profile::ProfileScope;
@@ -331,4 +331,69 @@ async fn sync_one_mailbox(
         }
     }
     Ok(ingested)
+}
+
+// ── The port the route asks through ─────────────────────────────────────────
+
+/// Both connectors, one pass, wired to what the binary already holds.
+///
+/// The scheduled loop and the "check now" button go through this same struct
+/// rather than each calling the two sweeps in their own order. Two callers with
+/// their own idea of what a sync is, is how the button and the timer start
+/// disagreeing about what happened.
+pub struct AccountSyncer {
+    repo: Arc<dyn ContextRepository>,
+    pipeline: Arc<IngestPipeline>,
+    secrets: Arc<dyn SecretRepository>,
+}
+
+impl AccountSyncer {
+    pub fn new(
+        repo: Arc<dyn ContextRepository>,
+        pipeline: Arc<IngestPipeline>,
+        secrets: Arc<dyn SecretRepository>,
+    ) -> Self {
+        Self {
+            repo,
+            pipeline,
+            secrets,
+        }
+    }
+
+    /// Calendar then mail, summed.
+    ///
+    /// Sequential rather than joined: they compete for the same uplink and the
+    /// same CPU, and on a Jetson two protocol conversations at once is a load
+    /// spike for no latency the household would notice.
+    pub async fn run(&self, now: DateTime<Utc>) -> Result<AccountSyncSummary> {
+        let calendars = sync_calendars(
+            self.repo.clone(),
+            self.pipeline.clone(),
+            self.secrets.clone(),
+            now,
+        )
+        .await?;
+        let mail = sync_mail(
+            self.repo.clone(),
+            self.pipeline.clone(),
+            self.secrets.clone(),
+            now,
+        )
+        .await?;
+        Ok(AccountSyncSummary {
+            sources: calendars.sources + mail.sources,
+            unchanged: calendars.unchanged + mail.unchanged,
+            ingested: calendars.ingested + mail.ingested,
+            needs_reauth: calendars.needs_reauth + mail.needs_reauth,
+            failed: calendars.failed + mail.failed,
+            paused: calendars.paused + mail.paused,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl AccountSync for AccountSyncer {
+    async fn sync_now(&self) -> Result<AccountSyncSummary> {
+        self.run(Utc::now()).await
+    }
 }

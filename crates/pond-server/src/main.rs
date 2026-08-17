@@ -3512,6 +3512,10 @@ async fn run_server(
     //    window of recent household facts to reason over, this wants every
     //    event exactly once so nothing is silently dropped by a ring that
     //    wrapped.
+    // Hoisted out of the block below so the router can reach it: the sweep and
+    // the "check now" route must be the SAME syncer, or the button and the
+    // timer become two implementations of one word.
+    let mut account_syncer: Option<Arc<dyn pond_core::context::ports::AccountSync>> = None;
     {
         let context_repo: Arc<dyn pond_core::context::ports::ContextRepository> = Arc::new(
             pond_infra::sqlite_context::SqliteContextRepository::new(
@@ -3557,21 +3561,18 @@ async fn run_server(
         // nearly free, and anything faster is load on somebody else's server
         // for no new information.
         if let Some(secrets) = secret_repo.clone() {
-            let sync_repo = context_repo.clone();
-            let sync_pipeline = pipeline.clone();
+            let syncer = Arc::new(pond_server::account_sync::AccountSyncer::new(
+                context_repo.clone(),
+                pipeline.clone(),
+                secrets.clone(),
+            ));
+            account_syncer = Some(syncer.clone());
             tokio::spawn(async move {
                 const FIRST_RUN_DELAY: std::time::Duration = std::time::Duration::from_secs(90);
                 const INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
                 tokio::time::sleep(FIRST_RUN_DELAY).await;
                 loop {
-                    match pond_server::account_sync::sync_calendars(
-                        sync_repo.clone(),
-                        sync_pipeline.clone(),
-                        secrets.clone(),
-                        chrono::Utc::now(),
-                    )
-                    .await
-                    {
+                    match syncer.run(chrono::Utc::now()).await {
                         Ok(report) if report.sources > 0 => tracing::info!(
                             sources = report.sources,
                             unchanged = report.unchanged,
@@ -3579,36 +3580,13 @@ async fn run_server(
                             needs_reauth = report.needs_reauth,
                             failed = report.failed,
                             paused = report.paused,
-                            "calendar sync"
+                            "account sync"
                         ),
-                        // Silent when no calendar is connected, which is every
-                        // pond until somebody connects one. A half-hourly line
+                        // Silent when nothing is connected, which is every pond
+                        // until somebody connects something. A half-hourly line
                         // saying "nothing" is how a log stops being read.
                         Ok(_) => {}
-                        Err(e) => tracing::warn!(error = %e, "calendar sync could not run"),
-                    }
-                    // Mail after calendar, in the same task rather than a
-                    // second one: they compete for the same narrow uplink and
-                    // the same CPU, and two timers drifting into each other on
-                    // a Jetson is a self-inflicted load spike.
-                    match pond_server::account_sync::sync_mail(
-                        sync_repo.clone(),
-                        sync_pipeline.clone(),
-                        secrets.clone(),
-                        chrono::Utc::now(),
-                    )
-                    .await
-                    {
-                        Ok(report) if report.sources > 0 => tracing::info!(
-                            sources = report.sources,
-                            ingested = report.ingested,
-                            needs_reauth = report.needs_reauth,
-                            failed = report.failed,
-                            paused = report.paused,
-                            "mail sync"
-                        ),
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(error = %e, "mail sync could not run"),
+                        Err(e) => tracing::warn!(error = %e, "account sync could not run"),
                     }
                     tokio::time::sleep(INTERVAL).await;
                 }
@@ -3840,6 +3818,7 @@ async fn run_server(
         // on a pond where nothing is going to refill, which is a lie that reads
         // as success -- the caller waits for a rebuild that never happens.
         index_reindex: index_sweep_running.then(|| index_reindex_requested.clone()),
+        account_sync: account_syncer.clone(),
         sensor_storage,
         camera_storage,
         prompt_template_dir: Some(data_dir.join("prompts")),

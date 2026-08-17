@@ -11,6 +11,7 @@ import {
   type CompactionReport,
   type ContextIndexHealth,
   type ContextIndexRebuild,
+  type AccountSyncSummary,
   type ContextSource,
   type Device,
   type DiskUsage,
@@ -251,7 +252,7 @@ export class PondApiClient {
   }
 
   private get<T>(path: string): Promise<T>                       { return this.request<T>("GET", path); }
-  private post<T>(path: string, body?: unknown): Promise<T>       { return this.request<T>("POST", path, body); }
+  private post<T>(path: string, body?: unknown, timeout?: number): Promise<T> { return this.request<T>("POST", path, body, timeout); }
   private put<T>(path: string, body?: unknown): Promise<T>        { return this.request<T>("PUT", path, body); }
   private patch<T = void>(path: string, body?: unknown): Promise<T> { return this.request<T>("PATCH", path, body); }
   private del<T = void>(path: string): Promise<T>                 { return this.request<T>("DELETE", path); }
@@ -727,6 +728,18 @@ export class PondApiClient {
           }
         : {}),
     });
+  }
+
+  /**
+   * Pull every connected account now, instead of waiting for the half-hourly
+   * sweep. Answers with what the pass did, so a person who just typed in a
+   * password learns whether it worked.
+   */
+  syncContextSources(): Promise<AccountSyncSummary> {
+    // Longer than the default: a sync is several HTTP round trips to somebody
+    // else's server, and timing out at 30s would report a failure for a pass
+    // that was still going.
+    return this.post("/api/v1/context/sync", {}, 120_000);
   }
 
   /** Disconnect a source. Its items go with it, and the reply says how many. */

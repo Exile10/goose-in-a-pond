@@ -80,19 +80,35 @@ export const PROVIDERS: ProviderOption[] = [
   },
 ];
 
-/** How a source's status should read to a person, and how urgently. */
-export function describeStatus(status: string): {
+/** How a source's status should read to a person, and how urgently.
+ *
+ * `lastSync` matters as much as the status here. `connected` is the state a
+ * source is CREATED in, before anything has run, so reporting it as "working,
+ * checked recently" beside a "not checked yet" line was the card contradicting
+ * itself on the one screen where somebody is trying to find out whether their
+ * password took. */
+export function describeStatus(
+  status: string,
+  lastSync?: string | null,
+): {
   label: string;
   tone: "ok" | "warn" | "muted";
   detail: string;
 } {
   switch (status) {
     case "connected":
-      return {
-        label: "Connected",
-        tone: "ok",
-        detail: "Working. The pond checked recently.",
-      };
+      return lastSync
+        ? {
+            label: "Connected",
+            tone: "ok",
+            detail: "Working. The pond read this account and found what it expected.",
+          }
+        : {
+            label: "Not checked yet",
+            tone: "muted",
+            detail:
+              "Saved, but the pond has not read this account yet, so the password is still unproven. Check now to find out.",
+          };
     case "needs_reauth":
       return {
         label: "Needs attention",

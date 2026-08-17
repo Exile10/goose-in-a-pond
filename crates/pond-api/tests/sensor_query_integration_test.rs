@@ -84,6 +84,7 @@ async fn make_harness() -> Harness {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         // The real store, so the aggregate SQL and the TEXT range comparison
         // are what the assertions actually exercise.
         sensor_storage: Arc::new(SqliteSensorStorage::new(logs.clone())),
