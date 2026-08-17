@@ -116,6 +116,38 @@ carries the underlying error.
 
 ---
 
+## Testing without hardware
+
+`matter-server/` can be a Matter *device* as well as drive one, so testing needs
+nothing external — no Google Matter Virtual Device, no bulb:
+
+```bash
+cd matter-server && npm run virtual-device
+```
+
+It prints a pairing code and waits. Pair it from the Devices tab, then drive it
+from chat ("turn off the light", "set the light to 40%") and watch the device
+process report what it was told:
+
+```
+  [device] power  -> on
+  [device] level  -> 102 (40%)
+```
+
+Two lines, one from each side, is the check worth making: GIAP reporting success
+and the device reporting the same change are different claims, and only the
+second one means the command arrived.
+
+Its fabric is temporary, so stopping and restarting gives you a fresh, unpaired
+device. It binds Matter port 5541 to stay out of the controller's way. Remove it
+from the Devices tab when finished, or it will show as offline once stopped.
+
+If you would rather use Google's Matter Virtual Device app, it works the same
+way — but it is a separate download, cannot be scripted, and an empty Controller
+tab in it is not something GIAP can diagnose.
+
+---
+
 ## Commissioning
 
 A device is paired by its setup code, entered in **Register device**. A QR

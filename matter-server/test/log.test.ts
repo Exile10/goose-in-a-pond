@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { redactSetupCode, setupCodeKind } from "../src/log.js";
+import { describeError, redactSetupCode, setupCodeKind } from "../src/log.js";
 
 describe("setup code redaction", () => {
   // A Matter pairing code grants fabric access. A leaked one in a log file is a
@@ -47,5 +47,41 @@ describe("setup code redaction", () => {
     expect(setupCodeKind("3497-011-2332")).toBe("pairing_code");
     expect(setupCodeKind("20202021")).toBe("passcode");
     expect(setupCodeKind("nonsense")).toBe("unknown");
+  });
+});
+
+describe("error description", () => {
+  it("renders the whole cause chain, not just the outermost layer", () => {
+    // The bug this exists for: a failed discovery reported "discovery of node
+    // discovery failed" and dropped the cause, which is the only part that says
+    // what to do about it.
+    const cause = new Error("no usable network interface");
+    const wrapped = new Error("discovery of node discovery failed", { cause });
+
+    const described = describeError(wrapped);
+    expect(described).toContain("no usable network interface");
+    expect(described).toContain("discovery of node");
+  });
+
+  it("does not repeat a message already embedded in its wrapper", () => {
+    const cause = new Error("EMSGSIZE");
+    expect(describeError(new Error("EMSGSIZE", { cause }))).toBe("EMSGSIZE");
+  });
+
+  it("survives a cyclic chain", () => {
+    const a = new Error("a") as Error & { cause?: unknown };
+    const b = new Error("b", { cause: a }) as Error & { cause?: unknown };
+    a.cause = b;
+    expect(describeError(b)).toBe("b: a");
+  });
+
+  it("redacts the chain, not only the outermost message", () => {
+    const cause = new Error("PASE failed for MT:Y.K9042C00KA0648G00");
+    const described = describeError(new Error("commissioning failed", { cause }));
+    expect(described).not.toContain("MT:");
+  });
+
+  it("always says something", () => {
+    expect(describeError(new Error(""))).toBe("an error with no message");
   });
 });

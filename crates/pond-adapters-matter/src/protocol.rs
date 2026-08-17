@@ -265,6 +265,58 @@ pub struct WireLog {
     pub kind: String,
     #[serde(default)]
     pub message: String,
+    /// The record's typed fields. Relayed as one rendered string rather than as
+    /// `tracing` fields, which have to be known at compile time — dropping them
+    /// entirely turned "a request failed" into the whole account of a failure
+    /// whose op, error code and reason the controller had all supplied.
+    #[serde(default)]
+    pub fields: Option<Value>,
+}
+
+impl WireLog {
+    /// Re-emit this record into `tracing` at the level it names.
+    ///
+    /// The whole reason the controller logs NDJSON rather than prose: a relay
+    /// that cannot tell an error from a debug line has to flatten everything to
+    /// one level, and a controller whose failures arrive at `debug` is most of
+    /// the way back to being silent.
+    pub fn relay(&self) {
+        let fields = self.rendered_fields();
+        let message = if fields.is_empty() {
+            redact_setup_code(&self.message)
+        } else {
+            format!("{} ({fields})", redact_setup_code(&self.message))
+        };
+        let kind = &self.kind;
+        match self.level.as_str() {
+            "error" => {
+                tracing::error!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
+            }
+            "warn" => {
+                tracing::warn!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
+            }
+            "info" => {
+                tracing::info!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
+            }
+            _ => tracing::debug!(kind = %kind, source = "controller", "{message}"),
+        }
+    }
+
+    /// `k=v k=v`, redacted, or empty when there are none.
+    pub fn rendered_fields(&self) -> String {
+        let Some(Value::Object(map)) = &self.fields else {
+            return String::new();
+        };
+        let rendered = map
+            .iter()
+            .map(|(k, v)| match v {
+                Value::String(s) => format!("{k}={s}"),
+                other => format!("{k}={other}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        redact_setup_code(&rendered)
+    }
 }
 
 /// A `device_availability` event.
@@ -522,6 +574,47 @@ mod tests {
         assert_eq!(setup_code_kind("3497-011-2332"), "pairing_code");
         assert_eq!(setup_code_kind("20202021"), "passcode");
         assert_eq!(setup_code_kind("nonsense"), "unknown");
+    }
+
+    #[test]
+    fn a_relayed_record_carries_its_fields() {
+        // The bug this exists for: the relay read level, kind and message and
+        // dropped `fields`, so a controller that had reported the op, the error
+        // code and the reason arrived in the log as "a request failed".
+        let record: WireLog = serde_json::from_value(json!({
+            "level": "warn",
+            "kind": "op_failed",
+            "message": "a request failed",
+            "fields": { "op": "discover", "error_code": "internal", "duration_ms": 12 },
+        }))
+        .unwrap();
+
+        let fields = record.rendered_fields();
+        assert!(fields.contains("op=discover"), "got: {fields}");
+        assert!(fields.contains("error_code=internal"), "got: {fields}");
+        assert!(fields.contains("duration_ms=12"), "got: {fields}");
+    }
+
+    #[test]
+    fn a_relayed_record_without_fields_renders_nothing_extra() {
+        let record: WireLog =
+            serde_json::from_value(json!({ "level": "info", "kind": "ready", "message": "up" }))
+                .unwrap();
+        assert_eq!(record.rendered_fields(), "");
+    }
+
+    #[test]
+    fn relayed_fields_are_redacted_too() {
+        // Fields are the likeliest place for a code to travel, since that is
+        // where structured values go.
+        let record: WireLog = serde_json::from_value(json!({
+            "level": "warn",
+            "kind": "op_failed",
+            "message": "a request failed",
+            "fields": { "error": "PASE failed for MT:Y.K9042C00KA0648G00" },
+        }))
+        .unwrap();
+        assert!(!record.rendered_fields().contains("MT:"));
     }
 
     #[test]

@@ -104,10 +104,30 @@ export class Controller {
   /** The controller's fabric, for the operator reading logs. */
   fabricId(): number | null {
     for (const peer of this.#node.peers) {
-      const index = peer.peerAddress?.fabricIndex;
-      if (index !== undefined) return Number(index);
+      // Guarded for the same reason as `peerNodeId`: reading the address of a
+      // node that has not joined a fabric throws.
+      try {
+        const index = peer.peerAddress?.fabricIndex;
+        if (index !== undefined) return Number(index);
+      } catch {
+        continue;
+      }
     }
     return null;
+  }
+
+  /**
+   * Wire up every commissioned peer that is not already wired.
+   *
+   * Called on each `subscribe`, which the bridge sends on every connect and
+   * reconnect. Belt and braces for the peers that never pass through the `added`
+   * handler in a commissioned state: one discovered as commissionable and then
+   * paired arrives as `added` before it has a node id, and is skipped there.
+   */
+  observeCommissioned(): void {
+    for (const peer of this.#node.peers) {
+      if (peerNodeId(peer) !== undefined) this.#observe(peer);
+    }
   }
 
   /** Every commissioned node, as GIAP devices. */
@@ -196,6 +216,9 @@ export class Controller {
     if (name !== undefined && name.trim().length > 0) {
       device.name = name.trim();
     }
+    // It arrived at `added` without a node id, so it was skipped there.
+    this.#observe(peer);
+
     log.info("commission_succeeded", "device joined the fabric", {
       device_id: device.id,
       device_type: device.device_type,
@@ -255,7 +278,16 @@ export class Controller {
               `Matter device '${deviceId}' does not accept ${action.command}`,
             );
           }
-          await command(action.payload);
+          // A command taking no fields must be invoked with NO argument. matter.js
+          // validates the request against the cluster schema and rejects `{}` with
+          // "Expected void, got object" — so On, Off, LockDoor and UnlockDoor all
+          // failed while the commands that do take fields worked, which is a very
+          // confusing half-working state to debug from the outside.
+          // Cast because the untyped `commandsOf` signature demands an argument
+          // while the cluster schema for these commands forbids one.
+          const invoke = command as (args?: Record<string, unknown>) => Promise<unknown>;
+          const hasFields = Object.keys(action.payload).length > 0;
+          await (hasFields ? invoke(action.payload) : invoke());
         } else {
           await endpoint.setStateOf(action.cluster, { [action.attribute]: action.value });
         }
@@ -292,22 +324,31 @@ export class Controller {
   }
 
   #watchPeers(): void {
-    for (const peer of this.#node.peers) {
-      this.#observe(peer);
-    }
-    this.#node.peers.added.on(peer => {
-      this.#observe(peer);
-      const nodeId = peerNodeId(peer);
-      if (nodeId !== undefined) {
+    this.observeCommissioned();
+    // Both handlers are wrapped, and both run on matter.js's own callbacks: an
+    // exception escaping one does not merely lose an event, it takes down the
+    // discovery or subscription that fired it.
+    this.#node.peers.added.on(peer =>
+      guard("peer_added", () => {
+        // Commissionable-but-not-commissioned nodes arrive here during every
+        // discovery. They are not devices, and they are not merely uninteresting
+        // — reading their structure throws, and this handler runs inside
+        // matter.js's mDNS listener, so throwing here fails the discovery.
+        const nodeId = peerNodeId(peer);
+        if (nodeId === undefined) return;
+
+        this.#observe(peer);
         this.#events.deviceAdded(nodeToDevice(snapshotOf(peer, nodeId)));
-      }
-    });
-    this.#node.peers.deleted.on(peer => {
-      const nodeId = peerNodeId(peer);
-      if (nodeId === undefined) return;
-      this.#observed.delete(peer.id);
-      this.#events.deviceRemoved(deviceIdForNode(nodeId));
-    });
+      }),
+    );
+    this.#node.peers.deleted.on(peer =>
+      guard("peer_deleted", () => {
+        const nodeId = peerNodeId(peer);
+        if (nodeId === undefined) return;
+        this.#observed.delete(peer.id);
+        this.#events.deviceRemoved(deviceIdForNode(nodeId));
+      }),
+    );
   }
 
   /**
@@ -321,8 +362,12 @@ export class Controller {
     if (this.#observed.has(peer.id)) return;
     this.#observed.add(peer.id);
 
-    peer.lifecycle.online.on(() => this.#announceAvailability(peer, true));
-    peer.lifecycle.offline.on(() => this.#announceAvailability(peer, false));
+    peer.lifecycle.online.on(() =>
+      guard("peer_online", () => this.#announceAvailability(peer, true)),
+    );
+    peer.lifecycle.offline.on(() =>
+      guard("peer_offline", () => this.#announceAvailability(peer, false)),
+    );
 
     for (const endpoint of peer.endpoints) {
       for (const cluster of Object.keys(endpoint.behaviors.supported)) {
@@ -348,22 +393,25 @@ export class Controller {
       const on = (observable as { on?: unknown }).on;
       if (typeof on !== "function") continue;
 
-      (on as (handler: (value: unknown) => void) => void).call(observable, value => {
-        const nodeId = peerNodeId(peer);
-        if (nodeId === undefined) return;
+      (on as (handler: (value: unknown) => void) => void).call(observable, value =>
+        guard("attribute_changed", () => {
+          const nodeId = peerNodeId(peer);
+          if (nodeId === undefined) return;
 
-        const reading = readingFor(nodeId, cluster, attribute, value);
-        if (reading !== undefined) {
-          this.#events.reading(reading);
-          return;
-        }
-        // Not a sensor value, but a change to a cluster that shapes what the device
-        // IS — a name, a device type, a newly reported cluster. The device is
-        // republished so the registry's typing and capabilities stay true.
-        if (cluster === "basicInformation" || cluster === "descriptor") {
-          this.#events.deviceUpdated(nodeToDevice(snapshotOf(peer, nodeId)));
-        }
-      });
+          const reading = readingFor(nodeId, cluster, attribute, value);
+          if (reading !== undefined) {
+            this.#events.reading(reading);
+            return;
+          }
+          // Not a sensor value, but a change to a cluster that shapes what the
+          // device IS — a name, a device type, a newly reported cluster. The
+          // device is republished so the registry's typing and capabilities
+          // stay true.
+          if (cluster === "basicInformation" || cluster === "descriptor") {
+            this.#events.deviceUpdated(nodeToDevice(snapshotOf(peer, nodeId)));
+          }
+        }),
+      );
     }
   }
 
@@ -374,10 +422,42 @@ export class Controller {
   }
 }
 
-/** The peer's Matter node id, or `undefined` while it is only commissionable. */
+/**
+ * The peer's Matter node id, or `undefined` while it is only commissionable.
+ *
+ * The `try` is load-bearing, and this is worth reading before anyone removes it.
+ * `peerAddress` reads a private cached field, and on a node that has not joined
+ * a fabric matter.js THROWS ("Cannot read private member #cachedPeerAddress…")
+ * rather than returning undefined. Discovery adds exactly such nodes to the peer
+ * collection, so an unguarded read here threw inside matter.js's own mDNS
+ * listener — which killed the discovery that raised it. The symptom was
+ * `discover` reporting nothing and every commission failing with "discovery of
+ * node discovery failed", on a device that `dns-sd` could see perfectly well.
+ * Commissioning could not succeed at all.
+ */
 function peerNodeId(peer: ClientNode): bigint | undefined {
-  const nodeId = peer.peerAddress?.nodeId;
-  return nodeId === undefined ? undefined : BigInt(nodeId);
+  try {
+    const nodeId = peer.peerAddress?.nodeId;
+    return nodeId === undefined ? undefined : BigInt(nodeId);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Run `body`, logging rather than propagating anything it throws.
+ *
+ * Every caller is a matter.js observer, and matter.js invokes those from inside
+ * its own operations — so an exception that escapes does not just lose one
+ * event, it fails the discovery or subscription that raised it. Losing an event
+ * and logging why is strictly better than that.
+ */
+function guard(kind: string, body: () => void): void {
+  try {
+    body();
+  } catch (error) {
+    log.warn(kind, "a controller event handler failed", { error: describeError(error) });
+  }
 }
 
 function snapshotOf(peer: ClientNode, nodeId: bigint): NodeSnapshot {
