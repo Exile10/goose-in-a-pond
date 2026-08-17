@@ -1,0 +1,22 @@
+[package]
+name = "pond-adapters-imap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pond-core     = { path = "../pond-core" }
+anyhow        = { workspace = true }
+async-imap    = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+base64        = { workspace = true }
+chrono        = { workspace = true }
+futures       = { workspace = true }
+rustls        = { workspace = true }
+rustls-pki-types = "1"
+tokio         = { workspace = true }
+tokio-rustls  = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
+tracing       = { workspace = true }
+webpki-roots  = "0.26"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

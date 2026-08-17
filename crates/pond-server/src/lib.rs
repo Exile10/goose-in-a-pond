@@ -3,7 +3,7 @@
 //! Exposing key modules here allows integration tests in `tests/` to import
 //! them without duplicating code from `main.rs`.
 
-pub mod calendar_sync;
+pub mod account_sync;
 pub mod hf_cache_migration;
 pub mod llm_memory_consolidator;
 pub mod llm_memory_extractor;

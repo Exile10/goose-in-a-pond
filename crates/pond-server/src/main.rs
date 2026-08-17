@@ -3564,7 +3564,7 @@ async fn run_server(
                 const INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
                 tokio::time::sleep(FIRST_RUN_DELAY).await;
                 loop {
-                    match pond_server::calendar_sync::sync_calendars(
+                    match pond_server::account_sync::sync_calendars(
                         sync_repo.clone(),
                         sync_pipeline.clone(),
                         secrets.clone(),
@@ -3586,6 +3586,29 @@ async fn run_server(
                         // saying "nothing" is how a log stops being read.
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "calendar sync could not run"),
+                    }
+                    // Mail after calendar, in the same task rather than a
+                    // second one: they compete for the same narrow uplink and
+                    // the same CPU, and two timers drifting into each other on
+                    // a Jetson is a self-inflicted load spike.
+                    match pond_server::account_sync::sync_mail(
+                        sync_repo.clone(),
+                        sync_pipeline.clone(),
+                        secrets.clone(),
+                        chrono::Utc::now(),
+                    )
+                    .await
+                    {
+                        Ok(report) if report.sources > 0 => tracing::info!(
+                            sources = report.sources,
+                            ingested = report.ingested,
+                            needs_reauth = report.needs_reauth,
+                            failed = report.failed,
+                            paused = report.paused,
+                            "mail sync"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "mail sync could not run"),
                     }
                     tokio::time::sleep(INTERVAL).await;
                 }
