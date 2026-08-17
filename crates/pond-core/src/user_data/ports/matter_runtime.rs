@@ -30,7 +30,7 @@ pub enum MatterState {
     Disabled,
     /// Enabled and converging: installing or starting the controller, or
     /// opening the WebSocket. The first enable on a fresh install downloads a
-    /// python-matter-server venv, so this can legitimately last minutes.
+    /// controller's dependencies, so this can legitimately last minutes.
     Connecting,
     /// Enabled and connected — commissioning and device control are live.
     Connected,

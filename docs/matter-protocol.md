@@ -19,9 +19,9 @@ in, what a node's device type is — lives in the controller, because that is wh
 matter.js's typed cluster models are. The Rust adapter does not know what a
 cluster is, and cannot be made wrong by a Matter detail.
 
-The predecessor protocol (python-matter-server's schema 11) was the other way
-round, which is why the adapter used to hold a hand-maintained table of decimal
-cluster ids, parse `"1/6/0"` attribute paths, and convert units by hand.
+The predecessor protocol was the other way round, which is why the adapter used
+to hold a hand-maintained table of decimal cluster ids, parse `"1/6/0"` attribute
+paths, and convert units by hand.
 
 ---
 
@@ -37,8 +37,8 @@ own. GIAP only ever auto-manages a controller on `127.0.0.1` (see
 for. An operator who wants a shared controller runs their own and points
 `matter_ws_url` at it — a deliberate act rather than a default.
 
-The path is `/giap` rather than `/ws` on purpose: a stale address left pointing
-at a python-matter-server fails at the handshake instead of half-working.
+The path names the protocol on purpose: an address left over from an earlier
+release fails at the handshake instead of half-working.
 
 ---
 

@@ -4540,7 +4540,7 @@ async fn update_settings(
     // controller. The reconciler treats "enabled but not yet Connected" as
     // needing a restart, so an unconditional send meant that ANY unrelated
     // save during the first controller install — renaming the home, changing a
-    // model — tore down a multi-minute `pip install` and started it again.
+    // model — tore down a multi-minute dependency install and started it again.
     // Repeat that a few times and the Devices panel sits on "Starting..."
     // forever.
     //

@@ -47,13 +47,11 @@ pub struct Greeting {
 
 /// Check a greeting frame, naming what was found when it is not ours.
 ///
-/// The failure this exists for is an install whose `matter_ws_url` still points
-/// at a python-matter-server: without the check the first `subscribe` fails
-/// somewhere inside serde with a message about an unexpected field, which tells
-/// the user nothing they can act on. The path also differs (`/giap` rather than
-/// `/ws`), so in practice that install fails at the handshake — but a controller
-/// reachable on the right path and speaking the wrong protocol is exactly the
-/// case a version number is for.
+/// The failure this exists for is an address pointing at a server that is not
+/// this controller: without the check the first `subscribe` fails somewhere
+/// inside serde with a message about an unexpected field, which tells the user
+/// nothing they can act on. A server reachable on the right path and speaking
+/// the wrong protocol is exactly the case the name and version are for.
 pub fn check_greeting(raw: &str) -> Result<Greeting, String> {
     let greeting: Greeting = serde_json::from_str(raw).map_err(|_| {
         "the controller's greeting was not JSON this version understands".to_string()
@@ -514,12 +512,12 @@ mod tests {
         );
         assert!(ours.is_ok());
 
-        // The failure this exists for: an install still pointed at a
-        // python-matter-server, whose greeting is a bare server-info frame.
-        let python = check_greeting(r#"{"fabric_id":1,"schema_version":11}"#).unwrap_err();
+        // Some other WebSocket server on the configured address, greeting with
+        // a frame of its own shape.
+        let stranger = check_greeting(r#"{"fabric_id":1,"schema_version":11}"#).unwrap_err();
         assert!(
-            python.contains("Matter controller address"),
-            "must tell the user what to fix, got: {python}"
+            stranger.contains("Matter controller address"),
+            "must tell the user what to fix, got: {stranger}"
         );
 
         let newer = check_greeting(r#"{"protocol":"giap-matter","version":99}"#).unwrap_err();
