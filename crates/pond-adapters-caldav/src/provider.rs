@@ -14,8 +14,19 @@
 /// A calendar host this pond knows how to reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CalDavProvider {
-    /// Google Calendar over CalDAV. Needs 2FA plus an app password; the
-    /// account password is refused outright.
+    /// Google Calendar over CalDAV.
+    ///
+    /// **Cannot be connected by this pond, and it is not a configuration
+    /// problem.** Google's CalDAV v2 guide is explicit: "The CalDAV server
+    /// refuses to authenticate a request unless it arrives over HTTPS with
+    /// OAuth 2.0 authentication of a Google Account. Attempting to connect over
+    /// HTTP or using Basic Authentication results in an HTTP 401 Unauthorized
+    /// status code." An app password IS Basic auth, so this preset shipped
+    /// unable to work and returned a 401 that read like a wrong password.
+    ///
+    /// The variant stays so rows already stored against it remain readable and
+    /// disconnectable; [`is_connectable`](Self::is_connectable) is what refuses
+    /// new ones. Gmail over IMAP is unaffected — app passwords work there.
     Google,
     /// iCloud. `SourceKind::Calendar` over CalDAV is the honest ceiling here --
     /// there is no general iCloud API, so this is not a stepping stone to one.
@@ -69,8 +80,9 @@ impl CalDavProvider {
     pub fn setup_hint(&self) -> &'static str {
         match self {
             Self::Google => {
-                "Google needs two-factor turned on, then an app password from your Google \
-                 account's security page. Your normal password will not work."
+                "Google Calendar needs you to sign in with Google, which this pond cannot do \
+                 yet. An app password will not work for it — Google refuses those for \
+                 calendars. Gmail still works under Mail."
             }
             Self::ICloud => {
                 "iCloud needs an app-specific password, created from the Sign-In and Security \
@@ -89,6 +101,16 @@ impl CalDavProvider {
                  account has two-factor turned on."
             }
         }
+    }
+
+    /// Whether a NEW source may be connected for this provider.
+    ///
+    /// Separate from the variant existing at all, because a pond that already
+    /// stored a Google source needs to read and disconnect it, and deleting the
+    /// variant would leave a row nothing could resolve. Refusing at connect
+    /// stops anybody else acquiring one.
+    pub fn is_connectable(&self) -> bool {
+        !matches!(self, Self::Google)
     }
 
     /// Rebuild a provider from what was stored, for a source being re-synced.
@@ -178,5 +200,50 @@ mod tests {
         assert_eq!(CalDavProvider::from_stored("nextcloud", None), None);
         assert_eq!(CalDavProvider::from_stored("custom", None), None);
         assert_eq!(CalDavProvider::from_stored("not-a-provider", None), None);
+    }
+}
+
+#[cfg(test)]
+mod connectability_tests {
+    use super::*;
+
+    /// Google's own CalDAV guide: Basic auth gets a 401, OAuth 2.0 is required.
+    /// Offering it with a password box produced a refusal that read like the
+    /// household had typed the wrong thing.
+    #[test]
+    fn google_calendar_is_not_connectable_with_a_password() {
+        assert!(!CalDavProvider::Google.is_connectable());
+        assert!(
+            CalDavProvider::Google
+                .setup_hint()
+                .contains("sign in with Google"),
+            "the hint must say WHY, or it reads as a bug in the pond"
+        );
+    }
+
+    #[test]
+    fn every_other_preset_is_connectable() {
+        for p in [
+            CalDavProvider::ICloud,
+            CalDavProvider::Fastmail,
+            CalDavProvider::Nextcloud {
+                base_url: "https://x".into(),
+            },
+            CalDavProvider::Custom {
+                base_url: "https://x".into(),
+            },
+        ] {
+            assert!(p.is_connectable(), "{p:?}");
+        }
+    }
+
+    /// A stored Google row must still resolve, or a household cannot disconnect
+    /// the thing this change stops them creating.
+    #[test]
+    fn a_stored_google_source_can_still_be_rebuilt() {
+        assert_eq!(
+            CalDavProvider::from_stored("google", None),
+            Some(CalDavProvider::Google)
+        );
     }
 }

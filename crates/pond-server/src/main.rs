@@ -410,6 +410,21 @@ enum MemoryAction {
 }
 
 fn main() -> Result<()> {
+    // Name the TLS provider before anything can ask rustls to guess.
+    //
+    // This workspace enables BOTH of rustls' crypto backends without meaning
+    // to: `aws_lc_rs` from the root Cargo.toml and `ring` from hyper-rustls via
+    // reqwest. rustls refuses to pick between them, and every entry point that
+    // infers a provider panics rather than returning an error — on whatever
+    // background worker happened to touch TLS first, which is a crash with no
+    // relationship to the code that caused it.
+    //
+    // Installing one here makes the answer deterministic for the whole process,
+    // including dependencies that will hit the inferring path later. `Err` means
+    // somebody already installed one, which is equally fine and not worth
+    // failing a boot over.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);

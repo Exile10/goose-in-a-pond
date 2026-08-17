@@ -14893,6 +14893,26 @@ async fn connect_context_source(
         ));
     }
 
+    // A provider that cannot possibly authenticate is refused HERE, with the
+    // reason, rather than stored and left to fail every half hour with a 401
+    // that reads like a mistyped password. Google Calendar over CalDAV is the
+    // case: its own guide requires OAuth 2.0 and rejects Basic auth.
+    if kind == SourceKind::Calendar {
+        if let Some(provider) =
+            pond_adapters_caldav::CalDavProvider::from_stored(body.provider.trim(), Some("x"))
+        {
+            if !provider.is_connectable() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": provider.setup_hint(),
+                        "provider": body.provider.trim(),
+                    })),
+                ));
+            }
+        }
+    }
+
     let now = chrono::Utc::now();
     // Deterministic id, so connecting the same device twice is an update rather
     // than a second source racing the first for the same events.

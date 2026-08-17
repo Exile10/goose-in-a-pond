@@ -46,6 +46,21 @@ describe("provider list", () => {
     }
   });
 
+  /**
+   * The reverse of the drift check above. `from_stored` still knows `google`
+   * so a stored row stays readable, which means "the backend parses it" is no
+   * longer enough to justify offering it — the UI must not list a provider the
+   * connect route refuses.
+   */
+  it("does not offer a calendar provider the backend refuses to connect", () => {
+    const rust = rustSource("crates/pond-adapters-caldav/src/provider.rs");
+    const unconnectable = rust.includes("!matches!(self, Self::Google)");
+    expect(unconnectable, "is_connectable no longer refuses Google").toBe(true);
+    expect(
+      PROVIDERS.filter((p) => p.kind === "calendar").map((p) => p.id),
+    ).not.toContain("google");
+  });
+
   /** The hint is the whole reason a household gets past the password box. */
   it("gives every provider a setup hint", () => {
     for (const p of PROVIDERS) {
