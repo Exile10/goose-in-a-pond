@@ -98,6 +98,63 @@ pub struct DeviceControlMcpServer {
 
 /// The description as a sentence a model can act on. JSON would be smaller and
 /// worse: the point is that the next tool call is obvious from reading it.
+/// The state each operation is asking the device to reach.
+///
+/// A verb and the state it produces are different words for the same success:
+/// Start ends in Running, Pause in Paused. Comparing the two directly reports
+/// every successful start as a mismatch.
+fn state_intended_by(operation: &str) -> Option<&'static str> {
+    match operation.to_ascii_lowercase().as_str() {
+        "start" | "resume" => Some("running"),
+        "stop" => Some("stopped"),
+        "pause" => Some("paused"),
+        _ => None,
+    }
+}
+
+/// Is this one of the states Operational State itself defines?
+///
+/// Separate from the verbs above because they are different vocabularies: "stop"
+/// is a verb and "stopped" is a state, and a device may name a state neither list
+/// contains. Only a standard state can contradict a verb; a device's own word for
+/// what it is doing cannot.
+fn is_standard_state(state: &str) -> bool {
+    matches!(
+        state.to_ascii_lowercase().as_str(),
+        "stopped" | "running" | "paused" | "error"
+    )
+}
+
+/// How an operation's result reads.
+///
+/// The state the device ended up in, which need not be the one that was asked for:
+/// a device may accept Start and stay Stopped -- Google's Matter Virtual Device
+/// washer does exactly that -- and reporting "operation=start" there states the
+/// request as the result. A device that did not reach the state its verb asks for
+/// is said so plainly, because a bare "stopped" cannot be told from an error.
+///
+/// A device wording a state its own way ("washing" rather than "running") is taken
+/// at that word and not called a mismatch: only a state contradicting the verb is.
+fn render_operation(requested: &str, became: Option<&str>) -> String {
+    let Some(became) = became else {
+        // Nothing said about where it ended up: the request is all that is known.
+        return format!("operation={requested}");
+    };
+
+    let contradicted = match state_intended_by(requested) {
+        // A state the cluster defines, and not the one this verb asks for.
+        Some(wanted) => is_standard_state(became) && !became.eq_ignore_ascii_case(wanted),
+        // A verb with no state of its own to check against.
+        None => false,
+    };
+
+    if contradicted {
+        format!("asked it to {requested}, but it reports being {became}")
+    } else {
+        format!("operation={became}")
+    }
+}
+
 fn render_description(d: &DeviceDescription) -> String {
     let mut out = format!("{} ({})", d.device_id, d.device_type);
 
@@ -378,7 +435,12 @@ impl DeviceControlMcpServer {
                 )));
             };
             match self.control.set_mode(device_id, setting, value).await {
-                Ok(_) => applied.push(format!("{setting}={value}")),
+                // Reported in the device's own words: it answers with the label it
+                // uses, which need not be the spelling the caller typed.
+                Ok(outcome) => match outcome.applied.mode {
+                    Some(mode) => applied.push(format!("{}={}", mode.setting, mode.value)),
+                    None => applied.push(format!("{setting}={value}")),
+                },
                 Err(e) => {
                     return Ok(guidance(format!(
                         "Couldn't set {setting} on '{device_id}': {e}"
@@ -388,7 +450,15 @@ impl DeviceControlMcpServer {
         }
         if let Some(operation) = p.operation.as_deref() {
             match self.control.set_operation(device_id, operation).await {
-                Ok(_) => applied.push(format!("operation={operation}")),
+                // The state the device ended up in, which need not be the one that
+                // was asked for: a device may accept Start and stay Stopped, and
+                // saying "operation=start" there reports the request as the result.
+                // Said plainly, because a model told only "stopped" after asking to
+                // start has to guess whether that is the answer or an error.
+                Ok(outcome) => applied.push(render_operation(
+                    operation,
+                    outcome.applied.operation.as_deref(),
+                )),
                 Err(e) => return Ok(guidance(format!("Couldn't {operation} '{device_id}': {e}"))),
             }
         }
@@ -684,6 +754,49 @@ mod tests {
         // And it says plainly that there is nothing to drive, rather than leaving
         // the model to infer it from an empty list.
         assert!(rendered.contains("Cannot be controlled"), "{rendered}");
+    }
+
+    /// The last place the request was being reported as the result. GIAP said the
+    /// washer was running while the washer said Stopped -- the controller had been
+    /// fixed to answer honestly, and this layer overwrote its answer with the verb
+    /// it had sent.
+    #[test]
+    fn an_operation_reports_the_state_reached_not_the_one_requested() {
+        // What the Matter Virtual Device washer actually does: Start is accepted,
+        // and the state stays Stopped.
+        assert_eq!(
+            render_operation("start", Some("stopped")),
+            "asked it to start, but it reports being stopped"
+        );
+        assert_eq!(
+            render_operation("pause", Some("running")),
+            "asked it to pause, but it reports being running"
+        );
+
+        // A verb and the state it produces are different words for one success, so
+        // neither of these is a mismatch.
+        assert_eq!(
+            render_operation("start", Some("running")),
+            "operation=running"
+        );
+        assert_eq!(
+            render_operation("stop", Some("stopped")),
+            "operation=stopped"
+        );
+        assert_eq!(
+            render_operation("resume", Some("running")),
+            "operation=running"
+        );
+
+        // A device wording a state its own way is taken at its word rather than
+        // accused of disobeying.
+        assert_eq!(
+            render_operation("start", Some("washing")),
+            "operation=washing"
+        );
+
+        // Nothing said about where it ended up: the request is all that is known.
+        assert_eq!(render_operation("stop", None), "operation=stop");
     }
 
     struct StubControl;
