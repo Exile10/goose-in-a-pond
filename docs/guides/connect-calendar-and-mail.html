@@ -1,0 +1,526 @@
+<title>Calendar and Mail Setup</title>
+<style>
+  :root {
+    --paper: #F6F8F7;
+    --raised: #FFFFFF;
+    --ink: #12201C;
+    --ink-soft: #4A5C56;
+    --ink-faint: #7A8A84;
+    --rule: #DCE4E0;
+    --accent: #1F6F63;
+    --accent-soft: #E4EFEC;
+    --amber: #8A5A18;
+    --amber-soft: #F6EEDF;
+    --clay: #8E4232;
+    --clay-soft: #F7E9E5;
+    --code-bg: #10201C;
+    --code-ink: #D8E6E1;
+
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #0E1614;
+      --raised: #16211E;
+      --ink: #E7EFEB;
+      --ink-soft: #A9BAB4;
+      --ink-faint: #74857F;
+      --rule: #253430;
+      --accent: #6FBFAF;
+      --accent-soft: #16302B;
+      --amber: #D9A75B;
+      --amber-soft: #2C2417;
+      --clay: #DE9080;
+      --clay-soft: #2E1C18;
+      --code-bg: #0A1210;
+      --code-ink: #CFE0DA;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --paper: #0E1614;
+    --raised: #16211E;
+    --ink: #E7EFEB;
+    --ink-soft: #A9BAB4;
+    --ink-faint: #74857F;
+    --rule: #253430;
+    --accent: #6FBFAF;
+    --accent-soft: #16302B;
+    --amber: #D9A75B;
+    --amber-soft: #2C2417;
+    --clay: #DE9080;
+    --clay-soft: #2E1C18;
+    --code-bg: #0A1210;
+    --code-ink: #CFE0DA;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap {
+    max-width: 46rem;
+    margin: 0 auto;
+    padding: 4rem 1.5rem 6rem;
+    display: flex;
+    flex-direction: column;
+    gap: 3.5rem;
+  }
+
+  header { display: flex; flex-direction: column; gap: 0.9rem; }
+
+  .eyebrow {
+    font-size: 0.75rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  h1 {
+    font-family: var(--serif);
+    font-size: clamp(2.1rem, 5vw, 2.9rem);
+    line-height: 1.12;
+    margin: 0;
+    font-weight: 600;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+
+  .standfirst {
+    font-size: 1.1rem;
+    color: var(--ink-soft);
+    margin: 0;
+    max-width: 34rem;
+  }
+
+  section { display: flex; flex-direction: column; gap: 1.1rem; }
+
+  h2 {
+    font-family: var(--serif);
+    font-size: 1.5rem;
+    margin: 0;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    text-wrap: balance;
+  }
+
+  h3 {
+    font-size: 0.95rem;
+    margin: 0;
+    font-weight: 650;
+    letter-spacing: 0.01em;
+  }
+
+  p { margin: 0; max-width: 38rem; }
+
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+
+  .callout {
+    background: var(--accent-soft);
+    border-left: 3px solid var(--accent);
+    padding: 1.1rem 1.25rem;
+    border-radius: 0 6px 6px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .callout p { max-width: none; }
+  .callout strong { font-weight: 650; }
+
+  figure { margin: 0; }
+
+  figcaption {
+    font-size: 0.85rem;
+    color: var(--ink-faint);
+    margin-top: 0.7rem;
+    max-width: 34rem;
+  }
+
+  /* SVG presentation ATTRIBUTES do not resolve var(); only CSS declarations
+     do. Every colour in the diagram is therefore set here, or the whole thing
+     renders in default black on both themes. */
+  .flow { width: 100%; height: auto; display: block; }
+  .flow .box { fill: var(--raised); stroke: var(--rule); }
+  .flow .box-accent { fill: var(--accent-soft); stroke: var(--accent); }
+  .flow text { font-family: var(--sans); }
+  .flow .t-strong { fill: var(--ink); font-size: 14px; font-weight: 600; }
+  .flow .t-faint { fill: var(--ink-faint); font-size: 12px; }
+  .flow .t-soft { fill: var(--ink-soft); font-size: 12px; }
+  .flow .t-pond { fill: var(--ink); font-family: var(--serif); font-size: 17px; font-weight: 600; }
+  .flow .t-blocked { fill: var(--clay); font-size: 12px; font-weight: 600; }
+  .flow .arrow { fill: none; stroke: var(--accent); stroke-width: 2; }
+  .flow .arrow-head { fill: var(--accent); }
+  .flow .blocked { fill: none; stroke: var(--clay); stroke-width: 2; stroke-dasharray: 5 5; }
+  .flow .cross { stroke: var(--clay); stroke-width: 2.5; }
+
+  /* Provider picker */
+  .picker {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .picker button {
+    font: inherit;
+    font-size: 0.9rem;
+    font-weight: 550;
+    padding: 0.5rem 0.9rem;
+    border-radius: 999px;
+    border: 1px solid var(--rule);
+    background: var(--raised);
+    color: var(--ink-soft);
+    cursor: pointer;
+    transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+  }
+  .picker button:hover { border-color: var(--accent); color: var(--ink); }
+  .picker button[aria-pressed="true"] {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--paper);
+  }
+  .picker button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .provider { display: none; flex-direction: column; gap: 1.5rem; }
+  .provider.is-shown { display: flex; }
+
+  .card {
+    background: var(--raised);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 1.4rem 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+  }
+
+  .card-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+
+  .tag {
+    font-size: 0.7rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    font-weight: 650;
+    color: var(--ink-faint);
+    font-family: var(--mono);
+  }
+
+  ol.steps {
+    margin: 0;
+    padding-left: 1.3rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+  }
+  ol.steps li { padding-left: 0.2rem; }
+  ol.steps li::marker { color: var(--accent); font-weight: 650; }
+
+  code {
+    font-family: var(--mono);
+    font-size: 0.87em;
+    background: var(--accent-soft);
+    padding: 0.12em 0.36em;
+    border-radius: 3px;
+  }
+
+  pre {
+    background: var(--code-bg);
+    color: var(--code-ink);
+    padding: 1rem 1.1rem;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin: 0;
+    font-size: 0.86rem;
+    line-height: 1.55;
+  }
+  pre code { background: none; padding: 0; color: inherit; font-size: 1em; }
+
+  .table-scroll { overflow-x: auto; }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.94rem;
+    min-width: 30rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.65rem 0.9rem 0.65rem 0;
+    border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  th {
+    font-size: 0.72rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 650;
+  }
+  td:first-child { font-weight: 550; white-space: nowrap; padding-right: 1.4rem; }
+
+  .yes { color: var(--accent); font-weight: 600; }
+  .no { color: var(--clay); font-weight: 600; }
+
+  .status-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .status-list li {
+    display: grid;
+    grid-template-columns: minmax(8.5rem, auto) 1fr;
+    gap: 0.4rem 1.1rem;
+    align-items: baseline;
+  }
+  @media (max-width: 34rem) {
+    .status-list li { grid-template-columns: 1fr; }
+  }
+
+  .pill {
+    font-size: 0.75rem;
+    font-weight: 650;
+    letter-spacing: 0.03em;
+    padding: 0.2rem 0.6rem;
+    border-radius: 999px;
+    justify-self: start;
+    white-space: nowrap;
+  }
+  .pill-ok { background: var(--accent-soft); color: var(--accent); }
+  .pill-warn { background: var(--amber-soft); color: var(--amber); }
+  .pill-pause { background: var(--rule); color: var(--ink-soft); }
+
+  footer {
+    border-top: 1px solid var(--rule);
+    padding-top: 1.5rem;
+    color: var(--ink-faint);
+    font-size: 0.88rem;
+  }
+  footer p { max-width: 38rem; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <span class="eyebrow">Goose in a Pond</span>
+    <h1>Connecting your calendar and mail</h1>
+    <p class="standfirst">Your pond can read your calendar and the subject lines of your mail, so it knows what your week actually looks like. Everything below takes about five minutes per account.</p>
+  </header>
+
+  <section>
+    <h2>First, the one thing that trips everyone up</h2>
+    <p>You will not use your normal password. Every provider here wants an <strong>app-specific password</strong> — a separate password you generate for one app, which you can revoke on its own without changing anything else.</p>
+    <div class="callout">
+      <p><strong>Why it matters.</strong> An app password only opens the one door you point it at. If you ever want the pond to stop reading your mail, you delete that one password and nothing else about your account changes.</p>
+    </div>
+    <p>Most providers only offer app passwords once two-factor authentication is switched on. If you get stuck at that step, that is usually why.</p>
+  </section>
+
+  <section>
+    <h2>What the pond does with what it reads</h2>
+    <figure>
+      <svg class="flow" viewBox="0 0 680 200" role="img" aria-labelledby="flow-title flow-desc">
+        <title id="flow-title">Data flows from your accounts into the pond, and never back out</title>
+        <desc id="flow-desc">Calendar and mail flow one way into the pond. Nothing is ever sent back to your accounts, and no conversation leaves the pond.</desc>
+
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+            <path class="arrow-head" d="M 0 0 L 10 5 L 0 10 z"/>
+          </marker>
+        </defs>
+
+        <rect class="box" x="8" y="30" width="180" height="58" rx="7"/>
+        <text class="t-strong" x="98" y="55" text-anchor="middle">Your calendar</text>
+        <text class="t-faint" x="98" y="74" text-anchor="middle">events, times, places</text>
+
+        <rect class="box" x="8" y="108" width="180" height="58" rx="7"/>
+        <text class="t-strong" x="98" y="133" text-anchor="middle">Your mail</text>
+        <text class="t-faint" x="98" y="152" text-anchor="middle">subjects and senders</text>
+
+        <path class="arrow" d="M 196 59 L 250 59 L 250 92 L 300 92" marker-end="url(#arrow)"/>
+        <path class="arrow" d="M 196 137 L 250 137 L 250 104 L 300 104" marker-end="url(#arrow)"/>
+
+        <rect class="box-accent" x="312" y="62" width="150" height="72" rx="7"/>
+        <text class="t-pond" x="387" y="92" text-anchor="middle">Your pond</text>
+        <text class="t-soft" x="387" y="112" text-anchor="middle">at home, on your desk</text>
+
+        <path class="blocked" d="M 474 98 L 566 98"/>
+        <line class="cross" x1="512" y1="82" x2="528" y2="114"/>
+        <line class="cross" x1="528" y1="82" x2="512" y2="114"/>
+        <text class="t-blocked" x="596" y="94" text-anchor="middle">nothing</text>
+        <text class="t-blocked" x="596" y="110" text-anchor="middle">goes back</text>
+      </svg>
+      <figcaption>The pond reads. It never sends, replies, schedules, deletes, or marks anything as read — and no part of a conversation with your assistant is ever transmitted to a connected account.</figcaption>
+    </figure>
+
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Treatment</th><th>What</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="yes">Kept</span></td>
+            <td>Event title, time, place, who is invited</td>
+          </tr>
+          <tr>
+            <td><span class="yes">Kept</span></td>
+            <td>Subject line, sender, and date</td>
+          </tr>
+          <tr>
+            <td><span class="no">Never read</span></td>
+            <td>The body of any message, and any attachment</td>
+          </tr>
+          <tr>
+            <td><span class="no">Never done</span></td>
+            <td>Sending, replying, deleting, or marking mail read</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Mail bodies are left alone on purpose. A household's mail runs to hundreds of items a week, and keeping the whole of it would bury the things you would actually ask about.</p>
+  </section>
+
+  <section>
+    <h2>Find your provider</h2>
+    <div class="picker" role="group" aria-label="Choose your provider">
+      <button type="button" data-provider="google" aria-pressed="true">Google</button>
+      <button type="button" data-provider="icloud" aria-pressed="false">iCloud</button>
+      <button type="button" data-provider="fastmail" aria-pressed="false">Fastmail</button>
+      <button type="button" data-provider="nextcloud" aria-pressed="false">Nextcloud or other</button>
+    </div>
+
+    <div class="provider is-shown" data-panel="google">
+      <div class="card">
+        <div class="card-head"><h3>Google Calendar</h3><span class="tag">caldav</span></div>
+        <ol class="steps">
+          <li>Turn on 2-Step Verification in your Google account, under Security.</li>
+          <li>On the same Security page, open <strong>App passwords</strong> and create one. Name it something you will recognise, like "Pond".</li>
+          <li>Copy the 16-character password Google shows you. It is only shown once.</li>
+          <li>Run the connect command below with <code>google</code> and that password.</li>
+        </ol>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Gmail</h3><span class="tag">imap</span></div>
+        <ol class="steps">
+          <li>In Gmail, open Settings, then <strong>Forwarding and POP/IMAP</strong>, and switch IMAP on. This step is the one people miss.</li>
+          <li>Use the same app password you created above — one password works for both.</li>
+          <li>Run the connect command with <code>gmail</code>.</li>
+        </ol>
+      </div>
+    </div>
+
+    <div class="provider" data-panel="icloud">
+      <div class="card">
+        <div class="card-head"><h3>iCloud Calendar and Mail</h3><span class="tag">caldav &middot; imap</span></div>
+        <ol class="steps">
+          <li>Sign in to your Apple account and open <strong>Sign-In and Security</strong>.</li>
+          <li>Choose <strong>App-Specific Passwords</strong> and generate one.</li>
+          <li>Use your full iCloud email address as the username.</li>
+          <li>Run the connect command with <code>icloud</code> — the same word works for both calendar and mail.</li>
+        </ol>
+        <p>Apple offers no general-purpose API, so calendar over CalDAV and mail over IMAP is as far as any app can go. That is the ceiling, not a shortcut this pond is taking.</p>
+      </div>
+    </div>
+
+    <div class="provider" data-panel="fastmail">
+      <div class="card">
+        <div class="card-head"><h3>Fastmail Calendar and Mail</h3><span class="tag">caldav &middot; imap</span></div>
+        <ol class="steps">
+          <li>Open Settings, then <strong>Privacy &amp; Security</strong>, then <strong>Connected apps</strong>.</li>
+          <li>Create a new app password. Give it calendar access, mail access, or both.</li>
+          <li>Run the connect command with <code>fastmail</code>.</li>
+        </ol>
+        <p>Fastmail has the cleanest implementation of both protocols of any provider here. If you are choosing where to keep things, it is the one that gives the least trouble.</p>
+      </div>
+    </div>
+
+    <div class="provider" data-panel="nextcloud">
+      <div class="card">
+        <div class="card-head"><h3>Nextcloud calendar</h3><span class="tag">caldav</span></div>
+        <ol class="steps">
+          <li>Open Settings, then <strong>Security</strong>, and create a device password.</li>
+          <li>Your server address is the one you use in a browser, for example <code>https://cloud.example.org/remote.php/dav</code>.</li>
+          <li>Run the connect command with <code>nextcloud</code> and pass the server address as a fourth argument.</li>
+        </ol>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Any other mail server</h3><span class="tag">imap</span></div>
+        <ol class="steps">
+          <li>Find your provider's IMAP server address — usually something like <code>imap.example.org</code>.</li>
+          <li>Run the connect command with <code>custom</code> and pass the address as a fourth argument.</li>
+          <li>Add <code>:993</code> to the address only if your server uses a different port.</li>
+        </ol>
+        <p>The pond connects over TLS on port 993 and will not fall back to an unencrypted connection.</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Connect it</h2>
+    <p>One command per account, run on the machine your pond is on.</p>
+    <pre><code>bash scripts/connect-calendar.sh fastmail you@example.org YOUR-APP-PASSWORD</code></pre>
+    <p>Swap <code>fastmail</code> for <code>google</code>, <code>icloud</code>, or <code>nextcloud</code>. For Nextcloud or a custom server, add the address on the end:</p>
+    <pre><code>bash scripts/connect-calendar.sh nextcloud you@example.org APP-PASSWORD https://cloud.example.org/remote.php/dav</code></pre>
+    <p>The pond checks for new events and mail every half hour. The first check runs a minute or two after it starts, so you do not have to wait long to see whether it worked.</p>
+  </section>
+
+  <section>
+    <h2>If something needs your attention</h2>
+    <p>Each connected account shows one of three states.</p>
+    <ul class="status-list">
+      <li>
+        <span class="pill pill-ok">Connected</span>
+        <span>Working. The pond checked recently and found what it expected.</span>
+      </li>
+      <li>
+        <span class="pill pill-warn">Needs attention</span>
+        <span>The password was refused. Usually the app password was revoked, or an ordinary account password was used by mistake. The pond stops trying until you reconnect — it will not keep hammering your provider with a password that cannot work.</span>
+      </li>
+      <li>
+        <span class="pill pill-pause">Paused</span>
+        <span>Your pond is set to stay offline, so it is not reaching out to anything. Nothing is broken and nothing needs fixing.</span>
+      </li>
+    </ul>
+  </section>
+
+  <footer>
+    <p>Disconnecting an account deletes everything the pond read from it, and tells you how many items went. Your app password stays yours to revoke at your provider whenever you like.</p>
+  </footer>
+
+</div>
+
+<script>
+  const buttons = document.querySelectorAll(".picker button");
+  const panels = document.querySelectorAll(".provider");
+  buttons.forEach((button) => {
+    button.addEventListener("click", () => {
+      const wanted = button.dataset.provider;
+      buttons.forEach((b) => b.setAttribute("aria-pressed", String(b === button)));
+      panels.forEach((p) => p.classList.toggle("is-shown", p.dataset.panel === wanted));
+    });
+  });
+</script>
