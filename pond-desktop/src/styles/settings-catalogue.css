@@ -359,12 +359,57 @@
   font-weight: var(--weight-semibold);
 }
 
+/* Always shown, directly under the label. Held to ~62ch because a description
+   that runs the full width of a settings row stops reading as a caption and
+   starts competing with the label it is explaining. */
+.scat__desc {
+  margin: 3px 0 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--color-text-secondary);
+  max-width: 62ch;
+}
+
+/* Developer view only — see the guard in SettingsCatalogue.tsx. */
 .scat__key {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   color: var(--color-text-tertiary);
-  margin-top: 2px;
+  margin-top: 4px;
 }
+
+/* Chrome, so it stays on a hairline and never takes the ink offset. State is
+   elevation elsewhere; here the affordance is small enough that a border and a
+   filled dot carry it without a second treatment. */
+.scat__dev {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: var(--tap-min);
+  padding: 0 var(--space-3);
+  border: 1.5px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color var(--transition-base), color var(--transition-base);
+}
+.scat__dev:hover { border-color: var(--color-accent); }
+.scat__dev[aria-pressed="true"] {
+  border-color: var(--border-ink);
+  background: var(--bg-brand-soft);
+  color: var(--color-text);
+}
+.scat__devDot {
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-pill);
+  background: var(--color-text-tertiary);
+}
+.scat__dev[aria-pressed="true"] .scat__devDot { background: var(--color-accent); }
 
 .scat__new {
   font-family: var(--font-mono);
@@ -974,3 +1019,220 @@
 /* Shown only when the page is hosted inside another section (the classic
    Settings view), which owns navigation but not this page's header. */
 .scat__back { margin-bottom: var(--space-3); }
+
+/* ── Developer strip ──────────────────────────────────────────────────────
+ *
+ * Only rendered behind the developer flag, so it is allowed to look like a
+ * tool rather than part of the page. Hairline and brand-soft: it is chrome,
+ * and the ink offset is already spent on the panels below it.
+ */
+.scat__devbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+  margin: var(--space-4) 0 0;
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-brand-soft);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+}
+.scat__devbar b {
+  display: block;
+  font-size: var(--text-base);
+  font-weight: var(--weight-bold);
+}
+.scat__devbar span {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+  max-width: 62ch;
+}
+.scat__devbarErr {
+  font-size: var(--text-sm);
+  color: var(--color-destructive-fg);
+}
+.scat__devbarBtn {
+  margin-left: auto;
+  min-height: var(--tap-min);
+  padding: 0 var(--space-4);
+  border: 1.5px solid var(--border-ink);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.scat__devbarBtn:hover { border-color: var(--color-accent); }
+.scat__devbarBtn:disabled { opacity: 0.6; cursor: progress; }
+/* Armed: the second press is the one that acts, so it takes the accent it has
+   been withholding. State is still elevation elsewhere — this is the one
+   control on the page whose next click is destructive. */
+.scat__devbarBtn--armed {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+  color: var(--color-text-on-accent);
+}
+
+/* ── Folding, for a 7-inch panel ──────────────────────────────────────────
+ *
+ * A 1024x600 kiosk has 600px of height. Unfolded, the masthead and the posture
+ * banner take close to half of it before a single setting is visible — so both
+ * fold, and on a short viewport they start folded. On a desktop neither does.
+ *
+ * The banner animates on `grid-template-rows: 0fr → 1fr` rather than
+ * `max-height`. Max-height needs a magic number larger than the content, which
+ * makes the close look fast and the open look slow; `0fr → 1fr` measures the
+ * content itself, so the two halves take the same time whatever is inside.
+ */
+
+.scat__postureToggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  min-height: var(--tap-min);
+  padding: 0;
+  background: none;
+  border: 0;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.scat__postureToggle .scat__eyebrow { margin-bottom: 0; }
+
+/* The gist, shown only when folded: the banner still answers its question. */
+.scat__postureGist {
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.scat__postureChev {
+  margin-left: auto;
+  flex: 0 0 auto;
+  color: var(--color-text-tertiary);
+  transition: transform var(--dur-base) var(--ease-out);
+}
+.scat__posture[data-open="true"] .scat__postureChev { transform: rotate(180deg); }
+
+.scat__postureWrap {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows var(--dur-base) var(--ease-out);
+}
+/* `hidden` is honoured for semantics; the grid row is what animates. */
+.scat__postureWrap[hidden] {
+  display: grid;
+  grid-template-rows: 0fr;
+}
+.scat__postureWrap > * { overflow: hidden; min-height: 0; }
+.scat__posture[data-open="true"] .scat__postureBody { padding-top: var(--space-4); }
+
+/* ── Contractable search ──────────────────────────────────────────────────
+ *
+ * Closed, the magnifier is the whole control — a 44px target. Open, the field
+ * grows beside it. The input keeps its place in the DOM either way so the value
+ * survives a fold, and `tabindex="-1"` keeps it off the tab ring while hidden.
+ */
+.scat__searchBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--tap-min);
+  height: var(--tap-min);
+  flex: 0 0 auto;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-pill);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: border-color var(--transition-base), color var(--transition-base);
+}
+.scat__searchBtn:hover { border-color: var(--color-accent); color: var(--color-text); }
+
+.scat__search { gap: var(--space-2); }
+/* The icon inside the field is the button now, so the old absolute one goes. */
+.scat__search > svg { display: none; }
+
+.scat__searchInput {
+  width: 230px;
+  opacity: 1;
+  transition: width var(--dur-base) var(--ease-out),
+              opacity var(--dur-fast) linear,
+              padding var(--dur-base) var(--ease-out);
+}
+.scat__search[data-open="false"] .scat__searchInput {
+  width: 0;
+  padding-left: 0;
+  padding-right: 0;
+  opacity: 0;
+  border-color: transparent;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scat__postureWrap,
+  .scat__postureChev,
+  .scat__searchInput { transition: none; }
+}
+
+/* ── The catalogue is the settings view now ───────────────────────────────
+ *
+ * It was a destination reached from a landing page, so it was sized like a
+ * sub-page: a narrow column, tight group heads, rows packed close. As the view
+ * itself it gets the room — bigger cards, more air between groups, and a wider
+ * column, because there is no longer a page above it competing for attention.
+ */
+
+.scat { max-width: 1360px; }
+
+/* Groups read as cards rather than as ruled sections. */
+.scat__group {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  padding: var(--space-2) var(--space-5) var(--space-3);
+  margin-bottom: var(--space-5);
+}
+.scat__group:last-child { margin-bottom: 0; }
+
+.scat__groupHead {
+  padding-top: var(--space-4);
+  padding-bottom: var(--space-3);
+  margin-bottom: var(--space-1);
+  border-bottom: 1px solid var(--color-border);
+}
+
+/* More room per row, and a wider control column so a select is not squeezed
+   against the description it belongs to. */
+.scat__row {
+  padding-top: var(--space-4);
+  padding-bottom: var(--space-4);
+  gap: var(--space-6);
+}
+.scat__rowLabel { font-size: var(--text-md); }
+
+.scat__panel { padding: var(--space-2) 0 0; }
+.scat__panelHead { margin-bottom: var(--space-5); }
+.scat__panelTitle { font-size: var(--text-2xl); }
+
+/* Appearance brings its own heading and spacing. */
+.scat__panel--appearance { padding: 0; }
+
+/* The rail grows with the cards so the two columns still read as a pair. */
+.scat__grid { gap: var(--space-8); }
+.scat__rail { padding: var(--space-4) var(--space-3); }
+
+/* A 7-inch panel gets the air back: at 1024px the column is the constraint,
+   not the window, so this tracks the container. */
+@container scat (max-width: 900px) {
+  .scat__group { padding-left: var(--space-4); padding-right: var(--space-4); }
+  .scat__row { gap: var(--space-4); }
+}

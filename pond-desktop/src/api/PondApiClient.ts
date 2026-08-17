@@ -334,7 +334,7 @@ export class PondApiClient {
    *
    * See docs/developer/settings-defaults-and-user-intent.md. Callers that
    * batch edits behind a Save button should diff against the last loaded
-   * snapshot; `diffSettings` in `sections/Settings.tsx` does exactly that.
+   * snapshot; `diffSettings` in `settings/state.ts` does exactly that.
    *
    * The returned object is NOT byte-identical to the patch for a float field.
    * `Settings` holds these as `f32` and the API serialises through `f64`, so a

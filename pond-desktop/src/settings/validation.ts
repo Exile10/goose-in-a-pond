@@ -167,3 +167,60 @@ export function detectTimezone(): string | null {
     return null;
   }
 }
+
+/** Where this pond thinks it is. All three fields the weather rows need. */
+export interface DetectedLocation {
+  name: string;
+  latitude: number;
+  longitude: number;
+}
+
+/**
+ * The place name, taken from the time zone rather than looked up.
+ *
+ * `Africa/Nairobi` → `Nairobi`. It costs no network call, which matters on a
+ * pond that may be set to refuse them outright, and it is right far more often
+ * than it is wrong because the zone was chosen for this house in the first
+ * place. When it is wrong the household is typing over a plausible guess rather
+ * than an empty box.
+ */
+export function placeFromTimezone(zone?: string | null): string | null {
+  const z = zone ?? detectTimezone();
+  if (!z || !z.includes("/")) return null;
+  const leaf = z.split("/").pop();
+  return leaf ? leaf.replace(/_/g, " ") : null;
+}
+
+/**
+ * Ask the device where it is.
+ *
+ * Coordinates come from the browser, which prompts for permission — so this is
+ * only ever called from a button the household pressed. The name comes from the
+ * time zone, so a refusal to share coordinates still leaves something useful
+ * rather than nothing.
+ *
+ * Rejects rather than returning null: the caller needs to tell "you said no"
+ * apart from "it did not work", and both deserve different words on screen.
+ */
+export function detectLocation(timeoutMs = 8000): Promise<DetectedLocation> {
+  return new Promise((resolve, reject) => {
+    if (typeof navigator === "undefined" || !navigator.geolocation) {
+      reject(new Error("This device cannot report where it is."));
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (p) => resolve({
+        name: placeFromTimezone() ?? "",
+        // Four decimals is roughly 11 m — far finer than weather needs, and it
+        // keeps the stored value from reading like a tracking coordinate.
+        latitude: Number(p.coords.latitude.toFixed(4)),
+        longitude: Number(p.coords.longitude.toFixed(4)),
+      }),
+      (err) => reject(new Error(
+        err.code === err.PERMISSION_DENIED
+          ? "Location permission was declined."
+          : "Could not work out where this pond is.")),
+      { timeout: timeoutMs, maximumAge: 600_000, enableHighAccuracy: false },
+    );
+  });
+}

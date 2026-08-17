@@ -16,7 +16,7 @@ import { Memory } from "../sections/Memory";
 import { Skills } from "../sections/Skills";
 import { Models } from "../sections/Models";
 import { Prompts } from "../sections/Prompts";
-import { Settings } from "../sections/Settings";
+import { SettingsCatalogueView } from "../settings/SettingsCatalogue";
 import { Faces } from "../sections/Faces";
 import { Canvas } from "../sections/Canvas";
 import { Logs } from "../sections/Logs";
@@ -37,7 +37,7 @@ function SectionContent({ section }: { section: GuiSection }) {
     case "extensions": return <Extensions />;
     case "models":    return <Models />;
     case "prompts":   return <Prompts />;
-    case "settings":  return <Settings />;
+    case "settings":  return <SettingsCatalogueView />;
     case "faces":     return <Faces />;
     case "canvas":    return <Canvas />;
     case "logs":      return <Logs />;
