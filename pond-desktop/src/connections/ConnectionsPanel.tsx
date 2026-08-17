@@ -12,7 +12,9 @@ import { api } from "../api/PondApiClient";
 import type { ContextSource } from "../api/types";
 import {
   PROVIDERS,
+  describeHaul,
   describeLastSync,
+  describeSourceOutcome,
   describeStatus,
   type ProviderOption,
 } from "./providers";
@@ -46,6 +48,8 @@ export function ConnectionsPanel({ sessionId }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  /** Per-account lines from the last check, keyed by source id. */
+  const [lastRun, setLastRun] = useState<Record<string, string>>({});
 
   const scopeId = sessionId ?? NO_CONVERSATION;
 
@@ -116,6 +120,16 @@ export function ConnectionsPanel({ sessionId }: Props) {
     setNotice(null);
     try {
       const r = await api.syncContextSources();
+      // Named results before the summary sentence, because with two accounts
+      // "read 3 new things" does not say which one they came from.
+      setLastRun(
+        Object.fromEntries(
+          (r.per_source ?? []).map((o) => [
+            o.source_id,
+            describeSourceOutcome(o.outcome, o.ingested),
+          ]),
+        ),
+      );
       // Every outcome gets its own sentence. "Done" would be the one answer
       // that tells somebody nothing, and this button exists precisely because
       // they could not tell whether it had worked.
@@ -193,6 +207,7 @@ export function ConnectionsPanel({ sessionId }: Props) {
         <ul className="connections-list">
           {sources.map((source) => {
             const status = describeStatus(source.status, source.last_sync);
+            const haul = describeHaul(source.items ?? 0, source.awaiting_index ?? 0);
             const label =
               PROVIDERS.find((p) => p.id === source.provider && p.kind === source.kind)
                 ?.label ?? `${source.provider} ${source.kind}`;
@@ -213,7 +228,15 @@ export function ConnectionsPanel({ sessionId }: Props) {
                     </span>
                   </div>
                   <p className="connections-detail">{status.detail}</p>
-                  <p className="connections-muted">{describeLastSync(source.last_sync)}</p>
+                  <p className="connections-muted">
+                    {describeLastSync(source.last_sync)}
+                    {haul ? ` · ${haul}` : ""}
+                  </p>
+                  {lastRun[source.id] && (
+                    <p className="connections-ran">
+                      Last check: {lastRun[source.id]}
+                    </p>
+                  )}
                 </div>
                 <button
                   type="button"

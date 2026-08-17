@@ -87,6 +87,19 @@ pub trait ContextRepository: Send + Sync {
     /// How many items a member owns. Used to say what deleting them removes.
     async fn count_for_profile(&self, profile_id: &str) -> Result<u64>;
 
+    /// What each source has contributed, and how much of it is searchable.
+    ///
+    /// One query for every source rather than one per source: this is read on
+    /// a screen that already lists them, and N+1 round trips to answer a
+    /// sentence is a cost that only shows up on the pond with the most data.
+    ///
+    /// Defaulted to empty so an adapter that has not implemented it reports
+    /// "nothing known" instead of failing the whole sources list — the counts
+    /// are a nicety and the list is not.
+    async fn item_stats_by_source(&self) -> Result<Vec<SourceItemStats>> {
+        Ok(Vec::new())
+    }
+
     /// Delete everything past its retention window. Returns how many rows went.
     ///
     /// Takes the whole [`ContextRetention`] rather than a day count because the
@@ -118,6 +131,28 @@ pub struct AccountSyncSummary {
     pub failed: usize,
     /// Accounts skipped because the pond is offline.
     pub paused: usize,
+    /// What each account did, named.
+    ///
+    /// The totals above answer "did anything happen"; this answers "where from",
+    /// which is the question somebody with two calendars and a mailbox actually
+    /// has. A single number cannot tell them their work calendar is fine and
+    /// their mail is not.
+    #[serde(default)]
+    pub per_source: Vec<SourceSyncOutcome>,
+}
+
+/// One account's result from a sync pass.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceSyncOutcome {
+    pub source_id: String,
+    /// `google`, `fastmail`, `icloud`, … — as stored.
+    pub provider: String,
+    /// `calendar` or `mail`.
+    pub kind: String,
+    /// `ingested` | `unchanged` | `needs_reauth` | `failed` | `paused`
+    pub outcome: String,
+    /// Items stored from this account in this pass.
+    pub ingested: usize,
 }
 
 /// Pull every connected account now, rather than waiting for the timer.
@@ -129,4 +164,21 @@ pub struct AccountSyncSummary {
 #[async_trait]
 pub trait AccountSync: Send + Sync {
     async fn sync_now(&self) -> Result<AccountSyncSummary>;
+}
+
+// ── What each source has actually produced ──────────────────────────────────
+
+/// One source's contribution to the corpus, and how much of it is searchable.
+///
+/// Two numbers rather than one, because "read 142 things" and "142 things you
+/// can actually find" are different claims and the gap between them is exactly
+/// what a person wants explaining when search comes up short. A source can be
+/// perfectly connected and still be half-invisible while the index catches up.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SourceItemStats {
+    pub source_id: String,
+    /// Everything stored from this source.
+    pub items: u64,
+    /// Of those, the ones still waiting for a vector.
+    pub awaiting_index: u64,
 }
