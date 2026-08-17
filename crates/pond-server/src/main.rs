@@ -2597,6 +2597,13 @@ async fn run_server(
         }
     };
 
+    // The sensor-RULE tools live in `giap-sensors` but need the scheduler, and
+    // the scheduler is built here rather than beside the other sensor deps —
+    // hence a second install rather than reordering startup around it.
+    if let Some(sched) = scheduler.clone() {
+        pond_mcp_server::init_sensor_rule_deps(sched, settings_repo.clone());
+    }
+
     // MCP Memory — enabled when --features mcp-memory is passed at build time.
     #[cfg(feature = "mcp-memory")]
     let mcp_memory: Option<
