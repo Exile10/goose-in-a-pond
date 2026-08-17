@@ -16,12 +16,25 @@ import {
   describeStatus,
   type ProviderOption,
 } from "./providers";
-import "./connections.css";
+import "../styles/connections.css";
 
 interface Props {
   /** Which conversation this is being done in. The OWNER is resolved from it. */
   sessionId: string | null;
 }
+
+/**
+ * What to send when no conversation is open.
+ *
+ * The owner is resolved server-side from the session, the paired device and the
+ * household size — and in a one-member pond the answer does not depend on the
+ * session at all. Demanding a conversation before somebody can connect a
+ * calendar made them establish something the pond already knew.
+ *
+ * A real session id is still preferred when there is one: in a household with
+ * two members it is what says whose account this is.
+ */
+const NO_CONVERSATION = "context-setup";
 
 export function ConnectionsPanel({ sessionId }: Props) {
   const [sources, setSources] = useState<ContextSource[]>([]);
@@ -34,19 +47,22 @@ export function ConnectionsPanel({ sessionId }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
+  const scopeId = sessionId ?? NO_CONVERSATION;
+
   const refresh = useCallback(async () => {
-    if (!sessionId) return;
     setLoading(true);
     try {
-      const result = await api.listContextSources(sessionId);
-      setSources(result.sources.filter((s) => s.needs_credentials));
+      const result = await api.listContextSources(scopeId);
+      // `request` returns undefined cast to T for an empty body, so a method
+      // typed as returning an object can hand back nothing at all.
+      setSources((result?.sources ?? []).filter((s) => s.needs_credentials));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not read your accounts.");
     } finally {
       setLoading(false);
     }
-  }, [sessionId]);
+  }, [scopeId]);
 
   useEffect(() => {
     void refresh();
@@ -55,16 +71,15 @@ export function ConnectionsPanel({ sessionId }: Props) {
   const canSubmit = useMemo(
     () =>
       !busy &&
-      !!sessionId &&
       username.trim().length > 0 &&
       password.length > 0 &&
       (!selected.needsServer || server.trim().length > 0),
-    [busy, sessionId, username, password, selected, server],
+    [busy, username, password, selected, server],
   );
 
   async function connect(event: React.FormEvent) {
     event.preventDefault();
-    if (!canSubmit || !sessionId) return;
+    if (!canSubmit) return;
     setBusy(true);
     setError(null);
     setNotice(null);
@@ -72,7 +87,7 @@ export function ConnectionsPanel({ sessionId }: Props) {
       await api.connectContextSource({
         kind: selected.kind,
         provider: selected.id,
-        sessionId,
+        sessionId: scopeId,
         credentials: {
           username: username.trim(),
           password,
@@ -95,12 +110,11 @@ export function ConnectionsPanel({ sessionId }: Props) {
   }
 
   async function disconnect(source: ContextSource) {
-    if (!sessionId) return;
     setBusy(true);
     setError(null);
     setNotice(null);
     try {
-      const result = await api.disconnectContextSource(source.id, sessionId);
+      const result = await api.disconnectContextSource(source.id, scopeId);
       setNotice(
         result.removed === 1
           ? "Disconnected, and the one thing it had read was deleted."
@@ -237,12 +251,6 @@ export function ConnectionsPanel({ sessionId }: Props) {
           <span>{busy ? "Connecting…" : "Connect"}</span>
         </button>
 
-        {!sessionId && (
-          <p className="connections-error">
-            Start a conversation first — the pond works out whose account this is from the
-            conversation you are in.
-          </p>
-        )}
         {error && <p className="connections-error">{error}</p>}
         {notice && <p className="connections-notice">{notice}</p>}
       </form>

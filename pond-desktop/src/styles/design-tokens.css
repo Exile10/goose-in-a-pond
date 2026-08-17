@@ -324,6 +324,10 @@
   --color-success-fg:  #4ADE80;
   --color-warning-fg:  #FBBF24;
   --color-info-fg:     #60A5FA;
+  /* Was inheriting the light-mode #B91C1C, the only semantic fg without a dark
+     value — a dark red on a dark panel, well under AA, while its three
+     siblings had all been brightened. Same 4xx step as those. */
+  --color-destructive-fg: #F87171;
   --color-info-dark:   #60A5FA;
   /* Was inheriting the light-mode value (#8E8E93), which is too dark against
      dark backgrounds — 4.4:1 on panel, under the 4.5:1 AA minimum. */
