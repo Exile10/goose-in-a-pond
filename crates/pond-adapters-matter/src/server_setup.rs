@@ -101,6 +101,12 @@ pub fn app_dir(data_dir: &Path) -> PathBuf {
 pub fn entrypoint(data_dir: &Path) -> PathBuf {
     app_dir(data_dir).join("src").join("server.ts")
 }
+/// Where the running controller's pid is recorded, so a controller that outlived
+/// its Pond can be found and reaped on the next start.
+fn pidfile(data_dir: &Path) -> PathBuf {
+    controller_dir(data_dir).join("controller.pid")
+}
+
 /// Records the lockfile the installed tree was built from, so an upgrade that
 /// changes dependencies reinstalls and one that does not is a no-op.
 fn install_marker(data_dir: &Path) -> PathBuf {
@@ -399,6 +405,11 @@ fn spawn_server(data_dir: &Path, port: u16) -> Result<(Child, StderrTail)> {
         .spawn()
         .context("spawning the Matter controller")?;
 
+    // Recorded before anything else can fail, so an orphan is always findable.
+    if let Some(pid) = child.id() {
+        let _ = std::fs::write(pidfile(data_dir), pid.to_string());
+    }
+
     let tail: StderrTail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
 
     if let Some(stderr) = child.stderr.take() {
@@ -442,6 +453,98 @@ fn relay(line: &str) {
     }
 }
 
+/// Forget the recorded controller, after stopping it deliberately.
+pub(crate) fn clear_pidfile(data_dir: &Path) {
+    let _ = std::fs::remove_file(pidfile(data_dir));
+}
+
+/// Classify the pid in the pidfile, reading its command line via `ps` (portable
+/// across macOS and Linux):
+///
+///   * `Some(true)`  — alive, and still our controller: safe to kill.
+///   * `Some(false)` — `ps` ran and reported no such process, or a live but
+///     UNRELATED one (the pid was reused). Never kill; clear the file.
+///   * `None`        — `ps` could not be run, so liveness is indeterminate. The
+///     caller must not treat this as dead, or a real orphan loses the only
+///     record of itself.
+async fn pid_is_our_controller(pid: u32, data_dir: &Path) -> Option<bool> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .kill_on_drop(true)
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => {
+            let cmdline = String::from_utf8_lossy(&out.stdout);
+            let cmdline = cmdline.trim();
+            // The entrypoint path is unique to this data dir, so two Ponds on
+            // one machine cannot reap each other's controllers.
+            let ours = entrypoint(data_dir).display().to_string();
+            Some(!cmdline.is_empty() && cmdline.contains(&ours))
+        }
+        // `ps` ran and exited non-zero → no such pid → the process is gone.
+        Ok(_) => Some(false),
+        Err(e) => {
+            tracing::debug!(pid, error = %e, "matter: could not run `ps` to classify the pidfile");
+            None
+        }
+    }
+}
+
+/// Kill a controller left behind by a Pond that did not exit cleanly.
+///
+/// The graceful path already kills the controller (`stop_controller`, on the
+/// signal handler), and `kill_on_drop` covers an unwinding exit. Neither fires
+/// on `SIGKILL`, a panic under `panic = "abort"`, or an OOM kill. In practice
+/// the controller usually dies anyway — its stderr is a pipe to the Pond, so the
+/// next line it writes fails — but that is luck, not design: an idle controller
+/// with nothing to say survives, and being reachable it would then be ADOPTED by
+/// the next start and never owned by anyone, since nothing holds its handle.
+///
+/// So it is reaped rather than adopted. "When the Pond dies, everything dies
+/// with it" is only true if something enforces it on the way back up.
+async fn reap_orphan(data_dir: &Path) {
+    let path = pidfile(data_dir);
+    let Some(pid) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| c.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+
+    match pid_is_our_controller(pid, data_dir).await {
+        Some(true) => {
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "matter_orphan_reaped",
+                pid,
+                "matter: a controller from a previous run was still going; stopping it"
+            );
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .kill_on_drop(true)
+                .status()
+                .await;
+            // Give it a moment to release the port before anything probes it.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = std::fs::remove_file(&path);
+        }
+        Some(false) => {
+            tracing::debug!(pid, "matter: stale pidfile; clearing it");
+            let _ = std::fs::remove_file(&path);
+        }
+        None => {
+            // Keep the file: it is the only record of a controller that may
+            // still be holding the port, and a later start can retry.
+            tracing::warn!(
+                pid,
+                "matter: could not determine whether the recorded controller is alive; \
+                 keeping the pidfile so a later start can retry"
+            );
+        }
+    }
+}
+
 /// Ensure a controller is reachable on `port`, installing and starting one if
 /// needed. Returns the child handle when GIAP started it (the caller must keep
 /// it alive), or `None` when an existing controller was reused.
@@ -452,6 +555,9 @@ pub async fn ensure_running(
     notifier: &MatterNotifier,
     url: &str,
 ) -> Result<Option<Child>> {
+    // Before the probe, or an orphan would be found healthy and adopted.
+    reap_orphan(data_dir).await;
+
     match probe_controller(port, url).await {
         Occupant::Ours => {
             tracing::info!(
@@ -788,6 +894,63 @@ mod tests {
             probe_controller(free, &format!("ws://127.0.0.1:{free}/giap")).await,
             Occupant::Free
         );
+    }
+
+    /// A pid that is alive but is NOT our controller must never be killed. The
+    /// pidfile can outlive the process it names, and the OS reuses pids — so
+    /// without the command-line check, a start-up could kill an unrelated
+    /// process belonging to the user.
+    #[tokio::test]
+    async fn a_reused_pid_belonging_to_something_else_is_not_killed() {
+        // This test process is certainly alive and certainly not a controller.
+        let me = std::process::id();
+        assert_eq!(
+            pid_is_our_controller(me, Path::new("/var/lib/giap")).await,
+            Some(false),
+            "would have killed an unrelated live process"
+        );
+    }
+
+    /// A pid nothing is using reads as gone, so the stale record is cleared
+    /// rather than kept forever.
+    #[tokio::test]
+    async fn a_dead_pid_reads_as_gone() {
+        // PID 1 exists, so pick something implausible instead: a pid above the
+        // system maximum can never be live.
+        assert_eq!(
+            pid_is_our_controller(4_294_967_294, Path::new("/var/lib/giap")).await,
+            Some(false)
+        );
+    }
+
+    /// Reaping is keyed on the entrypoint path, which contains the data dir, so
+    /// two Ponds on one machine cannot stop each other's controllers.
+    #[test]
+    fn the_pid_record_and_entrypoint_are_per_data_dir() {
+        let a = Path::new("/var/lib/giap-a");
+        let b = Path::new("/var/lib/giap-b");
+        assert_ne!(pidfile(a), pidfile(b));
+        assert_ne!(entrypoint(a), entrypoint(b));
+        assert!(pidfile(a).starts_with(a));
+    }
+
+    /// An absent or unparseable record is simply nothing to do, not an error:
+    /// this runs on every single start.
+    #[tokio::test]
+    async fn a_missing_or_junk_pidfile_is_harmless() {
+        let dir = std::env::temp_dir().join(format!("giap-pid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(controller_dir(&dir)).unwrap();
+
+        reap_orphan(&dir).await; // no file at all
+
+        std::fs::write(pidfile(&dir), "not-a-pid").unwrap();
+        reap_orphan(&dir).await;
+
+        std::fs::write(pidfile(&dir), "").unwrap();
+        reap_orphan(&dir).await;
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
