@@ -123,11 +123,13 @@ impl DeviceMcpServer {
                 None,
             )
         })?;
-        let location = if settings.weather_location_name.is_empty() {
-            "not configured".to_string()
-        } else {
-            settings.weather_location_name.clone()
-        };
+        // "not configured" was this tool telling the household about its own
+        // setup. Ask the location service instead: it falls back to the time
+        // zone, so the answer is usually a place rather than an apology.
+        let location = pond_core::user_data::services::location::resolve(&settings)
+            .describe()
+            .unwrap_or("unknown")
+            .to_string();
         let text = format!(
             "User: {}\nAssistant name: {}\nTimezone: {}\nLocation: {}",
             settings.user_name, settings.assistant_name, settings.timezone, location,
