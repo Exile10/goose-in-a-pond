@@ -130,6 +130,16 @@ that was sent, and the operations offered are derived from `operationalStateList
 rather than assumed: each of the four commands is optional, and the spec requires a
 device to expose the states matching the commands it supports.
 
+Reporting a state means waiting for it. A cluster's state is whatever the
+subscription last reported, and the report carrying a change arrives *after* the
+command returns — against the Matter Virtual Device, the command answered in 13ms
+and the new state landed within 500ms. So the controller waits for the state the
+verb asks for (Start for Running, Pause for Paused) before answering, returning as
+soon as it appears and giving up after two seconds. Read without that wait, a
+washer that started perfectly well reports as stopped, which is worse than the echo
+it replaced: an echo is uninformative, while this contradicts a device that did
+exactly as it was told.
+
 ---
 
 ## Events

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { assertAccepted, isSnapshotCluster } from "../src/controller.js";
+import { assertAccepted, isSnapshotCluster, settleTo } from "../src/controller.js";
 import { planControl } from "../src/mapping/control.js";
 import { describeNode } from "../src/mapping/describe.js";
 import { observedOperation, operationsOf, settingsOf } from "../src/mapping/settings.js";
@@ -271,5 +271,37 @@ describe("appliance settings", () => {
     expect(() =>
       planControl(twoModes, "matter-72", "mode", { setting: "mode", value: "Normal" }),
     ).toThrowError(/is not a setting/);
+  });
+  it("waits for the device to report the command's effect", async () => {
+    // Measured against the Matter Virtual Device washer: the command answers in
+    // about 13ms and the state arrives around 500ms later. Reading straight after
+    // the invocation returns the state BEFORE the command, which reported a washer
+    // that started perfectly well as having stayed stopped.
+    let reads = 0;
+    const washer = () => (++reads < 3 ? "stopped" : "running");
+
+    expect(await settleTo("running", washer, 500, 1)).toBe("running");
+    expect(reads).toBeGreaterThan(1);
+  });
+
+  it("gives up and reports what the device actually is", async () => {
+    // A device that takes the command and does nothing is reported as it is, not
+    // waited on forever and not assumed to have obeyed.
+    expect(await settleTo("running", () => "stopped", 20, 1)).toBe("stopped");
+
+    // A verb with no state of its own to reach is not waited on at all.
+    let reads = 0;
+    expect(
+      await settleTo(
+        undefined,
+        () => {
+          reads++;
+          return "idle";
+        },
+        20,
+        1,
+      ),
+    ).toBe("idle");
+    expect(reads).toBe(1);
   });
 });
