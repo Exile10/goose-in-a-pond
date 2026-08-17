@@ -84,6 +84,7 @@ read a failure carrying a null result as a success.
 | `commission` | `{code, name?}` | `{device: Device}` |
 | `decommission` | `{device_id}` | `{}` |
 | `control` | `{device_id, verb, value}` | `{applied: DeviceStatePatch}` |
+| `describe` | `{device_id}` | `{description: DeviceDescription}` |
 | `ping` | — | `{}` — liveness without a fabric round-trip |
 
 `subscribe` returns the **whole fabric**, readings included, so a fresh
@@ -145,6 +146,46 @@ Rust side deserialises them without a mapping step. `Device` is deliberately
 smaller than GIAP's: the controller knows nothing about rooms, hostnames or when
 a device was first registered, and inventing values for those would make a Matter
 device look different from every other kind.
+
+---
+
+## Describing a device
+
+`capabilities` on `Device` is a list of verb names. It is enough to know a fan has
+a speed and not enough to drive one: it cannot say which modes *that* fan has,
+what a thermostat's limits are, or that an air quality sensor measures eleven
+separate substances. An agent given only the list guesses, and learns the limits
+by failing at them in front of the user.
+
+`describe` answers that, **read from the device rather than assumed**. Where a
+cluster states a constraint it is carried: FanControl's `fanModeSequence` says
+which modes the fan really has, a thermostat states its setpoint limits, a
+concentration cluster declares its unit. Where a cluster states nothing, the
+conventional default stands and nothing further is claimed — an invented
+constraint is worse than an absent one, because it will be believed.
+
+```ts
+DeviceDescription = {
+  device_id, device_type,
+  capabilities: Capability[],      // what it can be told to do
+  sensors: SensorSpec[],           // what it measures, reported or not
+}
+Capability = { verb: Verb, value: ValueSpec }
+ValueSpec =
+  | { kind: "boolean" }
+  | { kind: "percent" }                          // 0–100
+  | { kind: "number", min?, max?, unit? }        // absent key = unstated
+  | { kind: "enum", values: string[] }
+  | { kind: "color" }
+SensorSpec = { sensor_type, unit }
+```
+
+`verb` is exactly a control verb, so a description and a `control` call cannot
+drift apart: anything describable is callable, by construction.
+
+It is answered live rather than cached. A description is derived from what the
+device currently reports, and a stored copy goes stale exactly when a device is
+upgraded or reconfigured — the moment its description matters most.
 
 ---
 

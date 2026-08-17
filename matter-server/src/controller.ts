@@ -12,6 +12,7 @@ import { Endpoint, Environment, Seconds, ServerNode, type ClientNode } from "@ma
 import { log, describeError, setupCodeKind } from "./log.js";
 import { nodeToDevice } from "./mapping/devices.js";
 import { planControl, type Verb } from "./mapping/control.js";
+import { describeNode } from "./mapping/describe.js";
 import { readingFor, sensorClusters } from "./mapping/sensors.js";
 import {
   type ClusterState,
@@ -23,6 +24,7 @@ import {
   deviceIdForNode,
   nodeIdFromDeviceId,
   type Device,
+  type DeviceDescription,
   type DeviceStatePatch,
   type Reading,
 } from "./protocol.js";
@@ -275,6 +277,25 @@ export class Controller {
       });
       await peer.delete();
     }
+  }
+
+  /**
+   * What a device can be told to do and what it measures.
+   *
+   * Read live rather than stored: a description is derived from what the device
+   * currently reports, and a cached copy would go stale exactly when a device is
+   * upgraded or reconfigured — the moment its description matters most.
+   */
+  describe(deviceId: string): DeviceDescription {
+    const peer = this.#peerFor(deviceId);
+    const nodeId = peer === undefined ? undefined : peerNodeId(peer);
+    if (peer === undefined || nodeId === undefined) {
+      throw new OpError(
+        "device_unknown",
+        `Matter device '${deviceId}' is not commissioned on this fabric`,
+      );
+    }
+    return describeNode(snapshotOf(peer, nodeId));
   }
 
   /** Drive a device. Returns what the device state became. */

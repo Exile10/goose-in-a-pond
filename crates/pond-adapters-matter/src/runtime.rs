@@ -34,7 +34,9 @@ use async_trait::async_trait;
 use pond_core::mcp::ports::notification::NotificationSender;
 use pond_core::shared::ports::event_bus::EventBus;
 use pond_core::user_data::ports::device_commissioning::DeviceCommissioningPort;
-use pond_core::user_data::ports::device_control::{DeviceControlOutcome, DeviceControlPort};
+use pond_core::user_data::ports::device_control::{
+    DeviceControlOutcome, DeviceControlPort, DeviceDescription,
+};
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use pond_core::user_data::ports::matter_runtime::{MatterRuntimePort, MatterState, MatterStatus};
 use tokio::sync::{watch, RwLock};
@@ -556,6 +558,10 @@ impl SwitchableDeviceControl {
 // moment they went through this facade.
 #[async_trait]
 impl DeviceControlPort for SwitchableDeviceControl {
+    async fn describe(&self, device_id: &str) -> Result<DeviceDescription> {
+        self.backend_for(device_id).await?.describe(device_id).await
+    }
+
     async fn set_power(&self, device_id: &str, on: bool) -> Result<DeviceControlOutcome> {
         self.backend_for(device_id)
             .await?

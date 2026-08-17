@@ -63,6 +63,57 @@ impl DeviceControlOutcome {
     }
 }
 
+/// What a device can be told to do and what it measures, in its own terms.
+///
+/// `Device::capabilities` is a list of verb names — enough to know a fan has a
+/// speed, not enough to drive it. It cannot say which modes that fan has, what a
+/// thermostat's limits are, or that an air quality sensor measures eleven
+/// substances. An agent given only the list guesses, and learns the limits by
+/// failing at them in front of the user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceDescription {
+    pub device_id: String,
+    pub device_type: String,
+    /// Verbs the device accepts, named as this port names them.
+    pub capabilities: Vec<Capability>,
+    /// What it measures, whether or not it has reported yet.
+    pub sensors: Vec<SensorSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Capability {
+    pub verb: String,
+    pub value: ValueSpec,
+}
+
+/// The shape a verb accepts. A constraint is present only when the device stated
+/// it: an invented range is worse than an absent one, because it is believed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ValueSpec {
+    Boolean,
+    /// 0–100.
+    Percent,
+    Number {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unit: Option<String>,
+    },
+    Enum {
+        values: Vec<String>,
+    },
+    Color,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SensorSpec {
+    pub sensor_type: String,
+    pub unit: String,
+}
+
 /// Driven Port: actuate a smart device.
 #[async_trait]
 pub trait DeviceControlPort: Send + Sync {
@@ -107,6 +158,16 @@ pub trait DeviceControlPort: Send + Sync {
     /// device, which is exactly what a user asking for "auto" wants.
     async fn set_fan_mode(&self, device_id: &str, _mode: &str) -> Result<DeviceControlOutcome> {
         anyhow::bail!("device '{device_id}' does not support fan modes")
+    }
+
+    /// What this device can be told to do, and what it measures.
+    ///
+    /// Optional like the verbs below: a transport that cannot ask a device about
+    /// itself says so rather than inventing an answer. The Matter adapter reads
+    /// it live from the controller, so it reflects the device as it is now
+    /// rather than as it was when it was paired.
+    async fn describe(&self, device_id: &str) -> Result<DeviceDescription> {
+        anyhow::bail!("device '{device_id}' does not describe itself")
     }
 
     /// Set a covering (blind/curtain/shade) position, as a 0–100 percentage

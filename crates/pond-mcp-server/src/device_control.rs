@@ -6,7 +6,9 @@
 //! devices through this single tool surface. Backends are pluggable behind the
 //! port (logging stub today; MQTT/HTTP/IR or a Home-Assistant MCP-client later).
 
-use pond_core::user_data::ports::device_control::DeviceControlPort;
+use pond_core::user_data::ports::device_control::{
+    DeviceControlPort, DeviceDescription, ValueSpec,
+};
 use pond_core::user_data::ports::device_registry::{Device, DeviceRegistry};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -25,6 +27,15 @@ use std::sync::Arc;
 // ── Parameter struct ─────────────────────────────────────────────────────────
 // All params optional with serde(default) + a flatten extra absorber so a small
 // model sending `{}` (or unexpected fields) never breaks deserialization.
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct DescribeDeviceParams {
+    /// Device id, name, or a natural reference like "the fan".
+    pub device_id: String,
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct SetDeviceStateParams {
@@ -74,6 +85,56 @@ pub struct DeviceControlMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
+/// The description as a sentence a model can act on. JSON would be smaller and
+/// worse: the point is that the next tool call is obvious from reading it.
+fn render_description(d: &DeviceDescription) -> String {
+    let mut out = format!("{} ({})", d.device_id, d.device_type);
+
+    if d.capabilities.is_empty() {
+        out.push_str("\n  Cannot be controlled — nothing to set on this device.");
+    } else {
+        out.push_str("\n  Accepts:");
+        for capability in &d.capabilities {
+            out.push_str(&format!(
+                "\n    {} — {}",
+                capability.verb,
+                render_value(&capability.value)
+            ));
+        }
+    }
+
+    if d.sensors.is_empty() {
+        out.push_str("\n  Measures: nothing.");
+    } else {
+        out.push_str("\n  Measures:");
+        for sensor in &d.sensors {
+            out.push_str(&format!("\n    {} ({})", sensor.sensor_type, sensor.unit));
+        }
+    }
+    out
+}
+
+fn render_value(value: &ValueSpec) -> String {
+    match value {
+        ValueSpec::Boolean => "true or false".to_string(),
+        ValueSpec::Percent => "0-100 percent".to_string(),
+        ValueSpec::Color => "hue 0-360 with saturation 0-100".to_string(),
+        ValueSpec::Enum { values } => format!("one of: {}", values.join(", ")),
+        ValueSpec::Number { min, max, unit } => {
+            let unit = unit.as_deref().unwrap_or("");
+            match (min, max) {
+                (Some(lo), Some(hi)) => format!("a number from {lo} to {hi} {unit}")
+                    .trim_end()
+                    .to_string(),
+                (Some(lo), None) => format!("a number from {lo} {unit}").trim_end().to_string(),
+                (None, Some(hi)) => format!("a number up to {hi} {unit}").trim_end().to_string(),
+                // No stated limits: say so rather than implying a range.
+                (None, None) => format!("a number in {unit}").trim_end().to_string(),
+            }
+        }
+    }
+}
+
 #[tool_router]
 impl DeviceControlMcpServer {
     pub fn new(
@@ -84,6 +145,57 @@ impl DeviceControlMcpServer {
             control,
             registry,
             tool_router: Self::tool_router(),
+        }
+    }
+
+    #[tool(
+        description = "What a device can be told to do and what it measures: the verbs it \
+                       accepts, the values each takes (fan modes, temperature limits), and \
+                       its sensors. Consult this before driving a device you have not driven \
+                       before, rather than attempting a verb to find out whether it works. \
+                       device_id: id, name, or natural ref like \"the fan\"."
+    )]
+    async fn describe_device(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<DescribeDeviceParams>,
+    ) -> Result<CallToolResult, rmcp::model::ErrorData> {
+        crate::set_current_tool("describe_device");
+        let Parameters(p) = params;
+        let device_id = p.device_id.trim();
+
+        let device_id = match self.registry.list_devices().await {
+            Ok(devices) => match resolve_device(device_id, &devices) {
+                DeviceResolution::Resolved(id) => id,
+                DeviceResolution::Ambiguous(names) => {
+                    return Ok(guidance(format!(
+                        "'{device_id}' matches several devices: {}. Which one?",
+                        names.join(", ")
+                    )));
+                }
+                DeviceResolution::NotFound => {
+                    let known: Vec<String> = devices.iter().map(|d| d.name.clone()).collect();
+                    return Ok(guidance(if known.is_empty() {
+                        "No devices are registered yet.".to_string()
+                    } else {
+                        format!(
+                            "No device matches '{device_id}'. Registered devices: {}.",
+                            known.join(", ")
+                        )
+                    }));
+                }
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "describe_device: device list unavailable");
+                device_id.to_string()
+            }
+        };
+
+        match self.control.describe(&device_id).await {
+            Ok(description) => Ok(CallToolResult::success(vec![Content::text(
+                render_description(&description),
+            )])),
+            Err(e) => Ok(guidance(format!("Couldn't describe '{device_id}': {e}"))),
         }
     }
 
@@ -370,6 +482,104 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use pond_core::user_data::ports::device_control::{DeviceControlOutcome, DeviceStatePatch};
+
+    use pond_core::user_data::ports::device_control::{Capability, SensorSpec};
+
+    fn spec(verb: &str, value: ValueSpec) -> Capability {
+        Capability {
+            verb: verb.to_string(),
+            value,
+        }
+    }
+
+    /// What the model reads. The whole point of the tool is that the next call is
+    /// obvious from the text, so the text is what gets asserted.
+    #[test]
+    fn a_description_names_the_values_a_device_accepts() {
+        let rendered = render_description(&DeviceDescription {
+            device_id: "matter-18".into(),
+            device_type: "fan".into(),
+            capabilities: vec![
+                spec("power", ValueSpec::Boolean),
+                spec("fan_speed", ValueSpec::Percent),
+                spec(
+                    "fan_mode",
+                    ValueSpec::Enum {
+                        values: vec!["off".into(), "low".into(), "high".into()],
+                    },
+                ),
+            ],
+            sensors: vec![],
+        });
+
+        assert!(rendered.contains("matter-18 (fan)"), "{rendered}");
+        // The modes are the reason this tool exists: "fan_mode" alone sends the
+        // model back to guessing which words are accepted.
+        assert!(rendered.contains("one of: off, low, high"), "{rendered}");
+        assert!(rendered.contains("0-100 percent"), "{rendered}");
+        assert!(rendered.contains("Measures: nothing."), "{rendered}");
+    }
+
+    #[test]
+    fn a_stated_range_is_shown_and_an_unstated_one_is_not_invented() {
+        let stated = render_description(&DeviceDescription {
+            device_id: "matter-30".into(),
+            device_type: "thermostat".into(),
+            capabilities: vec![spec(
+                "target_temp",
+                ValueSpec::Number {
+                    min: Some(7.0),
+                    max: Some(30.0),
+                    unit: Some("C".into()),
+                },
+            )],
+            sensors: vec![],
+        });
+        assert!(stated.contains("from 7 to 30 C"), "{stated}");
+
+        let silent = render_description(&DeviceDescription {
+            device_id: "matter-31".into(),
+            device_type: "thermostat".into(),
+            capabilities: vec![spec(
+                "target_temp",
+                ValueSpec::Number {
+                    min: None,
+                    max: None,
+                    unit: Some("C".into()),
+                },
+            )],
+            sensors: vec![],
+        });
+        assert!(silent.contains("a number in C"), "{silent}");
+        assert!(!silent.contains("from"), "no range is implied: {silent}");
+    }
+
+    /// A sensor is describable before it has ever reported, which is the question
+    /// "what does this measure?" that readings alone could not answer.
+    #[test]
+    fn a_sensor_lists_what_it_measures_with_units() {
+        let rendered = render_description(&DeviceDescription {
+            device_id: "matter-40".into(),
+            device_type: "sensor".into(),
+            capabilities: vec![],
+            sensors: vec![
+                SensorSpec {
+                    sensor_type: "carbon_dioxide".into(),
+                    unit: "ppm".into(),
+                },
+                SensorSpec {
+                    sensor_type: "pm2_5".into(),
+                    unit: "ug/m3".into(),
+                },
+            ],
+        });
+
+        assert!(rendered.contains("carbon_dioxide (ppm)"), "{rendered}");
+        assert!(rendered.contains("pm2_5 (ug/m3)"), "{rendered}");
+        // And it says plainly that there is nothing to drive, rather than leaving
+        // the model to infer it from an empty list.
+        assert!(rendered.contains("Cannot be controlled"), "{rendered}");
+    }
 
     struct StubControl;
     #[async_trait]

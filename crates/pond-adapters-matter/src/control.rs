@@ -15,14 +15,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use pond_core::user_data::ports::device_control::{DeviceControlOutcome, DeviceControlPort};
+use pond_core::user_data::ports::device_control::{
+    DeviceControlOutcome, DeviceControlPort, DeviceDescription,
+};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 use crate::client::{code_of, MatterClient};
-use crate::protocol::{describe, ControlResult};
+use crate::protocol::{describe, ControlResult, DescribeResult};
 
 /// A swappable handle to the live client. The reconnect supervisor replaces the
 /// inner `Arc<MatterClient>` after re-establishing the WebSocket, so the control
@@ -104,6 +106,16 @@ impl MatterDeviceControl {
 
 #[async_trait]
 impl DeviceControlPort for MatterDeviceControl {
+    async fn describe(&self, device_id: &str) -> Result<DeviceDescription> {
+        let client = self.client.read().await.clone();
+        let result = client
+            .send("describe", json!({ "device_id": device_id }))
+            .await?;
+        serde_json::from_value::<DescribeResult>(result)
+            .map(|r| r.description)
+            .context("the controller did not describe the device")
+    }
+
     async fn set_power(&self, device_id: &str, on: bool) -> Result<DeviceControlOutcome> {
         self.control(device_id, "power", json!(on)).await
     }
