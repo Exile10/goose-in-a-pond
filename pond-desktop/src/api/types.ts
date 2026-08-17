@@ -610,6 +610,23 @@ export interface SourceSyncOutcome {
   ingested: number;
 }
 
+/** One thing the pond read from a connected source. */
+export interface ContextItem {
+  id: string;
+  source_id: string;
+  /** `calendar`, `mail`, `camera`, `sensor`. */
+  source_kind: string;
+  /** `event`, `message`, `document`, `location`, `task`. */
+  kind: string;
+  title: string;
+  body: string;
+  occurred_at: string;
+  participants: string[];
+  /** Whether retrieval can currently reach it. Usually the answer to
+   *  "why did search not find this". */
+  searchable: boolean;
+}
+
 /** A connected personal-context source, as the sources API reports it. */
 export interface ContextSource {
   id: string;

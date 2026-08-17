@@ -554,6 +554,19 @@ impl MemoryRepository for SqliteMemoryRepository {
         Ok(())
     }
 
+    async fn update_content(&self, id: &str, content: &str) -> Result<()> {
+        // The vector goes with the words it described. Keeping it would leave a
+        // row that still scores against the OLD text -- worse than no vector,
+        // because nothing would notice. `search_unembedded` picks it up next
+        // sweep.
+        sqlx::query("UPDATE memory_fragments SET content = ?, embedding = NULL WHERE id = ?")
+            .bind(content)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn update_lifecycle(&self, id: &str, lifecycle: MemoryLifecycle) -> Result<()> {
         sqlx::query("UPDATE memory_fragments SET lifecycle = ? WHERE id = ?")
             .bind(lifecycle_to_str(&lifecycle))

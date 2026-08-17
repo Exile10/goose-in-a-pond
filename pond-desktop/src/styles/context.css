@@ -355,3 +355,113 @@
   line-height: 1.5;
   color: var(--color-text-secondary);
 }
+
+/* ── Card actions ───────────────────────────────────────────────────────── */
+
+.ctx__cardActions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: auto;
+  flex-wrap: wrap;
+}
+
+.ctx__cardActions button {
+  font: inherit;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 9px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+.ctx__cardActions button:hover { color: var(--color-text); border-color: var(--color-accent); }
+.ctx__cardActions button:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+
+.ctx__danger:hover {
+  border-color: var(--color-destructive) !important;
+  color: var(--color-destructive-fg) !important;
+}
+.ctx__confirmAsk { font-size: 12px; font-weight: var(--weight-bold); }
+
+/* Revealed on hover or keyboard focus. Present in the DOM either way, so it is
+   reachable by tab — a control that only exists under a pointer is a control
+   keyboard users do not have. */
+.ctx__cardActions--hover { opacity: 0; transition: opacity 120ms ease; }
+.ctx__card:hover .ctx__cardActions--hover,
+.ctx__card:focus-within .ctx__cardActions--hover { opacity: 1; }
+@media (hover: none) {
+  .ctx__cardActions--hover { opacity: 1; }
+}
+
+.ctx__edit {
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  width: 100%;
+  min-height: 5rem;
+  resize: vertical;
+  padding: 8px 10px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+.ctx__edit:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+
+/* ── Collected ──────────────────────────────────────────────────────────── */
+
+.coll { display: flex; flex-direction: column; gap: var(--space-4); }
+
+.coll__note {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--color-text-secondary);
+  max-width: 56ch;
+}
+
+.coll__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: 52rem;
+}
+
+.coll__item {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--space-3);
+  align-items: start;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md, 8px);
+  background: var(--color-surface);
+}
+
+.coll__icon { color: var(--color-text-secondary); display: flex; padding-top: 2px; }
+.coll__body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.coll__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.coll__title { font-size: 14px; }
+.coll__when { font-size: 12px; color: var(--color-text-secondary); white-space: nowrap; }
+.coll__text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-text-secondary);
+  white-space: pre-line;
+}
+.coll__with { margin: 0; font-size: 12px; color: var(--color-text-secondary); }
+.coll__pending { margin: 0; font-size: 12px; color: var(--color-warning-fg); }

@@ -12,6 +12,7 @@ import {
   type ContextIndexHealth,
   type ContextIndexRebuild,
   type AccountSyncSummary,
+  type ContextItem,
   type ContextSource,
   type Device,
   type DiskUsage,
@@ -728,6 +729,27 @@ export class PondApiClient {
           }
         : {}),
     });
+  }
+
+  /** What the pond has read from connected sources, newest first.
+   *
+   * Keyword search, not semantic: somebody scanning this list is looking for a
+   * message they remember the words of, and a cosine ranking would bury an
+   * exact title match under things merely about the same subject. */
+  listContextItems(
+    sessionId: string,
+    query?: string,
+    limit = 200,
+  ): Promise<{ items: ContextItem[] }> {
+    const q = query?.trim() ? `&q=${encodeURIComponent(query.trim())}` : "";
+    return this.get(
+      `/api/v1/context/items?session_id=${encodeURIComponent(sessionId)}&limit=${limit}${q}`,
+    );
+  }
+
+  /** Correct a memory's wording, keeping its identity. */
+  updateMemory(id: string, content: string): Promise<void> {
+    return this.put(`/api/v1/memories/${encodeURIComponent(id)}`, { content });
   }
 
   /**

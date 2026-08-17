@@ -1,30 +1,37 @@
 // ─── Context: everything the pond knows about you ───────────────────────────
 //
 // The screen the sidebar's Context entry lands on, replacing the old Memories
-// tab. Three views of one subject, because "what the pond knows" is three
+// tab. Four views of one subject, because "what the pond knows" is three
 // different questions a person actually asks:
 //
-//   Remembered  what it has kept          (a wall, like Conversations)
-//   Sources     where else it may read    (calendar, mail, the pond's own)
-//   Lineage     how any of it connects    (the advanced view)
+//   Remembered  what you told it          (a wall, like Conversations)
+//   Collected   what it read from accounts (calendar events, mail subjects)
+//   Sources     where else it may read     (which accounts, and their health)
+//   Lineage     how any of it connects     (the advanced view)
+//
+// Remembered and Collected are kept apart because the provenance decides what
+// you DO about a row you disagree with: you correct a memory, and you
+// disconnect a source.
 //
 // It borrows Conversations' card treatment on purpose. That screen is the one
 // people already know how to scan, and a second wall that behaves differently
 // would be a second thing to learn for no reason.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Plus, Search, RefreshCw } from "lucide-react";
+import { Plus, Search, RefreshCw, Pencil, Trash2, Check, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import type { ContextIndexHealth, MemoryFragment } from "../api/types";
 import { ConnectionsPanel } from "../connections/ConnectionsPanel";
 import { useAppState } from "../state/AppContext";
+import { Collected } from "./context/Collected";
 import { Lineage } from "./context/Lineage";
 import "../styles/context.css";
 
-type View = "remembered" | "sources" | "lineage";
+type View = "remembered" | "collected" | "sources" | "lineage";
 
 const VIEWS: Array<{ id: View; label: string; blurb: string }> = [
-  { id: "remembered", label: "Remembered", blurb: "What the pond has kept" },
+  { id: "remembered", label: "Remembered", blurb: "What you told it" },
+  { id: "collected", label: "Collected", blurb: "What it read from your accounts" },
   { id: "sources", label: "Sources", blurb: "Where else it may read" },
   { id: "lineage", label: "Lineage", blurb: "How it all connects" },
 ];
@@ -60,6 +67,9 @@ export function Context() {
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  const [confirmingId, setConfirmingId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -112,6 +122,35 @@ export function Context() {
       setError(e instanceof Error ? e.message : "Could not save that.");
     } finally {
       setAdding(false);
+    }
+  }
+
+  async function saveEdit(id: string) {
+    const text = editDraft.trim();
+    const original = memories.find((m) => m.id === id);
+    if (!text || text === original?.content) {
+      setEditingId(null);
+      return;
+    }
+    try {
+      // In place: the memory keeps its id, its age and its usage. It used to be
+      // add-then-delete, which turned a corrected long-held fact into a
+      // brand-new one that had never been used.
+      await api.updateMemory(id, text);
+      setEditingId(null);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not save that change.");
+    }
+  }
+
+  async function removeMemory(id: string) {
+    try {
+      await api.deleteMemory(id);
+      setConfirmingId(null);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not delete that.");
     }
   }
 
@@ -205,13 +244,77 @@ export function Context() {
                     {m.tier && <span className="ctx__tier" data-tier={m.tier}>{m.tier}</span>}
                     <span className="ctx__when">{relativeWhen(m.created_at)}</span>
                   </div>
-                  <p className="ctx__cardBody">{m.content}</p>
+
+                  {editingId === m.id ? (
+                    <>
+                      <textarea
+                        className="ctx__edit"
+                        value={editDraft}
+                        autoFocus
+                        onChange={(e) => setEditDraft(e.target.value)}
+                      />
+                      <div className="ctx__cardActions">
+                        <button type="button" onClick={() => void saveEdit(m.id)} aria-label="Save">
+                          <Check size={14} />
+                          <span>Save</span>
+                        </button>
+                        <button type="button" onClick={() => setEditingId(null)} aria-label="Cancel">
+                          <X size={14} />
+                          <span>Cancel</span>
+                        </button>
+                      </div>
+                    </>
+                  ) : confirmingId === m.id ? (
+                    <>
+                      <p className="ctx__cardBody">{m.content}</p>
+                      <div className="ctx__cardActions">
+                        <span className="ctx__confirmAsk">Forget this?</span>
+                        <button
+                          type="button"
+                          className="ctx__danger"
+                          onClick={() => void removeMemory(m.id)}
+                        >
+                          Forget
+                        </button>
+                        <button type="button" onClick={() => setConfirmingId(null)}>
+                          Keep
+                        </button>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <p className="ctx__cardBody">{m.content}</p>
+                      <div className="ctx__cardActions ctx__cardActions--hover">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditDraft(m.content);
+                            setEditingId(m.id);
+                          }}
+                          aria-label="Edit this memory"
+                        >
+                          <Pencil size={14} />
+                          <span>Edit</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmingId(m.id)}
+                          aria-label="Forget this memory"
+                        >
+                          <Trash2 size={14} />
+                          <span>Forget</span>
+                        </button>
+                      </div>
+                    </>
+                  )}
                 </article>
               ))}
             </div>
           )}
         </>
       )}
+
+      {view === "collected" && <Collected sessionId={sessionId} />}
 
       {view === "sources" && <ConnectionsPanel sessionId={sessionId} />}
 
