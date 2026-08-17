@@ -85,6 +85,7 @@ read a failure carrying a null result as a success.
 | `decommission` | `{device_id}` | `{}` |
 | `control` | `{device_id, verb, value}` | `{applied: DeviceStatePatch}` |
 | `describe` | `{device_id}` | `{description: DeviceDescription}` |
+| `state` | `{device_id}` | `{state: DeviceState}` |
 | `ping` | — | `{}` — liveness without a fabric round-trip |
 
 `subscribe` returns the **whole fabric**, readings included, so a fresh
@@ -237,6 +238,31 @@ device currently reports, and a stored copy goes stale exactly when a device is
 upgraded or reconfigured — the moment its description matters most.
 
 ---
+
+## Reading a device
+
+`describe` says what a device can be told to do. `state` says what it is doing.
+
+```ts
+DeviceState = { device_id, values: StateValue[] }
+StateValue  = { name, value }        // both as the device words them
+```
+
+Every `name` is one `describe` also uses — a control verb for a scalar, a setting
+name for a selectable — so a reading names the thing that changes it: "spin speed
+is Low" leads straight to the call that makes it High. That correspondence is the
+point of the type being this plain, and it is asserted in the controller's tests
+rather than left as an intention.
+
+Values are read through the inverses of the conversions `control` writes with, so a
+covering reported at 40% open is the same 40% that would put it there — not
+WindowCovering's percent *closed*. Anything the device does not report is absent
+rather than filled in: an invented "unknown" cannot be told from a real reading one
+layer up.
+
+Without this the only way to learn a device's state was to change it. "Is the
+washer running?" had no answer that did not involve starting the washer.
+
 
 ## Error codes
 

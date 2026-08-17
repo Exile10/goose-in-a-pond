@@ -56,9 +56,19 @@ export function brightnessToLevel(percent: number): number {
   return Math.floor((pct * 254 + 50) / 100);
 }
 
+/** Matter's 0-254 level back to a 0-100 GIAP percentage, for reading state. */
+export function levelToBrightness(level: number): number {
+  return clampPercent((level * 100) / 254);
+}
+
 /** Celsius onto a Matter thermostat setpoint (hundredths of a degree). */
 export function celsiusToSetpoint(celsius: number): number {
   return Math.min(32767, Math.max(-32768, Math.round(celsius * 100)));
+}
+
+/** A Matter thermostat setpoint back to Celsius. */
+export function setpointToCelsius(setpoint: number): number {
+  return Math.round(setpoint) / 100;
 }
 
 /** A 0-360 degree hue onto ColorControl's 0-254 scale (360 wraps to 0, matching the
@@ -82,6 +92,11 @@ export function saturationToMatter(percent: number): number {
  */
 export function positionOpenToLift100ths(percentOpen: number): number {
   return (100 - clampPercent(percentOpen)) * 100;
+}
+
+/** WindowCovering's hundredths-of-a-percent CLOSED back to GIAP percent OPEN. */
+export function lift100thsToPositionOpen(lift100ths: number): number {
+  return clampPercent(100 - lift100ths / 100);
 }
 
 function clampPercent(value: number): number {
@@ -132,6 +147,28 @@ export function fanModeFromName(name: string): number | undefined {
       return 5;
     case "smart":
       return 6;
+    default:
+      return undefined;
+  }
+}
+
+/** `FanMode` back to the name it is sent by, for reading state. */
+export function fanModeName(code: number): string | undefined {
+  switch (code) {
+    case FAN_MODE_OFF:
+      return "off";
+    case 1:
+      return "low";
+    case 2:
+      return "medium";
+    case 3:
+      return "high";
+    case 4:
+      return "on";
+    case 5:
+      return "auto";
+    case 6:
+      return "smart";
     default:
       return undefined;
   }

@@ -17,7 +17,9 @@
 
 use chrono::{DateTime, Utc};
 use pond_core::user_data::domain::sensor::SensorReading;
-use pond_core::user_data::ports::device_control::{DeviceDescription, DeviceStatePatch};
+use pond_core::user_data::ports::device_control::{
+    DeviceDescription, DeviceState, DeviceStatePatch,
+};
 use pond_core::user_data::ports::device_registry::Device;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -246,6 +248,12 @@ pub struct ControlResult {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DescribeResult {
     pub description: DeviceDescription,
+}
+
+/// The `state` result.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StateResult {
+    pub state: DeviceState,
 }
 
 /// The `commission` result.

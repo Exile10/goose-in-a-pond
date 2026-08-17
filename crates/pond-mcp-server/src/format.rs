@@ -556,7 +556,7 @@ mod tests {
         assert!(!tools.contains("giap-discovery__search_web"), "{tools:?}");
         assert_eq!(
             tools.len(),
-            68,
+            69,
             "the tool inventory changed. Update this count in the same commit as \
              the tool — the number is the record, and a stale one is how a count \
              read 64 for months while the real number was 65. This assertion has \

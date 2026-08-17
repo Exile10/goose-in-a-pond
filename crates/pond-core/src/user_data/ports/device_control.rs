@@ -76,6 +76,29 @@ impl DeviceControlOutcome {
     }
 }
 
+/// One thing a device currently is: `spin speed` is `High`.
+///
+/// `name` is always a name [`DeviceDescription`] also uses — a control verb for a
+/// scalar, a setting name for a selectable — so a reading names the thing that
+/// changes it, and reading leads to acting without a second lookup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateValue {
+    pub name: String,
+    pub value: String,
+}
+
+/// Everything a device currently reports.
+///
+/// The counterpart to [`DeviceDescription`]: that says what a device can be told to
+/// do, this says what it is doing. Without it the only way to learn a device's state
+/// was to change it, and "is the washer running?" had no answer that did not involve
+/// starting the washer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceState {
+    pub device_id: String,
+    pub values: Vec<StateValue>,
+}
+
 /// What a device can be told to do and what it measures, in its own terms.
 ///
 /// `Device::capabilities` is a list of verb names — enough to know a fan has a
@@ -189,6 +212,15 @@ pub trait DeviceControlPort: Send + Sync {
     /// rather than as it was when it was paired.
     async fn describe(&self, device_id: &str) -> Result<DeviceDescription> {
         anyhow::bail!("device '{device_id}' does not describe itself")
+    }
+
+    /// What this device currently is.
+    ///
+    /// Optional in the same way the verbs below are: a backend that cannot read a
+    /// device's state says so rather than returning an empty one, which would be
+    /// indistinguishable from a device reporting nothing.
+    async fn state(&self, device_id: &str) -> Result<DeviceState> {
+        anyhow::bail!("device '{device_id}' cannot report its state")
     }
 
     /// Choose a named setting — a wash cycle, a spin speed, a temperature level.
