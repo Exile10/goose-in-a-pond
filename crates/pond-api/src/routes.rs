@@ -272,6 +272,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/context/sources/{id}", delete(disconnect_context_source))
         .route("/context/sync", post(sync_context_sources))
+        .route("/context/items", get(list_context_items))
         // ── The index's own health, and the way to repair it ───────────────
         // Protected, and deliberately absent from `middleware::PUBLIC_ROUTES`:
         // these counts say how much of a household's memory exists and how
@@ -354,7 +355,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/logs/export", get(export_logs_csv))
         // ── Memories ──────────────────────────────────────────────────────────
         .route("/memories", get(list_memories).post(save_memory))
-        .route("/memories/{id}", delete(delete_memory))
+        .route("/memories/{id}", delete(delete_memory).put(update_memory))
         // ── Memory Consolidation ─────────────────────────────────────────────
         .route("/memory/consolidate", post(start_consolidation))
         .route("/memory/consolidate/stop", post(stop_consolidation))
@@ -12258,6 +12259,42 @@ async fn save_memory(
     }
 }
 
+#[derive(Deserialize)]
+struct UpdateMemoryRequest {
+    content: String,
+}
+
+/// `PUT /api/v1/memories/{id}` -- correct a memory's wording in place.
+///
+/// In place, keeping its id. The desktop used to do this by adding the new text
+/// and deleting the old row, which reset the memory's age and usage, orphaned
+/// its vector, and left a duplicate behind whenever the delete half failed. A
+/// correction should not turn a long-held fact into a brand-new one.
+async fn update_memory(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateMemoryRequest>,
+) -> impl axum::response::IntoResponse {
+    let content = body.content.trim();
+    if content.is_empty() {
+        // Emptying a memory is a deletion wearing an edit's clothes, and the
+        // caller has a route for that which reports what it removed.
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "a memory cannot be blank -- delete it instead"})),
+        )
+            .into_response();
+    }
+    match state.memory_repo.update_content(&id, content).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 async fn delete_memory(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -15031,6 +15068,72 @@ async fn connect_context_source(
     Ok(Json(
         json!({"id": id, "kind": kind.as_str(), "profile_id": owner}),
     ))
+}
+
+/// `GET /api/v1/context/items?session_id=X&q=…` -- what the pond has read.
+///
+/// Scoped like every other read of this corpus: the caller sees their own items
+/// and nobody else's, decided in the SQL rather than filtered afterwards.
+///
+/// Keyword search rather than semantic, deliberately. Somebody scrolling a list
+/// of what their pond collected is looking for a message they remember the
+/// words of, and a cosine ranking would bury an exact title match under three
+/// things that are merely about the same subject. The semantic path is what the
+/// assistant uses; this is what a person uses.
+async fn list_context_items(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let session_id = params.get("session_id").cloned().unwrap_or_default();
+    let device = proven_device(principal.as_ref());
+    let scope = resolve_turn_scope(&state, &session_id, &device).await;
+
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(200)
+        .clamp(1, 500);
+
+    let query = params.get("q").map(|q| q.trim()).unwrap_or_default();
+    let repo = context_repo(&state);
+    let items = if query.is_empty() {
+        repo.recent_items(&scope, limit).await
+    } else {
+        // Split on whitespace: the store's keyword search takes terms, and
+        // handing it the whole phrase would match only items containing that
+        // exact string.
+        let terms: Vec<String> = query.split_whitespace().map(|t| t.to_string()).collect();
+        repo.search_items(&terms, &scope, limit).await
+    };
+
+    let items = items.map_err(|e| {
+        tracing::warn!(error = %e, "could not read context items");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "could not read what the pond has collected"})),
+        )
+    })?;
+
+    Ok(Json(json!({
+        "items": items
+            .iter()
+            .map(|i| json!({
+                "id": i.id(),
+                "source_id": i.source_id(),
+                "source_kind": i.source_kind().as_str(),
+                "kind": i.kind().as_str(),
+                "title": i.title(),
+                "body": i.body(),
+                "occurred_at": i.occurred_at().to_rfc3339(),
+                "participants": i.participants(),
+                // Whether retrieval can currently reach it. The list is also
+                // the place somebody asks "why did search not find this", and
+                // the answer is usually this flag.
+                "searchable": i.embedding().is_some(),
+            }))
+            .collect::<Vec<_>>()
+    })))
 }
 
 /// `POST /api/v1/context/sync` -- pull every connected account now.
