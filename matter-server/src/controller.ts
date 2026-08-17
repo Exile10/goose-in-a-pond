@@ -369,7 +369,7 @@ export class Controller {
     // What the device is now, not what it was asked to be. The command response
     // above proves it accepted the command; this is how it describes the result.
     if (verb === "operation") {
-      const observed = observedOperation(snapshotOf(peer, nodeId));
+      const observed = await settledOperation(peer, nodeId, plan.applied.operation);
       if (observed !== undefined) plan.applied.operation = observed;
     }
 
@@ -546,6 +546,64 @@ function snapshotOf(peer: ClientNode, nodeId: bigint): NodeSnapshot {
     });
   }
   return { nodeId, online: peer.lifecycle.isOnline, endpoints };
+}
+
+/**
+ * How long to let a device's state catch up with the command it just took.
+ *
+ * A cluster's state here is whatever the subscription last reported, and the report
+ * carrying a change arrives after the command returns -- measured against Google's
+ * Matter Virtual Device, the command answered in 13ms and the new state landed
+ * within 500ms. Reading straight after the invocation therefore returns the state
+ * BEFORE the command, which reported a washer that started perfectly well as having
+ * stayed stopped. That is a worse failure than the echo it replaced: an echo is
+ * merely uninformative, while this contradicts a device that did as it was told.
+ */
+const OPERATION_SETTLE_MS = 2000;
+const OPERATION_POLL_MS = 100;
+
+/** The state each operation asks the device to reach. */
+const INTENDED_STATE: Record<string, string> = {
+  start: "running",
+  resume: "running",
+  stop: "stopped",
+  pause: "paused",
+};
+
+/**
+ * Wait for `read` to report `wanted`, or give up and return whatever it last said.
+ *
+ * Returns as soon as the state appears, so a device that obeys is not delayed past
+ * its own report. A device that never gets there costs the full window and is then
+ * reported as whatever it actually is -- which is the honest answer for one that
+ * took the command and did nothing.
+ */
+export async function settleTo(
+  wanted: string | undefined,
+  read: () => string | undefined,
+  waitMs: number = OPERATION_SETTLE_MS,
+  pollMs: number = OPERATION_POLL_MS,
+): Promise<string | undefined> {
+  let seen = read();
+  // Nothing to wait for: a verb with no state of its own to reach.
+  if (wanted === undefined) return seen;
+
+  const deadline = Date.now() + waitMs;
+  while (seen !== wanted && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, pollMs));
+    seen = read();
+  }
+  return seen;
+}
+
+/** The device's state once it has had a chance to report the command's effect. */
+async function settledOperation(
+  peer: ClientNode,
+  nodeId: bigint,
+  requested: string | undefined,
+): Promise<string | undefined> {
+  const wanted = requested === undefined ? undefined : INTENDED_STATE[requested.toLowerCase()];
+  return settleTo(wanted, () => observedOperation(snapshotOf(peer, nodeId)));
 }
 
 /** ErrorStateEnum, for a device that sends an id without a label. */
