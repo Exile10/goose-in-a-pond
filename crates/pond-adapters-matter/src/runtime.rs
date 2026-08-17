@@ -456,7 +456,7 @@ async fn teardown(running: &mut Running, r: &Reconciler) {
         // means it cannot revive a controller between here and the kill below.
         supervisor.abort();
     }
-    stop_controller(&running.child).await;
+    stop_controller(&running.child, &r.data_dir).await;
 }
 
 /// Kill the controller GIAP started, whichever process that currently is.
@@ -466,10 +466,14 @@ async fn teardown(running: &mut Running, r: &Reconciler) {
 /// exited long ago, and killing that one would leave the live controller
 /// running past the Pond. Empty cell means GIAP started nothing — the user's
 /// own controller is theirs to stop.
-pub(crate) async fn stop_controller(child: &SharedServerChild) {
+pub(crate) async fn stop_controller(child: &SharedServerChild, data_dir: &std::path::Path) {
     if let Some(mut running) = child.lock().await.take() {
         tracing::info!("matter: stopping the controller GIAP started");
         let _ = running.start_kill();
+        // Cleared on the way out so the next start has nothing stale to
+        // classify. Losing this file is harmless — the pid check would find the
+        // process gone — but leaving it costs a `ps` on every start.
+        crate::server_setup::clear_pidfile(data_dir);
     }
 }
 
