@@ -751,9 +751,20 @@ async fn handshake_pairing_code(
 #[serde(deny_unknown_fields)]
 struct IssuePairingCodeRequest {
     /// The household member the device pairing with this code will belong to.
-    /// Omitted or `null` leaves it unattributed.
+    ///
+    /// Omitted or `null` no longer means "unattributed" on its own: a
+    /// one-member household defaults to that member, per
+    /// [`pairing_attribution::owner_for_new_code`]. Set `unattributed` to ask
+    /// for a code that binds to nobody.
     #[serde(default)]
     profile_id: Option<String>,
+    /// Ask for a code that binds the device to nobody, even in a household
+    /// where a member could be inferred.
+    ///
+    /// This is how a guest's phone is paired without becoming a member's. It is
+    /// the reason the sole-member default is safe to have at all.
+    #[serde(default)]
+    unattributed: bool,
 }
 
 /// Issue a **fresh** single-use pairing code. **Loopback-only** — this is the
@@ -797,9 +808,34 @@ async fn handshake_issue_pairing_code(
     };
 
     let named_a_member = request.profile_id.is_some();
+    // The member ids the default is allowed to consider. A failed read narrows
+    // to an unattributed code rather than assuming the household is one person,
+    // exactly as `resolve_turn_scope` narrows on the same failure: pairing is
+    // recoverable, and a wrong attribution rides on every turn the device sends.
+    let member_ids: Vec<String> = match state.profile_repo.list().await {
+        Ok(profiles) => profiles.into_iter().map(|p| p.id).collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not list household members; issuing an unattributed pairing code"
+            );
+            Vec::new()
+        }
+    };
+    let owner = pond_core::user_data::services::pairing_attribution::owner_for_new_code(
+        request.profile_id.as_deref(),
+        request.unattributed,
+        &member_ids,
+    );
+    if owner.is_some() && !named_a_member {
+        tracing::info!(
+            "this household has one member, so the device pairing with this code becomes theirs; \
+             POST {{\"unattributed\": true}} for a code that binds to nobody"
+        );
+    }
     let pc = state
         .handshake
-        .issue_pairing_code_for(request.profile_id.as_deref())
+        .issue_pairing_code_for(owner.as_deref())
         .await
         .map_err(|e| {
             // Logged the same way either way, so the real cause is in the log

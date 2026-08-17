@@ -277,13 +277,79 @@ async fn a_code_issued_with_no_body_at_all_is_unattributed_as_it_always_was() {
     );
     assert!(
         body["profile_id"].is_null(),
-        "no member was named, so the code must belong to nobody rather than to \
-         a defaulted member; body: {body}"
+        "this harness has NO profiles, so there is no member to infer and the \
+         code must belong to nobody; body: {body}"
     );
 
     let stored = live_code(&h.loopback).await;
     assert_eq!(stored["code"], body["code"]);
     assert!(stored["profile_id"].is_null());
+}
+
+// ── The sole-member default ──────────────────────────────────────────────────
+
+/// The writer for a path that was complete and undriven.
+///
+/// `issue_pairing_code_for` has taken a member since P9 and no shipped caller
+/// ever passed one, so every device on a real pond paired unattributed --
+/// twelve of twelve, measured. That falls through the paired-device rung on
+/// every turn, which is also why `sessions.profile_id` is never written and the
+/// summary corpus can never be retrieved.
+#[tokio::test]
+async fn a_sole_member_household_binds_the_code_without_being_asked() {
+    let h = make_app().await;
+    let jerry = a_member(&h, "Jerry").await;
+
+    // No body at all -- exactly what the CLI and the desktop dashboard send.
+    let (status, body) = issue(&h.loopback, None).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["profile_id"].as_str(),
+        Some(jerry.as_str()),
+        "one member means one answer to whose device this is, and refusing to \
+         write it down does not make the pond safer; body: {body}"
+    );
+
+    let stored = live_code(&h.loopback).await;
+    assert_eq!(stored["profile_id"].as_str(), Some(jerry.as_str()));
+}
+
+/// The escape hatch, and the reason the default above is safe to have.
+///
+/// Without it a one-member pond could not pair a guest's phone without that
+/// phone becoming the member's, and every turn it sent would inherit an
+/// identity nobody claimed.
+#[tokio::test]
+async fn a_sole_member_household_can_still_pair_a_guests_phone() {
+    let h = make_app().await;
+    let _jerry = a_member(&h, "Jerry").await;
+
+    let (status, body) = issue(&h.loopback, Some(r#"{"unattributed": true}"#)).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["profile_id"].is_null(),
+        "the operator asked for a code that binds to nobody and must get one; \
+         body: {body}"
+    );
+
+    let stored = live_code(&h.loopback).await;
+    assert!(stored["profile_id"].is_null());
+}
+
+/// Two members is no answer, not a coin flip. Binding to whoever was created
+/// first would attribute a phone by row order, which is evidence of nothing.
+#[tokio::test]
+async fn two_members_still_require_the_operator_to_name_one() {
+    let h = make_app().await;
+    let _jerry = a_member(&h, "Jerry").await;
+    let _liz = a_member(&h, "Liz").await;
+
+    let (status, body) = issue(&h.loopback, None).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["profile_id"].is_null(),
+        "with two members there is nothing to infer; body: {body}"
+    );
 }
 
 // ── The security argument the capture point rests on ─────────────────────────
