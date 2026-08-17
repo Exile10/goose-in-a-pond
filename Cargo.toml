@@ -14,6 +14,7 @@ members = [
     "crates/pond-infra",
     "crates/pond-infra-scheduler",
     "crates/pond-server",
+    "crates/pond-adapters-caldav",
     "crates/pond-adapters-llamafile",
     "crates/pond-adapters-ollama",
     "crates/pond-adapters-whisper",

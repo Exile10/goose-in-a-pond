@@ -1,0 +1,20 @@
+[package]
+name = "pond-adapters-caldav"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pond-core   = { path = "../pond-core" }
+anyhow      = { workspace = true }
+async-trait = { workspace = true }
+base64      = { workspace = true }
+chrono      = { workspace = true }
+quick-xml   = "0.37"
+reqwest     = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+tokio    = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = { workspace = true }

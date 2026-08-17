@@ -90,6 +90,7 @@ jobs:
             -p pond-adapters-piper \
             -p pond-adapters-vision \
             -p pond-adapters-weather \
+            -p pond-adapters-caldav \
             -p pond-adapters-mcp-memory \
             -p pond-mesh-protocol \
             -p pond-mcp-server
@@ -111,6 +112,7 @@ jobs:
             -p pond-adapters-piper \
             -p pond-adapters-vision \
             -p pond-adapters-weather \
+            -p pond-adapters-caldav \
             -p pond-adapters-mcp-memory \
             -p pond-mesh-protocol \
             -p pond-mcp-server

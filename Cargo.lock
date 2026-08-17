@@ -9311,6 +9311,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond-adapters-caldav"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "pond-core",
+ "quick-xml 0.37.5",
+ "reqwest 0.13.3",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "pond-adapters-face-onnx"
 version = "0.1.0"
 dependencies = [
