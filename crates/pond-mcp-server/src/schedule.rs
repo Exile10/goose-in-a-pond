@@ -131,6 +131,20 @@ pub struct ScheduleIdParam {
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ScheduleActionParams {
+    /// Schedule ID, from list_schedules.
+    #[serde(default)]
+    pub id: String,
+    /// delete | pause | resume | run_now.
+    #[serde(default)]
+    pub action: String,
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct CreateSensorRuleParams {
     pub name: Option<String>,
     /// "sensor" (default) | "camera" | "device".
@@ -192,6 +206,25 @@ pub struct UpdateScheduleParams {
     pub cron: Option<String>,
     pub prompt: Option<String>,
     /// IANA timezone.
+    pub timezone: Option<String>,
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// The merged surface for create-or-update. `id` decides which.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ScheduleUpsertParams {
+    /// Existing schedule ID to change. Omit to create a new one.
+    #[serde(default)]
+    pub id: String,
+    pub name: Option<String>,
+    /// 6-field cron: sec min hr dom mon dow. Also accepts natural language.
+    pub cron: Option<String>,
+    /// Prompt sent to the agent on each fire.
+    pub prompt: Option<String>,
+    /// IANA timezone; default: user's setting.
     pub timezone: Option<String>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -383,28 +416,43 @@ repeating use create_schedule instead.")]
         }
     }
 
+    // create and update were two tools over near-identical schemas -- name,
+    // cron, prompt, timezone, differing only in whether `id` was present and
+    // whether the fields were optional. `id` is the whole distinction, so it
+    // is now the parameter that carries it.
     #[tool(
-        description = "Create a scheduled task. Accepts natural language ('every morning at 8am') or 6-field cron: sec min hr dom mon dow."
+        description = "Create a scheduled task that sends a prompt to the agent on a cron. Pass an existing id to change one instead; omitted fields keep their current value."
     )]
     async fn create_schedule(
         &self,
         _ctx: RequestContext<RoleServer>,
-        params: Parameters<CreateScheduleParams>,
+        params: Parameters<ScheduleUpsertParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        eprintln!("[schedule] ╔═══ MCP SERVER RECEIVED ═══");
-        eprintln!("[schedule] ║ params.name:  {:?}", params.0.name);
-        eprintln!("[schedule] ║ params.cron:  {:?}", params.0.cron);
-        eprintln!("[schedule] ║ params.prompt: {:?}", params.0.prompt);
-        eprintln!("[schedule] ║ params.extra: {:?}", params.0.extra);
-        eprintln!("[schedule] ╚═══════════════════════════");
+        let p = params.0;
+        if p.id.trim().is_empty() {
+            let c = CreateScheduleParams {
+                name: p.name.unwrap_or_default(),
+                cron: p.cron.unwrap_or_default(),
+                prompt: p.prompt.unwrap_or_default(),
+                timezone: p.timezone,
+                extra: p.extra,
+            };
 
-        let user_msg = crate::last_user_message();
+            eprintln!("[schedule] ╔═══ MCP SERVER RECEIVED ═══");
+            eprintln!("[schedule] ║ params.name:  {:?}", c.name);
+            eprintln!("[schedule] ║ params.cron:  {:?}", c.cron);
+            eprintln!("[schedule] ║ params.prompt: {:?}", c.prompt);
+            eprintln!("[schedule] ║ params.extra: {:?}", c.extra);
+            eprintln!("[schedule] ╚═══════════════════════════");
 
-        // ── ToolCaller PRIMARY: generate all params from user message ──
-        const SCHEDULE_SCHEMA: &str = r#"{"type":"object","properties":{"cron":{"type":"string","description":"6-field cron: sec min hr dom mon dow. Example: 0 0 8 * * * for daily 8 AM"},"prompt":{"type":"string","description":"The action to perform on each fire"},"name":{"type":"string","description":"Short human-readable name"}},"required":["cron","prompt"]}"#;
+            let user_msg = crate::last_user_message();
 
-        let (tc_cron, tc_prompt, tc_name) =
-            if let Some(args) = crate::generate_params("create_schedule", SCHEDULE_SCHEMA).await {
+            // ── ToolCaller PRIMARY: generate all params from user message ──
+            const SCHEDULE_SCHEMA: &str = r#"{"type":"object","properties":{"cron":{"type":"string","description":"6-field cron: sec min hr dom mon dow. Example: 0 0 8 * * * for daily 8 AM"},"prompt":{"type":"string","description":"The action to perform on each fire"},"name":{"type":"string","description":"Short human-readable name"}},"required":["cron","prompt"]}"#;
+
+            let (tc_cron, tc_prompt, tc_name) = if let Some(args) =
+                crate::generate_params("create_schedule", SCHEDULE_SCHEMA).await
+            {
                 eprintln!("[schedule] ToolCaller generated: {:?}", args);
                 (
                     args.get("cron")
@@ -421,121 +469,263 @@ repeating use create_schedule instead.")]
                 (None, None, None)
             };
 
-        // ── Resolve cron: ToolCaller > model param > user message parse > nudge ──
-        // Validate cron looks like a real 6-field expression (not garbage from small models)
-        let looks_like_cron = |s: &str| {
-            let parts: Vec<&str> = s.split_whitespace().collect();
-            parts.len() == 6
-                && parts.iter().all(|p| {
-                    p.chars()
-                        .all(|c| c.is_ascii_digit() || c == '*' || c == '/' || c == '-' || c == ',')
+            // ── Resolve cron: ToolCaller > model param > user message parse > nudge ──
+            // Validate cron looks like a real 6-field expression (not garbage from small models)
+            let looks_like_cron = |s: &str| {
+                let parts: Vec<&str> = s.split_whitespace().collect();
+                parts.len() == 6
+                    && parts.iter().all(|p| {
+                        p.chars().all(|c| {
+                            c.is_ascii_digit() || c == '*' || c == '/' || c == '-' || c == ','
+                        })
+                    })
+            };
+            let cron = tc_cron
+                .filter(|s| !s.is_empty() && looks_like_cron(s))
+                .or_else(|| {
+                    let c = &c.cron;
+                    if c.is_empty() || !looks_like_cron(c) {
+                        None
+                    } else {
+                        Some(c.clone())
+                    }
                 })
-        };
-        let cron = tc_cron
-            .filter(|s| !s.is_empty() && looks_like_cron(s))
-            .or_else(|| {
-                let c = &params.0.cron;
-                if c.is_empty() || !looks_like_cron(c) {
-                    None
-                } else {
-                    Some(c.clone())
-                }
-            })
-            .or_else(|| parse_cron_from_message(&user_msg.to_lowercase()));
+                .or_else(|| parse_cron_from_message(&user_msg.to_lowercase()));
 
-        let cron = match cron {
-            Some(c) => c,
-            None => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Could not parse a schedule from: \"{}\". \
-                     Retry with cron (sec min hr dom mon dow). \
-                     Examples: '0 0 8 * * *' = daily 8 AM, '0 30 9 * * 1' = Monday 9:30 AM.",
-                    user_msg
-                ))]));
+            let cron = match cron {
+                Some(c) => c,
+                None => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Could not parse a schedule from: \"{}\". \
+                         Retry with cron (sec min hr dom mon dow). \
+                         Examples: '0 0 8 * * *' = daily 8 AM, '0 30 9 * * 1' = Monday 9:30 AM.",
+                        user_msg
+                    ))]));
+                }
+            };
+
+            // ── Resolve prompt: ToolCaller > model param > user message extract ──
+            let prompt = tc_prompt
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    let p = &c.prompt;
+                    if p.is_empty() {
+                        None
+                    } else {
+                        Some(p.clone())
+                    }
+                })
+                .unwrap_or_else(|| {
+                    extract_prompt_from_message(&user_msg.to_lowercase(), &user_msg)
+                });
+
+            // ── Resolve name: ToolCaller > model param > derive from prompt ──
+            let name = tc_name
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    let n = &c.name;
+                    if n.is_empty() {
+                        None
+                    } else {
+                        Some(n.clone())
+                    }
+                })
+                .unwrap_or_else(|| {
+                    if prompt.len() > 40 {
+                        format!("{}...", &prompt[..37])
+                    } else {
+                        prompt.clone()
+                    }
+                });
+
+            // Default timezone to user's setting if not provided.
+            let timezone = match &c.timezone {
+                Some(tz) if !tz.is_empty() => tz.clone(),
+                _ => self
+                    .settings_repo
+                    .get()
+                    .await
+                    .map(|s| s.timezone.clone())
+                    .unwrap_or_else(|_| "UTC".to_string()),
+            };
+
+            let id = uuid::Uuid::new_v4().to_string();
+            let req = CreateScheduleRequest {
+                fire_at: None,
+                id: id.clone(),
+                label: name,
+                cron: cron.clone(),
+                timezone: timezone.clone(),
+                kind: TaskKind::AgentPrompt {
+                    prompt: prompt.clone(),
+                },
+            };
+
+            match self.scheduler.create_task(req).await {
+                Ok(schedule) => Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Schedule created: \"{}\" [{}] — {} {} (agent prompt: \"{}\")",
+                    schedule.label, schedule.id, schedule.cron, schedule.timezone, prompt,
+                ))])),
+                Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Failed to create schedule: {e}. Check the cron expression '{}' is valid 6-field format.",
+                    cron
+                ))])),
             }
-        };
+        } else {
+            let u = UpdateScheduleParams {
+                id: p.id,
+                name: p.name,
+                cron: p.cron,
+                prompt: p.prompt,
+                timezone: p.timezone,
+                extra: p.extra,
+            };
 
-        // ── Resolve prompt: ToolCaller > model param > user message extract ──
-        let prompt = tc_prompt
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                let p = &params.0.prompt;
-                if p.is_empty() {
-                    None
-                } else {
-                    Some(p.clone())
-                }
-            })
-            .unwrap_or_else(|| extract_prompt_from_message(&user_msg.to_lowercase(), &user_msg));
+            let user_msg = crate::last_user_message();
 
-        // ── Resolve name: ToolCaller > model param > derive from prompt ──
-        let name = tc_name
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                let n = &params.0.name;
-                if n.is_empty() {
-                    None
-                } else {
-                    Some(n.clone())
+            // ── Resolve ID: model param > extract from user message ──
+            let id = if u.id.is_empty() {
+                // Try to find a UUID-shaped string in the user message
+                user_msg
+                    .split_whitespace()
+                    .find(|w| uuid::Uuid::parse_str(w).is_ok())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            } else {
+                u.id.clone()
+            };
+
+            if id.is_empty() {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "Missing schedule ID. Please provide the ID of the schedule to update. \
+                     Use list_schedules to see all schedules and their IDs.",
+                )]));
+            }
+
+            // ── Resolve cron: natural language parse > validated literal ──
+            // Same validation as create_schedule — reject strings that aren't valid 6-field cron.
+            let looks_like_cron = |s: &str| {
+                let parts: Vec<&str> = s.split_whitespace().collect();
+                parts.len() == 6
+                    && parts.iter().all(|p| {
+                        p.chars().all(|c| {
+                            c.is_ascii_digit() || c == '*' || c == '/' || c == '-' || c == ','
+                        })
+                    })
+            };
+            let cron = u.cron.as_ref().and_then(|c| {
+                if c.is_empty() {
+                    return None;
                 }
-            })
-            .unwrap_or_else(|| {
-                if prompt.len() > 40 {
-                    format!("{}...", &prompt[..37])
-                } else {
-                    prompt.clone()
-                }
+                // Try natural language first, then validated literal
+                parse_cron_from_message(&c.to_lowercase()).or_else(|| {
+                    if looks_like_cron(c) {
+                        Some(c.clone())
+                    } else {
+                        None
+                    }
+                })
             });
 
-        // Default timezone to user's setting if not provided.
-        let timezone = match &params.0.timezone {
-            Some(tz) if !tz.is_empty() => tz.clone(),
-            _ => self
-                .settings_repo
-                .get()
-                .await
-                .map(|s| s.timezone.clone())
-                .unwrap_or_else(|_| "UTC".to_string()),
-        };
+            // ── Resolve prompt: pass through if provided ──
+            let prompt =
+                u.prompt
+                    .as_ref()
+                    .and_then(|p| if p.is_empty() { None } else { Some(p.clone()) });
 
-        let id = uuid::Uuid::new_v4().to_string();
-        let req = CreateScheduleRequest {
-            fire_at: None,
-            id: id.clone(),
-            label: name,
-            cron: cron.clone(),
-            timezone: timezone.clone(),
-            kind: TaskKind::AgentPrompt {
-                prompt: prompt.clone(),
-            },
-        };
+            // ── Build TaskKind only if prompt changed ──
+            let kind = prompt.map(|p| TaskKind::AgentPrompt { prompt: p });
 
-        match self.scheduler.create_task(req).await {
-            Ok(schedule) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Schedule created: \"{}\" [{}] — {} {} (agent prompt: \"{}\")",
-                schedule.label, schedule.id, schedule.cron, schedule.timezone, prompt,
-            ))])),
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Failed to create schedule: {e}. Check the cron expression '{}' is valid 6-field format.",
-                cron
-            ))])),
+            let req =
+                UpdateScheduleRequest {
+                    label: u.name.as_ref().and_then(|n| {
+                        if n.is_empty() {
+                            None
+                        } else {
+                            Some(n.clone())
+                        }
+                    }),
+                    cron,
+                    timezone: u.timezone.as_ref().and_then(|tz| {
+                        if tz.is_empty() {
+                            None
+                        } else {
+                            Some(tz.clone())
+                        }
+                    }),
+                    kind,
+                };
+
+            match self.scheduler.update_task(&id, req).await {
+                Ok(schedule) => {
+                    let prompt_preview = match &schedule.kind {
+                        TaskKind::AgentPrompt { prompt } => {
+                            if prompt.len() > 60 {
+                                format!("{}...", &prompt[..57])
+                            } else {
+                                prompt.clone()
+                            }
+                        }
+                        TaskKind::Webhook { webhook_url } => format!("webhook: {webhook_url}"),
+                        TaskKind::SensorTrigger(spec) => sensor_rule_summary(spec),
+                    };
+                    Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Schedule updated: \"{}\" [{}] — {} {} ({})",
+                        schedule.label,
+                        schedule.id,
+                        schedule.cron,
+                        schedule.timezone,
+                        prompt_preview,
+                    ))]))
+                }
+                Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Failed to update schedule '{}': {e}. Check the ID is correct \
+                     (use list_schedules to see all schedules).",
+                    id
+                ))])),
+            }
         }
     }
 
-    #[tool(description = "Delete a scheduled task by ID.")]
-    async fn delete_schedule(
+    // One tool with an action enum, replacing delete/pause/resume/run_now.
+    //
+    // Those four were 78 tokens between them, so this is not really a token
+    // change -- it is a COUNT change. Four tools that differ only in a verb
+    // are four things the model has to tell apart, and the same reasoning that
+    // gave `control` thirteen playback actions applies here.
+    #[tool(
+        description = "Act on an existing schedule by ID: delete it, pause it, resume a paused one, or run it now regardless of its cron."
+    )]
+    async fn schedule_action(
         &self,
         _ctx: RequestContext<RoleServer>,
-        params: Parameters<ScheduleIdParam>,
+        params: Parameters<ScheduleActionParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        match self.scheduler.delete_task(&params.0.id).await {
+        let id = params.0.id;
+        let action = params.0.action.trim().to_ascii_lowercase();
+        let (result, past) = match action.as_str() {
+            "delete" => (self.scheduler.delete_task(&id).await, "deleted"),
+            "pause" => (self.scheduler.pause_task(&id).await, "paused"),
+            "resume" => (self.scheduler.resume_task(&id).await, "resumed"),
+            "run_now" => (
+                self.scheduler.run_now(&id).await,
+                "triggered for immediate execution",
+            ),
+            other => {
+                return Err(ErrorData::new(
+                    ErrorCode::INVALID_PARAMS,
+                    format!("unknown action '{other}' -- use delete, pause, resume or run_now"),
+                    None,
+                ))
+            }
+        };
+        match result {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Schedule '{}' deleted.",
-                params.0.id
+                "Schedule '{id}' {past}."
             ))])),
             Err(e) => Err(ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
-                format!("Failed to delete schedule: {}", e),
+                format!("Failed to {action} schedule: {e}"),
                 None,
             )),
         }
@@ -729,63 +919,6 @@ repeating use create_schedule instead.")]
         }
     }
 
-    #[tool(description = "Pause a scheduled task until resumed.")]
-    async fn pause_schedule(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<ScheduleIdParam>,
-    ) -> Result<CallToolResult, ErrorData> {
-        match self.scheduler.pause_task(&params.0.id).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Schedule '{}' paused.",
-                params.0.id
-            ))])),
-            Err(e) => Err(ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Failed to pause schedule: {}", e),
-                None,
-            )),
-        }
-    }
-
-    #[tool(description = "Resume a paused scheduled task.")]
-    async fn resume_schedule(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<ScheduleIdParam>,
-    ) -> Result<CallToolResult, ErrorData> {
-        match self.scheduler.resume_task(&params.0.id).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Schedule '{}' resumed.",
-                params.0.id
-            ))])),
-            Err(e) => Err(ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Failed to resume schedule: {}", e),
-                None,
-            )),
-        }
-    }
-
-    #[tool(description = "Run a scheduled task immediately, ignoring its cron.")]
-    async fn run_schedule_now(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<ScheduleIdParam>,
-    ) -> Result<CallToolResult, ErrorData> {
-        match self.scheduler.run_now(&params.0.id).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Schedule '{}' triggered for immediate execution.",
-                params.0.id
-            ))])),
-            Err(e) => Err(ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Failed to run schedule: {}", e),
-                None,
-            )),
-        }
-    }
-
     #[tool(description = "Get recent run history for a schedule: status, result, duration.")]
     async fn get_schedule_runs(
         &self,
@@ -859,119 +992,6 @@ repeating use create_schedule instead.")]
                 format!("Failed to get runs: {}", e),
                 None,
             )),
-        }
-    }
-
-    #[tool(
-        description = "Update a schedule's name, cron, prompt, or timezone. Only provided fields change."
-    )]
-    async fn update_schedule(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<UpdateScheduleParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let user_msg = crate::last_user_message();
-
-        // ── Resolve ID: model param > extract from user message ──
-        let id = if params.0.id.is_empty() {
-            // Try to find a UUID-shaped string in the user message
-            user_msg
-                .split_whitespace()
-                .find(|w| uuid::Uuid::parse_str(w).is_ok())
-                .map(|s| s.to_string())
-                .unwrap_or_default()
-        } else {
-            params.0.id.clone()
-        };
-
-        if id.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "Missing schedule ID. Please provide the ID of the schedule to update. \
-                 Use list_schedules to see all schedules and their IDs.",
-            )]));
-        }
-
-        // ── Resolve cron: natural language parse > validated literal ──
-        // Same validation as create_schedule — reject strings that aren't valid 6-field cron.
-        let looks_like_cron = |s: &str| {
-            let parts: Vec<&str> = s.split_whitespace().collect();
-            parts.len() == 6
-                && parts.iter().all(|p| {
-                    p.chars()
-                        .all(|c| c.is_ascii_digit() || c == '*' || c == '/' || c == '-' || c == ',')
-                })
-        };
-        let cron = params.0.cron.as_ref().and_then(|c| {
-            if c.is_empty() {
-                return None;
-            }
-            // Try natural language first, then validated literal
-            parse_cron_from_message(&c.to_lowercase()).or_else(|| {
-                if looks_like_cron(c) {
-                    Some(c.clone())
-                } else {
-                    None
-                }
-            })
-        });
-
-        // ── Resolve prompt: pass through if provided ──
-        let prompt =
-            params.0.prompt.as_ref().and_then(
-                |p| {
-                    if p.is_empty() {
-                        None
-                    } else {
-                        Some(p.clone())
-                    }
-                },
-            );
-
-        // ── Build TaskKind only if prompt changed ──
-        let kind = prompt.map(|p| TaskKind::AgentPrompt { prompt: p });
-
-        let req = UpdateScheduleRequest {
-            label: params.0.name.as_ref().and_then(|n| {
-                if n.is_empty() {
-                    None
-                } else {
-                    Some(n.clone())
-                }
-            }),
-            cron,
-            timezone: params.0.timezone.as_ref().and_then(|tz| {
-                if tz.is_empty() {
-                    None
-                } else {
-                    Some(tz.clone())
-                }
-            }),
-            kind,
-        };
-
-        match self.scheduler.update_task(&id, req).await {
-            Ok(schedule) => {
-                let prompt_preview = match &schedule.kind {
-                    TaskKind::AgentPrompt { prompt } => {
-                        if prompt.len() > 60 {
-                            format!("{}...", &prompt[..57])
-                        } else {
-                            prompt.clone()
-                        }
-                    }
-                    TaskKind::Webhook { webhook_url } => format!("webhook: {webhook_url}"),
-                    TaskKind::SensorTrigger(spec) => sensor_rule_summary(spec),
-                };
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Schedule updated: \"{}\" [{}] — {} {} ({})",
-                    schedule.label, schedule.id, schedule.cron, schedule.timezone, prompt_preview,
-                ))]))
-            }
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Failed to update schedule '{}': {e}. Check the ID is correct \
-                 (use list_schedules to see all schedules).",
-                id
-            ))])),
         }
     }
 

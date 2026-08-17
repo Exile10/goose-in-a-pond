@@ -165,6 +165,7 @@ async fn make_app(wire_index: bool, wire_embedder: bool) -> Harness {
         // `if let Some(provider)`. Wiring it whenever the index is present would
         // make this harness claim a refill on a pond where nothing can refill.
         index_reindex: (wire_index && wire_embedder).then(|| reindex.clone()),
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
