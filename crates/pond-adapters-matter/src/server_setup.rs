@@ -32,11 +32,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_tungstenite::connect_async;
 
 use crate::notify::MatterNotifier;
+use crate::protocol::{check_greeting, PROTOCOL_NAME};
 
 /// The controller GIAP started, if any. Shared rather than owned outright
 /// because two places have to agree on which process is current: the reconciler
@@ -119,10 +122,81 @@ fn legacy_python_storage(data_dir: &Path) -> PathBuf {
 }
 
 /// Is something accepting connections on the controller port?
+///
+/// A bare TCP probe, and only used to wait for a controller GIAP has just
+/// spawned — where what is listening is not in question. Deciding whether to
+/// ADOPT a listener is [`probe_controller`]'s job, because "something answers"
+/// and "our controller answers" are different questions and conflating them is
+/// what let a leftover python-matter-server be adopted forever.
 pub async fn is_running(port: u16) -> bool {
     tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .is_ok()
+}
+
+/// What is on the controller port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Occupant {
+    /// Nothing is listening.
+    Free,
+    /// A controller GIAP can talk to. Reuse it.
+    Ours,
+    /// Something is listening and it is not one of ours, with the reason.
+    Foreign(String),
+}
+
+/// How long the adoption probe waits. Loopback, so a controller that is up
+/// answers in milliseconds; the bound only stops a wedged listener from stalling
+/// startup.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Find out what is on `port` by speaking to it.
+///
+/// The TCP probe alone is not enough to decide whether to reuse a listener, and
+/// getting that wrong is not a small matter: an install upgrading from the
+/// python-matter-server controller still has one running on 5580. It answers
+/// TCP, so it was adopted; it serves `/ws` and 404s `/giap`, so every connection
+/// then failed; and because it had been "reused", GIAP never started a
+/// controller of its own. Permanently broken, and the log said only that it was
+/// reusing a controller and then could not reach it.
+pub async fn probe_controller(port: u16, url: &str) -> Occupant {
+    if !is_running(port).await {
+        return Occupant::Free;
+    }
+
+    let handshake = tokio::time::timeout(PROBE_TIMEOUT, connect_async(url)).await;
+    let mut socket = match handshake {
+        Ok(Ok((socket, _))) => socket,
+        Ok(Err(e)) => {
+            return Occupant::Foreign(format!("it refused a {PROTOCOL_NAME} connection ({e})"))
+        }
+        Err(_) => return Occupant::Foreign("it did not answer a connection in time".to_string()),
+    };
+
+    let frame = match tokio::time::timeout(PROBE_TIMEOUT, socket.next()).await {
+        Ok(Some(Ok(frame))) => frame,
+        _ => return Occupant::Foreign("it did not send a greeting".to_string()),
+    };
+
+    let outcome = match check_greeting(frame.to_text().unwrap_or_default()) {
+        Ok(_) => Occupant::Ours,
+        Err(reason) => Occupant::Foreign(reason),
+    };
+    let _ = socket.close(None).await;
+    outcome
+}
+
+/// What to tell the user when the port belongs to something else.
+///
+/// Named and specific because the fix is specific, and because the situation is
+/// one an upgrade creates rather than anything the user did wrong.
+fn port_is_taken(port: u16, why: &str) -> anyhow::Error {
+    anyhow!(
+        "port {port} is already in use by something that is not a {PROTOCOL_NAME} controller: \
+         {why}. The usual cause is a python-matter-server left running from before this Pond \
+         switched controllers. Stop it (`lsof -nP -iTCP:{port} -sTCP:LISTEN` names the process), \
+         or point the Matter controller address at a different port."
+    )
 }
 
 /// Where the controller sources are shipped. `GIAP_ASSET_ROOT` and the exe's
@@ -427,15 +501,31 @@ pub async fn ensure_running(
     port: u16,
     ready_timeout: Duration,
     notifier: &MatterNotifier,
+    url: &str,
 ) -> Result<Option<Child>> {
-    if is_running(port).await {
-        tracing::info!(
-            target: "giap::trace",
-            kind = "matter_controller_reused",
-            port,
-            "matter: controller already running; reusing it"
-        );
-        return Ok(None);
+    match probe_controller(port, url).await {
+        Occupant::Ours => {
+            tracing::info!(
+                target: "giap::trace",
+                kind = "matter_controller_reused",
+                port,
+                "matter: controller already running; reusing it"
+            );
+            return Ok(None);
+        }
+        // Not ours, so it must not be adopted — and spawning onto the port would
+        // only fail to bind, with a worse message than this one.
+        Occupant::Foreign(why) => {
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "matter_port_taken",
+                port,
+                reason = %why,
+                "matter: the controller port belongs to something else"
+            );
+            return Err(port_is_taken(port, &why));
+        }
+        Occupant::Free => {}
     }
 
     tracing::info!(port, "matter: no controller found; setting one up");
@@ -522,7 +612,15 @@ pub async fn revive_local_controller(
 
     // A revival is not a first run, so it never announces setup: the user is
     // already being told the controller is unreachable.
-    match ensure_running(data_dir, port, ready_timeout, &MatterNotifier::disabled()).await? {
+    match ensure_running(
+        data_dir,
+        port,
+        ready_timeout,
+        &MatterNotifier::disabled(),
+        url,
+    )
+    .await?
+    {
         // Storing the new handle drops the dead one, which is harmless:
         // `kill_on_drop` against an already-exited process is a no-op, and
         // teardown now kills the controller that is really running.
@@ -539,6 +637,7 @@ pub async fn revive_local_controller(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::SinkExt;
 
     /// A remote controller is another machine's process. Revival runs on every
     /// failing URL, so this is the guard that stops GIAP installing a runtime
@@ -567,12 +666,33 @@ mod tests {
     /// trying to fix.
     #[tokio::test]
     async fn revival_reuses_a_controller_that_is_still_listening() {
+        // Speaks the greeting, which is what "a controller of ours" now means:
+        // a bare listener would (correctly) be refused instead.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let child: SharedServerChild = Arc::new(AsyncMutex::new(None));
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                        let _ = ws
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                serde_json::json!({
+                                    "protocol": PROTOCOL_NAME,
+                                    "version": crate::protocol::PROTOCOL_VERSION,
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await;
+                        while ws.next().await.is_some() {}
+                    }
+                });
+            }
+        });
 
+        let child: SharedServerChild = Arc::new(AsyncMutex::new(None));
         let outcome = revive_local_controller(
-            // The port answers, so setup returns before the data dir is used.
+            // The port answers as ours, so setup returns before the data dir is used.
             Path::new("/nonexistent"),
             &format!("ws://127.0.0.1:{port}/giap"),
             &child,
@@ -671,6 +791,58 @@ mod tests {
         // Fewer lines than asked for is not an error.
         assert_eq!(tail("only one", 5), "only one");
         assert_eq!(tail("", 5), "");
+    }
+
+    /// The regression this whole probe exists for. An install upgrading from
+    /// the python-matter-server controller still has one listening on 5580: it
+    /// answers TCP, so the old check adopted it; it 404s `/giap`, so every
+    /// connection then failed; and having "reused" it, GIAP never started a
+    /// controller of its own. Permanently broken, with a log that said only that
+    /// it was reusing a controller and then could not reach it.
+    #[tokio::test]
+    async fn a_listener_that_is_not_ours_is_named_rather_than_adopted() {
+        // A plain TCP listener that never speaks: the shape of anything on the
+        // port that is not a giap-matter controller.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+
+        let url = format!("ws://127.0.0.1:{port}/giap");
+        assert!(
+            matches!(probe_controller(port, &url).await, Occupant::Foreign(_)),
+            "a listener that cannot speak the protocol must not be adopted"
+        );
+
+        let error = ensure_running(
+            Path::new("/nonexistent"),
+            port,
+            Duration::from_millis(1),
+            &MatterNotifier::disabled(),
+            &url,
+        )
+        .await
+        .expect_err("adopting it would leave Matter permanently broken");
+
+        let message = error.to_string();
+        assert!(message.contains("already in use"), "got: {message}");
+        // The fix has to be in the message, because the cause is an upgrade
+        // rather than anything the user did.
+        assert!(message.contains("python-matter-server"), "got: {message}");
+        assert!(message.contains("lsof"), "got: {message}");
+    }
+
+    #[tokio::test]
+    async fn a_free_port_reads_as_free() {
+        let free = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        assert_eq!(
+            probe_controller(free, &format!("ws://127.0.0.1:{free}/giap")).await,
+            Occupant::Free
+        );
     }
 
     #[test]

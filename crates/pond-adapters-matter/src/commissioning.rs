@@ -21,8 +21,8 @@ use serde_json::json;
 use crate::client::{code_of, MatterClient};
 use crate::notify::MatterNotifier;
 use crate::protocol::{
-    device_id_for_node, node_id_from_device_id, setup_code_kind, CommissionResult, DiscoverResult,
-    CODE_NOTHING_PAIRABLE,
+    describe, device_id_for_node, node_id_from_device_id, setup_code_kind, CommissionResult,
+    DiscoverResult, CODE_NOTHING_PAIRABLE,
 };
 
 /// Commissioning is slow: discovery, attestation, and fabric join, often over a
@@ -138,7 +138,7 @@ impl DeviceCommissioningPort for MatterCommissioner {
                     target: "giap::trace",
                     kind = "matter_commission_failed",
                     error_code = %code,
-                    error = %e,
+                    error = %describe(&e),
                     "matter: commissioning failed"
                 );
                 // The controller's own wording, except for the one failure that
@@ -146,7 +146,7 @@ impl DeviceCommissioningPort for MatterCommissioner {
                 let told = if code == CODE_NOTHING_PAIRABLE {
                     NOTHING_IN_PAIRING_MODE.to_string()
                 } else {
-                    e.to_string()
+                    describe(&e)
                 };
                 self.notifier.pairing_failed(&told).await;
                 return Err(e).context("commissioning failed");

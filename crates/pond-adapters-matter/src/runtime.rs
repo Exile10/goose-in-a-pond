@@ -45,7 +45,7 @@ use crate::client::{MatterClient, MatterEvent};
 use crate::commissioning::MatterCommissioner;
 use crate::control::MatterDeviceControl;
 use crate::notify::MatterNotifier;
-use crate::protocol::{node_id_from_device_id, redact_setup_code};
+use crate::protocol::{describe, node_id_from_device_id};
 use crate::server_setup::{ensure_running, local_port_from_ws_url, SharedServerChild};
 
 /// How long to wait for a freshly installed controller to start listening.
@@ -302,12 +302,13 @@ async fn reconcile_loop(mut rx: watch::Receiver<Desired>, r: Reconciler) {
                             );
                         }
                         Err(e) => {
-                            // Redacted because this string is not only logged:
-                            // it is stored in `Unreachable` and SERVED by
-                            // `GET /api/v1/matter/status`. A failed commission
-                            // whose cause reached this path would otherwise put
-                            // a setup code in an HTTP response.
-                            let error = redact_setup_code(&e.to_string());
+                            // `describe` and not `to_string`: this string is
+                            // the ONLY account of the failure the user gets, and
+                            // plain Display shows just the outermost context —
+                            // "connecting to the controller at ws://…" with the
+                            // reason thrown away. It is also served by
+                            // `GET /api/v1/matter/status`, hence the redaction.
+                            let error = describe(&e);
                             tracing::warn!(
                                 target: "giap::trace",
                                 kind = "matter_state_changed",
@@ -373,7 +374,14 @@ async fn connect(r: &Reconciler, url: &str) -> Result<Connected> {
     // someone else's controller and is used as-is.
     let started = match local_port_from_ws_url(url) {
         Some(port) => {
-            ensure_running(&r.data_dir, port, CONTROLLER_READY_TIMEOUT, &r.notifier).await?
+            ensure_running(
+                &r.data_dir,
+                port,
+                CONTROLLER_READY_TIMEOUT,
+                &r.notifier,
+                url,
+            )
+            .await?
         }
         None => None,
     };
