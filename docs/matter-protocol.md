@@ -197,6 +197,15 @@ published — "Whites" appears because the washer said "Whites". The two that ar
 not ModeBase, Temperature Control and Laundry Washer Controls, are read explicitly
 because their shape differs, not because they are special.
 
+One name-shaped constraint survives, upstream of all this: a snapshot reads a
+bounded set of clusters, because it is rebuilt on every node event and reading all
+of them on a busy fabric costs more than the unread data is worth. The bound admits
+anything named `*Mode`, which is how Matter names every ModeBase derivative, so the
+promise above holds — but a control that is neither in the fixed set nor named that
+way has to be added to it. Settings read by shape from a snapshot filtered by name
+is a contradiction worth knowing about: it is what made a paired washer report
+nothing but power while every unit test passed.
+
 It is answered live rather than cached. A description is derived from what the
 device currently reports, and a stored copy goes stale exactly when a device is
 upgraded or reconfigured — the moment its description matters most.

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { isSnapshotCluster } from "../src/controller.js";
 import { planControl } from "../src/mapping/control.js";
 import { describeNode } from "../src/mapping/describe.js";
 import { operationsOf, settingsOf } from "../src/mapping/settings.js";
@@ -129,6 +130,27 @@ describe("appliance settings", () => {
     expect(() => planControl(bulb, "matter-60", "operation", "start")).toThrowError(
       /does not run cycles/,
     );
+  });
+
+  it("lets appliance clusters into the snapshot at all", () => {
+    // The bug that made everything above invisible in a running Pond: settings are
+    // read by shape, but the snapshot dropped these clusters BY NAME before anything
+    // could look at their shape. Every test above passed while a paired washer still
+    // reported nothing but power. They build snapshots by hand, so they never went
+    // through the filter that was discarding the clusters.
+    expect(isSnapshotCluster("laundryWasherMode")).toBe(true);
+    expect(isSnapshotCluster("temperatureControl")).toBe(true);
+    expect(isSnapshotCluster("laundryWasherControls")).toBe(true);
+    expect(isSnapshotCluster("operationalState")).toBe(true);
+
+    // The `*Mode` rule is what keeps the promise for devices nobody has coded for.
+    expect(isSnapshotCluster("dishwasherMode")).toBe(true);
+    expect(isSnapshotCluster("rvcRunMode")).toBe(true);
+    expect(isSnapshotCluster("astonishinglyNovelMode")).toBe(true);
+
+    // And it stays bounded: a snapshot is rebuilt on every node event.
+    expect(isSnapshotCluster("timeSynchronization")).toBe(false);
+    expect(isSnapshotCluster("diagnosticLogs")).toBe(false);
   });
 
   it("finds a mode cluster it has never heard of, by its shape", () => {
