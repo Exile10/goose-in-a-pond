@@ -22,7 +22,7 @@
 //! controller setup before the next attempt, and keeps doing so on that cadence
 //! until it is back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,6 +121,19 @@ fn publish_reading(reading: &WireReading, cache: &mut ReadingCache, bus: &Arc<dy
     bus.publish(BusEvent::Sensor(reading.to_reading()));
 }
 
+/// How often a device the controller can still see is touched in the registry.
+///
+/// `is_online` is derived from `last_seen` being fresher than five minutes, so
+/// something has to say "still here" or every device eventually reads offline. The
+/// bridge only ever said it when an event arrived, and a Matter device that is
+/// simply idle sends none: a washer nobody touched went offline five minutes after
+/// the server started, and its "last seen" stayed frozen at the moment it was
+/// synced -- which is why the card read like a commissioning timestamp.
+///
+/// A fifth of the threshold, so four ticks can be missed before a device that is
+/// genuinely present is called absent.
+const LIVENESS_TICK: Duration = Duration::from_secs(60);
+
 /// Sync one device into the registry (register if new, heartbeat if known).
 async fn sync_device(
     wire: &WireDevice,
@@ -203,6 +216,10 @@ pub async fn run_matter_bridge(
     registry: Arc<dyn DeviceRegistry + Send + Sync>,
     bus: Arc<dyn EventBus>,
     notifier: MatterNotifier,
+    // How often to vouch for the devices the controller can still see. A parameter
+    // so the behaviour can be tested without waiting a minute for it; production
+    // passes LIVENESS_TICK.
+    liveness_tick: Duration,
 ) -> Result<()> {
     // Initial sync: `subscribe` returns the whole fabric AND subscribes this
     // connection to subsequent events.
@@ -223,14 +240,44 @@ pub async fn run_matter_bridge(
     );
 
     let mut cache = ReadingCache::new();
+    // Who the controller currently believes is on the fabric. Held here rather than
+    // read back from the registry because the controller is the authority on it:
+    // the registry only knows when someone last said so.
+    let mut present: HashSet<String> = HashSet::new();
     for device in &snapshot.devices {
         sync_device(device, &registry, &notifier).await;
+        if device.online {
+            present.insert(device.id.clone());
+        }
     }
     for reading in &snapshot.readings {
         publish_reading(reading, &mut cache, &bus);
     }
 
-    while let Some(MatterEvent { event, payload }) = events.recv().await {
+    let mut liveness = tokio::time::interval(liveness_tick);
+    // The first tick fires immediately and everything above has just been synced;
+    // skipping a late tick rather than firing a burst of them keeps a bridge that
+    // was starved from writing one UPDATE per device per missed minute.
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    liveness.tick().await;
+
+    loop {
+        let MatterEvent { event, payload } = tokio::select! {
+            received = events.recv() => match received {
+                Some(event) => event,
+                // Channel closed: the connection is gone and the caller reconnects.
+                None => break,
+            },
+            _ = liveness.tick() => {
+                for device_id in &present {
+                    if let Err(e) = registry.heartbeat(device_id).await {
+                        tracing::warn!(device = %device_id, error = %e, "matter: heartbeat failed");
+                    }
+                }
+                continue;
+            }
+        };
+
         match event.as_str() {
             "reading" => {
                 if let Ok(reading) = serde_json::from_value::<WireReading>(payload) {
@@ -245,6 +292,11 @@ pub async fn run_matter_bridge(
             }
             "device_added" | "device_updated" => {
                 if let Ok(DeviceEvent { device }) = serde_json::from_value::<DeviceEvent>(payload) {
+                    if device.online {
+                        present.insert(device.id.clone());
+                    } else {
+                        present.remove(&device.id);
+                    }
                     sync_device(&device, &registry, &notifier).await;
                 }
             }
@@ -261,6 +313,7 @@ pub async fn run_matter_bridge(
                     // Only news if GIAP still thinks it has this device: a user
                     // deleting one goes through the same removal, and telling
                     // them about the thing they just did is noise.
+                    present.remove(&device_id);
                     if matches!(registry.get_device(&device_id).await, Ok(Some(_))) {
                         notifier.device_dropped(&device_id).await;
                     }
@@ -272,9 +325,15 @@ pub async fn run_matter_bridge(
                 {
                     tracing::debug!(device = %device_id, online, "matter: availability changed");
                     if online {
+                        present.insert(device_id.clone());
                         if let Err(e) = registry.heartbeat(&device_id).await {
                             tracing::warn!(device = %device_id, error = %e, "matter: heartbeat failed");
                         }
+                    } else {
+                        // Stop vouching for it. Its `last_seen` then ages out on its
+                        // own, so the card turns offline without a second mechanism
+                        // that could disagree with this one.
+                        present.remove(&device_id);
                     }
                 }
             }
@@ -321,6 +380,7 @@ pub async fn run_matter_supervisor(
             registry.clone(),
             bus.clone(),
             notifier.clone(),
+            LIVENESS_TICK,
         )
         .await
         {
