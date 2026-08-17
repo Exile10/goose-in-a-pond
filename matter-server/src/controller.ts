@@ -40,12 +40,18 @@ import {
 const DISCOVER_TIMEOUT = Seconds(8);
 
 /**
- * The clusters a snapshot reads.
+ * Which clusters a snapshot reads.
  *
  * Bounded rather than "every supported cluster": a snapshot is rebuilt on every node
- * event, and reading all ~40 clusters a composed device may expose would make a busy
- * fabric expensive for data nothing consumes. Anything not listed here is invisible to
- * GIAP by construction, which is the same contract the schema-11 adapter had.
+ * event, and reading all the clusters a composed device may expose would make a busy
+ * fabric expensive for data nothing consumes.
+ *
+ * The named set is the fixed vocabulary -- lighting, closures, climate, sensors. The
+ * `*Mode` rule is what keeps appliances working without a list: Matter's ModeBase
+ * derivatives are consistently named that way, and `settingsOf` reads them by shape,
+ * so a washer, a dishwasher, an oven and whatever ships next all arrive without a
+ * code change. Without that rule the promise was empty -- the snapshot dropped those
+ * clusters by name before anything could look at their shape.
  */
 const SNAPSHOT_CLUSTERS: ReadonlySet<string> = new Set([
   "descriptor",
@@ -57,8 +63,21 @@ const SNAPSHOT_CLUSTERS: ReadonlySet<string> = new Set([
   "doorLock",
   "fanControl",
   "windowCovering",
+  // Selectable settings whose shape is not ModeBase, so the rule below cannot match
+  // them and they are named here instead -- as they already are in settings.ts.
+  "temperatureControl",
+  "laundryWasherControls",
+  // Start / stop / pause / resume, shared by every appliance that runs a cycle.
+  "operationalState",
   ...sensorClusters(),
 ]);
+
+/** Is this cluster worth putting in a snapshot? */
+export function isSnapshotCluster(clusterId: string): boolean {
+  // Every ModeBase derivative: laundryWasherMode, dishwasherMode, rvcRunMode,
+  // ovenMode, and the ones that do not exist yet.
+  return SNAPSHOT_CLUSTERS.has(clusterId) || clusterId.endsWith("Mode");
+}
 
 export interface ControllerEvents {
   deviceAdded(device: Device): void;
@@ -416,7 +435,7 @@ export class Controller {
 
     for (const endpoint of peer.endpoints) {
       for (const cluster of Object.keys(endpoint.behaviors.supported)) {
-        if (!SNAPSHOT_CLUSTERS.has(cluster)) continue;
+        if (!isSnapshotCluster(cluster)) continue;
         this.#observeCluster(peer, endpoint, cluster);
       }
     }
@@ -520,7 +539,7 @@ function snapshotOf(peer: ClientNode, nodeId: bigint): NodeSnapshot {
 function readClusters(endpoint: Endpoint): ClusterState {
   const clusters: ClusterState = {};
   for (const cluster of Object.keys(endpoint.behaviors.supported)) {
-    if (!SNAPSHOT_CLUSTERS.has(cluster)) continue;
+    if (!isSnapshotCluster(cluster)) continue;
     try {
       clusters[cluster] = { ...endpoint.stateOf(cluster) } as Record<string, unknown>;
     } catch {
