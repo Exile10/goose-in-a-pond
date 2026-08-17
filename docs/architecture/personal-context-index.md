@@ -1,7 +1,11 @@
 # Personal-context index — design and handoff
 
-**Status: DESIGNED 2026-08-12. Blocker 0a IMPLEMENTED, Mac-verified, and MODEL-VERIFIED ON THE ORIN
-2026-08-13. 0b and 0c done. Phases A–G unstarted. See §7.**
+**Status: 0a–0c and phases A–G landed 2026-08-13. VERIFIED THROUGH THE DEPLOYED BINARY ON THE ORIN
+2026-08-17. Still open by design: G's passive prompt tier (a measurement, not a guess) and F's media
+captioning (blocked on absent encoder bytes). See §7.**
+
+The line that stood here said "Phases A–G unstarted" for four days after they had all landed, and
+the closing paragraph of §7 said it too. Read §7's log and the phase table, not a status line.
 
 A single semantic retrieval surface over the three things this pond knows about a household —
 extracted **memories**, ingested **context items**, and conversation **summaries** — so the agent can
@@ -601,8 +605,47 @@ G's passive prompt tier — but that remains a MEASUREMENT, and the probe is now
 One thing the probe caught in passing: the assistant's answers still leak harness text ("The goal is
 not fully met"), which is the measured-bad prompt rule 6 recommended dropping, still live on `main`.
 
-**Owed, in priority order.** (1) A re-embed path for stale-width vectors (`search_stale_dimension`), since
-backfill cannot see them. (2) `embed_query`: nomic wants `search_query: ` on the query side and
-currently gets `search_document: `, a bounded ranking-quality loss on the three query call sites
-(`topical_memories`, `search_context`, `recall_memories`). (3) `cargo test -p pond-inference` is in no
-CI job, so none of this module's tests run there. (4) The Orin run. Phases 0b–G remain unstarted.
+**Owed as of 2026-08-14, and all four are now closed.** (1) The re-embed path for stale-width vectors
+is `search_stale_dimension`, in the port, `sqlite_memory.rs`, the redacting wrapper and a caller in
+`memory_relevance.rs`. (2) `embed_query` splits the prefixes — `search_query: ` on the question,
+`search_document: ` on stored text — at all three query sites. (3) `cargo test -p pond-inference` is
+a CI job. (4) The Orin run is done; see below.
+
+### 2026-08-17 — the deployed-binary run, and what it found was wrong with the pond rather than the code
+
+**0a is fully closed.** With `embedding_provider = "gguf"` the deployed binary on the Orin reports
+`GGUF embedding provider ready model_id="nomic-embed-text-v1.5" dims=768`, then
+`GGUF embedding model loaded n_gpu_layers=0 max_ctx=2048`, and answers HTTP 200. The maintenance
+pass then re-embedded the stale 384-dim vectors and restamped the index from `all-MiniLM-L6-v2` to
+`nomic-embed-text-v1.5` — so the stale-width path is proven live, not just unit-tested.
+
+**And the reason it had never run is not in this repository.** The pond's own settings said
+`embedding_provider = fastembed` — the provider §1.1 records as unable to initialise on this
+hardware. The GGUF work landed on 2026-08-13 and the device was never switched over, so §1.1's
+headline defect ("semantic memory injection has never run on the hardware GIAP ships to") stayed
+true for four more days while every phase above it was recorded as landed. The model bytes had been
+sitting in `models/embedding/` since 2026-08-14. **Check what the device is configured to do before
+believing what the code can do.**
+
+**The coverage number was read wrong, including by me.** The index served ~20 rows against 276
+memories, which reads as 7% coverage. It is not: 62 of those memories are archived and 209 merged,
+so **five are live** — and all five were indexed. Coverage of live rows was complete. `CorpusHealth`
+counts only rows that QUALIFY, which is the right denominator and the one that makes this legible;
+the raw row count is not.
+
+**What is actually empty, and why.** Three independent causes, none of them the index:
+
+1. `context_items` is **zero**. No source has ever been connected, so PAI-8's corpus is empty by
+   construction. That is the connector phases (P3–P8), not this document.
+2. `sessions.profile_id` is NULL on all 651 sessions, so the summary corpus is refused. Traced to
+   its actual cause: `Handshake::issue_pairing_code_for` has accepted a member since PAI-1 P9 and
+   **no shipped caller ever passed one**, which the port's own doc states. Twelve devices, none
+   attributed, so every turn falls through the paired-device rung. Fixed for a one-member household
+   in `pairing_attribution::owner_for_new_code`, with `{"unattributed": true}` as the escape hatch;
+   existing devices need re-pairing to pick up an owner.
+3. Only five memories are live at all. A pond this small has little to retrieve regardless.
+
+**The lesson worth carrying.** Every one of these was a complete mechanism with nothing driving it —
+an embedder never switched on, a member parameter no caller passes, a corpus with no connected
+source. This programme's recurring defect is not broken code; it is code that is finished, correct,
+and unreached, which no test fails on and no log complains about.
