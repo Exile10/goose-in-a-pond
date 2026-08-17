@@ -185,7 +185,7 @@ DeviceDescription = {
   capabilities: Capability[],      // what it can be told to do
   sensors: SensorSpec[],           // what it measures, reported or not
 }
-Capability = { verb: Verb, value: ValueSpec }
+Capability = { verb: Verb, setting?: string, value: ValueSpec }
 ValueSpec =
   | { kind: "boolean" }
   | { kind: "percent" }                          // 0–100
@@ -200,7 +200,10 @@ drift apart: anything describable is callable, by construction.
 
 `mode` carries a `setting` name because a device has more than one: a washer has a
 wash cycle, a spin speed, a rinse count and a temperature level, and without the
-name they are indistinguishable in the list.
+name they are indistinguishable in the list. It is the same name `control` is
+called with, and every layer that carries a description has to carry it — a
+renderer that drops it leaves a reader four identical `mode` entries and no way to
+name one, which reads as a device with no controls at all.
 
 **Settings are found by shape, not by a list of cluster names.** Matter's appliance
 controls are nearly all ModeBase derivatives, publishing `supportedModes` as

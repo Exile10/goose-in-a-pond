@@ -14,6 +14,7 @@ import {
   rootAttribute,
   type NodeSnapshot,
 } from "./snapshot.js";
+import { operationsOf, settingsOf } from "./settings.js";
 
 export const CLUSTER_ON_OFF = "onOff";
 export const CLUSTER_LEVEL_CONTROL = "levelControl";
@@ -106,6 +107,13 @@ function capabilitiesOf(node: NodeSnapshot): string[] {
   if (hasCluster(node, CLUSTER_LEVEL_CONTROL)) capabilities.push("brightness");
   if (hasCluster(node, CLUSTER_THERMOSTAT)) capabilities.push("temperature");
   if (hasCluster(node, CLUSTER_DOOR_LOCK)) capabilities.push("lock");
+
+  // Appliance vocabulary, found the same structural way `settingsOf` finds it rather
+  // than from a second list that could disagree with the first. Without these a
+  // washer was listed as "capabilities: power", which is what the model reads before
+  // it decides whether to look closer -- so it never looked.
+  if (settingsOf(node).length > 0) capabilities.push("mode");
+  if (operationsOf(node) !== undefined) capabilities.push("operation");
 
   return capabilities;
 }

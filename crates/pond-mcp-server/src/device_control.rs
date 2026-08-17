@@ -106,11 +106,23 @@ fn render_description(d: &DeviceDescription) -> String {
     } else {
         out.push_str("\n  Accepts:");
         for capability in &d.capabilities {
-            out.push_str(&format!(
-                "\n    {} — {}",
-                capability.verb,
-                render_value(&capability.value)
-            ));
+            // The setting name is not decoration: an appliance has several `mode`
+            // capabilities, and the name is the parameter that tells them apart.
+            // Rendered without it, a washer offered four identical `mode` lines and
+            // the only sane reading was that its controls did not exist.
+            match &capability.setting {
+                Some(setting) => out.push_str(&format!(
+                    "\n    {} (setting: \"{}\") — {}",
+                    capability.verb,
+                    setting,
+                    render_value(&capability.value)
+                )),
+                None => out.push_str(&format!(
+                    "\n    {} — {}",
+                    capability.verb,
+                    render_value(&capability.value)
+                )),
+            }
         }
     }
 
@@ -528,8 +540,61 @@ mod tests {
     fn spec(verb: &str, value: ValueSpec) -> Capability {
         Capability {
             verb: verb.to_string(),
+            setting: None,
             value,
         }
+    }
+
+    /// One of several capabilities sharing a verb, told apart by its setting name.
+    fn setting_spec(verb: &str, setting: &str, value: ValueSpec) -> Capability {
+        Capability {
+            verb: verb.to_string(),
+            setting: Some(setting.to_string()),
+            value,
+        }
+    }
+
+    /// The failure this pins: a washer described its four settings, the renderer
+    /// dropped every name, and the model was shown four identical `mode` lines with
+    /// no way to say which one it meant. It reported the controls as unavailable,
+    /// which was the only sane reading of what it had been given.
+    #[test]
+    fn capabilities_sharing_a_verb_are_told_apart_by_their_setting() {
+        let rendered = render_description(&DeviceDescription {
+            device_id: "matter-1".into(),
+            device_type: "appliance".into(),
+            capabilities: vec![
+                spec("power", ValueSpec::Boolean),
+                setting_spec(
+                    "mode",
+                    "laundry washer mode",
+                    ValueSpec::Enum {
+                        values: vec!["Normal".into(), "Heavy".into()],
+                    },
+                ),
+                setting_spec(
+                    "mode",
+                    "spin speed",
+                    ValueSpec::Enum {
+                        values: vec!["Off".into(), "High".into()],
+                    },
+                ),
+            ],
+            sensors: vec![],
+        });
+
+        // The name is what `set_device_state` is called with, so it has to be in the
+        // text the model reads.
+        assert!(
+            rendered.contains(r#"mode (setting: "laundry washer mode") — one of: Normal, Heavy"#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"mode (setting: "spin speed") — one of: Off, High"#),
+            "{rendered}"
+        );
+        // A verb a device can only have one of stays unadorned.
+        assert!(rendered.contains("power — true or false"), "{rendered}");
     }
 
     /// What the model reads. The whole point of the tool is that the next call is
