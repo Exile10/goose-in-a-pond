@@ -200,7 +200,7 @@ async function handleMessage(
     const wire =
       error instanceof OpError
         ? error.toWire()
-        : { code: "internal" as const, message: describeError(error), retryable: true };
+        : { code: "internal" as const, message: describeError(error) };
     socket.send(JSON.stringify(failure(request.id, wire)));
     log.warn("op_failed", "a request failed", {
       op: request.op,

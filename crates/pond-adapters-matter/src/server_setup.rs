@@ -1,67 +1,80 @@
-//! Local matter-server lifecycle — GIAP installs and runs the controller itself.
+//! Local controller lifecycle — GIAP installs and runs the controller itself.
 //!
-//! The Matter adapter talks to a [python-matter-server] over WebSocket, but that
-//! controller is a Python process someone has to install. Requiring the user to
-//! hand-build a Python stack before a single bulb works is the wrong first-run
-//! experience for an appliance, so when Matter is enabled and nothing is serving
-//! the configured port, GIAP sets one up:
+//! The controller is a Node process: `matter-server/`, shipped beside the
+//! binary, running matter.js. Requiring the user to hand-build a runtime before
+//! a single bulb works is the wrong first-run experience for an appliance, so
+//! when Matter is enabled and nothing is serving the configured port, GIAP sets
+//! one up:
 //!
 //! 1. probe the port — if a controller is already there (the user runs their
 //!    own, or a previous Pond left one up), use it and change nothing;
-//! 2. otherwise create a private venv under the data dir and `pip install` a
-//!    **pinned** python-matter-server;
+//! 2. otherwise copy the controller into the data dir and `npm ci` its pinned
+//!    dependencies there;
 //! 3. spawn it with its storage inside the data dir, so the commissioned fabric
 //!    (and every paired device) survives restarts and upgrades;
 //! 4. wait for the port to accept connections before the adapter connects.
 //!
 //! Only loopback URLs are auto-started: a remote `matter_ws_url` is someone
-//! else's server and GIAP must not try to manage it.
+//! else's controller and GIAP must not try to manage it.
 //!
-//! [python-matter-server]: https://github.com/home-assistant-libs/python-matter-server
+//! # Why the app is copied rather than run in place
+//!
+//! `npm ci` writes `node_modules/` next to the `package.json` it reads, and the
+//! asset root may be a read-only install directory or an app bundle. Copying the
+//! sources into `<data_dir>/matter-server/app/` puts the dependency tree
+//! somewhere writable, and lets Node resolve `node_modules` as a plain sibling of
+//! the entrypoint — no `NODE_PATH`, no ESM resolution games.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
+
+use crate::notify::MatterNotifier;
 
 /// The controller GIAP started, if any. Shared rather than owned outright
 /// because two places have to agree on which process is current: the reconciler
 /// kills it on teardown, and the reconnect supervisor replaces it when it finds
 /// the process dead. `None` means GIAP did not start one — the user runs their
 /// own controller, or Matter is off.
-pub type SharedServerChild = Arc<Mutex<Option<Child>>>;
+pub type SharedServerChild = Arc<AsyncMutex<Option<Child>>>;
 
-/// Pinned: an unpinned install would let an upstream release change what runs
-/// on the user's home network without review.
-pub const MATTER_SERVER_SPEC: &str = "python-matter-server[server]==8.1.2";
+/// matter.js 0.17 requires Node 20.19+, 22.13+ or 24+. The floor is the oldest
+/// of those; anything newer satisfies it.
+pub const MIN_NODE: (u32, u32) = (20, 19);
 
-/// python-matter-server requires Python >= 3.12.
-pub const MIN_PYTHON: (u32, u32) = (3, 12);
+/// How many lines of the controller's stderr to keep.
+///
+/// A child that dies before it is ready writes its reason only to stderr, and
+/// with the output going to a file nobody reads, the most GIAP could say was
+/// that the port never opened. The tail is attached to the readiness-timeout
+/// error so the reason travels with the failure. Twenty lines is enough for a
+/// Node stack trace without holding a log in memory.
+const STDERR_TAIL_LINES: usize = 20;
 
-/// Interpreters to try, newest first.
-const PYTHON_CANDIDATES: &[&str] = &["python3.13", "python3.12", "python3"];
-
-/// Parse `"Python 3.12.13"` into `(3, 12)`. Pure so the version gate is
-/// testable without an interpreter.
-pub fn parse_python_version(output: &str) -> Option<(u32, u32)> {
-    let version = output.split_whitespace().nth(1)?;
+/// Parse `"v20.19.4"` into `(20, 19)`. Pure so the version gate is testable
+/// without an interpreter.
+pub fn parse_node_version(output: &str) -> Option<(u32, u32)> {
+    let version = output.trim().trim_start_matches(['v', 'V']);
     let mut parts = version.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     Some((major, minor))
 }
 
-/// Tuple ordering gives the right comparison: (3,13) >= (3,12) >= MIN.
-pub fn meets_min_python(version: (u32, u32)) -> bool {
-    version >= MIN_PYTHON
+/// Tuple ordering gives the right comparison: (22,13) >= (20,19) >= MIN.
+pub fn meets_min_node(version: (u32, u32)) -> bool {
+    version >= MIN_NODE
 }
 
-/// The loopback port to auto-start for, or `None` when the URL points at
-/// another host — GIAP only manages a controller it runs itself.
+/// The loopback port to auto-start for, or `None` when the URL points at another
+/// host — GIAP only manages a controller it runs itself.
 pub fn local_port_from_ws_url(url: &str) -> Option<u16> {
     let rest = url
         .strip_prefix("ws://")
@@ -78,14 +91,30 @@ pub fn local_port_from_ws_url(url: &str) -> Option<u16> {
 pub fn controller_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("matter-server")
 }
-pub fn venv_dir(data_dir: &Path) -> PathBuf {
-    controller_dir(data_dir).join("venv")
+/// The controller's own copy of `matter-server/`, with its `node_modules`.
+pub fn app_dir(data_dir: &Path) -> PathBuf {
+    controller_dir(data_dir).join("app")
 }
-pub fn venv_python(data_dir: &Path) -> PathBuf {
-    venv_dir(data_dir).join("bin").join("python")
+pub fn entrypoint(data_dir: &Path) -> PathBuf {
+    app_dir(data_dir).join("src").join("server.ts")
+}
+/// Records the lockfile the installed tree was built from, so an upgrade that
+/// changes dependencies reinstalls and one that does not is a no-op.
+fn install_marker(data_dir: &Path) -> PathBuf {
+    app_dir(data_dir).join(".giap-install")
 }
 /// The fabric store — commissioned nodes live here, so it must be stable.
+///
+/// Deliberately NOT the `storage/` the python-matter-server used: matter.js
+/// cannot read that format, and writing into it would mix two incompatible
+/// stores in one directory. The old one is left untouched so an operator who
+/// wants their previous fabric can still point their own python-matter-server at
+/// it.
 pub fn storage_dir(data_dir: &Path) -> PathBuf {
+    controller_dir(data_dir).join("storage-js")
+}
+/// The store the Python controller used, if this install predates the move.
+fn legacy_python_storage(data_dir: &Path) -> PathBuf {
     controller_dir(data_dir).join("storage")
 }
 
@@ -96,153 +125,354 @@ pub async fn is_running(port: u16) -> bool {
         .is_ok()
 }
 
-/// First interpreter on PATH meeting [`MIN_PYTHON`].
-async fn find_python() -> Result<PathBuf> {
-    for candidate in PYTHON_CANDIDATES {
-        let Ok(out) = Command::new(candidate)
-            .arg("--version")
-            .kill_on_drop(true)
-            .output()
-            .await
-        else {
-            continue;
-        };
-        // Older interpreters print the version on stderr.
-        let text = if out.stdout.is_empty() {
-            String::from_utf8_lossy(&out.stderr)
-        } else {
-            String::from_utf8_lossy(&out.stdout)
-        };
-        if parse_python_version(&text).is_some_and(meets_min_python) {
-            return Ok(PathBuf::from(candidate));
+/// Where the controller sources are shipped. `GIAP_ASSET_ROOT` and the exe's
+/// neighbours, matching how `extensions/` is found.
+fn source_dir() -> Result<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(root) = std::env::var("GIAP_ASSET_ROOT") {
+        candidates.push(PathBuf::from(root).join("matter-server"));
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../matter-server"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("matter-server"));
+            candidates.push(dir.join("../Resources/matter-server"));
+            candidates.push(dir.join("../matter-server"));
+        }
+    }
+
+    for candidate in &candidates {
+        if candidate.join("package.json").is_file() {
+            return Ok(candidate.clone());
         }
     }
     Err(anyhow!(
-        "no Python {}.{}+ found on PATH — python-matter-server needs it. \
-         Install one (macOS: `brew install python@3.12`; Debian/Jetson: \
-         `apt install python3.12 python3.12-venv`) and restart, or run your own \
-         matter-server and point matter_ws_url at it.",
-        MIN_PYTHON.0,
-        MIN_PYTHON.1
+        "cannot find the matter-server sources — looked in {}. This is a packaging fault: \
+         matter-server/ has to ship beside the binary.",
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     ))
 }
 
-/// Create the venv and install the pinned controller. Idempotent: if the module
-/// already imports in the venv, this is a no-op.
-async fn ensure_installed(data_dir: &Path) -> Result<()> {
-    let py = venv_python(data_dir);
-    if py.exists() {
-        if let Ok(out) = Command::new(&py)
-            .args(["-c", "import matter_server"])
-            .kill_on_drop(true)
-            .output()
-            .await
-        {
-            if out.status.success() {
-                return Ok(());
+/// First `node` on PATH meeting [`MIN_NODE`].
+async fn find_node() -> Result<PathBuf> {
+    if let Ok(out) = Command::new("node")
+        .arg("--version")
+        .kill_on_drop(true)
+        .output()
+        .await
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(version) = parse_node_version(&text) {
+            if meets_min_node(version) {
+                return Ok(PathBuf::from("node"));
             }
+            return Err(anyhow!(
+                "Node {}.{} is on PATH but the Matter controller needs {}.{}+. Upgrade it \
+                 (Debian/Jetson: `curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash - \
+                 && sudo apt-get install -y nodejs`; macOS: `brew install node`), or run your own \
+                 controller and point matter_ws_url at it.",
+                version.0,
+                version.1,
+                MIN_NODE.0,
+                MIN_NODE.1
+            ));
         }
     }
+    Err(anyhow!(
+        "no Node {}.{}+ found on PATH — the Matter controller needs it. Install one \
+         (Debian/Jetson: `curl -fsSL https://deb.nodesource.com/setup_22.x | sudo bash - && \
+         sudo apt-get install -y nodejs`; macOS: `brew install node`) and restart, or run your \
+         own controller and point matter_ws_url at it.",
+        MIN_NODE.0,
+        MIN_NODE.1
+    ))
+}
 
-    let system_python = find_python().await?;
-    let venv = venv_dir(data_dir);
-    tracing::info!(path = %venv.display(), "matter: creating controller venv");
-    std::fs::create_dir_all(controller_dir(data_dir))
-        .with_context(|| format!("creating {}", controller_dir(data_dir).display()))?;
-
-    let status = Command::new(&system_python)
-        .arg("-m")
-        .arg("venv")
-        .arg(&venv)
-        // `kill_on_drop` because this future is cancellable: the reconciler
-        // races `connect()` against a settings change, so toggling Matter off
-        // mid-install drops us here. Without it the child keeps running after
-        // the runtime has reported `Disabled`, keeps writing into the venv,
-        // and survives process exit -- `shutdown()` never sees it. Re-enabling
-        // before it finishes then finds a half-written venv and starts a
-        // second install into it.
-        .kill_on_drop(true)
-        .status()
-        .await
-        .context("running python -m venv")?;
-    if !status.success() {
-        return Err(anyhow!("python -m venv failed with status {status}"));
+/// Copy `src` into `dst`, replacing whatever is there.
+fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    if dst.exists() {
+        std::fs::remove_dir_all(dst).with_context(|| format!("clearing {}", dst.display()))?;
     }
-
-    tracing::info!(spec = MATTER_SERVER_SPEC, "matter: installing controller");
-    let status = Command::new(&py)
-        .args(["-m", "pip", "install", "--disable-pip-version-check"])
-        .arg(MATTER_SERVER_SPEC)
-        // Same reasoning as the venv step above, and this is the one that
-        // matters: pip is the multi-minute part, so it is where a cancellation
-        // almost always lands.
-        .kill_on_drop(true)
-        .status()
-        .await
-        .context("running pip install")?;
-    if !status.success() {
-        return Err(anyhow!(
-            "pip install {MATTER_SERVER_SPEC} failed with status {status}"
-        ));
+    std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
+    for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)
+                .with_context(|| format!("copying {}", entry.path().display()))?;
+        }
     }
     Ok(())
 }
 
+/// The lockfile's contents, used as the installed-tree fingerprint.
+///
+/// The whole file rather than a hash of it: it is tens of kilobytes, this runs
+/// once per enable, and comparing bytes needs no dependency and cannot collide.
+fn lockfile(dir: &Path) -> Result<String> {
+    let path = dir.join("package-lock.json");
+    std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
+}
+
+/// Install the controller into the data dir. Idempotent: if the installed tree
+/// was built from the lockfile that ships now, this is a no-op.
+async fn ensure_installed(data_dir: &Path, notifier: &MatterNotifier) -> Result<()> {
+    let source = source_dir()?;
+    let wanted = lockfile(&source)?;
+
+    let installed = std::fs::read_to_string(install_marker(data_dir)).ok();
+    if installed.as_deref() == Some(wanted.as_str())
+        && app_dir(data_dir).join("node_modules").is_dir()
+    {
+        return Ok(());
+    }
+
+    let node = find_node().await?;
+    let started = Instant::now();
+    let app = app_dir(data_dir);
+    tracing::info!(
+        target: "giap::trace",
+        kind = "matter_setup_started",
+        path = %app.display(),
+        node = %node.display(),
+        upgrade = installed.is_some(),
+        "matter: installing the controller"
+    );
+    notifier.setup_started().await;
+
+    std::fs::create_dir_all(controller_dir(data_dir))
+        .with_context(|| format!("creating {}", controller_dir(data_dir).display()))?;
+    copy_tree(&source, &app)?;
+
+    // `kill_on_drop` because this future is cancellable: the reconciler races
+    // `connect()` against a settings change, so toggling Matter off mid-install
+    // drops us here. Without it the child keeps running after the runtime has
+    // reported `Disabled`, keeps writing into the tree, and survives process
+    // exit -- `shutdown()` never sees it. Re-enabling before it finishes then
+    // finds a half-written tree and starts a second install into it.
+    //
+    // `npm ci` is the multi-minute part, so it is where a cancellation almost
+    // always lands.
+    let output = Command::new("npm")
+        .args(["ci", "--omit=dev", "--no-audit", "--no-fund"])
+        .current_dir(&app)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("running npm ci — is npm on PATH?")?;
+
+    if !output.status.success() {
+        // npm's own diagnosis, rather than a status code. This used to go
+        // nowhere at all: the install inherited stdio, so a failure on a
+        // headless Pond left "the port never opened" as the only symptom.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "installing the Matter controller failed ({}). npm said:\n{}",
+            output.status,
+            tail(&stderr, STDERR_TAIL_LINES)
+        ));
+    }
+
+    std::fs::write(install_marker(data_dir), &wanted)
+        .with_context(|| format!("writing {}", install_marker(data_dir).display()))?;
+
+    tracing::info!(
+        target: "giap::trace",
+        kind = "matter_setup_finished",
+        duration_ms = started.elapsed().as_millis() as u64,
+        "matter: controller installed"
+    );
+    notifier.setup_finished().await;
+    Ok(())
+}
+
+/// The last `lines` lines of `text`.
+fn tail(text: &str, lines: usize) -> String {
+    let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+/// A bounded ring of the controller's most recent stderr lines.
+type StderrTail = Arc<Mutex<VecDeque<String>>>;
+
 /// Spawn the controller. The child is `kill_on_drop`, so holding the handle ties
 /// its lifetime to pond-server: drop it and the controller goes away too.
-fn spawn_server(data_dir: &Path, port: u16) -> Result<Child> {
+fn spawn_server(data_dir: &Path, port: u16) -> Result<(Child, StderrTail)> {
     let storage = storage_dir(data_dir);
     std::fs::create_dir_all(&storage).with_context(|| format!("creating {}", storage.display()))?;
 
-    // Keep the controller's own output for diagnosis; a silent failure here is
-    // otherwise very hard to debug from the Pond side.
-    let log_path = controller_dir(data_dir).join("matter-server.log");
-    let log = std::fs::File::create(&log_path)
-        .with_context(|| format!("creating {}", log_path.display()))?;
-    let log_err = log.try_clone().context("cloning log handle")?;
+    if legacy_python_storage(data_dir).is_dir() {
+        tracing::info!(
+            target: "giap::trace",
+            kind = "matter_legacy_storage_found",
+            path = %legacy_python_storage(data_dir).display(),
+            "matter: a python-matter-server fabric is present but cannot be read by this \
+             controller — devices need pairing again, and the old store is left in place"
+        );
+    }
 
-    Command::new(venv_python(data_dir))
-        .arg("-m")
-        .arg("matter_server.server")
+    let mut child = Command::new("node")
+        .arg("--import")
+        .arg("tsx")
+        .arg(entrypoint(data_dir))
         .args(["--port", &port.to_string()])
         .arg("--storage-path")
         .arg(&storage)
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err))
+        .current_dir(app_dir(data_dir))
+        // Piped rather than sent to a file nobody reads. The controller writes
+        // structured NDJSON here, so the relay below can re-emit each record at
+        // the level it names instead of flattening everything to one.
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .context("spawning matter_server.server")
+        .context("spawning the Matter controller")?;
+
+    let tail: StderrTail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
+
+    if let Some(stderr) = child.stderr.take() {
+        let ring = tail.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                relay(&line);
+                let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
+                if ring.len() == STDERR_TAIL_LINES {
+                    ring.pop_front();
+                }
+                ring.push_back(line);
+            }
+        });
+    }
+
+    // Nothing should reach stdout — the controller keeps it clean deliberately —
+    // so anything that does is unexpected and worth seeing rather than dropping.
+    if let Some(stdout) = child.stdout.take() {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::debug!(target: "matter_server_stdout", "{line}");
+            }
+        });
+    }
+
+    Ok((child, tail))
+}
+
+/// Re-emit one controller stderr line into `tracing`.
+///
+/// Structured records keep their level, which is the whole reason the controller
+/// logs as NDJSON. Anything else — a Node stack trace, matter.js's own output —
+/// is relayed at debug, where it is available when someone goes looking without
+/// filling the log by default.
+fn relay(line: &str) {
+    #[derive(serde::Deserialize)]
+    struct Record {
+        #[serde(default)]
+        level: String,
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        message: String,
+    }
+
+    let Ok(record) = serde_json::from_str::<Record>(line) else {
+        tracing::debug!(target: "matter_server_stderr", "{line}");
+        return;
+    };
+    if record.level.is_empty() {
+        tracing::debug!(target: "matter_server_stderr", "{line}");
+        return;
+    }
+
+    let message = crate::protocol::redact_setup_code(&record.message);
+    let kind = record.kind;
+    match record.level.as_str() {
+        "error" => {
+            tracing::error!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
+        }
+        "warn" => {
+            tracing::warn!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
+        }
+        "info" => {
+            tracing::info!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
+        }
+        _ => tracing::debug!(kind = %kind, source = "controller", "{message}"),
+    }
 }
 
 /// Ensure a controller is reachable on `port`, installing and starting one if
 /// needed. Returns the child handle when GIAP started it (the caller must keep
-/// it alive), or `None` when an existing server was reused.
+/// it alive), or `None` when an existing controller was reused.
 pub async fn ensure_running(
     data_dir: &Path,
     port: u16,
     ready_timeout: Duration,
+    notifier: &MatterNotifier,
 ) -> Result<Option<Child>> {
     if is_running(port).await {
-        tracing::info!(port, "matter: controller already running; reusing it");
+        tracing::info!(
+            target: "giap::trace",
+            kind = "matter_controller_reused",
+            port,
+            "matter: controller already running; reusing it"
+        );
         return Ok(None);
     }
 
     tracing::info!(port, "matter: no controller found; setting one up");
-    ensure_installed(data_dir).await?;
-    let child = spawn_server(data_dir, port)?;
+    ensure_installed(data_dir, notifier).await?;
+    let (child, stderr_tail) = spawn_server(data_dir, port)?;
+    tracing::info!(
+        target: "giap::trace",
+        kind = "matter_controller_spawned",
+        port,
+        pid = child.id(),
+        "matter: controller started"
+    );
 
     let deadline = Instant::now() + ready_timeout;
     while Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(500)).await;
         if is_running(port).await {
-            tracing::info!(port, "matter: controller ready");
+            tracing::info!(
+                target: "giap::trace",
+                kind = "matter_controller_ready",
+                port,
+                "matter: controller ready"
+            );
             return Ok(Some(child));
         }
     }
+
+    // The reason, not a pointer to where the reason might be. A controller that
+    // dies during startup writes why to stderr and nowhere else, and "see the
+    // log file" was as far as this could go when that file went unread.
+    let reason = {
+        let ring = stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
+        ring.iter().cloned().collect::<Vec<_>>().join("\n")
+    };
+    tracing::warn!(
+        target: "giap::trace",
+        kind = "matter_controller_exited",
+        port,
+        stderr_tail = %reason,
+        "matter: controller did not become ready"
+    );
     Err(anyhow!(
-        "matter-server did not start listening on port {port} within {:?} — see {}",
+        "the Matter controller did not start listening on port {port} within {:?}.{}",
         ready_timeout,
-        controller_dir(data_dir).join("matter-server.log").display()
+        if reason.is_empty() {
+            " It printed nothing, which usually means node could not start at all.".to_string()
+        } else {
+            format!(" It last said:\n{reason}")
+        }
     ))
 }
 
@@ -264,10 +494,10 @@ pub enum Revival {
 /// actually running.
 ///
 /// The reconnect supervisor calls this once reconnecting alone has stopped
-/// working: a controller whose process has exited will never answer a
-/// reconnect, no matter how long the loop runs. Idempotent by construction —
-/// [`ensure_running`] reuses a live port — so it is safe to call repeatedly,
-/// and it never puts a second controller onto a fabric that already has one.
+/// working: a controller whose process has exited will never answer a reconnect,
+/// no matter how long the loop runs. Idempotent by construction —
+/// [`ensure_running`] reuses a live port — so it is safe to call repeatedly, and
+/// it never puts a second controller onto a fabric that already has one.
 pub async fn revive_local_controller(
     data_dir: &Path,
     url: &str,
@@ -278,7 +508,9 @@ pub async fn revive_local_controller(
         return Ok(Revival::NotLocal);
     };
 
-    match ensure_running(data_dir, port, ready_timeout).await? {
+    // A revival is not a first run, so it never announces setup: the user is
+    // already being told the controller is unreachable.
+    match ensure_running(data_dir, port, ready_timeout, &MatterNotifier::disabled()).await? {
         // Storing the new handle drops the dead one, which is harmless:
         // `kill_on_drop` against an already-exited process is a no-op, and
         // teardown now kills the controller that is really running.
@@ -297,16 +529,16 @@ mod tests {
     use super::*;
 
     /// A remote controller is another machine's process. Revival runs on every
-    /// failing URL, so this is the guard that stops GIAP installing a Python
-    /// stack and spawning a controller for a server it does not own.
+    /// failing URL, so this is the guard that stops GIAP installing a runtime
+    /// and spawning a controller for a server it does not own.
     #[tokio::test]
     async fn revival_never_touches_a_remote_controller() {
-        let child: SharedServerChild = Arc::new(Mutex::new(None));
+        let child: SharedServerChild = Arc::new(AsyncMutex::new(None));
 
         let outcome = revive_local_controller(
             // Unreachable on purpose: nothing here may be read or written.
             Path::new("/nonexistent"),
-            "ws://192.168.1.50:5580/ws",
+            "ws://192.168.1.50:5580/giap",
             &child,
             Duration::from_millis(1),
         )
@@ -325,12 +557,12 @@ mod tests {
     async fn revival_reuses_a_controller_that_is_still_listening() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let child: SharedServerChild = Arc::new(Mutex::new(None));
+        let child: SharedServerChild = Arc::new(AsyncMutex::new(None));
 
         let outcome = revive_local_controller(
             // The port answers, so setup returns before the data dir is used.
             Path::new("/nonexistent"),
-            &format!("ws://127.0.0.1:{port}/ws"),
+            &format!("ws://127.0.0.1:{port}/giap"),
             &child,
             Duration::from_millis(1),
         )
@@ -345,49 +577,56 @@ mod tests {
     }
 
     #[test]
-    fn parses_python_versions_and_gates_on_3_12() {
-        assert_eq!(parse_python_version("Python 3.12.13"), Some((3, 12)));
-        assert_eq!(parse_python_version("Python 3.9.6"), Some((3, 9)));
-        assert_eq!(parse_python_version("Python 3.13.0rc1"), Some((3, 13)));
-        assert_eq!(parse_python_version("not a version"), None);
-        assert_eq!(parse_python_version(""), None);
+    fn parses_node_versions_and_gates_on_20_19() {
+        assert_eq!(parse_node_version("v20.19.4"), Some((20, 19)));
+        assert_eq!(parse_node_version("v24.14.1\n"), Some((24, 14)));
+        assert_eq!(parse_node_version("v18.20.8"), Some((18, 20)));
+        assert_eq!(parse_node_version("not a version"), None);
+        assert_eq!(parse_node_version(""), None);
 
-        assert!(meets_min_python((3, 12)));
-        assert!(meets_min_python((3, 13)));
-        assert!(meets_min_python((4, 0)));
-        // The macOS system Python is 3.9 — it must be rejected, not used.
-        assert!(!meets_min_python((3, 9)));
-        assert!(!meets_min_python((2, 7)));
+        assert!(meets_min_node((20, 19)));
+        assert!(meets_min_node((22, 13)));
+        assert!(meets_min_node((24, 0)));
+        // The floor is a MINOR one, which is the whole reason this is a tuple:
+        // Node 20.18 satisfies "20+" and does not satisfy matter.js.
+        assert!(!meets_min_node((20, 18)));
+        assert!(!meets_min_node((18, 20)));
     }
 
     #[test]
     fn only_loopback_urls_are_auto_started() {
-        assert_eq!(local_port_from_ws_url("ws://127.0.0.1:5580/ws"), Some(5580));
-        assert_eq!(local_port_from_ws_url("ws://localhost:5580/ws"), Some(5580));
+        assert_eq!(
+            local_port_from_ws_url("ws://127.0.0.1:5580/giap"),
+            Some(5580)
+        );
+        assert_eq!(
+            local_port_from_ws_url("ws://localhost:5580/giap"),
+            Some(5580)
+        );
         assert_eq!(local_port_from_ws_url("ws://127.0.0.1:6000"), Some(6000));
 
         // Someone else's controller: never auto-managed.
-        assert_eq!(local_port_from_ws_url("ws://192.168.1.50:5580/ws"), None);
-        assert_eq!(local_port_from_ws_url("ws://matter.local:5580/ws"), None);
+        assert_eq!(local_port_from_ws_url("ws://192.168.1.50:5580/giap"), None);
+        assert_eq!(local_port_from_ws_url("ws://matter.local:5580/giap"), None);
         // Malformed / portless.
         assert_eq!(local_port_from_ws_url("http://127.0.0.1:5580"), None);
-        assert_eq!(local_port_from_ws_url("ws://127.0.0.1/ws"), None);
+        assert_eq!(local_port_from_ws_url("ws://127.0.0.1/giap"), None);
     }
 
     #[test]
     fn controller_paths_are_nested_under_the_data_dir() {
         let data = Path::new("/var/lib/giap");
-        assert_eq!(
-            venv_dir(data),
-            Path::new("/var/lib/giap/matter-server/venv")
-        );
+        assert_eq!(app_dir(data), Path::new("/var/lib/giap/matter-server/app"));
         assert_eq!(
             storage_dir(data),
-            Path::new("/var/lib/giap/matter-server/storage")
+            Path::new("/var/lib/giap/matter-server/storage-js")
         );
         // Storage must live under the data dir so the commissioned fabric
         // survives restarts.
         assert!(storage_dir(data).starts_with(data));
+        // And must not be the Python store, which matter.js cannot read and
+        // would be corrupting to write into.
+        assert_ne!(storage_dir(data), legacy_python_storage(data));
     }
 
     #[tokio::test]
@@ -406,5 +645,29 @@ mod tests {
             p
         };
         assert!(!is_running(free).await);
+    }
+
+    #[test]
+    fn the_stderr_tail_keeps_the_end_not_the_beginning() {
+        // The reason a process died is its last words, not its first.
+        let text = (1..=50)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(tail(&text, 3), "line 48\nline 49\nline 50");
+
+        // Fewer lines than asked for is not an error.
+        assert_eq!(tail("only one", 5), "only one");
+        assert_eq!(tail("", 5), "");
+    }
+
+    #[test]
+    fn the_shipped_controller_is_findable_from_the_source_tree() {
+        // Guards the packaging contract from the dev side: `cargo test` runs
+        // with CARGO_MANIFEST_DIR set, so this proves the repo-relative fallback
+        // still points at the real directory after a move.
+        let found = source_dir().expect("matter-server/ must be findable in the repo");
+        assert!(found.join("package.json").is_file());
+        assert!(found.join("src/server.ts").is_file());
     }
 }

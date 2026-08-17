@@ -5,6 +5,31 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Where GIAP's own Matter controller listens.
+///
+/// The path is `/giap`, not python-matter-server's `/ws`: the controller speaks
+/// a protocol of GIAP's own now, and a distinct path means a stale address fails
+/// at the handshake with a sentence naming the problem rather than half-working.
+pub const DEFAULT_MATTER_WS_URL: &str = "ws://127.0.0.1:5580/giap";
+
+/// The default this setting had while the controller was python-matter-server.
+///
+/// Every install predating the move holds this string, and it points at a path
+/// the current controller does not serve — so without rewriting it, upgrading
+/// would silently break Matter for everyone who never touched the field.
+/// Only the exact old default is migrated: an address the user typed themselves
+/// is their own, and may well be a python-matter-server they still run.
+pub const LEGACY_MATTER_WS_URL: &str = "ws://127.0.0.1:5580/ws";
+
+/// Rewrite the superseded default, leaving anything user-chosen alone.
+pub fn migrate_matter_ws_url(stored: &str) -> String {
+    if stored.trim() == LEGACY_MATTER_WS_URL {
+        DEFAULT_MATTER_WS_URL.to_string()
+    } else {
+        stored.to_string()
+    }
+}
+
 /// The turn budget handed to the agent engine when `agent_max_turns == 0`
 /// ("uncapped").
 ///
@@ -1351,7 +1376,7 @@ impl Settings {
         false
     }
     fn default_matter_ws_url() -> String {
-        "ws://127.0.0.1:5580/ws".to_string()
+        DEFAULT_MATTER_WS_URL.to_string()
     }
     fn default_mesh_enabled() -> bool {
         false

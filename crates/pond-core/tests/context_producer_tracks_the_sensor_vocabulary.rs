@@ -67,6 +67,11 @@ const KNOWN_CONTINUOUS: &[&str] = &[
     "pm10",
     "radon",
     "total_volatile_organic_compounds",
+    // Remaining filter life as a percentage. It falls continuously with use, so
+    // it is a sampled series; the event a household wants out of this family is
+    // the change indication, and that is discrete and kept.
+    "hepa_filter_condition",
+    "carbon_filter_condition",
 ];
 
 fn workspace_root() -> PathBuf {
@@ -78,11 +83,16 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn matter_protocol_source() -> String {
-    let path = workspace_root().join("crates/pond-adapters-matter/src/protocol.rs");
+fn matter_sensor_source() -> String {
+    // The cluster map lives in the Matter controller now: it is TypeScript, next
+    // to matter.js's typed cluster models, rather than a hand-maintained table of
+    // decimal cluster ids in Rust. The vocabulary it mints is unchanged, so this
+    // tripwire follows it rather than being retired — a rule that fails silently
+    // needs its guard wherever the thing it guards has moved to.
+    let path = workspace_root().join("matter-server/src/mapping/sensors.ts");
     std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
-            "cannot read {}: {e}. If the Matter protocol map moved, this tripwire is watching a \
+            "cannot read {}: {e}. If the Matter sensor map moved, this tripwire is watching a \
              file that no longer exists and would never fire.",
             path.display()
         )
@@ -91,13 +101,14 @@ fn matter_protocol_source() -> String {
 
 /// Every `sensor_type` the Matter bridge can mint, read out of its cluster map.
 ///
-/// The map is written as `CLUSTER_X => ("name", value, "unit")`, so the signal
-/// name is the first string literal after each `=> (`. Collected by shape rather
-/// than by looking for the names this file already knows, which is the
-/// difference between finding a new one and confirming the old ones.
+/// Each entry is written as `{ cluster: …, attribute: …, sensorType: "name", … }`,
+/// so the signal name is the first string literal after each `sensorType: "`.
+/// Collected by shape rather than by looking for the names this file already
+/// knows, which is the difference between finding a new one and confirming the
+/// old ones.
 fn matter_sensor_types(body: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for fragment in body.split("=> (\"").skip(1) {
+    for fragment in body.split("sensorType: \"").skip(1) {
         if let Some((literal, _)) = fragment.split_once('"') {
             if !out.iter().any(|s| s == literal) {
                 out.push(literal.to_string());
@@ -112,9 +123,9 @@ fn matter_sensor_types(body: &str) -> Vec<String> {
 /// would make it pass by reading nothing.
 #[test]
 fn the_tripwire_is_reading_the_matter_cluster_map() {
-    let body = matter_protocol_source();
+    let body = matter_sensor_source();
     assert!(
-        body.contains("SensorReading"),
+        body.contains("Reading"),
         "the file this test reads no longer produces sensor readings, so it is not the bridge \
          whose vocabulary this rule is calibrated against"
     );
@@ -142,7 +153,7 @@ fn the_tripwire_is_reading_the_matter_cluster_map() {
 /// transition, or named as a measurement that is deliberately dropped.
 #[test]
 fn every_matter_signal_is_either_kept_or_named_as_a_measurement() {
-    let found = matter_sensor_types(&matter_protocol_source());
+    let found = matter_sensor_types(&matter_sensor_source());
 
     let undecided: Vec<&String> = found
         .iter()

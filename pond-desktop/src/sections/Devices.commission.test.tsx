@@ -20,7 +20,7 @@ const mocked = (fn: unknown) => fn as ReturnType<typeof vi.fn>;
 
 /** A Matter runtime in the given state, as `GET /matter/status` reports it. */
 function matterStatus(state: MatterStatus["state"], error?: string): MatterStatus {
-  return { enabled: state !== "disabled", url: "ws://127.0.0.1:5580/ws", state, error };
+  return { enabled: state !== "disabled", url: "ws://127.0.0.1:5580/giap", state, error };
 }
 
 beforeEach(() => {
@@ -171,7 +171,7 @@ describe("Matter section — turning the fabric on", () => {
     // The placeholder is the same string as the default address, so anything
     // that asserts on displayed text passes even when nothing is set. The value
     // is the only thing separating "configured" from "blank".
-    await waitFor(() => expect(input.value).toBe("ws://127.0.0.1:5580/ws"));
+    await waitFor(() => expect(input.value).toBe("ws://127.0.0.1:5580/giap"));
     expect(input.placeholder).toBe(input.value);
   });
 
@@ -200,7 +200,7 @@ describe("Matter section — turning the fabric on", () => {
     await waitFor(() =>
       expect(api.updateSettings).toHaveBeenCalledWith({
         matter_enabled: true,
-        matter_ws_url: "ws://127.0.0.1:5580/ws",
+        matter_ws_url: "ws://127.0.0.1:5580/giap",
       }),
     );
     // The runtime is asked again rather than the UI assuming the save worked.
@@ -237,7 +237,7 @@ describe("Matter section — turning the fabric on", () => {
     await waitFor(() =>
       expect(api.updateSettings).toHaveBeenCalledWith({
         matter_enabled: true,
-        matter_ws_url: "ws://127.0.0.1:5580/ws",
+        matter_ws_url: "ws://127.0.0.1:5580/giap",
       }),
     );
   });

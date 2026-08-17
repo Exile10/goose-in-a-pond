@@ -223,7 +223,7 @@ async fn an_unreachable_controller_is_not_reported_as_disabled() {
         .unwrap()
         .to_string();
     assert!(error.contains("connection refused"), "{error}");
-    assert!(error.contains("ws://127.0.0.1:5580/ws"), "{error}");
+    assert!(error.contains("ws://127.0.0.1:5580/giap"), "{error}");
     assert!(
         !error.contains("not enabled") && !error.contains("is off"),
         "it is enabled — do not say otherwise: {error}"
@@ -294,7 +294,7 @@ async fn status_reports_the_state_and_its_failure_reason() {
     assert_eq!(body["state"], "unreachable");
     assert_eq!(body["enabled"], true);
     assert_eq!(body["error"], "no route to host");
-    assert_eq!(body["url"], "ws://127.0.0.1:5580/ws");
+    assert_eq!(body["url"], "ws://127.0.0.1:5580/giap");
 }
 
 /// The whole point of the change: saving the setting reconfigures the running
@@ -311,7 +311,7 @@ async fn saving_the_setting_reconciles_the_runtime_without_a_restart() {
             "/api/v1/settings",
             Some(serde_json::json!({
                 "matter_enabled": true,
-                "matter_ws_url": "ws://127.0.0.1:5580/ws",
+                "matter_ws_url": "ws://127.0.0.1:5580/giap",
             })),
         ))
         .await
@@ -320,7 +320,7 @@ async fn saving_the_setting_reconciles_the_runtime_without_a_restart() {
 
     assert_eq!(
         matter.unwrap().applied(),
-        vec![(true, "ws://127.0.0.1:5580/ws".to_string())],
+        vec![(true, "ws://127.0.0.1:5580/giap".to_string())],
         "the save must ask the runtime to converge"
     );
 }
@@ -375,7 +375,7 @@ async fn deleting_a_matter_device_while_off_refuses_with_the_honest_reason() {
 /// unrelated save.
 ///
 /// The fixture is the point. It used to store a perfectly valid
-/// `ws://127.0.0.1:5580/ws` while its comment claimed to be testing "no
+/// `ws://127.0.0.1:5580/giap` while its comment claimed to be testing "no
 /// address", so the validation branch it exists for was never reached and the
 /// test passed with `touches_matter &&` deleted from the guard. Seeding the
 /// repository directly is the only way in: the API now rejects

@@ -1,0 +1,354 @@
+//! Telling the user when something Matter-related actually happened.
+//!
+//! The adapter used to be silent in the direction that matters most. A device
+//! paired, a pairing failed, the controller died and was restarted, a node
+//! dropped off the fabric — all of it went, at best, into a log file nobody
+//! reads. "The lights stopped working and nothing said why" is not a diagnosis a
+//! household can act on.
+//!
+//! So the significant occurrences push a [`Notification`], which reaches phones
+//! over `GET /api/v1/notifications/stream` and the desktop through its poller.
+//! The bar for being here is deliberately high: a notification is an
+//! interruption, and a subsystem that interrupts on routine events gets muted,
+//! after which it cannot report the one thing that mattered.
+//!
+//! Everything alerting is debounced, following the pairing-alert window in
+//! `routes.rs`. The underlying `giap::trace` events are still emitted per
+//! occurrence — the debounce narrows what the user is *told*, never what is
+//! recorded.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use pond_core::mcp::ports::notification::{Notification, NotificationSender};
+use tokio::sync::{Mutex, RwLock};
+
+/// How long an alert of a given kind suppresses the next one of that kind.
+///
+/// Ten minutes, matching the pairing-failure window in `routes.rs`. A flapping
+/// controller reconnects far faster than this, so the user hears "Matter is
+/// down" once rather than once per attempt.
+const ALERT_WINDOW: Duration = Duration::from_secs(600);
+
+/// Whether an unreachable alert is outstanding, so recovery is only announced to
+/// someone who was told about the outage.
+#[derive(Default)]
+struct State {
+    last_pairing_failure: Option<Instant>,
+    last_unreachable: Option<Instant>,
+    /// Set when an unreachable alert went out; cleared when recovery is
+    /// announced. Without it, every ordinary reconnect would report a recovery
+    /// from an outage the user never heard about.
+    outage_announced: bool,
+    /// Set while first-run setup is in progress, so "finished" is only reported
+    /// for an install that was actually announced as starting.
+    setup_announced: bool,
+}
+
+/// Builds and pushes the Matter notifications, holding the debounce state.
+///
+/// Cloneable and cheap: the bridge, the supervisor and the commissioner each
+/// hold one, and they share the same window so two paths cannot both alert for
+/// the same outage.
+#[derive(Clone)]
+pub struct MatterNotifier {
+    /// `None` until a sender is attached, and on a build without the
+    /// notification stack. Every method is then a no-op, which is why callers
+    /// never branch on it.
+    ///
+    /// Settable rather than fixed at construction because of startup order: the
+    /// Matter runtime is built before the notification stack exists (the agent
+    /// wiring in between needs the runtime's device-control facade), so the
+    /// sender arrives later. The alternative was reordering several hundred
+    /// lines of `serve()` around a subsystem that is off by default.
+    sender: Arc<RwLock<Option<Arc<dyn NotificationSender>>>>,
+    state: Arc<Mutex<State>>,
+}
+
+impl MatterNotifier {
+    /// A notifier that sends nothing until [`attach`](Self::attach) is called.
+    pub fn new() -> Self {
+        Self {
+            sender: Arc::new(RwLock::new(None)),
+            state: Arc::new(Mutex::new(State::default())),
+        }
+    }
+
+    /// A notifier that will never send, for tests and for the paths that have no
+    /// user to tell (a controller revival, which is already being reported).
+    pub fn disabled() -> Self {
+        Self::new()
+    }
+
+    /// Start sending through `sender`. Callers must do this before the first
+    /// `apply`, or a first-run install would finish unannounced.
+    pub async fn attach(&self, sender: Arc<dyn NotificationSender>) {
+        *self.sender.write().await = Some(sender);
+    }
+
+    pub async fn device_paired(&self, name: &str, device_type: &str) {
+        self.push(
+            "info",
+            "Matter device added".to_string(),
+            format!("\"{name}\" joined this Pond's Matter network as a {device_type}."),
+        )
+        .await;
+    }
+
+    pub async fn pairing_failed(&self, reason: &str) {
+        {
+            let mut state = self.state.lock().await;
+            if state
+                .last_pairing_failure
+                .is_some_and(|at| at.elapsed() < ALERT_WINDOW)
+            {
+                return;
+            }
+            state.last_pairing_failure = Some(Instant::now());
+        }
+        self.push(
+            "alert",
+            "Matter pairing failed".to_string(),
+            reason.to_string(),
+        )
+        .await;
+    }
+
+    /// The controller has stopped answering and a restart is being attempted.
+    ///
+    /// Raised on the first revival attempt rather than the first failed
+    /// reconnect: a controller restarting normally is back within a couple of
+    /// attempts, and alerting on those would tell the user about every blip.
+    pub async fn controller_unreachable(&self, url: &str) {
+        {
+            let mut state = self.state.lock().await;
+            if state
+                .last_unreachable
+                .is_some_and(|at| at.elapsed() < ALERT_WINDOW)
+            {
+                return;
+            }
+            state.last_unreachable = Some(Instant::now());
+            state.outage_announced = true;
+        }
+        self.push(
+            "alert",
+            "Matter controller is not responding".to_string(),
+            format!(
+                "This Pond cannot reach its Matter controller at {url}, so Matter devices \
+                 cannot be controlled. It is being restarted."
+            ),
+        )
+        .await;
+    }
+
+    /// The connection is back. Silent unless an outage was announced, so a
+    /// routine reconnect does not produce an all-clear for nothing.
+    pub async fn controller_recovered(&self) {
+        {
+            let mut state = self.state.lock().await;
+            if !state.outage_announced {
+                return;
+            }
+            state.outage_announced = false;
+        }
+        self.push(
+            "info",
+            "Matter is working again".to_string(),
+            "This Pond reconnected to its Matter controller. Matter devices can be controlled \
+             again."
+                .to_string(),
+        )
+        .await;
+    }
+
+    /// A device left the fabric without the user removing it.
+    pub async fn device_dropped(&self, device_id: &str) {
+        self.push(
+            "alert",
+            "A Matter device left the network".to_string(),
+            format!(
+                "\"{device_id}\" is no longer on this Pond's Matter network. If it was not \
+                 removed deliberately, it may have been factory reset."
+            ),
+        )
+        .await;
+    }
+
+    /// First-run setup has started. It legitimately takes minutes, and the UI
+    /// otherwise shows nothing but "Starting..." for the whole of it.
+    pub async fn setup_started(&self) {
+        self.state.lock().await.setup_announced = true;
+        self.push(
+            "info",
+            "Setting up Matter".to_string(),
+            "This Pond is installing its Matter controller. This takes a few minutes and only \
+             happens once."
+                .to_string(),
+        )
+        .await;
+    }
+
+    /// Setup finished. Only reported when the start was, so a Pond whose
+    /// controller was already installed says nothing.
+    pub async fn setup_finished(&self) {
+        {
+            let mut state = self.state.lock().await;
+            if !state.setup_announced {
+                return;
+            }
+            state.setup_announced = false;
+        }
+        self.push(
+            "info",
+            "Matter is ready".to_string(),
+            "This Pond's Matter controller is installed and running. Matter devices can now be \
+             added from the Devices tab."
+                .to_string(),
+        )
+        .await;
+    }
+
+    async fn push(&self, category: &str, title: String, body: String) {
+        let Some(sender) = self.sender.read().await.clone() else {
+            return;
+        };
+        let notification = Notification {
+            id: uuid::Uuid::new_v4().to_string(),
+            target: "broadcast".to_string(),
+            category: category.to_string(),
+            title,
+            body,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            data: None,
+        };
+        if let Err(e) = sender.broadcast(notification).await {
+            // A failed notification must not fail the thing it was reporting on.
+            tracing::warn!(error = %e, category, "matter: could not push a notification");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use async_trait::async_trait;
+
+    #[derive(Default)]
+    struct Recorder {
+        sent: std::sync::Mutex<Vec<Notification>>,
+    }
+
+    impl Recorder {
+        fn titles(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|n| n.title.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl NotificationSender for Recorder {
+        async fn send(&self, notification: Notification) -> Result<()> {
+            self.sent.lock().unwrap().push(notification);
+            Ok(())
+        }
+        async fn broadcast(&self, notification: Notification) -> Result<()> {
+            self.sent.lock().unwrap().push(notification);
+            Ok(())
+        }
+    }
+
+    async fn notifier() -> (MatterNotifier, Arc<Recorder>) {
+        let recorder = Arc::new(Recorder::default());
+        let notifier = MatterNotifier::new();
+        notifier.attach(recorder.clone()).await;
+        (notifier, recorder)
+    }
+
+    #[tokio::test]
+    async fn a_flapping_controller_alerts_once_not_once_per_attempt() {
+        // The supervisor retries for as long as an outage lasts. Without the
+        // window, a controller down for an hour would be an hour of alerts.
+        let (notifier, recorder) = notifier().await;
+        for _ in 0..5 {
+            notifier
+                .controller_unreachable("ws://127.0.0.1:5580/giap")
+                .await;
+        }
+        assert_eq!(recorder.titles().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_is_only_announced_to_someone_who_heard_about_the_outage() {
+        let (notifier, recorder) = notifier().await;
+
+        // An ordinary reconnect, with no outage announced: says nothing.
+        notifier.controller_recovered().await;
+        assert!(recorder.titles().is_empty(), "an all-clear for nothing");
+
+        notifier
+            .controller_unreachable("ws://127.0.0.1:5580/giap")
+            .await;
+        notifier.controller_recovered().await;
+        assert_eq!(
+            recorder.titles(),
+            vec![
+                "Matter controller is not responding",
+                "Matter is working again"
+            ]
+        );
+
+        // And the all-clear is not repeated on the next reconnect.
+        notifier.controller_recovered().await;
+        assert_eq!(recorder.titles().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_retry_burst_produces_one_pairing_alert() {
+        let (notifier, recorder) = notifier().await;
+        for _ in 0..4 {
+            notifier.pairing_failed("nothing was in pairing mode").await;
+        }
+        assert_eq!(recorder.titles().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn setup_finished_says_nothing_when_setup_never_started() {
+        // The common case by far: every start after the first finds the
+        // controller already installed and must be silent.
+        let (notifier, recorder) = notifier().await;
+        notifier.setup_finished().await;
+        assert!(recorder.titles().is_empty());
+
+        notifier.setup_started().await;
+        notifier.setup_finished().await;
+        assert_eq!(
+            recorder.titles(),
+            vec!["Setting up Matter", "Matter is ready"]
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_success_is_not_debounced() {
+        // Adding several devices in one sitting is a normal thing to do, and each
+        // one is a distinct fact the user wants confirmed.
+        let (notifier, recorder) = notifier().await;
+        notifier.device_paired("Hall light", "light").await;
+        notifier.device_paired("Porch lock", "lock").await;
+        assert_eq!(recorder.titles().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_notifier_without_a_sender_is_inert() {
+        // Every notifier starts this way, and stays this way on a build without
+        // the notification stack, so no caller may have to branch on it.
+        let notifier = MatterNotifier::disabled();
+        notifier.device_paired("Hall light", "light").await;
+        notifier.controller_unreachable("ws://x").await;
+    }
+}

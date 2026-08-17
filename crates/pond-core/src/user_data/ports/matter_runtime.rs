@@ -115,7 +115,7 @@ mod tests {
     fn status_serializes_flat_with_the_failure_reason() {
         let json = serde_json::to_value(MatterStatus {
             enabled: true,
-            url: "ws://127.0.0.1:5580/ws".into(),
+            url: "ws://127.0.0.1:5580/giap".into(),
             state: MatterState::Unreachable {
                 error: "connection refused".into(),
             },
@@ -123,7 +123,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(json["enabled"], true);
-        assert_eq!(json["url"], "ws://127.0.0.1:5580/ws");
+        assert_eq!(json["url"], "ws://127.0.0.1:5580/giap");
         assert_eq!(json["state"], "unreachable");
         assert_eq!(json["error"], "connection refused");
     }

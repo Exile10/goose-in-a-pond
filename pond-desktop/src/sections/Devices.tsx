@@ -334,7 +334,7 @@ export function Devices() {
             className="native-input native-input--flex"
             value={matterUrl}
             disabled={!(matter?.enabled ?? false) || matterBusy}
-            placeholder="ws://127.0.0.1:5580/ws"
+            placeholder="ws://127.0.0.1:5580/giap"
             onChange={(e) => setMatterUrl(e.target.value)}
             onBlur={() => {
               // Only a real edit is worth a reconnect.

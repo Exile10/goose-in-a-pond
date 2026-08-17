@@ -2794,8 +2794,15 @@ async fn run_server(
         Option<Arc<dyn pond_core::user_data::ports::matter_runtime::MatterRuntimePort>>;
     type DeviceControl = Arc<dyn pond_core::user_data::ports::device_control::DeviceControlPort>;
 
+    // The concrete runtime is kept alongside the trait object because
+    // `attach_notifications` is an adapter concern, not part of `MatterRuntimePort`:
+    // putting it on the port would make every mock and stub in the workspace
+    // answer for a method that only one implementation has any use for.
     #[cfg(feature = "goose-agent")]
-    let (matter_runtime, device_control): (MatterRuntimeHandle, DeviceControl) = {
+    let (matter_concrete, device_control): (
+        Option<Arc<pond_adapters_matter::MatterRuntime>>,
+        DeviceControl,
+    ) = {
         // The bridge holds only a bus handle, so persistence is attached to the
         // handle (#90): the decorator records each BusEvent::Sensor before
         // forwarding it, giving Matter readings the same persist-before-publish
@@ -2822,15 +2829,16 @@ async fn run_server(
         let control = runtime.device_control(Arc::new(
             pond_infra::logging_device_control::LoggingDeviceControl::new(),
         ));
-        // Converge to the persisted setting. Returns immediately by design: a
-        // first enable installs and starts a controller, and serving must not
-        // wait minutes on that. The Devices tab shows the progress.
-        runtime.apply(
-            settings.matter_enabled,
-            settings.matter_ws_url.trim().to_string(),
-        );
-        (Some(runtime as Arc<dyn MatterRuntimePort>), control)
+        // NOT converged here: `apply` waits until the notification sender exists
+        // further down, so a first-run controller install can tell the user it
+        // has started. See the `matter.attach_notifications` call below.
+        (Some(runtime), control)
     };
+
+    #[cfg(feature = "goose-agent")]
+    let matter_runtime: MatterRuntimeHandle = matter_concrete
+        .clone()
+        .map(|runtime| runtime as Arc<dyn MatterRuntimePort>);
 
     #[cfg(not(feature = "goose-agent"))]
     let (matter_runtime, device_control): (MatterRuntimeHandle, DeviceControl) = (
@@ -3362,6 +3370,25 @@ async fn run_server(
         targeted_notification_sender.clone();
     // Let the `send_notification` MCP tool reach connected phones too (#99).
     pond_mcp_server::init_notification_sender(notification_sender.clone());
+
+    // Matter can now tell the user things, so converge it (#195). Deferred to
+    // here rather than left beside the runtime's construction because the first
+    // enable on a fresh install downloads and installs a controller, which
+    // legitimately takes minutes: without a sender attached first, the one
+    // notification explaining that wait would be sent into nothing.
+    //
+    // Still returns immediately — serving must not wait on the install, and the
+    // Devices tab shows the progress.
+    #[cfg(feature = "goose-agent")]
+    if let Some(matter) = &matter_concrete {
+        matter
+            .attach_notifications(notification_sender.clone())
+            .await;
+        matter.apply(
+            settings.matter_enabled,
+            settings.matter_ws_url.trim().to_string(),
+        );
+    }
 
     // Bridge schedule completion/failure events to push notifications (#99), so a
     // reminder/scheduled task surfaces on the phone, not just the dashboard.
