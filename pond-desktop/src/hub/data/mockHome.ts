@@ -70,6 +70,8 @@ export interface NowPlayingData {
   artist: string;
   elapsed: number;
   hue: number;
+  /** Spotify's cover-art URL for the current track, when available. Falls back to the hue gradient when null/absent. */
+  albumArt?: string | null;
   /** Whether Spotify is connected — gates real playback controls vs. the cosmetic demo toggle. */
   connected: boolean;
   playing: boolean;

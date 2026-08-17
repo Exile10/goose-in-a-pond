@@ -285,7 +285,7 @@ export function Devices() {
           <p className="dev-header__sub">All registered nodes on your local network.</p>
         </div>
         <div className="page-header__action">
-          <Button size="sm" variant="primary" onPress={openForm}>
+          <Button size="sm" variant="primary" className="page-header-btn" onPress={openForm}>
             <Plus size={14} /> Register device
           </Button>
         </div>

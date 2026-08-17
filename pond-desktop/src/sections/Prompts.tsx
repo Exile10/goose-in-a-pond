@@ -167,7 +167,7 @@ export function Prompts() {
       <PageHeader
         title="Prompts"
         action={
-          <Chip size="sm" variant="soft">
+          <Chip size="sm" variant="soft" className="header-status-chip">
             {orderedPrompts.length} preset{orderedPrompts.length !== 1 ? "s" : ""}
           </Chip>
         }

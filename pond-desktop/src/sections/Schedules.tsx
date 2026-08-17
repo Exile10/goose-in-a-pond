@@ -861,6 +861,7 @@ export function Schedules() {
           <Button
             size="sm"
             variant="secondary"
+            className="page-header-btn"
             onPress={() => setShowRoutineForm(true)}
           >
             <Plus size={14} /> New Routine
@@ -868,6 +869,7 @@ export function Schedules() {
           <Button
             size="sm"
             variant="primary"
+            className="page-header-btn"
             isDisabled={!state.serverOnline}
             onPress={() => setShowForm(true)}
           >

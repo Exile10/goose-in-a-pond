@@ -4,6 +4,23 @@
    Variables reference design-tokens.css (aliases resolve there).
    ============================================================================= */
 
+/* HeroUI's own horizontal padding for buttons lives in Tailwind's `components`
+   cascade layer; base.css's `* { padding: 0 }` reset is unlayered, so per the
+   CSS cascade-layers spec it wins over the layered rule regardless of
+   specificity — silently zeroing every HeroUI button's padding. Re-declared
+   here at class specificity, matching the fix already applied to
+   `.switch__thumb` in base.css for the same reason. Shared by every
+   page-header primary action button (Devices, Mesh, …) since they all hit
+   the same zeroed-padding bug. */
+.page-header-btn { padding: 0 12px; }
+
+/* HeroUI's stock `chip--sm` (padding: 0 4px, font-size: 10px / --text-xs) now
+   renders correctly since the cascade-layer fix in base.css/design-tokens.css,
+   but reads as cramped and small for a header-area status chip. Bumped past
+   the stock size for chips like the pairing countdown and the prompts preset
+   count — anywhere a chip sits in a page header rather than inline in a list. */
+.header-status-chip { padding: 3px 10px; font-size: var(--text-sm); }
+
 /* ─── HeroUI button sizing ─── */
 .button--sm:not(.button--icon-only) { min-width: 80px; }
 .button--md:not(.button--icon-only) { min-width: 96px; }
@@ -129,8 +146,10 @@
 .sidebar.is-collapsed .sidebar__actions {
   flex-direction: column;
   align-items: center;
-  padding: 0;
+  padding: 0 0 10px;
+  margin-bottom: 4px;
   gap: 4px;
+  border-bottom: 1px solid var(--grey-200);
 }
 .sidebar.is-collapsed .sidebar__action-btn {
   flex: none;
@@ -213,9 +232,7 @@
   width: 100%;
   transition: background var(--transition-fast);
 }
-.sidebar__item:hover { background: var(--grey-100); }
 .sidebar__item.is-active {
-  background: var(--pp-50);
   color: var(--pp);
 }
 .sidebar__item.is-active .sidebar__icon { color: var(--pp); }
@@ -5870,6 +5887,9 @@
   .sidebar__actions {
     justify-content: center;
     gap: 4px;
+    padding-bottom: 8px;
+    margin-bottom: 3px;
+    border-bottom: 1px solid var(--grey-200);
   }
   .sidebar__footer { padding: 6px 0 6px; align-items: center; }
   .sidebar__bottom-nav { padding: 2px 0; }
