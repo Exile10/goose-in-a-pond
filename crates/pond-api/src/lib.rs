@@ -202,6 +202,15 @@ pub struct AppState {
     /// The route still clears, because clearing is what makes the next process
     /// rebuild from scratch.
     pub index_reindex: Option<Arc<tokio::sync::Notify>>,
+    /// Pull every connected account now, instead of waiting for the timer.
+    ///
+    /// The half-hourly sweep is right for a calendar that changes a few times a
+    /// week and wrong for somebody who has just typed in a password and wants
+    /// to know whether it worked. This is what makes that answerable.
+    ///
+    /// `None` where nothing can sync — no secret store, or a CLI process — and
+    /// the route says so rather than reporting a sync that never ran.
+    pub account_sync: Option<Arc<dyn pond_core::context::ports::AccountSync>>,
     /// IoT sensor reading storage (uses logs DB).
     pub sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
     /// Camera event storage (uses logs DB).

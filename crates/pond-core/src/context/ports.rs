@@ -95,3 +95,38 @@ pub trait ContextRepository: Send + Sync {
     /// items for the baseline period.
     async fn purge_expired(&self, retention: &ContextRetention, now: DateTime<Utc>) -> Result<u64>;
 }
+
+// ── Asking an account for news, now ─────────────────────────────────────────
+
+/// What one sync pass did, in the shape a person can be told.
+///
+/// Deliberately counts rather than a bare success flag: "checked, nothing new"
+/// and "checked, found eleven things" are both successes and they are not the
+/// same answer, and somebody who just pressed a button deserves to know which
+/// one happened.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AccountSyncSummary {
+    /// Accounts considered.
+    pub sources: usize,
+    /// Accounts whose upstream said nothing had changed.
+    pub unchanged: usize,
+    /// Items stored.
+    pub ingested: usize,
+    /// Accounts whose credentials were refused.
+    pub needs_reauth: usize,
+    /// Accounts that failed for some other reason.
+    pub failed: usize,
+    /// Accounts skipped because the pond is offline.
+    pub paused: usize,
+}
+
+/// Pull every connected account now, rather than waiting for the timer.
+///
+/// A port because the sync itself composes a repository, a pipeline, a secret
+/// store and one protocol adapter per kind — a combination that belongs to the
+/// binary that wires them, not to a domain that has never heard of CalDAV. The
+/// route only needs to be able to ASK.
+#[async_trait]
+pub trait AccountSync: Send + Sync {
+    async fn sync_now(&self) -> Result<AccountSyncSummary>;
+}

@@ -586,6 +586,17 @@ export interface ContextCorpusCleared {
  * The result of emptying the index. Every corpus is listed, including the ones
  * at zero, so a corpus that was never populated is still visible afterwards.
  */
+/** What one sync pass did. Counts, not a success flag: "nothing new" and
+ *  "found eleven things" are both successes and are not the same answer. */
+export interface AccountSyncSummary {
+  sources: number;
+  unchanged: number;
+  ingested: number;
+  needs_reauth: number;
+  failed: number;
+  paused: number;
+}
+
 /** A connected personal-context source, as the sources API reports it. */
 export interface ContextSource {
   id: string;

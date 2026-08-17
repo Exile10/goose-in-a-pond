@@ -271,6 +271,7 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(list_context_sources).post(connect_context_source),
         )
         .route("/context/sources/{id}", delete(disconnect_context_source))
+        .route("/context/sync", post(sync_context_sources))
         // ── The index's own health, and the way to repair it ───────────────
         // Protected, and deliberately absent from `middleware::PUBLIC_ROUTES`:
         // these counts say how much of a household's memory exists and how
@@ -15010,6 +15011,43 @@ async fn connect_context_source(
     Ok(Json(
         json!({"id": id, "kind": kind.as_str(), "profile_id": owner}),
     ))
+}
+
+/// `POST /api/v1/context/sync` -- pull every connected account now.
+///
+/// The half-hourly sweep is right for a calendar that changes a few times a
+/// week and wrong for somebody who has just typed a password in and wants to
+/// know whether it worked. So this answers with what the pass actually did:
+/// "checked, nothing new" and "checked, found eleven things" are both successes
+/// and somebody who pressed a button deserves to know which one they got.
+///
+/// Held open for the duration rather than returning a job id. A household sync
+/// is a handful of HTTP round trips, and a progress API for something that
+/// takes seconds is more moving parts than the answer is worth.
+async fn sync_context_sources(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(syncer) = state.account_sync.as_ref() else {
+        // Distinguished from "synced, found nothing": this pond CANNOT sync,
+        // and reporting a zero would read as a working account with no news.
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "this pond cannot reach connected accounts -- it has no encrypted \
+                          secret store to read their sign-in details from",
+            })),
+        ));
+    };
+    match syncer.sync_now().await {
+        Ok(summary) => Ok(Json(json!(summary))),
+        Err(e) => {
+            tracing::warn!(error = %e, "a requested account sync failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "the sync could not run"})),
+            ))
+        }
+    }
 }
 
 /// `GET /api/v1/context/sources?session_id=X` -- the sources this caller may see.
