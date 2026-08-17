@@ -8,9 +8,8 @@ export type GuiSection =
   | "pairing"
   | "schedules"
   | "notifications"
-  | "memory"
   | "skills"
-  | "connections"
+  | "context"
   | "extensions"
   | "models"
   | "prompts"
@@ -42,8 +41,7 @@ export const SIDEBAR_GROUPS: SidebarGroup[] = [
       { section: "mesh",      label: "Mesh",       icon: "mesh" },
       { section: "pairing",   label: "Pairing",   icon: "pairing" },
       { section: "schedules", label: "Schedules", icon: "clock" },
-      { section: "memory",    label: "Memory",    icon: "memory" },
-      { section: "connections", label: "Accounts", icon: "memory" },
+      { section: "context",   label: "Context",   icon: "memory" },
       { section: "skills",    label: "Skills",    icon: "skills" },
       { section: "logs",      label: "Logs",      icon: "logs" },
     ],
@@ -75,10 +73,20 @@ export function normalizeDesktopMode(value: string | null | undefined): DesktopM
   return value === "voice" || value === "gui" ? value : "gui";
 }
 
+/** Sections that were renamed, and where somebody sitting on the old one lands.
+ *
+ * The Memories tab became Context. Without this, anyone whose app was last left
+ * on that tab reopens on the dashboard — which reads as the app losing their
+ * place rather than as a screen being renamed. */
+const RENAMED_SECTIONS: Record<string, GuiSection> = {
+  memory: "context",
+  connections: "context",
+};
+
 export function normalizeGuiSection(value: string | null | undefined): GuiSection {
-  return value && SECTION_SET.has(value as GuiSection)
-    ? (value as GuiSection)
-    : "dashboard";
+  if (!value) return "dashboard";
+  if (SECTION_SET.has(value as GuiSection)) return value as GuiSection;
+  return RENAMED_SECTIONS[value] ?? "dashboard";
 }
 
 export function getDesktopSectionLabel(section: GuiSection): string {
