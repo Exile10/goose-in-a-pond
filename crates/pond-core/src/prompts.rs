@@ -1082,14 +1082,17 @@ pub fn render_jinja_template(
     // Stating the location is not enough: a small model reads it as trivia and
     // still asks "which city?" when a location-aware tool needs one. Say what
     // to DO with it. Static per install, so the prefix stays KV-stable.
-    let location = if settings.weather_location_name.is_empty() {
-        String::new()
-    } else {
-        format!(
+    // Asked, not read. `location::resolve` is the one place that decides what
+    // "where is this pond" means — including the fall back to the time zone,
+    // which this used to skip, leaving the line out of the prompt for a pond
+    // that knew perfectly well it was in Nairobi.
+    let location = match crate::user_data::services::location::resolve(settings).describe() {
+        None => String::new(),
+        Some(place) => format!(
             "\nLocation: {}. This is the user's home — when a tool needs a place \
              and none was given, use it rather than asking which city.",
-            sanitize_field(&settings.weather_location_name, 100)
-        )
+            sanitize_field(place, 100)
+        ),
     };
 
     let mut ctx = tera::Context::new();
