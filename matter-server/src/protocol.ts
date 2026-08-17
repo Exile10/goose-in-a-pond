@@ -12,8 +12,8 @@
 /** Bumped when a change would break a Rust client that has not been updated with it. */
 export const PROTOCOL_VERSION = 1;
 
-/** Identifies this protocol in the greeting, so a URL still pointing at an old
- *  python-matter-server fails with a name rather than a parse error. */
+/** Identifies this protocol in the greeting, so an address pointing at some
+ *  other server fails with a name rather than a parse error. */
 export const PROTOCOL_NAME = "giap-matter";
 
 /** The server speaks first. A client that does not recognise this refuses to proceed. */

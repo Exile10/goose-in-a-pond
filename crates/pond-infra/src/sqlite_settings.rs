@@ -1208,8 +1208,8 @@ mod tests {
         );
     }
 
-    /// An address the user typed is theirs, and may well be a
-    /// python-matter-server they still run. Only the exact old default moves.
+    /// An address the user typed is theirs — another host, another port. Only
+    /// the exact old default moves.
     #[tokio::test]
     async fn a_user_chosen_controller_address_is_left_alone() {
         let repo = fresh_repo().await;

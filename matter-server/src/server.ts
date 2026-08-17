@@ -46,8 +46,8 @@ import {
  */
 const BIND_HOST = "127.0.0.1";
 
-/** The protocol's path. Distinct from python-matter-server's `/ws` so a stale URL
- *  fails loudly rather than half-working. */
+/** The protocol's path. Naming the protocol means an address left over from an
+ *  earlier release fails loudly rather than half-working. */
 const PATH = "/giap";
 
 const DEFAULT_PORT = 5580;

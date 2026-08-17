@@ -612,8 +612,8 @@ async fn the_supervisor_reconnects_after_the_connection_drops() {
 
 #[tokio::test]
 async fn a_controller_that_is_not_ours_is_refused_by_name() {
-    // The failure this exists for: an install whose matter_ws_url still points
-    // at a python-matter-server, whose greeting is a bare server-info frame.
+    // The failure this exists for: an address pointing at some other WebSocket
+    // server, greeting with a frame of its own shape.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/giap", listener.local_addr().unwrap());
     tokio::spawn(async move {

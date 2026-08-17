@@ -7,18 +7,18 @@ use serde::{Deserialize, Serialize};
 
 /// Where GIAP's own Matter controller listens.
 ///
-/// The path is `/giap`, not python-matter-server's `/ws`: the controller speaks
-/// a protocol of GIAP's own now, and a distinct path means a stale address fails
-/// at the handshake with a sentence naming the problem rather than half-working.
+/// The path names the protocol the controller speaks, so an address left over
+/// from an earlier release fails at the handshake with a sentence naming the
+/// problem rather than half-working.
 pub const DEFAULT_MATTER_WS_URL: &str = "ws://127.0.0.1:5580/giap";
 
-/// The default this setting had while the controller was python-matter-server.
+/// The default this setting had before the controller spoke `giap-matter`.
 ///
-/// Every install predating the move holds this string, and it points at a path
-/// the current controller does not serve — so without rewriting it, upgrading
-/// would silently break Matter for everyone who never touched the field.
-/// Only the exact old default is migrated: an address the user typed themselves
-/// is their own, and may well be a python-matter-server they still run.
+/// Every install predating that release holds this string, and it points at a
+/// path the current controller does not serve — so without rewriting it,
+/// upgrading would silently break Matter for everyone who never touched the
+/// field. Only the exact old default is migrated: an address the user typed
+/// themselves is their own and is left alone.
 pub const LEGACY_MATTER_WS_URL: &str = "ws://127.0.0.1:5580/ws";
 
 /// Rewrite the superseded default, leaving anything user-chosen alone.
@@ -409,7 +409,7 @@ pub struct Settings {
     pub vision_classifier_model: String,
 
     // ── Matter (#195) ──────────────────────────────────────────────────────
-    /// Whether to connect to a local Matter controller (python-matter-server)
+    /// Whether to connect to a local Matter controller
     /// and drive commissioned Matter devices. Off by default — requires the
     /// controller running on the LAN.
     #[serde(default = "Settings::default_matter_enabled")]

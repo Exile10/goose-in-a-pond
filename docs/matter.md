@@ -76,23 +76,21 @@ giving the command above. It does not fail silently.
 
 ---
 
-## Upgrading from the python-matter-server controller
+## Upgrading from an earlier release
 
-**Commissioned devices must be paired again.** matter.js cannot read
-python-matter-server's fabric store — different format, different keys — so there
-is no migration to run.
-
-The old store is **left untouched** at `<data_dir>/matter-server/storage/`, and
-the old venv at `<data_dir>/matter-server/venv/`. If you would rather keep your
-existing fabric, run your own python-matter-server against that store and point
-`matter_ws_url` at it; the setting still accepts any address. Nothing here takes
-that away from you, but GIAP will not manage that process for you either.
+**Commissioned devices must be paired again.** The fabric store is matter.js's
+own and cannot be read from the previous controller's, so there is no migration
+to run — pair each device once more from the Devices tab.
 
 The default address moved from `ws://127.0.0.1:5580/ws` to
 `ws://127.0.0.1:5580/giap`, and an install still holding the old default is
-migrated on read. An address you typed yourself is left alone.
+migrated on read, so a Pond whose address was never touched follows it. An
+address you typed yourself is left alone.
 
-Once you are sure you are not going back, the old directories can be deleted.
+An earlier controller left running will hold port 5580 and be refused rather than
+adopted, with a message naming the process. Stop it, and delete any
+`venv/` or `storage/` left beside the controller in the data dir — nothing reads
+them now.
 
 ---
 
@@ -169,9 +167,9 @@ dns-sd -B _matterc._udp local.              # macOS; an "Add" line means yes
 avahi-browse -rt _matterc._udp              # Linux
 ```
 
-No result means nothing is in pairing mode. Reboot the device (for Google's
-Matter Virtual Device, the Reboot button on its Controller tab) and retry
-promptly.
+No result means nothing is in pairing mode. Restart the device and retry
+promptly — for the bundled virtual device, that is Ctrl-C and `npm run
+virtual-device` again.
 
 Setup codes are credentials, and are redacted out of every log line, error
 message and API response on both sides of the socket. If you ever find one in a
@@ -222,7 +220,7 @@ websocat ws://127.0.0.1:5580/giap   # then paste:
 | "Matter is off" on a device command | The toggle is off. Matter devices are refused rather than silently succeeding. |
 | "Cannot reach controller" + Retry | The socket is down. Retry re-sends the current settings, which reconnects. |
 | "No device found in pairing mode" | Nothing is advertising. See the 15-minute window above. |
-| "expected a giap-matter controller but…" | The address points at something else — most likely a python-matter-server, or the old `/ws` path. |
+| "expected a giap-matter controller but…" | The address points at something else, or at the old `/ws` path from an earlier release. |
 | "…speaks giap-matter v1 but this Pond speaks v2" | The controller and pond-server are from different releases. Restart pond-server so it reinstalls the controller. |
 | "no Node 20.19+ found on PATH" | The prerequisite above. |
 | Repeated `matter_reconnect_attempt` | The controller is unreachable. After three in a row GIAP restarts it itself and notifies you. |

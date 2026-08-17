@@ -107,18 +107,8 @@ fn install_marker(data_dir: &Path) -> PathBuf {
     app_dir(data_dir).join(".giap-install")
 }
 /// The fabric store — commissioned nodes live here, so it must be stable.
-///
-/// Deliberately NOT the `storage/` the python-matter-server used: matter.js
-/// cannot read that format, and writing into it would mix two incompatible
-/// stores in one directory. The old one is left untouched so an operator who
-/// wants their previous fabric can still point their own python-matter-server at
-/// it.
 pub fn storage_dir(data_dir: &Path) -> PathBuf {
     controller_dir(data_dir).join("storage-js")
-}
-/// The store the Python controller used, if this install predates the move.
-fn legacy_python_storage(data_dir: &Path) -> PathBuf {
-    controller_dir(data_dir).join("storage")
 }
 
 /// Is something accepting connections on the controller port?
@@ -126,8 +116,8 @@ fn legacy_python_storage(data_dir: &Path) -> PathBuf {
 /// A bare TCP probe, and only used to wait for a controller GIAP has just
 /// spawned — where what is listening is not in question. Deciding whether to
 /// ADOPT a listener is [`probe_controller`]'s job, because "something answers"
-/// and "our controller answers" are different questions and conflating them is
-/// what let a leftover python-matter-server be adopted forever.
+/// and "our controller answers" are different questions, and conflating them let
+/// any process holding the port be adopted forever.
 pub async fn is_running(port: u16) -> bool {
     tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
@@ -153,12 +143,11 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Find out what is on `port` by speaking to it.
 ///
 /// The TCP probe alone is not enough to decide whether to reuse a listener, and
-/// getting that wrong is not a small matter: an install upgrading from the
-/// python-matter-server controller still has one running on 5580. It answers
-/// TCP, so it was adopted; it serves `/ws` and 404s `/giap`, so every connection
-/// then failed; and because it had been "reused", GIAP never started a
-/// controller of its own. Permanently broken, and the log said only that it was
-/// reusing a controller and then could not reach it.
+/// getting that wrong is not a small matter. A different server holding the port
+/// answers TCP, so it was adopted; it does not serve `/giap`, so every connection
+/// then failed; and because it had been "reused", GIAP never started a controller
+/// of its own. Permanently broken, and the log said only that it was reusing a
+/// controller and then could not reach it.
 pub async fn probe_controller(port: u16, url: &str) -> Occupant {
     if !is_running(port).await {
         return Occupant::Free;
@@ -193,9 +182,9 @@ pub async fn probe_controller(port: u16, url: &str) -> Occupant {
 fn port_is_taken(port: u16, why: &str) -> anyhow::Error {
     anyhow!(
         "port {port} is already in use by something that is not a {PROTOCOL_NAME} controller: \
-         {why}. The usual cause is a python-matter-server left running from before this Pond \
-         switched controllers. Stop it (`lsof -nP -iTCP:{port} -sTCP:LISTEN` names the process), \
-         or point the Matter controller address at a different port."
+         {why}. Usually that is another Matter controller, or one left running from an earlier \
+         release. Stop it (`lsof -nP -iTCP:{port} -sTCP:LISTEN` names the process), or point the \
+         Matter controller address at a different port."
     )
 }
 
@@ -392,16 +381,6 @@ type StderrTail = Arc<Mutex<VecDeque<String>>>;
 fn spawn_server(data_dir: &Path, port: u16) -> Result<(Child, StderrTail)> {
     let storage = storage_dir(data_dir);
     std::fs::create_dir_all(&storage).with_context(|| format!("creating {}", storage.display()))?;
-
-    if legacy_python_storage(data_dir).is_dir() {
-        tracing::info!(
-            target: "giap::trace",
-            kind = "matter_legacy_storage_found",
-            path = %legacy_python_storage(data_dir).display(),
-            "matter: a python-matter-server fabric is present but cannot be read by this \
-             controller — devices need pairing again, and the old store is left in place"
-        );
-    }
 
     let mut child = Command::new("node")
         .arg("--import")
@@ -726,9 +705,6 @@ mod tests {
         // Storage must live under the data dir so the commissioned fabric
         // survives restarts.
         assert!(storage_dir(data).starts_with(data));
-        // And must not be the Python store, which matter.js cannot read and
-        // would be corrupting to write into.
-        assert_ne!(storage_dir(data), legacy_python_storage(data));
     }
 
     #[tokio::test]
@@ -763,12 +739,11 @@ mod tests {
         assert_eq!(tail("", 5), "");
     }
 
-    /// The regression this whole probe exists for. An install upgrading from
-    /// the python-matter-server controller still has one listening on 5580: it
-    /// answers TCP, so the old check adopted it; it 404s `/giap`, so every
-    /// connection then failed; and having "reused" it, GIAP never started a
-    /// controller of its own. Permanently broken, with a log that said only that
-    /// it was reusing a controller and then could not reach it.
+    /// The regression this whole probe exists for. Another server holding the
+    /// port answers TCP, so the old check adopted it; it does not serve `/giap`,
+    /// so every connection then failed; and having "reused" it, GIAP never
+    /// started a controller of its own. Permanently broken, with a log that said
+    /// only that it was reusing a controller and then could not reach it.
     #[tokio::test]
     async fn a_listener_that_is_not_ours_is_named_rather_than_adopted() {
         // A plain TCP listener that never speaks: the shape of anything on the
@@ -795,10 +770,10 @@ mod tests {
 
         let message = error.to_string();
         assert!(message.contains("already in use"), "got: {message}");
-        // The fix has to be in the message, because the cause is an upgrade
-        // rather than anything the user did.
-        assert!(message.contains("python-matter-server"), "got: {message}");
+        // The fix has to be in the message: nothing the user did caused this,
+        // so nothing they know tells them how to clear it.
         assert!(message.contains("lsof"), "got: {message}");
+        assert!(message.contains("different port"), "got: {message}");
     }
 
     #[tokio::test]
