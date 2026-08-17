@@ -56,6 +56,10 @@ export interface Reading {
  */
 export interface DeviceStatePatch {
   on?: boolean;
+  /** The setting that changed, and what it became. */
+  mode?: { setting: string; value: string };
+  /** The operation that was run. */
+  operation?: string;
   brightness?: number;
   target_temp?: number;
   locked?: boolean;
@@ -96,11 +100,21 @@ export type Verb =
   | "color"
   | "fan_speed"
   | "fan_mode"
-  | "position";
+  | "position"
+  /** Choose a named setting: `{setting, value}`, both in the device's own words. */
+  | "mode"
+  /** start / stop / pause / resume, for a device that runs cycles. */
+  | "operation";
 
 export interface Capability {
   /** Exactly a `control` verb, so a description and a call cannot drift apart. */
   verb: Verb;
+  /**
+   * Which named setting this addresses, for verbs that have more than one. A
+   * washer has a wash mode, a spin speed and a rinse count — all `mode` — and
+   * without the name they are indistinguishable to anything reading the list.
+   */
+  setting?: string;
   value: ValueSpec;
 }
 

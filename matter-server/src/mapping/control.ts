@@ -17,6 +17,7 @@ import {
   CLUSTER_THERMOSTAT,
   CLUSTER_WINDOW_COVERING,
 } from "./devices.js";
+import { operationsOf, settingNamed, settingsOf } from "./settings.js";
 import { endpointWith, type NodeSnapshot } from "./snapshot.js";
 
 // `Verb` is protocol vocabulary — it names what a `control` op may ask for — so it
@@ -32,6 +33,8 @@ export const VERBS: ReadonlySet<string> = new Set<Verb>([
   "fan_speed",
   "fan_mode",
   "position",
+  "mode",
+  "operation",
 ]);
 
 /** What the server must actually do to the device. */
@@ -317,7 +320,112 @@ export function planControl(
         applied: { position: pct },
       };
     }
+
+    case "mode": {
+      const { setting: wanted, value: choice } = readModeRequest(value);
+      const setting = settingNamed(node, wanted);
+      if (setting === undefined) {
+        const available = settingsOf(node).map(s => s.name);
+        throw new OpError(
+          "capability_unsupported",
+          available.length === 0
+            ? `Matter device '${deviceId}' has no settings that can be chosen`
+            : `'${wanted}' is not a setting on '${deviceId}' — it has: ${available.join(", ")}`,
+        );
+      }
+
+      // The device published these labels; anything else was never on offer, and
+      // guessing at the nearest one is how a wash ends up on the wrong cycle.
+      const encoded = setting.valueFor(choice);
+      if (encoded === undefined) {
+        throw new OpError(
+          "bad_request",
+          `'${choice}' is not a ${setting.name} on '${deviceId}' — it accepts: ${setting.values.join(", ")}`,
+        );
+      }
+
+      const action: Action =
+        setting.write.kind === "command"
+          ? {
+              kind: "command",
+              endpoint: setting.endpoint,
+              cluster: setting.cluster,
+              command: setting.write.command,
+              payload: { [setting.write.field]: encoded },
+            }
+          : {
+              kind: "write",
+              endpoint: setting.endpoint,
+              cluster: setting.cluster,
+              attribute: setting.write.attribute,
+              value: encoded,
+            };
+
+      return {
+        actions: [action],
+        // Reported with the label the device uses, not the one the user typed.
+        applied: {
+          mode: {
+            setting: setting.name,
+            value: setting.values.find(v => v.toLowerCase() === choice.trim().toLowerCase()) ?? choice,
+          },
+        },
+      };
+    }
+
+    case "operation": {
+      const wanted = asString(value, "operation").toLowerCase();
+      const operations = operationsOf(node);
+      if (operations === undefined) {
+        throw new OpError(
+          "capability_unsupported",
+          `Matter device '${deviceId}' does not run cycles, so it cannot be started or stopped`,
+        );
+      }
+      if (!operations.values.includes(wanted)) {
+        throw new OpError(
+          "bad_request",
+          `'${wanted}' is not an operation — use ${operations.values.join(", ")}`,
+        );
+      }
+      return {
+        actions: [
+          {
+            kind: "command",
+            endpoint: operations.endpoint,
+            cluster: operations.cluster,
+            command: wanted,
+            payload: {},
+          },
+        ],
+        applied: { operation: wanted },
+      };
+    }
   }
+}
+
+/** A `mode` request names the setting and the choice, both as the device words them. */
+function readModeRequest(value: unknown): { setting: string; value: string } {
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { setting?: unknown }).setting === "string" &&
+    typeof (value as { value?: unknown }).value === "string"
+  ) {
+    const request = value as { setting: string; value: string };
+    return { setting: request.setting.trim(), value: request.value.trim() };
+  }
+  throw new OpError(
+    "bad_request",
+    "a mode needs both the setting and the value, as {setting, value}",
+  );
+}
+
+function asString(value: unknown, verb: string): string {
+  if (typeof value !== "string") {
+    throw new OpError("bad_request", `${verb} takes a name, not ${typeof value}`);
+  }
+  return value.trim();
 }
 
 function readColor(value: unknown): { hue: number; saturation: number } {

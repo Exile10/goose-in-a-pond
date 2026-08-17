@@ -65,6 +65,17 @@ pub struct SetDeviceStateParams {
     /// fan_speed when the user names a mode — auto and smart have no percentage.
     #[serde(default)]
     pub fan_mode: Option<String>,
+    /// A named setting on an appliance — wash cycle, spin speed, temperature
+    /// level. Both the name and the value come from describe_device; they are
+    /// the device's own words, so do not translate or abbreviate them.
+    #[serde(default)]
+    pub setting: Option<String>,
+    /// The value for `setting`. Ignored unless `setting` is given.
+    #[serde(default)]
+    pub setting_value: Option<String>,
+    /// start, stop, pause or resume, for a device that runs cycles.
+    #[serde(default)]
+    pub operation: Option<String>,
     /// 0-100 percent open (100=fully open).
     #[serde(default)]
     pub position: Option<u8>,
@@ -224,13 +235,17 @@ impl DeviceControlMcpServer {
             && p.saturation.is_none()
             && p.fan_speed.is_none()
             && p.fan_mode.is_none()
+            && p.setting.is_none()
+            && p.operation.is_none()
             && p.position.is_none()
         {
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "No change requested for '{device_id}'. Specify one of: power (on/off), \
                  brightness (0-100), target_temp (°C), locked (true/false), hue (0-360) + \
                  saturation (0-100), fan_speed (0-100), fan_mode (off/low/medium/high/on/auto/\
-                 smart), or position (0-100 percent open)."
+                 smart), setting + setting_value (appliance settings such as a wash \
+                 cycle or spin speed — see describe_device), operation (start/stop/\
+                 pause/resume), or position (0-100 percent open)."
             ))]));
         }
 
@@ -338,6 +353,31 @@ impl DeviceControlMcpServer {
                         "Couldn't set fan mode on '{device_id}': {e}"
                     )))
                 }
+            }
+        }
+        if let Some(setting) = p.setting.as_deref() {
+            // Both halves or neither: a setting with no value is a question, not
+            // an instruction, and guessing which value was meant is how a wash
+            // ends up on the wrong cycle.
+            let Some(value) = p.setting_value.as_deref() else {
+                return Ok(guidance(format!(
+                    "Which value for '{setting}' on '{device_id}'? Pass setting_value. \
+                     describe_device lists what it accepts."
+                )));
+            };
+            match self.control.set_mode(device_id, setting, value).await {
+                Ok(_) => applied.push(format!("{setting}={value}")),
+                Err(e) => {
+                    return Ok(guidance(format!(
+                        "Couldn't set {setting} on '{device_id}': {e}"
+                    )))
+                }
+            }
+        }
+        if let Some(operation) = p.operation.as_deref() {
+            match self.control.set_operation(device_id, operation).await {
+                Ok(_) => applied.push(format!("operation={operation}")),
+                Err(e) => return Ok(guidance(format!("Couldn't {operation} '{device_id}': {e}"))),
             }
         }
         if let Some(open) = p.position {

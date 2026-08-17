@@ -107,6 +107,8 @@ Exactly GIAP's `DeviceControlPort` vocabulary:
 | `fan_speed` | 0–100 | `fan_speed`, `on` |
 | `fan_mode` | `off`/`low`/`medium`/`high`/`on`/`auto`/`smart` | `fan_mode`, `on` |
 | `position` | 0–100 percent **open** | `position` |
+| `mode` | `{setting, value}`, both as the device words them | `mode` |
+| `operation` | `start` / `stop` / `pause` / `resume` | `operation` |
 
 Values are in GIAP's units. The controller converts.
 
@@ -182,6 +184,18 @@ SensorSpec = { sensor_type, unit }
 
 `verb` is exactly a control verb, so a description and a `control` call cannot
 drift apart: anything describable is callable, by construction.
+
+`mode` carries a `setting` name because a device has more than one: a washer has a
+wash cycle, a spin speed, a rinse count and a temperature level, and without the
+name they are indistinguishable in the list.
+
+**Settings are found by shape, not by a list of cluster names.** Matter's appliance
+controls are nearly all ModeBase derivatives, publishing `supportedModes` as
+`{label, mode}` pairs the device chose. So a cluster nobody has written code for
+works the day a device ships it, and the values offered are the labels that device
+published — "Whites" appears because the washer said "Whites". The two that are
+not ModeBase, Temperature Control and Laundry Washer Controls, are read explicitly
+because their shape differs, not because they are special.
 
 It is answered live rather than cached. A description is derived from what the
 device currently reports, and a stored copy goes stale exactly when a device is

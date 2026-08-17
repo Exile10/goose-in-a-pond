@@ -27,6 +27,7 @@ import {
   nodeToDevice,
 } from "./devices.js";
 import { SENSORS } from "./sensors.js";
+import { operationsOf, settingsOf } from "./settings.js";
 import { endpointWith, type NodeSnapshot } from "./snapshot.js";
 
 /**
@@ -144,6 +145,22 @@ function capabilitiesOf(node: NodeSnapshot): Capability[] {
   if (has(CLUSTER_DOOR_LOCK)) add("locked", { kind: "boolean" });
   if (has(CLUSTER_COLOR_CONTROL)) add("color", { kind: "color" });
   if (has(CLUSTER_WINDOW_COVERING)) add("position", { kind: "percent" });
+
+  // Everything the device says can be chosen, named as it names it. This is what
+  // makes an appliance drivable without a verb per appliance: a washer's cycle,
+  // its spin speed and its rinse count are three settings, not three new verbs.
+  for (const setting of settingsOf(node)) {
+    capabilities.push({
+      verb: "mode",
+      setting: setting.name,
+      value: { kind: "enum", values: setting.values },
+    });
+  }
+
+  const operations = operationsOf(node);
+  if (operations !== undefined) {
+    capabilities.push({ verb: "operation", value: { kind: "enum", values: operations.values } });
+  }
 
   return capabilities;
 }

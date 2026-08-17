@@ -59,3 +59,42 @@ export function describedNode(
     endpoint(1, clusters, [deviceType]),
   ]);
 }
+
+/**
+ * The Matter Virtual Device's Laundry Washer: On/Off, a wash mode, a temperature
+ * level, spin speed and rinse count, and an operational state. Four of its five
+ * clusters had no verb, so `describe` could only offer power — which is what sent
+ * "set the spin speed to high" back as "this device only turns on and off".
+ */
+export function laundryWasherNode(): NodeSnapshot {
+  return node(50, [
+    named("Virtual Laundry Washer"),
+    endpoint(
+      1,
+      {
+        onOff: { onOff: false },
+        laundryWasherMode: {
+          currentMode: 0,
+          supportedModes: [
+            { label: "Normal", mode: 0 },
+            { label: "Heavy", mode: 1 },
+            { label: "Delicate", mode: 2 },
+            { label: "Whites", mode: 3 },
+          ],
+        },
+        temperatureControl: {
+          selectedTemperatureLevel: 0,
+          supportedTemperatureLevels: ["Cold", "Warm", "Hot"],
+        },
+        laundryWasherControls: {
+          spinSpeeds: ["Low", "Medium", "High"],
+          spinSpeedCurrent: 0,
+          numberOfRinses: 1,
+          supportedRinses: ["None", "Normal", "Extra", "Max"],
+        },
+        operationalState: { operationalState: 0 },
+      },
+      [0x0073],
+    ),
+  ]);
+}
