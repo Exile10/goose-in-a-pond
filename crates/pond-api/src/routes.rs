@@ -15009,6 +15009,12 @@ async fn list_context_sources(
                 "provider": s.provider(),
                 "profile_id": s.profile_id(),
                 "status": s.status().as_str(),
+                // When the pond last reached this account. `null` means it has
+                // not run yet, which a household reads very differently from
+                // "checked, found nothing" -- the surface needs to tell them
+                // apart or a source that has never synced looks healthy.
+                "last_sync": s.last_sync().map(|t| t.to_rfc3339()),
+                "needs_credentials": s.kind().needs_credentials(),
             }))
             .collect::<Vec<_>>()
     })))

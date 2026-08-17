@@ -13,6 +13,7 @@ import { Mesh } from "../sections/Mesh";
 import { Pairing } from "../sections/Pairing";
 import { Schedules } from "../sections/Schedules";
 import { Memory } from "../sections/Memory";
+import { Connections } from "../sections/Connections";
 import { Skills } from "../sections/Skills";
 import { Models } from "../sections/Models";
 import { Prompts } from "../sections/Prompts";
@@ -37,6 +38,7 @@ function SectionContent({ section }: { section: GuiSection }) {
     case "extensions": return <Extensions />;
     case "models":    return <Models />;
     case "prompts":   return <Prompts />;
+    case "connections": return <Connections />;
     case "settings":  return <SettingsCatalogueView />;
     case "faces":     return <Faces />;
     case "canvas":    return <Canvas />;
