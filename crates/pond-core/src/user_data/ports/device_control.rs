@@ -96,6 +96,14 @@ pub struct DeviceDescription {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Capability {
     pub verb: String,
+    /// Which named setting this is, for a verb a device offers more than once.
+    ///
+    /// A washer has four `mode` capabilities — wash cycle, temperature level, spin
+    /// speed, rinses — and this is the name that tells them apart, and the same name
+    /// [`DeviceControlPort::set_mode`] is called with. Absent for a verb a device can
+    /// only have one of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setting: Option<String>,
     pub value: ValueSpec,
 }
 
