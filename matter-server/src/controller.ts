@@ -86,11 +86,35 @@ export class Controller {
    * the wrong place is not a cosmetic fault — it is every commissioned device lost on
    * the next start, from a working-directory change nobody would connect to it.
    */
-  static async start(storagePath: string, events: ControllerEvents): Promise<Controller> {
+  static async start(
+    storagePath: string,
+    matterPort: number,
+    events: ControllerEvents,
+  ): Promise<Controller> {
     Environment.default.vars.set("storage.path", storagePath);
 
-    const node = await ServerNode.create({ id: "giap-controller" });
+    // NOT the default 5540.
+    //
+    // matter.js models a controller as a `ServerNode`, which binds the Matter
+    // operational port — and 5540 is well-known precisely so that COMMISSIONABLE
+    // DEVICES can be found on it. A controller squatting it means no Matter
+    // device can start on the same machine: Google's Matter Virtual Device dies
+    // with "OS Error 0x02000030: Address already in use ... UDP::Init
+    // bind&listen port=5540" and shows an empty Controller tab, and this repo's
+    // own virtual-device tool had to be moved off 5540 for the same reason.
+    //
+    // A controller has no need of a well-known port. It initiates the
+    // connections; devices answer whatever source port it used. Verified by
+    // commissioning successfully from controllers on several non-standard ports.
+    const node = await ServerNode.create({
+      id: "giap-controller",
+      network: { port: matterPort },
+    });
     await node.start();
+
+    log.info("controller_online", "the Matter controller is online", {
+      matter_port: matterPort,
+    });
 
     const controller = new Controller(node, events);
     controller.#watchPeers();

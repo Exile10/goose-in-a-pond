@@ -150,12 +150,34 @@ and the device reporting the same change are different claims, and only the
 second one means the command arrived.
 
 Its fabric is temporary, so stopping and restarting gives you a fresh, unpaired
-device. It binds Matter port 5541 to stay out of the controller's way. Remove it
-from the Devices tab when finished, or it will show as offline once stopped.
+device. It binds Matter port 5541, leaving the standard 5540 for a real device
+app. Remove it from the Devices tab when finished, or it will show as offline
+once stopped.
 
-If you would rather use Google's Matter Virtual Device app, it works the same
-way — but it is a separate download, cannot be scripted, and an empty Controller
-tab in it is not something GIAP can diagnose.
+Google's Matter Virtual Device works too, and wants UDP 5540.
+
+### Ports, and why a device app may refuse to start
+
+Matter devices are found on **UDP 5540**, so every device app wants it. The
+controller does not use it: matter.js models a controller as a `ServerNode`,
+which would bind 5540 by default, so GIAP gives it the same NUMBER as its
+WebSocket port instead (UDP 5580 by default — a different protocol from the
+TCP the WebSocket uses, so they cannot collide).
+
+That matters because a controller holding 5540 stops every Matter device on the
+machine from starting, with no clue pointing back at the controller:
+
+```
+[SVR] ERROR setting up transport: OS Error 0x02000030: Address already in use
+[IN]  UDP::Init bind&listen port=5540
+```
+
+An app failing this way usually shows an empty device list rather than an error.
+If you see it, find what has the port:
+
+```bash
+lsof -nP -iUDP:5540
+```
 
 ---
 

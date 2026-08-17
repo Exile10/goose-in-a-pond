@@ -109,7 +109,11 @@ async function main(): Promise<void> {
     }
   };
 
-  const controller = await Controller.start(storagePath, {
+  // The Matter operational port takes the same NUMBER as the WebSocket port.
+  // They are different protocols (UDP and TCP) so they cannot collide, it needs
+  // no extra configuration, and it moves with `--port` — so two Ponds on one
+  // host stay out of each other's way as well as out of 5540's.
+  const controller = await Controller.start(storagePath, port, {
     deviceAdded: (device: Device) => broadcast("device_added", { device }),
     deviceUpdated: (device: Device) => broadcast("device_updated", { device }),
     deviceRemoved: (deviceId: string) => broadcast("device_removed", { device_id: deviceId }),
