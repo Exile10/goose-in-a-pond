@@ -965,8 +965,13 @@ mod tests {
                 !availability.refusal().is_empty() && rendered.contains(availability.refusal()),
                 "the refusal does not carry the availability table's own sentence: {rendered}"
             );
+            // Names the MISSING THING, not a phase number. The reason for the
+            // connector kinds used to cite PAI-2 P6b and that citation expired:
+            // chokepoint 3 is discharged and the draft gate only ever applied to
+            // write-back, which v1 does not do. A guard that pins a phase id
+            // outlives the phase; one that pins the mechanism does not.
             assert!(
-                rendered.contains("PAI-8 P3") || rendered.contains("PAI-2 P6b"),
+                rendered.contains("ingest route") || rendered.contains("connector"),
                 "the refusal does not name what has to land first: {rendered}"
             );
         }

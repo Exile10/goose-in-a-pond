@@ -102,11 +102,33 @@ pub enum SourceAvailability {
     /// reaches out for these — a paired client pushes them — so no egress gate
     /// is involved, only an authenticated route that does not exist yet.
     AwaitingIngestRoute,
-    /// Waiting on PAI-2 P6b: the draft gate for outbound connector actions, and
-    /// redaction chokepoint 3 (before a body leaves the pond). Both are
-    /// unfinished, and chokepoint 3 has no call site until the first connector
-    /// exists — which is why neither side may be built assuming the other.
-    AwaitingEgressGate,
+    /// Waiting on a connector that reaches out to the account and only READS.
+    ///
+    /// **This arm used to name PAI-2 P6b — the draft gate and redaction
+    /// chokepoint 3 — and both halves of that reason have since expired.**
+    /// Chokepoint 3 is discharged: `IngestPipeline::new` takes a `Redactor`
+    /// that is deliberately not an `Option`, and P1 wired a pipeline, so it is
+    /// present AND reached. The draft gate is not a prerequisite at all: it
+    /// exists to approve outbound *actions on an account* — sending mail,
+    /// posting to a channel — and PAI-8 §0 puts write-back out of scope for v1.
+    /// An ingest-only connector takes no such action, so there is nothing for
+    /// that gate to approve.
+    ///
+    /// What a read-only connector actually needs is already in the tree:
+    /// egress tracking (`UNGATED_SENDERS` is empty, `MAX_UNGATED` is 0),
+    /// `network_mode` governance, encrypted credentials in
+    /// `SecretRepository`, and redaction before persistence.
+    ///
+    /// So this is no longer a security gate. It is the plain statement that
+    /// nothing fetches this kind yet, and it lifts per kind as each connector
+    /// lands — not all at once, because a connector is per protocol.
+    ///
+    /// The refusal is KEPT rather than removed. Accepting a kind nothing can
+    /// produce would let `upsert_source` mint a source that stays empty
+    /// forever, which is the reader-with-no-writer shape this programme keeps
+    /// recording. When the CalDAV adapter lands, `Calendar` moves to
+    /// [`Landed`](Self::Landed) and this doc loses a sentence.
+    AwaitingReadConnector,
 }
 
 impl SourceAvailability {
@@ -118,10 +140,9 @@ impl SourceAvailability {
                 "this source kind is pushed to the pond by a paired client, and the ingest \
                  route it would arrive on (PAI-8 P3) does not exist yet"
             }
-            Self::AwaitingEgressGate => {
-                "this source kind needs a connector that reaches out to an account, and the \
-                 gate every outbound body must pass (PAI-2 P6b: the draft gate for connector \
-                 actions, and redaction chokepoint 3) is unfinished"
+            Self::AwaitingReadConnector => {
+                "this source kind needs a connector that signs in to the account and reads \
+                 it, and no connector for this protocol exists yet"
             }
         }
     }
@@ -169,7 +190,7 @@ impl SourceKind {
             Self::Sensor | Self::Camera | Self::Voice => SourceAvailability::Landed,
             Self::Mobile => SourceAvailability::AwaitingIngestRoute,
             Self::Mail | Self::Calendar | Self::Files | Self::Chat => {
-                SourceAvailability::AwaitingEgressGate
+                SourceAvailability::AwaitingReadConnector
             }
         }
     }
