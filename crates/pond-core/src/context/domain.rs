@@ -193,8 +193,8 @@ impl SourceKind {
             // credentials and `calendar_sync` pulls it on a schedule. All three
             // had to exist before this line could move: a `Landed` kind with no
             // sync is a source that looks connected and stays empty.
-            Self::Calendar => SourceAvailability::Landed,
-            Self::Mail | Self::Files | Self::Chat => SourceAvailability::AwaitingReadConnector,
+            Self::Calendar | Self::Mail => SourceAvailability::Landed,
+            Self::Files | Self::Chat => SourceAvailability::AwaitingReadConnector,
         }
     }
 
@@ -881,7 +881,7 @@ mod tests {
         // connected and stay empty.
         assert_eq!(
             landed,
-            vec!["sensor", "camera", "voice", "calendar"],
+            vec!["sensor", "camera", "voice", "mail", "calendar"],
             "a kind is Landed only once an adapter, a credential path and a sync exist for it"
         );
         for kind in SourceKind::ALL {

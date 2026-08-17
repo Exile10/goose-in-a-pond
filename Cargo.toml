@@ -15,6 +15,7 @@ members = [
     "crates/pond-infra-scheduler",
     "crates/pond-server",
     "crates/pond-adapters-caldav",
+    "crates/pond-adapters-imap",
     "crates/pond-adapters-llamafile",
     "crates/pond-adapters-ollama",
     "crates/pond-adapters-whisper",
@@ -240,6 +241,7 @@ pond-adapters-matter           = { path = "crates/pond-adapters-matter" }
 pond-adapters-vision           = { path = "crates/pond-adapters-vision" }
 pond-adapters-vision-onnx      = { path = "crates/pond-adapters-vision-onnx" }
 pond-adapters-caldav           = { path = "crates/pond-adapters-caldav" }
+pond-adapters-imap             = { path = "crates/pond-adapters-imap" }
 pond-adapters-weather          = { path = "crates/pond-adapters-weather" }
 pond-adapters-mcp-memory       = { path = "crates/pond-adapters-mcp-memory" }
 pond-adapters-local-inference  = { path = "crates/pond-adapters-local-inference" }

@@ -1,10 +1,10 @@
-//! Pulling a connected calendar into the personal-context corpus.
+//! Pulling a connected account into the personal-context corpus.
 //!
-//! The composition step for PAI-8's first connector: it holds the
+//! The composition step for PAI-8's account connectors: it holds the
 //! [`ContextRepository`], the [`IngestPipeline`], the secret store and the
-//! CalDAV adapter together, which is why it lives in the binary rather than in
-//! `pond-core` — the domain does not know that CalDAV exists and should not
-//! learn.
+//! protocol adapters together, which is why it lives in the binary rather than
+//! in `pond-core` — the domain does not know that CalDAV or IMAP exist and
+//! should not learn.
 //!
 //! # What it refuses to do
 //!
@@ -25,6 +25,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use pond_adapters_caldav::{CalDavAdapter, CalDavConfig, CalDavProvider};
+use pond_adapters_imap::{ImapAdapter, ImapConfig, ImapProvider};
 use pond_core::context::domain::{secret_key_for, ContextSource, SourceKind, SourceStatus};
 use pond_core::context::ingest::IngestPipeline;
 use pond_core::context::ports::ContextRepository;
@@ -34,7 +35,7 @@ use pond_core::user_data::domain::profile::ProfileScope;
 
 /// What one sweep did, for the log line and for tests.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct CalendarSyncReport {
+pub struct AccountSyncReport {
     /// Calendar sources considered.
     pub sources: usize,
     /// Sources whose ctag matched, so nothing was fetched.
@@ -56,16 +57,17 @@ pub struct CalendarSyncReport {
 /// server names the household. It is account configuration, and account
 /// configuration belongs in the encrypted store.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CalendarCredentials {
+pub struct AccountCredentials {
     pub username: String,
     pub password: String,
-    /// Only for the self-hosted presets; `None` for Google, iCloud, Fastmail.
+    /// The self-hosted server, when there is one: a CalDAV base URL, or
+    /// `host:port` for IMAP. `None` for every named preset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
 }
 
 /// Rebuild the adapter a stored source needs.
-fn adapter_for(source: &ContextSource, creds: &CalendarCredentials) -> Result<CalDavAdapter> {
+fn adapter_for(source: &ContextSource, creds: &AccountCredentials) -> Result<CalDavAdapter> {
     let provider = CalDavProvider::from_stored(source.provider(), creds.base_url.as_deref())
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -101,8 +103,8 @@ pub async fn sync_calendars(
     pipeline: Arc<IngestPipeline>,
     secrets: Arc<dyn SecretRepository>,
     now: DateTime<Utc>,
-) -> Result<CalendarSyncReport> {
-    let mut report = CalendarSyncReport::default();
+) -> Result<AccountSyncReport> {
+    let mut report = AccountSyncReport::default();
     let offline = network_mode() == NetworkMode::Offline;
 
     let sources = repo.list_sources(&ProfileScope::Household).await?;
@@ -178,7 +180,7 @@ async fn sync_one(
         .get(&key)
         .await?
         .ok_or_else(|| anyhow::anyhow!("this calendar's credentials are missing from the store"))?;
-    let creds: CalendarCredentials = serde_json::from_str(&blob)
+    let creds: AccountCredentials = serde_json::from_str(&blob)
         .map_err(|e| anyhow::anyhow!("this calendar's stored credentials are unreadable: {e}"))?;
 
     let adapter = adapter_for(source, &creds)?;
@@ -218,4 +220,115 @@ async fn sync_one(
     let _ = repo;
     source.advance(Some(ctag), now, SourceStatus::Connected);
     Ok(SyncOne::Ingested(ingested))
+}
+
+// ── Mail ─────────────────────────────────────────────────────────────────────
+
+/// Sync every mail source this pond holds.
+///
+/// Deliberately a sibling of [`sync_calendars`] rather than a generic over both.
+/// The two protocols share their SHAPE — credentials, a window, a status — and
+/// nothing else: CalDAV discovers collections and has a ctag to skip work with,
+/// IMAP opens one mailbox and has neither. A generic over that difference would
+/// be a trait with one useful method and two awkward ones.
+pub async fn sync_mail(
+    repo: Arc<dyn ContextRepository>,
+    pipeline: Arc<IngestPipeline>,
+    secrets: Arc<dyn SecretRepository>,
+    now: DateTime<Utc>,
+) -> Result<AccountSyncReport> {
+    let mut report = AccountSyncReport::default();
+    let offline = network_mode() == NetworkMode::Offline;
+
+    let sources = repo.list_sources(&ProfileScope::Household).await?;
+    for mut source in sources.into_iter().filter(|s| s.kind() == SourceKind::Mail) {
+        report.sources += 1;
+
+        if offline {
+            report.paused += 1;
+            source.advance(
+                source.cursor().map(str::to_string),
+                now,
+                SourceStatus::Paused,
+            );
+            let _ = repo.upsert_source(&source).await;
+            continue;
+        }
+
+        match sync_one_mailbox(&pipeline, &secrets, &source, now).await {
+            Ok(n) => {
+                report.ingested += n;
+                source.advance(None, now, SourceStatus::Connected);
+            }
+            Err(e) => {
+                if is_auth_failure(&e) {
+                    report.needs_reauth += 1;
+                    tracing::warn!(
+                        source = source.id(),
+                        "this mailbox refused its credentials; it will not be retried until \
+                         somebody reconnects it"
+                    );
+                    source.advance(None, now, SourceStatus::NeedsReauth);
+                } else {
+                    report.failed += 1;
+                    tracing::warn!(source = source.id(), error = %e, "mail sync failed");
+                    source.advance(None, now, SourceStatus::Error);
+                }
+            }
+        }
+        if let Err(e) = repo.upsert_source(&source).await {
+            tracing::warn!(source = source.id(), error = %e, "could not record the sync result");
+        }
+    }
+    Ok(report)
+}
+
+async fn sync_one_mailbox(
+    pipeline: &Arc<IngestPipeline>,
+    secrets: &Arc<dyn SecretRepository>,
+    source: &ContextSource,
+    now: DateTime<Utc>,
+) -> Result<usize> {
+    let key = source
+        .secret_ref()
+        .map(str::to_string)
+        .unwrap_or_else(|| secret_key_for(source.id()));
+    let blob = secrets
+        .get(&key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("this mailbox's credentials are missing from the store"))?;
+    let creds: AccountCredentials = serde_json::from_str(&blob)
+        .map_err(|e| anyhow::anyhow!("this mailbox's stored credentials are unreadable: {e}"))?;
+
+    let provider = ImapProvider::from_stored(source.provider(), creds.base_url.as_deref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "this source names a mail provider this pond does not know: {}",
+                source.provider()
+            )
+        })?;
+    let adapter = ImapAdapter::new(ImapConfig {
+        provider,
+        username: creds.username.clone(),
+        password: creds.password.clone(),
+    });
+
+    // No cursor. IMAP offers no cheap "has anything changed" answer the way a
+    // CalDAV ctag does, and re-reading a 30-day window is idempotent: the
+    // Message-ID is the external_id, so a message already stored is an update
+    // to the same row rather than a duplicate.
+    let items = adapter
+        .recent_messages(ImapAdapter::default_window(now))
+        .await?;
+
+    let mut ingested = 0usize;
+    for item in items {
+        match pipeline.ingest(source, item, now).await {
+            Ok(_) => ingested += 1,
+            Err(e) => {
+                tracing::debug!(source = source.id(), error = %e, "one message was not ingested")
+            }
+        }
+    }
+    Ok(ingested)
 }
