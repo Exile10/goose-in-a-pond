@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { assertAccepted, isSnapshotCluster, settleTo } from "../src/controller.js";
+import {
+  assertAccepted,
+  isSnapshotCluster,
+  refusalOrFault,
+  settleTo,
+} from "../src/controller.js";
 import { planControl } from "../src/mapping/control.js";
 import { describeNode } from "../src/mapping/describe.js";
 import { observedOperation, operationsOf, settingsOf } from "../src/mapping/settings.js";
@@ -303,5 +308,21 @@ describe("appliance settings", () => {
       ),
     ).toBe("idle");
     expect(reads).toBe(1);
+  });
+  it("calls a refusal a refusal, not an unreachable device", () => {
+    // The thermostat answered "Constraint error" in milliseconds, from the same
+    // machine, and was reported as unreachable -- which sends the reader looking at
+    // the network for a fault that is not there.
+    const refused = refusalOrFault("matter-1", new Error("Constraint error"));
+    expect(refused.code).toBe("device_refused");
+    expect(refused.message).toMatch(/outside what it will accept/);
+    // The device's own words are kept alongside the explanation.
+    expect(refused.message).toMatch(/Constraint error/);
+
+    // A real fault stays one: guessing that an unfamiliar error was a refusal
+    // would hide an outage.
+    const fault = refusalOrFault("matter-1", new Error("socket hang up"));
+    expect(fault.code).toBe("device_unreachable");
+    expect(fault.message).toBe("socket hang up");
   });
 });

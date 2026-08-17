@@ -93,12 +93,36 @@ function fanModes(node: NodeSnapshot): string[] {
 }
 
 /**
- * A thermostat's own setpoint limits, in degrees Celsius. Matter reports these in
- * hundredths; a range invented by GIAP would be a promise the device never made.
+ * A thermostat's own setpoint limits, in degrees Celsius.
+ *
+ * Three things narrow this, and reporting only the first advertises a range the
+ * device will refuse. Matter reports all of them in hundredths.
+ *
+ * `absMin/MaxHeatSetpointLimit` is what the hardware could ever do.
+ * `min/MaxHeatSetpointLimit` is what it is configured to allow, and is the tighter
+ * pair when present.
+ *
+ * Then the deadband. In Auto the thermostat runs both setpoints and keeps them
+ * `minSetpointDeadBand` apart, so the heating setpoint cannot come within that of
+ * the cooling one -- a ceiling that appears in no limit attribute at all. Measured
+ * on Google's Matter Virtual Device: it advertised 7 to 30, accepted 23, and
+ * answered "Constraint error" from 24 up, because its cooling setpoint sat at 26.
+ * The description said 30 was allowed, so the model tried 30, and the failure it
+ * got back explained nothing.
  */
 function temperatureSpec(node: NodeSnapshot): ValueSpec {
-  const min = asNumber(attribute(node, CLUSTER_THERMOSTAT, "absMinHeatSetpointLimit"));
-  const max = asNumber(attribute(node, CLUSTER_THERMOSTAT, "absMaxHeatSetpointLimit"));
+  const limit = (name: string) => asNumber(attribute(node, CLUSTER_THERMOSTAT, name));
+
+  // The configured limits where the device states them, the absolute ones otherwise.
+  const min = limit("minHeatSetpointLimit") ?? limit("absMinHeatSetpointLimit");
+  let max = limit("maxHeatSetpointLimit") ?? limit("absMaxHeatSetpointLimit");
+
+  const cooling = limit("occupiedCoolingSetpoint");
+  if (cooling !== undefined) {
+    // Absent means zero deadband, not "no rule": the setpoints still may not cross.
+    const deadband = heatingCeilingUnder(cooling, limit("minSetpointDeadBand"));
+    max = max === undefined ? deadband : Math.min(max, deadband);
+  }
 
   // Keys are omitted rather than set undefined: a limit the device did not state
   // must be absent from the description, not present and empty.
@@ -108,6 +132,20 @@ function temperatureSpec(node: NodeSnapshot): ValueSpec {
     ...(min === undefined ? {} : { min: min / 100 }),
     ...(max === undefined ? {} : { max: max / 100 }),
   };
+}
+
+/**
+ * The highest heating setpoint that still clears the cooling one.
+ *
+ * `minSetpointDeadBand` is in whole degrees where the setpoints are in hundredths,
+ * which is the kind of mismatch that silently produces a limit a hundred times too
+ * generous.
+ */
+export function heatingCeilingUnder(
+  coolingHundredths: number,
+  deadbandDegrees: number | undefined,
+): number {
+  return coolingHundredths - (deadbandDegrees ?? 0) * 100;
 }
 
 /** The unit a concentration cluster declares, if it declares one. */
