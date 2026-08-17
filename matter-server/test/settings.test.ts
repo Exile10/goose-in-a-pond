@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { isSnapshotCluster } from "../src/controller.js";
+import { assertAccepted, isSnapshotCluster } from "../src/controller.js";
 import { planControl } from "../src/mapping/control.js";
 import { describeNode } from "../src/mapping/describe.js";
-import { operationsOf, settingsOf } from "../src/mapping/settings.js";
+import { observedOperation, operationsOf, settingsOf } from "../src/mapping/settings.js";
 import { endpoint, laundryWasherNode, named, node } from "./fixtures.js";
 
 /** The capabilities of one verb, in the order the device offered them. */
@@ -174,5 +174,69 @@ describe("appliance settings", () => {
     expect(setting?.values).toEqual(["Gentle", "Vigorous"]);
     // And the device's own code is sent, not the position in the list.
     expect(setting?.valueFor("Vigorous")).toBe(7);
+  });
+
+  it("offers only the operations the device says it has", () => {
+    // Start, Stop, Pause and Resume are each optional. The spec ties them to the
+    // state list: a device "shall expose the set of states matching the commands
+    // that are also supported", so a washer with no Paused state cannot be paused.
+    const noPause = node(70, [
+      named("Basic Washer"),
+      endpoint(1, {
+        operationalState: {
+          operationalState: 0,
+          operationalStateList: [
+            { operationalStateId: 0, operationalStateLabel: "Stopped" },
+            { operationalStateId: 3, operationalStateLabel: "Error" },
+          ],
+        },
+      }),
+    ]);
+
+    expect(operationsOf(noPause)?.values).toEqual(["stop"]);
+    expect(() => planControl(noPause, "matter-70", "operation", "start")).toThrowError(
+      /is not an operation/,
+    );
+  });
+
+  it("reports the state the device is in, not the verb it was sent", () => {
+    // The whole complaint: GIAP said a washer was running while the washer said
+    // Stopped, because it echoed the request back instead of looking.
+    expect(observedOperation(laundryWasherNode())).toBe("stopped");
+
+    const running = node(71, [
+      named("Washer"),
+      endpoint(1, {
+        operationalState: {
+          operationalState: 1,
+          // Its own word for the state, which need not be the standard one.
+          operationalStateList: [{ operationalStateId: 1, operationalStateLabel: "Washing" }],
+        },
+      }),
+    ]);
+    expect(observedOperation(running)).toBe("washing");
+  });
+
+  it("treats a refusal as a failure, in the device's own words", () => {
+    // A refused command is a perfectly successful invocation carrying a non-zero
+    // code. Nothing throws, so nothing looked -- and a washer that never started
+    // was reported as running.
+    expect(() =>
+      assertAccepted("matter-50", "start", {
+        commandResponseState: { errorStateId: 3, errorStateLabel: "CommandInvalidInState" },
+      }),
+    ).toThrowError(/refused start: CommandInvalidInState/);
+
+    // ModeBase says no differently, with a status and a statusText.
+    expect(() =>
+      assertAccepted("matter-50", "changeToMode", { status: 2, statusText: "Door is open" }),
+    ).toThrowError(/refused changeToMode: Door is open/);
+
+    // And an acceptance is left alone, in both shapes.
+    expect(() =>
+      assertAccepted("matter-50", "start", { commandResponseState: { errorStateId: 0 } }),
+    ).not.toThrow();
+    expect(() => assertAccepted("matter-50", "changeToMode", { status: 0 })).not.toThrow();
+    expect(() => assertAccepted("matter-50", "off", undefined)).not.toThrow();
   });
 });

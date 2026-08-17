@@ -178,6 +178,7 @@ export type ErrorCode =
   | "commission_failed"
   | "device_unknown"
   | "capability_unsupported"
+  | "device_refused"
   | "device_unreachable"
   | "bad_request"
   | "internal";

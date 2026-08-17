@@ -108,7 +108,7 @@ Exactly GIAP's `DeviceControlPort` vocabulary:
 | `fan_mode` | `off`/`low`/`medium`/`high`/`on`/`auto`/`smart` | `fan_mode`, `on` |
 | `position` | 0–100 percent **open** | `position` |
 | `mode` | `{setting, value}`, both as the device words them | `mode` |
-| `operation` | `start` / `stop` / `pause` / `resume` | `operation` |
+| `operation` | one of the operations the device offers | `operation` |
 
 Values are in GIAP's units. The controller converts.
 
@@ -116,6 +116,19 @@ Values are in GIAP's units. The controller converts.
 clamps to its own minimum reports that minimum. This is why the field exists: the
 old adapter built its outcome from the caller's request, so a device that did
 something else was still described to the user as having obeyed.
+
+That holds only if the command's *response* is read. Matter commands do not merely
+succeed or throw: Operational State answers every Start/Stop/Pause/Resume with an
+`ErrorStateID`, and ModeBase answers `changeToMode` with a `status`, so a refusal
+arrives as a perfectly successful invocation carrying a non-zero code. A controller
+that discards the response reports a refusal as a success — which is how GIAP told
+a user a washer was running while the washer sat there saying Stopped. Refusals
+become `device_refused`, worded by the device where it says why.
+
+`operation` accordingly applies the state the device reports being in, not the verb
+that was sent, and the operations offered are derived from `operationalStateList`
+rather than assumed: each of the four commands is optional, and the spec requires a
+device to expose the states matching the commands it supports.
 
 ---
 
@@ -226,6 +239,7 @@ failed" the only diagnosis GIAP could offer.
 | `commission_failed` | pairing was attempted and did not complete |
 | `device_unknown` | no such device on this fabric |
 | `capability_unsupported` | the device has no cluster for that verb |
+| `device_refused` | the device answered, and said no |
 | `device_unreachable` | the device is commissioned but did not answer |
 | `bad_request` | the op or its params are malformed |
 | `internal` | anything else |

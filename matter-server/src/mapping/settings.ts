@@ -51,6 +51,14 @@ export interface Operations {
 }
 
 const OPERATIONAL_STATE = "operationalState";
+
+/** OperationalStateEnum's own values, for a device that labels a state with nothing. */
+const STANDARD_STATES: Record<number, string> = {
+  0: "stopped",
+  1: "running",
+  2: "paused",
+  3: "error",
+};
 const TEMPERATURE_CONTROL = "temperatureControl";
 const LAUNDRY_WASHER_CONTROLS = "laundryWasherControls";
 
@@ -206,13 +214,71 @@ export function settingNamed(node: NodeSnapshot, name: string): Setting | undefi
   return partial.length === 1 ? partial[0] : undefined;
 }
 
-/** Start / stop / pause / resume, if the device runs cycles. */
+/**
+ * Which operational states this device says it has, lowercased.
+ *
+ * `operationalStateList` entries are `{operationalStateId, operationalStateLabel}`;
+ * a device may add its own beyond Stopped / Running / Paused / Error.
+ */
+function operationalStates(endpoint: EndpointSnapshot): Map<number, string> {
+  const list = endpoint.clusters[OPERATIONAL_STATE]?.["operationalStateList"];
+  const states = new Map<number, string>();
+  if (!Array.isArray(list)) return states;
+
+  for (const entry of list) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const id = (entry as { operationalStateId?: unknown }).operationalStateId;
+    const label = (entry as { operationalStateLabel?: unknown }).operationalStateLabel;
+    if (typeof id !== "number") continue;
+    states.set(id, typeof label === "string" && label !== "" ? label.toLowerCase() : STANDARD_STATES[id] ?? `state ${id}`);
+  }
+  return states;
+}
+
+/**
+ * The operations this device actually accepts.
+ *
+ * Every one of these commands is optional — the spec says Start "shall be supported
+ * if the device supports remotely starting the operation" — so offering all four to
+ * every appliance advertises things a device will refuse.
+ *
+ * They are derived from `operationalStateList` because the spec ties the two
+ * together: a device "shall, at a minimum, expose the set of states matching the
+ * commands that are also supported". So a washer that lists Running accepts Start,
+ * one that lists Paused accepts Pause and Resume, and one that lists neither is not
+ * remotely startable however much we would like it to be.
+ */
 export function operationsOf(node: NodeSnapshot): Operations | undefined {
   const endpoint = applicationEndpoints(node).find(e => OPERATIONAL_STATE in e.clusters);
   if (endpoint === undefined) return undefined;
+
+  const states = new Set(operationalStates(endpoint).values());
+  const values: string[] = [];
+  if (states.has("running")) values.push("start");
+  if (states.has("stopped")) values.push("stop");
+  if (states.has("paused")) values.push("pause", "resume");
+
+  // A device that publishes no state list at all has told us nothing, which is not
+  // the same as telling us "no". Offer the standard four and let it refuse.
   return {
     endpoint: endpoint.number,
     cluster: OPERATIONAL_STATE,
-    values: ["start", "stop", "pause", "resume"],
+    values: values.length > 0 ? values : ["start", "stop", "pause", "resume"],
   };
+}
+
+/**
+ * The state the device reports being in, in its own words.
+ *
+ * This is what an operation reports back, rather than the verb that was asked for.
+ * Echoing the request is how GIAP told a user a washer was running while the washer
+ * sat there saying Stopped.
+ */
+export function observedOperation(node: NodeSnapshot): string | undefined {
+  const endpoint = applicationEndpoints(node).find(e => OPERATIONAL_STATE in e.clusters);
+  if (endpoint === undefined) return undefined;
+
+  const current = endpoint.clusters[OPERATIONAL_STATE]?.["operationalState"];
+  if (typeof current !== "number") return undefined;
+  return operationalStates(endpoint).get(current) ?? STANDARD_STATES[current];
 }
