@@ -25,18 +25,18 @@ export interface ProviderOption {
   serverPlaceholder?: string;
 }
 
+// Google Calendar is deliberately absent.
+//
+// Google's CalDAV guide requires OAuth 2.0 and rejects Basic auth with a 401,
+// so an app password cannot work for it however carefully it is typed. Offering
+// it produced a refusal that read as the household's mistake. Gmail stays,
+// because IMAP app passwords are unaffected.
 export const PROVIDERS: ProviderOption[] = [
-  {
-    id: "google",
-    label: "Google Calendar",
-    kind: "calendar",
-    hint: "Turn on 2-Step Verification, then create an app password on your Google account's Security page. Your normal password will not work.",
-  },
   {
     id: "gmail",
     label: "Gmail",
     kind: "mail",
-    hint: "Use the same app password as Google Calendar, and switch IMAP on in Gmail's own settings under Forwarding and POP/IMAP. That second step is the one people miss.",
+    hint: "Turn on 2-Step Verification, then create an app password on your Google account's Security page. Also switch IMAP on in Gmail's own settings, under Forwarding and POP/IMAP — that second step is the one people miss.",
   },
   {
     id: "icloud",

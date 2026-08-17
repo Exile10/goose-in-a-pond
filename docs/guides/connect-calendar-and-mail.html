@@ -407,7 +407,7 @@
   <section>
     <h2>Find your provider</h2>
     <div class="picker" role="group" aria-label="Choose your provider">
-      <button type="button" data-provider="google" aria-pressed="true">Google</button>
+      <button type="button" data-provider="google" aria-pressed="true">Gmail</button>
       <button type="button" data-provider="icloud" aria-pressed="false">iCloud</button>
       <button type="button" data-provider="fastmail" aria-pressed="false">Fastmail</button>
       <button type="button" data-provider="nextcloud" aria-pressed="false">Nextcloud or other</button>
@@ -415,21 +415,19 @@
 
     <div class="provider is-shown" data-panel="google">
       <div class="card">
-        <div class="card-head"><h3>Google Calendar</h3><span class="tag">caldav</span></div>
+        <div class="card-head"><h3>Gmail</h3><span class="tag">imap</span></div>
         <ol class="steps">
           <li>Turn on 2-Step Verification in your Google account, under Security.</li>
           <li>On the same Security page, open <strong>App passwords</strong> and create one. Name it something you will recognise, like "Pond".</li>
           <li>Copy the 16-character password Google shows you. It is only shown once.</li>
-          <li>Run the connect command below with <code>google</code> and that password.</li>
+          <li>In Gmail, open Settings, then <strong>Forwarding and POP/IMAP</strong>, and switch IMAP on. This step is the one people miss.</li>
+          <li>Connect the account as <strong>Gmail</strong>.</li>
         </ol>
       </div>
       <div class="card">
-        <div class="card-head"><h3>Gmail</h3><span class="tag">imap</span></div>
-        <ol class="steps">
-          <li>In Gmail, open Settings, then <strong>Forwarding and POP/IMAP</strong>, and switch IMAP on. This step is the one people miss.</li>
-          <li>Use the same app password you created above — one password works for both.</li>
-          <li>Run the connect command with <code>gmail</code>.</li>
-        </ol>
+        <div class="card-head"><h3>Google Calendar</h3><span class="tag">not yet</span></div>
+        <p>Google Calendar needs you to sign in with Google, and this pond cannot do that yet. An app password will not work for it — Google refuses those for calendars specifically, which is why it is not offered rather than offered and broken.</p>
+        <p>Gmail above is unaffected. If you want a calendar today, an iCloud, Fastmail, or Nextcloud one works.</p>
       </div>
     </div>
 
@@ -481,9 +479,9 @@
 
   <section>
     <h2>Connect it</h2>
-    <p>One command per account, run on the machine your pond is on.</p>
+    <p>Easiest is the app: open <strong>Context</strong>, then <strong>Sources</strong>. If you would rather use a terminal, one command per account, run on the machine your pond is on.</p>
     <pre><code>bash scripts/connect-calendar.sh fastmail you@example.org YOUR-APP-PASSWORD</code></pre>
-    <p>Swap <code>fastmail</code> for <code>google</code>, <code>icloud</code>, or <code>nextcloud</code>. For Nextcloud or a custom server, add the address on the end:</p>
+    <p>Swap <code>fastmail</code> for <code>icloud</code> or <code>nextcloud</code>. For Nextcloud or a custom server, add the address on the end:</p>
     <pre><code>bash scripts/connect-calendar.sh nextcloud you@example.org APP-PASSWORD https://cloud.example.org/remote.php/dav</code></pre>
     <p>The pond checks for new events and mail every half hour. The first check runs a minute or two after it starts, so you do not have to wait long to see whether it worked.</p>
   </section>

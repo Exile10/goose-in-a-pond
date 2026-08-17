@@ -113,9 +113,26 @@ impl ImapAdapter {
 
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls_config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        // The provider is NAMED, not inferred.
+        //
+        // `ClientConfig::builder()` asks rustls to work the provider out from
+        // crate features, and it PANICS when it cannot -- which is this
+        // workspace's normal state: `aws_lc_rs` comes from the root Cargo.toml
+        // and `ring` from hyper-rustls via reqwest, so both are enabled and
+        // there is no single answer to infer. That ambiguity predates this
+        // crate; being the first code to call the inferring constructor is what
+        // turned it into a crash on a background worker.
+        //
+        // A library has no business depending on the host process having
+        // installed a default either, so this one says which provider it wants
+        // and stops caring.
+        let tls_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .context("could not select TLS protocol versions")?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
         let server_name = rustls_pki_types::ServerName::try_from(host.to_string())
             .map_err(|_| anyhow!("{host} is not a usable server name"))?;
         let tls = tokio_rustls::TlsConnector::from(Arc::new(tls_config))
