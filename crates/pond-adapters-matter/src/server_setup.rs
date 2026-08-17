@@ -269,6 +269,43 @@ async fn find_node() -> Result<PathBuf> {
 /// are simply not runtime inputs.
 const NOT_COPIED: &[&str] = &["node_modules", "test", ".git"];
 
+/// Replace the installed sources while leaving `node_modules` where it is.
+///
+/// `copy_tree` clears the destination first, which would take the dependency
+/// tree with it — the whole point of this path is not to pay for that again.
+fn refresh_sources(src: &Path, dst: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dst).with_context(|| format!("reading {}", dst.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "node_modules" {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        }
+        .with_context(|| format!("clearing {}", path.display()))?;
+    }
+
+    for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if NOT_COPIED.iter().any(|skip| name == *skip) {
+            continue;
+        }
+        let target = dst.join(&name);
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)
+                .with_context(|| format!("copying {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Copy `src` into `dst`, replacing whatever is there.
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     if dst.exists() {
@@ -292,31 +329,137 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The lockfile's contents, used as the installed-tree fingerprint.
+/// What the installed tree was built from: its dependencies, and its sources.
 ///
-/// The whole file rather than a hash of it: it is tens of kilobytes, this runs
-/// once per enable, and comparing bytes needs no dependency and cannot collide.
-fn lockfile(dir: &Path) -> Result<String> {
-    let path = dir.join("package-lock.json");
-    std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
+/// TWO fingerprints, because they answer different questions and have very
+/// different costs. Dependencies change rarely and cost minutes (`npm ci`);
+/// sources change with every release and cost a file copy.
+///
+/// The marker used to be the lockfile alone, which silently made every
+/// source-only change a no-op: a controller fix would ship in the binary, the
+/// installed copy under the data dir would keep running the old code, and
+/// nothing anywhere would say so. That is how a fixed bug comes back on the one
+/// machine that already had the software.
+#[derive(PartialEq, Eq)]
+struct Fingerprint {
+    deps: String,
+    sources: String,
+}
+
+impl Fingerprint {
+    fn render(&self) -> String {
+        format!("{}\n{}", self.deps, self.sources)
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        let (deps, sources) = raw.split_once('\n')?;
+        Some(Self {
+            deps: deps.to_string(),
+            sources: sources.to_string(),
+        })
+    }
+}
+
+/// Hash `bytes` into a short hex string.
+///
+/// `DefaultHasher` rather than a cryptographic digest: this detects change, it
+/// does not defend against a forged one, and the alternative was a new
+/// dependency for something a std hasher does adequately.
+fn digest(bytes: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Every file under `dir`, hashed with its relative path so a rename counts as
+/// a change. Sorted, so the result does not depend on directory order.
+fn hash_tree(root: &Path, dir: &Path, into: &mut Vec<(String, String)>) -> Result<()> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+
+    for entry in entries {
+        let name = entry
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if NOT_COPIED.contains(&name.as_str()) {
+            continue;
+        }
+        if entry.is_dir() {
+            hash_tree(root, &entry, into)?;
+        } else {
+            let relative = entry
+                .strip_prefix(root)
+                .unwrap_or(&entry)
+                .display()
+                .to_string();
+            let bytes =
+                std::fs::read(&entry).with_context(|| format!("reading {}", entry.display()))?;
+            into.push((relative, digest(&bytes)));
+        }
+    }
+    Ok(())
+}
+
+fn fingerprint(dir: &Path) -> Result<Fingerprint> {
+    let lock = dir.join("package-lock.json");
+    let deps =
+        digest(&std::fs::read(&lock).with_context(|| format!("reading {}", lock.display()))?);
+
+    let mut files: Vec<(String, String)> = Vec::new();
+    hash_tree(dir, dir, &mut files)?;
+    let joined = files
+        .into_iter()
+        .map(|(path, hash)| format!("{path}:{hash}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(Fingerprint {
+        deps,
+        sources: digest(joined.as_bytes()),
+    })
 }
 
 /// Install the controller into the data dir. Idempotent: if the installed tree
 /// was built from the lockfile that ships now, this is a no-op.
 async fn ensure_installed(data_dir: &Path, notifier: &MatterNotifier) -> Result<()> {
     let source = source_dir()?;
-    let wanted = lockfile(&source)?;
+    let wanted = fingerprint(&source)?;
+    let app = app_dir(data_dir);
+    let has_modules = app.join("node_modules").is_dir();
 
-    let installed = std::fs::read_to_string(install_marker(data_dir)).ok();
-    if installed.as_deref() == Some(wanted.as_str())
-        && app_dir(data_dir).join("node_modules").is_dir()
-    {
+    let installed = std::fs::read_to_string(install_marker(data_dir))
+        .ok()
+        .and_then(|raw| Fingerprint::parse(&raw));
+
+    if installed.as_ref() == Some(&wanted) && has_modules {
+        return Ok(());
+    }
+
+    // Sources changed but dependencies did not — by far the common case for an
+    // upgrade. Refreshing the code is a file copy; reinstalling `node_modules`
+    // for it would be minutes of work to arrive at the same tree.
+    if has_modules && installed.as_ref().is_some_and(|i| i.deps == wanted.deps) {
+        tracing::info!(
+            target: "giap::trace",
+            kind = "matter_sources_refreshed",
+            path = %app.display(),
+            "matter: controller sources changed; refreshing them without reinstalling"
+        );
+        refresh_sources(&source, &app)?;
+        std::fs::write(install_marker(data_dir), wanted.render())
+            .with_context(|| format!("writing {}", install_marker(data_dir).display()))?;
         return Ok(());
     }
 
     let node = find_node().await?;
     let started = Instant::now();
-    let app = app_dir(data_dir);
     tracing::info!(
         target: "giap::trace",
         kind = "matter_setup_started",
@@ -360,7 +503,7 @@ async fn ensure_installed(data_dir: &Path, notifier: &MatterNotifier) -> Result<
         ));
     }
 
-    std::fs::write(install_marker(data_dir), &wanted)
+    std::fs::write(install_marker(data_dir), wanted.render())
         .with_context(|| format!("writing {}", install_marker(data_dir).display()))?;
 
     tracing::info!(
@@ -959,6 +1102,86 @@ mod tests {
         reap_orphan(&dir).await;
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The regression that broke a working install: the marker was the lockfile
+    /// alone, so a change to the controller's SOURCES left the installed copy
+    /// untouched. The fix shipped in the binary, the data dir kept running the
+    /// old code, and nothing said so — which is how a fixed bug comes back on
+    /// the one machine that already had the software.
+    #[test]
+    fn a_source_change_changes_the_fingerprint() {
+        let dir = std::env::temp_dir().join(format!("giap-fp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("package-lock.json"), "{}").unwrap();
+        std::fs::write(dir.join("src/server.ts"), "// v1").unwrap();
+
+        let before = fingerprint(&dir).unwrap();
+
+        std::fs::write(dir.join("src/server.ts"), "// v2").unwrap();
+        let after = fingerprint(&dir).unwrap();
+
+        assert_ne!(
+            before.sources, after.sources,
+            "a source edit went unnoticed"
+        );
+        assert_eq!(before.deps, after.deps, "dependencies did not change");
+
+        // And a dependency change is distinguishable from a source change, so a
+        // source edit does not pay for a reinstall.
+        std::fs::write(dir.join("package-lock.json"), r#"{"x":1}"#).unwrap();
+        assert_ne!(fingerprint(&dir).unwrap().deps, after.deps);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_renamed_file_changes_the_fingerprint() {
+        // Hashing contents alone would call a rename no change at all.
+        let dir = std::env::temp_dir().join(format!("giap-fp2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("package-lock.json"), "{}").unwrap();
+        std::fs::write(dir.join("src/a.ts"), "same").unwrap();
+        let before = fingerprint(&dir).unwrap();
+
+        std::fs::remove_file(dir.join("src/a.ts")).unwrap();
+        std::fs::write(dir.join("src/b.ts"), "same").unwrap();
+        assert_ne!(before.sources, fingerprint(&dir).unwrap().sources);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The refresh path exists to avoid a multi-minute reinstall, so it must not
+    /// take `node_modules` with it.
+    #[test]
+    fn refreshing_sources_keeps_node_modules() {
+        let base = std::env::temp_dir().join(format!("giap-refresh-{}", std::process::id()));
+        let (src, dst) = (base.join("src"), base.join("dst"));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(src.join("src")).unwrap();
+        std::fs::create_dir_all(dst.join("node_modules/@matter")).unwrap();
+        std::fs::create_dir_all(dst.join("src")).unwrap();
+
+        std::fs::write(src.join("package.json"), "{}").unwrap();
+        std::fs::write(src.join("src/server.ts"), "// new").unwrap();
+        std::fs::write(dst.join("src/server.ts"), "// old").unwrap();
+        std::fs::write(dst.join("node_modules/@matter/keep.js"), "x").unwrap();
+
+        refresh_sources(&src, &dst).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dst.join("src/server.ts")).unwrap(),
+            "// new",
+            "the source was not refreshed"
+        );
+        assert!(
+            dst.join("node_modules/@matter/keep.js").is_file(),
+            "node_modules was destroyed; the refresh would cost a reinstall"
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
