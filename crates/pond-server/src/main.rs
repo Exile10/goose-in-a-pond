@@ -3388,6 +3388,25 @@ async fn run_server(
             settings.matter_enabled,
             settings.matter_ws_url.trim().to_string(),
         );
+
+        // Bounded, so the Matter lines belong to the startup log rather than
+        // arriving after the "listening" banner as though something had
+        // restarted. Free when Matter is off, a second or two when its
+        // controller is already installed, and abandoned rather than waited out
+        // on a first run — which is the only case that takes minutes, and the
+        // one the Devices tab is already reporting progress for.
+        const MATTER_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+        let settled = matter.settle(MATTER_STARTUP_GRACE).await;
+        if matches!(
+            settled.state,
+            pond_core::user_data::ports::matter_runtime::MatterState::Connecting
+        ) {
+            tracing::info!(
+                target: "giap::trace",
+                kind = "matter_startup_deferred",
+                "matter: still starting; continuing without waiting for it"
+            );
+        }
     }
 
     // Bridge schedule completion/failure events to push notifications (#99), so a
