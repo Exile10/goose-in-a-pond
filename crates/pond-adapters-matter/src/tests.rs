@@ -822,7 +822,7 @@ async fn enabling_connects_and_exposes_a_commissioner() {
     let (url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
     let runtime = runtime_for();
 
-    runtime.apply(true, url.clone());
+    runtime.apply(url.clone());
     let status = wait_for(&runtime, MatterState::is_connected).await;
 
     assert!(status.enabled);
@@ -830,20 +830,31 @@ async fn enabling_connects_and_exposes_a_commissioner() {
     assert!(runtime.commissioner().await.is_some());
 }
 
+/// Matter has no off switch, so a second apply of the same address while
+/// connected must change nothing rather than tearing the fabric down and
+/// rebuilding it — every settings save that touches the address arrives here.
 #[tokio::test]
-async fn disabling_tears_down_and_re_enabling_reconnects() {
-    let (url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
+async fn re_applying_the_same_address_while_connected_does_not_churn() {
+    let (url, received) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
     let runtime = runtime_for();
 
-    runtime.apply(true, url.clone());
+    runtime.apply(url.clone());
     wait_for(&runtime, MatterState::is_connected).await;
+    let subscribes = || {
+        received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f["op"] == "subscribe")
+            .count()
+    };
+    let before = subscribes();
 
-    runtime.apply(false, url.clone());
-    let status = wait_for(&runtime, |s| matches!(s, MatterState::Disabled)).await;
-    assert!(!status.enabled);
-    assert!(runtime.commissioner().await.is_none());
-    // The URL stays visible while off, so the UI still shows what will be used.
-    assert_eq!(status.url, url);
+    runtime.apply(url.clone());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(runtime.status().await.state.is_connected());
+    assert_eq!(subscribes(), before, "a no-op save resubscribed the fabric");
 }
 
 #[tokio::test]
@@ -854,7 +865,7 @@ async fn an_unreachable_controller_reports_the_failure_not_off() {
     // A name that cannot resolve, so this fails promptly and — being non-loopback
     // — never sends the runtime off to install a controller for someone else's
     // address. A blackholed IP would do neither: it would hang on the connect.
-    runtime.apply(true, "ws://controller.invalid:5580/giap".to_string());
+    runtime.apply("ws://controller.invalid:5580/giap".to_string());
 
     let status = wait_for(&runtime, |s| matches!(s, MatterState::Unreachable { .. })).await;
     assert!(status.enabled, "unreachable is not the same as off");
@@ -865,7 +876,7 @@ async fn an_empty_controller_address_is_reported_plainly() {
     // An install predating the Matter section could have been enabled with no
     // address. The fix is to fill the field in, so say that.
     let runtime = runtime_for();
-    runtime.apply(true, String::new());
+    runtime.apply(String::new());
 
     let status = wait_for(&runtime, |s| matches!(s, MatterState::Unreachable { .. })).await;
     let MatterState::Unreachable { error } = status.state else {
@@ -887,7 +898,7 @@ async fn re_applying_after_a_failure_retries() {
     drop(listener); // nothing is serving it yet
 
     let runtime = runtime_for();
-    runtime.apply(true, url.clone());
+    runtime.apply(url.clone());
     wait_for(&runtime, |s| matches!(s, MatterState::Unreachable { .. })).await;
 
     // Bring a controller up on that exact port, then retry.
@@ -914,7 +925,7 @@ async fn re_applying_after_a_failure_retries() {
         }
     });
 
-    runtime.apply(true, url);
+    runtime.apply(url);
     wait_for(&runtime, MatterState::is_connected).await;
 }
 
@@ -923,7 +934,7 @@ async fn shutdown_clears_the_runtime() {
     let (url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
     let runtime = runtime_for();
 
-    runtime.apply(true, url);
+    runtime.apply(url);
     wait_for(&runtime, MatterState::is_connected).await;
 
     runtime.shutdown().await;
@@ -997,7 +1008,7 @@ async fn control_switches_to_matter_once_connected() {
     let runtime = runtime_for();
     let control = runtime.device_control(fallback.clone());
 
-    runtime.apply(true, url);
+    runtime.apply(url);
     wait_for(&runtime, MatterState::is_connected).await;
 
     control.set_power("matter-2", true).await.unwrap();

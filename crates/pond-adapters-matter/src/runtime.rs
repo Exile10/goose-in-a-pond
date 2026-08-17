@@ -70,7 +70,6 @@ type ControlCell = Arc<RwLock<Option<Arc<MatterDeviceControl>>>>;
 /// unreachable retries the connection.
 #[derive(Clone, PartialEq, Eq)]
 struct Desired {
-    enabled: bool,
     url: String,
     shutdown: bool,
     nonce: u64,
@@ -98,7 +97,6 @@ impl MatterRuntime {
         bus: Arc<dyn EventBus>,
     ) -> Arc<Self> {
         let (desired, desired_rx) = watch::channel(Desired {
-            enabled: false,
             url: String::new(),
             shutdown: false,
             nonce: 0,
@@ -147,13 +145,20 @@ impl MatterRuntime {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let status = self.status().await;
-            if !matches!(status.state, MatterState::Connecting) {
+            // `enabled` first, and this is the whole subtlety: `apply` only
+            // SENDS to the watch channel, so for a moment after it returns the
+            // reconciler has not woken and the status is still the initial
+            // `Disabled`. Polling only for "not Connecting" saw that and
+            // returned instantly — which is why the Matter lines still landed
+            // after the banner. Waiting for the reconciler to acknowledge the
+            // request is what makes this a wait rather than a race.
+            if status.enabled && !matches!(status.state, MatterState::Connecting) {
                 return status;
             }
             if tokio::time::Instant::now() >= deadline {
                 return status;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -184,7 +189,7 @@ impl MatterRuntime {
 
 #[async_trait]
 impl MatterRuntimePort for MatterRuntime {
-    fn apply(&self, enabled: bool, url: String) {
+    fn apply(&self, url: String) {
         let nonce = self
             .nonce
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -192,7 +197,6 @@ impl MatterRuntimePort for MatterRuntime {
         // A closed channel means the reconciler is gone (shutdown); dropping
         // the request is correct — there is nothing left to converge.
         let _ = self.desired.send(Desired {
-            enabled,
             url,
             shutdown: false,
             nonce,
@@ -216,7 +220,6 @@ impl MatterRuntimePort for MatterRuntime {
         if self
             .desired
             .send(Desired {
-                enabled: false,
                 url: String::new(),
                 shutdown: true,
                 nonce,
@@ -269,7 +272,6 @@ async fn reconcile_loop(mut rx: watch::Receiver<Desired>, r: Reconciler) {
     // What the running state was built from — compared against the request to
     // decide whether anything needs to change.
     let mut current = Desired {
-        enabled: false,
         url: String::new(),
         shutdown: false,
         nonce: 0,
@@ -289,12 +291,12 @@ async fn reconcile_loop(mut rx: watch::Receiver<Desired>, r: Reconciler) {
         // connected are a no-op, but the same values while unreachable are a
         // retry — which is what the UI's retry affordance sends.
         let healthy = r.status.read().await.state.is_connected();
-        let changed = want.enabled != current.enabled || want.url != current.url;
-        if changed || (want.enabled && !healthy) {
+        let changed = want.url != current.url;
+        if changed || !healthy {
             teardown(&mut running, &r).await;
             current = want.clone();
 
-            if want.enabled {
+            {
                 *r.status.write().await = MatterStatus {
                     enabled: true,
                     url: want.url.clone(),
@@ -350,20 +352,6 @@ async fn reconcile_loop(mut rx: watch::Receiver<Desired>, r: Reconciler) {
                         }
                     },
                 }
-            } else {
-                // Keep the URL visible while off, so the UI's controller field
-                // still shows what will be used when it is turned back on.
-                *r.status.write().await = MatterStatus {
-                    enabled: false,
-                    url: want.url.clone(),
-                    state: MatterState::Disabled,
-                };
-                tracing::info!(
-                    target: "giap::trace",
-                    kind = "matter_state_changed",
-                    to = "disabled",
-                    "matter: disabled"
-                );
             }
         }
 

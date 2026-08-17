@@ -409,12 +409,8 @@ pub struct Settings {
     pub vision_classifier_model: String,
 
     // ── Matter (#195) ──────────────────────────────────────────────────────
-    /// Whether to run the Matter controller. On by default and not surfaced in
-    /// the UI — see [`Settings::default_matter_enabled`].
     /// and drive commissioned Matter devices. Off by default — requires the
     /// controller running on the LAN.
-    #[serde(default = "Settings::default_matter_enabled")]
-    pub matter_enabled: bool,
 
     /// WebSocket URL of the Matter controller.
     #[serde(default = "Settings::default_matter_ws_url")]
@@ -1161,7 +1157,6 @@ impl Default for Settings {
             vision_fps: Self::default_vision_fps(),
             vision_motion_threshold: Self::default_vision_motion_threshold(),
             vision_classifier_model: Self::default_vision_classifier_model(),
-            matter_enabled: Self::default_matter_enabled(),
             matter_ws_url: Self::default_matter_ws_url(),
             mesh_enabled: Self::default_mesh_enabled(),
             mic_enabled: Self::default_mic_enabled(),
@@ -1372,20 +1367,6 @@ impl Settings {
     }
     fn default_vision_classifier_model() -> String {
         "".to_string()
-    }
-    /// On, always.
-    ///
-    /// Matter used to be opt-in because enabling it meant installing a Python
-    /// stack the user had to provide. It does not any more: the controller ships
-    /// with GIAP, installs itself on first use, and costs nothing while no
-    /// device is paired. A toggle whose only honest advice is "leave it on" is a
-    /// question the appliance should not be asking, so the Devices tab no longer
-    /// asks it — the user pairs a device and that is the whole interaction.
-    ///
-    /// Still a setting rather than a constant: an operator can turn it off
-    /// through the settings API on a Pond that will never see a Matter device.
-    fn default_matter_enabled() -> bool {
-        true
     }
     fn default_matter_ws_url() -> String {
         DEFAULT_MATTER_WS_URL.to_string()
@@ -2456,7 +2437,6 @@ mod tests {
             "llm_max_tokens",
             "llm_provider",
             "llm_temperature",
-            "matter_enabled",
             "matter_ws_url",
             "memory_archive_threshold",
             "memory_cleanup_enabled",
