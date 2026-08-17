@@ -192,6 +192,14 @@ async fn find_node() -> Result<PathBuf> {
     ))
 }
 
+/// Directories never worth copying into the install.
+///
+/// `node_modules` is the one that matters: in a dev checkout the source tree has
+/// one, and `npm ci` deletes and rebuilds it anyway — so copying it is a hundred
+/// megabytes of work to produce something immediately thrown away. The others
+/// are simply not runtime inputs.
+const NOT_COPIED: &[&str] = &["node_modules", "test", ".git"];
+
 /// Copy `src` into `dst`, replacing whatever is there.
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     if dst.exists() {
@@ -200,7 +208,11 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
     for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
         let entry = entry?;
-        let target = dst.join(entry.file_name());
+        let name = entry.file_name();
+        if NOT_COPIED.iter().any(|skip| name == *skip) {
+            continue;
+        }
+        let target = dst.join(&name);
         if entry.file_type()?.is_dir() {
             copy_tree(&entry.path(), &target)?;
         } else {
@@ -659,6 +671,39 @@ mod tests {
         // Fewer lines than asked for is not an error.
         assert_eq!(tail("only one", 5), "only one");
         assert_eq!(tail("", 5), "");
+    }
+
+    #[test]
+    fn the_install_copy_leaves_node_modules_behind() {
+        // A dev checkout's matter-server/ has a node_modules of its own, and
+        // `npm ci` deletes and rebuilds one regardless — so copying it is a lot
+        // of work to produce something immediately discarded.
+        let tmp = std::env::temp_dir().join(format!("giap-copy-{}", std::process::id()));
+        let src = tmp.join("src");
+        let dst = tmp.join("dst");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        std::fs::create_dir_all(src.join("node_modules/@matter")).unwrap();
+        std::fs::create_dir_all(src.join("src")).unwrap();
+        std::fs::create_dir_all(src.join("test")).unwrap();
+        std::fs::write(src.join("package.json"), "{}").unwrap();
+        std::fs::write(src.join("src/server.ts"), "// entry").unwrap();
+        std::fs::write(src.join("node_modules/@matter/big.js"), "x").unwrap();
+
+        copy_tree(&src, &dst).unwrap();
+
+        assert!(dst.join("package.json").is_file());
+        assert!(
+            dst.join("src/server.ts").is_file(),
+            "the entrypoint must travel"
+        );
+        assert!(
+            !dst.join("node_modules").exists(),
+            "node_modules was copied"
+        );
+        assert!(!dst.join("test").exists(), "tests are not a runtime input");
+
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]

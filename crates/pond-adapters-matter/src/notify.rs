@@ -65,6 +65,12 @@ pub struct MatterNotifier {
     state: Arc<Mutex<State>>,
 }
 
+impl Default for MatterNotifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MatterNotifier {
     /// A notifier that sends nothing until [`attach`](Self::attach) is called.
     pub fn new() -> Self {
