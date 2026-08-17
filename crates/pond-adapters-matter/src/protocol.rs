@@ -17,7 +17,7 @@
 
 use chrono::{DateTime, Utc};
 use pond_core::user_data::domain::sensor::SensorReading;
-use pond_core::user_data::ports::device_control::DeviceStatePatch;
+use pond_core::user_data::ports::device_control::{DeviceDescription, DeviceStatePatch};
 use pond_core::user_data::ports::device_registry::Device;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -239,6 +239,13 @@ pub struct Snapshot {
 pub struct ControlResult {
     #[serde(default)]
     pub applied: DeviceStatePatch,
+}
+
+/// The `describe` result. The description's own shape is GIAP's, so it
+/// deserialises straight into the domain type with no mapping step.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DescribeResult {
+    pub description: DeviceDescription,
 }
 
 /// The `commission` result.

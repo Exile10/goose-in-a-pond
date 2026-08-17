@@ -66,6 +66,56 @@ export interface DeviceStatePatch {
   position?: number;
 }
 
+/**
+ * What a device can be told to do and what it measures, in its own terms.
+ *
+ * `capabilities: string[]` on `Device` says a fan has speed; it cannot say which
+ * modes that particular fan has, what a thermostat's limits are, or that an air
+ * quality sensor measures eleven separate substances. A model given only the short
+ * list has to guess, and discovers the limits by failing.
+ *
+ * Read from the device rather than assumed: where a cluster states a constraint —
+ * FanControl's mode sequence, a thermostat's setpoint limits, a concentration's
+ * declared unit — the description carries what it says.
+ */
+export interface DeviceDescription {
+  device_id: string;
+  device_type: string;
+  /** Verbs the device accepts, in `control`'s vocabulary. */
+  capabilities: Capability[];
+  /** What it measures, whether or not it has reported yet. */
+  sensors: SensorSpec[];
+}
+
+/** What a `control` op may ask a device to do. */
+export type Verb =
+  | "power"
+  | "brightness"
+  | "target_temp"
+  | "locked"
+  | "color"
+  | "fan_speed"
+  | "fan_mode"
+  | "position";
+
+export interface Capability {
+  /** Exactly a `control` verb, so a description and a call cannot drift apart. */
+  verb: Verb;
+  value: ValueSpec;
+}
+
+export type ValueSpec =
+  | { kind: "boolean" }
+  | { kind: "percent" }
+  | { kind: "number"; min?: number; max?: number; unit?: string }
+  | { kind: "enum"; values: string[] }
+  | { kind: "color" };
+
+export interface SensorSpec {
+  sensor_type: string;
+  unit: string;
+}
+
 // ── Envelope ─────────────────────────────────────────────────────────────────
 
 export type OpName =
@@ -74,6 +124,7 @@ export type OpName =
   | "commission"
   | "decommission"
   | "control"
+  | "describe"
   | "ping";
 
 export interface Request {

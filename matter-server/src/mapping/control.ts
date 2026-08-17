@@ -7,7 +7,7 @@
  * decision below is unit-testable against a recorded device.
  */
 
-import { OpError, type DeviceStatePatch } from "../protocol.js";
+import { OpError, type DeviceStatePatch, type Verb } from "../protocol.js";
 import {
   CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
@@ -19,15 +19,9 @@ import {
 } from "./devices.js";
 import { endpointWith, type NodeSnapshot } from "./snapshot.js";
 
-export type Verb =
-  | "power"
-  | "brightness"
-  | "target_temp"
-  | "locked"
-  | "color"
-  | "fan_speed"
-  | "fan_mode"
-  | "position";
+// `Verb` is protocol vocabulary — it names what a `control` op may ask for — so it
+// lives in protocol.ts and is re-exported here, where every caller already looks.
+export type { Verb };
 
 export const VERBS: ReadonlySet<string> = new Set<Verb>([
   "power",
