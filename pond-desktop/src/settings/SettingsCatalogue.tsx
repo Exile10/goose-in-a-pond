@@ -1,15 +1,17 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { Switch, Button } from "@heroui/react";
-import { Search, Crosshair, AlertCircle, Wand2 } from "lucide-react";
+import { Search, Crosshair, AlertCircle, Wand2, ChevronDown, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import type { ModelEntry, RetitleResult, Settings } from "../api/types";
-import { diffSettings, foldServerState } from "../sections/Settings";
+import { diffSettings, foldServerState } from "./state";
 import { ErrorBanner, SkeletonList } from "../components/shared";
 import {
   CATALOGUE, TIER_NOTE, allEntries, inertCount,
   type CatalogueCategory, type Consumer, type Entry, type OptionSource, type Subcategory,
 } from "./catalogue";
-import { detectTimezone } from "./validation";
+import { detectTimezone, detectLocation, placeFromTimezone } from "./validation";
+import { AppearanceView } from "../hub/views/settings/Appearance";
+import { WakeWordCalibration } from "../components/WakeWordCalibration";
 import "../styles/settings-catalogue.css";
 
 // ─── Marks ────────────────────────────────────────────────────────────────
@@ -149,7 +151,7 @@ function postureClauses(s: Partial<Settings>): { clauses: Clause[]; reach: Claus
 // ─── Row ──────────────────────────────────────────────────────────────────
 
 function EntryRow({
-  entry, value, error, options, onChange, extra,
+  entry, value, error, options, onChange, extra, dev = false,
 }: {
   entry: Entry;
   value: unknown;
@@ -157,6 +159,8 @@ function EntryRow({
   options: Option[] | null;
   onChange: (key: keyof Settings, v: unknown) => void;
   extra?: React.ReactNode;
+  /** Developer view: reveals field names, types and the consumer marks. */
+  dev?: boolean;
 }) {
   // A control nothing reads is not offered. Leaving it operable would let
   // someone spend a decision on a value that changes nothing — the exact
@@ -170,13 +174,23 @@ function EntryRow({
     <div className="scat__row" data-invalid={error ? "true" : undefined}>
       <div className="scat__rowMain">
         <div className="scat__rowLabel">
-          <Mark consumer={entry.consumer} />
+          {dev && <Mark consumer={entry.consumer} />}
           <span>{entry.label}</span>
           {entry.proposed && <span className="scat__new">New</span>}
         </div>
-        <div className="scat__key">{entry.key}</div>
 
-        {entry.note && (
+        {/* Always. A control whose effect has to be guessed is a control the
+            household will leave alone, which is the same as not shipping it. */}
+        <p className="scat__desc">{entry.description}</p>
+
+        {/* The field name is a maintenance detail. Somebody living here cannot
+            act on `voice_tts_quality`, and showing it invites them to think the
+            interface is talking to someone else. */}
+        {dev && <div className="scat__key">{entry.key}</div>}
+
+        {/* Likewise the note: it exists to explain why a mark is not "connected",
+            which is only meaningful once the marks are visible. */}
+        {dev && entry.note && (
           <p className={`scat__note scat__note--${entry.consumer}`}>
             <Mark consumer={entry.consumer} />
             <span>{entry.note}</span>
@@ -332,6 +346,45 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
   const [saveError, setSaveError] = useState<string | null>(null);
   const [categoryId, setCategoryId] = useState(CATALOGUE[0].id);
   const [query, setQuery] = useState("");
+  /**
+   * Developer view. Off by default, so what a household sees is labels and
+   * descriptions; on, it adds field names, the consumer marks and their notes.
+   */
+  const [dev, setDev] = useState(false);
+  /**
+   * Re-running setup is destructive enough to deserve a second press — it
+   * throws away the answers the wizard collected — but not a modal, because
+   * this only exists behind the developer flag in the first place.
+   */
+  const [armed, setArmed] = useState(false);
+  const [onboarding, setOnboarding] = useState(false);
+  const [onboardErr, setOnboardErr] = useState<string | null>(null);
+
+  /**
+   * Reset on the server, then reload.
+   *
+   * Onboarding is a whole-app mode, decided in `App.tsx` from the status the
+   * backend reports — so the honest way back into it is to re-arm the guard and
+   * let the app read that on the next load. Reaching for the app dispatcher
+   * from here would couple a settings panel to the shell for no gain.
+   */
+  const startOnboarding = useCallback(async () => {
+    if (!armed) { setArmed(true); return; }
+    setOnboarding(true);
+    setOnboardErr(null);
+    try {
+      await api.resetOnboarding();
+      window.location.reload();
+    } catch (e) {
+      setOnboardErr(e instanceof Error ? e.message : String(e));
+      setOnboarding(false);
+      setArmed(false);
+    }
+  }, [armed]);
+
+  // Leaving developer view disarms it, so the button is never found half-pressed.
+  useEffect(() => { if (!dev) { setArmed(false); setOnboardErr(null); } }, [dev]);
+
   const [retitling, setRetitling] = useState(false);
   const [retitleNote, setRetitleNote] = useState<string | null>(null);
 
@@ -416,6 +469,69 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
     setSettings((prev) => ({ ...prev, [key]: value }));
   }, []);
 
+  /**
+   * The banner and the search box both start folded on a short screen.
+   *
+   * A 7-inch panel is 1024x600. The banner is ~180px and the masthead another
+   * ~90, so unfolded they take nearly half the height before a single setting
+   * is visible. On a desktop there is room for both, so nothing folds.
+   */
+  const short = typeof window !== "undefined"
+    && window.matchMedia?.("(max-height: 720px)").matches === true;
+  const [bannerOpen, setBannerOpen] = useState(!short);
+  /** Appearance is app-local, so it is a destination rather than a category. */
+  const [appearance, setAppearance] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(!short);
+
+  /**
+   * Training the wake word, not just typing it.
+   *
+   * The classic view offered this beside the phrase and the hub still does. It
+   * has to live here too now — a box you can type a phrase into is not the same
+   * capability as teaching the pond to hear it, and losing the second one while
+   * keeping the first would look like the setting still worked.
+   */
+  const [calibrating, setCalibrating] = useState(false);
+
+  const [locating, setLocating] = useState(false);
+  const [locationNote, setLocationNote] = useState<string | null>(null);
+
+  /**
+   * Fill the place and both coordinates from the device.
+   *
+   * Staged on purpose rather than saved: this writes into the same draft every
+   * other control writes into, so it appears in the change count and can be
+   * abandoned. A detection that silently persisted would be the one control on
+   * the page that acts before you press Save.
+   *
+   * The name comes from the time zone, which is what `location::resolve` does
+   * server-side — the two are deliberately the same rule in both languages, so
+   * a detected pond and an undetected one describe themselves identically.
+   */
+  const findLocation = useCallback(async () => {
+    setLocating(true);
+    setLocationNote(null);
+    try {
+      const at = await detectLocation();
+      patch("weather_latitude", at.latitude);
+      patch("weather_longitude", at.longitude);
+      if (at.name) patch("weather_location_name", at.name);
+      setLocationNote(at.name ? `Found ${at.name}` : "Found the coordinates");
+    } catch (e) {
+      // A refusal is not a failure, and the fallback still helps: the time zone
+      // names the place even when the device will not give coordinates.
+      const guess = placeFromTimezone();
+      if (guess) {
+        patch("weather_location_name", guess);
+        setLocationNote(`Used ${guess}, from your time zone`);
+      } else {
+        setLocationNote(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      setLocating(false);
+    }
+  }, [patch]);
+
   async function save() {
     const body = diffSettings(baseline, settings);
     if (!Object.keys(body).length || saving || errorCount) return;
@@ -444,18 +560,40 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
   const searching = query.trim().length > 0;
   const category = CATALOGUE.find((c) => c.id === categoryId) ?? CATALOGUE[0];
 
+  /**
+   * Mirrors are not offered here. `pond-server` syncs the `active_*` keys from
+   * `model_role_assignments` — the join table is the source of truth — so a
+   * control on this page would lose to the next sync. The Models page owns them
+   * and this page points at it.
+   *
+   * A setting nothing reads is also withheld, but only outside developer view.
+   * It used to render disabled with a note explaining why; once the note moved
+   * behind the developer flag that left a dead control and no reason for it,
+   * which is worse than either half. So the household sees settings that do
+   * something, and the marks live where the field names do.
+   */
+  const offered = useCallback(
+    (es: Entry[]) => es.filter((e) =>
+      e.ownedBy === undefined && (dev || e.consumer !== "none")), [dev]);
+
   const groups: Subcategory[] = useMemo(() => {
-    if (!searching) return category.groups;
+    if (!searching) return category.groups.map((g) => ({ ...g, entries: offered(g.entries) }))
+      .filter((g) => g.entries.length > 0);
     const q = query.trim().toLowerCase();
     return CATALOGUE
       .flatMap((c) => c.groups)
       .map((g) => ({
         ...g,
-        entries: g.entries.filter((e) =>
-          `${e.label} ${e.key} ${e.note ?? ""}`.toLowerCase().includes(q)),
+        // Descriptions are in the haystack, so a setting is findable by what it
+        // does rather than only by what it is called. Field names join only in
+        // developer view — matching on a string the household cannot see gives
+        // a result they cannot explain.
+        entries: offered(g.entries).filter((e) =>
+          `${e.label} ${e.description} ${dev ? `${e.key} ${e.note ?? ""}` : ""}`
+            .toLowerCase().includes(q)),
       }))
       .filter((g) => g.entries.length > 0);
-  }, [searching, query, category]);
+  }, [searching, query, category, dev, offered]);
 
   const resultCount = groups.reduce((n, g) => n + g.entries.length, 0);
 
@@ -463,6 +601,8 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
     const all = allEntries();
     return {
       total: all.length,
+      /** What this page actually offers — mirrors are owned by Models. */
+      offered: all.filter((e) => e.ownedBy === undefined).length,
       live: all.filter((e) => e.consumer === "live").length,
       app: all.filter((e) => e.consumer === "app").length,
       none: all.filter((e) => e.consumer === "none").length,
@@ -470,7 +610,7 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
     };
   }, []);
 
-  const goTo = useCallback((id: string) => { setCategoryId(id); setQuery(""); }, []);
+  const goTo = useCallback((id: string) => { setCategoryId(id); setQuery(""); setAppearance(false); }, []);
 
   const { clauses, reach, tail } = postureClauses(settings);
   const systemZone = detectTimezone();
@@ -481,10 +621,48 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
     if (entry.key === "timezone") {
       if (!zoneDiffers) return undefined;
       return (
-        <button type="button" className="scat__detect" onClick={() => patch("timezone", systemZone)}>
+        <button type="button" className="scat__detect reach" onClick={() => patch("timezone", systemZone)}>
           <Crosshair size={12} aria-hidden="true" />
           Use {systemZone}
         </button>
+      );
+    }
+
+    if (entry.key === "voice_wake_word") {
+      const phrase = String((settings as Record<string, unknown>).voice_wake_word ?? "").trim();
+      return (
+        <button
+          type="button"
+          className="scat__detect reach"
+          onClick={() => setCalibrating(true)}
+          disabled={!phrase}
+          title={phrase ? undefined : "Type a wake phrase first"}
+        >
+          <Wand2 size={12} aria-hidden="true" />
+          Train
+        </button>
+      );
+    }
+
+    // One press fills the name and both coordinates, because they are one
+    // answer to one question and nobody thinks of them as three settings.
+    if (entry.key === "weather_location_name") {
+      return (
+        <>
+          <button
+            type="button"
+            className="scat__detect reach"
+            onClick={findLocation}
+            disabled={locating}
+            aria-busy={locating || undefined}
+          >
+            <Crosshair size={12} aria-hidden="true" />
+            {locating ? "Finding…" : "Detect"}
+          </button>
+          {locationNote && (
+            <span className="scat__actionNote" role="status">{locationNote}</span>
+          )}
+        </>
       );
     }
 
@@ -496,7 +674,7 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
         <>
           <button
             type="button"
-            className="scat__detect"
+            className="scat__detect reach"
             onClick={runRetitle}
             disabled={retitling}
             aria-busy={retitling || undefined}
@@ -539,22 +717,88 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
           <p className="scat__sub">Everything this pond is, knows, hears, and is allowed to do.</p>
         </div>
         <div className="scat__headActions">
-          <div className="scat__search">
-            <Search size={14} aria-hidden="true" />
+          <div className="scat__search" data-open={searchOpen || searching}>
+            {/* Closed, the icon IS the control — one 44px target rather than a
+                field that has shrunk to something nobody can hit. */}
+            <button
+              type="button"
+              className="scat__searchBtn"
+              aria-label={searchOpen || searching ? "Close search" : "Open search"}
+              aria-expanded={searchOpen || searching}
+              onClick={() => {
+                if (searchOpen || searching) { setQuery(""); setSearchOpen(false); }
+                else {
+                  setSearchOpen(true);
+                  requestAnimationFrame(() =>
+                    document.getElementById("scat-q")?.focus());
+                }
+              }}
+            >
+              {searchOpen || searching
+                ? <X size={15} aria-hidden="true" />
+                : <Search size={15} aria-hidden="true" />}
+            </button>
             <input
+              id="scat-q"
               type="search"
               className="scat__searchInput"
               aria-label="Search settings"
-              placeholder={`Search ${totals.total} settings`}
+              placeholder={`Search ${totals.offered} settings`}
               value={query}
+              tabIndex={searchOpen || searching ? 0 : -1}
               onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Escape") { setQuery(""); setSearchOpen(false); } }}
             />
           </div>
+          <button
+            type="button"
+            className="scat__dev"
+            aria-pressed={dev}
+            onClick={() => setDev((d) => !d)}
+            title="Show field names, types and which settings are wired up"
+          >
+            <span className="scat__devDot" aria-hidden="true" />
+            Developer view
+          </button>
           <Button variant="primary" isDisabled={!dirty || saving || errorCount > 0} onPress={save}>
             {saveLabel}
           </Button>
         </div>
       </header>
+
+      {calibrating && (
+        <WakeWordCalibration
+          phrase={String((settings as Record<string, unknown>).voice_wake_word ?? "")}
+          onComplete={() => {
+            setCalibrating(false);
+            // Calibration writes the learned pronunciations server-side, so the
+            // page has to re-read rather than assume. `foldServerState` keeps
+            // any other edit in progress.
+            void load();
+          }}
+          onCancel={() => setCalibrating(false)}
+        />
+      )}
+
+      {dev && (
+        <section className="scat__devbar" aria-label="Developer tools">
+          <div>
+            <b>Run setup again</b>
+            <span>
+              Clears the answers setup collected and reopens the wizard. Your settings are kept.
+            </span>
+          </div>
+          {onboardErr && <span className="scat__devbarErr" role="alert">{onboardErr}</span>}
+          <button
+            type="button"
+            className={`scat__devbarBtn${armed ? " scat__devbarBtn--armed" : ""}`}
+            onClick={startOnboarding}
+            disabled={onboarding}
+          >
+            {onboarding ? "Starting…" : armed ? "Yes, start setup" : "Start onboarding"}
+          </button>
+        </section>
+      )}
 
       {loadError && <ErrorBanner error={loadError} onRetry={load} />}
 
@@ -569,8 +813,25 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
         <SkeletonList rows={8} />
       ) : (
         <>
-          <section className="scat__posture" aria-labelledby="scat-now">
-            <div className="scat__eyebrow" id="scat-now">Right now</div>
+          <section className="scat__posture" aria-labelledby="scat-now" data-open={bannerOpen}>
+            <button
+              type="button"
+              className="scat__postureToggle"
+              aria-expanded={bannerOpen}
+              aria-controls="scat-posture-body"
+              onClick={() => setBannerOpen((o) => !o)}
+            >
+              <span className="scat__eyebrow" id="scat-now">Right now</span>
+              {/* Collapsed, the banner still has to answer the question it
+                  exists to answer, so the reach clause comes with it. */}
+              {!bannerOpen && (
+                <span className="scat__postureGist">
+                  {clauses.map((c) => c.text).join(" · ")}
+                </span>
+              )}
+              <ChevronDown className="scat__postureChev" size={16} aria-hidden="true" />
+            </button>
+            <div className="scat__postureWrap" id="scat-posture-body" hidden={!bannerOpen}>
             <div className="scat__postureBody">
               <p className="scat__sentence">
                 Your pond{" "}
@@ -621,6 +882,7 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
                 </span>
               </div>
             </div>
+            </div>
           </section>
 
           <div className="scat__grid">
@@ -663,8 +925,27 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
                   </div>
                 );
               })}
+              <div className="scat__railItem">
+                <div className="scat__tier">This app</div>
+                <p className="scat__tierNote">How it looks on this screen. The pond never sees it.</p>
+                <button
+                  type="button"
+                  className="scat__navBtn"
+                  aria-current={appearance}
+                  onClick={() => { setAppearance(true); setQuery(""); }}
+                >
+                  <span>Appearance</span>
+                </button>
+              </div>
             </nav>
 
+            {appearance ? (
+              /* Rendered bare: it brings its own heading, and the pond has no
+                 say in any of it. */
+              <div className="scat__panel scat__panel--appearance">
+                <AppearanceView />
+              </div>
+            ) : (
             <div className="scat__panel">
               <div className="scat__panelHead">
                 <h2 className="scat__panelTitle">
@@ -703,12 +984,14 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
                         options={e.control.kind === "lookup" && models ? optionsFor(e.control.source, models) : null}
                         onChange={patch}
                         extra={extraFor(e)}
+                        dev={dev}
                       />
                     ))}
                   </section>
                 ))
               )}
             </div>
+            )}
           </div>
 
           <div className="scat__legend">

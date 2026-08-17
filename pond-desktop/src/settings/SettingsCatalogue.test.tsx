@@ -42,6 +42,7 @@ vi.mock("../api/PondApiClient", () => ({
     updateSettings: vi.fn(),
     listModels: vi.fn(),
     retitleSessions: vi.fn(),
+    resetOnboarding: vi.fn(),
   },
 }));
 
@@ -50,6 +51,7 @@ const mockApi = api as unknown as {
   updateSettings: ReturnType<typeof vi.fn>;
   listModels: ReturnType<typeof vi.fn>;
   retitleSessions: ReturnType<typeof vi.fn>;
+  resetOnboarding: ReturnType<typeof vi.fn>;
 };
 
 /** A re-titling reply with the boring fields filled in. */
@@ -109,14 +111,142 @@ describe("SettingsCatalogue", () => {
     await renderPage();
     fireEvent.click(screen.getByRole("button", { name: /Privacy & Security/ }));
 
-    // `cameras_enabled` persists and renders, but no code reads it — the whole
-    // reason this page exists. It must be visible, explained, and inoperable.
-    const cameras = screen.getByLabelText("Cameras") as HTMLInputElement;
-    expect(cameras.disabled).toBe(true);
-    expect(rowFor("Cameras").textContent).toContain("Nothing reads this");
+    // `cameras_enabled` persists and renders, but no code reads it. It used to
+    // show disabled with a note saying why; the note is a maintenance fact, so
+    // it moved behind developer view — and a disabled control whose reason is
+    // hidden is worse than either half. So the household is not shown it at all.
+    expect(screen.queryByLabelText("Cameras")).toBeNull();
 
     // Its live neighbour is untouched.
     expect((screen.getByLabelText("Microphone") as HTMLInputElement).disabled).toBe(false);
+  });
+
+  it("shows the inert ones, marked, in developer view", async () => {
+    await renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /Privacy & Security/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Developer view/ }));
+
+    const cameras = screen.getByLabelText("Cameras") as HTMLInputElement;
+    expect(cameras.disabled).toBe(true);
+    expect(rowFor("Cameras").textContent).toContain("Nothing reads this");
+    // The field name appears here and only here.
+    expect(rowFor("Cameras").textContent).toContain("cameras_enabled");
+  });
+
+  it("keeps field names out of sight until asked for", async () => {
+    await renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /Privacy & Security/ }));
+
+    // A household sees what the setting does, never what it is called — but the
+    // description is there, so the row says more than its label.
+    expect(rowFor("Microphone").textContent).not.toContain("mic_enabled");
+    expect(rowFor("Microphone").textContent!.length).toBeGreaterThan("Microphone".length + 20);
+
+    fireEvent.click(screen.getByRole("button", { name: /Developer view/ }));
+    expect(rowFor("Microphone").textContent).toContain("mic_enabled");
+  });
+
+  it("offers a way back into setup, behind developer view and behind a confirm", async () => {
+    mockApi.resetOnboarding.mockResolvedValue({
+      onboarded: false, current_step: "welcome", steps_completed: 0, total_steps: 5,
+    });
+    await renderPage();
+
+    // Not on offer to a household.
+    expect(screen.queryByRole("button", { name: /Start onboarding/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /Developer view/ }));
+    const start = screen.getByRole("button", { name: /Start onboarding/ });
+
+    // First press only arms it — re-running setup throws away what it collected.
+    fireEvent.click(start);
+    expect(mockApi.resetOnboarding).not.toHaveBeenCalled();
+    await screen.findByRole("button", { name: /Yes, start setup/ });
+  });
+
+  it("disarms the setup button when developer view is switched off", async () => {
+    await renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /Developer view/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Start onboarding/ }));
+    await screen.findByRole("button", { name: /Yes, start setup/ });
+
+    fireEvent.click(screen.getByRole("button", { name: /Developer view/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Developer view/ }));
+    // Never found half-pressed.
+    expect(screen.getByRole("button", { name: /Start onboarding/ })).toBeTruthy();
+    expect(mockApi.resetOnboarding).not.toHaveBeenCalled();
+  });
+
+  it("folds the banner away and keeps answering its question while folded", async () => {
+    await renderPage();
+    const toggle = screen.getByRole("button", { name: /Right now/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    // Folded, it still says what the pond may do — a summary, not a blank strip.
+    expect(document.querySelector(".scat__postureGist")!.textContent).toContain("listens");
+  });
+
+  it("contracts the search to its icon and keeps what was typed", async () => {
+    await renderPage();
+    const box = screen.getByLabelText("Search settings") as HTMLInputElement;
+    fireEvent.change(box, { target: { value: "camera" } });
+    await screen.findByText(/result/);
+
+    // Pressing the icon while open clears and closes — one control, both ways.
+    fireEvent.click(screen.getByRole("button", { name: /Close search/ }));
+    expect((screen.getByLabelText("Search settings") as HTMLInputElement).value).toBe("");
+    expect(document.querySelector(".scat__search")!.getAttribute("data-open")).toBe("false");
+  });
+
+  it("fills the place and both coordinates from one press", async () => {
+    const getCurrentPosition = vi.fn((ok: (p: unknown) => void) =>
+      ok({ coords: { latitude: -1.2864123, longitude: 36.8172223 } }));
+    vi.stubGlobal("navigator", { ...navigator, geolocation: { getCurrentPosition } });
+
+    await renderPage({ weather_location_name: "" });
+    fireEvent.click(screen.getByRole("button", { name: /Detect/ }));
+
+    // Coordinates rounded to four places — finer than weather needs, and it
+    // keeps the stored value from reading like a tracking fix.
+    await waitFor(() =>
+      expect((screen.getByLabelText("Latitude") as HTMLInputElement).value).toBe("-1.2864"));
+    expect((screen.getByLabelText("Longitude") as HTMLInputElement).value).toBe("36.8172");
+    // The name comes from the time zone, matching what `location::resolve` does
+    // server-side, so a detected pond and an undetected one agree.
+    expect((screen.getByLabelText("Location") as HTMLInputElement).value).toBe("Nairobi");
+    vi.unstubAllGlobals();
+  });
+
+  // The two things the deleted classic Settings view owned. Losing either while
+  // keeping the settings around them would look like they still worked.
+  it("still offers appearance, which the pond has no say in", async () => {
+    await renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /^Appearance/ }));
+    expect(document.querySelector(".scat__panel--appearance")).toBeTruthy();
+  });
+
+  it("still offers wake-word training beside the phrase", async () => {
+    await renderPage({ voice_wake_word: "hey goose" });
+    fireEvent.click(screen.getByRole("button", { name: /^Voice/ }));
+    const train = screen.getByRole("button", { name: /Train/ }) as HTMLButtonElement;
+    expect(train.disabled).toBe(false);
+  });
+
+  it("will not train a phrase that has not been typed yet", async () => {
+    await renderPage({ voice_wake_word: "" });
+    fireEvent.click(screen.getByRole("button", { name: /^Voice/ }));
+    expect((screen.getByRole("button", { name: /Train/ }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("leaves the model-role mirrors to the Models page", async () => {
+    await renderPage();
+    fireEvent.click(screen.getByRole("button", { name: /^Models/ }));
+    // pond-server syncs these FROM model_role_assignments, so a control here
+    // would lose to the next sync. They stay catalogued, they are not offered.
+    expect(screen.queryByLabelText("Chat model")).toBeNull();
+    expect(screen.queryByLabelText("Embedding model")).toBeNull();
   });
 
   it("counts the inert settings per category in the rail", async () => {
@@ -200,11 +330,25 @@ describe("SettingsCatalogue", () => {
 
   it("searches across every category, not just the open one", async () => {
     await renderPage();
-    // "Cameras" lives under Privacy; the camera pipeline under Vision.
+    // "Motion sensitivity" lives under Vision; "Camera address" beside it — and
+    // neither is on the category the page opens to.
     fireEvent.change(screen.getByLabelText("Search settings"), { target: { value: "camera" } });
     await screen.findByText(/results/);
-    expect(screen.getByLabelText("Cameras")).toBeTruthy();
     expect(screen.getByLabelText("Camera address")).toBeTruthy();
+
+    // `cameras_enabled` also matches "camera", but nothing reads it, so it is
+    // not among the results a household is offered.
+    expect(screen.queryByLabelText("Cameras")).toBeNull();
+  });
+
+  it("finds a setting by what it does, not only by its name", async () => {
+    await renderPage();
+    // "greetings" appears nowhere in the label "Home name" — only in its
+    // description. Before descriptions were searchable this found nothing.
+    fireEvent.change(screen.getByLabelText("Search settings"), { target: { value: "greetings" } });
+    // One match, so the heading reads "result" — not "results".
+    await screen.findByText(/result/);
+    expect(screen.getByLabelText("Home name")).toBeTruthy();
   });
 
   it("renders consequential choices as radios", async () => {

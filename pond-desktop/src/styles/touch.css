@@ -562,3 +562,49 @@ label:has(> .native-checkbox) {
   padding-left: var(--sidebar-inset);
   padding-right: var(--sidebar-inset);
 }
+
+/* ── The settings catalogue ───────────────────────────────────────────────
+ *
+ * The same split as everywhere else, with one difference worth stating: the
+ * density argument that protects Logs and Models does NOT apply here. Those
+ * screens put ten filter pills in a row, so shrinking them buys real
+ * information per screen. A settings row holds exactly one control, so a
+ * compact control buys nothing and costs the target. These take the floor
+ * outright rather than reaching for it.
+ *
+ * `.scat__searchInput` and `.scat__field--num` are handled further up with the
+ * other fields; this is the rest of the page.
+ */
+
+/* Navigation, so it grows on every pointer — the rail is how you get anywhere
+ * on a page with twelve categories behind it. */
+.scat__navBtn { min-height: var(--tap-min); }
+
+/* A radio here is two to four options and the cost of hitting the wrong one is
+ * a changed setting, not a re-filtered list. Full target, not a reach region. */
+.scat__radio { min-height: var(--tap-min); }
+
+/* The control cell, not the control. HeroUI's Switch keeps a clipped input
+ * inside its own plumbing and the checkbox rules above already record what
+ * happens when a stylesheet reaches into that. Giving the cell the floor puts
+ * the switch in a comfortable region without touching the component. */
+.scat__ctl {
+  display: flex;
+  align-items: center;
+  min-height: var(--tap-min);
+}
+
+@media (pointer: coarse) {
+  /* With every control at the floor, the old row rhythm reads tight — the
+   * controls stop colliding but the rows still look stacked. */
+  .scat__row { padding-block: var(--space-3); }
+
+  /* Group headings earn a little more air for the same reason: on a panel
+   * the eye needs somewhere to rest between one subgroup and the next. */
+  .scat__groupHead { padding-block: var(--space-3); }
+
+  /* The inline action beside a control ("Use Africa/Nairobi") is the one
+   * genuinely dense thing on this page, so it keeps its size and takes a
+   * reach region from `.reach` instead. */
+  .scat__detect { min-height: var(--tap-dense); }
+}
