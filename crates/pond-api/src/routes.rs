@@ -4428,12 +4428,9 @@ async fn update_settings(
     // model) until someone fixed a field they were not touching.
     let touches_matter = patch
         .as_object()
-        .is_some_and(|o| o.contains_key("matter_enabled") || o.contains_key("matter_ws_url"));
+        .is_some_and(|o| o.contains_key("matter_ws_url"));
     let matter_url = merged.matter_ws_url.trim();
-    if touches_matter
-        && merged.matter_enabled
-        && !(matter_url.starts_with("ws://") || matter_url.starts_with("wss://"))
-    {
+    if touches_matter && !(matter_url.starts_with("ws://") || matter_url.starts_with("wss://")) {
         // An empty address and a malformed one are different mistakes and read
         // as different sentences: "empty" tells the user the field they are
         // looking at is blank, which the placeholder otherwise hides.
@@ -4544,15 +4541,11 @@ async fn update_settings(
     // Repeat that a few times and the Devices panel sits on "Starting..."
     // forever.
     //
-    // Retry from the Devices tab still works: `saveMatter` sends
-    // `matter_enabled` and `matter_ws_url` explicitly, so it is a
-    // `touches_matter` save by construction.
+    // Retry from the Devices tab still works: it sends `matter_ws_url`
+    // explicitly, so it is a `touches_matter` save by construction.
     if touches_matter {
         if let Some(matter) = &state.matter {
-            matter.apply(
-                merged.matter_enabled,
-                merged.matter_ws_url.trim().to_string(),
-            );
+            matter.apply(merged.matter_ws_url.trim().to_string());
         }
     }
 

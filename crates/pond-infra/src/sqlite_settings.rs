@@ -206,14 +206,6 @@ impl SettingsRepository for SqliteSettingsRepository {
         );
         upsert!("vision_classifier_model", &settings.vision_classifier_model);
         // Matter (#195)
-        upsert!(
-            "matter_enabled",
-            if settings.matter_enabled {
-                "true"
-            } else {
-                "false"
-            }
-        );
         upsert!("matter_ws_url", &settings.matter_ws_url);
         // Private mesh (#132)
         upsert!(
@@ -889,7 +881,12 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         }
         "vision_classifier_model" => s.vision_classifier_model = value.to_string(),
         // Matter (#195)
-        "matter_enabled" => s.matter_enabled = value == "true",
+        // `matter_enabled` was a setting while Matter was opt-in. A row may
+        // still be here from then, and it is ignored rather than honoured: the
+        // toggle that set it is gone, so an install that had it off would have
+        // no way back and every device command would refuse with advice
+        // pointing at a control that no longer exists.
+        "matter_enabled" => {}
         // An empty row must not defeat the default. `get` starts from
         // `Settings::default()` and overwrites it row by row, so a stored empty
         // string would leave no address at all — and the Devices tab renders

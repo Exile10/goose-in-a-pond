@@ -80,7 +80,7 @@ pub trait MatterRuntimePort: Send + Sync {
     /// install plus startup), and the settings write that triggers it must not
     /// block on that. Idempotent — asking for the state already in effect does
     /// nothing, so repeated saves do not churn the connection.
-    fn apply(&self, enabled: bool, url: String);
+    fn apply(&self, url: String);
 
     /// What the runtime is currently doing.
     async fn status(&self) -> MatterStatus;

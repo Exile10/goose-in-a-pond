@@ -28,6 +28,7 @@ mod llm_memory_consolidator;
 mod llm_memory_extractor;
 mod mdns_advertiser;
 mod model_download;
+mod node_path;
 mod ports;
 mod reqwest_model_downloader;
 mod schedule_executors;
@@ -410,6 +411,15 @@ enum MemoryAction {
 }
 
 fn main() -> Result<()> {
+    // Before the runtime exists, so this is genuinely single-threaded, and
+    // before any child is spawned — which is the only moment it can help. A
+    // GUI-launched process inherits launchd's bare PATH, so nvm's node is
+    // invisible to it and both the Matter controller and the stdio extensions
+    // fail with "not found in PATH". Logged rather than reported: nothing is
+    // wrong yet, and the subsystems that need Node say so themselves if it
+    // turns out not to be there at all.
+    node_path::ensure_node_on_path();
+
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -3384,10 +3394,7 @@ async fn run_server(
         matter
             .attach_notifications(notification_sender.clone())
             .await;
-        matter.apply(
-            settings.matter_enabled,
-            settings.matter_ws_url.trim().to_string(),
-        );
+        matter.apply(settings.matter_ws_url.trim().to_string());
 
         // Bounded, so the Matter lines belong to the startup log rather than
         // arriving after the "listening" banner as though something had
