@@ -133,18 +133,22 @@ describe("device description", () => {
           absMinHeatSetpointLimit: 700,
           absMaxHeatSetpointLimit: 3000,
           occupiedCoolingSetpoint: 2600,
-          // Whole degrees, where the setpoints are hundredths.
-          minSetpointDeadBand: 3,
+          // TENTHS of a degree, where the setpoints are hundredths: an int8 whose
+          // legal range is 0 to 25, so this is 2.5 degrees. These are the values
+          // the Matter Virtual Device actually reports.
+          minSetpointDeadBand: 25,
           occupiedHeatingSetpoint: 2000,
         },
       }),
     ]);
 
+    // 26 less 2.5, which is where that device stops accepting: 23 goes in, 24 does
+    // not. Read as whole degrees this came out as 1.
     expect(capability(auto, "target_temp")?.value).toEqual({
       kind: "number",
       unit: "C",
       min: 7,
-      max: 23,
+      max: 23.5,
     });
   });
 

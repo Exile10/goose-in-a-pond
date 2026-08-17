@@ -28,6 +28,7 @@ import {
   type Device,
   type DeviceDescription,
   type DeviceState,
+  type ValueSpec,
   type DeviceStatePatch,
   type Reading,
 } from "./protocol.js";
@@ -384,7 +385,7 @@ export class Controller {
         }
       } catch (error) {
         if (error instanceof OpError) throw error;
-        throw refusalOrFault(deviceId, error);
+        throw refusalOrFault(deviceId, error, acceptedFor(snapshotOf(peer, nodeId), verb, value));
       }
     }
 
@@ -656,19 +657,62 @@ const REFUSALS: ReadonlyMap<string, string> = new Map([
  * carrying the device's own words, because guessing that an unfamiliar error was a
  * refusal would hide a real outage.
  */
-export function refusalOrFault(deviceId: string, error: unknown): OpError {
+export function refusalOrFault(deviceId: string, error: unknown, accepts?: string): OpError {
   const said = describeError(error);
   const lowered = said.toLowerCase();
 
   for (const [needle, meaning] of REFUSALS) {
     if (lowered.includes(needle)) {
+      // What it WILL take, on the refusal itself. A caller that did not read the
+      // description first is exactly the caller who gets here, and telling it only
+      // that the value was wrong leaves it to guess again -- which is what a
+      // thermostat refusing 30 with no mention of 23.5 produced.
+      const offer = accepts === undefined ? "" : ` It accepts ${accepts}.`;
       return new OpError(
         "device_refused",
-        `Matter device '${deviceId}' refused that: ${meaning} (it said: ${said})`,
+        `Matter device '${deviceId}' refused that: ${meaning} (it said: ${said}).${offer}`,
       );
     }
   }
   return new OpError("device_unreachable", said);
+}
+
+/** How the device's own description words what this verb takes, if it says. */
+function acceptedFor(node: NodeSnapshot, verb: Verb, value: unknown): string | undefined {
+  const setting = verb === "mode" ? readSettingName(value) : undefined;
+  const capability = describeNode(node).capabilities.find(
+    c => c.verb === verb && (setting === undefined || c.setting === setting),
+  );
+  return capability === undefined ? undefined : wordValueSpec(capability.value);
+}
+
+/** The setting a `mode` request named, so its own limits are the ones quoted. */
+function readSettingName(value: unknown): string | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const setting = (value as { setting?: unknown }).setting;
+  return typeof setting === "string" ? setting : undefined;
+}
+
+function wordValueSpec(spec: ValueSpec): string | undefined {
+  switch (spec.kind) {
+    case "enum":
+      return spec.values.join(", ");
+    case "percent":
+      return "0 to 100 percent";
+    case "number": {
+      const unit = spec.unit === undefined ? "" : ` ${spec.unit}`;
+      if (spec.min !== undefined && spec.max !== undefined) {
+        return `${spec.min} to ${spec.max}${unit}`;
+      }
+      if (spec.max !== undefined) return `up to ${spec.max}${unit}`;
+      if (spec.min !== undefined) return `from ${spec.min}${unit}`;
+      return undefined;
+    }
+    // Nothing a refusal could usefully narrow.
+    case "boolean":
+    case "color":
+      return undefined;
+  }
 }
 
 /** ErrorStateEnum, for a device that sends an id without a label. */

@@ -325,4 +325,15 @@ describe("appliance settings", () => {
     expect(fault.code).toBe("device_unreachable");
     expect(fault.message).toBe("socket hang up");
   });
+
+  it("says what the device will take, on the refusal itself", () => {
+    // A caller that did not read the description first is exactly the caller who
+    // gets here. Told only that 30 was wrong, it asked for 30 again.
+    const refused = refusalOrFault("matter-1", new Error("Constraint error"), "7 to 23.5 C");
+    expect(refused.message).toMatch(/It accepts 7 to 23\.5 C\./);
+
+    // Nothing useful to add is not a reason to invent something.
+    const bare = refusalOrFault("matter-1", new Error("Constraint error"));
+    expect(bare.message).not.toMatch(/It accepts/);
+  });
 });

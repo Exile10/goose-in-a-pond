@@ -106,7 +106,8 @@ function fanModes(node: NodeSnapshot): string[] {
  * `minSetpointDeadBand` apart, so the heating setpoint cannot come within that of
  * the cooling one -- a ceiling that appears in no limit attribute at all. Measured
  * on Google's Matter Virtual Device: it advertised 7 to 30, accepted 23, and
- * answered "Constraint error" from 24 up, because its cooling setpoint sat at 26.
+ * answered "Constraint error" from 24 up -- its cooling setpoint sits at 26 with a
+ * 2.5 degree deadband, so 23.5 is the true ceiling.
  * The description said 30 was allowed, so the model tried 30, and the failure it
  * got back explained nothing.
  */
@@ -137,15 +138,20 @@ function temperatureSpec(node: NodeSnapshot): ValueSpec {
 /**
  * The highest heating setpoint that still clears the cooling one.
  *
- * `minSetpointDeadBand` is in whole degrees where the setpoints are in hundredths,
- * which is the kind of mismatch that silently produces a limit a hundred times too
- * generous.
+ * Three units in one subtraction. Setpoints are hundredths of a degree;
+ * `minSetpointDeadBand` is TENTHS -- an int8 whose legal range is 0 to 25, meaning
+ * 0 to 2.5 degrees. Reading it as whole degrees turned a 2.5 degree band into 25,
+ * and a thermostat that accepts up to 23.5 was described as accepting up to 1.
+ *
+ * The value that makes this trap worth a function: 25 is a plausible-looking
+ * number in either unit, so the mistake produces a limit that is wrong rather than
+ * absurd, and the arithmetic is the only place it shows.
  */
 export function heatingCeilingUnder(
   coolingHundredths: number,
-  deadbandDegrees: number | undefined,
+  deadbandTenths: number | undefined,
 ): number {
-  return coolingHundredths - (deadbandDegrees ?? 0) * 100;
+  return coolingHundredths - (deadbandTenths ?? 0) * 10;
 }
 
 /** The unit a concentration cluster declares, if it declares one. */
