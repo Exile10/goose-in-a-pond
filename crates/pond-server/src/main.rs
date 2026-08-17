@@ -3548,6 +3548,50 @@ async fn run_server(
             unified_retrieval,
         );
 
+        // PAI-8's first connector, on a timer.
+        //
+        // Deferred like the index sweep and for the same reason: a household's
+        // first turn after a restart must not wait while the pond talks to a
+        // calendar server. The interval is deliberately unhurried -- a calendar
+        // changes a few times a week, the ctag check makes an unchanged sync
+        // nearly free, and anything faster is load on somebody else's server
+        // for no new information.
+        if let Some(secrets) = secret_repo.clone() {
+            let sync_repo = context_repo.clone();
+            let sync_pipeline = pipeline.clone();
+            tokio::spawn(async move {
+                const FIRST_RUN_DELAY: std::time::Duration = std::time::Duration::from_secs(90);
+                const INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+                tokio::time::sleep(FIRST_RUN_DELAY).await;
+                loop {
+                    match pond_server::calendar_sync::sync_calendars(
+                        sync_repo.clone(),
+                        sync_pipeline.clone(),
+                        secrets.clone(),
+                        chrono::Utc::now(),
+                    )
+                    .await
+                    {
+                        Ok(report) if report.sources > 0 => tracing::info!(
+                            sources = report.sources,
+                            unchanged = report.unchanged,
+                            ingested = report.ingested,
+                            needs_reauth = report.needs_reauth,
+                            failed = report.failed,
+                            paused = report.paused,
+                            "calendar sync"
+                        ),
+                        // Silent when no calendar is connected, which is every
+                        // pond until somebody connects one. A half-hourly line
+                        // saying "nothing" is how a log stops being read.
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "calendar sync could not run"),
+                    }
+                    tokio::time::sleep(INTERVAL).await;
+                }
+            });
+        }
+
         let ingest = Arc::new(pond_core::context::bus_ingest::BusIngest::new(
             context_repo,
             pipeline,

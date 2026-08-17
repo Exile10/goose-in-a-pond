@@ -981,9 +981,9 @@ mod tests {
         // this test pass having asserted nothing.
         assert_eq!(
             refused,
-            SourceKind::ALL.len() - 3,
-            "exactly the five connector kinds are unlanded; if that changed, this sweep is no \
-             longer testing what it claims"
+            SourceKind::ALL.len() - 4,
+            "sensor, camera, voice and calendar have a path; the other four do not. If that \
+             changed, this sweep is no longer testing what it claims"
         );
         assert!(
             p.raw_item_for(&source(SourceKind::Sensor, HALL_PIR), &event)

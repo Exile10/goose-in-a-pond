@@ -189,9 +189,25 @@ impl SourceKind {
             // Data the pond already holds. Ingesting it adds no egress.
             Self::Sensor | Self::Camera | Self::Voice => SourceAvailability::Landed,
             Self::Mobile => SourceAvailability::AwaitingIngestRoute,
-            Self::Mail | Self::Calendar | Self::Files | Self::Chat => {
-                SourceAvailability::AwaitingReadConnector
-            }
+            // The CalDAV adapter reads it, the connect route stores its
+            // credentials and `calendar_sync` pulls it on a schedule. All three
+            // had to exist before this line could move: a `Landed` kind with no
+            // sync is a source that looks connected and stays empty.
+            Self::Calendar => SourceAvailability::Landed,
+            Self::Mail | Self::Files | Self::Chat => SourceAvailability::AwaitingReadConnector,
+        }
+    }
+
+    /// Whether connecting this kind means signing in to an account.
+    ///
+    /// The two on-pond kinds are already here and need nothing; the account
+    /// kinds cannot work without an app password. Stated on the kind rather
+    /// than checked at the route, because the connect surface and the sync
+    /// sweep both have to agree and a second copy is how they stop agreeing.
+    pub fn needs_credentials(&self) -> bool {
+        match self {
+            Self::Sensor | Self::Camera | Self::Voice | Self::Mobile => false,
+            Self::Mail | Self::Calendar | Self::Files | Self::Chat => true,
         }
     }
 
@@ -352,6 +368,16 @@ pub struct ContextSource {
     status: SourceStatus,
     secret_ref: Option<String>,
     created_at: DateTime<Utc>,
+}
+
+/// Where a source's sign-in details live in the secret store.
+///
+/// Derived from the source id rather than stored beside it, so the two cannot
+/// drift and a disconnect knows what to delete without reading the row it has
+/// just removed. Both the connect route and the sync sweep call this; a second
+/// copy of the format string is how a credential becomes unreachable.
+pub fn secret_key_for(source_id: &str) -> String {
+    format!("caldav:{source_id}")
 }
 
 /// The parts a [`ContextSource`] is built from, on both the connect path and the
@@ -842,16 +868,21 @@ mod tests {
     /// would let the pipeline accept a connector's data before the gate that is
     /// supposed to govern it exists.
     #[test]
-    fn only_the_on_pond_kinds_are_landed() {
+    fn only_kinds_with_a_working_path_are_landed() {
         let landed: Vec<&str> = SourceKind::ALL
             .into_iter()
             .filter(|k| k.availability() == SourceAvailability::Landed)
             .map(|k| k.as_str())
             .collect();
+        // `calendar` joined the on-pond three when its connector landed, and it
+        // is the whole test: a kind may only be `Landed` when something can
+        // actually produce items for it. Adding a name here before the adapter,
+        // the credential path and the sync all exist mints sources that look
+        // connected and stay empty.
         assert_eq!(
             landed,
-            vec!["sensor", "camera", "voice"],
-            "PAI-8 P1 is on-pond sources only; anything else needs a phase that has not landed"
+            vec!["sensor", "camera", "voice", "calendar"],
+            "a kind is Landed only once an adapter, a credential path and a sync exist for it"
         );
         for kind in SourceKind::ALL {
             if kind.availability() != SourceAvailability::Landed {

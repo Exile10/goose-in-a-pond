@@ -14778,6 +14778,25 @@ struct ConnectSourceRequest {
     /// Which conversation the caller is speaking in. The OWNER is resolved from
     /// this and the caller's proven device; see below.
     session_id: String,
+    /// Sign-in details, for a kind that reaches an account.
+    ///
+    /// REQUIRED for `calendar` and refused for the on-pond kinds. A calendar
+    /// source without them would be a row that looks connected and can never
+    /// sync — the empty-source shape `availability` exists to prevent, arriving
+    /// through the door instead of around it.
+    #[serde(default)]
+    credentials: Option<ConnectCredentials>,
+}
+
+/// App-password sign-in for an account source. Never echoed back.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectCredentials {
+    username: String,
+    password: String,
+    /// Only for the self-hosted presets (`nextcloud`, `custom`).
+    #[serde(default)]
+    base_url: Option<String>,
 }
 
 /// The owner of a source is resolved, never supplied.
@@ -14843,7 +14862,72 @@ async fn connect_context_source(
     let now = chrono::Utc::now();
     // Deterministic id, so connecting the same device twice is an update rather
     // than a second source racing the first for the same events.
-    let id = format!("{}:{}", kind.as_str(), body.provider.trim());
+    //
+    // An account kind carries the OWNER in its id as well. Two members each
+    // connecting their own Google calendar is the ordinary case in a household,
+    // and `calendar:google` alone would make the second one collide with the
+    // first — which migration 0044 correctly refuses, leaving a member unable
+    // to connect for a reason that is not their fault. The profile id is
+    // already on the row, so this adds no new personal data to the key.
+    let id = if kind.needs_credentials() {
+        format!("{}:{}:{}", kind.as_str(), body.provider.trim(), owner)
+    } else {
+        format!("{}:{}", kind.as_str(), body.provider.trim())
+    };
+
+    // Credentials, before the source row exists. Storing them second would
+    // leave a source that cannot sync if the secret write failed, which is the
+    // same empty-source outcome by a slower route.
+    let secret_ref = match (kind.needs_credentials(), body.credentials.as_ref()) {
+        (true, None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "this source signs in to an account, so it needs a username and an \
+                              app password",
+                })),
+            ))
+        }
+        (false, Some(_)) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "this source is already on the pond and needs no sign-in details",
+                })),
+            ))
+        }
+        (false, None) => None,
+        (true, Some(creds)) => {
+            // No secret store means no credentials, and REFUSING is the only
+            // safe answer: the alternatives are dropping the password (a source
+            // that can never sync) or putting it somewhere unencrypted, and
+            // invariant 4 exists to rule out the second.
+            let Some(secrets) = state.secret_repo.as_ref() else {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "this pond has no encrypted secret store, so it cannot hold \
+                                  an account password",
+                    })),
+                ));
+            };
+            let key = pond_core::context::domain::secret_key_for(&id);
+            let blob = json!({
+                "username": creds.username,
+                "password": creds.password,
+                "base_url": creds.base_url,
+            })
+            .to_string();
+            secrets.set(&key, &blob).await.map_err(|e| {
+                tracing::warn!(error = %e, "could not store calendar credentials");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "could not store the sign-in details"})),
+                )
+            })?;
+            Some(key)
+        }
+    };
     let source = ContextSource::from_parts(SourceParts {
         id: id.clone(),
         kind,
@@ -14853,7 +14937,7 @@ async fn connect_context_source(
         cursor: None,
         last_sync: None,
         status: SourceStatus::Connected,
-        secret_ref: None,
+        secret_ref,
         created_at: now,
     })
     .map_err(|e| {
