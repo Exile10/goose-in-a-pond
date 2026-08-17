@@ -43,6 +43,10 @@ async function main(): Promise<void> {
 
   const node = await ServerNode.create({
     id: "giap-virtual-device",
+    // 5541, not Matter's standard 5540, so this can run alongside a real device
+    // app that wants the standard port — Google's Matter Virtual Device among
+    // them. The controller used to squat 5540 itself, which is what broke those
+    // apps; it no longer does, so 5540 is left for whoever actually needs it.
     network: { port: 5541 },
     commissioning: { passcode: PASSCODE, discriminator: DISCRIMINATOR },
     productDescription: { name: "GIAP Test Light", deviceType: DimmableLightDevice.deviceType },
