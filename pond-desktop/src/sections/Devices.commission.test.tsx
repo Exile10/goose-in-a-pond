@@ -134,24 +134,15 @@ describe("Add device — Matter vs other", () => {
     expect((screen.getByPlaceholderText(/20202021/) as HTMLInputElement).value).toBe("20202021");
   });
 
-  it("switching to 'Other device' restores the manual fields and registers", async () => {
-    mocked(api.registerDevice).mockResolvedValue({ id: "d1", name: "Pi" });
+  it("offers no path but Matter, because there is no other kind to add", async () => {
     await openModal();
 
-    fireEvent.click(screen.getByText("Other device"));
-
-    // Manual entry is back, and the setup code is gone.
-    expect(await screen.findByText("Device type")).toBeTruthy();
-    expect(screen.queryByText("Setup code")).toBeNull();
-
-    fireEvent.change(screen.getByPlaceholderText("Living Room Pi"), {
-      target: { value: "Pi" },
-    });
-    fireEvent.click(screen.getByText("Register"));
-
-    await waitFor(() => expect(api.registerDevice).toHaveBeenCalled());
-    // A non-Matter device is never commissioned.
-    expect(api.commissionDevice).not.toHaveBeenCalled();
+    // Phones pair with a pairing code and the desktop app is this app, so a
+    // chooser here had one real option in it and a form nobody could use.
+    expect(await screen.findByText("Setup code")).toBeTruthy();
+    expect(screen.queryByText("Other device")).toBeNull();
+    expect(screen.queryByText("Device type")).toBeNull();
+    expect(screen.queryByText("Register")).toBeNull();
   });
 });
 
@@ -164,60 +155,27 @@ describe("Matter section — turning the fabric on", () => {
     expect((await screen.findByTestId("matter-state")).textContent).toBe("Starting…");
   });
 
-  it("carries the controller address as a value, not just a placeholder", async () => {
+  it("offers nothing to switch on, because there is nothing to switch on", async () => {
     render(<Devices />);
-    const input = (await screen.findByLabelText("Controller address")) as HTMLInputElement;
+    await screen.findByTestId("matter-state");
 
-    // The placeholder is the same string as the default address, so anything
-    // that asserts on displayed text passes even when nothing is set. The value
-    // is the only thing separating "configured" from "blank".
-    await waitFor(() => expect(input.value).toBe("ws://127.0.0.1:5580/giap"));
-    expect(input.placeholder).toBe(input.value);
+    // Matter installs its own controller and runs by default, so a toggle's
+    // only honest advice was "leave it on" — a question the appliance should
+    // not be asking. The address is an operator setting and lives in Settings.
+    expect(screen.queryByLabelText("Enable Matter")).toBeNull();
+    expect(screen.queryByLabelText("Controller address")).toBeNull();
   });
 
-  it("leaves the field visibly empty when the runtime reports no address", async () => {
-    mocked(api.getMatterStatus).mockResolvedValue({
-      enabled: false,
-      url: "",
-      state: "disabled",
-    });
-    render(<Devices />);
-    const input = (await screen.findByLabelText("Controller address")) as HTMLInputElement;
-
-    // Supplying the default is the server's job (an empty stored value resolves
-    // to it there). The UI must not paper over a genuinely empty address, or
-    // the user is back to a filled-looking field that fails to save.
-    await waitFor(() => expect(input.value).toBe(""));
-  });
-
-  it("saves the toggle and re-reads what actually happened", async () => {
-    mocked(api.getMatterStatus).mockResolvedValue(matterStatus("disabled"));
-    render(<Devices />);
-    await waitFor(() => expect(api.getMatterStatus).toHaveBeenCalled());
-
-    fireEvent.click(screen.getByLabelText("Enable Matter"));
-
-    await waitFor(() =>
-      expect(api.updateSettings).toHaveBeenCalledWith({
-        matter_enabled: true,
-        matter_ws_url: "ws://127.0.0.1:5580/giap",
-      }),
-    );
-    // The runtime is asked again rather than the UI assuming the save worked.
-    await waitFor(() => expect(mocked(api.getMatterStatus).mock.calls.length).toBeGreaterThan(1));
-  });
-
-  it("blocks commissioning while Matter is off, and says where to turn it on", async () => {
-    mocked(api.getMatterStatus).mockResolvedValue(matterStatus("disabled"));
+  it("blocks commissioning until the controller is up, and says which it is", async () => {
+    mocked(api.getMatterStatus).mockResolvedValue(matterStatus("connecting"));
     await openModal();
 
     fireEvent.change(await screen.findByPlaceholderText(/20202021/), {
       target: { value: "20202021" },
     });
-    // The old build let this through and failed on submit with advice that
-    // pointed at a Settings control which did not exist.
+    // The old build let this through and failed on submit.
     expect(screen.getByText("Commission").closest("button")?.disabled).toBe(true);
-    expect(screen.getByTestId("matter-not-ready").textContent).toMatch(/Matter is off/);
+    expect(screen.getByTestId("matter-not-ready").textContent).toMatch(/still starting up/);
   });
 
   it("reports an unreachable controller as its own problem, and retries in place", async () => {
@@ -231,12 +189,12 @@ describe("Matter section — turning the fabric on", () => {
     );
     expect(screen.getByText(/connection refused/)).toBeTruthy();
 
-    // Retry is the same save: the runtime reconnects because it compares
-    // against what is running, not against the request.
+    // Retry re-sends the current address: the runtime treats an unchanged
+    // request while unreachable as a retry, because it compares against what is
+    // running rather than against the request.
     fireEvent.click(screen.getByText("Retry"));
     await waitFor(() =>
       expect(api.updateSettings).toHaveBeenCalledWith({
-        matter_enabled: true,
         matter_ws_url: "ws://127.0.0.1:5580/giap",
       }),
     );

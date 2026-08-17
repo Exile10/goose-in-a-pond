@@ -2782,7 +2782,7 @@ async fn run_server(
     // controller is reachable, else the logging stub.
     //
     // Which of the two is live is the runtime's decision and can change at any
-    // moment, because `matter_enabled` is a user-facing toggle rather than a
+    // moment, because the controller can come and go at runtime rather than being a
     // boot-time constant. `device_control` is therefore a facade — one `Arc`
     // that the agent, the MCP server, and the tool wiring hold for the life of
     // the process while the backend behind it is swapped underneath.

@@ -49,7 +49,8 @@ impl MatterState {
 /// A snapshot of the runtime, safe to serialize straight to the UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatterStatus {
-    /// The persisted `matter_enabled` setting — what the user asked for.
+    /// Whether the integration is meant to be running at all. On by default;
+    /// not a user-facing toggle.
     pub enabled: bool,
     /// The controller URL currently in effect.
     pub url: String,

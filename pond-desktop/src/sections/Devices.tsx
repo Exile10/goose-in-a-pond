@@ -27,14 +27,6 @@ const MATTER_STATE_LABEL: Record<MatterStatus["state"], string> = {
 /** How often to re-check while the controller is starting up. */
 const MATTER_POLL_MS = 2000;
 
-const DEVICE_TYPES = [
-  { value: "host",          label: "Host / PC" },
-  { value: "sensor",        label: "Sensor" },
-  { value: "gotg",          label: "Mobile (GOTG)" },
-  { value: "smart_speaker", label: "Smart speaker" },
-  { value: "pond",          label: "Pond instance" },
-  { value: "edge",          label: "Edge device" },
-];
 
 function DeviceIcon({ kind }: { kind: string | undefined }) {
   if (kind === "host")   return <Cpu size={22} />;
@@ -89,17 +81,12 @@ export function Devices() {
 
   // Form state
   const [name, setName]               = useState("");
-  const [mode, setMode]               = useState<"matter" | "manual">("matter");
   const [setupCode, setSetupCode]     = useState("");
-  const [deviceType, setDeviceType]   = useState("host");
-  const [hostname, setHostname]       = useState("");
-  const [room, setRoom]               = useState("");
   const [submitting, setSubmitting]   = useState(false);
   const [formError, setFormError]     = useState<string | null>(null);
 
   // Matter section state
   const [matter, setMatter]           = useState<MatterStatus | null>(null);
-  const [matterUrl, setMatterUrl]     = useState("");
   const [matterBusy, setMatterBusy]   = useState(false);
   const [matterError, setMatterError] = useState<string | null>(null);
 
@@ -122,19 +109,18 @@ export function Devices() {
       .finally(() => setLoading(false));
   }
 
-  /** Read the Matter runtime's actual state. The URL field follows it unless
-   *  the user is mid-edit, so a reload never clobbers what they are typing. */
-  function loadMatter(adoptUrl = false) {
+  /** Read the Matter runtime's actual state — what it is doing, not what was
+   *  saved. "Starting" and "unreachable" need different words from the user. */
+  function loadMatter() {
     return api.getMatterStatus()
       .then((s) => {
         setMatter(s);
-        if (adoptUrl) setMatterUrl(s.url);
         return s;
       })
       .catch((e) => { setMatterError(errorText(e)); return null; });
   }
 
-  useEffect(() => { load(); void loadMatter(true); }, []);
+  useEffect(() => { load(); void loadMatter(); }, []);
 
   // Enabling installs and starts a controller, which the settings save does not
   // wait for — so the panel watches it come up rather than claiming it is done.
@@ -144,16 +130,19 @@ export function Devices() {
     return () => clearInterval(timer);
   }, [matter?.state]);
 
-  /** Save the Matter settings and start watching the runtime converge. Also the
-   *  retry path: re-sending an unchanged state reconnects a failed controller. */
-  async function saveMatter(enabled: boolean, url: string) {
+  /** Ask the runtime to try again.
+   *
+   *  Re-sending the current settings is what reconnects a failed controller —
+   *  the reconciler treats an unchanged request while unreachable as a retry,
+   *  which is precisely what this button means. */
+  async function retryMatter() {
     setMatterBusy(true);
     setMatterError(null);
     try {
-      await api.updateSettings({ matter_enabled: enabled, matter_ws_url: url.trim() });
-      // Optimistic, so the chip moves the moment the toggle does; the poll
-      // above replaces this with whatever actually happened.
-      setMatter({ enabled, url: url.trim(), state: enabled ? "connecting" : "disabled" });
+      await api.updateSettings({ matter_ws_url: matter?.url ?? "" });
+      // Optimistic, so the chip moves the moment the button is pressed; the
+      // poll above replaces this with whatever actually happened.
+      setMatter((m) => (m ? { ...m, state: "connecting", error: undefined } : m));
       await loadMatter();
     } catch (e) {
       setMatterError(errorText(e));
@@ -164,7 +153,7 @@ export function Devices() {
   }
 
   function openForm() {
-    setName(""); setDeviceType("host"); setHostname(""); setRoom(""); setSetupCode(""); setMode("matter");
+    setName(""); setSetupCode("");
     setFormError(null);
     setShowForm(true);
   }
@@ -181,28 +170,6 @@ export function Devices() {
       await api.commissionDevice(setupCode.trim(), name.trim() || undefined);
       closeForm();
       load();
-    } catch (e) {
-      setFormError(errorText(e));
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  async function handleRegister() {
-    if (!name.trim()) { setFormError("Name is required."); return; }
-    setSubmitting(true);
-    setFormError(null);
-    try {
-      await api.registerDevice({
-        name: name.trim(),
-        device_type: deviceType,
-        hostname: hostname.trim() || undefined,
-        capabilities: [],
-        room: room.trim() || undefined,
-      });
-      closeForm();
-      load();
-      void refreshHomeData();
     } catch (e) {
       setFormError(errorText(e));
     } finally {
@@ -292,63 +259,33 @@ export function Devices() {
       </div>
 
       {/* ── Matter ────────────────────────────────────────────
-          Matter is off by default and needs a controller, so this is where it
-          gets switched on. It reports what the runtime is actually doing, not
-          just what was saved: enabling starts a controller, and "on but
-          unreachable" is a different problem from "off". */}
+          Status only. Matter runs by default and installs its own controller,
+          so there is nothing here to switch on — the panel exists to say
+          whether pairing will work right now, and to offer the one action worth
+          offering when it will not. */}
       <section className="matter-panel">
         <div className="matter-panel__head">
           <Radio size={15} />
           <h2 className="matter-panel__title">Matter</h2>
           <span
-            className={`matter-panel__chip matter-panel__chip--${matter?.state ?? "disabled"}`}
+            className={`matter-panel__chip matter-panel__chip--${matter?.state ?? "connecting"}`}
             data-testid="matter-state"
           >
-            {MATTER_STATE_LABEL[matter?.state ?? "disabled"]}
+            {MATTER_STATE_LABEL[matter?.state ?? "connecting"]}
           </span>
           <span className="matter-panel__spacer" />
-          <Switch
-            aria-label="Enable Matter"
-            isSelected={matter?.enabled ?? false}
-            isDisabled={matterBusy}
-            onChange={(v) => void saveMatter(v, matterUrl)}
-          >
-            {/* `Switch.Content` is what renders the labelled input, so without
-                it the `aria-label` above reaches nothing: the toggle has no
-                accessible name and a screen reader cannot identify or operate
-                it. Every other Switch in the app wraps its control this way. */}
-            <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content>
-          </Switch>
-        </div>
-
-        <p className="matter-panel__hint">
-          Commissions lights, locks, and sensors onto your local fabric. The
-          first time this is switched on, GIAP downloads and starts a Matter
-          controller — that can take a couple of minutes.
-        </p>
-
-        <div className="matter-panel__row">
-          <label className="matter-panel__label" htmlFor="matter-url">Controller address</label>
-          <input
-            id="matter-url"
-            className="native-input native-input--flex"
-            value={matterUrl}
-            disabled={!(matter?.enabled ?? false) || matterBusy}
-            placeholder="ws://127.0.0.1:5580/giap"
-            onChange={(e) => setMatterUrl(e.target.value)}
-            onBlur={() => {
-              // Only a real edit is worth a reconnect.
-              if (matter?.enabled && matterUrl.trim() !== matter.url) {
-                void saveMatter(true, matterUrl);
-              }
-            }}
-          />
           {matter?.state === "unreachable" && (
-            <Button size="sm" variant="outline" isDisabled={matterBusy} onPress={() => void saveMatter(true, matterUrl)}>
+            <Button size="sm" variant="outline" isDisabled={matterBusy} onPress={() => void retryMatter()}>
               <RefreshCw size={13} /> Retry
             </Button>
           )}
         </div>
+
+        <p className="matter-panel__hint">
+          Lights, locks, and sensors paired onto your local fabric. The first
+          device you add starts a Matter controller here, which can take a couple
+          of minutes; after that it is always ready.
+        </p>
 
         {matter?.state === "unreachable" && matter.error && (
           <p className="text-error text-error--sm">{matter.error}</p>
@@ -437,119 +374,47 @@ export function Devices() {
             <Separator />
 
             <div className="sched-modal__body">
-              {/* What you are adding decides what GIAP needs. A Matter device
-                  is commissioned onto the fabric with its setup code; anything
-                  else is a catalogue entry you describe yourself. */}
+              {/* Only Matter devices are registered here. Phones pair with a
+                  pairing code and the desktop app is this app, so a chooser
+                  would have had one real option in it. */}
               <div className="sched-modal__field">
-                <label className="sched-modal__label">What are you adding?</label>
-                <div className="dev-mode-toggle">
-                  <button
-                    type="button"
-                    className={mode === "matter" ? "dev-mode-toggle__btn dev-mode-toggle__btn--on" : "dev-mode-toggle__btn"}
-                    onClick={() => { setMode("matter"); setFormError(null); }}
-                  >
-                    <Radio size={13} /> Matter device
-                  </button>
-                  <button
-                    type="button"
-                    className={mode === "manual" ? "dev-mode-toggle__btn dev-mode-toggle__btn--on" : "dev-mode-toggle__btn"}
-                    onClick={() => { setMode("manual"); setFormError(null); }}
-                  >
-                    <Monitor size={13} /> Other device
-                  </button>
-                </div>
+                <label className="sched-modal__label">Setup code</label>
+                <input
+                  className="sched-modal__input"
+                  placeholder="20202021 or MT:-24J0AFN00KA0648G00"
+                  value={setupCode}
+                  onChange={(e) => setSetupCode(e.target.value)}
+                  autoFocus
+                />
+                <p className="sched-modal__cron-hint">
+                  The 11-digit pairing code or QR payload on the device, or its
+                  8-digit passcode. GIAP commissions it onto your fabric.
+                </p>
               </div>
 
-              {mode === "matter" ? (
-                <>
-                  <div className="sched-modal__field">
-                    <label className="sched-modal__label">Setup code</label>
-                    <input
-                      className="sched-modal__input"
-                      placeholder="20202021 or MT:-24J0AFN00KA0648G00"
-                      value={setupCode}
-                      onChange={(e) => setSetupCode(e.target.value)}
-                      autoFocus
-                    />
-                    <p className="sched-modal__cron-hint">
-                      The 11-digit pairing code or QR payload on the device, or
-                      its 8-digit passcode. GIAP commissions it onto your fabric.
-                    </p>
-                  </div>
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Name <span className="sched-modal__cron-hint">(optional)</span></label>
+                <input
+                  className="sched-modal__input"
+                  placeholder="Living Room Light"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                />
+                <p className="sched-modal__cron-hint">
+                  Written to the device so GIAP and other apps use it — say
+                  "turn on the living room light". Left blank, the device's own
+                  name is used.
+                </p>
+              </div>
 
-                  <div className="sched-modal__field">
-                    <label className="sched-modal__label">Name <span className="sched-modal__cron-hint">(optional)</span></label>
-                    <input
-                      className="sched-modal__input"
-                      placeholder="Living Room Light"
-                      value={name}
-                      onChange={(e) => setName(e.target.value)}
-                    />
-                    <p className="sched-modal__cron-hint">
-                      Written to the device so GIAP and other apps use it — say
-                      "turn on the living room light". Left blank, the device's
-                      own name is used.
-                    </p>
-                  </div>
-
-                  {/* Commissioning needs a live controller. Say so here rather
-                      than letting the user fill the form in and fail on submit. */}
-                  {matter?.state !== "connected" && (
-                    <p className="sched-modal__cron-hint" data-testid="matter-not-ready">
-                      {matter?.state === "connecting"
-                        ? "Matter is still starting up. This will be ready in a moment."
-                        : matter?.state === "unreachable"
-                          ? "The Matter controller cannot be reached. Fix it in the Matter section of this tab."
-                          : "Matter is off. Turn it on in the Matter section of this tab first."}
-                    </p>
-                  )}
-                </>
-              ) : (
-                <>
-                  <div className="sched-modal__field">
-                    <label className="sched-modal__label">Name</label>
-                    <input
-                      className="sched-modal__input"
-                      placeholder="Living Room Pi"
-                      value={name}
-                      onChange={(e) => setName(e.target.value)}
-                      autoFocus
-                    />
-                  </div>
-
-                  <div className="sched-modal__field">
-                    <label className="sched-modal__label">Device type</label>
-                    <select
-                      className="sched-modal__select"
-                      value={deviceType}
-                      onChange={(e) => setDeviceType(e.target.value)}
-                    >
-                      {DEVICE_TYPES.map((t) => (
-                        <option key={t.value} value={t.value}>{t.label}</option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div className="sched-modal__field">
-                    <label className="sched-modal__label">Hostname <span className="sched-modal__cron-hint">(optional)</span></label>
-                    <input
-                      className="sched-modal__input"
-                      placeholder="raspberrypi.local"
-                      value={hostname}
-                      onChange={(e) => setHostname(e.target.value)}
-                    />
-                  </div>
-
-                  <div className="sched-modal__field">
-                    <label className="sched-modal__label">Room <span className="sched-modal__cron-hint">(optional)</span></label>
-                    <input
-                      className="sched-modal__input"
-                      placeholder="Living Room"
-                      value={room}
-                      onChange={(e) => setRoom(e.target.value)}
-                    />
-                  </div>
-                </>
+              {/* Commissioning needs a live controller. Say so here rather than
+                  letting the user fill the form in and fail on submit. */}
+              {matter?.state !== "connected" && (
+                <p className="sched-modal__cron-hint" data-testid="matter-not-ready">
+                  {matter?.state === "unreachable"
+                    ? "The Matter controller cannot be reached. See the Matter section of this tab."
+                    : "Matter is still starting up. This will be ready in a moment."}
+                </p>
               )}
 
               {formError && (
@@ -561,26 +426,15 @@ export function Devices() {
 
             <div className="sched-modal__footer">
               <Button size="sm" variant="ghost" onPress={closeForm}>Cancel</Button>
-              {mode === "matter" ? (
-                <Button
-                  size="sm"
-                  variant="primary"
-                  isDisabled={submitting || !setupCode.trim() || matter?.state !== "connected"}
-                  onPress={handleCommission}
-                >
-                  {/* Commissioning is slow — say so rather than looking hung. */}
-                  {submitting ? "Commissioning…" : "Commission"}
-                </Button>
-              ) : (
-                <Button
-                  size="sm"
-                  variant="primary"
-                  isDisabled={submitting || !name.trim()}
-                  onPress={handleRegister}
-                >
-                  {submitting ? "Registering…" : "Register"}
-                </Button>
-              )}
+              <Button
+                size="sm"
+                variant="primary"
+                isDisabled={submitting || !setupCode.trim() || matter?.state !== "connected"}
+                onPress={handleCommission}
+              >
+                {/* Commissioning is slow — say so rather than looking hung. */}
+                {submitting ? "Commissioning…" : "Commission"}
+              </Button>
             </div>
           </div>
         </div>
