@@ -27,11 +27,14 @@ async fn a_fresh_pond_installs_a_controller_and_talks_to_it() {
         p
     };
 
+    let url = format!("ws://127.0.0.1:{port}/giap");
+
     let child = ensure_matter_server(
         &data_dir,
         port,
         Duration::from_secs(240),
         &MatterNotifier::disabled(),
+        &url,
     )
     .await
     .expect("a fresh Pond must be able to install and start its own controller");
@@ -40,12 +43,15 @@ async fn a_fresh_pond_installs_a_controller_and_talks_to_it() {
         "GIAP started it, so it must hold the handle"
     );
 
-    // The install is idempotent: a second call finds the port live and reuses it.
+    // Idempotent: a second call recognises the running controller as one of
+    // ours — by its greeting, not merely by something answering the port — and
+    // reuses it.
     let reused = ensure_matter_server(
         &data_dir,
         port,
         Duration::from_secs(10),
         &MatterNotifier::disabled(),
+        &url,
     )
     .await
     .unwrap();
@@ -55,7 +61,6 @@ async fn a_fresh_pond_installs_a_controller_and_talks_to_it() {
     );
 
     // And it speaks the protocol.
-    let url = format!("ws://127.0.0.1:{port}/giap");
     let (client, _events) = MatterClient::connect(&url)
         .await
         .expect("the greeting must be one this version accepts");

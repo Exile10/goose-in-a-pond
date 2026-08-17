@@ -368,6 +368,18 @@ fn is_qr_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '$' | '%' | '*' | '+' | '-' | '/' | ':')
 }
 
+/// Render an error for a human: the whole cause chain, redacted.
+///
+/// `anyhow::Error`'s plain `Display` prints only the OUTERMOST context, so
+/// `error = %e` on a failure like "connecting to the controller at ws://…"
+/// showed the attempt and threw away the reason — which is the one thing the
+/// reader needs. `{:#}` walks the chain ("context: cause: cause"), and this is
+/// the only way any error in this crate should reach a log, an API response, or
+/// the model.
+pub fn describe(error: &anyhow::Error) -> String {
+    redact_setup_code(&format!("{error:#}"))
+}
+
 /// Which kind of setup code this is, for logging in place of the value.
 pub fn setup_code_kind(code: &str) -> &'static str {
     let trimmed = code.trim();
@@ -510,6 +522,37 @@ mod tests {
         assert_eq!(setup_code_kind("3497-011-2332"), "pairing_code");
         assert_eq!(setup_code_kind("20202021"), "passcode");
         assert_eq!(setup_code_kind("nonsense"), "unknown");
+    }
+
+    #[test]
+    fn an_error_is_described_by_its_whole_chain() {
+        // The bug this exists for: the adapter reported "connecting to the
+        // Matter controller at ws://127.0.0.1:5580/giap" and nothing else, so a
+        // controller answering 404 to the handshake and one refusing the
+        // connection outright were the same sentence.
+        let error = anyhow::anyhow!("HTTP error: 404 Not Found")
+            .context("connecting to the Matter controller at ws://127.0.0.1:5580/giap");
+
+        let described = describe(&error);
+        assert!(
+            described.contains("404"),
+            "the reason was dropped: {described}"
+        );
+        assert!(
+            described.contains("connecting to"),
+            "the attempt was dropped"
+        );
+    }
+
+    #[test]
+    fn a_described_error_is_still_redacted() {
+        let error = anyhow::anyhow!("PASE failed for MT:Y.K9042C00KA0648G00")
+            .context("commissioning failed");
+        let described = describe(&error);
+        assert!(
+            !described.contains("MT:"),
+            "leaked a setup code: {described}"
+        );
     }
 
     #[test]

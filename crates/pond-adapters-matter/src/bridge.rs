@@ -37,7 +37,7 @@ use crate::client::{MatterClient, MatterEvent};
 use crate::control::SharedMatterClient;
 use crate::notify::MatterNotifier;
 use crate::protocol::{
-    AvailabilityEvent, DeviceEvent, DeviceRemovedEvent, Snapshot, WireDevice, WireReading,
+    describe, AvailabilityEvent, DeviceEvent, DeviceRemovedEvent, Snapshot, WireDevice, WireReading,
 };
 use crate::server_setup::{revive_local_controller, Revival, SharedServerChild};
 
@@ -332,7 +332,7 @@ pub async fn run_matter_supervisor(
             Err(e) => tracing::warn!(
                 target: "giap::trace",
                 kind = "matter_bridge_failed",
-                error = %e,
+                error = %describe(&e),
                 "matter: bridge failed; reconnecting"
             ),
         }
@@ -365,7 +365,7 @@ pub async fn run_matter_supervisor(
                     Err(e) => tracing::warn!(
                         target: "giap::trace",
                         kind = "matter_controller_revive_failed",
-                        error = %e,
+                        error = %describe(&e),
                         "matter: controller restart failed; will retry with the next attempts"
                     ),
                 }
@@ -382,7 +382,7 @@ pub async fn run_matter_supervisor(
                         url = %url,
                         attempt,
                         delay_ms = delay.as_millis() as u64,
-                        error = %e,
+                        error = %describe(&e),
                         "matter: reconnect attempt failed; will retry"
                     );
                     attempt = attempt.saturating_add(1);

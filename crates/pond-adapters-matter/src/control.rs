@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 use crate::client::{code_of, MatterClient};
-use crate::protocol::ControlResult;
+use crate::protocol::{describe, ControlResult};
 
 /// A swappable handle to the live client. The reconnect supervisor replaces the
 /// inner `Arc<MatterClient>` after re-establishing the WebSocket, so the control
@@ -93,7 +93,7 @@ impl MatterDeviceControl {
                     verb,
                     duration_ms = elapsed,
                     error_code = code_of(&e).unwrap_or("none"),
-                    error = %e,
+                    error = %describe(&e),
                     "a Matter device command failed"
                 );
                 Err(e)
