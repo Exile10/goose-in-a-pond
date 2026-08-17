@@ -28,7 +28,9 @@ use pond_adapters_caldav::{CalDavAdapter, CalDavConfig, CalDavProvider};
 use pond_adapters_imap::{ImapAdapter, ImapConfig, ImapProvider};
 use pond_core::context::domain::{secret_key_for, ContextSource, SourceKind, SourceStatus};
 use pond_core::context::ingest::IngestPipeline;
-use pond_core::context::ports::{AccountSync, AccountSyncSummary, ContextRepository};
+use pond_core::context::ports::{
+    AccountSync, AccountSyncSummary, ContextRepository, SourceSyncOutcome,
+};
 use pond_core::security::ports::secret::SecretRepository;
 use pond_core::shared::services::egress::{network_mode, NetworkMode};
 use pond_core::user_data::domain::profile::ProfileScope;
@@ -48,6 +50,20 @@ pub struct AccountSyncReport {
     pub failed: usize,
     /// Sources skipped because the pond is offline.
     pub paused: usize,
+    /// What each source did, named, so a household with two accounts can tell
+    /// which of them is the one that is not working.
+    pub per_source: Vec<SourceSyncOutcome>,
+}
+
+/// Record one source's result on the report it belongs to.
+fn note(report: &mut AccountSyncReport, source: &ContextSource, outcome: &str, ingested: usize) {
+    report.per_source.push(SourceSyncOutcome {
+        source_id: source.id().to_string(),
+        provider: source.provider().to_string(),
+        kind: source.kind().as_str().to_string(),
+        outcome: outcome.to_string(),
+        ingested,
+    });
 }
 
 /// The credential blob behind a source's `secret_ref`.
@@ -116,6 +132,7 @@ pub async fn sync_calendars(
 
         if offline {
             report.paused += 1;
+            note(&mut report, &source, "paused", 0);
             source.advance(
                 source.cursor().map(str::to_string),
                 now,
@@ -127,8 +144,14 @@ pub async fn sync_calendars(
 
         let outcome = sync_one(&repo, &pipeline, &secrets, &mut source, now).await;
         match outcome {
-            Ok(SyncOne::Unchanged) => report.unchanged += 1,
-            Ok(SyncOne::Ingested(n)) => report.ingested += n,
+            Ok(SyncOne::Unchanged) => {
+                report.unchanged += 1;
+                note(&mut report, &source, "unchanged", 0);
+            }
+            Ok(SyncOne::Ingested(n)) => {
+                report.ingested += n;
+                note(&mut report, &source, "ingested", n);
+            }
             Err(e) => {
                 if is_auth_failure(&e) {
                     report.needs_reauth += 1;
@@ -263,6 +286,7 @@ pub async fn sync_mail(
             Err(e) => {
                 if is_auth_failure(&e) {
                     report.needs_reauth += 1;
+                    note(&mut report, &source, "needs_reauth", 0);
                     tracing::warn!(
                         source = source.id(),
                         "this mailbox refused its credentials; it will not be retried until \
@@ -271,6 +295,7 @@ pub async fn sync_mail(
                     source.advance(None, now, SourceStatus::NeedsReauth);
                 } else {
                     report.failed += 1;
+                    note(&mut report, &source, "failed", 0);
                     tracing::warn!(source = source.id(), error = %e, "mail sync failed");
                     source.advance(None, now, SourceStatus::Error);
                 }
@@ -387,6 +412,11 @@ impl AccountSyncer {
             needs_reauth: calendars.needs_reauth + mail.needs_reauth,
             failed: calendars.failed + mail.failed,
             paused: calendars.paused + mail.paused,
+            per_source: calendars
+                .per_source
+                .into_iter()
+                .chain(mail.per_source)
+                .collect(),
         })
     }
 }

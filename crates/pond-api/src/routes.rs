@@ -15091,10 +15091,21 @@ async fn list_context_sources(
             )
         })?;
 
+    // One grouped query for every source, so the counts cost the same whether a
+    // household has one account or six. A failure here loses the counts and
+    // keeps the list: knowing what is connected matters more than knowing how
+    // much each one brought.
+    let stats = context_repo(&state)
+        .item_stats_by_source()
+        .await
+        .unwrap_or_default();
+
     Ok(Json(json!({
         "sources": sources
             .iter()
-            .map(|s| json!({
+            .map(|s| {
+                let stat = stats.iter().find(|st| st.source_id == s.id());
+                json!({
                 "id": s.id(),
                 "kind": s.kind().as_str(),
                 "provider": s.provider(),
@@ -15106,7 +15117,15 @@ async fn list_context_sources(
                 // apart or a source that has never synced looks healthy.
                 "last_sync": s.last_sync().map(|t| t.to_rfc3339()),
                 "needs_credentials": s.kind().needs_credentials(),
-            }))
+                // What this source has actually produced, and how much of it
+                // retrieval can reach. Reported separately because a source can
+                // be perfectly connected and still half-invisible while the
+                // index catches up, and that gap is what needs explaining when
+                // a search comes up short.
+                "items": stat.map(|st| st.items).unwrap_or(0),
+                "awaiting_index": stat.map(|st| st.awaiting_index).unwrap_or(0),
+            })
+            })
             .collect::<Vec<_>>()
     })))
 }

@@ -595,6 +595,19 @@ export interface AccountSyncSummary {
   needs_reauth: number;
   failed: number;
   paused: number;
+  /** What each account did. The totals say whether anything happened; this
+   *  says where from, which is the question somebody with two accounts has. */
+  per_source?: SourceSyncOutcome[];
+}
+
+/** One account's result from a sync pass. */
+export interface SourceSyncOutcome {
+  source_id: string;
+  provider: string;
+  kind: string;
+  /** `ingested` | `unchanged` | `needs_reauth` | `failed` | `paused` */
+  outcome: string;
+  ingested: number;
 }
 
 /** A connected personal-context source, as the sources API reports it. */
@@ -611,6 +624,10 @@ export interface ContextSource {
   last_sync: string | null;
   /** Whether this kind signs in to an account, as opposed to being on-pond. */
   needs_credentials: boolean;
+  /** Everything stored from this source. */
+  items: number;
+  /** Of those, the ones still waiting to become searchable by meaning. */
+  awaiting_index: number;
 }
 
 export interface ContextIndexRebuild {

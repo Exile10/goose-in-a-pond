@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { PROVIDERS, describeLastSync, describeStatus } from "./providers";
+import {
+  PROVIDERS,
+  describeHaul,
+  describeLastSync,
+  describeSourceOutcome,
+  describeStatus,
+} from "./providers";
 
 const REPO = join(__dirname, "..", "..", "..");
 
@@ -104,5 +110,38 @@ describe("last sync wording", () => {
     expect(describeLastSync("2026-08-17T09:00:00Z", now)).toMatch(/3 hours ago/);
     expect(describeLastSync("2026-08-15T12:00:00Z", now)).toMatch(/2 days ago/);
     expect(describeLastSync("2026-08-17T11:59:50Z", now)).toMatch(/just now/i);
+  });
+});
+
+describe("what a source has brought in", () => {
+  /**
+   * Two numbers, not a percentage. "142 things" is the account working;
+   * "8 not searchable yet" is why a search for one of them just came up empty.
+   * A single figure hides the second, which is the one somebody is confused by.
+   */
+  it("separates what was read from what can be found", () => {
+    expect(describeHaul(142, 0)).toBe("142 things read, all searchable");
+    expect(describeHaul(142, 8)).toBe("142 things read, 8 not searchable yet");
+    expect(describeHaul(142, 142)).toBe("142 things read, not searchable yet");
+  });
+
+  it("says nothing at all when a source has brought nothing", () => {
+    expect(describeHaul(0, 0)).toBeNull();
+  });
+
+  it("counts one thing as one thing", () => {
+    expect(describeHaul(1, 0)).toBe("1 thing read, all searchable");
+  });
+});
+
+describe("per-account check results", () => {
+  /** With two accounts, a total cannot say which one is broken. */
+  it("gives every outcome its own words", () => {
+    expect(describeSourceOutcome("ingested", 3)).toBe("3 new things");
+    expect(describeSourceOutcome("ingested", 1)).toBe("1 new thing");
+    expect(describeSourceOutcome("unchanged", 0)).toBe("nothing new");
+    expect(describeSourceOutcome("needs_reauth", 0)).toMatch(/password refused/);
+    expect(describeSourceOutcome("paused", 0)).toMatch(/offline/);
+    expect(describeSourceOutcome("anything-else", 0)).toMatch(/could not be reached/);
   });
 });

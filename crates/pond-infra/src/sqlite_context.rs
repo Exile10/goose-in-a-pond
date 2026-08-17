@@ -31,7 +31,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use pond_core::context::domain::{
     ContextItem, ContextSource, ItemKind, ItemParts, SourceKind, SourceParts, SourceStatus,
 };
-use pond_core::context::ports::ContextRepository;
+use pond_core::context::ports::{ContextRepository, SourceItemStats};
 use pond_core::context::retention::ContextRetention;
 use pond_core::context::vector_index::{Corpus, VectorEntry, VectorIndex};
 use pond_core::security::domain::event::PrivacySensitivity;
@@ -583,6 +583,30 @@ impl ContextRepository for SqliteContextRepository {
                 .fetch_one(&self.pool)
                 .await?;
         Ok(count.max(0) as u64)
+    }
+
+    async fn item_stats_by_source(&self) -> Result<Vec<SourceItemStats>> {
+        // GROUP BY, not a query per source. The screen that reads this already
+        // has the source list, so the alternative is N+1 round trips to answer
+        // one sentence -- a cost that only bites the pond with the most data.
+        let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+            "SELECT source_id, \
+                    COUNT(*), \
+                    SUM(CASE WHEN embedding IS NULL THEN 1 ELSE 0 END) \
+             FROM context_items \
+             GROUP BY source_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(source_id, items, awaiting)| SourceItemStats {
+                source_id,
+                items: items.max(0) as u64,
+                awaiting_index: awaiting.max(0) as u64,
+            })
+            .collect())
     }
 
     async fn purge_expired(&self, retention: &ContextRetention, now: DateTime<Utc>) -> Result<u64> {

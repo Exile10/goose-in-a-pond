@@ -146,3 +146,32 @@ export function describeLastSync(iso: string | null, now = Date.now()): string {
   const days = Math.round(hours / 24);
   return `Checked ${days} day${days === 1 ? "" : "s"} ago`;
 }
+
+/** What a source has brought in, and whether all of it is findable yet.
+ *
+ * Two numbers because they answer different worries. "142 things" is the
+ * account working; "8 still being read" is why a search for one of them just
+ * came up empty. Collapsing them into a percentage would hide the second. */
+export function describeHaul(items: number, awaitingIndex: number): string | null {
+  if (items === 0) return null;
+  const noun = items === 1 ? "1 thing" : `${items} things`;
+  if (awaitingIndex === 0) return `${noun} read, all searchable`;
+  if (awaitingIndex === items) return `${noun} read, not searchable yet`;
+  return `${noun} read, ${awaitingIndex} not searchable yet`;
+}
+
+/** One account's line in the result of a check. */
+export function describeSourceOutcome(outcome: string, ingested: number): string {
+  switch (outcome) {
+    case "ingested":
+      return ingested === 1 ? "1 new thing" : `${ingested} new things`;
+    case "unchanged":
+      return "nothing new";
+    case "needs_reauth":
+      return "password refused";
+    case "paused":
+      return "not checked, pond is offline";
+    default:
+      return "could not be reached";
+  }
+}

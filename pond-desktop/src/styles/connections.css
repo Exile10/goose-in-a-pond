@@ -187,3 +187,10 @@
 .connections-sync:hover:not(:disabled) { border-color: var(--color-accent); }
 .connections-sync:disabled { opacity: 0.5; cursor: not-allowed; }
 .connections-sync:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
+
+.connections-ran {
+  margin: 0;
+  font-size: 12px;
+  font-weight: var(--weight-bold);
+  color: var(--color-accent);
+}
