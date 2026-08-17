@@ -17,6 +17,7 @@
 //! occurrence — the debounce narrows what the user is *told*, never what is
 //! recorded.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +30,14 @@ use tokio::sync::{Mutex, RwLock};
 /// controller reconnects far faster than this, so the user hears "Matter is
 /// down" once rather than once per attempt.
 const ALERT_WINDOW: Duration = Duration::from_secs(600);
+
+/// How long after asking for a removal the resulting event still counts as ours.
+///
+/// Generous relative to the event, which follows within seconds, because the
+/// cost of being too tight is a false "your device left the network" alarm about
+/// something the user just did — and the cost of being too loose is only that a
+/// genuine departure of the SAME device inside the window goes unannounced.
+const REMOVAL_GRACE: Duration = Duration::from_secs(120);
 
 /// Whether an unreachable alert is outstanding, so recovery is only announced to
 /// someone who was told about the outage.
@@ -43,6 +52,9 @@ struct State {
     /// Set while first-run setup is in progress, so "finished" is only reported
     /// for an install that was actually announced as starting.
     setup_announced: bool,
+    /// Removals GIAP asked for, so the event they cause is not reported as a
+    /// device leaving on its own.
+    expected_removals: HashMap<String, Instant>,
 }
 
 /// Builds and pushes the Matter notifications, holding the debounce state.
@@ -168,8 +180,38 @@ impl MatterNotifier {
         .await;
     }
 
-    /// A device left the fabric without the user removing it.
+    /// GIAP is about to remove `device_id` from the fabric itself.
+    ///
+    /// Needed because the delete path decommissions BEFORE it removes the
+    /// registry row (`unregister_device` in routes.rs — a Matter device has to
+    /// leave the fabric first, or the controller re-announces it and it comes
+    /// back). So the `device_removed` event arrives while the device is still
+    /// registered, and "is it still in the registry?" cannot by itself tell a
+    /// user's deletion from a device that left on its own. This can: the adapter
+    /// knows which removals it caused.
+    pub async fn expect_removal(&self, device_id: &str) {
+        let mut state = self.state.lock().await;
+        // Opportunistic sweep: entries are only ever consumed by the matching
+        // event, and one that never arrives would otherwise sit here for the
+        // life of the process suppressing a real alert years later.
+        state
+            .expected_removals
+            .retain(|_, at| at.elapsed() < REMOVAL_GRACE);
+        state
+            .expected_removals
+            .insert(device_id.to_string(), Instant::now());
+    }
+
+    /// A device left the fabric. Silent when GIAP is the one that removed it.
     pub async fn device_dropped(&self, device_id: &str) {
+        {
+            let mut state = self.state.lock().await;
+            if let Some(at) = state.expected_removals.remove(device_id) {
+                if at.elapsed() < REMOVAL_GRACE {
+                    return; // we asked for this
+                }
+            }
+        }
         self.push(
             "alert",
             "A Matter device left the network".to_string(),
@@ -337,6 +379,39 @@ mod tests {
             recorder.titles(),
             vec!["Setting up Matter", "Matter is ready"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_removal_giap_asked_for_is_not_reported_as_a_device_leaving() {
+        // The delete path decommissions before it removes the registry row, so
+        // the event arrives while the device still looks registered. Alerting on
+        // it would tell the user their device had vanished, moments after they
+        // deliberately removed it.
+        let (notifier, recorder) = notifier().await;
+
+        notifier.expect_removal("matter-18").await;
+        notifier.device_dropped("matter-18").await;
+        assert!(
+            recorder.titles().is_empty(),
+            "alerted on a deliberate removal"
+        );
+
+        // A different device leaving at the same time is still news.
+        notifier.device_dropped("matter-4").await;
+        assert_eq!(recorder.titles(), vec!["A Matter device left the network"]);
+    }
+
+    #[tokio::test]
+    async fn the_expectation_is_consumed_not_permanent() {
+        // Otherwise the first deliberate removal of a device would silence every
+        // later, genuine departure of one that reused the id.
+        let (notifier, recorder) = notifier().await;
+
+        notifier.expect_removal("matter-18").await;
+        notifier.device_dropped("matter-18").await;
+        notifier.device_dropped("matter-18").await;
+
+        assert_eq!(recorder.titles().len(), 1, "the expectation was permanent");
     }
 
     #[tokio::test]

@@ -184,6 +184,9 @@ impl DeviceCommissioningPort for MatterCommissioner {
 
     async fn decommission(&self, node_id: u64) -> Result<()> {
         let device_id = device_id_for_node(node_id);
+        // Before the op, not after: the controller's `device_removed` event can
+        // reach the bridge while this call is still returning.
+        self.notifier.expect_removal(&device_id).await;
         match self
             .client
             .send_with_timeout(
