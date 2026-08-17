@@ -754,7 +754,7 @@ struct IssuePairingCodeRequest {
     ///
     /// Omitted or `null` no longer means "unattributed" on its own: a
     /// one-member household defaults to that member, per
-    /// [`pairing_attribution::owner_for_new_code`]. Set `unattributed` to ask
+    /// [`member_attribution::owner_for_new_code`]. Set `unattributed` to ask
     /// for a code that binds to nobody.
     #[serde(default)]
     profile_id: Option<String>,
@@ -822,7 +822,7 @@ async fn handshake_issue_pairing_code(
             Vec::new()
         }
     };
-    let owner = pond_core::user_data::services::pairing_attribution::owner_for_new_code(
+    let owner = pond_core::user_data::services::member_attribution::owner_for_new_code(
         request.profile_id.as_deref(),
         request.unattributed,
         &member_ids,
@@ -14818,17 +14818,50 @@ async fn context_source_owner(
     device: &ProvenDevice,
 ) -> Result<String, (StatusCode, Json<Value>)> {
     let scope = resolve_turn_scope(state, session_id, device).await;
-    match scope.owner_id() {
-        Some(id) => Ok(id.to_string()),
-        None => Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "a context source belongs to one household member, and this caller \
-                          could not be resolved to one",
-                "scope": format!("{scope:?}"),
-            })),
-        )),
+    if let Some(id) = scope.owner_id() {
+        return Ok(id.to_string());
     }
+
+    // `Household` in a ONE-MEMBER pond resolves to that member.
+    //
+    // Without this, connecting a calendar required first starting a
+    // conversation AND being on an attributed device, to establish something
+    // the pond only ever had one possible answer to. Same shape as the pairing
+    // default: refusing to write down the only answer does not make a
+    // single-member pond safer, it makes the feature unreachable.
+    //
+    // Deliberately NOT extended to `Guest`, and not to a household with two or
+    // more members — there, picking one would attribute an account by row
+    // order. Both still refuse.
+    //
+    // The residual exposure, stated plainly: in a one-member pond an
+    // unidentified caller on an authenticated-but-unattributed device can
+    // connect an account that becomes the member's. The sharper fix is devices
+    // being attributed at pairing, which they now are; this covers the ones
+    // paired before that landed.
+    if matches!(scope, ProfileScope::Household) {
+        let members: Vec<String> = state
+            .profile_repo
+            .list()
+            .await
+            .map(|profiles| profiles.into_iter().map(|p| p.id).collect())
+            .unwrap_or_default();
+        if let Some(only) =
+            pond_core::user_data::services::member_attribution::sole_member(&members)
+        {
+            return Ok(only);
+        }
+    }
+
+    Err((
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "a context source belongs to one household member, and this caller could \
+                      not be resolved to one. Identify yourself in this conversation, or pair \
+                      this device to a member.",
+            "scope": format!("{scope:?}"),
+        })),
+    ))
 }
 
 /// `POST /api/v1/context/sources` -- connect a sensor or camera as personal context.

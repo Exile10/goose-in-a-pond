@@ -458,7 +458,9 @@ async fn a_guest_cannot_connect_a_source_and_sees_none() {
 #[tokio::test]
 async fn the_whole_household_is_not_an_owner() {
     let h = make_app().await;
-    let _liz = member(&h, "Liz").await; // ONE member: unidentified is Household
+    // TWO members, so `Household` genuinely names more than one person.
+    let _liz = member(&h, "Liz").await;
+    let _jerry = member(&h, "Jerry").await;
     let session = unidentified_session(&h, "chat-anon").await;
 
     let (status, body) = post_json(
@@ -474,6 +476,47 @@ async fn the_whole_household_is_not_an_owner() {
          broadcast, and a source it owned would file one member's camera under everybody: {body}"
     );
 }
+
+/// The same scope, and the opposite answer, because the household is one person.
+///
+/// This test used to assert the refusal above with a SINGLE member, and that
+/// was the wrong line to draw. `Household` and `Owner(the-only-member)` denote
+/// the same set of people when there is only one, so refusing established
+/// nothing and made connecting a calendar require identifying yourself to a
+/// pond that had exactly one possible answer.
+///
+/// The multi-member refusal above is the part of that reasoning that survives,
+/// and it is why this is a sole-member rule rather than a Household rule.
+#[tokio::test]
+async fn a_one_member_household_is_that_member() {
+    let h = make_app().await;
+    let jerry = member(&h, "Jerry").await;
+    let session = unidentified_session(&h, "chat-anon").await;
+
+    let (status, body) = post_json(
+        &h.app,
+        "/api/v1/context/sources",
+        connect_body("camera", "front-door", &session),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["profile_id"].as_str(),
+        Some(jerry.as_str()),
+        "the one member should own it: {body}"
+    );
+}
+
+// There is deliberately no "a guest is refused in a one-member household" test
+// here, because that state cannot be reached: `identity_resolution::resolve`
+// answers `Guest` only when the household has MORE than one member, and
+// `Household` otherwise. In a one-member pond an unidentified speaker and the
+// member are the same scope by construction.
+//
+// That is the residual exposure of the rule above, and it is a property of
+// identity resolution rather than of this route — writing a test that pretended
+// otherwise would assert a scope the pond never produces. What limits it in
+// practice is that the caller still needs an authenticated, paired device.
 
 // ── A connector that does not exist is refused up front ────────────────────
 
