@@ -428,7 +428,78 @@ fn fingerprint(dir: &Path) -> Result<Fingerprint> {
 
 /// Install the controller into the data dir. Idempotent: if the installed tree
 /// was built from the lockfile that ships now, this is a no-op.
+/// Turn what node printed into something a person can act on.
+///
+/// A crashing controller prints a JavaScript stack trace, and passing that through
+/// verbatim asks the reader to parse a loader backtrace to find out that a directory
+/// needs reinstalling. The failures worth naming are the ones with a specific remedy;
+/// anything else keeps node's own words, because an unrecognised fault said plainly
+/// is better than a guess said confidently.
+fn explain_startup_failure(stderr: &str, app: &Path) -> String {
+    if stderr.contains("ERR_MODULE_NOT_FOUND") {
+        // Which module is missing decides whether the dependencies or the sources
+        // are the incomplete half, and the remedy is the same either way.
+        let what = if stderr.contains("'tsx'") {
+            "its dependencies are missing"
+        } else {
+            "part of it is missing"
+        };
+        return format!(
+            "The Matter controller could not start because {what}. Its install at \
+             {} is incomplete -- usually an npm install that was interrupted. Delete \
+             that directory and start again; it will be reinstalled, and no \
+             commissioned devices are stored there.",
+            app.display()
+        );
+    }
+
+    if stderr.contains("EADDRINUSE") || stderr.contains("Address already in use") {
+        return "The Matter controller could not start because its port is already \
+                taken, most likely by a controller from a previous run that is still \
+                going."
+            .to_string();
+    }
+
+    if stderr.trim().is_empty() {
+        return "The Matter controller printed nothing, which usually means node \
+                could not start at all."
+            .to_string();
+    }
+
+    format!("The Matter controller said:\n{stderr}")
+}
+
+/// Is this install actually runnable?
+///
+/// The marker records what was *asked* for, not what survived. A cancelled or raced
+/// `npm ci` leaves a tree that satisfies every check above -- marker current,
+/// `node_modules` present -- and still cannot start, because the loader needs `tsx`
+/// and the entry file. Checking the two things node will reach for turns a silent
+/// corrupt install into one clear failure at setup, instead of a stack trace on
+/// every boot from then on.
+fn install_is_runnable(app: &Path) -> bool {
+    app.join("src/server.ts").is_file() && app.join("node_modules/tsx").is_dir()
+}
+
+/// Serialises installs.
+///
+/// `ensure_installed` is reached from the reconciler, from the revive path, and
+/// from a plain start, and nothing stopped two of them running at once. They race
+/// destructively rather than merely wastefully: one clears the tree while the other
+/// is halfway through `npm ci` into it, and the survivor then writes the "installed"
+/// marker over a half-built install that every later start trusts. Observed as a
+/// controller that had 7 of its 51 packages and reported `Cannot find package 'tsx'`
+/// on every boot, from a marker claiming the install was complete.
+///
+/// Held across the whole install, `npm ci` included, so the second caller waits and
+/// then finds the marker already current rather than redoing it.
+static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn ensure_installed(data_dir: &Path, notifier: &MatterNotifier) -> Result<()> {
+    // Waiting here is the point: whoever holds this may be about to make the very
+    // install this call would otherwise start in parallel with it.
+    let _installing = INSTALL_LOCK.lock().await;
+
     let source = source_dir()?;
     let wanted = fingerprint(&source)?;
     let app = app_dir(data_dir);
@@ -438,14 +509,17 @@ async fn ensure_installed(data_dir: &Path, notifier: &MatterNotifier) -> Result<
         .ok()
         .and_then(|raw| Fingerprint::parse(&raw));
 
-    if installed.as_ref() == Some(&wanted) && has_modules {
+    if installed.as_ref() == Some(&wanted) && has_modules && install_is_runnable(&app) {
         return Ok(());
     }
 
     // Sources changed but dependencies did not — by far the common case for an
     // upgrade. Refreshing the code is a file copy; reinstalling `node_modules`
     // for it would be minutes of work to arrive at the same tree.
-    if has_modules && installed.as_ref().is_some_and(|i| i.deps == wanted.deps) {
+    if has_modules
+        && install_is_runnable(&app)
+        && installed.as_ref().is_some_and(|i| i.deps == wanted.deps)
+    {
         tracing::info!(
             target: "giap::trace",
             kind = "matter_sources_refreshed",
@@ -503,6 +577,18 @@ async fn ensure_installed(data_dir: &Path, notifier: &MatterNotifier) -> Result<
         ));
     }
 
+    // Before the marker, not after: a marker written over an install that cannot
+    // run is the thing that made this survive restarts.
+    if !install_is_runnable(&app) {
+        return Err(anyhow!(
+            "the Matter controller was installed into {} but cannot run from it: \
+             either src/server.ts or node_modules/tsx is missing. This is what a \
+             cancelled or raced npm ci leaves behind. Delete that directory and \
+             start again to reinstall it.",
+            app.display()
+        ));
+    }
+
     std::fs::write(install_marker(data_dir), wanted.render())
         .with_context(|| format!("writing {}", install_marker(data_dir).display()))?;
 
@@ -514,6 +600,79 @@ async fn ensure_installed(data_dir: &Path, notifier: &MatterNotifier) -> Result<
     );
     notifier.setup_finished().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod startup_message_tests {
+    use super::*;
+
+    /// What this actually looked like: node's loader backtrace, surfaced verbatim,
+    /// asking the reader to work out from `package_json_reader:301` that a directory
+    /// needed reinstalling.
+    #[test]
+    fn a_missing_dependency_reads_as_something_to_do() {
+        let stderr = "node:internal/modules/package_json_reader:301\n  \
+                      throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);\n\
+                      Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'tsx' imported from /x/app/";
+        let explained = explain_startup_failure(stderr, Path::new("/x/app"));
+
+        assert!(
+            explained.contains("dependencies are missing"),
+            "{explained}"
+        );
+        assert!(explained.contains("/x/app"), "{explained}");
+        // The one thing a user is most likely to fear about deleting it.
+        assert!(explained.contains("no commissioned devices"), "{explained}");
+        // And none of node's plumbing.
+        assert!(!explained.contains("package_json_reader"), "{explained}");
+    }
+
+    #[test]
+    fn a_taken_port_is_named_as_one() {
+        let explained =
+            explain_startup_failure("Error: listen EADDRINUSE :::5580", Path::new("/x/app"));
+        assert!(explained.contains("port is already taken"), "{explained}");
+    }
+
+    /// An unrecognised fault is passed through rather than guessed at: node's own
+    /// words are worth more than a confident wrong explanation.
+    #[test]
+    fn anything_unrecognised_keeps_the_controllers_own_words() {
+        let explained = explain_startup_failure("TypeError: x is not a function", Path::new("/x"));
+        assert!(
+            explained.contains("TypeError: x is not a function"),
+            "{explained}"
+        );
+    }
+
+    #[test]
+    fn silence_is_reported_as_silence() {
+        let explained = explain_startup_failure("   ", Path::new("/x"));
+        assert!(explained.contains("printed nothing"), "{explained}");
+    }
+
+    /// The check that would have caught the half-built install at setup instead of
+    /// on every boot from then on.
+    #[test]
+    fn an_install_missing_its_loader_is_not_runnable() {
+        // Same shape as the other filesystem tests here: a named directory under
+        // the process id, cleaned up at the end.
+        let app = std::env::temp_dir().join(format!("giap-runnable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&app);
+        let app = app.as_path();
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::write(app.join("src/server.ts"), "// entry").unwrap();
+        assert!(!install_is_runnable(app), "no node_modules/tsx yet");
+
+        std::fs::create_dir_all(app.join("node_modules/tsx")).unwrap();
+        assert!(install_is_runnable(app));
+
+        // Sources cleared by a racing install, dependencies left behind.
+        std::fs::remove_file(app.join("src/server.ts")).unwrap();
+        assert!(!install_is_runnable(app));
+
+        std::fs::remove_dir_all(app).unwrap();
+    }
 }
 
 /// The last `lines` lines of `text`.
@@ -766,13 +925,9 @@ pub async fn ensure_running(
         "matter: controller did not become ready"
     );
     Err(anyhow!(
-        "the Matter controller did not start listening on port {port} within {:?}.{}",
+        "the Matter controller did not start listening on port {port} within {:?}. {}",
         ready_timeout,
-        if reason.is_empty() {
-            " It printed nothing, which usually means node could not start at all.".to_string()
-        } else {
-            format!(" It last said:\n{reason}")
-        }
+        explain_startup_failure(&reason, &app_dir(data_dir))
     ))
 }
 
