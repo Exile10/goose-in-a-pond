@@ -3,8 +3,12 @@
 //!
 //! Provides 12 tools: `list_schedules`, `create_schedule`, `update_schedule`,
 //! `delete_schedule`, `pause_schedule`, `resume_schedule`, `run_schedule_now`,
-//! `get_schedule_runs`, `world_clock`, `create_sensor_rule`,
-//! `list_sensor_rules`, `delete_sensor_rule`.
+//! `get_schedule_runs`, `world_clock`.
+//!
+//! Sensor RULES moved to `giap-sensors` (they are about sensors, and a
+//! household reaching for a timer should not pay ~437 tokens of schema for
+//! them). `sensor_rule_summary` stays here because `list_schedules` renders
+//! them too — a rule is still a scheduled task underneath.
 //! Depends on [`SchedulerPort`] and [`SettingsRepository`].
 
 use pond_core::user_data::domain::schedule::{
@@ -138,50 +142,6 @@ pub struct ScheduleActionParams {
     /// delete | pause | resume | run_now.
     #[serde(default)]
     pub action: String,
-    /// Catch-all for unexpected fields the model sends.
-    #[serde(flatten)]
-    #[schemars(skip)]
-    pub extra: std::collections::HashMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-pub struct CreateSensorRuleParams {
-    pub name: Option<String>,
-    /// "sensor" (default) | "camera" | "device".
-    pub source: Option<String>,
-    /// Match this device/camera ID only; omit for any.
-    pub device_id: Option<String>,
-    /// Event type, e.g. "motion", "person", "temperature"; omit for any.
-    pub signal: Option<String>,
-    /// Compare event value: gt | gte | lt | lte | eq.
-    pub op: Option<String>,
-    /// Threshold for `op`.
-    pub value: Option<f64>,
-    /// Fire only after this local time, 24h "HH:MM".
-    pub after: Option<String>,
-    /// Fire only before this local time, 24h "HH:MM".
-    pub before: Option<String>,
-    /// Action: send this prompt to the agent.
-    pub prompt: Option<String>,
-    /// Action: switch this device (with power_on).
-    pub power_device_id: Option<String>,
-    /// true = on (default), false = off.
-    pub power_on: Option<bool>,
-    /// Action: notification title (requires notify_body).
-    pub notify_title: Option<String>,
-    pub notify_body: Option<String>,
-    /// Debounce seconds between fires. Default 60.
-    pub cooldown_secs: Option<u64>,
-    /// Catch-all for unexpected fields the model sends.
-    #[serde(flatten)]
-    #[schemars(skip)]
-    pub extra: std::collections::HashMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-pub struct DeleteSensorRuleParams {
-    /// Rule ID (see list_sensor_rules).
-    pub rule_id: Option<String>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
     #[schemars(skip)]
@@ -731,194 +691,6 @@ repeating use create_schedule instead.")]
         }
     }
 
-    #[tool(
-        description = "Create a rule fired by sensor/camera/device events, not a timer. Needs at least one action: prompt, device power, or notify."
-    )]
-    async fn create_sensor_rule(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<CreateSensorRuleParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let p = params.0;
-
-        // ── Source ──
-        let source_kind = match p.source.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
-            Some(s) if s == "sensor" => TriggerSourceKind::Sensor,
-            Some(s) if s == "camera" => TriggerSourceKind::Camera,
-            Some(s) if s == "device" => TriggerSourceKind::Device,
-            None => TriggerSourceKind::Sensor,
-            Some(other) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Invalid source '{other}'. Use sensor, camera, or device."
-                ))]));
-            }
-        };
-
-        // ── Condition ──
-        let op = match p.op.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
-            None => None,
-            Some(s) => match s.as_str() {
-                "gt" | ">" => Some(CompareOp::Gt),
-                "gte" | ">=" => Some(CompareOp::Gte),
-                "lt" | "<" => Some(CompareOp::Lt),
-                "lte" | "<=" => Some(CompareOp::Lte),
-                "eq" | "==" | "=" => Some(CompareOp::Eq),
-                other => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Invalid op '{other}'. Use gt, gte, lt, lte, or eq."
-                    ))]));
-                }
-            },
-        };
-        for (field, v) in [("after", &p.after), ("before", &p.before)] {
-            if let Some(v) = v {
-                if chrono::NaiveTime::parse_from_str(v, "%H:%M").is_err() {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Invalid `{field}` '{v}' — use 24h HH:MM (e.g. \"18:30\")."
-                    ))]));
-                }
-            }
-        }
-
-        // ── Actions (at least one) ──
-        let mut actions = Vec::new();
-        if let Some(prompt) = p.prompt.as_deref().filter(|s| !s.trim().is_empty()) {
-            actions.push(TriggerAction::AgentPrompt {
-                prompt: prompt.trim().to_string(),
-            });
-        }
-        if let Some(device_id) = p
-            .power_device_id
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-        {
-            actions.push(TriggerAction::DevicePower {
-                device_id: device_id.trim().to_string(),
-                on: p.power_on.unwrap_or(true),
-            });
-        }
-        if let (Some(title), Some(body)) = (&p.notify_title, &p.notify_body) {
-            actions.push(TriggerAction::Notify {
-                title: title.clone(),
-                body: body.clone(),
-            });
-        }
-        if actions.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "A rule needs at least one action: `prompt`, `power_device_id` (+ `power_on`), \
-                 or `notify_title` + `notify_body`.",
-            )]));
-        }
-
-        let spec = SensorTriggerSpec {
-            source: TriggerSource {
-                kind: source_kind,
-                device_id: p.device_id.filter(|s| !s.trim().is_empty()),
-                signal: p.signal.filter(|s| !s.trim().is_empty()),
-            },
-            condition: TriggerCondition {
-                op,
-                value: p.value,
-                after: p.after,
-                before: p.before,
-            },
-            actions,
-            cooldown_secs: p
-                .cooldown_secs
-                .unwrap_or_else(SensorTriggerSpec::default_cooldown_secs),
-        };
-
-        let label = p
-            .name
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| format!("Rule: {}", sensor_rule_summary(&spec)));
-        let timezone = self
-            .settings_repo
-            .get()
-            .await
-            .map(|s| s.timezone)
-            .unwrap_or_else(|_| "UTC".to_string());
-        let id = format!("rule-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-
-        let req = pond_core::user_data::ports::scheduler::CreateScheduleRequest {
-            fire_at: None,
-            id: id.clone(),
-            label: label.clone(),
-            // Sentinel for display — event rules are never cron-registered.
-            cron: "@event".to_string(),
-            timezone,
-            kind: TaskKind::SensorTrigger(spec.clone()),
-        };
-        match self.scheduler.create_task(req).await {
-            Ok(_) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Sensor rule created: \"{label}\" [{id}] — {} (cooldown {}s). \
-                 It fires when a matching event arrives.",
-                sensor_rule_summary(&spec),
-                spec.cooldown_secs,
-            ))])),
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Failed to create sensor rule: {e}"
-            ))])),
-        }
-    }
-
-    #[tool(
-        description = "List sensor/event-triggered rules. Time-based schedules: use list_schedules."
-    )]
-    async fn list_sensor_rules(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        match self.scheduler.list_tasks().await {
-            Ok(tasks) => {
-                let rules: Vec<String> = tasks
-                    .iter()
-                    .filter_map(|t| match &t.kind {
-                        TaskKind::SensorTrigger(spec) => Some(format!(
-                            "- \"{}\" [{}]: {} (cooldown {}s{})",
-                            t.label,
-                            t.id,
-                            sensor_rule_summary(spec),
-                            spec.cooldown_secs,
-                            if t.paused { ", paused" } else { "" },
-                        )),
-                        _ => None,
-                    })
-                    .collect();
-                let text = if rules.is_empty() {
-                    "No sensor rules defined. Create one with create_sensor_rule.".to_string()
-                } else {
-                    rules.join("\n")
-                };
-                Ok(CallToolResult::success(vec![Content::text(text)]))
-            }
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Failed to list sensor rules: {e}"
-            ))])),
-        }
-    }
-
-    #[tool(description = "Delete a sensor rule by ID (see list_sensor_rules).")]
-    async fn delete_sensor_rule(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<DeleteSensorRuleParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let Some(id) = params.0.rule_id.filter(|s| !s.trim().is_empty()) else {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "I need a `rule_id`. Use list_sensor_rules to find it.",
-            )]));
-        };
-        match self.scheduler.delete_task(id.trim()).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Sensor rule {id} deleted."
-            ))])),
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Failed to delete sensor rule '{id}': {e}"
-            ))])),
-        }
-    }
-
     #[tool(description = "Get recent run history for a schedule: status, result, duration.")]
     async fn get_schedule_runs(
         &self,
@@ -1351,7 +1123,7 @@ pub async fn try_upcoming_schedules_context(scheduler: &dyn SchedulerPort) -> Op
 }
 
 /// One-line human summary of a sensor rule, shared by every display site.
-fn sensor_rule_summary(spec: &SensorTriggerSpec) -> String {
+pub(crate) fn sensor_rule_summary(spec: &SensorTriggerSpec) -> String {
     let src = match spec.source.kind {
         TriggerSourceKind::Sensor => "sensor",
         TriggerSourceKind::Camera => "camera",
