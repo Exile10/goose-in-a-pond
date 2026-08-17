@@ -96,12 +96,25 @@ them now.
 
 ## Turning it on
 
-The Devices tab has the toggle and the controller address. The address must be a
-WebSocket URL; `ws://127.0.0.1:5580/giap` is the default and means "GIAP runs the
-controller itself". The first enable on a fresh install downloads and installs the
-controller's dependencies, which legitimately takes a few minutes — the panel
-shows "Starting…" throughout, and a notification says the install has begun and
-another says when it is done.
+You do not. Matter runs by default: the controller ships with GIAP and installs
+itself the first time it is needed, so the only thing a user does is add a
+device. There is no enable toggle, because its only honest advice would have been
+"leave it on", and no controller address on the Devices tab, because a Pond
+running its own controller has nothing to point anywhere.
+
+The first start on a fresh install downloads the controller's dependencies, which
+legitimately takes a few minutes — the Devices tab shows "Starting…" throughout,
+a notification says the install has begun, and another says when it is done.
+After that it is always ready.
+
+The Devices tab shows only what the runtime is actually doing, and a Retry when
+it cannot reach the controller. **Register device** takes a setup code and
+nothing else: phones pair with a pairing code from the dashboard, and the desktop
+app is the app, so a "what kind of device" chooser had one real option in it.
+
+`matter_ws_url` remains in Settings for an operator running their own
+controller. `matter_enabled` remains settable through the settings API, for a
+Pond that will never see a Matter device — it is not in the UI and defaults on.
 
 Verify from the API rather than the UI when in doubt:
 

@@ -277,8 +277,10 @@ export interface Settings {
   vision_fps?: number;
   vision_motion_threshold?: number;
 
-  // Matter (smart-home fabric) — surfaced in the Devices tab
-  matter_enabled?: boolean;
+  // Matter (smart-home fabric). `matter_enabled` is deliberately absent: the
+  // integration runs by default and installs its own controller, so the app has
+  // nothing to set. It still exists server-side for an operator who wants it
+  // off, which is a settings-API decision rather than a screen.
   matter_ws_url?: string;
 
   // Inference stats display
