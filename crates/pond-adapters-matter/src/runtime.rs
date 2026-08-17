@@ -132,6 +132,31 @@ impl MatterRuntime {
         runtime
     }
 
+    /// Wait for the reconciler to reach a settled state, or for `timeout`.
+    ///
+    /// Startup calls this so the Matter lines land with the rest of the startup
+    /// log rather than arriving after the "listening" banner, which reads as if
+    /// something restarted. `apply` is deliberately non-blocking — a first-run
+    /// install takes minutes and serving must not wait on it — so this is the
+    /// bounded compromise: settle quickly in the ordinary case, give up and let
+    /// the install continue in the background in the slow one.
+    ///
+    /// Costs nothing when Matter is off: `apply` reaches `Disabled` without
+    /// touching the network, so this returns on the first poll.
+    pub async fn settle(&self, timeout: Duration) -> MatterStatus {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let status = self.status().await;
+            if !matches!(status.state, MatterState::Connecting) {
+                return status;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Route the runtime's user-facing notifications through `sender`.
     ///
     /// Separate from construction because the notification stack is built after

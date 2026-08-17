@@ -13,6 +13,7 @@
  *   control       — pause, resume, next, previous, volume, shuffle, seek, repeat
  */
 import * as readline from "readline";
+import { describeError, log } from "./log.js";
 import { SpotifyProvider } from "./providers/spotify.js";
 import type { TimeRange } from "./providers/types.js";
 
@@ -648,9 +649,19 @@ function parsePosition(value: unknown): number | null {
   return Number.isFinite(seconds) ? Math.max(0, seconds * 1000) : null;
 }
 
-// ── Debug logging (goes to stderr, not stdout) ───────────────
+// ── Logging ───────────────────────────────────────────────────
+//
+// Structured, levelled and redacted, in the same shape as the Matter controller
+// — see `src/log.ts`. `debug` keeps its old call sites: JSON-RPC traffic is
+// per-message chatter and belongs at debug, while anything that FAILED now says
+// so at a level that can be found.
 function debug(...args: unknown[]) {
-  console.error(`[music-ext]`, ...args);
+  const [first, ...rest] = args;
+  log.debug(
+    "jsonrpc",
+    typeof first === "string" ? first : JSON.stringify(first),
+    rest.length > 0 ? { detail: rest.map(a => (typeof a === "string" ? a : JSON.stringify(a))).join(" ") } : undefined,
+  );
 }
 
 // ── MCP JSON-RPC server ───────────────────────────────────────
@@ -698,7 +709,8 @@ async function handleRequest(
           unknown
         >) ?? {};
 
-      debug(`tool call: ${toolName}`, JSON.stringify(args));
+      const started = Date.now();
+      log.info("tool_call", `handling ${toolName}`, { tool: toolName });
 
       try {
         let text: string;
@@ -736,7 +748,9 @@ async function handleRequest(
             text = await handleControl(args);
             break;
           default:
-            debug("unknown tool:", toolName);
+            log.warn("unknown_tool", "the model asked for a tool this extension does not have", {
+              tool: toolName,
+            });
             return {
               jsonrpc: "2.0",
               id,
@@ -744,15 +758,26 @@ async function handleRequest(
             };
         }
 
-        debug(`result (${text.length} chars):`, text.slice(0, 120));
+        log.info("tool_ok", `${toolName} succeeded`, {
+          tool: toolName,
+          chars: text.length,
+          duration_ms: Date.now() - started,
+        });
         return {
           jsonrpc: "2.0",
           id,
           result: { content: [{ type: "text", text }] },
         };
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        debug("ERROR:", msg);
+        // Reported to the model AND logged. It was only ever reported, so a
+        // tool that failed the same way every time left no trace anyone could
+        // find afterwards — the model relayed a sentence and it was gone.
+        const msg = describeError(err);
+        log.warn("tool_failed", `${toolName} failed`, {
+          tool: toolName,
+          error: msg,
+          duration_ms: Date.now() - started,
+        });
         return {
           jsonrpc: "2.0",
           id,
