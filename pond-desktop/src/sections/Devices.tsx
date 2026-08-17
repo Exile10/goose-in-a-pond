@@ -73,6 +73,19 @@ function timeSince(iso: string | null | undefined): string {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
+/**
+ * When a device was last heard from.
+ *
+ * A device that is online is being vouched for right now — "online" is derived
+ * from having been heard from recently — so it reads "now" rather than counting
+ * the minutes since the last heartbeat, which would tick 1, 2, 3 for a device
+ * that never went anywhere. An offline one shows when it actually went quiet,
+ * which is the number worth having then.
+ */
+function lastSeen(device: Pick<Device, "is_online" | "last_seen">): string {
+  return device.is_online ? "now" : timeSince(device.last_seen);
+}
+
 export function Devices() {
   const [devices, setDevices]     = useState<Device[]>([]);
   const [loading, setLoading]     = useState(true);
@@ -335,7 +348,7 @@ export function Devices() {
                 {d.device_type && (
                   <span className="device-card__chip">{d.device_type}</span>
                 )}
-                <span className="device-card__chip">{timeSince(d.last_seen)}</span>
+                <span className="device-card__chip">{lastSeen(d)}</span>
               </div>
 
               {/* Actions */}
@@ -488,7 +501,7 @@ export function Devices() {
               <div className="sched-modal__field">
                 <label className="sched-modal__label">Status</label>
                 <div className="muted-12">
-                  {detail.is_online ? "online" : "offline"} · last seen {timeSince(detail.last_seen)}
+                  {detail.is_online ? "online" : "offline"} · last seen {lastSeen(detail)}
                 </div>
               </div>
               <div className="sched-modal__field">
