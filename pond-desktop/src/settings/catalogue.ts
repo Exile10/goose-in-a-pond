@@ -692,10 +692,10 @@ export const CATALOGUE: CatalogueCategory[] = [
           { key: "matter_enabled", label: "Use a Matter controller", description: "Connect to a smart-home controller and drive the devices on it.", control: { kind: "toggle" }, consumer: "live" },
           {
             key: "matter_ws_url", label: "Controller address", description: "Address of your smart-home controller.",
-            control: { kind: "text", placeholder: "ws://127.0.0.1:5580/ws" }, consumer: "live",
+            control: { kind: "text", placeholder: "ws://127.0.0.1:5580/giap" }, consumer: "live",
             // Mirrors the server's own 422 so the message arrives before the
             // round-trip rather than instead of it.
-            validate: optional(url(["ws://", "wss://"], "ws://127.0.0.1:5580/ws")),
+            validate: optional(url(["ws://", "wss://"], "ws://127.0.0.1:5580/giap")),
           },
         ],
       },

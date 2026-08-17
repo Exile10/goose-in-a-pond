@@ -899,7 +899,13 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         // chosen", which is what the default is for.
         "matter_ws_url" => {
             if !value.trim().is_empty() {
-                s.matter_ws_url = value.to_string();
+                // Migrated on read rather than by a schema migration: the value
+                // is a plain settings row, and rewriting it here means an
+                // install that never touched the field follows the default
+                // across the move to the matter.js controller instead of
+                // pointing at a path nothing serves.
+                s.matter_ws_url =
+                    pond_core::user_data::domain::settings::migrate_matter_ws_url(value);
             }
         }
         // Private mesh (#132)
@@ -1179,6 +1185,44 @@ mod tests {
             repo.get().await.unwrap().matter_ws_url,
             "ws://192.168.1.50:5580/ws"
         );
+    }
+
+    /// Every install predating the matter.js controller holds the old default,
+    /// which points at a path the current controller does not serve. Without
+    /// this rewrite, upgrading would silently break Matter for everyone who
+    /// never touched the field — the worst shape of breakage, because the
+    /// setting still LOOKS right.
+    #[tokio::test]
+    async fn the_superseded_controller_default_is_migrated_on_read() {
+        let repo = fresh_repo().await;
+        repo.set_key(
+            "matter_ws_url",
+            pond_core::user_data::domain::settings::LEGACY_MATTER_WS_URL.to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.get().await.unwrap().matter_ws_url,
+            pond_core::user_data::domain::settings::DEFAULT_MATTER_WS_URL
+        );
+    }
+
+    /// An address the user typed is theirs, and may well be a
+    /// python-matter-server they still run. Only the exact old default moves.
+    #[tokio::test]
+    async fn a_user_chosen_controller_address_is_left_alone() {
+        let repo = fresh_repo().await;
+        for chosen in [
+            "ws://192.168.1.50:5580/ws",
+            "ws://127.0.0.1:9000/ws",
+            "wss://matter.example:443/giap",
+        ] {
+            repo.set_key("matter_ws_url", chosen.to_string())
+                .await
+                .unwrap();
+            assert_eq!(repo.get().await.unwrap().matter_ws_url, chosen);
+        }
     }
 
     /// Perturb every scalar field of a serialised `Settings` to a value that

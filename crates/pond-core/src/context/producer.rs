@@ -120,6 +120,18 @@ pub const DISCRETE_SENSOR_TYPES: &[&str] = &[
     // corpus exists to be able to say. Grouped with `smoke` above rather than
     // replacing it, because the two names come from different bridges.
     "smoke_alarm",
+    // An air purifier asking for its filter to be changed. Same argument as
+    // `smoke_alarm`: 0/1/2 rather than a boolean, but it is a device asking for
+    // something to be DONE, it changes a handful of times a year, and "the
+    // filter needs changing" is a household fact worth a durable row.
+    //
+    // These were minted by the Matter bridge long before they were listed here.
+    // The tripwire could not see them because they were written in a shape its
+    // extraction did not match, so every one of these readings was silently
+    // discarded — which is the exact failure that tripwire exists to catch,
+    // slipping past it on a technicality. Both names are now dispositioned.
+    "hepa_filter_change",
+    "carbon_filter_change",
 ];
 
 /// Camera event types that mean "the pixels changed" rather than naming a thing.

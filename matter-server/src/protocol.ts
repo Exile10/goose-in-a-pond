@@ -99,8 +99,6 @@ export type Response = SuccessResponse | FailureResponse;
 export interface WireError {
   code: ErrorCode;
   message: string;
-  /** Whether repeating the same request unchanged could plausibly succeed. */
-  retryable: boolean;
 }
 
 /**
@@ -119,11 +117,6 @@ export type ErrorCode =
   | "bad_request"
   | "internal";
 
-export const RETRYABLE_CODES: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
-  "no_device_in_pairing_mode",
-  "device_unreachable",
-  "internal",
-]);
 
 /** An error carrying a wire code, so the dispatcher does not have to guess one. */
 export class OpError extends Error {
@@ -136,7 +129,7 @@ export class OpError extends Error {
   }
 
   toWire(): WireError {
-    return { code: this.code, message: this.message, retryable: RETRYABLE_CODES.has(this.code) };
+    return { code: this.code, message: this.message };
   }
 }
 

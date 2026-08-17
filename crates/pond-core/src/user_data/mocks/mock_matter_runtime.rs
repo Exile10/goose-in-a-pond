@@ -87,7 +87,7 @@ impl StubMatterRuntime {
         Self {
             status: Mutex::new(MatterStatus {
                 enabled,
-                url: "ws://127.0.0.1:5580/ws".into(),
+                url: "ws://127.0.0.1:5580/giap".into(),
                 state,
             }),
             commissioner,

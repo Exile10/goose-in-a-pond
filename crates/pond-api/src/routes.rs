@@ -4439,9 +4439,9 @@ async fn update_settings(
         // looking at is blank, which the placeholder otherwise hides.
         let message = if matter_url.is_empty() {
             "Controller address is empty. Enter the Matter controller's WebSocket URL, \
-             for example ws://127.0.0.1:5580/ws"
+             for example ws://127.0.0.1:5580/giap"
         } else {
-            "Controller address must be a WebSocket URL, for example ws://127.0.0.1:5580/ws"
+            "Controller address must be a WebSocket URL, for example ws://127.0.0.1:5580/giap"
         };
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,

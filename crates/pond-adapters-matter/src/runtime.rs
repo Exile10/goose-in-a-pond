@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use pond_core::mcp::ports::notification::NotificationSender;
 use pond_core::shared::ports::event_bus::EventBus;
 use pond_core::user_data::ports::device_commissioning::DeviceCommissioningPort;
 use pond_core::user_data::ports::device_control::{DeviceControlOutcome, DeviceControlPort};
@@ -42,8 +43,9 @@ use tokio::task::JoinHandle;
 use crate::bridge::{run_matter_supervisor, SupervisorConfig};
 use crate::client::{MatterClient, MatterEvent};
 use crate::commissioning::MatterCommissioner;
-use crate::control::{MatterDeviceControl, NodeCache};
-use crate::protocol::node_id_from_device_id;
+use crate::control::MatterDeviceControl;
+use crate::notify::MatterNotifier;
+use crate::protocol::{node_id_from_device_id, redact_setup_code};
 use crate::server_setup::{ensure_running, local_port_from_ws_url, SharedServerChild};
 
 /// How long to wait for a freshly installed controller to start listening.
@@ -76,6 +78,7 @@ struct Desired {
 
 /// Reconciles the Matter integration toward the requested state.
 pub struct MatterRuntime {
+    notifier: MatterNotifier,
     desired: watch::Sender<Desired>,
     status: Arc<RwLock<MatterStatus>>,
     commissioner: Arc<RwLock<Option<Arc<dyn DeviceCommissioningPort>>>>,
@@ -101,7 +104,9 @@ impl MatterRuntime {
             nonce: 0,
         });
 
+        let notifier = MatterNotifier::new();
         let runtime = Arc::new(Self {
+            notifier: notifier.clone(),
             desired,
             status: Arc::new(RwLock::new(MatterStatus::disabled())),
             commissioner: Arc::new(RwLock::new(None)),
@@ -116,6 +121,7 @@ impl MatterRuntime {
                 data_dir,
                 registry,
                 bus,
+                notifier,
                 status: runtime.status.clone(),
                 commissioner: runtime.commissioner.clone(),
                 control: runtime.control.clone(),
@@ -124,6 +130,16 @@ impl MatterRuntime {
         ));
 
         runtime
+    }
+
+    /// Route the runtime's user-facing notifications through `sender`.
+    ///
+    /// Separate from construction because the notification stack is built after
+    /// the runtime is — see [`MatterNotifier`]. Call it before the first
+    /// [`apply`](MatterRuntimePort::apply), or a first-run install finishes
+    /// without the user ever being told it started.
+    pub async fn attach_notifications(&self, sender: Arc<dyn NotificationSender>) {
+        self.notifier.attach(sender).await;
     }
 
     /// A [`DeviceControlPort`] that follows this runtime: Matter while
@@ -201,6 +217,7 @@ struct Reconciler {
     data_dir: PathBuf,
     registry: Arc<dyn DeviceRegistry + Send + Sync>,
     bus: Arc<dyn EventBus>,
+    notifier: MatterNotifier,
     status: Arc<RwLock<MatterStatus>>,
     commissioner: Arc<RwLock<Option<Arc<dyn DeviceCommissioningPort>>>>,
     control: ControlCell,
@@ -276,18 +293,33 @@ async fn reconcile_loop(mut rx: watch::Receiver<Desired>, r: Reconciler) {
                                 url: want.url.clone(),
                                 state: MatterState::Connected,
                             };
-                            tracing::info!(url = %want.url, "matter: controller connected");
+                            tracing::info!(
+                                target: "giap::trace",
+                                kind = "matter_state_changed",
+                                url = %want.url,
+                                to = "connected",
+                                "matter: controller connected"
+                            );
                         }
                         Err(e) => {
+                            // Redacted because this string is not only logged:
+                            // it is stored in `Unreachable` and SERVED by
+                            // `GET /api/v1/matter/status`. A failed commission
+                            // whose cause reached this path would otherwise put
+                            // a setup code in an HTTP response.
+                            let error = redact_setup_code(&e.to_string());
                             tracing::warn!(
+                                target: "giap::trace",
+                                kind = "matter_state_changed",
                                 url = %want.url,
-                                error = %e,
+                                to = "unreachable",
+                                error = %error,
                                 "matter: could not start or reach the controller"
                             );
                             *r.status.write().await = MatterStatus {
                                 enabled: true,
                                 url: want.url.clone(),
-                                state: MatterState::Unreachable { error: e.to_string() },
+                                state: MatterState::Unreachable { error },
                             };
                         }
                     },
@@ -300,7 +332,12 @@ async fn reconcile_loop(mut rx: watch::Receiver<Desired>, r: Reconciler) {
                     url: want.url.clone(),
                     state: MatterState::Disabled,
                 };
-                tracing::info!("matter: disabled");
+                tracing::info!(
+                    target: "giap::trace",
+                    kind = "matter_state_changed",
+                    to = "disabled",
+                    "matter: disabled"
+                );
             }
         }
 
@@ -335,7 +372,9 @@ async fn connect(r: &Reconciler, url: &str) -> Result<Connected> {
     // Only a loopback URL is GIAP's to install and run; anything else is
     // someone else's controller and is used as-is.
     let started = match local_port_from_ws_url(url) {
-        Some(port) => ensure_running(&r.data_dir, port, CONTROLLER_READY_TIMEOUT).await?,
+        Some(port) => {
+            ensure_running(&r.data_dir, port, CONTROLLER_READY_TIMEOUT, &r.notifier).await?
+        }
         None => None,
     };
     // One cell, two writers: this connect puts the first handle in, and the
@@ -345,15 +384,14 @@ async fn connect(r: &Reconciler, url: &str) -> Result<Connected> {
     let (client, events): (Arc<MatterClient>, tokio::sync::mpsc::Receiver<MatterEvent>) =
         MatterClient::connect(url).await?;
 
-    let nodes: NodeCache = Arc::new(RwLock::new(std::collections::HashMap::new()));
-    let control = Arc::new(MatterDeviceControl::new(client.clone(), nodes.clone()));
+    let control = Arc::new(MatterDeviceControl::new(client.clone()));
     let commissioner: Arc<dyn DeviceCommissioningPort> =
-        Arc::new(MatterCommissioner::new(client.clone()));
+        Arc::new(MatterCommissioner::new(client.clone(), r.notifier.clone()));
 
     // Supervised: on connection loss it reconnects with backoff and swaps the
-    // fresh client into the control's handle, so a matter-server restart no
-    // longer needs a pond-server restart. It also restarts the controller
-    // itself when reconnecting alone stops being enough.
+    // fresh client into the control's handle, so a controller restart no longer
+    // needs a pond-server restart. It also restarts the controller itself when
+    // reconnecting alone stops being enough.
     let supervisor = tokio::spawn(run_matter_supervisor(
         SupervisorConfig {
             url: url.to_string(),
@@ -363,9 +401,9 @@ async fn connect(r: &Reconciler, url: &str) -> Result<Connected> {
         control.client_handle(),
         client,
         events,
-        nodes,
         r.registry.clone(),
         r.bus.clone(),
+        r.notifier.clone(),
     ));
 
     Ok(Connected {

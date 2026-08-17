@@ -9,9 +9,10 @@
  * ALLOW-list: an unlisted signal is discarded forever, with no error anywhere, and a
  * household's new device becomes the one thing the assistant never mentions.
  *
- * So: keep the table one entry per line with a literal `sensorType: "…"`, because that
- * is the shape the tripwire scans for. A mapping written some other way is invisible
- * to it, and an invisible mapping is the failure it was built to catch.
+ * So: keep the table one entry per line, each with its sensor name as a plain string
+ * literal in the sensorType field, because that is the shape the tripwire scans for. A
+ * mapping written some other way is invisible to it, and an invisible mapping is the
+ * failure it was built to catch.
  */
 
 import type { Reading } from "../protocol.js";

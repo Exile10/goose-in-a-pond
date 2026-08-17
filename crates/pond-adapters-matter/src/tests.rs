@@ -1,6 +1,12 @@
-//! Integration tests against an in-process mock matter-server (a real
-//! WebSocket server speaking the schema-11 protocol), so the whole adapter is
-//! CI-green with no controller installed.
+//! Integration tests against an in-process mock controller (a real WebSocket
+//! server speaking `giap-matter`), so the whole adapter is CI-green with no
+//! controller installed and no hardware.
+//!
+//! What is asserted here is the adapter's half of the contract: which op it
+//! sends for a verb, what it does with the answer, how it behaves when the
+//! connection drops, and how the runtime converges. Which Matter cluster a verb
+//! becomes is the controller's business now and is tested in
+//! `matter-server/test/control.test.ts` against the same recorded devices.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -8,8 +14,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures::{SinkExt, StreamExt};
+use pond_core::shared::ports::event_bus::BusStream;
 use pond_core::shared::ports::event_bus::{BusEvent, EventBus};
 use pond_core::shared::services::in_process_event_bus::InProcessEventBus;
+use pond_core::user_data::ports::device_commissioning::{DeviceCommissioningPort, SetupCode};
 use pond_core::user_data::ports::device_control::{
     DeviceControlOutcome, DeviceControlPort, DeviceStatePatch,
 };
@@ -23,113 +31,138 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::bridge::{run_matter_bridge, run_matter_supervisor, SupervisorConfig};
 use crate::client::MatterClient;
 use crate::commissioning::MatterCommissioner;
-use crate::control::{MatterDeviceControl, NodeCache, SharedMatterClient};
+use crate::control::{MatterDeviceControl, SharedMatterClient};
+use crate::notify::MatterNotifier;
 use crate::runtime::MatterRuntime;
-use pond_core::user_data::ports::device_commissioning::{DeviceCommissioningPort, SetupCode};
 
-// ── Mock matter-server ───────────────────────────────────────────────────────
+// ── Mock controller ──────────────────────────────────────────────────────────
 
-/// Everything the mock received (`device_command` / `write_attribute` frames),
-/// for assertions.
-type ReceivedCommands = Arc<Mutex<Vec<Value>>>;
+/// Every request the mock received, for assertions.
+type Received = Arc<Mutex<Vec<Value>>>;
 
-/// Start a one-connection mock matter-server. It greets, answers
-/// `start_listening` with `nodes`, records every other command (answering
-/// success), and pushes `push_events` right after `start_listening`.
-async fn mock_matter_server(nodes: Value, push_events: Vec<Value>) -> (String, ReceivedCommands) {
+fn greeting() -> Message {
+    Message::Text(
+        json!({
+            "protocol": "giap-matter",
+            "version": 1,
+            "fabric_id": 1,
+            "matter_js": "test",
+        })
+        .to_string()
+        .into(),
+    )
+}
+
+/// How the mock should answer one op.
+type Answer = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
+
+/// A mock controller. It greets, answers `subscribe` with `snapshot`, pushes
+/// `events` right after, and answers everything else with `answer` (success and
+/// an empty result by default).
+///
+/// It accepts connections in a loop, and a connection that never completes a
+/// WebSocket handshake is dropped rather than fatal. Both matter: `is_running`
+/// probes the port with a bare TCP connect before the runtime connects properly,
+/// so a mock that accepted once, or that unwrapped the handshake, would spend
+/// its only connection on the probe and then fail the test it was set up for.
+async fn mock_controller(
+    snapshot: Value,
+    events: Vec<Value>,
+    answer: Option<Answer>,
+) -> (String, Received) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-    let received: ReceivedCommands = Arc::new(Mutex::new(Vec::new()));
+    let url = format!("ws://{}/giap", listener.local_addr().unwrap());
+    let received: Received = Arc::new(Mutex::new(Vec::new()));
     let received_srv = received.clone();
 
     tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-        ws.send(Message::Text(
-            json!({"fabric_id": 1, "schema_version": 11})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
+        while let Ok((stream, _)) = listener.accept().await {
+            let snapshot = snapshot.clone();
+            let events = events.clone();
+            let answer = answer.clone();
+            let received_conn = received_srv.clone();
 
-        while let Some(Ok(Message::Text(text))) = ws.next().await {
-            let frame: Value = serde_json::from_str(&text).unwrap();
-            let mid = frame["message_id"].as_str().unwrap().to_string();
-            match frame["command"].as_str().unwrap() {
-                "start_listening" => {
-                    ws.send(Message::Text(
-                        json!({"message_id": mid, "result": nodes})
-                            .to_string()
-                            .into(),
-                    ))
-                    .await
-                    .unwrap();
-                    for event in &push_events {
-                        ws.send(Message::Text(event.to_string().into()))
-                            .await
-                            .unwrap();
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return; // a liveness probe, not a client
+                };
+                if ws.send(greeting()).await.is_err() {
+                    return;
+                }
+
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    let id = frame["id"].as_str().unwrap().to_string();
+                    received_conn.lock().unwrap().push(frame.clone());
+
+                    if frame["op"] == "subscribe" {
+                        ws.send(Message::Text(
+                            json!({"id": id, "ok": true, "result": snapshot})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                        for event in &events {
+                            ws.send(Message::Text(event.to_string().into()))
+                                .await
+                                .unwrap();
+                        }
+                        continue;
                     }
+
+                    let mut reply = match &answer {
+                        Some(f) => f(&frame),
+                        None => json!({"id": id, "ok": true, "result": {}}),
+                    };
+                    reply["id"] = json!(id);
+                    ws.send(Message::Text(reply.to_string().into()))
+                        .await
+                        .unwrap();
                 }
-                _ => {
-                    received_srv.lock().unwrap().push(frame.clone());
-                    ws.send(Message::Text(
-                        json!({"message_id": mid, "result": null})
-                            .to_string()
-                            .into(),
-                    ))
-                    .await
-                    .unwrap();
-                }
-            }
+            });
         }
     });
 
     (url, received)
 }
 
-/// A mock that accepts multiple connections and drops the FIRST one right
-/// after its `start_listening`, to force a reconnect. Returns the url and a
-/// shared count of `start_listening` calls across all connections.
-async fn mock_reconnecting_server(nodes: Value) -> (String, Arc<Mutex<u32>>) {
+/// A mock that accepts several connections and drops the FIRST one right after
+/// its `subscribe`, to force a reconnect. Returns the url and a shared count of
+/// `subscribe` calls across all connections.
+async fn mock_reconnecting_controller(snapshot: Value) -> (String, Arc<Mutex<u32>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-    let listens = Arc::new(Mutex::new(0u32));
-    let listens_srv = listens.clone();
+    let url = format!("ws://{}/giap", listener.local_addr().unwrap());
+    let subscribes = Arc::new(Mutex::new(0u32));
+    let counter = subscribes.clone();
 
     tokio::spawn(async move {
         let mut conn = 0u32;
         while let Ok((stream, _)) = listener.accept().await {
             conn += 1;
-            let drop_after_listen = conn == 1;
+            let drop_after_subscribe = conn == 1;
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-            ws.send(Message::Text(
-                json!({"fabric_id": 1, "schema_version": 11})
-                    .to_string()
-                    .into(),
-            ))
-            .await
-            .unwrap();
+            ws.send(greeting()).await.unwrap();
 
             while let Some(Ok(Message::Text(text))) = ws.next().await {
                 let frame: Value = serde_json::from_str(&text).unwrap();
-                let mid = frame["message_id"].as_str().unwrap().to_string();
-                if frame["command"] == "start_listening" {
-                    *listens_srv.lock().unwrap() += 1;
+                let id = frame["id"].as_str().unwrap().to_string();
+                if frame["op"] == "subscribe" {
+                    *counter.lock().unwrap() += 1;
                     ws.send(Message::Text(
-                        json!({"message_id": mid, "result": nodes})
+                        json!({"id": id, "ok": true, "result": snapshot})
                             .to_string()
                             .into(),
                     ))
                     .await
                     .unwrap();
-                    if drop_after_listen {
+                    if drop_after_subscribe {
                         let _ = ws.close(None).await;
                         break;
                     }
                 } else {
                     ws.send(Message::Text(
-                        json!({"message_id": mid, "result": null})
+                        json!({"id": id, "ok": true, "result": {}})
                             .to_string()
                             .into(),
                     ))
@@ -140,56 +173,60 @@ async fn mock_reconnecting_server(nodes: Value) -> (String, Arc<Mutex<u32>>) {
         }
     });
 
-    (url, listens)
+    (url, subscribes)
 }
 
-/// Same cluster layout as the light commissioned in the live session
-/// (OnOff + LevelControl on endpoint 13) — identical for real bulbs.
-fn light_node_json() -> Value {
+// ── Fixtures ─────────────────────────────────────────────────────────────────
+
+fn light() -> Value {
     json!({
-        "node_id": 2,
-        "available": true,
-        "attributes": {
-            "0/40/5": "Living Room Light",
-            "13/6/0": false,
-            "13/8/0": 1
-        }
+        "id": "matter-2",
+        "name": "Kitchen Light",
+        "device_type": "light",
+        "capabilities": ["power", "brightness"],
+        "online": true,
     })
 }
 
-/// The Matter Virtual Device's fan as commissioned on 2026-08-05: Fan Control
-/// on endpoint 1, and no On/Off cluster anywhere on the node.
-fn fan_node_json() -> Value {
+fn sensor() -> Value {
     json!({
-        "node_id": 18,
-        "available": true,
-        "attributes": {
-            "0/40/5": "Living Room Fan",
-            "1/514/0": 0,
-            "1/514/2": 0
-        }
+        "id": "matter-4",
+        "name": "Hall Sensor",
+        "device_type": "sensor",
+        "capabilities": [],
+        "online": true,
     })
 }
 
-fn occupancy_node_json() -> Value {
+fn snapshot(devices: Vec<Value>, readings: Vec<Value>) -> Value {
+    json!({ "devices": devices, "readings": readings })
+}
+
+fn reading(device: &str, sensor_type: &str, value: f64) -> Value {
     json!({
-        "node_id": 7,
-        "available": true,
-        "attributes": { "1/1030/0": 0 }
+        "device_id": device,
+        "sensor_type": sensor_type,
+        "value": value,
+        "unit": "bool",
     })
 }
 
-// ── In-memory registry stub ──────────────────────────────────────────────────
+// ── Test registry ────────────────────────────────────────────────────────────
 
 #[derive(Default)]
-struct InMemoryRegistry {
-    devices: Mutex<HashMap<String, Device>>,
+struct MockRegistry {
+    devices: RwLock<HashMap<String, Device>>,
+    heartbeats: Mutex<Vec<String>>,
+    retypes: Mutex<Vec<(String, String)>>,
 }
 
 #[async_trait::async_trait]
-impl DeviceRegistry for InMemoryRegistry {
+impl DeviceRegistry for MockRegistry {
     async fn register(&self, request: RegisterDeviceRequest) -> Result<Device> {
-        let id = request.id.clone().unwrap_or_else(|| "generated".into());
+        let id = request
+            .id
+            .clone()
+            .unwrap_or_else(|| "generated".to_string());
         let device = Device {
             id: id.clone(),
             name: request.name,
@@ -202,442 +239,383 @@ impl DeviceRegistry for InMemoryRegistry {
             is_online: true,
             room: request.room,
         };
-        self.devices.lock().unwrap().insert(id, device.clone());
+        self.devices.write().await.insert(id, device.clone());
         Ok(device)
     }
+
     async fn list_devices(&self) -> Result<Vec<Device>> {
-        Ok(self.devices.lock().unwrap().values().cloned().collect())
+        Ok(self.devices.read().await.values().cloned().collect())
     }
+
     async fn get_device(&self, id: &str) -> Result<Option<Device>> {
-        Ok(self.devices.lock().unwrap().get(id).cloned())
+        Ok(self.devices.read().await.get(id).cloned())
     }
+
     async fn unregister(&self, id: &str) -> Result<()> {
-        self.devices.lock().unwrap().remove(id);
+        self.devices.write().await.remove(id);
         Ok(())
     }
-    async fn heartbeat(&self, _id: &str) -> Result<()> {
+
+    async fn heartbeat(&self, id: &str) -> Result<()> {
+        self.heartbeats.lock().unwrap().push(id.to_string());
         Ok(())
     }
+
     async fn set_discovered_profile(
         &self,
         id: &str,
         device_type: &str,
         capabilities: &[String],
     ) -> Result<()> {
-        // Implemented rather than left on the port's no-op default, because the
-        // default would make `an_already_registered_device_is_retyped_on_sync`
-        // pass whether or not the bridge calls it.
-        if let Some(d) = self.devices.lock().unwrap().get_mut(id) {
-            d.device_type = device_type.to_string();
-            d.capabilities = capabilities.to_vec();
+        self.retypes
+            .lock()
+            .unwrap()
+            .push((id.to_string(), device_type.to_string()));
+        if let Some(device) = self.devices.write().await.get_mut(id) {
+            device.device_type = device_type.to_string();
+            device.capabilities = capabilities.to_vec();
         }
         Ok(())
     }
 }
 
+/// Connect, run the bridge to completion of its initial sync, and hand back the
+/// pieces a test needs.
 async fn start_adapter(
-    nodes: Value,
-    push_events: Vec<Value>,
+    url: &str,
 ) -> (
-    Arc<MatterClient>,
-    NodeCache,
-    Arc<InMemoryRegistry>,
-    Arc<InProcessEventBus>,
-    ReceivedCommands,
+    Arc<MatterDeviceControl>,
+    Arc<MockRegistry>,
+    Arc<dyn EventBus>,
+    BusStream,
 ) {
-    let (url, received) = mock_matter_server(nodes, push_events).await;
-    let (client, events) = MatterClient::connect(&url).await.unwrap();
-    let cache: NodeCache = Arc::new(RwLock::new(HashMap::new()));
-    let registry = Arc::new(InMemoryRegistry::default());
-    let bus = Arc::new(InProcessEventBus::new());
-    tokio::spawn(run_matter_bridge(
-        client.clone(),
-        events,
-        cache.clone(),
-        registry.clone() as Arc<dyn DeviceRegistry + Send + Sync>,
-        bus.clone() as Arc<dyn EventBus>,
-    ));
-    // Let the bridge finish its initial sync.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    (client, cache, registry, bus, received)
+    let (client, events) = MatterClient::connect(url).await.unwrap();
+    let registry = Arc::new(MockRegistry::default());
+    let bus: Arc<dyn EventBus> = Arc::new(InProcessEventBus::new());
+    let received = bus.subscribe();
+    let control = Arc::new(MatterDeviceControl::new(client.clone()));
+
+    let registry_dyn: Arc<dyn DeviceRegistry + Send + Sync> = registry.clone();
+    let bus_bridge = bus.clone();
+    tokio::spawn(async move {
+        let _ = run_matter_bridge(
+            client,
+            events,
+            registry_dyn,
+            bus_bridge,
+            MatterNotifier::disabled(),
+        )
+        .await;
+    });
+    // Let the initial sync land.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    (control, registry, bus, received)
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────────
-
-/// Nodes discovered at startup land in the registry with stable ids, real
-/// names, and capabilities inferred from their clusters.
-#[tokio::test]
-async fn bridge_syncs_fabric_nodes_into_the_device_registry() {
-    let (_client, cache, registry, _bus, _received) =
-        start_adapter(json!([light_node_json(), occupancy_node_json()]), vec![]).await;
-
-    let light = registry.get_device("matter-2").await.unwrap().unwrap();
-    assert_eq!(light.name, "Living Room Light");
-    assert_eq!(light.device_type, "light");
-    assert_eq!(light.capabilities, vec!["power", "brightness"]);
-
-    let sensor = registry.get_device("matter-7").await.unwrap().unwrap();
-    assert_eq!(sensor.device_type, "sensor");
-    assert_eq!(cache.read().await.len(), 2);
-}
-
-/// `set_power(off)` becomes the exact `device_command` frame proven in the
-/// live MVD session: node 2, endpoint 13, cluster 6, command "Off".
-#[tokio::test]
-async fn set_power_sends_the_proven_onoff_command() {
-    let (client, cache, _registry, _bus, received) =
-        start_adapter(json!([light_node_json()]), vec![]).await;
-    let control = MatterDeviceControl::new(client, cache);
-
-    let outcome = control.set_power("matter-2", false).await.unwrap();
-    assert_eq!(outcome.applied.on, Some(false));
-
-    let frames = received.lock().unwrap().clone();
-    assert_eq!(frames.len(), 1);
-    let args = &frames[0]["args"];
-    assert_eq!(frames[0]["command"], "device_command");
-    assert_eq!(args["node_id"], 2);
-    assert_eq!(args["endpoint_id"], 13);
-    assert_eq!(args["cluster_id"], 6);
-    assert_eq!(args["command_name"], "Off");
-}
-
-/// Brightness maps onto LevelControl with the Matter 0-254 scale.
-#[tokio::test]
-async fn set_brightness_maps_to_level_control() {
-    let (client, cache, _registry, _bus, received) =
-        start_adapter(json!([light_node_json()]), vec![]).await;
-    let control = MatterDeviceControl::new(client, cache);
-
-    control.set_brightness("matter-2", 50).await.unwrap();
-
-    let frames = received.lock().unwrap().clone();
-    let args = &frames[0]["args"];
-    assert_eq!(args["cluster_id"], 8);
-    assert_eq!(args["command_name"], "MoveToLevelWithOnOff");
-    assert_eq!(args["payload"]["level"], 127);
-}
-
-/// Unknown ids and missing capabilities fail with actionable errors instead
-/// of sending anything to the fabric.
-#[tokio::test]
-async fn control_rejects_unknown_devices_and_capabilities() {
-    let (client, cache, _registry, _bus, received) =
-        start_adapter(json!([light_node_json()]), vec![]).await;
-    let control = MatterDeviceControl::new(client, cache);
-
-    assert!(control.set_power("living-room-light", true).await.is_err());
-    assert!(control.set_power("matter-99", true).await.is_err());
-    // The light has no DoorLock cluster.
-    assert!(control.set_locked("matter-2", true).await.is_err());
-    assert!(
-        received.lock().unwrap().is_empty(),
-        "nothing reached the fabric"
-    );
-}
-
-/// The bug the Virtual Fan exposed: `set_power` resolved On/Off and nothing
-/// else, so a fan — which need not implement On/Off at all — could never be
-/// switched on. Its power is the `FanMode` attribute.
-#[tokio::test]
-async fn set_power_on_a_fan_writes_fan_mode() {
-    let (client, cache, _registry, _bus, received) =
-        start_adapter(json!([fan_node_json()]), vec![]).await;
-    let control = MatterDeviceControl::new(client, cache);
-
-    let outcome = control.set_power("matter-18", true).await.unwrap();
-    assert_eq!(outcome.applied.on, Some(true));
-
-    let frames = received.lock().unwrap().clone();
-    assert_eq!(frames.len(), 1, "exactly one write reached the fabric");
-    let args = &frames[0]["args"];
-    assert_eq!(frames[0]["command"], "write_attribute");
-    assert_eq!(args["node_id"], 18);
-    // endpoint/cluster/attribute — FanMode on the fan's endpoint.
-    assert_eq!(args["attribute_path"], "1/514/0");
-    // High (3), NOT FanMode::On (4). `On` was deprecated in Matter 1.2 and
-    // appears in none of the FanModeSequence values a current device
-    // advertises, so a conforming fan may reject the write — which would have
-    // left "turn on the fan" still not turning on the fan, the exact bug this
-    // path was added to fix. High is the only non-Off mode present in every
-    // sequence. See `FAN_MODE_ON`.
-    assert_eq!(args["value"], 3, "FanMode High");
-}
-
-#[tokio::test]
-async fn turning_a_fan_off_writes_fan_mode_off() {
-    let (client, cache, _registry, _bus, received) =
-        start_adapter(json!([fan_node_json()]), vec![]).await;
-    let control = MatterDeviceControl::new(client, cache);
-
-    control.set_power("matter-18", false).await.unwrap();
-
-    let frames = received.lock().unwrap().clone();
-    assert_eq!(frames[0]["args"]["value"], 0, "FanMode Off");
-}
-
-/// An air purifier is asked for a mode, not a percentage: "auto" and "smart"
-/// hand the choice back to the device and have no position on the speed slider.
-#[tokio::test]
-async fn setting_a_fan_mode_writes_the_mode_the_user_named() {
-    let (client, cache, _registry, _bus, received) =
-        start_adapter(json!([fan_node_json()]), vec![]).await;
-    let control = MatterDeviceControl::new(client, cache);
-
-    let outcome = control.set_fan_mode("matter-18", "auto").await.unwrap();
-    assert_eq!(outcome.applied.fan_mode.as_deref(), Some("auto"));
-    assert_eq!(outcome.applied.on, Some(true), "auto is not off");
-
-    let frames = received.lock().unwrap().clone();
-    assert_eq!(frames[0]["command"], "write_attribute");
-    assert_eq!(frames[0]["args"]["attribute_path"], "1/514/0");
-    assert_eq!(frames[0]["args"]["value"], 5, "FanMode Auto");
-}
-
-/// Off is the one mode that says something definite about power.
-#[tokio::test]
-async fn the_off_mode_reports_the_device_as_off() {
-    let (client, cache, _registry, _bus, received) =
-        start_adapter(json!([fan_node_json()]), vec![]).await;
-    let control = MatterDeviceControl::new(client, cache);
-
-    let outcome = control.set_fan_mode("matter-18", "Off").await.unwrap();
-    assert_eq!(outcome.applied.on, Some(false));
-    assert_eq!(received.lock().unwrap()[0]["args"]["value"], 0);
-}
-
-/// A mode the device does not have is refused before anything is sent, rather
-/// than written as some nearby number.
-#[tokio::test]
-async fn an_invented_fan_mode_reaches_nothing() {
-    let (client, cache, _registry, _bus, received) =
-        start_adapter(json!([fan_node_json()]), vec![]).await;
-    let control = MatterDeviceControl::new(client, cache);
-
-    let error = control
-        .set_fan_mode("matter-18", "turbo")
+/// The next event on the bus, or `None` if nothing arrives promptly. The bus
+/// hands back a stream, so "nothing was published" is a short wait rather than an
+/// immediate answer.
+async fn next_event(stream: &mut BusStream) -> Option<BusEvent> {
+    tokio::time::timeout(Duration::from_millis(200), stream.next())
         .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("off, low, medium"),
-        "it lists the modes: {error}"
-    );
-    assert!(
-        received.lock().unwrap().is_empty(),
-        "nothing reached the fabric"
-    );
+        .ok()
+        .flatten()
 }
 
-/// A light must keep using On/Off: the fan branch is a fallback for nodes that
-/// lack that cluster, never a replacement for the command that already works.
+/// The `control` frames the mock received, in order.
+fn control_frames(received: &Received) -> Vec<Value> {
+    received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| f["op"] == "control")
+        .cloned()
+        .collect()
+}
+
+// ── Bridge ───────────────────────────────────────────────────────────────────
+
 #[tokio::test]
-async fn a_light_still_goes_through_on_off() {
-    let (client, cache, _registry, _bus, received) =
-        start_adapter(json!([light_node_json()]), vec![]).await;
-    let control = MatterDeviceControl::new(client, cache);
+async fn the_bridge_syncs_the_fabric_into_the_device_registry() {
+    let (url, _) = mock_controller(snapshot(vec![light(), sensor()], vec![]), vec![], None).await;
+    let (_control, registry, _bus, _rx) = start_adapter(&url).await;
 
-    control.set_power("matter-2", true).await.unwrap();
-
-    let frames = received.lock().unwrap().clone();
-    assert_eq!(frames[0]["command"], "device_command");
-    assert_eq!(frames[0]["args"]["command_name"], "On");
+    let devices = registry.list_devices().await.unwrap();
+    assert_eq!(devices.len(), 2);
+    let kitchen = registry.get_device("matter-2").await.unwrap().unwrap();
+    assert_eq!(kitchen.name, "Kitchen Light");
+    assert_eq!(kitchen.device_type, "light");
+    assert_eq!(kitchen.capabilities, vec!["power", "brightness"]);
 }
 
-/// A sensor is knowable the moment it joins, not whenever it next changes.
-///
-/// `start_listening` hands over every current attribute, but readings used to
-/// come only from later `attribute_updated` events — so a freshly commissioned
-/// sensor sitting at a steady value was in the device list while every question
-/// about its reading answered "none recorded", which reads as "no such device".
 #[tokio::test]
 async fn a_sensor_reports_its_current_value_as_soon_as_it_is_synced() {
-    // Built by hand rather than with `start_adapter`: the subscription has to
-    // exist before the initial sync, which is the moment under test.
-    let (url, _received) = mock_matter_server(
-        json!([{
-            "node_id": 12,
-            "available": true,
-            "attributes": { "1/1026/0": 2150 }   // Temperature, 21.50 C
-        }]),
+    // Without the snapshot's readings a steady sensor exists in the device list
+    // while every question about its reading is answered "none recorded", which
+    // reads as "that device is not here".
+    let (url, _) = mock_controller(
+        snapshot(vec![sensor()], vec![reading("matter-4", "occupancy", 1.0)]),
         vec![],
+        None,
     )
     .await;
-    let (client, events) = MatterClient::connect(&url).await.unwrap();
-    let cache: NodeCache = Arc::new(RwLock::new(HashMap::new()));
-    let registry = Arc::new(InMemoryRegistry::default());
-    let bus = Arc::new(InProcessEventBus::new());
+    let (_control, _registry, _bus, mut rx) = start_adapter(&url).await;
 
-    use futures::StreamExt as _;
-    let mut stream = bus.subscribe();
-
-    tokio::spawn(run_matter_bridge(
-        client,
-        events,
-        cache,
-        registry as Arc<dyn DeviceRegistry + Send + Sync>,
-        bus.clone() as Arc<dyn EventBus>,
-    ));
-
-    let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
-        .await
-        .expect("a reading within the deadline — no attribute_updated was ever pushed")
-        .expect("bus open");
-    let BusEvent::Sensor(reading) = &event else {
-        panic!("expected a sensor reading, got {event:?}");
+    let Some(BusEvent::Sensor(reading)) = next_event(&mut rx).await else {
+        panic!("the initial value must be published");
     };
-    assert_eq!(reading.device_id, "matter-12");
-    assert_eq!(reading.sensor_type, "temperature");
-    assert!(
-        (reading.value - 21.5).abs() < f64::EPSILON,
-        "{}",
-        reading.value
-    );
-}
-
-/// #195 acceptance: a Matter occupancy update becomes a bus sensor event that
-/// a #92 automation rule matches — the full sensor → rule chain with zero
-/// physical hardware.
-#[tokio::test]
-async fn occupancy_update_reaches_the_bus_and_matches_a_rule() {
-    use futures::StreamExt as _;
-    use pond_core::user_data::domain::schedule::{
-        SensorTriggerSpec, TriggerAction, TriggerCondition, TriggerSource, TriggerSourceKind,
-    };
-
-    let (_client, _cache, _registry, bus, _received) = start_adapter(
-        json!([occupancy_node_json()]),
-        vec![json!({"event": "attribute_updated", "data": [7, "1/1030/0", 1]})],
-    )
-    .await;
-
-    let mut stream = bus.subscribe();
-    // The event was published during startup sync; re-subscribe misses it, so
-    // drive a second update through the same path.
-    let reading = crate::protocol::sensor_reading_from_update(7, "1/1030/0", &json!(1)).unwrap();
-    bus.publish(BusEvent::Sensor(reading));
-
-    let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
-        .await
-        .expect("bus event within deadline")
-        .expect("bus open");
-    let BusEvent::Sensor(reading) = &event else {
-        panic!("expected sensor event, got {event:?}");
-    };
-    assert_eq!(reading.device_id, "matter-7");
+    assert_eq!(reading.device_id, "matter-4");
     assert_eq!(reading.sensor_type, "occupancy");
     assert_eq!(reading.value, 1.0);
-
-    // The #92 rule: "occupancy on the Matter sensor -> notify".
-    let rule = SensorTriggerSpec {
-        source: TriggerSource {
-            kind: TriggerSourceKind::Sensor,
-            device_id: Some("matter-7".into()),
-            signal: Some("occupancy".into()),
-        },
-        condition: TriggerCondition::default(),
-        actions: vec![TriggerAction::Notify {
-            title: "Occupancy".into(),
-            body: "Someone is in the room".into(),
-        }],
-        cooldown_secs: 60,
-    };
-    let view = event
-        .trigger_view()
-        .expect("a sensor reading is device-shaped");
-    assert!(
-        rule.matches(&view, chrono::NaiveTime::from_hms_opt(20, 0, 0).unwrap()),
-        "the automation rule must match the Matter sensor update"
-    );
 }
 
-/// The control port follows a swapped client: after the reconnect supervisor
-/// replaces the inner client, commands go to the new connection — no rebuild.
 #[tokio::test]
-async fn control_follows_a_swapped_client() {
-    let (url_a, recv_a) = mock_matter_server(json!([light_node_json()]), vec![]).await;
-    let (client_a, _events_a) = MatterClient::connect(&url_a).await.unwrap();
+async fn a_reading_event_reaches_the_bus() {
+    let (url, _) = mock_controller(
+        snapshot(vec![sensor()], vec![]),
+        vec![json!({
+            "event": "reading",
+            "payload": reading("matter-4", "occupancy", 1.0),
+        })],
+        None,
+    )
+    .await;
+    let (_control, _registry, _bus, mut rx) = start_adapter(&url).await;
 
-    // Seed the node cache directly — this test targets the client swap, not the
-    // bridge sync (covered elsewhere).
-    let cache: NodeCache = Arc::new(RwLock::new(HashMap::new()));
-    cache
-        .write()
+    let Some(BusEvent::Sensor(reading)) = next_event(&mut rx).await else {
+        panic!("the event must publish");
+    };
+    assert_eq!(reading.sensor_type, "occupancy");
+}
+
+#[tokio::test]
+async fn a_device_added_event_registers_the_device() {
+    let (url, _) = mock_controller(
+        snapshot(vec![], vec![]),
+        vec![json!({ "event": "device_added", "payload": { "device": light() } })],
+        None,
+    )
+    .await;
+    let (_control, registry, _bus, _rx) = start_adapter(&url).await;
+
+    assert!(registry.get_device("matter-2").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn an_already_registered_device_is_retyped_on_sync() {
+    // Re-derived typing has to reach a device that already exists, or an
+    // improvement to typing only ever applies to devices commissioned after it
+    // shipped.
+    let (url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
+    let (client, events) = MatterClient::connect(&url).await.unwrap();
+
+    let registry = Arc::new(MockRegistry::default());
+    registry
+        .register(RegisterDeviceRequest {
+            id: Some("matter-2".to_string()),
+            name: "Kitchen Light".to_string(),
+            device_type: "matter".to_string(), // the old, untyped registration
+            hostname: None,
+            capabilities: vec![],
+            room: None,
+        })
         .await
-        .insert(2, serde_json::from_value(light_node_json()).unwrap());
+        .unwrap();
 
-    let control = MatterDeviceControl::new(client_a, cache.clone());
-    let cell = control.client_handle();
+    let registry_dyn: Arc<dyn DeviceRegistry + Send + Sync> = registry.clone();
+    let bus: Arc<dyn EventBus> = Arc::new(InProcessEventBus::new());
+    tokio::spawn(async move {
+        let _ = run_matter_bridge(
+            client,
+            events,
+            registry_dyn,
+            bus,
+            MatterNotifier::disabled(),
+        )
+        .await;
+    });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let device = registry.get_device("matter-2").await.unwrap().unwrap();
+    assert_eq!(
+        device.device_type, "light",
+        "the device kept its old typing"
+    );
+    assert_eq!(device.capabilities, vec!["power", "brightness"]);
+    assert_eq!(registry.retypes.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn an_unchanged_device_is_not_rewritten_on_every_sync() {
+    // This runs on the initial sync and on every reconnect, so an unconditional
+    // UPDATE would be a write per device per reconnect for a value that almost
+    // never changes.
+    let (url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
+    let (_control, registry, _bus, _rx) = start_adapter(&url).await;
+
+    // Registered once with the right profile: nothing to re-derive.
+    assert!(registry.retypes.lock().unwrap().is_empty());
+}
+
+// ── Control ──────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn every_verb_sends_one_control_op_naming_itself() {
+    // The adapter's half of the contract. Which cluster each verb becomes is
+    // asserted in the controller's own tests, against the same devices.
+    let (url, received) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
+    let (control, _registry, _bus, _rx) = start_adapter(&url).await;
 
     control.set_power("matter-2", true).await.unwrap();
-    assert_eq!(recv_a.lock().unwrap().len(), 1, "first command → server A");
+    control.set_brightness("matter-2", 40).await.unwrap();
+    control.set_target_temp("matter-2", 21.5).await.unwrap();
+    control.set_locked("matter-2", true).await.unwrap();
+    control.set_color("matter-2", 180, 50).await.unwrap();
+    control.set_fan_speed("matter-2", 30).await.unwrap();
+    control.set_fan_mode("matter-2", "auto").await.unwrap();
+    control.set_position("matter-2", 70).await.unwrap();
 
-    // Swap in a client on a different server.
-    let (url_b, recv_b) = mock_matter_server(json!([light_node_json()]), vec![]).await;
-    let (client_b, _events_b) = MatterClient::connect(&url_b).await.unwrap();
-    *cell.write().await = client_b;
-
-    control.set_power("matter-2", false).await.unwrap();
+    let frames = control_frames(&received);
+    let verbs: Vec<&str> = frames
+        .iter()
+        .map(|f| f["params"]["verb"].as_str().unwrap())
+        .collect();
     assert_eq!(
-        recv_a.lock().unwrap().len(),
-        1,
-        "server A saw no new command"
+        verbs,
+        vec![
+            "power",
+            "brightness",
+            "target_temp",
+            "locked",
+            "color",
+            "fan_speed",
+            "fan_mode",
+            "position"
+        ]
     );
-    assert_eq!(recv_b.lock().unwrap().len(), 1, "next command → server B");
+
+    // Values travel as themselves, in GIAP's units, with no conversion here.
+    assert_eq!(frames[0]["params"]["value"], json!(true));
+    assert_eq!(frames[1]["params"]["value"], json!(40));
+    assert_eq!(frames[2]["params"]["value"], json!(21.5));
+    assert_eq!(
+        frames[4]["params"]["value"],
+        json!({"hue": 180, "saturation": 50})
+    );
+    assert_eq!(frames[6]["params"]["value"], json!("auto"));
+    // Every frame names the device it is for.
+    assert!(frames
+        .iter()
+        .all(|f| f["params"]["device_id"] == "matter-2"));
 }
 
-/// #195 acceptance: when the matter-server connection drops, the supervisor
-/// reconnects and re-runs start_listening (resyncing the fabric) without a
-/// pond-server restart.
 #[tokio::test]
-async fn supervisor_reconnects_after_the_connection_drops() {
-    let (url, listens) = mock_reconnecting_server(json!([light_node_json()])).await;
+async fn the_outcome_is_what_the_device_did_not_what_was_asked_for() {
+    // A dimmer that clamps to its own minimum is the ordinary case. Reporting
+    // the request back as the result is how a device that did something else
+    // still got described to the user as having obeyed.
+    let answer: Answer = Arc::new(
+        |_frame| json!({"ok": true, "result": { "applied": { "brightness": 10, "on": true } }}),
+    );
+    let (url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], Some(answer)).await;
+    let (control, _registry, _bus, _rx) = start_adapter(&url).await;
+
+    let outcome = control.set_brightness("matter-2", 40).await.unwrap();
+    assert_eq!(outcome.device_id, "matter-2");
+    assert_eq!(
+        outcome.applied.brightness,
+        Some(10),
+        "the outcome must report the device's value, not the caller's"
+    );
+    assert_eq!(outcome.applied.on, Some(true));
+}
+
+#[tokio::test]
+async fn a_refused_command_fails_with_the_controllers_reason() {
+    let answer: Answer = Arc::new(|_frame| {
+        json!({
+            "ok": false,
+            "error": {
+                "code": "capability_unsupported",
+                "message": "Matter device 'matter-2' does not support this capability",
+            }
+        })
+    });
+    let (url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], Some(answer)).await;
+    let (control, _registry, _bus, _rx) = start_adapter(&url).await;
+
+    let error = control.set_position("matter-2", 50).await.unwrap_err();
+    assert_eq!(
+        crate::client::code_of(&error),
+        Some("capability_unsupported")
+    );
+    assert!(error.to_string().contains("does not support"));
+}
+
+#[tokio::test]
+async fn control_follows_a_swapped_client() {
+    // The reconnect supervisor replaces the client in place, so a control port
+    // built before a drop keeps working after one without being rebuilt.
+    let (first_url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
+    let (second_url, second_received) =
+        mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
+
+    let (client, _events) = MatterClient::connect(&first_url).await.unwrap();
+    let control = Arc::new(MatterDeviceControl::new(client));
+    let cell: SharedMatterClient = control.client_handle();
+
+    let (replacement, _events2) = MatterClient::connect(&second_url).await.unwrap();
+    *cell.write().await = replacement;
+
+    control.set_power("matter-2", true).await.unwrap();
+    assert_eq!(
+        control_frames(&second_received).len(),
+        1,
+        "the command went to the old connection"
+    );
+}
+
+// ── Reconnect ────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_supervisor_reconnects_after_the_connection_drops() {
+    let (url, subscribes) = mock_reconnecting_controller(snapshot(vec![light()], vec![])).await;
+
     let (client, events) = MatterClient::connect(&url).await.unwrap();
-    let cache: NodeCache = Arc::new(RwLock::new(HashMap::new()));
-    let cell: SharedMatterClient = Arc::new(RwLock::new(client.clone()));
-    let registry = Arc::new(InMemoryRegistry::default());
-    let bus = Arc::new(InProcessEventBus::new());
+    let control = Arc::new(MatterDeviceControl::new(client.clone()));
+    let registry: Arc<dyn DeviceRegistry + Send + Sync> = Arc::new(MockRegistry::default());
+    let bus: Arc<dyn EventBus> = Arc::new(InProcessEventBus::new());
 
     tokio::spawn(run_matter_supervisor(
         SupervisorConfig {
             url: url.clone(),
-            // A mock server on an ephemeral loopback port: revival would find
-            // it listening and reuse it, so nothing is ever installed here.
             data_dir: std::path::PathBuf::from("/nonexistent"),
             child: Arc::new(tokio::sync::Mutex::new(None)),
         },
-        cell.clone(),
+        control.client_handle(),
         client,
         events,
-        cache.clone(),
-        registry.clone() as Arc<dyn DeviceRegistry + Send + Sync>,
-        bus.clone() as Arc<dyn EventBus>,
+        registry,
+        bus,
+        MatterNotifier::disabled(),
     ));
 
-    // First connection: start_listening (1) then drop. The supervisor backs off
-    // (~0.5-1s) and reconnects, producing a second start_listening.
-    let mut waited = 0;
-    while *listens.lock().unwrap() < 2 && waited < 60 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        waited += 1;
-    }
-    assert_eq!(
-        *listens.lock().unwrap(),
-        2,
-        "supervisor should reconnect and re-run start_listening"
+    // First subscribe, drop, backoff (~0.5-1s), reconnect, subscribe again.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(
+        *subscribes.lock().unwrap() >= 2,
+        "the fabric must be resynced after a reconnect, saw {} subscribes",
+        subscribes.lock().unwrap()
     );
-    // The fabric was resynced on reconnect.
-    assert!(registry.get_device("matter-2").await.unwrap().is_some());
 }
 
-/// A mock that answers commissioning commands with a node and records every
-/// frame, so a commission/decommission can be asserted end to end.
-async fn mock_commissioning_server(node: Value) -> (String, ReceivedCommands) {
+#[tokio::test]
+async fn a_controller_that_is_not_ours_is_refused_by_name() {
+    // The failure this exists for: an install whose matter_ws_url still points
+    // at a python-matter-server, whose greeting is a bare server-info frame.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-    let received: ReceivedCommands = Arc::new(Mutex::new(Vec::new()));
-    let received_srv = received.clone();
-
+    let url = format!("ws://{}/giap", listener.local_addr().unwrap());
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -648,319 +626,284 @@ async fn mock_commissioning_server(node: Value) -> (String, ReceivedCommands) {
         ))
         .await
         .unwrap();
-
-        while let Some(Ok(Message::Text(text))) = ws.next().await {
-            let frame: Value = serde_json::from_str(&text).unwrap();
-            let mid = frame["message_id"].as_str().unwrap().to_string();
-            received_srv.lock().unwrap().push(frame.clone());
-            // Commissioning returns the freshly joined node; everything else
-            // (write_attribute, remove_node) succeeds with null.
-            let result = match frame["command"].as_str().unwrap() {
-                "commission_with_code" | "commission_on_network" => node.clone(),
-                // The pre-flight probe: one device is advertising, so
-                // commissioning proceeds.
-                "discover" => json!([{ "instance_name": "MOCKDEVICE" }]),
-                _ => Value::Null,
-            };
-            ws.send(Message::Text(
-                json!({"message_id": mid, "result": result})
-                    .to_string()
-                    .into(),
-            ))
-            .await
-            .unwrap();
-        }
+        // Hold the connection open so the failure is the greeting, not a drop.
+        tokio::time::sleep(Duration::from_secs(5)).await;
     });
 
-    (url, received)
+    let error = MatterClient::connect(&url).await.err().unwrap();
+    assert!(
+        error.to_string().contains("Matter controller address"),
+        "must tell the user what to fix, got: {error}"
+    );
 }
 
-/// A mock whose mDNS view is empty: nothing is advertising itself for pairing.
-/// It still answers the commissioning commands, so a test can prove the attempt
-/// was refused before it reached them rather than merely failing later.
-async fn mock_unpairable_server(node: Value) -> (String, ReceivedCommands) {
+#[tokio::test]
+async fn a_request_honours_its_timeout() {
+    // A controller that accepts a frame and never answers must not wedge the
+    // caller forever.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-    let received: ReceivedCommands = Arc::new(Mutex::new(Vec::new()));
-    let received_srv = received.clone();
-
+    let url = format!("ws://{}/giap", listener.local_addr().unwrap());
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-        ws.send(Message::Text(
-            json!({"fabric_id": 1, "schema_version": 11})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
-
-        while let Some(Ok(Message::Text(text))) = ws.next().await {
-            let frame: Value = serde_json::from_str(&text).unwrap();
-            let mid = frame["message_id"].as_str().unwrap().to_string();
-            received_srv.lock().unwrap().push(frame.clone());
-            let result = match frame["command"].as_str().unwrap() {
-                "discover" => json!([]),
-                "commission_with_code" | "commission_on_network" => node.clone(),
-                _ => Value::Null,
-            };
-            ws.send(Message::Text(
-                json!({"message_id": mid, "result": result})
-                    .to_string()
-                    .into(),
-            ))
-            .await
-            .unwrap();
-        }
+        ws.send(greeting()).await.unwrap();
+        while ws.next().await.is_some() {} // read, never answer
     });
 
-    (url, received)
+    let (client, _events) = MatterClient::connect(&url).await.unwrap();
+    let error = client
+        .send_with_timeout("ping", json!({}), Duration::from_millis(150))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("in time"), "got: {error}");
 }
 
-/// The failure that cost hours on 2026-08-05: the device's 15-minute
-/// commissioning window had closed, so discovery found nothing and the
-/// controller answered a bare "Commissioning failed for node N" after a 30s
-/// timeout — with the real reason only in its own log file. The user is now
-/// told what happened and what to do, without the wait.
+// ── Commissioning ────────────────────────────────────────────────────────────
+
+/// A mock that reports `commissionable` devices and commissions to `device`.
+async fn mock_commissioning_controller(commissionable: u32, device: Value) -> (String, Received) {
+    let answer: Answer = Arc::new(move |frame: &Value| match frame["op"].as_str() {
+        Some("discover") => json!({"ok": true, "result": {"commissionable": commissionable}}),
+        Some("commission") => json!({"ok": true, "result": {"device": device}}),
+        _ => json!({"ok": true, "result": {}}),
+    });
+    mock_controller(snapshot(vec![], vec![]), vec![], Some(answer)).await
+}
+
 #[tokio::test]
 async fn commissioning_with_nothing_in_pairing_mode_says_so_and_says_it_early() {
-    let (url, received) = mock_unpairable_server(light_node_json()).await;
+    // The most common way commissioning fails, and the one failure a user can
+    // fix in ten seconds — if anything tells them what it is.
+    let (url, received) = mock_commissioning_controller(0, light()).await;
     let (client, _events) = MatterClient::connect(&url).await.unwrap();
-    let commissioner = MatterCommissioner::new(client);
+    let commissioner = MatterCommissioner::new(client, MatterNotifier::disabled());
 
     let error = commissioner
         .commission(SetupCode::Passcode(20202021), None)
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
 
-    assert!(
-        error.contains("pairing mode"),
-        "the message names the actual problem: {error}"
-    );
-    assert!(
-        error.contains("15 minutes"),
-        "and the window that explains why it was pairable earlier: {error}"
-    );
-
-    // Refused on the probe, so the 30-second discovery timeout is never
-    // entered — that speed is the point, not a side effect.
-    let commands: Vec<String> = received
+    assert!(error.to_string().contains("15 minutes"), "got: {error}");
+    let ops: Vec<String> = received
         .lock()
         .unwrap()
         .iter()
-        .map(|f| f["command"].as_str().unwrap_or_default().to_string())
+        .map(|f| f["op"].as_str().unwrap_or_default().to_string())
         .collect();
-    assert_eq!(commands, vec!["discover"], "nothing else was attempted");
+    assert!(
+        !ops.iter().any(|op| op == "commission"),
+        "the wait must be skipped, not paid and then explained"
+    );
 }
 
-/// The probe must not become a second way to fail. A controller that answers it
-/// with something unexpected proves nothing about the device, so commissioning
-/// goes ahead exactly as before.
 #[tokio::test]
 async fn an_unusable_probe_answer_does_not_block_commissioning() {
-    // The general mock answers every non-commissioning command with null.
-    let (url, _received) = mock_matter_server(json!([]), vec![]).await;
+    // A probe that itself fails proves nothing, so it never blocks the attempt.
+    let answer: Answer = Arc::new(|frame: &Value| match frame["op"].as_str() {
+        Some("discover") => json!({"ok": false, "error": {"code": "internal", "message": "no"}}),
+        Some("commission") => json!({"ok": true, "result": {"device": light()}}),
+        _ => json!({"ok": true, "result": {}}),
+    });
+    let (url, received) = mock_controller(snapshot(vec![], vec![]), vec![], Some(answer)).await;
     let (client, _events) = MatterClient::connect(&url).await.unwrap();
-    let commissioner = MatterCommissioner::new(client);
+    let commissioner = MatterCommissioner::new(client, MatterNotifier::disabled());
 
-    let error = commissioner
+    let device = commissioner
         .commission(SetupCode::Passcode(20202021), None)
         .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(
-        !error.contains("pairing mode"),
-        "a null probe answer must not be reported as an empty network: {error}"
-    );
-}
-
-/// A named commission writes the name to the device's NodeLabel and returns it
-/// as the device name — so chat resolution and other controllers both see it.
-#[tokio::test]
-async fn commission_with_name_writes_nodelabel() {
-    let (url, received) = mock_commissioning_server(light_node_json()).await;
-    let (client, _events) = MatterClient::connect(&url).await.unwrap();
-    let commissioner = MatterCommissioner::new(client);
-
-    let dev = commissioner
-        .commission(SetupCode::Passcode(20202021), Some("Living Room".into()))
-        .await
         .unwrap();
-
-    // The user's name wins over the cluster-derived one, and the full identity
-    // is returned so the endpoint can register without waiting for the bridge.
-    assert_eq!(dev.name, "Living Room");
-    assert_eq!(dev.device_id, "matter-2");
-    assert_eq!(dev.device_type, "light");
-    assert_eq!(dev.capabilities, vec!["power", "brightness"]);
-
-    // NodeLabel (0/40/5) was written on the device with that name.
-    let frames = received.lock().unwrap().clone();
-    let write = frames
+    assert_eq!(device.device_id, "matter-2");
+    assert!(received
+        .lock()
+        .unwrap()
         .iter()
-        .find(|f| f["command"] == "write_attribute")
-        .expect("a NodeLabel write");
-    assert_eq!(write["args"]["node_id"], 2);
-    assert_eq!(write["args"]["attribute_path"], "0/40/5");
-    assert_eq!(write["args"]["value"], "Living Room");
+        .any(|f| f["op"] == "commission"));
 }
 
-/// An un-named commission touches no NodeLabel and keeps the device's own name.
 #[tokio::test]
-async fn commission_without_name_leaves_nodelabel_alone() {
-    let (url, received) = mock_commissioning_server(light_node_json()).await;
+async fn commissioning_passes_the_code_and_the_name_to_the_controller() {
+    let (url, received) = mock_commissioning_controller(1, light()).await;
     let (client, _events) = MatterClient::connect(&url).await.unwrap();
-    let commissioner = MatterCommissioner::new(client);
+    let commissioner = MatterCommissioner::new(client, MatterNotifier::disabled());
 
-    let dev = commissioner
+    let device = commissioner
+        .commission(
+            SetupCode::PairingCode("34970112332".to_string()),
+            Some("Porch Light".to_string()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(device.device_id, "matter-2");
+    assert_eq!(
+        device.node_id, 2,
+        "derived from the id the controller returned"
+    );
+    assert_eq!(device.name, "Porch Light", "the user's name wins");
+    assert_eq!(device.device_type, "light");
+
+    let frame = received
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|f| f["op"] == "commission")
+        .cloned()
+        .unwrap();
+    assert_eq!(frame["params"]["code"], "34970112332");
+    assert_eq!(frame["params"]["name"], "Porch Light");
+}
+
+#[tokio::test]
+async fn commissioning_without_a_name_keeps_the_devices_own() {
+    let (url, received) = mock_commissioning_controller(1, light()).await;
+    let (client, _events) = MatterClient::connect(&url).await.unwrap();
+    let commissioner = MatterCommissioner::new(client, MatterNotifier::disabled());
+
+    let device = commissioner
         .commission(SetupCode::Passcode(20202021), None)
         .await
         .unwrap();
+    assert_eq!(device.name, "Kitchen Light");
 
-    assert_eq!(dev.name, "Living Room Light"); // from the node's own label
-    let frames = received.lock().unwrap().clone();
+    let frame = received
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|f| f["op"] == "commission")
+        .cloned()
+        .unwrap();
     assert!(
-        !frames.iter().any(|f| f["command"] == "write_attribute"),
-        "no NodeLabel write when no name is given"
+        frame["params"].get("name").is_none(),
+        "no name means none is sent, not an empty one"
     );
 }
 
-/// A node the controller no longer knows is already in the desired end state,
-/// so decommission treats "does not exist" as success — letting a delete that
-/// an earlier interrupted removal left half-done finish cleanly.
 #[tokio::test]
-async fn decommission_treats_already_gone_as_success() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-    tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-        ws.send(Message::Text(
-            json!({"fabric_id": 1, "schema_version": 11})
-                .to_string()
-                .into(),
-        ))
-        .await
+async fn decommission_names_the_device_by_its_giap_id() {
+    let (url, received) = mock_commissioning_controller(1, light()).await;
+    let (client, _events) = MatterClient::connect(&url).await.unwrap();
+    let commissioner = MatterCommissioner::new(client, MatterNotifier::disabled());
+
+    commissioner.decommission(18).await.unwrap();
+
+    let frame = received
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|f| f["op"] == "decommission")
+        .cloned()
         .unwrap();
-        while let Some(Ok(Message::Text(text))) = ws.next().await {
-            let frame: Value = serde_json::from_str(&text).unwrap();
-            let mid = frame["message_id"].as_str().unwrap();
-            // Answer remove_node with the controller's real not-found error.
-            ws.send(Message::Text(
-                json!({
-                    "message_id": mid,
-                    "error_code": 1,
-                    "details": "Node 2 does not exist or has not been interviewed."
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .unwrap();
+    assert_eq!(frame["params"]["device_id"], "matter-18");
+}
+
+// ── Runtime ──────────────────────────────────────────────────────────────────
+
+async fn wait_for(runtime: &MatterRuntime, want: impl Fn(&MatterState) -> bool) -> MatterStatus {
+    for _ in 0..100 {
+        let status = runtime.status().await;
+        if want(&status.state) {
+            return status;
         }
-    });
-
-    let (client, _events) = MatterClient::connect(&url).await.unwrap();
-    let commissioner = MatterCommissioner::new(client);
-    // Not an error: the node is already off the fabric.
-    commissioner.decommission(2).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the runtime never reached the wanted state");
 }
 
-/// Decommissioning removes the node from the fabric, so a deleted device does
-/// not re-announce itself on the next start_listening.
-#[tokio::test]
-async fn decommission_sends_remove_node() {
-    let (url, received) = mock_commissioning_server(light_node_json()).await;
-    let (client, _events) = MatterClient::connect(&url).await.unwrap();
-    let commissioner = MatterCommissioner::new(client);
-
-    commissioner.decommission(2).await.unwrap();
-
-    let frames = received.lock().unwrap().clone();
-    let remove = frames
-        .iter()
-        .find(|f| f["command"] == "remove_node")
-        .expect("a remove_node frame");
-    assert_eq!(remove["args"]["node_id"], 2);
+fn runtime_for() -> Arc<MatterRuntime> {
+    MatterRuntime::new(
+        std::path::PathBuf::from("/nonexistent"),
+        Arc::new(MockRegistry::default()),
+        Arc::new(InProcessEventBus::new()),
+    )
 }
 
-/// Regression: `send_command_with_timeout` must honour its argument, not the
-/// 15s default. Commissioning relies on the longer window; a silent bug here
-/// would cut real pairings short.
 #[tokio::test]
-async fn send_command_honours_its_timeout_argument() {
-    // A server that greets, then never answers a command.
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-    tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-        ws.send(Message::Text(
-            json!({"fabric_id": 1, "schema_version": 11})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
-        while let Some(Ok(_)) = ws.next().await {} // read, never reply
-    });
+async fn enabling_connects_and_exposes_a_commissioner() {
+    let (url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
+    let runtime = runtime_for();
 
-    let (client, _events) = MatterClient::connect(&url).await.unwrap();
-    let start = std::time::Instant::now();
-    let res = client
-        .send_command_with_timeout("noop", json!({}), Duration::from_millis(200))
-        .await;
+    runtime.apply(true, url.clone());
+    let status = wait_for(&runtime, MatterState::is_connected).await;
 
-    assert!(res.is_err(), "a never-answered command must error");
-    // If the argument were ignored it would block on the 15s default.
+    assert!(status.enabled);
+    assert_eq!(status.url, url);
+    assert!(runtime.commissioner().await.is_some());
+}
+
+#[tokio::test]
+async fn disabling_tears_down_and_re_enabling_reconnects() {
+    let (url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
+    let runtime = runtime_for();
+
+    runtime.apply(true, url.clone());
+    wait_for(&runtime, MatterState::is_connected).await;
+
+    runtime.apply(false, url.clone());
+    let status = wait_for(&runtime, |s| matches!(s, MatterState::Disabled)).await;
+    assert!(!status.enabled);
+    assert!(runtime.commissioner().await.is_none());
+    // The URL stays visible while off, so the UI still shows what will be used.
+    assert_eq!(status.url, url);
+}
+
+#[tokio::test]
+async fn an_unreachable_controller_reports_the_failure_not_off() {
+    // "Off" and "the controller is unreachable" need different actions from the
+    // user, and the agent relays whichever it is.
+    let runtime = runtime_for();
+    // A name that cannot resolve, so this fails promptly and — being non-loopback
+    // — never sends the runtime off to install a controller for someone else's
+    // address. A blackholed IP would do neither: it would hang on the connect.
+    runtime.apply(true, "ws://controller.invalid:5580/giap".to_string());
+
+    let status = wait_for(&runtime, |s| matches!(s, MatterState::Unreachable { .. })).await;
+    assert!(status.enabled, "unreachable is not the same as off");
+}
+
+#[tokio::test]
+async fn an_empty_controller_address_is_reported_plainly() {
+    // An install predating the Matter section could have been enabled with no
+    // address. The fix is to fill the field in, so say that.
+    let runtime = runtime_for();
+    runtime.apply(true, String::new());
+
+    let status = wait_for(&runtime, |s| matches!(s, MatterState::Unreachable { .. })).await;
+    let MatterState::Unreachable { error } = status.state else {
+        panic!("expected unreachable");
+    };
     assert!(
-        start.elapsed() < Duration::from_secs(2),
-        "timed out on the 200ms argument, not COMMAND_TIMEOUT"
+        error.contains("no Matter controller address is set"),
+        "got: {error}"
     );
 }
 
-// ── Runtime reconciliation ───────────────────────────────────────────────────
-
-/// A mock that serves connection after connection, so enable → disable →
-/// enable can be observed. Reports how many times it was connected to, which
-/// is how "did the runtime churn the connection?" is asserted.
-async fn mock_reconnectable_server(node: Value) -> (String, Arc<Mutex<usize>>) {
+#[tokio::test]
+async fn re_applying_after_a_failure_retries() {
+    // Identical values while connected are a no-op, but the same values while
+    // unreachable are a retry — which is what the UI's retry affordance sends.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-    let connections = Arc::new(Mutex::new(0usize));
-    let connections_srv = connections.clone();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("ws://127.0.0.1:{port}/giap");
+    drop(listener); // nothing is serving it yet
 
+    let runtime = runtime_for();
+    runtime.apply(true, url.clone());
+    wait_for(&runtime, |s| matches!(s, MatterState::Unreachable { .. })).await;
+
+    // Bring a controller up on that exact port, then retry.
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
-            let node = node.clone();
-            let connections_conn = connections_srv.clone();
             tokio::spawn(async move {
-                // Only completed handshakes count. The controller-readiness
-                // probe (`is_running`) opens a bare TCP connection and drops
-                // it, which would otherwise read as a second client.
-                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
-                    return;
-                };
-                *connections_conn.lock().unwrap() += 1;
-                ws.send(Message::Text(
-                    json!({"fabric_id": 1, "schema_version": 11})
-                        .to_string()
-                        .into(),
-                ))
-                .await
-                .unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                ws.send(greeting()).await.unwrap();
                 while let Some(Ok(Message::Text(text))) = ws.next().await {
                     let frame: Value = serde_json::from_str(&text).unwrap();
-                    let mid = frame["message_id"].as_str().unwrap().to_string();
-                    let result = match frame["command"].as_str().unwrap() {
-                        "start_listening" => json!([node]),
-                        "commission_with_code" | "commission_on_network" => node.clone(),
-                        _ => Value::Null,
-                    };
+                    let id = frame["id"].as_str().unwrap();
                     ws.send(Message::Text(
-                        json!({"message_id": mid, "result": result})
+                        json!({"id": id, "ok": true, "result": {"devices": [], "readings": []}})
                             .to_string()
                             .into(),
                     ))
@@ -971,169 +914,24 @@ async fn mock_reconnectable_server(node: Value) -> (String, Arc<Mutex<usize>>) {
         }
     });
 
-    (url, connections)
+    runtime.apply(true, url);
+    wait_for(&runtime, MatterState::is_connected).await;
 }
 
-fn test_runtime() -> Arc<MatterRuntime> {
-    MatterRuntime::new(
-        std::env::temp_dir().join("giap-matter-runtime-test"),
-        Arc::new(InMemoryRegistry::default()) as Arc<dyn DeviceRegistry + Send + Sync>,
-        Arc::new(InProcessEventBus::new()) as Arc<dyn EventBus>,
-    )
-}
-
-/// Poll until the runtime reaches a state the predicate accepts, or fail. The
-/// reconciler is asynchronous by design, so tests observe it, never assume it.
-async fn wait_for(runtime: &MatterRuntime, want: impl Fn(&MatterState) -> bool) -> MatterStatus {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        let status = runtime.status().await;
-        if want(&status.state) {
-            return status;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "runtime never settled; stuck at {:?}",
-            status.state
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// The whole point of the runtime: Matter comes up from a settings change, with
-/// no process restart, and commissioning works the moment it reports Connected.
-#[tokio::test]
-async fn enabling_connects_and_exposes_a_commissioner() {
-    let (url, _connections) = mock_reconnectable_server(light_node_json()).await;
-    let runtime = test_runtime();
-
-    assert_eq!(runtime.status().await.state, MatterState::Disabled);
-    assert!(runtime.commissioner().await.is_none());
-
-    runtime.apply(true, url.clone());
-    let status = wait_for(&runtime, |s| *s == MatterState::Connected).await;
-    assert!(status.enabled);
-    assert_eq!(status.url, url);
-
-    let commissioner = runtime
-        .commissioner()
-        .await
-        .expect("a connected runtime exposes its commissioner");
-    let device = commissioner
-        .commission(SetupCode::Passcode(20202021), None)
-        .await
-        .unwrap();
-    assert_eq!(device.device_id, "matter-2");
-}
-
-/// Turning Matter off has to actually stop it: a commissioner left behind would
-/// keep the API reporting success against a controller nobody asked for.
-#[tokio::test]
-async fn disabling_tears_down_and_re_enabling_reconnects() {
-    let (url, connections) = mock_reconnectable_server(light_node_json()).await;
-    let runtime = test_runtime();
-
-    runtime.apply(true, url.clone());
-    wait_for(&runtime, |s| *s == MatterState::Connected).await;
-
-    runtime.apply(false, url.clone());
-    let status = wait_for(&runtime, |s| *s == MatterState::Disabled).await;
-    assert!(!status.enabled);
-    assert!(runtime.commissioner().await.is_none());
-    // The URL stays visible so the UI's controller field is not blanked.
-    assert_eq!(status.url, url);
-
-    runtime.apply(true, url.clone());
-    wait_for(&runtime, |s| *s == MatterState::Connected).await;
-    assert!(runtime.commissioner().await.is_some());
-    assert_eq!(
-        *connections.lock().unwrap(),
-        2,
-        "re-enabling opens a second connection"
-    );
-}
-
-/// Saving Settings re-sends every field, so an unchanged Matter section must
-/// not drop and re-open a working connection.
-#[tokio::test]
-async fn re_applying_the_same_state_while_connected_does_not_churn() {
-    let (url, connections) = mock_reconnectable_server(light_node_json()).await;
-    let runtime = test_runtime();
-
-    runtime.apply(true, url.clone());
-    wait_for(&runtime, |s| *s == MatterState::Connected).await;
-
-    for _ in 0..3 {
-        runtime.apply(true, url.clone());
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    assert_eq!(runtime.status().await.state, MatterState::Connected);
-    assert_eq!(
-        *connections.lock().unwrap(),
-        1,
-        "an unchanged desired state must not reconnect"
-    );
-}
-
-/// The bug this whole change exists to kill: an enabled-but-unreachable
-/// controller used to be indistinguishable from "Matter is not enabled".
-#[tokio::test]
-async fn an_unreachable_controller_reports_the_failure_not_off() {
-    let runtime = test_runtime();
-    // `.invalid` never resolves, and a non-loopback host is never auto-started,
-    // so this fails fast without touching the controller installer.
-    runtime.apply(true, "ws://matter-controller.invalid:5580/ws".into());
-
-    let status = wait_for(&runtime, |s| matches!(s, MatterState::Unreachable { .. })).await;
-    assert!(
-        status.enabled,
-        "still enabled — it is the link that is down"
-    );
-    let MatterState::Unreachable { error } = status.state else {
-        unreachable!()
-    };
-    assert!(
-        error.contains("matter-controller.invalid"),
-        "the reported error names what could not be reached: {error}"
-    );
-    assert!(runtime.commissioner().await.is_none());
-}
-
-/// Retrying is `apply` with the same values — which only reconnects because the
-/// runtime compares against what is actually running, not against the request.
-#[tokio::test]
-async fn re_applying_after_a_failure_retries() {
-    let (url, connections) = mock_reconnectable_server(light_node_json()).await;
-    let runtime = test_runtime();
-
-    runtime.apply(true, "ws://matter-controller.invalid:5580/ws".into());
-    wait_for(&runtime, |s| matches!(s, MatterState::Unreachable { .. })).await;
-
-    runtime.apply(true, url.clone());
-    wait_for(&runtime, |s| *s == MatterState::Connected).await;
-    assert_eq!(*connections.lock().unwrap(), 1);
-}
-
-/// Shutdown must leave nothing running — an orphaned controller outlives the
-/// Pond, including under `systemctl stop`.
 #[tokio::test]
 async fn shutdown_clears_the_runtime() {
-    let (url, _connections) = mock_reconnectable_server(light_node_json()).await;
-    let runtime = test_runtime();
+    let (url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
+    let runtime = runtime_for();
 
     runtime.apply(true, url);
-    wait_for(&runtime, |s| *s == MatterState::Connected).await;
+    wait_for(&runtime, MatterState::is_connected).await;
 
     runtime.shutdown().await;
-
     assert!(runtime.commissioner().await.is_none());
 }
 
-// ── Switchable device control ────────────────────────────────────────────────
+// ── The switchable facade ────────────────────────────────────────────────────
 
-/// Records every verb it is asked for, including the optional ones, so the
-/// facade's forwarding can be asserted rather than assumed.
 #[derive(Default)]
 struct RecordingControl {
     calls: Mutex<Vec<String>>,
@@ -1156,283 +954,53 @@ impl RecordingControl {
 #[async_trait::async_trait]
 impl DeviceControlPort for RecordingControl {
     async fn set_power(&self, id: &str, on: bool) -> Result<DeviceControlOutcome> {
-        self.ok(format!("set_power({id},{on})"), id)
+        self.ok(format!("power {id} {on}"), id)
     }
     async fn set_brightness(&self, id: &str, pct: u8) -> Result<DeviceControlOutcome> {
-        self.ok(format!("set_brightness({id},{pct})"), id)
+        self.ok(format!("brightness {id} {pct}"), id)
     }
     async fn set_target_temp(&self, id: &str, c: f32) -> Result<DeviceControlOutcome> {
-        self.ok(format!("set_target_temp({id},{c})"), id)
+        self.ok(format!("temp {id} {c}"), id)
     }
     async fn set_locked(&self, id: &str, locked: bool) -> Result<DeviceControlOutcome> {
-        self.ok(format!("set_locked({id},{locked})"), id)
-    }
-    async fn set_color(&self, id: &str, hue: u16, sat: u8) -> Result<DeviceControlOutcome> {
-        self.ok(format!("set_color({id},{hue},{sat})"), id)
-    }
-    async fn set_fan_speed(&self, id: &str, pct: u8) -> Result<DeviceControlOutcome> {
-        self.ok(format!("set_fan_speed({id},{pct})"), id)
-    }
-    async fn set_position(&self, id: &str, pct: u8) -> Result<DeviceControlOutcome> {
-        self.ok(format!("set_position({id},{pct})"), id)
+        self.ok(format!("lock {id} {locked}"), id)
     }
 }
 
-/// The stub answers every verb with success, so a Matter device must never
-/// reach it: routing `matter-18` there while Matter was off reported a fan as
-/// switched on when nothing had been sent anywhere, and the agent relayed that
-/// to the user. Devices on other transports are exactly what the stub is for,
-/// so those still fall through.
 #[tokio::test]
 async fn a_matter_device_is_refused_while_matter_is_off_but_others_fall_back() {
-    let runtime = test_runtime();
-    let stub = Arc::new(RecordingControl::default());
-    let control = runtime.device_control(stub.clone() as Arc<dyn DeviceControlPort>);
+    // The stub answers every verb with success, so routing `matter-18` to it
+    // while Matter was off reported the fan as switched on when nothing had been
+    // sent anywhere — and the agent then told the user so, truthfully relaying a
+    // lie it had been handed.
+    let fallback = Arc::new(RecordingControl::default());
+    let runtime = runtime_for();
+    let control = runtime.device_control(fallback.clone());
 
-    let refused = control
-        .set_power("matter-2", true)
-        .await
-        .unwrap_err()
-        .to_string();
+    let error = control.set_power("matter-18", true).await.unwrap_err();
+    assert!(error.to_string().contains("Matter is off"), "got: {error}");
     assert!(
-        refused.contains("Matter is off") && refused.contains("matter-2"),
-        "the refusal names the state and the device: {refused}"
+        fallback.calls().is_empty(),
+        "a Matter device must not fall back"
     );
-    assert!(control.set_brightness("matter-2", 40).await.is_err());
-    assert!(control.set_color("matter-2", 120, 80).await.is_err());
 
-    // Non-Matter ids are the stub's job and still get there.
-    control.set_target_temp("thermo", 21.5).await.unwrap();
-    control.set_locked("front-door", true).await.unwrap();
-    control.set_fan_speed("fan-1", 50).await.unwrap();
-    control.set_position("blind-1", 30).await.unwrap();
-
-    assert_eq!(
-        stub.calls(),
-        vec![
-            "set_target_temp(thermo,21.5)",
-            "set_locked(front-door,true)",
-            "set_fan_speed(fan-1,50)",
-            "set_position(blind-1,30)",
-        ],
-        "no Matter call reached the stub"
-    );
+    // A device on some other transport still falls back, which is what the stub
+    // is for.
+    control.set_power("mqtt-lamp", true).await.unwrap();
+    assert_eq!(fallback.calls(), vec!["power mqtt-lamp true"]);
 }
 
-/// Once connected the same facade drives the fabric — without the agent, MCP
-/// server, or tool wiring being rebuilt, since they all hold this one `Arc`.
 #[tokio::test]
 async fn control_switches_to_matter_once_connected() {
-    let (url, _connections) = mock_reconnectable_server(light_node_json()).await;
-    let runtime = test_runtime();
-    let stub = Arc::new(RecordingControl::default());
-    let control = runtime.device_control(stub.clone() as Arc<dyn DeviceControlPort>);
+    let (url, received) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
+    let fallback = Arc::new(RecordingControl::default());
+    let runtime = runtime_for();
+    let control = runtime.device_control(fallback.clone());
 
     runtime.apply(true, url);
-    wait_for(&runtime, |s| *s == MatterState::Connected).await;
-    // The bridge's initial sync has to land before endpoints resolve.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for(&runtime, MatterState::is_connected).await;
 
     control.set_power("matter-2", true).await.unwrap();
-    assert!(
-        stub.calls().is_empty(),
-        "a connected runtime must not fall back to the stub"
-    );
-
-    // Turning Matter off does not hand Matter devices back to the stub. With no
-    // controller there is nothing that could carry the command, and the stub's
-    // success would be a lie the agent repeats to the user.
-    runtime.apply(false, String::new());
-    wait_for(&runtime, |s| *s == MatterState::Disabled).await;
-    assert!(control.set_power("matter-2", false).await.is_err());
-    assert!(stub.calls().is_empty(), "still nothing reached the stub");
-}
-
-/// An install enabled before the Matter section existed could carry a blank
-/// address. It must say so, not surface an opaque URL-parse failure.
-#[tokio::test]
-async fn an_empty_controller_address_is_reported_plainly() {
-    let runtime = test_runtime();
-    runtime.apply(true, String::new());
-
-    let status = wait_for(&runtime, |s| matches!(s, MatterState::Unreachable { .. })).await;
-    let MatterState::Unreachable { error } = status.state else {
-        unreachable!()
-    };
-    assert!(error.contains("no Matter controller address"), "{error}");
-}
-
-/// Teardown must kill whatever process is in the shared cell *now*, not the
-/// handle `connect` originally put there. After the supervisor respawns a dead
-/// controller those are different processes, and killing the stale one would
-/// leave the live controller running past the Pond — the orphan that let a
-/// week-old controller outlive several restarts in the first place.
-#[cfg(unix)]
-#[tokio::test]
-async fn stopping_the_controller_kills_whatever_the_cell_holds_now() {
-    /// True while the process is alive. `kill -0` signals nothing; it only
-    /// checks the pid is still there, and avoids a libc dependency for one probe.
-    async fn alive(pid: u32) -> bool {
-        tokio::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-
-    let cell: crate::server_setup::SharedServerChild = Arc::new(tokio::sync::Mutex::new(None));
-
-    // An empty cell is the "user runs their own controller" case: nothing of
-    // GIAP's to kill, and no panic for trying.
-    crate::runtime::stop_controller(&cell).await;
-
-    // Stand in for a respawned controller: a real child, parked exactly the way
-    // `revive_local_controller` parks one.
-    let child = tokio::process::Command::new("sleep")
-        .arg("30")
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawning sleep should work on any unix host");
-    let pid = child.id().expect("a freshly spawned child has a pid");
-    *cell.lock().await = Some(child);
-    assert!(
-        alive(pid).await,
-        "the stand-in controller should be running"
-    );
-
-    crate::runtime::stop_controller(&cell).await;
-
-    assert!(
-        cell.lock().await.is_none(),
-        "the handle is taken, so a second teardown cannot double-kill"
-    );
-    // `start_kill` only signals; give the OS a moment to reap before asserting.
-    let mut gone = false;
-    for _ in 0..50 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        if !alive(pid).await {
-            gone = true;
-            break;
-        }
-    }
-    assert!(gone, "the controller process should be dead");
-}
-
-/// A device already in the registry gets its typing refreshed on sync.
-///
-/// Registration was the only writer of `device_type` and `capabilities`, and
-/// `sync_node` registers only when `get_device` returns `None` — so every
-/// device commissioned before a typing improvement shipped kept its old values
-/// through every restart. The fan that motivated Matter fan control stayed
-/// `device_type: "matter"` with no capabilities, and was therefore invisible to
-/// the device-type-aware routing the same change added.
-#[tokio::test]
-async fn an_already_registered_device_is_retyped_on_sync() {
-    let (url, _received) = mock_matter_server(json!([light_node_json()]), vec![]).await;
-    let (client, events) = MatterClient::connect(&url).await.unwrap();
-    let cache: NodeCache = Arc::new(RwLock::new(HashMap::new()));
-    let registry = Arc::new(InMemoryRegistry::default());
-    let bus = Arc::new(InProcessEventBus::new());
-
-    // The row an older GIAP left behind: right id, untyped, no capabilities.
-    registry
-        .register(RegisterDeviceRequest {
-            id: Some("matter-2".to_string()),
-            name: "Living Room Light".to_string(),
-            device_type: "matter".to_string(),
-            hostname: None,
-            capabilities: vec![],
-            room: None,
-        })
-        .await
-        .unwrap();
-
-    tokio::spawn(run_matter_bridge(
-        client,
-        events,
-        cache,
-        registry.clone() as Arc<dyn DeviceRegistry + Send + Sync>,
-        bus as Arc<dyn EventBus>,
-    ));
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let light = registry.get_device("matter-2").await.unwrap().unwrap();
-    assert_eq!(
-        light.device_type, "light",
-        "an existing device kept its stale device_type through a full sync"
-    );
-    assert!(
-        !light.capabilities.is_empty(),
-        "an existing device kept its empty capabilities through a full sync"
-    );
-    // The user's own fields are untouched: this path must never overwrite what
-    // somebody configured in the Devices tab.
-    assert_eq!(light.name, "Living Room Light");
-}
-
-/// A resync does not replay steady sensor values onto the bus.
-///
-/// `sync_node` runs on the initial sync, on every `node_added`/`node_updated`,
-/// and on every supervisor reconnect. The #92 rules engine is LEVEL-based, so
-/// republishing a steady "occupancy = 1" is indistinguishable from occupancy
-/// starting again: a controller that reconnects a few times would re-fire every
-/// automation attached to every Matter sensor with nothing in the house having
-/// changed. The supervisor exists to reconnect often, which is what makes this
-/// the common case rather than an edge one.
-///
-/// The subscription is opened BEFORE the bridge starts, deliberately. The bus
-/// is a broadcast channel, so a subscriber that joins afterwards misses
-/// everything already published — the first version of this test did that and
-/// would have passed with the fix reverted.
-#[tokio::test]
-async fn a_resync_does_not_republish_an_unchanged_sensor_value() {
-    let (url, _received) = mock_matter_server(
-        json!([occupancy_node_json()]),
-        vec![
-            // A resync carrying exactly what the initial sync already reported.
-            json!({"event": "node_updated", "data": {
-                "node_id": 7, "available": true, "attributes": {"1/1030/0": 0}
-            }}),
-            // ...then a real change, so this test can tell "publishes nothing
-            // on a resync" apart from "has stopped publishing".
-            json!({"event": "attribute_updated", "data": [7, "1/1030/0", 1]}),
-        ],
-    )
-    .await;
-    let (client, events) = MatterClient::connect(&url).await.unwrap();
-    let cache: NodeCache = Arc::new(RwLock::new(HashMap::new()));
-    let registry = Arc::new(InMemoryRegistry::default());
-    let bus = Arc::new(InProcessEventBus::new());
-
-    let mut stream = bus.subscribe();
-
-    tokio::spawn(run_matter_bridge(
-        client,
-        events,
-        cache,
-        registry as Arc<dyn DeviceRegistry + Send + Sync>,
-        bus.clone() as Arc<dyn EventBus>,
-    ));
-
-    let mut values = Vec::new();
-    while values.len() < 2 {
-        match tokio::time::timeout(Duration::from_millis(600), stream.next()).await {
-            Ok(Some(BusEvent::Sensor(r))) if r.device_id == "matter-7" => values.push(r.value),
-            Ok(Some(_)) => continue,
-            _ => break,
-        }
-    }
-
-    // Initial sync publishes 0 (first sight). The identical resync must publish
-    // nothing. The genuine change to 1 must publish.
-    assert_eq!(
-        values,
-        vec![0.0, 1.0],
-        "expected the first sight and the real change only; a duplicate 0 means \
-         the resync republished an unchanged value and re-fired every rule \
-         attached to this sensor"
-    );
+    assert_eq!(control_frames(&received).len(), 1);
+    assert!(fallback.calls().is_empty());
 }
