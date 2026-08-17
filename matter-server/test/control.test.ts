@@ -156,6 +156,36 @@ describe("control planning", () => {
     }
   });
 
+  it("gives commands that take no fields an EMPTY payload", () => {
+    // The contract `controller.ts` reads: an empty payload means invoke the
+    // command with NO argument. matter.js validates against the cluster schema
+    // and rejects `{}` on a void command with "Expected void, got object", so
+    // On, Off, LockDoor and UnlockDoor all failed while the commands that do
+    // take fields worked — a half-working state that is very hard to read from
+    // the outside. Anything added here with a void command must keep this shape.
+    const voidCommands: [ReturnType<typeof planControl>, string][] = [
+      [planControl(lightNode(), "matter-2", "power", true), "on"],
+      [planControl(lightNode(), "matter-2", "power", false), "off"],
+    ];
+    for (const [plan, name] of voidCommands) {
+      const action = plan.actions[0];
+      expect(action?.kind).toBe("command");
+      if (action?.kind !== "command") continue;
+      expect(action.command).toBe(name);
+      expect(Object.keys(action.payload)).toEqual([]);
+    }
+
+    const lock = describedNode(6, 0x000a, { doorLock: { lockState: 1 } });
+    const locking = planControl(lock, "matter-6", "locked", true).actions[0];
+    expect(locking?.kind === "command" && Object.keys(locking.payload)).toEqual([]);
+  });
+
+  it("gives commands that DO take fields a populated payload", () => {
+    // The other half of the same contract: these must not be invoked bare.
+    const dim = planControl(lightNode(), "matter-2", "brightness", 40).actions[0];
+    expect(dim?.kind === "command" && Object.keys(dim.payload).length).toBeGreaterThan(0);
+  });
+
   it("names the modes it accepts when given one it does not", () => {
     try {
       planControl(fanNode(), "matter-18", "fan_mode", "turbo");

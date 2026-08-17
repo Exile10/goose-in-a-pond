@@ -48,7 +48,21 @@ pub struct MatterClient {
 impl MatterClient {
     /// Connect, check the greeting, and start the read/write tasks. Returns the
     /// client plus the stream of unsolicited events.
+    ///
+    /// Relays the controller's `log` events into `tracing`. Use
+    /// [`connect_to_managed`] instead when GIAP spawned the controller itself
+    /// and is already relaying its stderr.
     pub async fn connect(url: &str) -> Result<(Arc<Self>, mpsc::Receiver<MatterEvent>)> {
+        Self::open(url, true).await
+    }
+
+    /// Connect to a controller whose stderr GIAP is already relaying, so its
+    /// `log` events are dropped rather than logged a second time.
+    pub async fn connect_to_managed(url: &str) -> Result<(Arc<Self>, mpsc::Receiver<MatterEvent>)> {
+        Self::open(url, false).await
+    }
+
+    async fn open(url: &str, relay_logs: bool) -> Result<(Arc<Self>, mpsc::Receiver<MatterEvent>)> {
         let (socket, _) = connect_async(url)
             .await
             .with_context(|| format!("connecting to the Matter controller at {url}"))?;
@@ -109,7 +123,15 @@ impl MatterClient {
                     }
                     ServerMessage::Event { event, payload } => {
                         if event == "log" {
-                            relay_controller_log(&payload);
+                            // Only when nothing else is: for a controller GIAP
+                            // spawned, its stderr is already piped and relayed,
+                            // and doing both put every controller line in the
+                            // log twice.
+                            if relay_logs {
+                                if let Ok(record) = serde_json::from_value::<WireLog>(payload) {
+                                    record.relay();
+                                }
+                            }
                             continue;
                         }
                         // Full channel = slow bridge; dropping is fine for state
@@ -228,32 +250,6 @@ pub fn code_of(error: &anyhow::Error) -> Option<&str> {
     error
         .downcast_ref::<ControllerCode>()
         .map(|code| code.0.as_str())
-}
-
-/// Re-emit the controller's own record at the level it names.
-///
-/// The point of the controller logging as NDJSON rather than prose: a relay that
-/// cannot tell an error from a debug line has to flatten everything to one
-/// level, and a controller whose failures arrive at `debug` is most of the way
-/// back to being silent.
-fn relay_controller_log(payload: &Value) {
-    let Ok(record) = serde_json::from_value::<WireLog>(payload.clone()) else {
-        return;
-    };
-    let message = redact_setup_code(&record.message);
-    let kind = record.kind;
-    match record.level.as_str() {
-        "error" => {
-            tracing::error!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
-        }
-        "warn" => {
-            tracing::warn!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
-        }
-        "info" => {
-            tracing::info!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
-        }
-        _ => tracing::debug!(kind = %kind, source = "controller", "{message}"),
-    }
 }
 
 #[cfg(test)]

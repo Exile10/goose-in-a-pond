@@ -385,12 +385,20 @@ async fn connect(r: &Reconciler, url: &str) -> Result<Connected> {
         }
         None => None,
     };
+    let started_here = started.is_some();
     // One cell, two writers: this connect puts the first handle in, and the
     // supervisor replaces it if it ever has to restart the process.
     let child: SharedServerChild = Arc::new(tokio::sync::Mutex::new(started));
 
+    // `started` is Some only when GIAP spawned the controller, which is exactly
+    // when its stderr is being piped and relayed — so its log EVENTS would be a
+    // duplicate of every line.
     let (client, events): (Arc<MatterClient>, tokio::sync::mpsc::Receiver<MatterEvent>) =
-        MatterClient::connect(url).await?;
+        if started_here {
+            MatterClient::connect_to_managed(url).await?
+        } else {
+            MatterClient::connect(url).await?
+        };
 
     let control = Arc::new(MatterDeviceControl::new(client.clone()));
     let commissioner: Arc<dyn DeviceCommissioningPort> =

@@ -220,7 +220,9 @@ async function dispatch(controller: Controller, request: Request): Promise<unkno
 
     case "subscribe":
       // The full snapshot, so a fresh connection knows the fabric without waiting for
-      // something to change. Events carry every change from here on.
+      // something to change. Events carry every change from here on — which is why
+      // this also re-checks that every commissioned peer is wired for them.
+      controller.observeCommissioned();
       return { devices: controller.devices(), readings: controller.readings() };
 
     case "discover":

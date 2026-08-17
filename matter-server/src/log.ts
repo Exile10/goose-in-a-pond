@@ -92,8 +92,34 @@ export const log = {
     emit("debug", kind, message, fields),
 };
 
-/** An error's message, redacted, without the stack — stacks belong in `fields`. */
+/**
+ * An error's whole cause chain, redacted, without the stack — stacks belong in
+ * `fields`.
+ *
+ * The chain and not just `.message`, for the same reason the Rust side renders
+ * `{:#}` rather than `Display`: matter.js wraps errors as it rethrows them, so
+ * the outermost message is the layer that gave up rather than the reason. A
+ * failed discovery reported itself as "discovery of node discovery failed" and
+ * dropped the cause, which is the only part that tells you what to do.
+ */
 export function describeError(error: unknown): string {
-  if (error instanceof Error) return redactSetupCode(error.message);
-  return redactSetupCode(String(error));
+  const parts: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+
+  // Bounded as well as cycle-guarded: a chain long enough to matter is a bug of
+  // its own, and a log line the width of a screen helps nobody.
+  while (current !== undefined && current !== null && parts.length < 8) {
+    if (seen.has(current)) break;
+    seen.add(current);
+
+    const message = current instanceof Error ? current.message : String(current);
+    // matter.js sometimes rethrows with the cause's text already embedded;
+    // repeating it would pad the line without adding anything.
+    if (message.length > 0 && !parts.includes(message)) parts.push(message);
+
+    current = current instanceof Error ? (current as { cause?: unknown }).cause : undefined;
+  }
+
+  return redactSetupCode(parts.join(": ")) || "an error with no message";
 }

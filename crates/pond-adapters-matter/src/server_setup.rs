@@ -453,43 +453,13 @@ fn spawn_server(data_dir: &Path, port: u16) -> Result<(Child, StderrTail)> {
 
 /// Re-emit one controller stderr line into `tracing`.
 ///
-/// Structured records keep their level, which is the whole reason the controller
-/// logs as NDJSON. Anything else — a Node stack trace, matter.js's own output —
-/// is relayed at debug, where it is available when someone goes looking without
-/// filling the log by default.
+/// Structured records keep their level and their fields; anything else — a Node
+/// stack trace, matter.js's own output — is relayed at debug, where it is
+/// available when someone goes looking without filling the log by default.
 fn relay(line: &str) {
-    #[derive(serde::Deserialize)]
-    struct Record {
-        #[serde(default)]
-        level: String,
-        #[serde(default)]
-        kind: String,
-        #[serde(default)]
-        message: String,
-    }
-
-    let Ok(record) = serde_json::from_str::<Record>(line) else {
-        tracing::debug!(target: "matter_server_stderr", "{line}");
-        return;
-    };
-    if record.level.is_empty() {
-        tracing::debug!(target: "matter_server_stderr", "{line}");
-        return;
-    }
-
-    let message = crate::protocol::redact_setup_code(&record.message);
-    let kind = record.kind;
-    match record.level.as_str() {
-        "error" => {
-            tracing::error!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
-        }
-        "warn" => {
-            tracing::warn!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
-        }
-        "info" => {
-            tracing::info!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
-        }
-        _ => tracing::debug!(kind = %kind, source = "controller", "{message}"),
+    match serde_json::from_str::<crate::protocol::WireLog>(line) {
+        Ok(record) if !record.level.is_empty() => record.relay(),
+        _ => tracing::debug!(target: "matter_server_stderr", "{line}"),
     }
 }
 
