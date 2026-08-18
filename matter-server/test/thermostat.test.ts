@@ -158,4 +158,59 @@ describe("which setpoint a thermostat request is about", () => {
       when: "while heating",
     });
   });
+  it("reads an appliance's own temperature setpoint, which is a number not a level", () => {
+    // Temperature Control has two shapes. The washer named levels and was read as a
+    // mode; this dishwasher states a number, and reading only the levels had GIAP
+    // telling a household "no, you cannot set a temperature for the dishwasher"
+    // about a device showing a 49 to 82 degree slider on its own screen. These are
+    // the values the Matter Virtual Device publishes.
+    const dishwasher = node(103, [
+      named("Dishwasher"),
+      endpoint(1, {
+        onOff: { onOff: false },
+        temperatureControl: {
+          temperatureSetpoint: 4900,
+          minTemperature: 4900,
+          maxTemperature: 8200,
+          step: 100,
+        },
+      }),
+    ]);
+
+    // Offered under the verb GIAP already has for a temperature in Celsius, rather
+    // than a verb per appliance.
+    expect(describeNode(dishwasher).capabilities.find(c => c.verb === "target_temp")?.value).toEqual(
+      { kind: "number", unit: "C", min: 49, max: 82, step: 1 },
+    );
+
+    expect(stateOf(dishwasher).values).toContainEqual({ name: "target_temp", value: "49 C" });
+
+    // Taken by command, which is how Temperature Control accepts one.
+    const plan = planControl(dishwasher, "matter-1", "target_temp", 60);
+    expect(plan.actions).toEqual([
+      {
+        kind: "command",
+        endpoint: 1,
+        cluster: "temperatureControl",
+        command: "setTemperature",
+        payload: { targetTemperature: 6000 },
+      },
+    ]);
+  });
+
+  it("still reads a washer's levels as a mode, not a number", () => {
+    // The other shape, unchanged: a device naming its levels has no numeric
+    // setpoint to offer, and claiming one would invent a range.
+    const washer = node(104, [
+      named("Washer"),
+      endpoint(1, {
+        temperatureControl: { supportedTemperatureLevels: ["Cold", "Warm", "Hot"] },
+      }),
+    ]);
+
+    expect(describeNode(washer).capabilities.find(c => c.verb === "target_temp")).toBeUndefined();
+    expect(
+      describeNode(washer).capabilities.find(c => c.setting === "temperature level")?.value,
+    ).toEqual({ kind: "enum", values: ["Cold", "Warm", "Hot"] });
+  });
 });

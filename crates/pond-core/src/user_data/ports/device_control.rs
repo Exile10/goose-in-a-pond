@@ -143,6 +143,10 @@ pub enum ValueSpec {
         min: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max: Option<f64>,
+        /// The increment the device accepts, where it states one. A dishwasher
+        /// taking 49 to 82 degrees in whole degrees will refuse 50.5.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unit: Option<String>,
         /// What this range is true of, where it is not true always.

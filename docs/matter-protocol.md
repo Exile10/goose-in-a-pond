@@ -147,6 +147,17 @@ the number reads as a fact about the device, so the same question minutes apart
 answers 7 to 23.5 and then 7 to 32 with nothing to explain either, and a reader
 concludes 30 is impossible when it is one mode away.
 
+`target_temp` also carries an appliance's own setpoint. Temperature Control has two
+shapes: a washer names levels, which are read as a `mode`, while a dishwasher states
+a number with its own minimum, maximum and `step`, taken by `setTemperature` rather
+than an attribute write. Reading only the levels, GIAP reported "you cannot set a
+temperature for the dishwasher" about a device showing a 49 to 82 degree slider. The
+existing verb carries it rather than a new one, a per-appliance vocabulary being the
+thing this area exists to avoid.
+
+A stated `step` travels with the range, because it is as much a part of what will be
+accepted: 50.5 into a dishwasher taking whole degrees is refused.
+
 The pairing reads backwards until you know what a setpoint is: heating runs BELOW
 its setpoint and cooling ABOVE its own, so heating is always the lower of the two.
 They bracket a band rather than describing how hard either can work.

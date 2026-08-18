@@ -273,6 +273,7 @@ fn render_value(value: &ValueSpec) -> String {
         ValueSpec::Number {
             min,
             max,
+            step,
             unit,
             when,
         } => {
@@ -285,6 +286,13 @@ fn render_value(value: &ValueSpec) -> String {
                 (None, None) => format!("a number in {unit}"),
             };
             let range = range.trim_end().to_string();
+            // A stated increment is part of what will be accepted: 50.5 into a
+            // dishwasher taking whole degrees is refused, and the refusal is
+            // avoidable by saying so first.
+            let range = match step {
+                Some(step) => format!("{range} in steps of {step}"),
+                None => range,
+            };
             // The circumstances travel with the number, so a range quoted back
             // later carries what it was true of.
             match when {
@@ -820,6 +828,7 @@ mod tests {
                 ValueSpec::Number {
                     min: Some(7.0),
                     max: Some(30.0),
+                    step: None,
                     unit: Some("C".into()),
                     when: None,
                 },
@@ -836,6 +845,7 @@ mod tests {
                 ValueSpec::Number {
                     min: None,
                     max: None,
+                    step: None,
                     unit: Some("C".into()),
                     when: None,
                 },
@@ -887,6 +897,7 @@ mod tests {
                 value: ValueSpec::Number {
                     min: Some(7.0),
                     max: Some(23.5),
+                    step: None,
                     unit: Some("C".into()),
                     when: Some(
                         "while heating; this device reaches 7 to 32 C across its modes".into(),
@@ -908,6 +919,7 @@ mod tests {
         let rendered = render_value(&ValueSpec::Number {
             min: Some(0.0),
             max: Some(100.0),
+            step: None,
             unit: Some("%".into()),
             when: None,
         });

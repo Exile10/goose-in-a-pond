@@ -27,7 +27,7 @@ import {
   nodeToDevice,
 } from "./devices.js";
 import { SENSORS } from "./sensors.js";
-import { reachableRange, targetSetpoint } from "./thermostat.js";
+import { applianceSetpoint, reachableRange, targetSetpoint } from "./thermostat.js";
 import { operationsOf, settingsOf } from "./settings.js";
 import { endpointWith, type NodeSnapshot } from "./snapshot.js";
 
@@ -111,6 +111,19 @@ function fanModes(node: NodeSnapshot): string[] {
  * on how warm it can make a room.
  */
 function temperatureSpec(node: NodeSnapshot): ValueSpec {
+  // An appliance keeps one setpoint, with its own limits and increment, and no mode
+  // to qualify it.
+  const appliance = applianceSetpoint(node);
+  if (appliance !== undefined) {
+    return {
+      kind: "number",
+      unit: "C",
+      ...(appliance.min === undefined ? {} : { min: appliance.min / 100 }),
+      ...(appliance.max === undefined ? {} : { max: appliance.max / 100 }),
+      ...(appliance.step === undefined ? {} : { step: appliance.step / 100 }),
+    };
+  }
+
   const mode = attribute(node, CLUSTER_THERMOSTAT, "systemMode");
   // Auto (1) and Off (0) do not name a setpoint; the requested value would.
   const settled = mode === MODE_COOL || mode === MODE_HEAT || mode === MODE_EMERGENCY_HEAT;
@@ -185,7 +198,12 @@ function capabilitiesOf(node: NodeSnapshot): Capability[] {
     add("fan_speed", { kind: "percent" });
     add("fan_mode", { kind: "enum", values: fanModes(node) });
   }
-  if (has(CLUSTER_THERMOSTAT)) add("target_temp", temperatureSpec(node));
+  // Either source of a temperature target: a thermostat's setpoints, or an
+  // appliance's own. Gating on the thermostat alone is why a dishwasher showing a
+  // 49 to 82 degree slider was described as having no temperature at all.
+  if (has(CLUSTER_THERMOSTAT) || applianceSetpoint(node) !== undefined) {
+    add("target_temp", temperatureSpec(node));
+  }
   if (has(CLUSTER_DOOR_LOCK)) add("locked", { kind: "boolean" });
   if (has(CLUSTER_COLOR_CONTROL)) add("color", { kind: "color" });
   if (has(CLUSTER_WINDOW_COVERING)) add("position", { kind: "percent" });

@@ -159,3 +159,53 @@ export function reachableRange(node: NodeSnapshot): { min?: number; max?: number
   const max = cooling.max ?? heating.max;
   return { ...(min === undefined ? {} : { min }), ...(max === undefined ? {} : { max }) };
 }
+
+/**
+ * An appliance's own temperature setpoint, where it keeps one.
+ *
+ * Temperature Control has two shapes and this is the other one. The washer named
+ * levels — Low, Medium, High — and `settingsOf` reads those as a mode. A dishwasher
+ * states a number instead: `temperatureSetpoint` in hundredths, with its own
+ * minimum, maximum and step. Reading only the levels, GIAP told a household "no,
+ * you cannot set a temperature for the dishwasher" about a device showing a 49 to
+ * 82 degree slider on its own screen.
+ *
+ * It answers to `target_temp` rather than a verb of its own. GIAP already has a
+ * verb meaning "a temperature in Celsius", and a dishwasher's wash temperature is
+ * that: adding `dishwasher_temp` would be the per-appliance vocabulary this whole
+ * area exists to avoid.
+ */
+export interface ApplianceSetpoint {
+  endpoint: number;
+  /** Hundredths of a degree, as Matter states them. Absent where unstated. */
+  min?: number;
+  max?: number;
+  /** The increment the device accepts, if it says. */
+  step?: number;
+}
+
+const TEMPERATURE_CONTROL = "temperatureControl";
+
+export function applianceSetpoint(node: NodeSnapshot): ApplianceSetpoint | undefined {
+  const endpoint = endpointWith(node, TEMPERATURE_CONTROL);
+  const state = endpoint?.clusters[TEMPERATURE_CONTROL];
+  if (endpoint === undefined || state === undefined) return undefined;
+
+  // The number feature, not the level one: a device offering levels is read as a
+  // mode, and one offering neither has nothing to set.
+  const number = (name: string) => {
+    const value = state[name];
+    return typeof value === "number" ? value : undefined;
+  };
+  if (number("temperatureSetpoint") === undefined) return undefined;
+
+  const min = number("minTemperature");
+  const max = number("maxTemperature");
+  const step = number("step");
+  return {
+    endpoint: endpoint.number,
+    ...(min === undefined ? {} : { min }),
+    ...(max === undefined ? {} : { max }),
+    ...(step === undefined ? {} : { step }),
+  };
+}

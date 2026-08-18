@@ -34,7 +34,7 @@ import {
   CLUSTER_WINDOW_COVERING,
 } from "./devices.js";
 import { observedOperation, settingsOf } from "./settings.js";
-import { targetSetpoint } from "./thermostat.js";
+import { applianceSetpoint, targetSetpoint } from "./thermostat.js";
 import { endpointWith, type NodeSnapshot } from "./snapshot.js";
 
 /** DoorLock's `lockState`: 0 is not-fully-locked, which is neither of the two. */
@@ -65,9 +65,16 @@ export function stateOf(node: NodeSnapshot): DeviceState {
   // The setpoint `target_temp` would write, which is the one the mode has live.
   // Reporting the heating one to a cooling thermostat describes a number that is
   // not currently steering anything.
-  const target = targetSetpoint(node);
-  const setpoint = target === undefined ? undefined : numberAt(node, CLUSTER_THERMOSTAT, target.attribute);
-  if (setpoint !== undefined) add("target_temp", `${setpointToCelsius(setpoint)} C`);
+  const appliance = applianceSetpoint(node);
+  if (appliance !== undefined) {
+    const set = numberAt(node, "temperatureControl", "temperatureSetpoint");
+    if (set !== undefined) add("target_temp", `${setpointToCelsius(set)} C`);
+  } else {
+    const target = targetSetpoint(node);
+    const setpoint =
+      target === undefined ? undefined : numberAt(node, CLUSTER_THERMOSTAT, target.attribute);
+    if (setpoint !== undefined) add("target_temp", `${setpointToCelsius(setpoint)} C`);
+  }
 
   const lock = numberAt(node, CLUSTER_DOOR_LOCK, "lockState");
   if (lock !== undefined) add("locked", LOCK_STATES[lock]);
