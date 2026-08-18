@@ -121,7 +121,7 @@ export interface Capability {
 export type ValueSpec =
   | { kind: "boolean" }
   | { kind: "percent" }
-  | { kind: "number"; min?: number; max?: number; unit?: string }
+  | { kind: "number"; min?: number; max?: number; unit?: string; when?: string }
   | { kind: "enum"; values: string[] }
   | { kind: "color" };
 

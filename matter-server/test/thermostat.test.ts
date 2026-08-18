@@ -78,10 +78,10 @@ describe("which setpoint a thermostat request is about", () => {
 
   it("describes the range of the setpoint the mode has live", () => {
     const cooling = describeNode(thermostat(COOL)).capabilities.find(c => c.verb === "target_temp");
-    expect(cooling?.value).toEqual({ kind: "number", unit: "C", min: 16, max: 32 });
+    expect(cooling?.value).toMatchObject({ kind: "number", unit: "C", min: 16, max: 32 });
 
     const heating = describeNode(thermostat(HEAT)).capabilities.find(c => c.verb === "target_temp");
-    expect(heating?.value).toEqual({ kind: "number", unit: "C", min: 7, max: 23.5 });
+    expect(heating?.value).toMatchObject({ kind: "number", unit: "C", min: 7, max: 23.5 });
 
     // Auto reaches either, so the range spans both rather than advertising one.
     const auto = describeNode(thermostat(AUTO)).capabilities.find(c => c.verb === "target_temp");
@@ -110,6 +110,52 @@ describe("which setpoint a thermostat request is about", () => {
       which: "heating",
       attribute: "occupiedHeatingSetpoint",
       max: 3000,
+    });
+  });
+  it("says what a mode-bound range is true of, and what the device can still reach", () => {
+    // A bare "7 to 23.5" reads as this thermostat's ceiling, so a reader concludes
+    // 30 is impossible -- when 30 is reachable the moment the mode changes. It also
+    // goes stale silently: the same question minutes later answers 16 to 32, with
+    // nothing to say why.
+    const heating = describeNode(thermostat(HEAT)).capabilities.find(c => c.verb === "target_temp");
+    expect(heating?.value).toEqual({
+      kind: "number",
+      unit: "C",
+      min: 7,
+      max: 23.5,
+      when: "while heating; this device reaches 7 to 32 C across its modes",
+    });
+
+    const cooling = describeNode(thermostat(COOL)).capabilities.find(c => c.verb === "target_temp");
+    expect(cooling?.value).toMatchObject({ when: "while cooling; this device reaches 7 to 32 C across its modes" });
+
+    // Auto already spans both, so there is no condition to state and nothing wider
+    // to point at.
+    const auto = describeNode(thermostat(AUTO)).capabilities.find(c => c.verb === "target_temp");
+    expect(auto?.value).toEqual({ kind: "number", unit: "C", min: 7, max: 32 });
+  });
+
+  it("states the condition without a wider range when there is none", () => {
+    // A heat-only thermostat has one setpoint: the range is the device's range, and
+    // claiming it "reaches" something else would be false.
+    const heatOnly = node(102, [
+      named("Boiler"),
+      endpoint(1, {
+        thermostat: {
+          systemMode: 4,
+          occupiedHeatingSetpoint: 2000,
+          absMinHeatSetpointLimit: 700,
+          absMaxHeatSetpointLimit: 3000,
+        },
+      }),
+    ]);
+
+    expect(describeNode(heatOnly).capabilities.find(c => c.verb === "target_temp")?.value).toEqual({
+      kind: "number",
+      unit: "C",
+      min: 7,
+      max: 30,
+      when: "while heating",
     });
   });
 });

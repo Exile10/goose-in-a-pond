@@ -270,16 +270,26 @@ fn render_value(value: &ValueSpec) -> String {
         ValueSpec::Percent => "0-100 percent".to_string(),
         ValueSpec::Color => "hue 0-360 with saturation 0-100".to_string(),
         ValueSpec::Enum { values } => format!("one of: {}", values.join(", ")),
-        ValueSpec::Number { min, max, unit } => {
+        ValueSpec::Number {
+            min,
+            max,
+            unit,
+            when,
+        } => {
             let unit = unit.as_deref().unwrap_or("");
-            match (min, max) {
-                (Some(lo), Some(hi)) => format!("a number from {lo} to {hi} {unit}")
-                    .trim_end()
-                    .to_string(),
-                (Some(lo), None) => format!("a number from {lo} {unit}").trim_end().to_string(),
-                (None, Some(hi)) => format!("a number up to {hi} {unit}").trim_end().to_string(),
+            let range = match (min, max) {
+                (Some(lo), Some(hi)) => format!("a number from {lo} to {hi} {unit}"),
+                (Some(lo), None) => format!("a number from {lo} {unit}"),
+                (None, Some(hi)) => format!("a number up to {hi} {unit}"),
                 // No stated limits: say so rather than implying a range.
-                (None, None) => format!("a number in {unit}").trim_end().to_string(),
+                (None, None) => format!("a number in {unit}"),
+            };
+            let range = range.trim_end().to_string();
+            // The circumstances travel with the number, so a range quoted back
+            // later carries what it was true of.
+            match when {
+                Some(when) => format!("{range} ({when})"),
+                None => range,
             }
         }
     }
@@ -811,6 +821,7 @@ mod tests {
                     min: Some(7.0),
                     max: Some(30.0),
                     unit: Some("C".into()),
+                    when: None,
                 },
             )],
             sensors: vec![],
@@ -826,6 +837,7 @@ mod tests {
                     min: None,
                     max: None,
                     unit: Some("C".into()),
+                    when: None,
                 },
             )],
             sensors: vec![],
@@ -859,6 +871,47 @@ mod tests {
         // And it says plainly that there is nothing to drive, rather than leaving
         // the model to infer it from an empty list.
         assert!(rendered.contains("Cannot be controlled"), "{rendered}");
+    }
+
+    /// A range that only holds in one mode has to say so, or it is read as a fact
+    /// about the device: asked twice minutes apart, the same thermostat answered
+    /// "7 to 23.5" and then "7 to 32", with nothing to explain either.
+    #[test]
+    fn a_conditional_range_carries_its_condition() {
+        let rendered = render_description(&DeviceDescription {
+            device_id: "matter-1".into(),
+            device_type: "thermostat".into(),
+            capabilities: vec![Capability {
+                verb: "target_temp".into(),
+                setting: None,
+                value: ValueSpec::Number {
+                    min: Some(7.0),
+                    max: Some(23.5),
+                    unit: Some("C".into()),
+                    when: Some(
+                        "while heating; this device reaches 7 to 32 C across its modes".into(),
+                    ),
+                },
+            }],
+            sensors: vec![],
+        });
+
+        assert!(rendered.contains("a number from 7 to 23.5 C"), "{rendered}");
+        // Both halves: what it is true of, and what the device can still reach.
+        assert!(rendered.contains("(while heating"), "{rendered}");
+        assert!(rendered.contains("reaches 7 to 32 C"), "{rendered}");
+    }
+
+    /// Anything whose limits do not move says nothing extra.
+    #[test]
+    fn an_unconditional_range_reads_as_it_did() {
+        let rendered = render_value(&ValueSpec::Number {
+            min: Some(0.0),
+            max: Some(100.0),
+            unit: Some("%".into()),
+            when: None,
+        });
+        assert_eq!(rendered, "a number from 0 to 100 %");
     }
 
     /// The gap this closes: asked "what is the state of the laundry washer?", the
