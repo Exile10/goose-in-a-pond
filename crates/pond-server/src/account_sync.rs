@@ -280,7 +280,7 @@ pub async fn sync_mail(
         }
 
         match sync_one_mailbox(&pipeline, &secrets, &source, now).await {
-            Ok(n) => {
+            Ok((n, cursor)) => {
                 report.ingested += n;
                 note(
                     &mut report,
@@ -288,7 +288,7 @@ pub async fn sync_mail(
                     if n > 0 { "ingested" } else { "unchanged" },
                     n,
                 );
-                source.advance(None, now, SourceStatus::Connected);
+                source.advance(cursor, now, SourceStatus::Connected);
             }
             Err(e) => {
                 if is_auth_failure(&e) {
@@ -320,7 +320,7 @@ async fn sync_one_mailbox(
     secrets: &Arc<dyn SecretRepository>,
     source: &ContextSource,
     now: DateTime<Utc>,
-) -> Result<usize> {
+) -> Result<(usize, Option<String>)> {
     let key = source
         .secret_ref()
         .map(str::to_string)
@@ -345,12 +345,14 @@ async fn sync_one_mailbox(
         password: creds.password.clone(),
     });
 
-    // No cursor. IMAP offers no cheap "has anything changed" answer the way a
-    // CalDAV ctag does, and re-reading a 30-day window is idempotent: the
-    // Message-ID is the external_id, so a message already stored is an update
-    // to the same row rather than a duplicate.
-    let items = adapter
-        .recent_messages(ImapAdapter::default_window(now))
+    // Resume above the last UID this pond saw.
+    //
+    // Re-reading the window is still idempotent — Message-ID is the
+    // external_id, so a message already stored is an update to the same row —
+    // but with bodies it is no longer CHEAP: a full re-read measured at 769 MB
+    // resident and took the pond off the air, every thirty minutes.
+    let (items, next_cursor) = adapter
+        .messages_since_cursor(ImapAdapter::default_window(now), source.cursor())
         .await?;
 
     let mut ingested = 0usize;
@@ -362,7 +364,7 @@ async fn sync_one_mailbox(
             }
         }
     }
-    Ok(ingested)
+    Ok((ingested, next_cursor))
 }
 
 // ── The port the route asks through ─────────────────────────────────────────

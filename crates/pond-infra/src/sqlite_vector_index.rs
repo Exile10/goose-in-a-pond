@@ -356,15 +356,31 @@ impl VectorIndex for SqliteVectorIndex {
             let (scope_pred, bind) = scope_sql(corpus, scope);
             let live = liveness_sql(corpus);
             let text = text_sql(corpus);
-            // The passage, when the vector describes one — `substr` is
-            // 1-indexed and the chunker counts from 0, hence the +1. A NULL
-            // span means the vector is of the whole text, which is every
+            // The passage, when the vector describes one. Two corrections
+            // ride on this expression and both are silent when wrong.
+            //
+            // `substr` is 1-indexed and the chunker counts from 0, hence the
+            // +1. And `substr` on a TEXT value counts CHARACTERS while the
+            // chunker counts BYTES, so the offsets must be applied to a BLOB
+            // and cast back. On this pond that was 814 of 5,701 passages
+            // running past the end of their text -- which SQLite truncates
+            // without complaint -- and every passage in a body containing a
+            // `©` or an em dash shifted by one position per multi-byte
+            // character before it, so a snippet began "our linked Google
+            // Account" where the mail said "your".
+            //
+            // The slice stays on a character boundary because the chunker only
+            // ever emits boundaries; a stale span is refused in Rust by
+            // `Chunk::slice` rather than sliced blindly here.
+            //
+            // A NULL span means the vector is of the whole text, which is every
             // memory, every summary, and every context vector written before
             // chunking existed.
             let sql = format!(
                 "SELECT v.row_id, v.vector, \
                         CASE WHEN v.chunk_start IS NULL OR v.chunk_len IS NULL THEN {text} \
-                             ELSE substr({text}, v.chunk_start + 1, v.chunk_len) END \
+                             ELSE CAST(substr(CAST({text} AS BLOB), \
+                                              v.chunk_start + 1, v.chunk_len) AS TEXT) END \
                  FROM vectors v \
                  JOIN {table} s ON s.{id_col} = v.row_id \
                  WHERE v.corpus = ? AND v.model_id = ? {scope_pred} {live}"
@@ -1596,6 +1612,141 @@ mod write_through_tests {
                 .unwrap()
                 .is_empty(),
             "a disconnected source left its vectors behind"
+        );
+    }
+
+    /// A chunk span is a BYTE offset; SQLite's `substr` on TEXT counts
+    /// CHARACTERS. Anything non-ASCII before a passage shifts it.
+    ///
+    /// Measured on a real mailbox: 814 of 5,701 passages ran past the end of
+    /// their own text -- silently truncated -- and a snippet from a Google
+    /// security mail began "our linked Google Account" where it said "your".
+    /// A copyright sign in a footer is enough to cause it.
+    #[tokio::test]
+    async fn a_passage_is_sliced_by_byte_not_by_character() {
+        use pond_core::context::chunking::{chunk, DEFAULT_CHUNK_BYTES, DEFAULT_OVERLAP_BYTES};
+        use pond_core::context::domain::{SourceKind, SourceParts, SourceStatus};
+        use pond_core::context::ingest::{IngestPipeline, RawItem};
+        use pond_core::context::ports::ContextRepository;
+        use pond_core::security::domain::redaction::RedactionKind;
+        use pond_core::security::mocks::mock_redactor::MockRedactor;
+
+        let tmp = TempDir::new().unwrap();
+        let db = crate::db::Database::init(tmp.path()).await.unwrap();
+        let index: Arc<dyn VectorIndex> = Arc::new(SqliteVectorIndex::new(db.vectors.clone()));
+        add_profile(&db.system, "jerry").await;
+
+        let redactor = Arc::new(MockRedactor::replacing("nothing", RedactionKind::ApiKey));
+        let repo = Arc::new(
+            crate::sqlite_context::SqliteContextRepository::new(
+                db.system.clone(),
+                redactor.clone(),
+            )
+            .with_vector_index(index.clone(), Some("m".into())),
+        );
+        let source = pond_core::context::domain::ContextSource::from_parts(SourceParts {
+            id: "src-mail".into(),
+            kind: SourceKind::Sensor,
+            provider: "pond".into(),
+            profile_id: "jerry".into(),
+            scopes: vec![],
+            cursor: None,
+            last_sync: None,
+            status: SourceStatus::Connected,
+            secret_ref: None,
+            created_at: chrono::Utc::now(),
+        })
+        .expect("valid source");
+        repo.upsert_source(&source).await.unwrap();
+
+        struct E;
+        #[async_trait]
+        impl pond_core::models::ports::embedding::EmbeddingProvider for E {
+            async fn embed(&self, _t: &str) -> Result<Vec<f32>> {
+                Ok(vec![1.0, 0.0])
+            }
+            fn dimensions(&self) -> usize {
+                2
+            }
+            fn model_id(&self) -> String {
+                "m".into()
+            }
+        }
+        let pipeline = IngestPipeline::new(repo.clone(), redactor).with_embedder(Some(
+            Arc::new(E) as Arc<dyn pond_core::models::ports::embedding::EmbeddingProvider>
+        ));
+
+        // Multi-byte characters early, so every later span drifts under
+        // character indexing: each costs two or three bytes but one position.
+        let title = "Notice";
+        let body = format!(
+            "© 2026 — “quoted” café ©\n{}",
+            "the invoice is attached and the rent is due on Friday. ".repeat(30)
+        );
+        pipeline
+            .ingest(
+                &source,
+                RawItem {
+                    external_id: "msg-1".into(),
+                    kind: pond_core::context::domain::ItemKind::Message,
+                    occurred_at: chrono::Utc::now(),
+                    title: title.into(),
+                    body: body.clone(),
+                    participants: vec![],
+                },
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("ingest");
+
+        // The text the index resolves against, mirroring `text_sql`.
+        let text = format!("{title}\n{body}");
+        let spans = chunk(&text, DEFAULT_CHUNK_BYTES, DEFAULT_OVERLAP_BYTES);
+        assert!(spans.len() > 1, "test needs a body worth chunking");
+
+        let row_id = index
+            .needs_embedding(Corpus::Context, "m", 10)
+            .await
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("{}:{}", source.id(), "msg-1"));
+
+        index.remove(Corpus::Context, &row_id).await.unwrap();
+        // The LAST chunk is made the winner. Chunk 0 starts at offset 0, where
+        // a character slice is still a valid substring and the bug hides; the
+        // drift only shows in a passage that starts after the multi-byte
+        // characters.
+        let last = spans.len() - 1;
+        for (ix, span) in spans.iter().enumerate() {
+            index
+                .upsert(&VectorEntry {
+                    corpus: Corpus::Context,
+                    row_id: row_id.clone(),
+                    chunk_ix: ix as i64,
+                    chunk_span: Some((span.start as i64, span.len as i64)),
+                    model_id: "m".into(),
+                    vector: if ix == last {
+                        vec![1.0, 0.0]
+                    } else {
+                        vec![0.0, 1.0]
+                    },
+                    source_rev: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let hits = index
+            .search_resolved(&[1.0, 0.0], "m", &ProfileScope::Household, 50)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "one row, rolled up from its best chunk");
+
+        let expected = spans[last].slice(&text).expect("span is on a boundary");
+        assert_eq!(
+            hits[0].text, expected,
+            "the resolved passage is not the bytes the chunk described"
         );
     }
 
