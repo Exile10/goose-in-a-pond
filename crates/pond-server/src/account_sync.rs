@@ -269,6 +269,7 @@ pub async fn sync_mail(
 
         if offline {
             report.paused += 1;
+            note(&mut report, &source, "paused", 0);
             source.advance(
                 source.cursor().map(str::to_string),
                 now,
@@ -281,6 +282,12 @@ pub async fn sync_mail(
         match sync_one_mailbox(&pipeline, &secrets, &source, now).await {
             Ok(n) => {
                 report.ingested += n;
+                note(
+                    &mut report,
+                    &source,
+                    if n > 0 { "ingested" } else { "unchanged" },
+                    n,
+                );
                 source.advance(None, now, SourceStatus::Connected);
             }
             Err(e) => {

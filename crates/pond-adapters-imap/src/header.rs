@@ -26,20 +26,37 @@ pub fn decode_rfc2047(raw: &str) -> String {
             out.push_str(before);
         }
         // charset ? encoding ? text ?=
-        let Some(end) = tail[2..].find("?=").map(|i| i + 2) else {
+        // An encoded-word is `=?charset?encoding?text?=`, and the terminator
+        // must be looked for AFTER the encoding field — not from the start.
+        //
+        // Searching from the start finds the wrong `?=` whenever the text
+        // begins with `=`, which quoted-printable does constantly: `?Q?=E2…`
+        // contains `?=` at the encoding separator, so the word was cut before
+        // its text began and the whole subject came through raw. Found on real
+        // mail — `=?UTF-8?Q?=E2=9A=A1_$10.5K…?=` decoded to nothing.
+        let after_marker = &tail[2..];
+        let Some(charset_end) = after_marker.find('?') else {
             out.push_str(tail);
             return out;
         };
-        let word = &tail[2..end];
-        let mut parts = word.splitn(3, '?');
-        let (Some(_charset), Some(encoding), Some(text)) =
-            (parts.next(), parts.next(), parts.next())
+        let Some(enc_end) = after_marker[charset_end + 1..]
+            .find('?')
+            .map(|i| charset_end + 1 + i)
         else {
-            out.push_str(&tail[..end + 2]);
-            rest = &tail[end + 2..];
-            prev_was_encoded = false;
-            continue;
+            out.push_str(tail);
+            return out;
         };
+        // Only now is it safe to look for the terminator.
+        let Some(text_end) = after_marker[enc_end + 1..]
+            .find("?=")
+            .map(|i| enc_end + 1 + i)
+        else {
+            out.push_str(tail);
+            return out;
+        };
+        let end = text_end + 2;
+        let encoding = &after_marker[charset_end + 1..enc_end];
+        let text = &after_marker[enc_end + 1..text_end];
         let decoded = match encoding.to_ascii_uppercase().as_str() {
             "B" => base64::engine::general_purpose::STANDARD
                 .decode(text)
@@ -138,6 +155,23 @@ mod tests {
             decode_rfc2047("Re: =?utf-8?Q?caf=C3=A9?= tomorrow"),
             "Re: café tomorrow"
         );
+    }
+
+    /// Found on real mail, not by reading the RFC.
+    ///
+    /// Quoted-printable text begins with `=` constantly — `=E2` is the first
+    /// byte of a UTF-8 emoji — so `?Q?=E2…` contains `?=` at the ENCODING
+    /// separator. A terminator search that starts from the charset finds that
+    /// one, cuts the word before its text begins, and hands the whole subject
+    /// back raw. Every emoji-prefixed marketing subject in the corpus hit it.
+    #[test]
+    fn text_that_starts_with_an_equals_sign_does_not_end_the_word_early() {
+        assert_eq!(
+            decode_rfc2047("=?UTF-8?Q?=E2=9A=A1_$10.5K,_robot_arms?="),
+            "\u{26a1} $10.5K, robot arms"
+        );
+        // The base64 form of the same trap: payloads routinely end in `=`.
+        assert_eq!(decode_rfc2047("=?UTF-8?B?4pqhIHRlc3Q=?="), "\u{26a1} test");
     }
 
     /// A subject somebody can squint at beats a blank one, so anything
