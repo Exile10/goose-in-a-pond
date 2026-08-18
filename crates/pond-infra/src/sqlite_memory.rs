@@ -86,6 +86,10 @@ impl SqliteMemoryRepository {
                     .upsert(&VectorEntry {
                         corpus: Corpus::Memory,
                         row_id: id.to_string(),
+                        // A memory is a sentence or two. Chunking one would
+                        // split a fact in half.
+                        chunk_ix: 0,
+                        chunk_span: None,
                         model_id: model_id.to_string(),
                         vector: vector.to_vec(),
                         // A memory's content is stable once extracted —
