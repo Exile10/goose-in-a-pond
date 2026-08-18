@@ -1,9 +1,14 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Button, Separator } from "@heroui/react";
-import { Share2, Plus, X, Trash2, Copy, Wifi, WifiOff } from "lucide-react";
+import { Button, Separator, Switch } from "@heroui/react";
+import { Share2, Plus, X, Trash2, Copy, Wifi, WifiOff, Coins, Cpu, Zap } from "lucide-react";
 import QRCode from "qrcode";
 import { api } from "../api/PondApiClient";
-import type { MeshPeer, MeshSelf } from "../api/types";
+import type {
+  MeshPeer,
+  MeshPeerCapabilities,
+  MeshSelf,
+  MeshSettlementStatus,
+} from "../api/types";
 import { PageHeader } from "../components/shared";
 
 function truncatePeerId(peerId: string): string {
@@ -45,18 +50,45 @@ export function Mesh() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
+  const [topUpTarget, setTopUpTarget] = useState<MeshPeer | null>(null);
+  const [topUpAmount, setTopUpAmount] = useState("");
+  const [topUpSubmitting, setTopUpSubmitting] = useState(false);
+  const [topUpError, setTopUpError] = useState<string | null>(null);
+
+  // Live, on-demand — queried per connected peer, not part of the peer list
+  // response (see MeshPeerCapabilities' own doc comment on why).
+  const [capabilities, setCapabilities] = useState<Record<string, MeshPeerCapabilities>>({});
+
+  // The *persisted* setting, distinct from `self.mesh_enabled` (what's
+  // actually live right now). `PUT /settings` hot-builds the real mesh
+  // transport synchronously when this flips on (#132 follow-up — no restart
+  // needed any more), so `toggleMesh` re-fetches `self` right after the
+  // setting saves and the two converge within that one round trip. If they
+  // still disagree after that refresh, it isn't a pending restart — it means
+  // the transport failed to come up (wrong build, or a real startup error;
+  // see the server logs).
+  const [meshEnabledSetting, setMeshEnabledSetting] = useState<boolean | null>(null);
+  const [meshToggling, setMeshToggling] = useState(false);
+
+  // Read-only settlement-job status — fetched best-effort alongside
+  // everything else; a failure here shouldn't block the rest of the screen,
+  // since it's informational, not something the user acts on directly.
+  const [settlementStatus, setSettlementStatus] = useState<MeshSettlementStatus | null>(null);
+
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
-    Promise.all([api.listMeshPeers(), api.getMeshSelf()])
-      .then(([p, s]) => {
+    Promise.all([api.listMeshPeers(), api.getMeshSelf(), api.getSettings()])
+      .then(([p, s, settings]) => {
+        setMeshEnabledSetting(settings.mesh_enabled ?? false);
         setPeers(p);
         setSelf(s);
       })
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
+    api.getMeshSettlementStatus().then(setSettlementStatus).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -71,6 +103,38 @@ export function Mesh() {
       color: { dark: "#000000", light: "#ffffff" },
     }).catch((e) => console.error("QR render failed", e));
   }, [self?.invite_url]);
+
+  // Only query connected peers — an offline peer would just time out. 404s
+  // (untrusted) and 503s (mesh disabled) are both plausible here too; either
+  // way the card simply shows no capability chips rather than an error.
+  useEffect(() => {
+    for (const p of peers) {
+      if (!p.connected || capabilities[p.peer_id]) continue;
+      api
+        .getMeshPeerCapabilities(p.peer_id)
+        .then((c) => setCapabilities((prev) => ({ ...prev, [p.peer_id]: c })))
+        .catch(() => {});
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [peers]);
+
+  async function toggleMesh(next: boolean) {
+    setMeshToggling(true);
+    try {
+      const settings = await api.updateSettings({ mesh_enabled: next });
+      setMeshEnabledSetting(settings.mesh_enabled ?? next);
+      // The PUT above already blocked on building the real transport when
+      // turning mesh on (server-side hot-reload, #132 follow-up) — re-fetch
+      // `self` now so `self.mesh_enabled`/peer_id/invite_url reflect that
+      // immediately, instead of waiting for a manual reload of this screen.
+      const fresh = await api.getMeshSelf();
+      setSelf(fresh);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setMeshToggling(false);
+    }
+  }
 
   function openForm() {
     setInviteInput("");
@@ -115,6 +179,43 @@ export function Mesh() {
     }
   }
 
+  function openTopUp(peer: MeshPeer) {
+    setTopUpTarget(peer);
+    setTopUpAmount("");
+    setTopUpError(null);
+  }
+
+  function closeTopUp() {
+    setTopUpTarget(null);
+    setTopUpError(null);
+  }
+
+  async function handleTopUp() {
+    if (!topUpTarget) return;
+    const sats = Number(topUpAmount);
+    if (!Number.isFinite(sats) || sats <= 0) {
+      setTopUpError("Enter a whole number of sats greater than zero.");
+      return;
+    }
+    setTopUpSubmitting(true);
+    setTopUpError(null);
+    try {
+      const result = await api.topUpMeshPeer(topUpTarget.peer_id, Math.round(sats) * 1000);
+      setPeers((prev) =>
+        prev.map((p) =>
+          p.peer_id === result.peer_id
+            ? { ...p, credit_balance_millisats: result.credit_balance_millisats }
+            : p,
+        ),
+      );
+      closeTopUp();
+    } catch (e) {
+      setTopUpError(String(e));
+    } finally {
+      setTopUpSubmitting(false);
+    }
+  }
+
   function handleCopyInvite() {
     if (!self?.invite_url) return;
     navigator.clipboard.writeText(self.invite_url).then(() => {
@@ -137,10 +238,45 @@ export function Mesh() {
       {loading && <p className="muted-12">Loading mesh…</p>}
       {error && <p className="muted-12 text-error">{error}</p>}
 
+      {!loading && meshEnabledSetting !== null && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+          <Switch
+            isSelected={meshEnabledSetting}
+            isDisabled={meshToggling}
+            onChange={toggleMesh}
+          >
+            <Switch.Control><Switch.Thumb /></Switch.Control>
+          </Switch>
+          <span className="muted-12">Enable mesh</span>
+          {/* Turning mesh ON hot-builds the real transport synchronously
+              (#132 follow-up) — `toggleMesh` already re-fetched `self` by
+              the time this renders, so `meshToggling` is the only normal
+              window where the two can disagree. Still mismatched once that
+              settles only happens two ways, and they need different advice:
+              turning OFF never tears down an already-running transport (by
+              design — see the setting's own docs), so it staying live really
+              is "until you restart"; turning ON and staying dark means the
+              hot-build itself failed (no `mesh` feature in this build, or a
+              real startup error) — telling the user to restart would be
+              wrong, since restarting cannot fix either of those. */}
+          {!meshToggling && self && meshEnabledSetting !== self.mesh_enabled && (
+            <span className="muted-12 text-error">
+              {meshEnabledSetting
+                ? "Mesh couldn't start — check the server logs (this build may not include mesh support)."
+                : "Still connected to peers until you restart pond-server."}
+            </span>
+          )}
+        </div>
+      )}
+
       {!loading && self && !self.mesh_enabled && (
         <div className="empty-state">
           <Share2 size={32} />
-          <span>Mesh is disabled. Enable it in Settings to invite trusted peers.</span>
+          <span>
+            {meshEnabledSetting
+              ? "Mesh is enabled but couldn't start — check the server logs."
+              : "Mesh is disabled. Flip the switch above to invite trusted peers."}
+          </span>
         </div>
       )}
 
@@ -208,9 +344,27 @@ export function Mesh() {
                 <span className="device-card__chip">
                   {p.trust_scope === "self_owned" ? "own device" : "circle"}
                 </span>
+                {capabilities[p.peer_id]?.inference_available && (
+                  <span className="device-card__chip" title="Offers compute to borrow">
+                    <Cpu size={11} /> inference
+                  </span>
+                )}
+                {capabilities[p.peer_id]?.lightning_available && (
+                  <span className="device-card__chip" title="Can settle over Lightning">
+                    <Zap size={11} /> lightning
+                  </span>
+                )}
               </div>
 
               <div className="device-card__actions">
+                <button
+                  className="device-card__action-btn"
+                  onClick={() => openTopUp(p)}
+                  disabled={busyId === p.peer_id}
+                  type="button"
+                >
+                  <Coins size={12} /> Top up
+                </button>
                 <button
                   className="device-card__action-btn"
                   onClick={() => handleRemove(p)}
@@ -222,6 +376,50 @@ export function Mesh() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {settlementStatus && (
+        <div style={{ marginTop: 24 }}>
+          <Separator />
+          <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "16px 0 8px" }}>
+            <h3 style={{ fontSize: 13, fontWeight: 600, margin: 0 }}>Settlement</h3>
+            <span
+              className={`device-card__chip device-card__chip--${settlementStatus.configured ? "online" : "offline"}`}
+              title="The exchange rate is set via the settings API, not this UI"
+            >
+              {settlementStatus.configured
+                ? `${settlementStatus.millisats_per_token} msat/token`
+                : "not configured"}
+            </span>
+          </div>
+
+          {!settlementStatus.configured && (
+            <p className="muted-12">
+              No exchange rate is set yet, so usage accumulates but nothing gets paid
+              automatically.
+            </p>
+          )}
+          {settlementStatus.configured && settlementStatus.peers.length === 0 && (
+            <p className="muted-12">No pending usage with any trusted peer right now.</p>
+          )}
+          {settlementStatus.peers.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {settlementStatus.peers.map((p) => (
+                <div
+                  key={p.peer_id}
+                  style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}
+                >
+                  <span>{truncatePeerId(p.peer_id)}</span>
+                  <span className="muted-12">
+                    {p.pending_tokens.toLocaleString()} tokens
+                    {settlementStatus.configured &&
+                      ` · ${formatMillisats(p.pending_millisats)} owed`}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -274,6 +472,55 @@ export function Mesh() {
                 onPress={handleAddPeer}
               >
                 {submitting ? "Adding…" : "Add peer"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {topUpTarget && (
+        <div className="sched-modal__overlay" onClick={closeTopUp}>
+          <div className="sched-modal__dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="sched-modal__header">
+              <h2 className="sched-modal__title">Top up {truncatePeerId(topUpTarget.peer_id)}</h2>
+              <button className="sched-modal__close" onClick={closeTopUp} aria-label="Close">
+                <X size={16} />
+              </button>
+            </div>
+            <Separator />
+
+            <div className="sched-modal__body">
+              <p className="muted-12" style={{ marginBottom: 12 }}>
+                Manual top-up — a stand-in until Lightning settlement is wired in.
+                Current balance: {formatMillisats(topUpTarget.credit_balance_millisats)}.
+              </p>
+              <div className="sched-modal__field">
+                <label className="sched-modal__label">Amount (sats)</label>
+                <input
+                  className="sched-modal__input"
+                  type="number"
+                  min={1}
+                  placeholder="1000"
+                  value={topUpAmount}
+                  onChange={(e) => setTopUpAmount(e.target.value)}
+                  autoFocus
+                />
+              </div>
+
+              {topUpError && <p className="text-error text-error--sm">{topUpError}</p>}
+            </div>
+
+            <Separator />
+
+            <div className="sched-modal__footer">
+              <Button size="sm" variant="ghost" onPress={closeTopUp}>Cancel</Button>
+              <Button
+                size="sm"
+                variant="primary"
+                isDisabled={topUpSubmitting || !topUpAmount.trim()}
+                onPress={handleTopUp}
+              >
+                {topUpSubmitting ? "Adding…" : "Top up"}
               </Button>
             </div>
           </div>

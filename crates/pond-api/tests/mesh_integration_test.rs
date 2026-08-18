@@ -9,15 +9,22 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use pond_api::{build_router, AppState};
+use pond_core::mesh::domain::capabilities::PeerCapabilities;
 use pond_core::mesh::domain::millisats::Millisats;
 use pond_core::mesh::domain::peer_id::PeerId;
+use pond_core::mesh::domain::token_count::TokenCount;
+use pond_core::mesh::mocks::mock_peer_capability_query::MockPeerCapabilityQuery;
 use pond_core::mesh::ports::credit_ledger::CreditLedger;
+use pond_core::mesh::ports::peer_capability_query::PeerCapabilityQuery;
+use pond_core::mesh::ports::usage_tally::UsageTally;
+use pond_core::models::ports::provider::LlmProvider;
 use pond_core::shared::mocks::mock_agent::MockAgent;
 use pond_core::user_data::mocks::mock_device_registry::MockDeviceRegistry;
 use pond_core::user_data::mocks::mock_memory::MockMemoryRepository;
 use pond_core::user_data::mocks::mock_profile::MockProfileRepository;
 use pond_core::user_data::mocks::mock_sensor::{MockCameraStorage, MockSensorStorage};
 use pond_core::user_data::mocks::mock_settings::MockSettingsRepository;
+use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_infra::db::Database;
 use pond_infra::mock_handshake::MockHandshake;
 use pond_infra::onboarding::SqlxOnboardingRepository;
@@ -28,6 +35,19 @@ use pond_infra::sqlite_usage_tally::SqliteUsageTally;
 use tower::ServiceExt;
 
 async fn make_app() -> (axum::Router, Arc<SqliteCreditLedger>, tempfile::TempDir) {
+    make_app_with_mesh_provider(None).await
+}
+
+async fn make_app_with_mesh_provider(
+    mesh_provider: Option<Arc<dyn LlmProvider>>,
+) -> (axum::Router, Arc<SqliteCreditLedger>, tempfile::TempDir) {
+    make_app_with_mesh_provider_and_capabilities(mesh_provider, None).await
+}
+
+async fn make_app_with_mesh_provider_and_capabilities(
+    mesh_provider: Option<Arc<dyn LlmProvider>>,
+    peer_capability_query: Option<Arc<dyn PeerCapabilityQuery>>,
+) -> (axum::Router, Arc<SqliteCreditLedger>, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let db = Database::init(tmp.path()).await.unwrap();
     let pool = db.system.clone();
@@ -46,7 +66,12 @@ async fn make_app() -> (axum::Router, Arc<SqliteCreditLedger>, tempfile::TempDir
         session_storage: Arc::new(SqliteSessionStorage::new(pool.clone())),
         http_client: reqwest::Client::new(),
         agent: Arc::new(MockAgent::new()),
-        llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        // In a real server, chat_provider="mesh" being selected means
+        // build_provider/build_one resolved mesh_provider and wrote the
+        // *same* provider into llm_provider — mirror that here rather than
+        // leaving llm_provider empty, since GET /api/v1/test reads
+        // llm_provider directly, never mesh_provider itself.
+        llm_provider: Arc::new(tokio::sync::RwLock::new(mesh_provider.clone())),
         llamafile_url: "http://127.0.0.1:8080".into(),
         tts: None,
         tts_control: None,
@@ -114,12 +139,131 @@ async fn make_app() -> (axum::Router, Arc<SqliteCreditLedger>, tempfile::TempDir
         peer_directory: Arc::new(SqlitePeerDirectory::new(pool.clone())),
         credit_ledger: credit_ledger.clone(),
         usage_tally: Arc::new(SqliteUsageTally::new(pool.clone())),
-        mesh_transport: None,
+        mesh_transport: Arc::new(tokio::sync::RwLock::new(None)),
+        mesh_provider: Arc::new(tokio::sync::RwLock::new(mesh_provider)),
+        payment_rail: None,
+        peer_capability_query: Arc::new(tokio::sync::RwLock::new(peer_capability_query)),
+        mesh_rebuild: None,
     });
 
     (
         build_router(state, std::path::PathBuf::from("web/dist")),
         credit_ledger,
+        tmp,
+    )
+}
+
+/// For `/mesh/settlement` tests — needs a real `usage_tally` (to seed
+/// pending usage) and a real `settings_repo` (to set the exchange rate),
+/// neither of which the other helpers above hand back.
+async fn make_app_with_settlement_deps() -> (
+    axum::Router,
+    Arc<SqliteUsageTally>,
+    Arc<MockSettingsRepository>,
+    Arc<SqlitePeerDirectory>,
+    tempfile::TempDir,
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = Database::init(tmp.path()).await.unwrap();
+    let pool = db.system.clone();
+
+    let credit_ledger = Arc::new(SqliteCreditLedger::new(pool.clone()));
+    let usage_tally = Arc::new(SqliteUsageTally::new(pool.clone()));
+    let settings_repo = Arc::new(MockSettingsRepository::new());
+    let peer_directory = Arc::new(SqlitePeerDirectory::new(pool.clone()));
+
+    let mock_hs = MockHandshake::new();
+    mock_hs.add_valid_token("test-token".to_string()).await;
+
+    let state = Arc::new(AppState {
+        db: Arc::new(db),
+        onboarding_repo: Arc::new(SqlxOnboardingRepository::new(pool.clone())),
+        handshake: Arc::new(mock_hs),
+        whisper_url: "http://127.0.0.1:9000".into(),
+        transcribe_audio: None,
+        session_storage: Arc::new(SqliteSessionStorage::new(pool.clone())),
+        http_client: reqwest::Client::new(),
+        agent: Arc::new(MockAgent::new()),
+        llm_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        llamafile_url: "http://127.0.0.1:8080".into(),
+        tts: None,
+        tts_control: None,
+        settings_repo: settings_repo.clone(),
+        profile_repo: Arc::new(MockProfileRepository::new()),
+        device_registry: Arc::new(MockDeviceRegistry),
+        memory_repo: Arc::new(MockMemoryRepository::new()),
+        embedding_provider: None,
+        vector_index: None,
+        index_reindex: None,
+        sensor_storage: Arc::new(MockSensorStorage::new()),
+        camera_storage: Arc::new(MockCameraStorage::new()),
+        face_recognition: None,
+        prompt_template_dir: None,
+        model_repo: None,
+        data_dir: Some(tmp.path().to_path_buf()),
+        skip_onboarding: true,
+        scheduler: None,
+        model_scheduler: None,
+        mcp_memory: None,
+        extension_manager: None,
+        mcp_server_repo: None,
+        tool_registry: None,
+        marketplace: None,
+        secret_repo: None,
+        download_tracker: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        piper_http_port: None,
+        model_catalog_provider: None,
+        model_storage_dir: None,
+        prompt_template_repo: None,
+        prompt_extra_repo: None,
+        skill_repo: None,
+        recipe_repo: None,
+        llamafile_manager: None,
+        operational_log: None,
+        matter: None,
+        oauth_outcomes: pond_api::oauth_callback::new_oauth_outcomes(),
+        event_bus: None,
+        event_log: None,
+        push_token_repo: None,
+        notification_tx: tokio::sync::broadcast::channel(16).0,
+        notification_queue: None,
+        notification_sender: None,
+        sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        answer_reviewer: None,
+        memory_extractor: None,
+        memory_extraction_service: None,
+        last_user_activity: Arc::new(tokio::sync::RwLock::new(std::time::Instant::now())),
+        consolidation_cancel: Arc::new(tokio::sync::RwLock::new(None)),
+        consolidation_event_tx: tokio::sync::broadcast::channel(16).0,
+        consolidation_runner: None,
+        inference_pool: None,
+        schedule_result_tx: tokio::sync::broadcast::channel(1).0,
+        telemetry: None,
+        context_monitor: Arc::new(
+            pond_core::models::services::context_monitor::ContextMonitor::new(),
+        ),
+        mcp_app_resources: std::collections::HashMap::new(),
+        oauth_state: pond_api::oauth_callback::new_oauth_state(),
+        security_policy: None,
+        tool_dispatcher: None,
+        api_port: 4000,
+        weather_provider: None,
+        peer_directory: peer_directory.clone(),
+        credit_ledger,
+        usage_tally: usage_tally.clone(),
+        mesh_transport: Arc::new(tokio::sync::RwLock::new(None)),
+        mesh_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        payment_rail: None,
+        peer_capability_query: Arc::new(tokio::sync::RwLock::new(None)),
+        mesh_rebuild: None,
+    });
+
+    (
+        build_router(state, std::path::PathBuf::from("web/dist")),
+        usage_tally,
+        settings_repo,
+        peer_directory,
         tmp,
     )
 }
@@ -238,4 +382,287 @@ async fn add_peer_rejects_malformed_peer_id() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// ── mesh_provider wiring (#132 Milestone 3.5) ─────────────────────────────
+//
+// These don't re-test pond-adapters-mesh-inference's own mesh round-trip
+// (that crate has its own full test suite over real libp2p nodes). They
+// prove the app-level wiring: when chat_provider="mesh" resolves to a real
+// provider (mesh_provider set, and — mirroring what build_provider/build_one
+// actually do in a running server — the same provider also live in
+// llm_provider), GET /api/v1/test, the one real consumer of
+// AppState.llm_provider besides the active-roles display, genuinely
+// round-trips through it instead of silently reporting nothing.
+
+#[tokio::test]
+async fn test_endpoint_reports_ok_through_the_wired_mesh_provider() {
+    let mesh_provider: Arc<dyn LlmProvider> =
+        Arc::new(pond_core::models::mocks::mock_provider::MockProvider::new());
+    let (app, _ledger, _tmp) = make_app_with_mesh_provider(Some(mesh_provider)).await;
+
+    let (status, body) = json_request(&app, Method::GET, "/api/v1/test", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["llm"]["status"], "ok");
+    assert_eq!(body["llm"]["provider"], "mock-v1");
+    // test_services always sends ChatMessage::user("pong") — MockProvider's
+    // canned reply for that is deterministic, so this proves the request
+    // really went through the wired provider, not a stub.
+    assert_eq!(body["llm"]["response"], "Mock response to: pong");
+}
+
+#[tokio::test]
+async fn test_endpoint_reports_not_configured_when_mesh_provider_is_absent() {
+    let (app, _ledger, _tmp) = make_app().await;
+    let (status, body) = json_request(&app, Method::GET, "/api/v1/test", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["llm"]["status"], "not_configured");
+}
+
+// ── Credit top-up (#132) ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn crediting_a_trusted_peer_increases_the_balance_it_reports() {
+    let (app, _ledger, _tmp) = make_app().await;
+    let peer = PeerId::from([9u8; 32]);
+    json_request(
+        &app,
+        Method::POST,
+        "/api/v1/mesh/peers",
+        Some(serde_json::json!({
+            "peer_id": peer.to_string(),
+            "trust_scope": "circle",
+        })),
+    )
+    .await;
+
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/mesh/peers/{peer}/credit"),
+        Some(serde_json::json!({ "amount_millisats": 500 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["peer_id"], peer.to_string());
+    assert_eq!(body["credit_balance_millisats"], 500);
+
+    // A second top-up accumulates rather than overwriting.
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/mesh/peers/{peer}/credit"),
+        Some(serde_json::json!({ "amount_millisats": 250 })),
+    )
+    .await;
+    assert_eq!(body["credit_balance_millisats"], 750);
+
+    let (_, body) = json_request(&app, Method::GET, "/api/v1/mesh/peers", None).await;
+    assert_eq!(body["peers"][0]["credit_balance_millisats"], 750);
+}
+
+#[tokio::test]
+async fn crediting_an_untrusted_peer_is_rejected() {
+    let (app, _ledger, _tmp) = make_app().await;
+    let peer = PeerId::from([10u8; 32]);
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/mesh/peers/{peer}/credit"),
+        Some(serde_json::json!({ "amount_millisats": 500 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn crediting_zero_is_rejected() {
+    let (app, _ledger, _tmp) = make_app().await;
+    let peer = PeerId::from([11u8; 32]);
+    json_request(
+        &app,
+        Method::POST,
+        "/api/v1/mesh/peers",
+        Some(serde_json::json!({
+            "peer_id": peer.to_string(),
+            "trust_scope": "circle",
+        })),
+    )
+    .await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/mesh/peers/{peer}/credit"),
+        Some(serde_json::json!({ "amount_millisats": 0 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn capabilities_of_a_trusted_peer_are_returned() {
+    let query = Arc::new(MockPeerCapabilityQuery::new());
+    let peer = PeerId::from([12u8; 32]);
+    query
+        .set(
+            peer,
+            PeerCapabilities {
+                inference_available: true,
+                lightning_available: false,
+            },
+        )
+        .await;
+    let (app, _ledger, _tmp) = make_app_with_mesh_provider_and_capabilities(
+        None,
+        Some(query as Arc<dyn PeerCapabilityQuery>),
+    )
+    .await;
+
+    json_request(
+        &app,
+        Method::POST,
+        "/api/v1/mesh/peers",
+        Some(serde_json::json!({
+            "peer_id": peer.to_string(),
+            "trust_scope": "circle",
+        })),
+    )
+    .await;
+
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/mesh/peers/{peer}/capabilities"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["inference_available"], true);
+    assert_eq!(body["lightning_available"], false);
+}
+
+#[tokio::test]
+async fn capabilities_of_an_untrusted_peer_is_rejected() {
+    let query = Arc::new(MockPeerCapabilityQuery::new());
+    let (app, _ledger, _tmp) = make_app_with_mesh_provider_and_capabilities(
+        None,
+        Some(query as Arc<dyn PeerCapabilityQuery>),
+    )
+    .await;
+    let peer = PeerId::from([13u8; 32]);
+
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/mesh/peers/{peer}/capabilities"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn capabilities_route_is_unavailable_without_mesh_configured() {
+    let (app, _ledger, _tmp) = make_app().await;
+    let peer = PeerId::from([14u8; 32]);
+    json_request(
+        &app,
+        Method::POST,
+        "/api/v1/mesh/peers",
+        Some(serde_json::json!({
+            "peer_id": peer.to_string(),
+            "trust_scope": "circle",
+        })),
+    )
+    .await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/mesh/peers/{peer}/capabilities"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+// ── GET /api/v1/mesh/settlement ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn settlement_status_reports_unconfigured_by_default() {
+    let (app, _usage_tally, _settings_repo, _peer_directory, _tmp) =
+        make_app_with_settlement_deps().await;
+
+    let (status, body) = json_request(&app, Method::GET, "/api/v1/mesh/settlement", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["configured"], false);
+    assert_eq!(body["millisats_per_token"], 0);
+    assert_eq!(body["peers"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn settlement_status_reports_pending_usage_per_peer() {
+    let (app, usage_tally, _settings_repo, _peer_directory, _tmp) =
+        make_app_with_settlement_deps().await;
+    let peer = PeerId::from([9u8; 32]);
+
+    json_request(
+        &app,
+        Method::POST,
+        "/api/v1/mesh/peers",
+        Some(serde_json::json!({
+            "peer_id": peer.to_string(),
+            "trust_scope": "circle",
+        })),
+    )
+    .await;
+    usage_tally
+        .record_usage(peer, TokenCount::new(250))
+        .await
+        .unwrap();
+
+    let (status, body) = json_request(&app, Method::GET, "/api/v1/mesh/settlement", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["configured"], false, "rate still 0 by default");
+    let peers = body["peers"].as_array().unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0]["peer_id"], peer.to_string());
+    assert_eq!(peers[0]["pending_tokens"], 250);
+    // Rate is 0, so the millisats estimate is 0 too — not "unknown", just honest.
+    assert_eq!(peers[0]["pending_millisats"], 0);
+}
+
+#[tokio::test]
+async fn settlement_status_reflects_a_real_rate_once_set() {
+    let (app, usage_tally, settings_repo, _peer_directory, _tmp) =
+        make_app_with_settlement_deps().await;
+    let peer = PeerId::from([10u8; 32]);
+
+    json_request(
+        &app,
+        Method::POST,
+        "/api/v1/mesh/peers",
+        Some(serde_json::json!({
+            "peer_id": peer.to_string(),
+            "trust_scope": "circle",
+        })),
+    )
+    .await;
+    usage_tally
+        .record_usage(peer, TokenCount::new(100))
+        .await
+        .unwrap();
+
+    let mut settings = settings_repo.get().await.unwrap();
+    settings.mesh_settlement_millisats_per_token = 5;
+    settings_repo.update(&settings).await.unwrap();
+
+    let (status, body) = json_request(&app, Method::GET, "/api/v1/mesh/settlement", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["configured"], true);
+    assert_eq!(body["millisats_per_token"], 5);
+    let peers = body["peers"].as_array().unwrap();
+    assert_eq!(peers[0]["pending_tokens"], 100);
+    assert_eq!(peers[0]["pending_millisats"], 500); // 100 tokens * 5 msat/token
 }

@@ -183,6 +183,16 @@ export function Chat() {
   const lastThinkingOnRef                         = useRef<string>("auto");
   // Used only to personalise the greeting; blank is fine and handled there.
   const [userName, setUserName]                   = useState<string>("");
+  // The currently *configured* provider/model, read once alongside the other
+  // settings below — used as the model-selector's fallback label so a
+  // provider with no per-turn model_name history (mesh, right after being
+  // selected in Settings) still shows correctly instead of the old hardcoded
+  // "local model" guess. `meshEnabled` also gates whether "mesh" is injected
+  // into the quick-switcher below, same principle as the Settings catalogue's
+  // provider dropdown (#132): it isn't a downloadable model, so it can never
+  // appear via the `listModels()` scan on its own.
+  const [configuredProvider, setConfiguredProvider] = useState<string | null>(null);
+  const [meshEnabled, setMeshEnabled]               = useState(false);
 
   const bottomRef        = useRef<HTMLDivElement>(null);
   const textareaRef      = useRef<HTMLTextAreaElement>(null);
@@ -306,13 +316,27 @@ export function Chat() {
   }, []);
 
   const chatModels = useMemo(() => {
-    return availableModels.filter((m) => {
+    const real = availableModels.filter((m) => {
       if (m.downloaded === false) return false;
       const cat = (m.category ?? m.provider ?? "").toLowerCase();
       if (cat === "whisper" || cat.startsWith("tts")) return false;
       return true;
     });
-  }, [availableModels]);
+    // "mesh" (#132) has no catalog row — it borrows a trusted peer's compute,
+    // it isn't a file this Pond downloaded — so it can never appear via the
+    // scan above. Synthesised here, gated on mesh_enabled, same principle as
+    // the Settings catalogue's provider dropdown.
+    if (!meshEnabled) return real;
+    const meshEntry: ModelEntry = {
+      id: "mesh/mesh",
+      provider: "mesh",
+      name: "mesh",
+      display_name: "Mesh (trusted peer)",
+      is_active: configuredProvider === "mesh",
+      downloaded: true,
+    };
+    return [...real, meshEntry];
+  }, [availableModels, meshEnabled, configuredProvider]);
 
   const groupedModels = useMemo(() => {
     const map = new Map<string, ModelEntry[]>();
@@ -327,7 +351,16 @@ export function Chat() {
   const handleModelSwitch = useCallback(async (provider: string, name: string) => {
     setModelSwitching(true);
     try {
-      await api.activateModel(provider, name, "chat");
+      // "mesh" has no catalog row to activate — `POST /activate/{category}/…`
+      // only knows gguf/llamafile/ollama/whisper/tts_* categories and would
+      // 400 on "mesh". Setting chat_provider directly is the same mechanism
+      // the Settings catalogue's Provider dropdown uses (#132).
+      if (provider === "mesh") {
+        await api.updateSettings({ chat_provider: "mesh" });
+        setConfiguredProvider("mesh");
+      } else {
+        await api.activateModel(provider, name, "chat");
+      }
       dispatch({ type: "SET_LAST_RESPONSE_META", payload: { modelName: name, modelRole: "chat", completionTokens: 0 } });
     } catch (e) {
       console.warn("Model switch failed:", e);
@@ -366,6 +399,8 @@ export function Chat() {
       const mode = s.thinking_mode ?? "auto";
       setThinkingMode(mode);
       if (mode !== "off") lastThinkingOnRef.current = mode;
+      setConfiguredProvider(s.chat_provider ?? null);
+      setMeshEnabled(s.mesh_enabled ?? false);
     }).catch(() => {});
   }, [state.serverOnline]);
 
@@ -900,7 +935,13 @@ export function Chat() {
     el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
   }
 
-  const modelLabel = state.lastResponseMeta?.modelName ?? "local model";
+  // `lastResponseMeta` only exists once a turn in THIS session has actually
+  // completed, so a freshly opened chat — or one right after switching
+  // providers in Settings — fell back to a hardcoded "local model" guess
+  // regardless of what's actually configured. `configuredProvider` (fetched
+  // alongside the other settings above) is accurate from the start; still
+  // falls back to the old guess only if that fetch hasn't resolved yet.
+  const modelLabel = state.lastResponseMeta?.modelName ?? configuredProvider ?? "local model";
 
   return (
     // `null` means the session list has not answered yet. Showing the wall's

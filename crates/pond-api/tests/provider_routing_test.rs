@@ -289,7 +289,11 @@ async fn make_app_with_provider(
             pond_core::mesh::mocks::mock_credit_ledger::MockCreditLedger::new(),
         ),
         usage_tally: Arc::new(pond_core::mesh::mocks::mock_usage_tally::MockUsageTally::new()),
-        mesh_transport: None,
+        mesh_transport: Arc::new(tokio::sync::RwLock::new(None)),
+        mesh_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        payment_rail: None,
+        peer_capability_query: Arc::new(tokio::sync::RwLock::new(None)),
+        mesh_rebuild: None,
     });
     (
         build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
@@ -630,7 +634,11 @@ async fn no_provider_still_returns_agent_response_for_non_task_messages() {
             pond_core::mesh::mocks::mock_credit_ledger::MockCreditLedger::new(),
         ),
         usage_tally: Arc::new(pond_core::mesh::mocks::mock_usage_tally::MockUsageTally::new()),
-        mesh_transport: None,
+        mesh_transport: Arc::new(tokio::sync::RwLock::new(None)),
+        mesh_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        payment_rail: None,
+        peer_capability_query: Arc::new(tokio::sync::RwLock::new(None)),
+        mesh_rebuild: None,
     });
     let app = build_router(state, std::path::PathBuf::from("pond-desktop/dist"));
 
@@ -744,7 +752,11 @@ async fn task_message_uses_agent_with_tool_call_events_without_provider() {
             pond_core::mesh::mocks::mock_credit_ledger::MockCreditLedger::new(),
         ),
         usage_tally: Arc::new(pond_core::mesh::mocks::mock_usage_tally::MockUsageTally::new()),
-        mesh_transport: None,
+        mesh_transport: Arc::new(tokio::sync::RwLock::new(None)),
+        mesh_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        payment_rail: None,
+        peer_capability_query: Arc::new(tokio::sync::RwLock::new(None)),
+        mesh_rebuild: None,
     });
     let app = build_router(state, std::path::PathBuf::from("pond-desktop/dist"));
 

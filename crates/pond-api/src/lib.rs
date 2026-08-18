@@ -387,10 +387,61 @@ pub struct AppState {
     /// Private mesh (#132): metered token usage pending settlement per peer.
     pub usage_tally: Arc<dyn pond_core::mesh::ports::usage_tally::UsageTally + Send + Sync>,
     /// Private mesh (#132): real libp2p connectivity to trusted peers. `None`
-    /// unless both the `mesh` Cargo feature is compiled in and
-    /// `settings.mesh_enabled` is true — real networking, real cost, unlike
-    /// the three ports above.
-    pub mesh_transport: Option<Arc<dyn pond_core::mesh::ports::mesh_transport::MeshTransport>>,
+    /// inside the lock unless both the `mesh` Cargo feature is compiled in
+    /// and `settings.mesh_enabled` is true — real networking, real cost,
+    /// unlike the three ports above. Wrapped in a `RwLock` (not a fixed
+    /// `Option`) so `PUT /api/v1/settings` can hot-enable mesh via
+    /// `mesh_rebuild` below, without a restart — mirrors `llm_provider`'s
+    /// hot-swap discipline above.
+    pub mesh_transport:
+        Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::mesh::ports::mesh_transport::MeshTransport>>>>,
+    /// Private mesh (#132 Milestone 3.5): an `LlmProvider` that routes
+    /// completions to a trusted peer instead of a local model. `None` inside
+    /// the lock unless `mesh_transport` is also populated — same
+    /// feature/settings gating. Shares construction discipline with
+    /// `mesh_transport`: only ever built once per mesh-enable (constructing
+    /// more than one `MeshInferenceService` would spawn a second consumer of
+    /// `mesh_transport`'s single `recv()` queue), but now that "once" can
+    /// happen at runtime via `mesh_rebuild` instead of only at startup.
+    pub mesh_provider:
+        Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::models::ports::provider::LlmProvider>>>>,
+    /// Private mesh (#132 Milestone 5): Lightning settlement with trusted
+    /// peers via Breez/Spark. `None` unless both the `lightning` Cargo
+    /// feature is compiled in and `settings.lightning_enabled` is true —
+    /// same gating discipline as `mesh_transport`/`mesh_provider`.
+    /// `batch_settle` pays a peer's invoice, obtained beforehand via the
+    /// `InvoiceRequester` port over the mesh (#132 Milestone 5's
+    /// `InvoiceRequest`/`InvoiceResponse` wire messages). A periodic
+    /// settlement job (#132 Milestone 6, `pond-server`'s own
+    /// `spawn_settlement_job`) calls both together — it isn't wired into
+    /// `AppState`/any route, since nothing here needs to trigger it
+    /// on-demand yet (see `Settings.mesh_settlement_millisats_per_token`'s
+    /// own docs for why the job is a no-op until that rate is set).
+    pub payment_rail: Option<Arc<dyn pond_core::mesh::ports::payment_rail::PaymentRail>>,
+    /// Private mesh (#132 Milestone 5): live "what does this peer offer
+    /// right now" queries, so the UI can show what a trusted peer actually
+    /// provides instead of guessing from trust scope alone. `None` inside
+    /// the lock unless `mesh_transport` is also populated — same
+    /// singleton-construction gating as `mesh_provider` (both are handles
+    /// into the same `MeshInferenceService`).
+    pub peer_capability_query: Arc<
+        tokio::sync::RwLock<
+            Option<Arc<dyn pond_core::mesh::ports::peer_capability_query::PeerCapabilityQuery>>,
+        >,
+    >,
+    /// Private mesh (#132): (re)builds `mesh_transport`/`mesh_provider`/
+    /// `peer_capability_query` at runtime when `settings.mesh_enabled` flips
+    /// on after startup, so enabling mesh from the UI takes effect
+    /// immediately instead of requiring a restart. Set by `pond-server` at
+    /// startup — the concrete `Libp2pMeshTransport`/`MeshInferenceService`
+    /// types live behind the `mesh` Cargo feature, which this crate does not
+    /// depend on (`pond-api` only knows the `pond_core` port traits above).
+    /// `None` when the binary lacks the `mesh` feature entirely; calling it
+    /// otherwise is always safe — it no-ops when mesh is already built or
+    /// still disabled. Does not tear anything down on disable: mesh_enabled
+    /// has only ever gated construction here, never the behaviour of an
+    /// already-built stack, and this keeps that contract.
+    pub mesh_rebuild: Option<Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>>,
 }
 
 impl AppState {

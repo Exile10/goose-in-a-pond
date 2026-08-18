@@ -169,7 +169,11 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
             pond_core::mesh::mocks::mock_credit_ledger::MockCreditLedger::new(),
         ),
         usage_tally: Arc::new(pond_core::mesh::mocks::mock_usage_tally::MockUsageTally::new()),
-        mesh_transport: None,
+        mesh_transport: Arc::new(tokio::sync::RwLock::new(None)),
+        mesh_provider: Arc::new(tokio::sync::RwLock::new(None)),
+        payment_rail: None,
+        peer_capability_query: Arc::new(tokio::sync::RwLock::new(None)),
+        mesh_rebuild: None,
     });
     (
         build_router(state, std::path::PathBuf::from("pond-desktop/dist")),
@@ -443,9 +447,10 @@ async fn settings_response_never_carries_a_secret_shaped_key() {
         "apikey",
         "passphrase",
     ];
-    // A token BUDGET, not a bearer token. Mirrors NOT_ACTUALLY_SECRET in
-    // pond-core's guard; if the two ever disagree, one of them is wrong.
-    const NOT_ACTUALLY_SECRET: &[&str] = &["llm_max_tokens"];
+    // A token BUDGET / an exchange RATE, not a bearer token. Mirrors
+    // NOT_ACTUALLY_SECRET in pond-core's guard; if the two ever disagree,
+    // one of them is wrong.
+    const NOT_ACTUALLY_SECRET: &[&str] = &["llm_max_tokens", "mesh_settlement_millisats_per_token"];
 
     let leaked: Vec<&String> = obj
         .keys()

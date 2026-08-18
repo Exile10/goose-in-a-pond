@@ -38,3 +38,4 @@ tokio-util = "0.7"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+pond-adapters-mesh-inference = { workspace = true }

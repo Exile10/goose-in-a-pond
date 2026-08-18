@@ -1,3 +1,4 @@
+pub mod capabilities;
 pub mod hashes;
 pub mod millisats;
 pub mod peer_id;

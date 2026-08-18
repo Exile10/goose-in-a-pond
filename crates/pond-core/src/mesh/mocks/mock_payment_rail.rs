@@ -57,8 +57,11 @@ impl PaymentRail for MockPaymentRail {
         &self,
         peer: PeerId,
         amount: Millisats,
+        invoice: &str,
     ) -> Result<SettlementRecord, PaymentRailError> {
-        let invoice = self.issue_invoice(amount).await?;
+        if !self.issued.read().await.contains_key(invoice) {
+            return Err(PaymentRailError::InvalidInvoice(invoice.to_string()));
+        }
         Ok(SettlementRecord {
             peer_id: peer,
             amount,
@@ -104,9 +107,23 @@ mod tests {
     async fn batch_settle_returns_stored_preimage() {
         let rail = MockPaymentRail::new();
         let peer = PeerId::from([9u8; 32]);
-        let record = rail.batch_settle(peer, Millisats::new(500)).await.unwrap();
+        let invoice = rail.issue_invoice(Millisats::new(500)).await.unwrap();
+        let record = rail
+            .batch_settle(peer, Millisats::new(500), &invoice)
+            .await
+            .unwrap();
         assert_eq!(record.peer_id, peer);
         assert_eq!(record.amount, Millisats::new(500));
         assert!(!record.preimage.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_settle_of_unknown_invoice_errors() {
+        let rail = MockPaymentRail::new();
+        let peer = PeerId::from([9u8; 32]);
+        let result = rail
+            .batch_settle(peer, Millisats::new(500), "nonexistent")
+            .await;
+        assert!(matches!(result, Err(PaymentRailError::InvalidInvoice(_))));
     }
 }

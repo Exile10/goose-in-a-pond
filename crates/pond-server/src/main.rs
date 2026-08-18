@@ -823,6 +823,41 @@ async fn run_setup(model: &str) -> Result<()> {
         }
     }
 
+    // Private mesh (mesh feature only): pre-generate the identity keypair.
+    // No download involved — this is compiled-in libp2p, not a model — so it
+    // is not numbered alongside the download steps above. `build_mesh_transport`
+    // would otherwise generate this lazily the first time mesh_enabled flips
+    // on, which is fine on its own but means the very first enable (whether
+    // at startup or hot-reloaded via PUT /api/v1/settings — see
+    // AppState::mesh_rebuild) pays a one-time keypair-generation cost this
+    // step moves here instead, onto a run the operator expects to take a
+    // while anyway.
+    #[cfg(feature = "mesh")]
+    {
+        use pond_mesh_protocol::identity::MeshKeypair;
+        println!("\n  Setting up private mesh identity...");
+        match settings_repo_setup.get_key("mesh_identity_secret").await {
+            Ok(Some(_)) => println!("  ✅ Mesh identity already set up"),
+            _ => {
+                let keypair = MeshKeypair::generate();
+                let hex = hex_encode_32(&keypair.secret_bytes());
+                match settings_repo_setup
+                    .set_key("mesh_identity_secret", hex)
+                    .await
+                {
+                    Ok(()) => println!(
+                        "  ✅ Mesh identity ready — peer_id={}\n     Enable it later via Settings → Mesh once you have a trusted peer to pair with.",
+                        keypair.peer_id()
+                    ),
+                    Err(e) => println!(
+                        "  ⚠  Failed to persist mesh identity: {} — it will be generated on first enable instead",
+                        e
+                    ),
+                }
+            }
+        }
+    }
+
     println!();
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  ✅ Setup complete!  Next steps:");
@@ -1767,6 +1802,25 @@ async fn run_server(
         temperature: f32,
     ) -> Arc<dyn LlmProvider> {
         match provider {
+            // The mesh stack (mesh_transport/mesh_provider) doesn't exist
+            // yet at this point in startup — it's built later in
+            // `run_server`, and `AppState.mesh_provider`'s lock is what
+            // `PUT /settings` hot-reloads into once it does (see
+            // `AppState::mesh_rebuild`'s own docs). A Pond that restarts
+            // with `chat_provider` already persisted as "mesh" therefore
+            // seeds its INITIAL provider with `UnavailableProvider`, not the
+            // real mesh provider — same as `build_one`'s "mesh" arm falls
+            // back to when mesh isn't available yet, and for the same
+            // stated reason: silently using llamafile instead would leave a
+            // user who picked mesh with no way to tell their choice didn't
+            // take effect. It self-corrects the next time anything saves
+            // `chat_provider`/`chat_model` through `PUT /settings`, which
+            // re-derives this from the (by-then-live) mesh provider.
+            "mesh" => Arc::new(UnavailableProvider::new(
+                "mesh inference is not ready yet at startup — save any setting via \
+                 PUT /api/v1/settings to re-check, or wait for mesh to finish connecting",
+            )) as Arc<dyn LlmProvider>,
+
             "ollama" => Arc::new(
                 OllamaProvider::new(None, Some(model))
                     .with_max_tokens(max_tokens)
@@ -2548,6 +2602,120 @@ async fn run_server(
     let mesh_transport =
         build_mesh_transport(&settings, &settings_repo, peer_directory.clone()).await;
 
+    // Private mesh (#132 Milestone 5) — Lightning settlement rail. Built
+    // before build_mesh_provider so the mesh responder can answer inbound
+    // InvoiceRequests immediately once the transport is up, rather than
+    // racing a later wire-in.
+    let payment_rail = build_payment_rail(&settings, &settings_repo, &data_dir).await;
+
+    // Private mesh (#132 Milestones 3-6) — the LlmProvider a trusted peer can
+    // borrow, plus capability-query and invoice-request handles into the same
+    // MeshInferenceService singleton. All three are `None` when
+    // mesh_transport is `None` (mesh disabled or built without the `mesh`
+    // feature).
+    let (mesh_provider, peer_capability_query, invoice_requester) = build_mesh_provider(
+        &mesh_transport,
+        peer_directory.clone(),
+        credit_ledger.clone(),
+        usage_tally.clone(),
+        llm_provider.clone(),
+        payment_rail.clone(),
+    );
+    // Off by design until settings.mesh_settlement_millisats_per_token is
+    // set to something nonzero — see SettlementService's own docs on why
+    // it refuses to guess an exchange rate. Safe to always spawn: the loop
+    // just no-ops every tick until that setting is real. NOTE this closes
+    // over whatever `invoice_requester` was built above — if mesh gets
+    // hot-enabled later via `mesh_rebuild` below, this job does NOT pick up
+    // the fresh one. Settlement stays restart-only for now; only mesh
+    // borrowing/lending itself is made hot-reloadable here.
+    spawn_settlement_job(
+        peer_directory.clone(),
+        usage_tally.clone(),
+        payment_rail.clone(),
+        invoice_requester,
+        settings_repo.clone(),
+    );
+
+    // Wrapped in locks (not fixed values) so enabling mesh from
+    // PUT /api/v1/settings takes effect immediately instead of requiring a
+    // restart — see `mesh_rebuild` and AppState::mesh_rebuild's own docs.
+    // GooseAdapter's own mesh_provider field shares this exact lock (see
+    // `.with_mesh_provider` below), so a chat turn picks up a freshly-built
+    // provider the moment this fires, with no separate wiring needed.
+    let mesh_transport = Arc::new(tokio::sync::RwLock::new(mesh_transport));
+    let mesh_provider = Arc::new(tokio::sync::RwLock::new(mesh_provider));
+    let peer_capability_query = Arc::new(tokio::sync::RwLock::new(peer_capability_query));
+
+    // Runtime mesh enable, no restart: `update_settings` calls this after
+    // saving whenever the patch touches `mesh_enabled` and the new value is
+    // true. Re-reads settings itself and is always safe to call — it
+    // no-ops when the stack is already built (MeshInferenceService is a
+    // singleton; see its own docs on why a second one would break
+    // mesh_transport's single `recv()` consumer), when mesh is still
+    // disabled, or when this binary lacks the `mesh` feature.
+    //
+    // Deliberately does not tear anything down on disable: mesh_enabled has
+    // only ever gated construction here, never the behaviour of an
+    // already-built stack (same as build_mesh_transport/build_mesh_provider
+    // always worked), so this keeps that contract rather than inventing a
+    // new one.
+    let mesh_rebuild: Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync> = {
+        let settings_repo = settings_repo.clone();
+        let peer_directory = peer_directory.clone();
+        let credit_ledger = credit_ledger.clone();
+        let usage_tally = usage_tally.clone();
+        let llm_provider = llm_provider.clone();
+        let payment_rail = payment_rail.clone();
+        let mesh_transport = mesh_transport.clone();
+        let mesh_provider = mesh_provider.clone();
+        let peer_capability_query = peer_capability_query.clone();
+        Arc::new(move || {
+            let settings_repo = settings_repo.clone();
+            let peer_directory = peer_directory.clone();
+            let credit_ledger = credit_ledger.clone();
+            let usage_tally = usage_tally.clone();
+            let llm_provider = llm_provider.clone();
+            let payment_rail = payment_rail.clone();
+            let mesh_transport = mesh_transport.clone();
+            let mesh_provider = mesh_provider.clone();
+            let peer_capability_query = peer_capability_query.clone();
+            Box::pin(async move {
+                if mesh_transport.read().await.is_some() {
+                    return; // already built
+                }
+                let settings = match settings_repo.get().await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        tracing::warn!("mesh hot-enable: failed to read settings: {err}");
+                        return;
+                    }
+                };
+                let Some(new_transport) =
+                    build_mesh_transport(&settings, &settings_repo, peer_directory.clone()).await
+                else {
+                    return; // still disabled, or a problem build_mesh_transport already logged
+                };
+                let new_transport = Some(new_transport);
+                let (new_provider, new_capability_query, _invoice_requester) =
+                    build_mesh_provider(
+                        &new_transport,
+                        peer_directory,
+                        credit_ledger,
+                        usage_tally,
+                        llm_provider,
+                        payment_rail,
+                    );
+                *mesh_transport.write().await = new_transport;
+                *mesh_provider.write().await = new_provider;
+                *peer_capability_query.write().await = new_capability_query;
+                tracing::info!(
+                    "mesh enabled at runtime — transport/provider built, no restart needed"
+                );
+            }) as futures::future::BoxFuture<'static, ()>
+        })
+    };
+
     // Scheduler — persist task list next to the databases.
     // Uses a DeferredExecutor so the scheduler can be created before the agent
     // exists.  The real executor (AgentScheduleExecutor) is injected after the
@@ -2921,6 +3089,7 @@ async fn run_server(
             Some(session_storage.clone()),
             Some(model_repo.clone()),
             false, // voice_mode — server mode, not voice
+            mesh_provider.clone(),
         )
         .await
     };
@@ -3842,6 +4011,10 @@ async fn run_server(
         credit_ledger,
         usage_tally,
         mesh_transport,
+        mesh_provider: mesh_provider.clone(),
+        payment_rail: payment_rail.clone(),
+        peer_capability_query,
+        mesh_rebuild: Some(mesh_rebuild),
     });
 
     // Spawn OAuth token auto-refresh worker.
@@ -4574,6 +4747,7 @@ async fn run_chat(
             Some(trim_storage), // powers the trimmer's summary splice
             Some(chat_model_repo.clone()),
             input == "whisper", // voice_mode
+            Arc::new(tokio::sync::RwLock::new(None)), // mesh_provider — CLI chat doesn't build the mesh stack (server-only for now)
         )
         .await;
         a
@@ -7275,6 +7449,281 @@ fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Connects to Breez/Spark for mesh-peer Lightning settlement (#132
+/// Milestone 5), when `settings.lightning_enabled` and this binary was
+/// compiled with the `lightning` feature. Mirrors `build_mesh_transport`'s
+/// shape and generate-once-and-persist discipline: the wallet mnemonic is
+/// read from (or, the first time, generated and written to) the raw
+/// settings key-value store under `lightning_wallet_mnemonic` — same
+/// mechanism as `mesh_identity_secret`, not a new secret-storage path.
+#[cfg(feature = "lightning")]
+async fn build_payment_rail(
+    settings: &pond_core::user_data::domain::settings::Settings,
+    settings_repo: &Arc<
+        dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
+    >,
+    data_dir: &std::path::Path,
+) -> Option<Arc<dyn pond_core::mesh::ports::payment_rail::PaymentRail>> {
+    use pond_adapters_lightning::{LightningConfig, LightningPaymentRail};
+
+    if !settings.lightning_enabled {
+        tracing::info!("lightning disabled — enable via PUT /api/v1/settings (lightning_enabled)");
+        return None;
+    }
+
+    let storage_dir = data_dir.join("lightning").to_string_lossy().to_string();
+    let mut config = match LightningConfig::from_env(storage_dir) {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::warn!(
+                "settings.lightning_enabled is true but {err} — Lightning settlement not started"
+            );
+            return None;
+        }
+    };
+    if let Ok(Some(saved)) = settings_repo.get_key("lightning_wallet_mnemonic").await {
+        config.mnemonic = Some(saved);
+    }
+
+    match LightningPaymentRail::connect(config).await {
+        Ok((rail, generated_mnemonic)) => {
+            if let Some(mnemonic) = generated_mnemonic {
+                if let Err(err) = settings_repo
+                    .set_key("lightning_wallet_mnemonic", mnemonic)
+                    .await
+                {
+                    tracing::error!("failed to persist lightning wallet mnemonic: {err}");
+                }
+            }
+            tracing::info!("lightning enabled — connected to Breez/Spark");
+            Some(Arc::new(rail) as Arc<dyn pond_core::mesh::ports::payment_rail::PaymentRail>)
+        }
+        Err(err) => {
+            tracing::error!("failed to connect to Breez/Spark: {err}");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "lightning"))]
+async fn build_payment_rail(
+    settings: &pond_core::user_data::domain::settings::Settings,
+    _settings_repo: &Arc<
+        dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync,
+    >,
+    _data_dir: &std::path::Path,
+) -> Option<Arc<dyn pond_core::mesh::ports::payment_rail::PaymentRail>> {
+    if settings.lightning_enabled {
+        tracing::warn!(
+            "settings.lightning_enabled is true but this pond-server binary was built without \
+             the `lightning` feature — Lightning settlement not started"
+        );
+    }
+    None
+}
+
+/// Reads through `AppState.llm_provider`'s own hot-swap lock on every call,
+/// so the mesh responder (which needs a fixed `Arc<dyn LlmProvider>` at
+/// construction — see `pond_adapters_mesh_inference`) automatically serves
+/// with whatever provider is *currently* active on this Pond, not a stale
+/// snapshot from whenever the mesh service was built.
+#[cfg(feature = "mesh")]
+struct SharedLlmProvider(Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>);
+
+#[cfg(feature = "mesh")]
+#[async_trait::async_trait]
+impl LlmProvider for SharedLlmProvider {
+    async fn complete(
+        &self,
+        system_prompt: &str,
+        messages: Vec<pond_core::models::domain::message::ChatMessage>,
+    ) -> anyhow::Result<pond_core::models::domain::message::ChatMessage> {
+        match self.0.read().await.clone() {
+            Some(provider) => provider.complete(system_prompt, messages).await,
+            None => Err(anyhow::anyhow!("no local provider is configured yet")),
+        }
+    }
+
+    fn model_name(&self) -> String {
+        "mesh-backing-provider".to_string()
+    }
+}
+
+/// `complete()` always fails with a clear message — the fallback when
+/// `chat_provider = "mesh"` is selected but mesh isn't actually available
+/// (feature not compiled in, or `mesh_enabled` is off). Deliberately not a
+/// silent fallback to llamafile: a user who picked mesh and gets a llamafile
+/// answer instead has no way to tell their choice didn't take effect.
+struct UnavailableProvider {
+    message: String,
+}
+
+impl UnavailableProvider {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for UnavailableProvider {
+    async fn complete(
+        &self,
+        _system_prompt: &str,
+        _messages: Vec<pond_core::models::domain::message::ChatMessage>,
+    ) -> anyhow::Result<pond_core::models::domain::message::ChatMessage> {
+        Err(anyhow::anyhow!(self.message.clone()))
+    }
+
+    fn model_name(&self) -> String {
+        "mesh (unavailable)".to_string()
+    }
+}
+
+/// Builds the mesh `LlmProvider` (and its capability-query / invoice-request
+/// handles) exactly once at startup, only when `mesh_transport` is `Some` —
+/// constructing more than one `MeshInferenceService` would spawn a second
+/// consumer of the transport's single `recv()` queue (see the crate's own
+/// docs). `build_provider` / `build_one`'s `"mesh"` match arms hand back a
+/// cheap handle into this same singleton; they never construct a new one.
+/// All three return values are handles into the *same* service —
+/// `PeerCapabilityQuery` and `InvoiceRequester` are both implemented
+/// directly on `MeshInferenceService` alongside `LlmProvider` support via
+/// `.provider()`.
+#[cfg(feature = "mesh")]
+fn build_mesh_provider(
+    mesh_transport: &Option<Arc<dyn pond_core::mesh::ports::mesh_transport::MeshTransport>>,
+    peer_directory: Arc<dyn pond_core::mesh::ports::peer_directory::PeerDirectory + Send + Sync>,
+    credit_ledger: Arc<dyn pond_core::mesh::ports::credit_ledger::CreditLedger + Send + Sync>,
+    usage_tally: Arc<dyn pond_core::mesh::ports::usage_tally::UsageTally + Send + Sync>,
+    llm_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,
+    payment_rail: Option<Arc<dyn pond_core::mesh::ports::payment_rail::PaymentRail>>,
+) -> (
+    Option<Arc<dyn LlmProvider>>,
+    Option<Arc<dyn pond_core::mesh::ports::peer_capability_query::PeerCapabilityQuery>>,
+    Option<Arc<dyn pond_core::mesh::ports::invoice_requester::InvoiceRequester>>,
+) {
+    let Some(transport) = mesh_transport.clone() else {
+        return (None, None, None);
+    };
+    let backing_provider: Arc<dyn LlmProvider> = Arc::new(SharedLlmProvider(llm_provider));
+    let service = pond_adapters_mesh_inference::MeshInferenceService::spawn(
+        transport,
+        peer_directory,
+        credit_ledger,
+        usage_tally,
+        backing_provider,
+        std::time::Duration::from_secs(30),
+        payment_rail,
+    );
+    (
+        Some(Arc::new(service.provider()) as Arc<dyn LlmProvider>),
+        Some(service.clone()
+            as Arc<dyn pond_core::mesh::ports::peer_capability_query::PeerCapabilityQuery>),
+        Some(service as Arc<dyn pond_core::mesh::ports::invoice_requester::InvoiceRequester>),
+    )
+}
+
+#[cfg(not(feature = "mesh"))]
+fn build_mesh_provider(
+    mesh_transport: &Option<Arc<dyn pond_core::mesh::ports::mesh_transport::MeshTransport>>,
+    _peer_directory: Arc<dyn pond_core::mesh::ports::peer_directory::PeerDirectory + Send + Sync>,
+    _credit_ledger: Arc<dyn pond_core::mesh::ports::credit_ledger::CreditLedger + Send + Sync>,
+    _usage_tally: Arc<dyn pond_core::mesh::ports::usage_tally::UsageTally + Send + Sync>,
+    _llm_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,
+    _payment_rail: Option<Arc<dyn pond_core::mesh::ports::payment_rail::PaymentRail>>,
+) -> (
+    Option<Arc<dyn LlmProvider>>,
+    Option<Arc<dyn pond_core::mesh::ports::peer_capability_query::PeerCapabilityQuery>>,
+    Option<Arc<dyn pond_core::mesh::ports::invoice_requester::InvoiceRequester>>,
+) {
+    debug_assert!(
+        mesh_transport.is_none(),
+        "mesh_transport should only ever be Some when built with --features mesh"
+    );
+    (None, None, None)
+}
+
+/// Spawns the periodic Lightning settlement job (#132 Milestone 6): once per
+/// interval, pays down each trusted peer's pending usage tally via
+/// `SettlementService`. Always spawned — no `#[cfg(feature = "mesh")]` split
+/// needed, since it only touches `pond-core` port traits, always compiled —
+/// safe to, because the loop checks `payment_rail`/`invoice_requester`/the
+/// exchange-rate setting on every tick and simply does nothing until all
+/// three are real. Re-reads the rate from `settings_repo` each tick rather
+/// than freezing it at startup, so setting a real rate takes effect on the
+/// next tick, not a restart.
+fn spawn_settlement_job(
+    peer_directory: Arc<dyn pond_core::mesh::ports::peer_directory::PeerDirectory + Send + Sync>,
+    usage_tally: Arc<dyn pond_core::mesh::ports::usage_tally::UsageTally + Send + Sync>,
+    payment_rail: Option<Arc<dyn pond_core::mesh::ports::payment_rail::PaymentRail>>,
+    invoice_requester: Option<Arc<dyn pond_core::mesh::ports::invoice_requester::InvoiceRequester>>,
+    settings_repo: Arc<dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync>,
+) {
+    const SETTLEMENT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(SETTLEMENT_INTERVAL);
+        loop {
+            interval.tick().await;
+
+            let (Some(payment_rail), Some(invoice_requester)) =
+                (payment_rail.clone(), invoice_requester.clone())
+            else {
+                continue; // mesh/lightning not enabled on this Pond — nothing to settle
+            };
+            let rate = match settings_repo.get().await {
+                Ok(settings) => settings.mesh_settlement_millisats_per_token,
+                Err(err) => {
+                    tracing::warn!("settlement: failed to read settings: {err}");
+                    continue;
+                }
+            };
+            if rate == 0 {
+                // Not configured yet — see mesh_settlement_millisats_per_token's
+                // own doc comment on why this is a deliberate no-op.
+                continue;
+            }
+
+            let service = pond_core::mesh::services::settlement::SettlementService::new(
+                peer_directory.clone(),
+                usage_tally.clone(),
+                payment_rail,
+                invoice_requester,
+            );
+            match service.run_once(rate).await {
+                Ok(outcomes) => {
+                    for outcome in outcomes {
+                        match outcome {
+                            pond_core::mesh::services::settlement::SettlementOutcome::Settled {
+                                peer,
+                                amount,
+                                ..
+                            } => {
+                                tracing::info!("settlement: paid {peer} {amount}");
+                            }
+                            pond_core::mesh::services::settlement::SettlementOutcome::Failed {
+                                peer,
+                                error,
+                            } => {
+                                tracing::warn!("settlement: failed for {peer}: {error}");
+                            }
+                            pond_core::mesh::services::settlement::SettlementOutcome::NothingPending {
+                                ..
+                            } => {}
+                        }
+                    }
+                }
+                Err(err) => tracing::warn!("settlement: pass failed to start: {err}"),
+            }
+        }
+    });
+    tracing::info!(
+        "settlement worker started — runs every 15 minutes \
+         (no-op until mesh_settlement_millisats_per_token is set)"
+    );
+}
+
 // ── Goose agent backend ───────────────────────────────────────────────────────
 
 /// Build a Goose-backed agent + extension manager.
@@ -7317,6 +7766,11 @@ async fn build_goose_backend(
     // because without it an Ollama model's window is guessed from its name.
     model_repo: Option<Arc<dyn ModelRepository>>,
     voice_mode: bool,
+    // Wrapped in a lock (not a fixed value) so `PUT /api/v1/settings`
+    // enabling mesh at runtime is visible on the very next chat turn — see
+    // AppState::mesh_rebuild's own docs. CLI callers with no mesh stack pass
+    // a lock that is permanently `None` (equivalent to the old `None` here).
+    mesh_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,
 ) -> (
     Arc<dyn Agent>,
     Option<Arc<dyn pond_core::mcp::ports::extension_manager::ExtensionManagerPort>>,
@@ -7497,6 +7951,14 @@ async fn build_goose_backend(
                 Some(repo) => adapter.with_model_repo(repo),
                 None => adapter,
             };
+            // Private mesh (#132): lets chat_provider="mesh" route through a
+            // trusted peer's compute. GooseAdapter reads this lock live on
+            // every turn, so it stays empty until the mesh transport is
+            // actually running — the "mesh" arm then warns and keeps
+            // whatever provider was already active rather than failing the
+            // turn — and starts serving the moment mesh_rebuild fills it,
+            // with no adapter rebuild required.
+            let adapter = adapter.with_mesh_provider(mesh_provider);
             if voice_mode {
                 adapter.set_voice_mode(true);
             }
@@ -8266,6 +8728,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 None, // session_storage — not needed for goose backend
                 Some(cli_model_repo.clone()),
                 false,
+                Arc::new(tokio::sync::RwLock::new(None)), // mesh_provider — CLI paths don't build the mesh stack (server-only for now)
             )
             .await;
 
@@ -8308,6 +8771,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 None, // session_storage — not needed for goose backend
                 Some(cli_model_repo.clone()),
                 false,
+                Arc::new(tokio::sync::RwLock::new(None)), // mesh_provider — CLI paths don't build the mesh stack (server-only for now)
             )
             .await;
 
@@ -8376,6 +8840,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 None, // session_storage — not needed for goose backend
                 Some(cli_model_repo.clone()),
                 false,
+                Arc::new(tokio::sync::RwLock::new(None)), // mesh_provider — CLI paths don't build the mesh stack (server-only for now)
             )
             .await;
 
