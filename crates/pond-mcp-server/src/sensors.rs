@@ -55,6 +55,101 @@ pub struct ListSensorsParams {
     pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+/// What an enum-valued reading means, for the readings that are grades rather than
+/// quantities.
+///
+/// A reading is stored as a number, because that is what a rule threshold compares
+/// and what the table holds. But "air quality: 2 level" tells a reader nothing the
+/// device did not already know how to say — its own screen shows "Fair" for that
+/// value. The number stays, and the word goes beside it.
+///
+/// This is Matter's vocabulary, and the controller holds the same table in
+/// `matter-server/src/mapping/sensors.ts` for the surfaces it renders. Two copies
+/// is the price of readings being stored as bare numbers: the alternative is a
+/// column to carry the word, which would freeze it at write time and go stale
+/// whenever the wording improved. Both copies are Matter's own names, so neither
+/// is free to drift on its own.
+fn worded_reading(sensor_type: &str, value: f64) -> Option<&'static str> {
+    // Only exact whole numbers name a grade; 1.5 is not a level.
+    if value.fract() != 0.0 {
+        return None;
+    }
+    let code = value as i64;
+
+    match sensor_type {
+        "air_quality" => match code {
+            0 => Some("Unknown"),
+            1 => Some("Good"),
+            2 => Some("Fair"),
+            3 => Some("Moderate"),
+            4 => Some("Poor"),
+            5 => Some("Very poor"),
+            6 => Some("Extremely poor"),
+            _ => None,
+        },
+        "hepa_filter_change" | "carbon_filter_change" => match code {
+            0 => Some("OK"),
+            1 => Some("Warning"),
+            2 => Some("Critical"),
+            _ => None,
+        },
+        "smoke_alarm" => match code {
+            0 => Some("Normal"),
+            1 => Some("Warning"),
+            2 => Some("Critical"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A reading as a person reads it: the number, and the word where there is one.
+fn render_reading(sensor_type: &str, value: f64, unit: &str) -> String {
+    match worded_reading(sensor_type, value) {
+        Some(word) => format!("{word} ({value} {unit})"),
+        None => format!("{value} {unit}"),
+    }
+}
+
+#[cfg(test)]
+mod reading_words {
+    use super::*;
+
+    /// The purifier's own screen shows "Fair" where GIAP reported "2 level" -- the
+    /// same fact with the meaning removed, from the tool a model reaches for first.
+    #[test]
+    fn a_grade_is_read_as_a_grade() {
+        assert_eq!(
+            render_reading("air_quality", 2.0, "level"),
+            "Fair (2 level)"
+        );
+        assert_eq!(
+            render_reading("hepa_filter_change", 2.0, "state"),
+            "Critical (2 state)"
+        );
+        assert_eq!(
+            render_reading("smoke_alarm", 0.0, "state"),
+            "Normal (0 state)"
+        );
+    }
+
+    /// The number stays beside the word: a rule threshold compares it, and a reader
+    /// checking one against the other should not have to translate back.
+    #[test]
+    fn a_quantity_is_left_alone() {
+        assert_eq!(render_reading("temperature", 21.5, "C"), "21.5 C");
+        assert_eq!(render_reading("carbon_monoxide", 433.0, "ppm"), "433 ppm");
+    }
+
+    /// A value with no word must keep its number rather than borrow a neighbour's.
+    #[test]
+    fn an_unknown_grade_keeps_its_number() {
+        assert_eq!(render_reading("air_quality", 9.0, "level"), "9 level");
+        // Not a whole number, so not a grade at all.
+        assert_eq!(render_reading("air_quality", 1.5, "level"), "1.5 level");
+    }
+}
+
 // ── MCP server ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -161,11 +256,10 @@ impl SensorsMcpServer {
             .await
         {
             Ok(Some(r)) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Latest {} reading from '{}': {} {} (recorded at {})",
+                "Latest {} reading from '{}': {} (recorded at {})",
                 r.sensor_type,
                 r.device_id,
-                r.value,
-                r.unit,
+                render_reading(&r.sensor_type, r.value, &r.unit),
                 r.recorded_at.format("%Y-%m-%d %H:%M:%S UTC"),
             ))])),
             Ok(None) => Ok(CallToolResult::success(vec![Content::text(
@@ -292,10 +386,9 @@ impl SensorsMcpServer {
                     .take(50)
                     .map(|r| {
                         format!(
-                            "  {} — {} {}",
+                            "  {} — {}",
                             r.recorded_at.format("%Y-%m-%d %H:%M"),
-                            r.value,
-                            r.unit
+                            render_reading(&r.sensor_type, r.value, &r.unit)
                         )
                     })
                     .collect();

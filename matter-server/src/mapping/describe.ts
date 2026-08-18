@@ -26,7 +26,7 @@ import {
   CLUSTER_WINDOW_COVERING,
   nodeToDevice,
 } from "./devices.js";
-import { SENSORS } from "./sensors.js";
+import { declaredUnitOf, SENSORS } from "./sensors.js";
 import { applianceSetpoint, reachableRange, targetSetpoint } from "./thermostat.js";
 import { operationsOf, settingsOf } from "./settings.js";
 import { endpointWith, type NodeSnapshot } from "./snapshot.js";
@@ -47,18 +47,6 @@ const FAN_MODE_SEQUENCES: ReadonlyMap<number, string[]> = new Map([
 
 /** Every mode GIAP can send, for a fan that does not narrow it down. */
 const ALL_FAN_MODES = ["off", "low", "medium", "high", "on", "auto", "smart"];
-
-/** Matter's `MeasurementUnitEnum`, however matter.js hands it over. */
-const MEASUREMENT_UNITS: ReadonlyMap<number, string> = new Map([
-  [0, "ppm"],
-  [1, "ppb"],
-  [2, "ppt"],
-  [3, "mg/m3"],
-  [4, "ug/m3"],
-  [5, "ng/m3"],
-  [6, "/m3"],
-  [7, "Bq/m3"],
-]);
 
 function attribute(node: NodeSnapshot, cluster: string, name: string): unknown {
   return endpointWith(node, cluster)?.clusters[cluster]?.[name];
@@ -168,20 +156,6 @@ function conditionFor(
 }
 
 /** The unit a concentration cluster declares, if it declares one. */
-function declaredUnit(node: NodeSnapshot, cluster: string): string | undefined {
-  const raw = attribute(node, cluster, "measurementUnit");
-
-  const numeric = asNumber(raw);
-  if (numeric !== undefined) return MEASUREMENT_UNITS.get(numeric);
-
-  if (typeof raw === "string") {
-    const match = [...MEASUREMENT_UNITS.values()].find(
-      unit => unit.replace("/", "").toLowerCase() === raw.replace("/", "").toLowerCase(),
-    );
-    return match;
-  }
-  return undefined;
-}
 
 function capabilitiesOf(node: NodeSnapshot): Capability[] {
   const capabilities: Capability[] = [];
@@ -243,7 +217,10 @@ function sensorsOf(node: NodeSnapshot): SensorSpec[] {
     seen.add(mapping.sensorType);
     sensors.push({
       sensor_type: mapping.sensorType,
-      unit: declaredUnit(node, mapping.cluster) ?? mapping.unit,
+      // What the device says it measures in, falling back to the substance's
+      // conventional unit only where it says nothing.
+      unit:
+        declaredUnitOf(attribute(node, mapping.cluster, "measurementUnit")) ?? mapping.unit,
     });
   }
 

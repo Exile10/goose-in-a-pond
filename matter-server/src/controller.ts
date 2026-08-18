@@ -206,7 +206,15 @@ export class Controller {
       for (const endpoint of snapshot.endpoints) {
         for (const [cluster, attributes] of Object.entries(endpoint.clusters)) {
           for (const [attribute, value] of Object.entries(attributes)) {
-            const reading = readingFor(snapshot.nodeId, cluster, attribute, value);
+            // The cluster's own declared unit travels with its value.
+            const reading = readingFor(
+              snapshot.nodeId,
+              cluster,
+              attribute,
+              value,
+              new Date(),
+              attributes["measurementUnit"],
+            );
             if (reading !== undefined) out.push(reading);
           }
         }
@@ -587,7 +595,19 @@ export class Controller {
           const nodeId = peerNodeId(peer);
           if (nodeId === undefined) return;
 
-          const reading = readingFor(nodeId, cluster, attribute, value);
+          // Read from the live cluster rather than carried in the event: the
+          // change is one attribute, and the unit is a different one on the same
+          // cluster.
+          let declaredUnit: unknown;
+          try {
+            declaredUnit = (endpoint.stateOf(cluster) as Record<string, unknown>)[
+              "measurementUnit"
+            ];
+          } catch {
+            declaredUnit = undefined;
+          }
+
+          const reading = readingFor(nodeId, cluster, attribute, value, new Date(), declaredUnit);
           if (reading !== undefined) {
             this.#events.reading(reading);
             return;

@@ -41,6 +41,38 @@ export interface SensorMapping {
   words?: Record<number, string>;
 }
 
+/**
+ * Matter's `MeasurementUnitEnum`, however matter.js hands it over.
+ *
+ * A concentration cluster states the unit its number is in, and substances do not
+ * share one: this device reports ozone in ppm where the conventional default is
+ * ppb, and pm1 in ppm where the default is ug/m3. Reading only the default gave a
+ * number that was right beside a unit that was not.
+ */
+const MEASUREMENT_UNITS: ReadonlyMap<number, string> = new Map([
+  [0, "ppm"],
+  [1, "ppb"],
+  [2, "ppt"],
+  [3, "mg/m3"],
+  [4, "ug/m3"],
+  [5, "ng/m3"],
+  [6, "/m3"],
+  [7, "Bq/m3"],
+]);
+
+/** The unit a device declared, from its raw `measurementUnit`, if it declared one. */
+export function declaredUnitOf(raw: unknown): string | undefined {
+  if (typeof raw === "number" && Number.isFinite(raw)) return MEASUREMENT_UNITS.get(raw);
+
+  // matter.js may decode the enum to its name.
+  if (typeof raw === "string") {
+    return [...MEASUREMENT_UNITS.values()].find(
+      unit => unit.replace("/", "").toLowerCase() === raw.replace("/", "").toLowerCase(),
+    );
+  }
+  return undefined;
+}
+
 // ── Value readers ────────────────────────────────────────────────────────────
 
 const asNumber: Read = v => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
@@ -174,6 +206,10 @@ export function readingFor(
   attribute: string,
   value: unknown,
   at: Date = new Date(),
+  // What the cluster says its numbers are in. `describe` has always read this;
+  // readings did not, so the same substance was described in one unit and reported
+  // in another -- ozone declared ppm and reported ppb, from one device, at once.
+  declaredUnit?: unknown,
 ): Reading | undefined {
   const mapping = BY_PATH.get(`${cluster}.${attribute}`);
   if (mapping === undefined) return undefined;
@@ -185,7 +221,7 @@ export function readingFor(
     device_id: deviceIdForNode(nodeId),
     sensor_type: mapping.sensorType,
     value: reading,
-    unit: mapping.unit,
+    unit: declaredUnitOf(declaredUnit) ?? mapping.unit,
     at: at.toISOString(),
   };
 }
