@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   assertAccepted,
+  changeObservables,
   isSnapshotCluster,
   refusalOrFault,
   settleTo,
@@ -369,5 +370,28 @@ describe("appliance settings", () => {
   it("does not offer a system mode on a device that has no thermostat", () => {
     const bulb = node(94, [named("Lamp"), endpoint(1, { onOff: { onOff: true } })]);
     expect(settingsOf(bulb).find(s => s.name === "system mode")).toBeUndefined();
+  });
+});
+
+describe("wiring attribute changes", () => {
+  it("finds the level that holds the change observables", () => {
+    // matter.js hands these back nested: the outer object's single key is `events`.
+    // Iterating the outer level found one key not ending in `$Changed` and wired
+    // nothing, for every cluster, with no error -- so readings only ever refreshed
+    // when the bridge re-subscribed, and a thermostat measuring 47.33 answered 100.
+    const nested = {
+      events: { localTemperature$Changed: {}, systemMode$Changed: {}, systemMode$Changing: {} },
+    };
+    expect(Object.keys(changeObservables(nested))).toContain("localTemperature$Changed");
+
+    // A flat shape is taken as it comes: the nesting is matter.js's business and
+    // may change back.
+    const flat = { measuredValue$Changed: {} };
+    expect(changeObservables(flat)).toBe(flat);
+
+    // Neither level has any: returned unchanged, so the caller wires nothing rather
+    // than reaching into something it does not understand.
+    const barren = { events: { somethingElse: {} } };
+    expect(changeObservables(barren)).toBe(barren);
   });
 });

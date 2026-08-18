@@ -95,7 +95,9 @@ export class Controller {
   #node: ServerNode;
   #events: ControllerEvents;
   /** Peers already wired for events, so a re-sync does not double-subscribe. */
-  #observed = new Set<string>();
+  #observed = new Map<string, Set<string>>();
+  /** The last value published per device and sensor, so a sweep only says what changed. */
+  #lastRead = new Map<string, number>();
 
   private constructor(node: ServerNode, events: ControllerEvents) {
     this.#node = node;
@@ -143,6 +145,13 @@ export class Controller {
 
     const controller = new Controller(node, events);
     controller.#watchPeers();
+
+    // Five seconds: fast enough that a person changing something on the device and
+    // then asking about it gets the new value, slow enough to be a handful of
+    // comparisons over an idle house.
+    const sweep = setInterval(() => guard("sweep_readings", () => controller.#sweepReadings()), 5_000);
+    sweep.unref?.();
+
     return controller;
   }
 
@@ -204,6 +213,34 @@ export class Controller {
       }
     }
     return out;
+  }
+
+
+  /**
+   * Re-read every sensor value periodically and publish what changed.
+   *
+   * The event path is the one that should carry these, and on this fabric it wires
+   * nothing: at the moment a peer is walked, a cluster's events object holds a
+   * single key and no observables, and retrying as the node settles still attaches
+   * none. Rather than leave freshness resting on a mechanism that cannot be shown
+   * to work, readings are also swept from the snapshots — which are demonstrably
+   * live, since `state` and `describe` read them and have been right throughout.
+   *
+   * Without this a reading only ever refreshed when the bridge re-subscribed: a
+   * thermostat measuring 47.33 answered 100, the value from the last reconnect,
+   * and it would have kept answering 100 for as long as the process stayed up.
+   *
+   * Only changes are published, so a quiet house costs one comparison per value.
+   * Should the event path start working, this sweep finds nothing left to say and
+   * becomes a cheap backstop rather than a second source of truth.
+   */
+  #sweepReadings(): void {
+    for (const reading of this.readings()) {
+      const key = `${reading.device_id}/${reading.sensor_type}`;
+      if (this.#lastRead.get(key) === reading.value) continue;
+      this.#lastRead.set(key, reading.value);
+      this.#events.reading(reading);
+    }
   }
 
   /** How many devices are advertising themselves for commissioning right now. */
@@ -458,31 +495,83 @@ export class Controller {
    * downstream reads as a sensor that fires twice per change.
    */
   #observe(peer: ClientNode): void {
-    if (this.#observed.has(peer.id)) return;
-    this.#observed.add(peer.id);
+    if (!this.#observed.has(peer.id)) {
+      this.#observed.set(peer.id, new Set());
 
-    peer.lifecycle.online.on(() =>
-      guard("peer_online", () => this.#announceAvailability(peer, true)),
-    );
-    peer.lifecycle.offline.on(() =>
-      guard("peer_offline", () => this.#announceAvailability(peer, false)),
-    );
+      peer.lifecycle.online.on(() =>
+        guard("peer_online", () => {
+          this.#announceAvailability(peer, true);
+          // A node that has just come online has only now finished populating its
+          // behaviors, which is the whole reason wiring is attempted more than once.
+          this.#wireChanges(peer);
+        }),
+      );
+      peer.lifecycle.offline.on(() =>
+        guard("peer_offline", () => this.#announceAvailability(peer, false)),
+      );
+    }
+
+    this.#wireChanges(peer);
+    this.#retryWiring(peer);
+  }
+
+  /**
+   * Try again shortly, because "ready" is not an event we can rely on.
+   *
+   * `lifecycle.online` only helps a node that was offline when we started watching;
+   * one already online when the controller connects never fires it again, and that
+   * is the ordinary case on a restart. Measured on the Matter Virtual Device: at the
+   * first attempt a cluster offers one key and no observables, and forty-five a
+   * second or so later.
+   *
+   * A short schedule rather than a poll: each attempt only walks clusters not yet
+   * wired, so once everything is attached the remaining passes cost a set lookup
+   * each and stop mattering. Unreferenced so a controller with nothing else to do
+   * can still exit.
+   */
+  #retryWiring(peer: ClientNode): void {
+    for (const delay of [1_000, 3_000, 10_000, 30_000]) {
+      const timer = setTimeout(
+        () => guard("wire_retry", () => this.#wireChanges(peer)),
+        delay,
+      );
+      timer.unref?.();
+    }
+  }
+
+  /**
+   * Attach change handlers to every cluster worth watching, for whatever is ready.
+   *
+   * Called again whenever a peer comes online, because the first attempt runs while
+   * the node is still assembling itself: at that moment a cluster's events object
+   * holds one key and no observables, and the same cluster offers forty-five a
+   * second later. The old code wired once, found nothing, raised nothing, and left
+   * every device in the house without live updates — visible only as readings that
+   * refreshed on reconnect and at no other time.
+   *
+   * A cluster is recorded as done only once it has actually yielded a handler, so an
+   * attempt that was too early is retried rather than remembered as finished. The
+   * record is what keeps a second attempt from doubling every reading.
+   */
+  #wireChanges(peer: ClientNode): void {
+    const wired = this.#observed.get(peer.id);
+    if (wired === undefined) return;
 
     for (const endpoint of peer.endpoints) {
       for (const cluster of Object.keys(endpoint.behaviors.supported)) {
         if (!isSnapshotCluster(cluster)) continue;
-        this.#observeCluster(peer, endpoint, cluster);
+        const key = `${endpoint.number}/${cluster}`;
+        if (wired.has(key)) continue;
+        if (this.#observeCluster(peer, endpoint, cluster) > 0) wired.add(key);
       }
     }
   }
 
-  #observeCluster(peer: ClientNode, endpoint: Endpoint, cluster: string): void {
-    let observables: Record<string, unknown>;
-    try {
-      observables = endpoint.eventsOf(cluster) as Record<string, unknown>;
-    } catch {
-      return; // the cluster is not present after all; nothing to watch
-    }
+  #observeCluster(peer: ClientNode, endpoint: Endpoint, cluster: string): number {
+    const observables = clusterEvents(endpoint, cluster);
+    if (observables === undefined) return 0; // nothing to watch
+
+    let attached = 0;
 
     for (const [name, observable] of Object.entries(observables)) {
       // matter.js names attribute-change observables `<attribute>$Changed`.
@@ -492,6 +581,7 @@ export class Controller {
       const on = (observable as { on?: unknown }).on;
       if (typeof on !== "function") continue;
 
+      attached += 1;
       (on as (handler: (value: unknown) => void) => void).call(observable, value =>
         guard("attribute_changed", () => {
           const nodeId = peerNodeId(peer);
@@ -512,6 +602,7 @@ export class Controller {
         }),
       );
     }
+    return attached;
   }
 
   #announceAvailability(peer: ClientNode, online: boolean): void {
@@ -712,6 +803,57 @@ function wordValueSpec(spec: ValueSpec): string | undefined {
     case "boolean":
     case "color":
       return undefined;
+  }
+}
+
+/**
+ * The live change observables for a cluster on a peer.
+ *
+ * `endpoint.events` is keyed by cluster and holds the real Observables — objects
+ * with an `on` to subscribe through. `eventsOf(cluster)` looks like the same thing
+ * and is not: it hands back a wrapper whose single key is `events`, and even after
+ * reaching inside, every one of its 45 `$Changed` keys reads back `undefined`. It
+ * enumerates names without carrying the objects.
+ *
+ * So the old wiring failed twice over: it iterated the outer level, where no key
+ * ends in `$Changed`, and had it looked one level deeper it would have found
+ * nothing subscribable anyway. Nothing was ever wired, for any cluster, with no
+ * error raised — the `typeof on !== "function"` check quietly skipped all of them.
+ *
+ * The cost was invisible because snapshots read state directly: `state` and
+ * `describe` were always current, while stored readings only refreshed when the
+ * bridge re-subscribed. A thermostat measuring 47.33 reported 100, the value from
+ * the last reconnect, and every sensor carried the same staleness with nothing
+ * looking broken.
+ */
+export function changeObservables(source: Record<string, unknown>): Record<string, unknown> {
+  const holdsChanges = (record: Record<string, unknown>) =>
+    Object.keys(record).some(name => name.endsWith("$Changed"));
+
+  if (holdsChanges(source)) return source;
+
+  const nested = source["events"];
+  if (typeof nested === "object" && nested !== null) {
+    const inner = nested as Record<string, unknown>;
+    if (holdsChanges(inner)) return inner;
+  }
+  return source;
+}
+
+/** A cluster's observables, from the accessor that carries live ones. */
+function clusterEvents(endpoint: Endpoint, cluster: string): Record<string, unknown> | undefined {
+  const events = (endpoint as unknown as { events?: Record<string, unknown> }).events;
+  const live = events?.[cluster];
+  if (typeof live === "object" && live !== null) {
+    return live as Record<string, unknown>;
+  }
+
+  // Fall back rather than assume: a matter.js that moves these again should wire
+  // nothing rather than wire the wrong thing.
+  try {
+    return changeObservables(endpoint.eventsOf(cluster) as Record<string, unknown>);
+  } catch {
+    return undefined;
   }
 }
 
