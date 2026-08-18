@@ -2105,6 +2105,8 @@ async fn run_server(
                         saw_activity_since_start,
                         idle_for,
                         idle_threshold,
+                        // Never exempt: a pond nobody has talked to has nothing to consolidate.
+                        false,
                     )
                     .await
                 else {
@@ -2386,6 +2388,8 @@ async fn run_server(
                         saw_activity_since_start,
                         idle_for,
                         idle_threshold,
+                        // Never exempt: no turn since boot means no conversation to name.
+                        false,
                     )
                     .await
                 else {
@@ -2695,7 +2699,7 @@ async fn run_server(
         let started_at_utc = chrono::Utc::now();
 
         tokio::spawn(async move {
-            use pond_core::context::index_maintenance::{run_index_maintenance, IndexBudget};
+            use pond_core::context::index_maintenance::{plan_sweep, run_index_maintenance};
             // Same alias the other three schedule blocks in this file use. The
             // sweep reads the shared inactivity threshold so it waits on the
             // same definition of "idle" as consolidation, rather than a second
@@ -2704,6 +2708,8 @@ async fn run_server(
 
             let poll = std::time::Duration::from_secs(INDEX_MAINTENANCE_POLL_SECS);
             let chore_idle = std::time::Duration::from_secs(sched::INACTIVITY_THRESHOLD_SECS);
+            // Whether a pass has COMPLETED since this process started.
+            let mut indexed_since_boot = false;
 
             tokio::select! {
                 _ = cancel.cancelled() => return,
@@ -2748,6 +2754,9 @@ async fn run_server(
                     (poll, chore_idle)
                 };
 
+                let first_post_boot = !indexed_since_boot;
+                let tick = plan_sweep(asked, indexed_since_boot);
+
                 let Some(_slot) = sweep_lane
                     .acquire(
                         LaneJob::IndexMaintenance,
@@ -2759,38 +2768,73 @@ async fn run_server(
                         true,
                         floor,
                         // A person asking is itself the activity this guard
-                        // wants to have seen, and on a pond that has served no
-                        // turn since boot it would otherwise refuse forever.
-                        saw_activity_since_start || asked,
+                        // wants to have seen; so is the first pass after boot,
+                        // on a pond that would otherwise refuse forever. See
+                        // `plan_sweep` for why the index needs that exemption
+                        // when the other chores do not.
+                        saw_activity_since_start,
                         idle_for,
                         idle_threshold,
+                        // Per-job, so relaxing the gate for the index does not
+                        // hand the tick to a chore that is still gated.
+                        tick.exempt_from_activity_gate,
                     )
                     .await
                 else {
                     continue;
                 };
 
+                // An exempt pass is exhaustive, so it must be interruptible --
+                // the alternative is a pond that boots, finds a mailbox to
+                // embed, and cannot be told to stop. A CHILD token so that
+                // giving the machine back does not also cancel the sweep task
+                // for the life of the process.
+                let pass = cancel.child_token();
+                let watcher = tokio::spawn({
+                    let pass = pass.clone();
+                    let activity = sweep_activity.clone();
+                    async move {
+                        // Only the in-process timestamp: it is written the
+                        // moment a turn starts, whereas the database one lags
+                        // by however long that turn takes to persist. This is
+                        // the signal that says "somebody is here NOW".
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            if activity.read().await.elapsed() < chore_idle {
+                                pass.cancel();
+                                return;
+                            }
+                        }
+                    }
+                });
+
                 let report = run_index_maintenance(
                     &index,
                     storage.as_ref(),
                     provider.as_ref(),
-                    &cancel,
-                    // Somebody watching an empty panel gets the whole
-                    // corpus; the 15-minute poll takes a bite.
-                    if asked {
-                        IndexBudget::UntilDone
-                    } else {
-                        IndexBudget::OneBatch
-                    },
+                    &pass,
+                    tick.budget,
                 )
                 .await;
-                if asked {
+                watcher.abort();
+
+                // The exemption is spent only by a pass that finished. One cut
+                // short by a member coming back has not indexed the backlog,
+                // and treating it as done would leave the pond in exactly the
+                // state the exemption exists to prevent.
+                if !pass.is_cancelled() {
+                    indexed_since_boot = true;
+                }
+
+                if asked || first_post_boot {
                     tracing::info!(
+                        requested = asked,
+                        interrupted = pass.is_cancelled(),
                         adopted = report.adopted,
                         summaries = report.summaries_indexed,
                         context = report.context_indexed,
                         still_missing = report.still_missing,
-                        "requested personal-context reindex finished"
+                        "personal-context index pass finished"
                     );
                 }
             }

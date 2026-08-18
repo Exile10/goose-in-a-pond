@@ -77,6 +77,47 @@ pub enum IndexBudget {
     UntilDone,
 }
 
+/// What one tick of the sweep is allowed to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SweepTick {
+    /// Whether this tick may run on a pond that has served no turn since boot.
+    ///
+    /// Handed to the lane as THIS job's exemption, which the lane ORs with the
+    /// household-wide activity flag. It is deliberately not that flag: one job
+    /// relaxing a lane-wide value qualifies every other job registered with it.
+    pub exempt_from_activity_gate: bool,
+    /// How much of the backlog this tick may work through.
+    pub budget: IndexBudget,
+}
+
+/// Decide whether a sweep tick may run, and how much it may do.
+///
+/// The lane refuses every background job until somebody has used the pond since
+/// boot. For most chores that is right -- there is nothing to consolidate on a
+/// pond nobody has talked to. For the index it deadlocks: mail arrives from a
+/// connector rather than a conversation, so a pond that is synced and browsed
+/// but never CHATTED with accumulates unindexed items forever, and the only
+/// thing that ever indexes them is somebody pressing Reindex.
+///
+/// So the first pass after boot is exempt, and it is exhaustive: an exemption
+/// that indexed 64 of 986 items and then went back to being gated would leave
+/// the same pond unsearchable, just less obviously.
+///
+/// Every later scheduled pass is gated again, and takes one bite. This is not
+/// a way around the gate; it is one pass, once per boot, on a pond that would
+/// otherwise never index at all.
+pub fn plan_sweep(asked: bool, indexed_since_boot: bool) -> SweepTick {
+    let first_post_boot = !indexed_since_boot;
+    SweepTick {
+        exempt_from_activity_gate: asked || first_post_boot,
+        budget: if asked || first_post_boot {
+            IndexBudget::UntilDone
+        } else {
+            IndexBudget::OneBatch
+        },
+    }
+}
+
 /// How many items one batch embeds. Also the step size of an exhaustive pass,
 /// which stays batched so cancellation is honoured promptly.
 const CONTEXT_BATCH: usize = 64;
@@ -472,6 +513,57 @@ mod tests {
         )
         .await;
         assert_eq!(report.context_indexed, CONTEXT_BATCH);
+    }
+
+    /// The deadlock this exemption exists for: mail arrives from a connector,
+    /// not a conversation, so a pond that is synced and browsed but never
+    /// chatted with never satisfies the lane's activity gate.
+    #[test]
+    fn an_idle_pond_indexes_itself_once_after_boot() {
+        let tick = plan_sweep(false, false);
+        assert!(
+            tick.exempt_from_activity_gate,
+            "a pond nobody has chatted with would never index at all"
+        );
+        assert_eq!(
+            tick.budget,
+            IndexBudget::UntilDone,
+            "an exemption that indexed one batch would leave the pond unsearchable anyway"
+        );
+    }
+
+    /// Once, not every tick. After the first pass the gate applies again.
+    #[test]
+    fn a_later_scheduled_pass_is_gated_again_and_takes_one_bite() {
+        let tick = plan_sweep(false, true);
+        assert!(
+            !tick.exempt_from_activity_gate,
+            "the exemption is per boot, not per tick"
+        );
+        assert_eq!(tick.budget, IndexBudget::OneBatch);
+    }
+
+    #[test]
+    fn a_busy_pond_still_takes_one_bite_per_scheduled_pass() {
+        // A used pond satisfies the lane's own gate; the sweep needs no
+        // exemption and must not claim one.
+        let tick = plan_sweep(false, true);
+        assert!(!tick.exempt_from_activity_gate);
+        assert_eq!(
+            tick.budget,
+            IndexBudget::OneBatch,
+            "background work must not queue a household's turn behind the mailbox"
+        );
+    }
+
+    /// Somebody watching an empty panel gets the whole corpus, always.
+    #[test]
+    fn a_requested_pass_is_always_exhaustive() {
+        for indexed in [false, true] {
+            let tick = plan_sweep(true, indexed);
+            assert!(tick.exempt_from_activity_gate);
+            assert_eq!(tick.budget, IndexBudget::UntilDone);
+        }
     }
 
     /// A member's turn must be able to take the CPU back mid-pass.
