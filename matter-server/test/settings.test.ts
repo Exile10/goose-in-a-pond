@@ -6,6 +6,7 @@ import {
   isSnapshotCluster,
   refusalOrFault,
   settleTo,
+  wordValueSpec,
 } from "../src/controller.js";
 import { planControl } from "../src/mapping/control.js";
 import { describeNode } from "../src/mapping/describe.js";
@@ -325,6 +326,28 @@ describe("appliance settings", () => {
     const fault = refusalOrFault("matter-1", new Error("socket hang up"));
     expect(fault.code).toBe("device_unreachable");
     expect(fault.message).toBe("socket hang up");
+  });
+
+  it("tells a refusal everything the description already knew", () => {
+    // The gap: describe said "49 to 82 C in steps of 1" while the refusal said
+    // "49 to 82 C" -- true of a request for 50.5, and no use, because it does not
+    // say what was wrong with it. A refusal knowing less than the description is
+    // how a caller guesses twice.
+    expect(
+      wordValueSpec({ kind: "number", unit: "C", min: 49, max: 82, step: 1 }),
+    ).toBe("49 to 82 C, in steps of 1");
+
+    // A condition travels too: a thermostat's range is a different range a mode
+    // later, so quoting one without it is wrong as soon as it is repeated.
+    expect(
+      wordValueSpec({ kind: "number", unit: "C", min: 7, max: 23.5, when: "while heating" }),
+    ).toBe("7 to 23.5 C (while heating)");
+
+    // An increment with no ends is still worth saying on its own.
+    expect(wordValueSpec({ kind: "number", unit: "C", step: 5 })).toBe("values in steps of 5 C");
+
+    // And a device that stated nothing has nothing quoted at it.
+    expect(wordValueSpec({ kind: "number" })).toBeUndefined();
   });
 
   it("says what the device will take, on the refusal itself", () => {

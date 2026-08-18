@@ -784,7 +784,7 @@ function readSettingName(value: unknown): string | undefined {
   return typeof setting === "string" ? setting : undefined;
 }
 
-function wordValueSpec(spec: ValueSpec): string | undefined {
+export function wordValueSpec(spec: ValueSpec): string | undefined {
   switch (spec.kind) {
     case "enum":
       return spec.values.join(", ");
@@ -792,12 +792,37 @@ function wordValueSpec(spec: ValueSpec): string | undefined {
       return "0 to 100 percent";
     case "number": {
       const unit = spec.unit === undefined ? "" : ` ${spec.unit}`;
-      if (spec.min !== undefined && spec.max !== undefined) {
-        return `${spec.min} to ${spec.max}${unit}`;
-      }
-      if (spec.max !== undefined) return `up to ${spec.max}${unit}`;
-      if (spec.min !== undefined) return `from ${spec.min}${unit}`;
-      return undefined;
+
+      const range =
+        spec.min !== undefined && spec.max !== undefined
+          ? `${spec.min} to ${spec.max}${unit}`
+          : spec.max !== undefined
+            ? `up to ${spec.max}${unit}`
+            : spec.min !== undefined
+              ? `from ${spec.min}${unit}`
+              : undefined;
+
+      // The step is as much a part of what will be accepted as the ends are. A
+      // refusal that names only the range answers "49 to 82 C" to a request for
+      // 50.5 -- true, and no use at all, because it does not say what was wrong
+      // with 50.5. The description already carries this; the refusal knowing less
+      // than the description is how a caller ends up guessing twice.
+      const step = spec.step === undefined ? undefined : `in steps of ${spec.step}`;
+      const accepted =
+        range === undefined
+          ? // No ends stated: the increment is still worth saying on its own.
+            spec.step === undefined
+            ? undefined
+            : `values in steps of ${spec.step}${unit}`
+          : step === undefined
+            ? range
+            : `${range}, ${step}`;
+
+      // And what it is true of, where that moves: a thermostat refusing 24 accepts
+      // a different range a mode later, so a refusal quoting one without its
+      // condition is wrong as soon as it is repeated.
+      if (accepted === undefined) return undefined;
+      return spec.when === undefined ? accepted : `${accepted} (${spec.when})`;
     }
     // Nothing a refusal could usefully narrow.
     case "boolean":
