@@ -224,6 +224,18 @@ impl SettingsRepository for SqliteSettingsRepository {
                 "false"
             }
         );
+        upsert!(
+            "lightning_enabled",
+            if settings.lightning_enabled {
+                "true"
+            } else {
+                "false"
+            }
+        );
+        upsert!(
+            "mesh_settlement_millisats_per_token",
+            settings.mesh_settlement_millisats_per_token.to_string()
+        );
         // Privacy / sensor access
         upsert!(
             "mic_enabled",
@@ -904,6 +916,12 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         }
         // Private mesh (#132)
         "mesh_enabled" => s.mesh_enabled = value == "true",
+        "lightning_enabled" => s.lightning_enabled = value == "true",
+        "mesh_settlement_millisats_per_token" => {
+            if let Ok(v) = value.parse() {
+                s.mesh_settlement_millisats_per_token = v;
+            }
+        }
         // Privacy / sensor access
         "mic_enabled" => s.mic_enabled = value == "true",
         "cameras_enabled" => s.cameras_enabled = value == "true",
@@ -1716,5 +1734,23 @@ mod tests {
 
         let got = repo.get().await.unwrap();
         assert!(got.mesh_enabled);
+    }
+
+    #[tokio::test]
+    async fn mesh_settlement_millisats_per_token_roundtrips() {
+        let repo = fresh_repo().await;
+
+        let s0 = repo.get().await.unwrap();
+        assert_eq!(
+            s0.mesh_settlement_millisats_per_token, 0,
+            "0 by default — settlement stays off until a real rate is set"
+        );
+
+        let mut s = s0;
+        s.mesh_settlement_millisats_per_token = 42;
+        repo.update(&s).await.unwrap();
+
+        let got = repo.get().await.unwrap();
+        assert_eq!(got.mesh_settlement_millisats_per_token, 42);
     }
 }

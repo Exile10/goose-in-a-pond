@@ -10,6 +10,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use libp2p::core::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId};
+use libp2p::swarm::dial_opts::DialOpts;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{gossipsub, identify, kad, noise, relay, tcp, yamux, Multiaddr, Swarm};
 use tokio::sync::{mpsc, oneshot};
@@ -223,7 +224,29 @@ impl EventLoop {
                     .behaviour_mut()
                     .kad
                     .add_address(&libp2p_peer, addr.clone());
-                match self.swarm.dial(addr.with(Protocol::P2p(libp2p_peer))) {
+                // TEMPORARY (#132 follow-up): the bare-Multiaddr dial below
+                // defaults to `PortUse::Reuse` — libp2p dials from the same
+                // local port this node listens on, which is what DCUtR wants
+                // for hole-punching. Two peers on the SAME machine (both on
+                // 127.0.0.1, as in local dev/testing) collide on that: the
+                // port is already bound in LISTEN state by this very
+                // process, so the dial fails with EADDRINUSE and the peer
+                // never shows connected. Two real Ponds on separate
+                // machines/IPs don't hit this — each dials a genuinely
+                // different address than its own listener.
+                //
+                // `.allocate_new_port()` forces a fresh ephemeral port per
+                // dial instead, trading away that hole-punch optimisation to
+                // unblock same-machine testing. Revisit once there's a real
+                // NAT-traversal scenario to tune against — restoring the
+                // commented-out call below is the whole revert.
+                //
+                // match self.swarm.dial(addr.with(Protocol::P2p(libp2p_peer))) {
+                let opts = DialOpts::peer_id(libp2p_peer)
+                    .addresses(vec![addr.clone()])
+                    .allocate_new_port()
+                    .build();
+                match self.swarm.dial(opts) {
                     Ok(()) => {
                         self.pending_connect.insert(libp2p_peer, (peer, reply));
                     }

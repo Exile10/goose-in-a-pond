@@ -425,6 +425,26 @@ export interface MeshSelf {
   invite_url?: string;
 }
 
+/** Live, on-demand — not part of MeshPeer since it's queried over the mesh, not cached. */
+export interface MeshPeerCapabilities {
+  peer_id: string;
+  inference_available: boolean;
+  lightning_available: boolean;
+}
+
+/** Read-only status for the periodic settlement job. No write counterpart —
+ * the exchange rate (millisats_per_token) is a settings-API-only knob until
+ * that rate is actually decided, deliberately not editable from this UI. */
+export interface MeshSettlementStatus {
+  configured: boolean;
+  millisats_per_token: number;
+  peers: Array<{
+    peer_id: string;
+    pending_tokens: number;
+    pending_millisats: number;
+  }>;
+}
+
 // ── Schedules ─────────────────────────────────────────────────
 export interface Schedule {
   id: string;

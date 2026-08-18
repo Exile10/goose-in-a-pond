@@ -27,6 +27,8 @@ import {
   type MatterStatus,
   type MemoryFragment,
   type MeshPeer,
+  type MeshPeerCapabilities,
+  type MeshSettlementStatus,
   type MeshSelf,
   type ModelActiveRoles,
   type ModelEntry,
@@ -450,8 +452,31 @@ export class PondApiClient {
     return this.del(`/api/v1/mesh/peers/${encodeURIComponent(peerId)}`);
   }
 
+  /** Manual top-up standing in for real Lightning settlement — not built yet. */
+  topUpMeshPeer(
+    peerId: string,
+    amountMillisats: number,
+  ): Promise<{ peer_id: string; credit_balance_millisats: number }> {
+    return this.post(`/api/v1/mesh/peers/${encodeURIComponent(peerId)}/credit`, {
+      amount_millisats: amountMillisats,
+    });
+  }
+
   getMeshSelf(): Promise<MeshSelf> {
     return this.get("/api/v1/mesh/self");
+  }
+
+  /** Live "what does this peer offer right now" — queried over the mesh on
+   * every call, not cached (a peer's Lightning wallet or backing model can
+   * flip between two calls). 503s when mesh isn't enabled on this Pond. */
+  getMeshPeerCapabilities(peerId: string): Promise<MeshPeerCapabilities> {
+    return this.get(`/api/v1/mesh/peers/${encodeURIComponent(peerId)}/capabilities`);
+  }
+
+  /** Read-only settlement-job status — see MeshSettlementStatus's own docs
+   * on why there's no matching setter here. */
+  getMeshSettlementStatus(): Promise<MeshSettlementStatus> {
+    return this.get("/api/v1/mesh/settlement");
   }
 
   // ── Schedules ─────────────────────────────────────────────

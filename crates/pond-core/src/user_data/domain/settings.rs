@@ -405,6 +405,27 @@ pub struct Settings {
     #[serde(default = "Settings::default_mesh_enabled")]
     pub mesh_enabled: bool,
 
+    /// Whether to connect to the Breez/Spark Lightning network for
+    /// mesh-peer settlement. Off by default — no UI yet, and requires a
+    /// `pond-server` build with the `lightning` feature plus a
+    /// `BREEZ_API_KEY` env var. The wallet mnemonic is stored separately via
+    /// `SettingsRepository::get_key`/`set_key` under
+    /// `lightning_wallet_mnemonic`, not as a `Settings` field — it's an
+    /// internal secret, not a setting (mirrors `mesh_identity_secret`).
+    #[serde(default = "Settings::default_lightning_enabled")]
+    pub lightning_enabled: bool,
+
+    /// Millisats owed per token of mesh usage — the exchange rate the
+    /// periodic settlement job (#132 Milestone 6) multiplies against each
+    /// trusted peer's pending `UsageTally` to get a real amount to invoice
+    /// and pay. Default `0` is not a placeholder value picked at random —
+    /// `SettlementService::run_once` treats `0` as "not configured yet" and
+    /// deliberately settles nothing rather than guess a rate nobody signed
+    /// off on. No UI yet; set via the settings API once a real rate is
+    /// decided.
+    #[serde(default = "Settings::default_mesh_settlement_millisats_per_token")]
+    pub mesh_settlement_millisats_per_token: u64,
+
     // ── Privacy / sensor access ────────────────────────────────────────────
     /// User-controlled privacy toggle for microphone access. When false, the
     /// voice pipeline (wake-word + ASR capture) is not permitted to record.
@@ -1138,6 +1159,9 @@ impl Default for Settings {
             matter_enabled: Self::default_matter_enabled(),
             matter_ws_url: Self::default_matter_ws_url(),
             mesh_enabled: Self::default_mesh_enabled(),
+            lightning_enabled: Self::default_lightning_enabled(),
+            mesh_settlement_millisats_per_token: Self::default_mesh_settlement_millisats_per_token(
+            ),
             mic_enabled: Self::default_mic_enabled(),
             cameras_enabled: Self::default_cameras_enabled(),
             cloud_fallback_enabled: Self::default_cloud_fallback_enabled(),
@@ -1355,6 +1379,12 @@ impl Settings {
     }
     fn default_mesh_enabled() -> bool {
         false
+    }
+    fn default_lightning_enabled() -> bool {
+        false
+    }
+    fn default_mesh_settlement_millisats_per_token() -> u64 {
+        0
     }
     fn default_mic_enabled() -> bool {
         true
@@ -2145,6 +2175,9 @@ mod tests {
     const NOT_ACTUALLY_SECRET: &[&str] = &[
         // A token BUDGET (a `u32`), not a bearer token.
         "llm_max_tokens",
+        // An exchange RATE (millisats per usage-token, a `u64`), not a
+        // bearer token — see the field's own doc comment (#132 Milestone 6).
+        "mesh_settlement_millisats_per_token",
     ];
 
     /// PAI-2 P2, section 3.2 item 2.
@@ -2363,23 +2396,25 @@ mod tests {
             // whoever owns those files.
             "context_ingest_enabled",
             "ext_context_enabled",
-            // Private mesh (#132 Milestone 2): starts the real libp2p
-            // MeshTransport. Requires a `pond-server` build with the `mesh`
-            // feature, so on a default build the switch has nothing to start.
-            //
-            // Headless because there is no CONTROL for it, which is not the
-            // same as there being no UI: the Mesh section exists and reads
-            // `GET /mesh/self`, so a household can see that the mesh is off
-            // and has no way in the app to turn it on. That gap is deliberate
-            // only for as long as the feature is opt-in at compile time --
-            // once `mesh` is in the default build, this belongs on the Privacy
-            // section next to `network_mode`, because "is my pond talking to
-            // other ponds" is exactly the question that section answers.
-            "mesh_enabled",
+            // Private mesh Lightning settlement (#132 Milestone 5): connects
+            // to Breez/Spark for mesh-peer invoices. No UI yet; requires a
+            // `pond-server` build with the `lightning` feature plus a
+            // `BREEZ_API_KEY` env var.
+            "lightning_enabled",
+            // Private mesh settlement exchange rate (#132 Milestone 6): the
+            // credit-to-sats conversion is an open product decision, not yet
+            // made — see SettlementService's own docs. No UI until it is.
+            "mesh_settlement_millisats_per_token",
         ];
         // Everything else is surfaced in the desktop UI (Settings tabs / hub
         // views / onboarding) and mirrored in the TS Settings type.
         const UI_WIRED: &[&str] = &[
+            // Private mesh (#132 Milestone 2): the Mesh section's toggle
+            // (Mesh.tsx) starts/stops the real libp2p MeshTransport. Requires
+            // a `pond-server` build with the `mesh` feature — flipping it on
+            // a build without that feature is a no-op the transport-builder
+            // warns about, not a UI error.
+            "mesh_enabled",
             "active_embedding_model",
             "active_llm_model",
             "active_tts_model",
