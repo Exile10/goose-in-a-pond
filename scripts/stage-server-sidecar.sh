@@ -15,7 +15,11 @@
 #      embeds pond-desktop/dist at COMPILE TIME (crates/pond-api/build.rs +
 #      include_dir). Skipping this yields a binary that serves the build.rs
 #      placeholder page instead of the real dashboard.
-#   2. Build pond-server in release with RUSTFLAGS explicitly EMPTIED.
+#   2. Build pond-server in release with RUSTFLAGS explicitly EMPTIED, with
+#      the `mesh` feature always on — the native desktop app's own copy of
+#      pond-server (this sidecar) needs it compiled in for the Mesh screen
+#      to be anything but a permanent no-op; there is no non-mesh sidecar
+#      variant, so nobody has to remember a flag to get it.
 #      .cargo/config.toml sets `-C target-cpu=native`, which bakes host-CPU
 #      instructions into the binary. A distributable binary built that way can
 #      SIGILL on a different CPU (per AGENTS.md, the same landmine CI overrides).
@@ -65,10 +69,12 @@ echo "==> [1/3] Building web UI (pond-desktop/dist) ..."
 [ -d "${DESKTOP_DIR}/dist" ] || fail "web UI build reported success but pond-desktop/dist is missing."
 
 # --- 2. Build pond-server (release, no host-CPU specialisation) ---------------
-echo "==> [2/3] Building pond-server (release, RUSTFLAGS emptied) ..."
+echo "==> [2/3] Building pond-server (release, RUSTFLAGS emptied, mesh feature on) ..."
 # RUSTFLAGS="" overrides the repo's .cargo/config.toml target-cpu=native so the
 # sidecar is portable. SQLX_OFFLINE=true keeps the build offline-safe.
-( cd "${REPO_ROOT}" && SQLX_OFFLINE=true RUSTFLAGS="" cargo build --release -p pond-server ) \
+# --features mesh: always on, so the staged sidecar is never the reason the
+# Mesh screen doesn't work — see this script's own header comment.
+( cd "${REPO_ROOT}" && SQLX_OFFLINE=true RUSTFLAGS="" cargo build --release -p pond-server --features mesh ) \
   || fail "cargo build of pond-server failed."
 [ -f "${RELEASE_BIN}" ] || fail "cargo reported success but ${RELEASE_BIN} is missing."
 
