@@ -18,7 +18,7 @@ export function Skills() {
     setLoading(true);
     api
       .listSkills(true)
-      .then(setSkills)
+      .then((res) => setSkills(Array.isArray(res) ? res : []))
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
   }
@@ -77,13 +77,14 @@ export function Skills() {
         <Card className="card">
           <CardContent>
             <div className="skills-form">
+              <label htmlFor="skill-name" className="ext-form-label">Skill name</label>
               <Input
-                label="Skill name"
+                id="skill-name"
                 placeholder="e.g. Code reviewer"
                 variant="bordered"
                 radius="md"
                 value={name}
-                onValueChange={setName}
+                onChange={(e) => setName(e.target.value)}
               />
               <textarea
                 className="skills-form__textarea"
