@@ -7,9 +7,15 @@
  * the whole time, with no way to ask for it.
  *
  * Every name here is one `describe` also uses: the control verb for a scalar
- * ("power", "brightness"), the setting name for a selectable ("spin speed"). So a
- * reading names the thing that changes it, and a reader can go from "spin speed is
- * Low" to the call that makes it High without a second lookup.
+ * ("power", "brightness"), the setting name for a selectable ("spin speed"), or the
+ * sensor type for something measured ("hepa_filter_condition"). So a reading names
+ * the thing that changes it where there is one, and a reader can go from "spin speed
+ * is Low" to the call that makes it High without a second lookup.
+ *
+ * Both halves belong here. A device's state is what it is, not only what it can be
+ * told to be: asked about an air purifier, an answer of power and fan speed alone
+ * had to add that the filter conditions "are not measured in this reading" -- while
+ * both sat in the snapshot at 100%.
  *
  * Values are read through the inverses of the conversions `control` writes with, so
  * a position reported as 40% open is the same 40% that put it there. Anything the
@@ -33,6 +39,7 @@ import {
   CLUSTER_THERMOSTAT,
   CLUSTER_WINDOW_COVERING,
 } from "./devices.js";
+import { SENSORS } from "./sensors.js";
 import { observedOperation, settingsOf } from "./settings.js";
 import { applianceSetpoint, targetSetpoint } from "./thermostat.js";
 import { endpointWith, type NodeSnapshot } from "./snapshot.js";
@@ -96,6 +103,24 @@ export function stateOf(node: NodeSnapshot): DeviceState {
   }
 
   add("operation", observedOperation(node));
+
+  // What it measures, after what it can be told to do. Asked for an air purifier's
+  // state, GIAP answered power and fan speed and had to add that the filter
+  // conditions "are not measured in this reading" -- while both were sitting in the
+  // snapshot at 100%. A device's state is what it is, and for a purifier the state
+  // of its filters is most of that.
+  //
+  // Read through the same table `describe` lists its sensors from, so a device
+  // cannot be described as measuring something its state then omits.
+  for (const sensor of SENSORS) {
+    const raw = endpointWith(node, sensor.cluster)?.clusters[sensor.cluster]?.[sensor.attribute];
+    const reading = sensor.read(raw);
+    // "50%" for a fan speed and "100 %" for a filter, in one list, reads as two
+    // different systems. A percentage closes up; everything else keeps its space.
+    if (reading !== undefined) {
+      add(sensor.sensorType, sensor.unit === "%" ? `${reading}%` : `${reading} ${sensor.unit}`);
+    }
+  }
 
   return { device_id: deviceIdForNode(node.nodeId), values };
 }
