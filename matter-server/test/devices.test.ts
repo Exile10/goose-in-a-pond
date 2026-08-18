@@ -101,4 +101,30 @@ describe("device typing", () => {
     expect(device.device_type).toBe("matter");
     expect(device.capabilities).toEqual([]);
   });
+  it("lists an appliance's temperature, which is not a thermostat's", () => {
+    // The listing is what a model reads before deciding whether to ask for the
+    // description at all. A dishwasher offering 49 to 82 degrees was listed as
+    // "power, mode, operation", so the fuller answer was never reached -- the same
+    // shape as the washer that was listed as "power" alone.
+    const dishwasher = node(105, [
+      named("Dishwasher"),
+      endpoint(1, {
+        onOff: { onOff: false },
+        temperatureControl: { temperatureSetpoint: 4900, minTemperature: 4900, maxTemperature: 8200 },
+      }),
+    ]);
+
+    expect(nodeToDevice(dishwasher).capabilities).toContain("temperature");
+
+    // A washer naming levels has no numeric setpoint, so it is a mode and not a
+    // temperature capability.
+    const washer = node(106, [
+      named("Washer"),
+      endpoint(1, {
+        temperatureControl: { supportedTemperatureLevels: ["Cold", "Hot"] },
+      }),
+    ]);
+    expect(nodeToDevice(washer).capabilities).not.toContain("temperature");
+    expect(nodeToDevice(washer).capabilities).toContain("mode");
+  });
 });
