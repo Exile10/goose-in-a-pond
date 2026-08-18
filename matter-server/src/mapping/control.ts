@@ -19,6 +19,7 @@ import {
 } from "./devices.js";
 import { operationsOf, settingNamed, settingsOf } from "./settings.js";
 import { endpointWith, type NodeSnapshot } from "./snapshot.js";
+import { targetSetpoint } from "./thermostat.js";
 
 // `Verb` is protocol vocabulary — it names what a `control` op may ask for — so it
 // lives in protocol.ts and is re-exported here, where every caller already looks.
@@ -264,11 +265,20 @@ export function planControl(
       if (typeof value !== "number" || !Number.isFinite(value)) {
         throw new OpError("bad_request", "target_temp needs a temperature in Celsius");
       }
-      const endpoint = endpointFor(node, CLUSTER_THERMOSTAT, deviceId);
+      // Which setpoint depends on what the thermostat is doing: writing the
+      // heating one to a device that is cooling moves a number nobody asked about
+      // and leaves the cooling unchanged.
+      const setpoint = targetSetpoint(node, value);
+      if (setpoint === undefined) {
+        throw new OpError(
+          "capability_unsupported",
+          `Matter device '${deviceId}' does not support this capability`,
+        );
+      }
       // Setpoints are attribute writes, not commands.
       return {
         actions: [
-          { kind: "write", endpoint, cluster: CLUSTER_THERMOSTAT, attribute: "occupiedHeatingSetpoint", value: celsiusToSetpoint(value) },
+          { kind: "write", endpoint: setpoint.endpoint, cluster: CLUSTER_THERMOSTAT, attribute: setpoint.attribute, value: celsiusToSetpoint(value) },
         ],
         applied: { target_temp: value },
       };
