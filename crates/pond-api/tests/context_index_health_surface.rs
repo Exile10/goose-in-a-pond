@@ -294,6 +294,8 @@ async fn add_vector(h: &Harness, corpus: Corpus, row_id: &str, model_id: &str) {
         .upsert(&VectorEntry {
             corpus,
             row_id: row_id.to_string(),
+            chunk_ix: 0,
+            chunk_span: None,
             model_id: model_id.to_string(),
             vector: vec![0.1, 0.2, 0.3, 0.4],
             source_rev: None,

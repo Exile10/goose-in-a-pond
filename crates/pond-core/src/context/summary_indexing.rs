@@ -99,13 +99,16 @@ pub async fn run_summary_indexing(
             };
             match embedder.embed(&text).await {
                 Ok(vector) => {
-                    let entry = VectorEntry {
-                        corpus: Corpus::Summary,
-                        row_id: session_id.clone(),
-                        model_id: model_id.clone(),
+                    // A rolling summary is already a compression of a whole
+                    // conversation; chunking a compression would be splitting
+                    // the summary of a thing rather than the thing.
+                    let entry = VectorEntry::whole(
+                        Corpus::Summary,
+                        session_id.clone(),
+                        model_id.clone(),
                         vector,
-                        source_rev: rev,
-                    };
+                        rev,
+                    );
                     match index.upsert(&entry).await {
                         Ok(()) => {
                             indexed += 1;

@@ -114,25 +114,56 @@ pub async fn run_index_maintenance(
                     if text.trim().is_empty() {
                         continue;
                     }
-                    match embedder.embed(&text).await {
-                        Ok(vector) => {
-                            let entry = crate::context::vector_index::VectorEntry {
-                                corpus: Corpus::Context,
-                                row_id,
-                                model_id: model_id.clone(),
-                                vector,
-                                // Left None: the adapter's own write-through
-                                // stamps the ingest time, and a rev invented here
-                                // could disagree with it and re-stale forever.
-                                source_rev: None,
-                            };
-                            if let Err(e) = index.upsert(&entry).await {
-                                tracing::warn!("[context-index] store failed: {e}");
-                            } else {
-                                report.context_indexed += 1;
+                    // Chunked, because a context item now carries a mail body
+                    // and one vector over the whole of it describes the
+                    // signature block as much as the point. A short item is one
+                    // chunk, so this is the same work it always was for a
+                    // sensor event.
+                    let spans = crate::context::chunking::chunk(
+                        &text,
+                        crate::context::chunking::DEFAULT_CHUNK_BYTES,
+                        crate::context::chunking::DEFAULT_OVERLAP_BYTES,
+                    );
+                    // Stale chunks first: a re-chunked item has a different
+                    // number of passages, and leaving the old ones would keep
+                    // scoring spans that no longer describe anything.
+                    if let Err(e) = index.remove(Corpus::Context, &row_id).await {
+                        tracing::warn!("[context-index] could not clear old chunks: {e}");
+                    }
+                    let mut stored = 0usize;
+                    for (ix, span) in spans.iter().enumerate() {
+                        let Some(passage) = span.slice(&text) else {
+                            continue;
+                        };
+                        match embedder.embed(passage).await {
+                            Ok(vector) => {
+                                let entry = crate::context::vector_index::VectorEntry {
+                                    corpus: Corpus::Context,
+                                    row_id: row_id.clone(),
+                                    chunk_ix: ix as i64,
+                                    chunk_span: Some((span.start as i64, span.len as i64)),
+                                    model_id: model_id.clone(),
+                                    vector,
+                                    // Left None: the adapter's own write-through
+                                    // stamps the ingest time, and a rev invented here
+                                    // could disagree with it and re-stale forever.
+                                    source_rev: None,
+                                };
+                                if let Err(e) = index.upsert(&entry).await {
+                                    tracing::warn!("[context-index] store failed: {e}");
+                                } else {
+                                    stored += 1;
+                                }
                             }
+                            Err(e) => tracing::warn!("[context-index] embed failed: {e}"),
                         }
-                        Err(e) => tracing::warn!("[context-index] embed failed: {e}"),
+                    }
+                    if stored > 0 {
+                        // Counted per ITEM, not per chunk: the report answers
+                        // "how much of the corpus is reachable", and a reader
+                        // comparing it against the item count would otherwise
+                        // see more indexed than exist.
+                        report.context_indexed += 1;
                     }
                 }
             }

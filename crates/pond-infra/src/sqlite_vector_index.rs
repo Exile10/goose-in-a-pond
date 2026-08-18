@@ -220,14 +220,20 @@ impl SqliteVectorIndex {
 impl VectorIndex for SqliteVectorIndex {
     async fn upsert(&self, entry: &VectorEntry) -> Result<()> {
         sqlx::query(
-            "INSERT INTO vectors (corpus, row_id, model_id, dims, vector, source_rev, embedded_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(corpus, row_id) DO UPDATE SET \
+            "INSERT INTO vectors \
+               (corpus, row_id, chunk_ix, chunk_start, chunk_len, \
+                model_id, dims, vector, source_rev, embedded_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(corpus, row_id, chunk_ix) DO UPDATE SET \
+               chunk_start = excluded.chunk_start, chunk_len = excluded.chunk_len, \
                model_id = excluded.model_id, dims = excluded.dims, vector = excluded.vector, \
                source_rev = excluded.source_rev, embedded_at = excluded.embedded_at",
         )
         .bind(entry.corpus.as_str())
         .bind(&entry.row_id)
+        .bind(entry.chunk_ix)
+        .bind(entry.chunk_span.map(|(start, _)| start))
+        .bind(entry.chunk_span.map(|(_, len)| len))
         .bind(&entry.model_id)
         .bind(entry.vector.len() as i64)
         .bind(vec_to_blob(&entry.vector))
@@ -248,21 +254,33 @@ impl VectorIndex for SqliteVectorIndex {
     }
 
     async fn get(&self, corpus: Corpus, row_id: &str) -> Result<Option<VectorEntry>> {
-        let row: Option<(String, Vec<u8>, Option<String>)> = sqlx::query_as(
-            "SELECT model_id, vector, source_rev FROM vectors WHERE corpus = ? AND row_id = ?",
-        )
-        .bind(corpus.as_str())
-        .bind(row_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(String, Vec<u8>, Option<String>, Option<i64>, Option<i64>)> =
+            sqlx::query_as(
+                // Chunk 0 specifically: `get` answers "is this row indexed", and a
+                // chunked row has many vectors of which the first is as good an
+                // answer as any.
+                "SELECT model_id, vector, source_rev, chunk_start, chunk_len FROM vectors \
+             WHERE corpus = ? AND row_id = ? AND chunk_ix = 0",
+            )
+            .bind(corpus.as_str())
+            .bind(row_id)
+            .fetch_optional(&self.pool)
+            .await?;
 
-        Ok(row.map(|(model_id, blob, source_rev)| VectorEntry {
-            corpus,
-            row_id: row_id.to_string(),
-            model_id,
-            vector: blob_to_vec(&blob),
-            source_rev,
-        }))
+        Ok(
+            row.map(|(model_id, blob, source_rev, start, len)| VectorEntry {
+                corpus,
+                row_id: row_id.to_string(),
+                chunk_ix: 0,
+                chunk_span: match (start, len) {
+                    (Some(s), Some(l)) => Some((s, l)),
+                    _ => None,
+                },
+                model_id,
+                vector: blob_to_vec(&blob),
+                source_rev,
+            }),
+        )
     }
 
     async fn search(
@@ -338,8 +356,16 @@ impl VectorIndex for SqliteVectorIndex {
             let (scope_pred, bind) = scope_sql(corpus, scope);
             let live = liveness_sql(corpus);
             let text = text_sql(corpus);
+            // The passage, when the vector describes one — `substr` is
+            // 1-indexed and the chunker counts from 0, hence the +1. A NULL
+            // span means the vector is of the whole text, which is every
+            // memory, every summary, and every context vector written before
+            // chunking existed.
             let sql = format!(
-                "SELECT v.row_id, v.vector, {text} FROM vectors v \
+                "SELECT v.row_id, v.vector, \
+                        CASE WHEN v.chunk_start IS NULL OR v.chunk_len IS NULL THEN {text} \
+                             ELSE substr({text}, v.chunk_start + 1, v.chunk_len) END \
+                 FROM vectors v \
                  JOIN {table} s ON s.{id_col} = v.row_id \
                  WHERE v.corpus = ? AND v.model_id = ? {scope_pred} {live}"
             );
@@ -349,16 +375,36 @@ impl VectorIndex for SqliteVectorIndex {
             if let Some(b) = bind {
                 q = q.bind(b);
             }
+            // BEST CHUNK PER ROW, not every chunk that scored.
+            //
+            // Without this a long email owning twelve passages can take twelve
+            // of the caller's top ten slots, and the answer becomes one message
+            // read aloud in fragments while eleven other messages that also
+            // matched are never seen. Rolling up to the row is what makes
+            // chunking a retrieval improvement rather than a way to flood the
+            // result set with whatever happens to be longest.
+            let mut best: std::collections::HashMap<String, ResolvedHit> =
+                std::collections::HashMap::new();
             for (row_id, blob, text) in q.fetch_all(&self.pool).await? {
-                if let Some(score) = cosine(query, &blob_to_vec(&blob)) {
-                    scored.push(ResolvedHit {
-                        corpus,
-                        row_id,
-                        score,
-                        text,
-                    });
+                let Some(score) = cosine(query, &blob_to_vec(&blob)) else {
+                    continue;
+                };
+                match best.get(&row_id) {
+                    Some(existing) if existing.score >= score => {}
+                    _ => {
+                        best.insert(
+                            row_id.clone(),
+                            ResolvedHit {
+                                corpus,
+                                row_id,
+                                score,
+                                text,
+                            },
+                        );
+                    }
                 }
             }
+            scored.extend(best.into_values());
         }
         // Score first; then the corpus order, which IS the "memory wins ties"
         // policy (see `Corpus`); then the id, so equal rows never reorder
@@ -552,10 +598,17 @@ impl VectorIndex for SqliteVectorIndex {
             //
             // Bind order follows the order the `?`s appear in the SQL text, so
             // `model_id` (inside the SELECT list) is bound BEFORE the corpus.
+            //
+            // Every count is DISTINCT over the source id, because one row now
+            // owns many vectors. Counting vector rows would report a corpus of
+            // 1,300 mails as several thousand "indexed rows" — more than exist
+            // — and coverage would read over 100%. The question this answers is
+            // "how many of my things can be found", not "how many vectors are
+            // stored", and chunking made those different numbers.
             let sql = format!(
-                "SELECT COUNT(*), \
-                 COALESCE(SUM(CASE WHEN v.model_id = ? THEN 1 ELSE 0 END), 0), \
-                 COALESCE(SUM(CASE WHEN v.row_id IS NULL THEN 1 ELSE 0 END), 0) \
+                "SELECT COUNT(DISTINCT s.{id_col}), \
+                 COUNT(DISTINCT CASE WHEN v.model_id = ? THEN s.{id_col} END), \
+                 COUNT(DISTINCT CASE WHEN v.row_id IS NULL THEN s.{id_col} END) \
                  FROM {table} s \
                  LEFT JOIN vectors v ON v.row_id = s.{id_col} AND v.corpus = ? \
                  WHERE 1 = 1 {live}"
@@ -650,6 +703,8 @@ mod tests {
         VectorEntry {
             corpus: Corpus::Memory,
             row_id: id.to_string(),
+            chunk_ix: 0,
+            chunk_span: None,
             model_id: "nomic-embed-text-v1.5".into(),
             vector: v,
             source_rev: None,
@@ -1113,6 +1168,83 @@ mod write_through_tests {
         );
     }
 
+    /// The property that makes chunking a retrieval improvement rather than a
+    /// way to flood the result set.
+    ///
+    /// A long email owning twelve passages would otherwise take twelve of the
+    /// caller's ten slots, and the answer becomes one message read aloud in
+    /// fragments while eleven other messages that also matched are never seen.
+    /// So a row contributes its BEST chunk and nothing else.
+    #[tokio::test]
+    async fn one_row_contributes_one_hit_however_many_chunks_it_owns() {
+        let tmp = TempDir::new().unwrap();
+        let db = crate::db::Database::init(tmp.path()).await.unwrap();
+        let index: Arc<dyn VectorIndex> = Arc::new(SqliteVectorIndex::new(db.vectors.clone()));
+
+        // Two memories. `long` owns four chunks, one of which is the closest
+        // thing in the store to the query; `short` owns one, slightly further.
+        let repo = crate::sqlite_memory::SqliteMemoryRepository::new(db.system.clone());
+        for (id, content) in [("long", "a long one"), ("short", "a short one")] {
+            repo.add(MemoryFragment::from_chat(
+                id.into(),
+                None,
+                None,
+                content.into(),
+            ))
+            .await
+            .unwrap();
+        }
+
+        for (ix, v) in [[0.9f32, 0.1], [0.95, 0.05], [1.0, 0.0], [0.8, 0.2]]
+            .into_iter()
+            .enumerate()
+        {
+            index
+                .upsert(&VectorEntry {
+                    corpus: Corpus::Memory,
+                    row_id: "long".into(),
+                    chunk_ix: ix as i64,
+                    chunk_span: Some((0, 4)),
+                    model_id: "m".into(),
+                    vector: v.to_vec(),
+                    source_rev: None,
+                })
+                .await
+                .unwrap();
+        }
+        index
+            .upsert(&VectorEntry {
+                corpus: Corpus::Memory,
+                row_id: "short".into(),
+                chunk_ix: 0,
+                chunk_span: None,
+                model_id: "m".into(),
+                vector: vec![0.85, 0.15],
+                source_rev: None,
+            })
+            .await
+            .unwrap();
+
+        let hits = index
+            .search_resolved(&[1.0, 0.0], "m", &ProfileScope::Household, 10)
+            .await
+            .unwrap();
+
+        let long_hits = hits.iter().filter(|h| h.row_id == "long").count();
+        assert_eq!(
+            long_hits, 1,
+            "a four-chunk row took {long_hits} slots: {hits:#?}"
+        );
+        // And it is the BEST chunk that represents it, not the first stored.
+        let long = hits.iter().find(|h| h.row_id == "long").unwrap();
+        assert!(
+            (long.score - 1.0).abs() < 1e-6,
+            "the row was represented by a weaker chunk: {}",
+            long.score
+        );
+        assert!(hits.iter().any(|h| h.row_id == "short"), "{hits:#?}");
+    }
+
     /// A process with no embedder configured (the `pond memories add` CLI) must
     /// not strip entries the server wrote correctly. It cannot attribute a
     /// vector to a model, so it leaves the index alone for the sweep.
@@ -1127,6 +1259,8 @@ mod write_through_tests {
             .upsert(&VectorEntry {
                 corpus: Corpus::Memory,
                 row_id: "m1".into(),
+                chunk_ix: 0,
+                chunk_span: None,
                 model_id: "nomic-embed-text-v1.5".into(),
                 vector: vec![1.0, 0.0],
                 source_rev: None,
@@ -1241,6 +1375,8 @@ mod write_through_tests {
                 .upsert(&VectorEntry {
                     corpus: Corpus::Summary,
                     row_id: id.into(),
+                    chunk_ix: 0,
+                    chunk_span: None,
                     model_id: "m".into(),
                     vector: vec![1.0, 0.0],
                     source_rev: Some("2026-08-13 10:00:00".into()),
@@ -1306,6 +1442,8 @@ mod write_through_tests {
             .upsert(&VectorEntry {
                 corpus: Corpus::Summary,
                 row_id: "s1".into(),
+                chunk_ix: 0,
+                chunk_span: None,
                 model_id: "m".into(),
                 vector: vec![1.0, 0.0],
                 source_rev: Some("2026-08-13 10:00:00".into()),
@@ -1599,6 +1737,8 @@ mod write_through_tests {
             .upsert(&VectorEntry {
                 corpus: Corpus::Summary,
                 row_id: "s1".into(),
+                chunk_ix: 0,
+                chunk_span: None,
                 model_id: "m".into(),
                 vector: vec![1.0, 0.0],
                 // No stamp -- what a writer that does not track revisions leaves.
@@ -1649,6 +1789,8 @@ mod write_through_tests {
             .upsert(&VectorEntry {
                 corpus: Corpus::Summary,
                 row_id: "s1".into(),
+                chunk_ix: 0,
+                chunk_span: None,
                 model_id: "m".into(),
                 vector: vec![1.0, 0.0],
                 source_rev: Some("2026-08-13 10:00:00".into()),
@@ -1682,6 +1824,8 @@ mod write_through_tests {
             .upsert(&VectorEntry {
                 corpus: Corpus::Summary,
                 row_id: "s1".into(),
+                chunk_ix: 0,
+                chunk_span: None,
                 model_id: "m".into(),
                 vector: vec![0.0, 1.0],
                 source_rev: Some("2026-08-13 11:00:00".into()),

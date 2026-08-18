@@ -125,6 +125,13 @@ impl SqliteContextRepository {
                     .upsert(&VectorEntry {
                         corpus: Corpus::Context,
                         row_id: item.id().to_string(),
+                        // Chunk 0 of the whole text. The pipeline computes one
+                        // vector over `embedding_text` and mirrors it here; the
+                        // maintenance sweep is what replaces it with a full set
+                        // of passages, and it clears this one first so the two
+                        // never co-exist as rival descriptions of one row.
+                        chunk_ix: 0,
+                        chunk_span: None,
                         model_id: model_id.to_string(),
                         vector: vector.to_vec(),
                         // A re-sync REWRITES the row in place (upsert on
