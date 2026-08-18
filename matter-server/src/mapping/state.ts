@@ -93,8 +93,25 @@ export function stateOf(node: NodeSnapshot): DeviceState {
 
   // Reported as percent open, matching how `position` is written and how people say
   // it, rather than WindowCovering's percent closed.
+  // Where it is, and where it is going when those differ. A covering takes time to
+  // travel, so the two disagree for as long as it moves -- and a device that took
+  // the command without moving is indistinguishable from one that ignored it unless
+  // the target is visible. Asked to close, a covering reported "100% open" with
+  // nothing to say its target had just become fully closed.
+  //
+  // Said in one reading rather than two, so the name stays `position`: the thing
+  // reported is the thing `position` sets.
   const lift = numberAt(node, CLUSTER_WINDOW_COVERING, "currentPositionLiftPercent100ths");
-  if (lift !== undefined) add("position", `${lift100thsToPositionOpen(lift)}% open`);
+  if (lift !== undefined) {
+    const target = numberAt(node, CLUSTER_WINDOW_COVERING, "targetPositionLiftPercent100ths");
+    const here = `${lift100thsToPositionOpen(lift)}% open`;
+    add(
+      "position",
+      target === undefined || target === lift
+        ? here
+        : `${here}, moving to ${lift100thsToPositionOpen(target)}% open`,
+    );
+  }
 
   // Selectable settings, named exactly as `describe` names them and as `control`
   // takes them, each carrying the label the device chose for its current value.

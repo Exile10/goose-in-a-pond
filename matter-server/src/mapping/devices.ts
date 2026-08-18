@@ -114,6 +114,9 @@ function capabilitiesOf(node: NodeSnapshot): string[] {
     capabilities.push("temperature");
   }
   if (hasCluster(node, CLUSTER_DOOR_LOCK)) capabilities.push("lock");
+  // A covering was listed with no capabilities at all while `describe` offered it a
+  // position, so the short answer said a controllable device could not be driven.
+  if (hasCluster(node, CLUSTER_WINDOW_COVERING)) capabilities.push("position");
 
   // Appliance vocabulary, found the same structural way `settingsOf` finds it rather
   // than from a second list that could disagree with the first. Without these a
