@@ -131,6 +131,16 @@ that was sent, and the operations offered are derived from `operationalStateList
 rather than assumed: each of the four commands is optional, and the spec requires a
 device to expose the states matching the commands it supports.
 
+`target_temp` names whichever setpoint the thermostat currently runs on. A
+thermostat has two — one it heats up to, one it cools down to — and writing the
+heating one to a device that is cooling moves a number nobody asked about while the
+cooling carries on unchanged. Cool means the cooling setpoint, Heat means the
+heating one; Auto and Off run neither exclusively, so there the requested value
+picks whichever it is nearer to. Their limits differ and each bounds the other
+across `minSetpointDeadBand`, which is why the range a description reports depends
+on the mode, and why a thermostat advertising a 30 degree maximum can refuse 24
+while heating and accept 30 while cooling.
+
 Reporting a state means waiting for it. A cluster's state is whatever the
 subscription last reported, and the report carrying a change arrives *after* the
 command returns — against the Matter Virtual Device, the command answered in 13ms

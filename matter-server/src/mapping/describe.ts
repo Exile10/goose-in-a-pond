@@ -27,6 +27,7 @@ import {
   nodeToDevice,
 } from "./devices.js";
 import { SENSORS } from "./sensors.js";
+import { reachableRange, targetSetpoint } from "./thermostat.js";
 import { operationsOf, settingsOf } from "./settings.js";
 import { endpointWith, type NodeSnapshot } from "./snapshot.js";
 
@@ -93,65 +94,32 @@ function fanModes(node: NodeSnapshot): string[] {
 }
 
 /**
- * A thermostat's own setpoint limits, in degrees Celsius.
+ * A thermostat's setpoint limits, in degrees Celsius.
  *
- * Three things narrow this, and reporting only the first advertises a range the
- * device will refuse. Matter reports all of them in hundredths.
+ * The limits belong to whichever setpoint a request would actually land on, which
+ * the mode decides — a cooling thermostat accepts a different range from a heating
+ * one, because each is bounded by the other across the deadband. Where the mode
+ * settles it, that setpoint's range is reported; in Auto or Off, where the value
+ * itself picks, both are reachable and the range spans them.
  *
- * `absMin/MaxHeatSetpointLimit` is what the hardware could ever do.
- * `min/MaxHeatSetpointLimit` is what it is configured to allow, and is the tighter
- * pair when present.
- *
- * Then the deadband. In Auto the thermostat runs both setpoints and keeps them
- * `minSetpointDeadBand` apart, so the heating setpoint cannot come within that of
- * the cooling one -- a ceiling that appears in no limit attribute at all. Measured
- * on Google's Matter Virtual Device: it advertised 7 to 30, accepted 23, and
- * answered "Constraint error" from 24 up -- its cooling setpoint sits at 26 with a
- * 2.5 degree deadband, so 23.5 is the true ceiling.
- * The description said 30 was allowed, so the model tried 30, and the failure it
- * got back explained nothing.
+ * Matter reports these in hundredths. Measured on Google's Matter Virtual Device:
+ * it advertises 7 to 30, and refuses 24 while heating, because its cooling setpoint
+ * sits at 26 with a 2.5 degree deadband.
  */
 function temperatureSpec(node: NodeSnapshot): ValueSpec {
-  const limit = (name: string) => asNumber(attribute(node, CLUSTER_THERMOSTAT, name));
-
-  // The configured limits where the device states them, the absolute ones otherwise.
-  const min = limit("minHeatSetpointLimit") ?? limit("absMinHeatSetpointLimit");
-  let max = limit("maxHeatSetpointLimit") ?? limit("absMaxHeatSetpointLimit");
-
-  const cooling = limit("occupiedCoolingSetpoint");
-  if (cooling !== undefined) {
-    // Absent means zero deadband, not "no rule": the setpoints still may not cross.
-    const deadband = heatingCeilingUnder(cooling, limit("minSetpointDeadBand"));
-    max = max === undefined ? deadband : Math.min(max, deadband);
-  }
+  const mode = attribute(node, CLUSTER_THERMOSTAT, "systemMode");
+  // Auto (1) and Off (0) do not name a setpoint; the requested value would.
+  const settled = mode === 3 || mode === 4 || mode === 5;
+  const range = settled ? targetSetpoint(node) : reachableRange(node);
 
   // Keys are omitted rather than set undefined: a limit the device did not state
   // must be absent from the description, not present and empty.
   return {
     kind: "number",
     unit: "C",
-    ...(min === undefined ? {} : { min: min / 100 }),
-    ...(max === undefined ? {} : { max: max / 100 }),
+    ...(range?.min === undefined ? {} : { min: range.min / 100 }),
+    ...(range?.max === undefined ? {} : { max: range.max / 100 }),
   };
-}
-
-/**
- * The highest heating setpoint that still clears the cooling one.
- *
- * Three units in one subtraction. Setpoints are hundredths of a degree;
- * `minSetpointDeadBand` is TENTHS -- an int8 whose legal range is 0 to 25, meaning
- * 0 to 2.5 degrees. Reading it as whole degrees turned a 2.5 degree band into 25,
- * and a thermostat that accepts up to 23.5 was described as accepting up to 1.
- *
- * The value that makes this trap worth a function: 25 is a plausible-looking
- * number in either unit, so the mistake produces a limit that is wrong rather than
- * absurd, and the arithmetic is the only place it shows.
- */
-export function heatingCeilingUnder(
-  coolingHundredths: number,
-  deadbandTenths: number | undefined,
-): number {
-  return coolingHundredths - (deadbandTenths ?? 0) * 10;
 }
 
 /** The unit a concentration cluster declares, if it declares one. */
