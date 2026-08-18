@@ -19,7 +19,7 @@ import {
 } from "./devices.js";
 import { operationsOf, settingNamed, settingsOf } from "./settings.js";
 import { endpointWith, type NodeSnapshot } from "./snapshot.js";
-import { targetSetpoint } from "./thermostat.js";
+import { applianceSetpoint, targetSetpoint } from "./thermostat.js";
 
 // `Verb` is protocol vocabulary — it names what a `control` op may ask for — so it
 // lives in protocol.ts and is re-exported here, where every caller already looks.
@@ -106,6 +106,8 @@ function clampPercent(value: number): number {
 }
 
 // ── Fan modes ────────────────────────────────────────────────────────────────
+
+const CLUSTER_TEMPERATURE_CONTROL = "temperatureControl";
 
 export const FAN_MODE_OFF = 0;
 
@@ -268,6 +270,24 @@ export function planControl(
       // Which setpoint depends on what the thermostat is doing: writing the
       // heating one to a device that is cooling moves a number nobody asked about
       // and leaves the cooling unchanged.
+      // An appliance keeps its target in Temperature Control and takes it by
+      // command, not by writing an attribute.
+      const appliance = applianceSetpoint(node);
+      if (appliance !== undefined) {
+        return {
+          actions: [
+            {
+              kind: "command",
+              endpoint: appliance.endpoint,
+              cluster: CLUSTER_TEMPERATURE_CONTROL,
+              command: "setTemperature",
+              payload: { targetTemperature: celsiusToSetpoint(value) },
+            },
+          ],
+          applied: { target_temp: value },
+        };
+      }
+
       const setpoint = targetSetpoint(node, value);
       if (setpoint === undefined) {
         throw new OpError(
