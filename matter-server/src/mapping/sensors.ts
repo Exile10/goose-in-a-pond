@@ -29,6 +29,16 @@ export interface SensorMapping {
   sensorType: string;
   unit: string;
   read: Read;
+  /**
+   * What the numbers mean, for a reading that is an enum rather than a quantity.
+   *
+   * The value stays the number: a rule comparing "filter change >= 2" needs one,
+   * and readings are stored as numbers. This is for the surfaces a person reads,
+   * where "2 state" says nothing. The device's own screen shows "Critical" beside
+   * the same attribute, and GIAP reporting 2 for it is GIAP knowing the answer and
+   * withholding it.
+   */
+  words?: Record<number, string>;
 }
 
 // ── Value readers ────────────────────────────────────────────────────────────
@@ -63,6 +73,37 @@ const occupied: Read = v => {
   return n === undefined ? undefined : (n & 1) === 1 ? 1 : 0;
 };
 
+// ── What the enum readings mean ──────────────────────────────────────────────
+//
+// Matter's own names for these values. Kept beside the sensors that use them so a
+// reading and its meaning cannot drift apart, and so adding a sensor with an enum
+// has an obvious place to say what its numbers are.
+
+/** ResourceMonitoring's ChangeIndicationEnum: does this filter need replacing. */
+const CHANGE_INDICATION: Record<number, string> = {
+  0: "OK",
+  1: "Warning",
+  2: "Critical",
+};
+
+/** SmokeCoAlarm's AlarmStateEnum. */
+const ALARM_STATE: Record<number, string> = {
+  0: "Normal",
+  1: "Warning",
+  2: "Critical",
+};
+
+/** AirQuality's AirQualityEnum, the ordinal the device grades itself on. */
+const AIR_QUALITY: Record<number, string> = {
+  0: "Unknown",
+  1: "Good",
+  2: "Fair",
+  3: "Moderate",
+  4: "Poor",
+  5: "Very poor",
+  6: "Extremely poor",
+};
+
 // ── The table ────────────────────────────────────────────────────────────────
 
 export const SENSORS: readonly SensorMapping[] = [
@@ -86,9 +127,9 @@ export const SENSORS: readonly SensorMapping[] = [
 
   // An ordinal: 0 unknown, 1 good, rising to 6 extremely poor. Kept as the ordinal
   // rather than invented units, so the scale stays the device's own.
-  { cluster: "airQuality", attribute: "airQuality", sensorType: "air_quality", unit: "level", read: asNumber },
+  { cluster: "airQuality", attribute: "airQuality", sensorType: "air_quality", unit: "level", read: asNumber, words: AIR_QUALITY },
   // Alarm state: 0 normal, non-zero means it is sounding.
-  { cluster: "smokeCoAlarm", attribute: "smokeState", sensorType: "smoke_alarm", unit: "state", read: asNumber },
+  { cluster: "smokeCoAlarm", attribute: "smokeState", sensorType: "smoke_alarm", unit: "state", read: asNumber, words: ALARM_STATE },
 
   // Concentrations are floats in each substance's own unit, passed through unscaled —
   // the number the device shows is the number a rule threshold should compare against.
@@ -113,9 +154,9 @@ export const SENSORS: readonly SensorMapping[] = [
   // questions: how worn the filter is, and whether the device is asking for it to be
   // changed. The change indication is 0 OK, 1 Warning, 2 Critical.
   { cluster: "hepaFilterMonitoring", attribute: "condition", sensorType: "hepa_filter_condition", unit: "%", read: asNumber },
-  { cluster: "hepaFilterMonitoring", attribute: "changeIndication", sensorType: "hepa_filter_change", unit: "state", read: asNumber },
+  { cluster: "hepaFilterMonitoring", attribute: "changeIndication", sensorType: "hepa_filter_change", unit: "state", read: asNumber, words: CHANGE_INDICATION },
   { cluster: "activatedCarbonFilterMonitoring", attribute: "condition", sensorType: "carbon_filter_condition", unit: "%", read: asNumber },
-  { cluster: "activatedCarbonFilterMonitoring", attribute: "changeIndication", sensorType: "carbon_filter_change", unit: "state", read: asNumber },
+  { cluster: "activatedCarbonFilterMonitoring", attribute: "changeIndication", sensorType: "carbon_filter_change", unit: "state", read: asNumber, words: CHANGE_INDICATION },
 ];
 
 const BY_PATH: ReadonlyMap<string, SensorMapping> = new Map(
