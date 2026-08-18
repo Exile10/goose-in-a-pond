@@ -72,6 +72,11 @@ export const SENSORS: readonly SensorMapping[] = [
 
   // Ambient measurements.
   { cluster: "temperatureMeasurement", attribute: "measuredValue", sensorType: "temperature", unit: "C", read: hundredths },
+  // A thermostat measures the room it is in, and publishes it here rather than
+  // through TemperatureMeasurement -- so asking a thermostat for the temperature
+  // got "none recorded", from the one device in the house whose whole job is
+  // knowing it. Its setpoint is a separate thing, reachable through `target_temp`.
+  { cluster: "thermostat", attribute: "localTemperature", sensorType: "temperature", unit: "C", read: hundredths },
   { cluster: "relativeHumidityMeasurement", attribute: "measuredValue", sensorType: "humidity", unit: "%", read: hundredths },
   // Lux, reported log-scaled. Passed through unconverted: the raw measurement is what
   // a rule threshold compares against.
