@@ -96,30 +96,62 @@ function fanModes(node: NodeSnapshot): string[] {
 /**
  * A thermostat's setpoint limits, in degrees Celsius.
  *
- * The limits belong to whichever setpoint a request would actually land on, which
- * the mode decides — a cooling thermostat accepts a different range from a heating
- * one, because each is bounded by the other across the deadband. Where the mode
- * settles it, that setpoint's range is reported; in Auto or Off, where the value
- * itself picks, both are reachable and the range spans them.
+ * The limits belong to whichever setpoint a request would land on, which the mode
+ * decides. So the same device answers 7 to 23.5 while heating and 16 to 32 while
+ * cooling, and a bare number is misleading twice over: it looks like a device fact
+ * when it is a mode fact, and it hides that the device reaches higher in another
+ * mode. Both the condition and the wider span are stated, so an answer read back
+ * later carries the circumstances it was true under.
  *
- * Matter reports these in hundredths. Measured on Google's Matter Virtual Device:
- * it advertises 7 to 30, and refuses 24 while heating, because its cooling setpoint
- * sits at 26 with a 2.5 degree deadband.
+ * The pairing is not arbitrary, and it reads backwards until you know what a
+ * setpoint is. The heating setpoint is the temperature heat runs BELOW, so it is
+ * the lower of the pair; the cooling setpoint is the one cooling runs ABOVE, so it
+ * is the higher. They bracket a band and must stay `minSetpointDeadBand` apart,
+ * which is what caps heating at 23.5 while this device cools at 26 — not a limit
+ * on how warm it can make a room.
  */
 function temperatureSpec(node: NodeSnapshot): ValueSpec {
   const mode = attribute(node, CLUSTER_THERMOSTAT, "systemMode");
   // Auto (1) and Off (0) do not name a setpoint; the requested value would.
-  const settled = mode === 3 || mode === 4 || mode === 5;
-  const range = settled ? targetSetpoint(node) : reachableRange(node);
+  const settled = mode === MODE_COOL || mode === MODE_HEAT || mode === MODE_EMERGENCY_HEAT;
+  const live = settled ? targetSetpoint(node) : undefined;
+  const range = live ?? reachableRange(node);
 
-  // Keys are omitted rather than set undefined: a limit the device did not state
-  // must be absent from the description, not present and empty.
   return {
     kind: "number",
     unit: "C",
     ...(range?.min === undefined ? {} : { min: range.min / 100 }),
     ...(range?.max === undefined ? {} : { max: range.max / 100 }),
+    ...(live === undefined ? {} : { when: conditionFor(live, reachableRange(node)) }),
   };
+}
+
+/** Matter's SystemModeEnum, for the modes that settle which setpoint is meant. */
+const MODE_COOL = 3;
+const MODE_HEAT = 4;
+const MODE_EMERGENCY_HEAT = 5;
+
+/**
+ * What a mode-bound range is true of, and what the device can do outside it.
+ *
+ * Without the second half, "7 to 23.5" reads as this thermostat's ceiling, and a
+ * reader concludes it cannot be asked for 30 — when 30 is reachable the moment its
+ * mode changes.
+ */
+function conditionFor(
+  live: { which: "heating" | "cooling"; min?: number; max?: number },
+  overall: { min?: number; max?: number } | undefined,
+): string {
+  const doing = live.which === "heating" ? "while heating" : "while cooling";
+  if (overall === undefined) return doing;
+
+  const wider = (overall.min !== undefined && overall.min !== live.min)
+    || (overall.max !== undefined && overall.max !== live.max);
+  if (!wider) return doing;
+
+  const from = overall.min === undefined ? "" : `${overall.min / 100} to `;
+  const to = overall.max === undefined ? "" : `${overall.max / 100}`;
+  return `${doing}; this device reaches ${from}${to} C across its modes`;
 }
 
 /** The unit a concentration cluster declares, if it declares one. */

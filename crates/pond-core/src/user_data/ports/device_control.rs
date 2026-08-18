@@ -145,6 +145,15 @@ pub enum ValueSpec {
         max: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unit: Option<String>,
+        /// What this range is true of, where it is not true always.
+        ///
+        /// A thermostat's limits belong to whichever setpoint its mode has live, so
+        /// the same device answers 7 to 23.5 while heating and 16 to 32 while
+        /// cooling. Stated bare, the number reads as a fact about the device and
+        /// goes stale the moment the mode changes — and it hides that the device
+        /// reaches higher elsewhere. Absent for anything whose limits do not move.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when: Option<String>,
     },
     Enum {
         values: Vec<String>,

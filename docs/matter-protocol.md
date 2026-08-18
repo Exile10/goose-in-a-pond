@@ -141,6 +141,16 @@ across `minSetpointDeadBand`, which is why the range a description reports depen
 on the mode, and why a thermostat advertising a 30 degree maximum can refuse 24
 while heating and accept 30 while cooling.
 
+A range that only holds in one mode says so, through `when` on the number: the
+condition it is true of, and where the device still reaches beyond it. Stated bare
+the number reads as a fact about the device, so the same question minutes apart
+answers 7 to 23.5 and then 7 to 32 with nothing to explain either, and a reader
+concludes 30 is impossible when it is one mode away.
+
+The pairing reads backwards until you know what a setpoint is: heating runs BELOW
+its setpoint and cooling ABOVE its own, so heating is always the lower of the two.
+They bracket a band rather than describing how hard either can work.
+
 Reporting a state means waiting for it. A cluster's state is whatever the
 subscription last reported, and the report carrying a change arrives *after* the
 command returns — against the Matter Virtual Device, the command answered in 13ms
