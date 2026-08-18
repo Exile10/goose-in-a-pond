@@ -20,18 +20,57 @@ describe("device state", () => {
     expect(valueOf(washer, "operation")).toBe("stopped");
   });
 
-  it("names state with the same words that change it", () => {
+  it("names state with words the description also uses", () => {
     // The invariant that makes one call follow from the other: every name reported
-    // here is a name `describe` offers, so "spin speed is Low" leads straight to the
-    // call that makes it High, with no second lookup and no guessing.
-    const washer = laundryWasherNode();
-    const settable = new Set(
-      describeNode(washer).capabilities.map(c => c.setting ?? c.verb),
-    );
+    // here appears in the description, either as something settable or as something
+    // measured. So "spin speed is Low" leads straight to the call that makes it
+    // High, and a measurement is named the same way `list_sensors` names it.
+    //
+    // A device with both halves, because the earlier version of this test used a
+    // washer -- which has no sensors, so it never checked the measured half at all.
+    const purifier = node(96, [
+      named("Air Purifier"),
+      endpoint(1, {
+        onOff: { onOff: true },
+        fanControl: { percentCurrent: 50, fanMode: 2 },
+        hepaFilterMonitoring: { condition: 100, changeIndication: 0 },
+        activatedCarbonFilterMonitoring: { condition: 80, changeIndication: 0 },
+      }),
+    ]);
 
-    for (const { name } of stateOf(washer).values) {
-      expect(settable.has(name), `'${name}' is reported but nothing can set it`).toBe(true);
+    const described = describeNode(purifier);
+    const settable = new Set(described.capabilities.map(c => c.setting ?? c.verb));
+    const measured = new Set(described.sensors.map(s => s.sensor_type));
+
+    const reported = stateOf(purifier).values.map(v => v.name);
+    // It has to report both kinds, or this passes by reporting nothing.
+    expect(reported).toContain("power");
+    expect(reported).toContain("hepa_filter_condition");
+
+    for (const name of reported) {
+      expect(
+        settable.has(name) || measured.has(name),
+        `'${name}' is reported but the description neither sets nor measures it`,
+      ).toBe(true);
     }
+  });
+
+  it("reports what a device measures, not only what it can be told to be", () => {
+    // Asked for an air purifier's state, GIAP answered power and fan speed and had
+    // to add that the filter conditions "are not measured in this reading" -- while
+    // both sat in the snapshot, and describe was already listing them.
+    const purifier = node(97, [
+      named("Air Purifier"),
+      endpoint(1, {
+        onOff: { onOff: true },
+        hepaFilterMonitoring: { condition: 100 },
+        activatedCarbonFilterMonitoring: { condition: 80 },
+      }),
+    ]);
+
+    // Formatted as the controls beside it are: no gap before a percent sign.
+    expect(valueOf(purifier, "hepa_filter_condition")).toBe("100%");
+    expect(valueOf(purifier, "carbon_filter_condition")).toBe("80%");
   });
 
   it("reads a mode by the device's own code, not its position in the list", () => {
