@@ -150,4 +150,39 @@ describe("device state", () => {
     ]);
     expect(valueOf(odd, "hepa_filter_change")).toBe("7 state");
   });
+  it("says where a covering is heading when that is not where it is", () => {
+    // 0 hundredths is fully OPEN in Matter: UpOrOpen sets it to 0.00%, DownOrClose
+    // to 100.00%. A covering told to close therefore sits at "100% open" with a
+    // target of fully closed until it travels -- and on a device that accepts the
+    // command without moving, that is the only sign the command landed at all.
+    const closing = node(110, [
+      named("Blind"),
+      endpoint(1, {
+        windowCovering: {
+          currentPositionLiftPercent100ths: 0,
+          targetPositionLiftPercent100ths: 10000,
+        },
+      }),
+    ]);
+    expect(valueOf(closing, "position")).toBe("100% open, moving to 0% open");
+
+    // Arrived: one fact, not two.
+    const settled = node(111, [
+      named("Blind"),
+      endpoint(1, {
+        windowCovering: {
+          currentPositionLiftPercent100ths: 3000,
+          targetPositionLiftPercent100ths: 3000,
+        },
+      }),
+    ]);
+    expect(valueOf(settled, "position")).toBe("70% open");
+
+    // Still one name, and one `describe` offers -- the thing reported is the thing
+    // `position` sets.
+    const settable = new Set(describeNode(closing).capabilities.map(c => c.setting ?? c.verb));
+    for (const { name } of stateOf(closing).values) {
+      expect(settable.has(name), `'${name}' is reported but nothing sets it`).toBe(true);
+    }
+  });
 });
