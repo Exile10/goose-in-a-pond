@@ -179,8 +179,23 @@ impl IngestPipeline {
 
         // Embedded from the item, which means from the REDACTED text: there is
         // no point in this function at which the raw body is still reachable.
-        let item = match &self.embedder {
-            Some(embedder) => match embedder.embed(&item.embedding_text()).await {
+        //
+        // Only the FIRST passage is embedded here, and that is deliberate. An
+        // item whose text fits one chunk — a sensor event, a calendar entry, a
+        // short mail — is completely described by it, and this is the whole
+        // job. A long mail body is not, and its remaining passages are the
+        // maintenance sweep's work: chunking a 20 KB message inline would put
+        // dozens of embeds on the path an ingest waits for, and a mailbox sync
+        // of a thousand messages would stall behind them.
+        //
+        // What matters is that the sweep can TELL the difference, which is why
+        // the item is left unembedded when its text spills past one chunk: an
+        // item carrying a vector looks indexed, and would never be picked up
+        // for the rest of its passages.
+        let text = item.embedding_text();
+        let one_chunk = text.len() <= crate::context::chunking::DEFAULT_CHUNK_BYTES;
+        let item = match (&self.embedder, one_chunk) {
+            (Some(embedder), true) => match embedder.embed(&text).await {
                 Ok(vector) => item.with_embedding(vector),
                 Err(e) => {
                     // Not fatal. `search_unembedded` + `update_embedding` are the
@@ -189,7 +204,9 @@ impl IngestPipeline {
                     item
                 }
             },
-            None => item,
+            // Long enough to chunk: stored now, passages embedded by the sweep.
+            (Some(_), false) => item,
+            (None, _) => item,
         };
 
         self.repo.save_item(&item).await?;

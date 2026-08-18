@@ -2695,7 +2695,7 @@ async fn run_server(
         let started_at_utc = chrono::Utc::now();
 
         tokio::spawn(async move {
-            use pond_core::context::index_maintenance::run_index_maintenance;
+            use pond_core::context::index_maintenance::{run_index_maintenance, IndexBudget};
             // Same alias the other three schedule blocks in this file use. The
             // sweep reads the shared inactivity threshold so it waits on the
             // same definition of "idle" as consolidation, rather than a second
@@ -2770,9 +2770,20 @@ async fn run_server(
                     continue;
                 };
 
-                let report =
-                    run_index_maintenance(&index, storage.as_ref(), provider.as_ref(), &cancel)
-                        .await;
+                let report = run_index_maintenance(
+                    &index,
+                    storage.as_ref(),
+                    provider.as_ref(),
+                    &cancel,
+                    // Somebody watching an empty panel gets the whole
+                    // corpus; the 15-minute poll takes a bite.
+                    if asked {
+                        IndexBudget::UntilDone
+                    } else {
+                        IndexBudget::OneBatch
+                    },
+                )
+                .await;
                 if asked {
                     tracing::info!(
                         adopted = report.adopted,

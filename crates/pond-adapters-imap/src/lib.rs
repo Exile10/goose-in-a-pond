@@ -36,7 +36,19 @@ use pond_core::context::ingest::RawItem;
 use std::sync::Arc;
 
 /// How long a whole IMAP conversation may take.
-const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+///
+/// Generous because ONE call is now many batches: a first sync over a 30-day
+/// window reads every body in it, and 45 seconds killed that mid-way. Later
+/// syncs resume above the stored UID and finish in a second or two, so this
+/// ceiling only ever applies to the first one.
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// How much of one message is worth reading.
+///
+/// A marketing email can be a megabyte of inlined HTML and tracking pixels, and
+/// nothing a household would ask about is in the last 900 KB of it. Cutting
+/// before the MIME parse bounds both memory and the work `body_to_text` does.
+const MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// Everything needed to reach one household member's mailbox.
 ///
@@ -86,6 +98,33 @@ impl ImapAdapter {
     /// not here: a home server holding open sockets to several providers is a
     /// reliability problem before it is a feature (PAI-8 §3.5).
     pub async fn recent_messages(&self, since: DateTime<Utc>) -> Result<Vec<RawItem>> {
+        Ok(self.fetch_since(since, None).await?.0)
+    }
+
+    /// Recent messages, plus the cursor a later sync should resume from.
+    ///
+    /// The cursor is `UIDVALIDITY:MAXUID`. Passing the previous one asks the
+    /// server for messages ABOVE that UID, which is what makes an ongoing sync
+    /// cheap: without it every pass re-downloads the whole window, and with
+    /// bodies that is the entire mailbox every thirty minutes.
+    ///
+    /// `UIDVALIDITY` is carried because a mailbox may renumber. When the server
+    /// reports a different one the stored UID means nothing, so the window is
+    /// read again from the start rather than resuming from a number that now
+    /// points somewhere else.
+    pub async fn messages_since_cursor(
+        &self,
+        since: DateTime<Utc>,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<RawItem>, Option<String>)> {
+        self.fetch_since(since, cursor).await
+    }
+
+    async fn fetch_since(
+        &self,
+        since: DateTime<Utc>,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<RawItem>, Option<String>)> {
         let host = self.config.provider.host().to_string();
         let port = self.config.provider.port();
 
@@ -97,7 +136,7 @@ impl ImapAdapter {
         pond_core::shared::services::egress::check_egress(&url)?;
 
         let started = std::time::Instant::now();
-        let result = tokio::time::timeout(TIMEOUT, self.fetch(&host, port, since)).await;
+        let result = tokio::time::timeout(TIMEOUT, self.fetch(&host, port, since, cursor)).await;
         let latency_ms = started.elapsed().as_millis() as u64;
         let status = match &result {
             Ok(Ok(_)) => Some(200),
@@ -112,7 +151,13 @@ impl ImapAdapter {
         }
     }
 
-    async fn fetch(&self, host: &str, port: u16, since: DateTime<Utc>) -> Result<Vec<RawItem>> {
+    async fn fetch(
+        &self,
+        host: &str,
+        port: u16,
+        since: DateTime<Utc>,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<RawItem>, Option<String>)> {
         let tcp = tokio::net::TcpStream::connect((host, port))
             .await
             .with_context(|| format!("could not reach the mail server at {host}:{port}"))?;
@@ -164,20 +209,58 @@ impl ImapAdapter {
         // INBOX only, and `examine` rather than `select`: examine opens the
         // mailbox READ-ONLY, so this connector cannot change a flag even by
         // accident and mail does not become "read" because the pond looked.
-        session
+        let mailbox = session
             .examine("INBOX")
             .await
             .context("could not open the INBOX")?;
+        let uid_validity = mailbox.uid_validity.unwrap_or(0);
 
-        let query = format!("SINCE {}", since.format("%d-%b-%Y"));
+        // Resume above the last UID this pond saw, but only if the mailbox has
+        // not renumbered. A changed UIDVALIDITY makes the stored number point
+        // at a different message, so the window is read again from the start —
+        // re-reading is idempotent (Message-ID is the key), resuming from a
+        // stale number silently skips mail.
+        let resume_from = cursor.and_then(|c| c.split_once(':')).and_then(|(v, u)| {
+            match (v.parse::<u32>().ok(), u.parse::<u32>().ok()) {
+                (Some(v), Some(u)) if v == uid_validity => Some(u),
+                _ => None,
+            }
+        });
+
+        let query = match resume_from {
+            Some(max) => format!("UID {}:* SINCE {}", max + 1, since.format("%d-%b-%Y")),
+            None => format!("SINCE {}", since.format("%d-%b-%Y")),
+        };
         let uids = session
-            .search(&query)
+            .uid_search(&query)
             .await
             .context("the mail server refused the search")?;
+        let highest = uids.iter().copied().max();
 
         let mut items = Vec::new();
-        if !uids.is_empty() {
-            let set = uids
+        // Counted, because both ways a message can vanish below are a silent
+        // `continue`. A sync that returns 21 of 1,345 and a sync that returns
+        // 21 because the mailbox holds 21 look identical from the outside, and
+        // the first one is a mail server throttling a client that just pulled
+        // every body twice.
+        let mut unreadable = 0usize;
+        let mut envelopeless = 0usize;
+        // BATCHED, and this is not a tuning knob — it is the difference between
+        // working and taking the pond down.
+        //
+        // Asking for every message in the window in ONE fetch was fine while
+        // this read envelopes: a thousand headers is a few hundred kilobytes.
+        // With bodies it streams the whole mailbox — measured at 769 MB
+        // resident on a 1,300-message window — and the process stopped
+        // answering its own health check for long enough that the desktop
+        // watchdog restarted it, killing the sync, which then began again.
+        //
+        // A batch bounds what is in flight to roughly `BATCH * message size`,
+        // and yielding between batches gives the runtime a chance to serve
+        // everything else the pond is doing.
+        const BATCH: usize = 50;
+        for window in uids.iter().copied().collect::<Vec<_>>().chunks(BATCH) {
+            let set = window
                 .iter()
                 .map(|u| u.to_string())
                 .collect::<Vec<_>>()
@@ -190,27 +273,70 @@ impl ImapAdapter {
             // the belt to that braces — and the one a future edit is most
             // likely to drop by shortening the atom.
             let mut stream = session
-                .fetch(set, "(ENVELOPE BODY.PEEK[TEXT])")
+                .uid_fetch(set, "(ENVELOPE BODY.PEEK[TEXT])")
                 .await
                 .context("the mail server refused the fetch")?;
             while let Some(message) = stream.next().await {
-                let Ok(message) = message else { continue };
+                let message = match message {
+                    Ok(m) => m,
+                    Err(e) => {
+                        unreadable += 1;
+                        tracing::debug!(error = %e, "a fetch response could not be read");
+                        continue;
+                    }
+                };
                 // The body is the message's own words, cleaned of quoted
                 // replies and signatures — text that belongs to other messages
                 // would otherwise be the most repeated, and therefore most
                 // findable, thing in the mailbox.
+                //
+                // Capped before parsing: a newsletter can carry a megabyte of
+                // inlined HTML, and no answer a household wants is in the last
+                // 900 KB of it.
                 let body = message
                     .text()
-                    .map(|raw| crate::body::body_to_text(&String::from_utf8_lossy(raw)))
+                    .map(|raw| {
+                        let cut = raw.len().min(MAX_BODY_BYTES);
+                        crate::body::body_to_text(&String::from_utf8_lossy(&raw[..cut]))
+                    })
                     .unwrap_or_default();
-                if let Some(item) = envelope_to_item(message.envelope(), &body) {
-                    items.push(item);
+                match envelope_to_item(message.envelope(), &body) {
+                    Some(item) => items.push(item),
+                    None => envelopeless += 1,
                 }
             }
+            drop(stream);
+            // Hand the runtime back between batches. Without this the fetch
+            // loop is one long await chain that never lets a health check in.
+            tokio::task::yield_now().await;
         }
         // Best effort: a failed logout does not invalidate what was read.
         let _ = session.logout().await;
-        Ok(items)
+
+        let asked = uids.len();
+        if items.len() < asked {
+            tracing::warn!(
+                asked,
+                returned = items.len(),
+                unreadable,
+                envelopeless,
+                "the mail server returned fewer messages than were searched for"
+            );
+        } else {
+            tracing::info!(asked, returned = items.len(), "mail fetched");
+        }
+
+        // Only advance the cursor past what was actually READ. A batch that
+        // failed mid-way leaves the cursor where it was, so the next pass
+        // covers the same ground rather than stepping over messages nothing
+        // stored.
+        let next_cursor = match (highest, resume_from) {
+            (Some(h), _) => Some(format!("{uid_validity}:{h}")),
+            // Nothing new, but the mailbox was reachable: keep the cursor.
+            (None, Some(prev)) => Some(format!("{uid_validity}:{prev}")),
+            (None, None) => None,
+        };
+        Ok((items, next_cursor))
     }
 }
 
