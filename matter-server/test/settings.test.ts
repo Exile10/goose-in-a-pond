@@ -336,4 +336,38 @@ describe("appliance settings", () => {
     const bare = refusalOrFault("matter-1", new Error("Constraint error"));
     expect(bare.message).not.toMatch(/It accepts/);
   });
+  it("offers the one thermostat control a person can see on the device", () => {
+    // A setpoint change may show nowhere on the thermostat's own screen; system
+    // mode is the control it does display. It is also the mode that decides whether
+    // a setpoint means anything: aiming a thermostat that is Off at 20 does nothing.
+    const thermostat = node(93, [
+      named("Thermostat"),
+      endpoint(1, { thermostat: { systemMode: 1, occupiedHeatingSetpoint: 2000 } }),
+    ]);
+
+    const setting = settingsOf(thermostat).find(s => s.name === "system mode");
+    expect(setting?.values).toEqual(["off", "auto", "cool", "heat"]);
+    // Matter's codes, which are not positions in the list: heat is 4, not 3.
+    expect(setting?.valueFor("heat")).toBe(4);
+    expect(setting?.valueFor("cool")).toBe(3);
+
+    const plan = planControl(thermostat, "matter-1", "mode", {
+      setting: "system mode",
+      value: "Heat",
+    });
+    expect(plan.actions).toEqual([
+      {
+        kind: "write",
+        endpoint: 1,
+        cluster: "thermostat",
+        attribute: "systemMode",
+        value: 4,
+      },
+    ]);
+  });
+
+  it("does not offer a system mode on a device that has no thermostat", () => {
+    const bulb = node(94, [named("Lamp"), endpoint(1, { onOff: { onOff: true } })]);
+    expect(settingsOf(bulb).find(s => s.name === "system mode")).toBeUndefined();
+  });
 });

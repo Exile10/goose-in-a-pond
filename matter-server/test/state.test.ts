@@ -72,4 +72,15 @@ describe("device state", () => {
     const lamp = node(83, [named("Lamp"), endpoint(1, { onOff: { onOff: true } })]);
     expect(stateOf(lamp).values).toEqual([{ name: "power", value: "on" }]);
   });
+  it("reports the system mode a thermostat is in", () => {
+    const thermostat = node(95, [
+      named("Thermostat"),
+      endpoint(1, { thermostat: { systemMode: 0, occupiedHeatingSetpoint: 1200 } }),
+    ]);
+
+    // Off is code 0 and a real answer, not an absent one: a thermostat that is off
+    // is the reason a setpoint appears to do nothing.
+    expect(valueOf(thermostat, "system mode")).toBe("off");
+    expect(valueOf(thermostat, "target_temp")).toBe("12 C");
+  });
 });
