@@ -63,11 +63,28 @@ describe("sensor readings", () => {
     expect(readingFor(NODE, "booleanState", "stateValue", 1)).toBeUndefined();
   });
 
-  it("keeps every sensor type distinct", () => {
-    // Two clusters minting the same name would make readings from different devices
-    // indistinguishable downstream. The filter pair is the near miss this guards.
-    const names = SENSORS.map(s => s.sensorType);
-    expect(new Set(names).size).toBe(names.length);
+  it("mints a sensor type from one cluster, save where a quantity has two sources", () => {
+    // Two clusters minting the same name is normally an accident -- the filter pair
+    // is the near miss this was written for. Readings carry a device id, so the harm
+    // is not telling devices apart; it is one device exposing both clusters, where
+    // two sources for one quantity would alternate in the reading cache.
+    //
+    // Temperature is the real exception rather than a slip. A thermostat measures the
+    // room and publishes it as `thermostat.localTemperature`, not through
+    // TemperatureMeasurement, and calling that anything but "temperature" would hide
+    // it from every question a person actually asks.
+    const DUPLICATES_ALLOWED = new Set(["temperature"]);
+
+    const seen = new Set<string>();
+    for (const { sensorType } of SENSORS) {
+      if (seen.has(sensorType)) {
+        expect(
+          DUPLICATES_ALLOWED.has(sensorType),
+          `'${sensorType}' is minted twice and is not a known exception`,
+        ).toBe(true);
+      }
+      seen.add(sensorType);
+    }
   });
 
   it("has no duplicate cluster/attribute pairs", () => {
