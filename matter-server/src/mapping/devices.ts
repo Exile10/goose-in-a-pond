@@ -10,6 +10,7 @@ import type { Device } from "../protocol.js";
 import { deviceIdForNode } from "../protocol.js";
 import {
   applicationEndpoints,
+  endpointWith,
   hasCluster,
   rootAttribute,
   type NodeSnapshot,
@@ -116,7 +117,14 @@ function capabilitiesOf(node: NodeSnapshot): string[] {
   if (hasCluster(node, CLUSTER_DOOR_LOCK)) capabilities.push("lock");
   // A covering was listed with no capabilities at all while `describe` offered it a
   // position, so the short answer said a controllable device could not be driven.
-  if (hasCluster(node, CLUSTER_WINDOW_COVERING)) capabilities.push("position");
+  if (hasCluster(node, CLUSTER_WINDOW_COVERING)) {
+    capabilities.push("position");
+    // Only a covering with slats to turn.
+    const tilting = endpointWith(node, CLUSTER_WINDOW_COVERING)?.clusters[CLUSTER_WINDOW_COVERING]?.[
+      "currentPositionTiltPercent100ths"
+    ];
+    if (tilting !== undefined) capabilities.push("tilt");
+  }
 
   // Appliance vocabulary, found the same structural way `settingsOf` finds it rather
   // than from a second list that could disagree with the first. Without these a

@@ -181,6 +181,12 @@ function capabilitiesOf(node: NodeSnapshot): Capability[] {
   if (has(CLUSTER_DOOR_LOCK)) add("locked", { kind: "boolean" });
   if (has(CLUSTER_COLOR_CONTROL)) add("color", { kind: "color" });
   if (has(CLUSTER_WINDOW_COVERING)) add("position", { kind: "percent" });
+  // The second axis, offered only by a covering that has it. A roller blind has no
+  // slats to turn, and offering a control the device will reject is the failure this
+  // whole area exists to stop.
+  if (attribute(node, CLUSTER_WINDOW_COVERING, "currentPositionTiltPercent100ths") !== undefined) {
+    add("tilt", { kind: "percent" });
+  }
 
   // Everything the device says can be chosen, named as it names it. This is what
   // makes an appliance drivable without a verb per appliance: a washer's cycle,

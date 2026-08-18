@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { planControl } from "../src/mapping/control.js";
 import { describeNode } from "../src/mapping/describe.js";
 import { stateOf } from "../src/mapping/state.js";
 import { endpoint, laundryWasherNode, named, node } from "./fixtures.js";
@@ -184,5 +185,51 @@ describe("device state", () => {
     for (const { name } of stateOf(closing).values) {
       expect(settable.has(name), `'${name}' is reported but nothing sets it`).toBe(true);
     }
+  });
+  it("offers and reports a covering's second axis, where it has one", () => {
+    // Lift and tilt are separate axes: how far a blind is lowered, and how far its
+    // slats are turned. A venetian blind is routinely down with its slats open, and
+    // position alone cannot ask for that.
+    const venetian = node(112, [
+      named("Blind"),
+      endpoint(1, {
+        windowCovering: {
+          currentPositionLiftPercent100ths: 0,
+          targetPositionLiftPercent100ths: 0,
+          currentPositionTiltPercent100ths: 10000,
+          targetPositionTiltPercent100ths: 3000,
+        },
+      }),
+    ]);
+
+    expect(describeNode(venetian).capabilities.map(c => c.verb)).toEqual(["position", "tilt"]);
+    expect(valueOf(venetian, "position")).toBe("100% open");
+    expect(valueOf(venetian, "tilt")).toBe("0% open, turning to 70% open");
+
+    // Sent as its own command, on the axis it belongs to.
+    const plan = planControl(venetian, "matter-2", "tilt", 40);
+    expect(plan.actions).toEqual([
+      {
+        kind: "command",
+        endpoint: 1,
+        cluster: "windowCovering",
+        command: "goToTiltPercentage",
+        payload: { tiltPercent100thsValue: 6000 },
+      },
+    ]);
+    expect(plan.applied).toEqual({ tilt: 40 });
+  });
+
+  it("does not offer tilt to a covering with no slats", () => {
+    // A roller blind has nothing to turn, and offering a control the device will
+    // reject is the failure this area exists to stop.
+    const roller = node(113, [
+      named("Roller"),
+      endpoint(1, { windowCovering: { currentPositionLiftPercent100ths: 5000 } }),
+    ]);
+
+    expect(describeNode(roller).capabilities.map(c => c.verb)).toEqual(["position"]);
+    expect(stateOf(roller).values.find(v => v.name === "tilt")).toBeUndefined();
+    expect(() => planControl(roller, "matter-3", "tilt", 40)).not.toThrow();
   });
 });

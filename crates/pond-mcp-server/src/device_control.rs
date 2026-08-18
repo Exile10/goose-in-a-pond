@@ -79,6 +79,10 @@ pub struct SetDeviceStateParams {
     /// 0-100 percent open (100=fully open).
     #[serde(default)]
     pub position: Option<u8>,
+    /// A covering's slat angle, 0-100 percent open. Separate from position: a
+    /// blind can be fully down with its slats open. Only blinds with slats.
+    #[serde(default)]
+    pub tilt: Option<u8>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -377,7 +381,7 @@ impl DeviceControlMcpServer {
     }
 
     #[tool(
-        description = "Set smart-device state: power, brightness, target_temp, lock, colour, fan, position. device_id: id, name, or natural ref like \"the light\"."
+        description = "Set smart-device state: power, brightness, target_temp, lock, colour, fan, position, tilt. device_id: id, name, or natural ref like \"the light\"."
     )]
     async fn set_device_state(
         &self,
@@ -563,6 +567,14 @@ impl DeviceControlMcpServer {
                 Err(e) => return Ok(guidance(format!("Couldn't {operation} '{device_id}': {e}"))),
             }
         }
+        if let Some(open) = p.tilt {
+            let pct = open.min(100);
+            match self.control.set_tilt(device_id, pct).await {
+                Ok(_) => applied.push(format!("tilt={pct}% open")),
+                Err(e) => return Ok(guidance(format!("Couldn't tilt '{device_id}': {e}"))),
+            }
+        }
+
         if let Some(open) = p.position {
             let pct = open.min(100);
             match self.control.set_position(device_id, pct).await {

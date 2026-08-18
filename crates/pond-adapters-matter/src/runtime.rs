@@ -636,6 +636,13 @@ impl DeviceControlPort for SwitchableDeviceControl {
             .await
     }
 
+    async fn set_tilt(&self, device_id: &str, percent_open: u8) -> Result<DeviceControlOutcome> {
+        self.backend_for(device_id)
+            .await?
+            .set_tilt(device_id, percent_open)
+            .await
+    }
+
     async fn set_position(
         &self,
         device_id: &str,

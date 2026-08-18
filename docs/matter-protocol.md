@@ -108,6 +108,7 @@ Exactly GIAP's `DeviceControlPort` vocabulary:
 | `fan_speed` | 0–100 | `fan_speed`, `on` |
 | `fan_mode` | `off`/`low`/`medium`/`high`/`on`/`auto`/`smart` | `fan_mode`, `on` |
 | `position` | 0–100 percent **open** | `position` |
+| `tilt` | 0–100 percent **open** | `tilt` |
 | `mode` | `{setting, value}`, both as the device words them | `mode` |
 | `operation` | one of the operations the device offers | `operation` |
 
@@ -146,6 +147,14 @@ condition it is true of, and where the device still reaches beyond it. Stated ba
 the number reads as a fact about the device, so the same question minutes apart
 answers 7 to 23.5 and then 7 to 32 with nothing to explain either, and a reader
 concludes 30 is impossible when it is one mode away.
+
+`tilt` is a covering's second axis, not a variant of `position`. Lift is how far a
+blind is lowered and tilt is how far its slats are turned, and a venetian blind is
+routinely down with its slats open — which `position` alone cannot ask for. Offered
+only by a covering that reports a tilt position, since a roller blind has nothing to
+turn and a control a device will reject is the failure this area exists to stop.
+Zero is open on both axes: the spec has `GoToTiltPercentage` treat a zero percentage
+as `UpOrOpen`, so one conversion serves both.
 
 `target_temp` also carries an appliance's own setpoint. Temperature Control has two
 shapes: a washer names levels, which are read as a `mode`, while a dishwasher states

@@ -113,6 +113,19 @@ export function stateOf(node: NodeSnapshot): DeviceState {
     );
   }
 
+  // The slat angle, read the same way and reported under the name that sets it.
+  const tilt = numberAt(node, CLUSTER_WINDOW_COVERING, "currentPositionTiltPercent100ths");
+  if (tilt !== undefined) {
+    const target = numberAt(node, CLUSTER_WINDOW_COVERING, "targetPositionTiltPercent100ths");
+    const here = `${lift100thsToPositionOpen(tilt)}% open`;
+    add(
+      "tilt",
+      target === undefined || target === tilt
+        ? here
+        : `${here}, turning to ${lift100thsToPositionOpen(target)}% open`,
+    );
+  }
+
   // Selectable settings, named exactly as `describe` names them and as `control`
   // takes them, each carrying the label the device chose for its current value.
   for (const setting of settingsOf(node)) {

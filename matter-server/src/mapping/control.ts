@@ -34,6 +34,7 @@ export const VERBS: ReadonlySet<string> = new Set<Verb>([
   "fan_speed",
   "fan_mode",
   "position",
+  "tilt",
   "mode",
   "operation",
 ]);
@@ -301,6 +302,30 @@ export function planControl(
           { kind: "write", endpoint: setpoint.endpoint, cluster: CLUSTER_THERMOSTAT, attribute: setpoint.attribute, value: celsiusToSetpoint(value) },
         ],
         applied: { target_temp: value },
+      };
+    }
+
+    case "tilt": {
+      // A covering's second axis: how far the slats are turned, independent of how
+      // far the blind is raised. A venetian blind is routinely down with its slats
+      // open, which `position` alone cannot ask for.
+      //
+      // Same convention as lift, and the spec is explicit about it: zero is treated
+      // as UpOrOpen. So GIAP speaks percent OPEN here too, and the same conversion
+      // serves both.
+      const pct = asPercent(value, "tilt");
+      const endpoint = endpointFor(node, CLUSTER_WINDOW_COVERING, deviceId);
+      return {
+        actions: [
+          {
+            kind: "command",
+            endpoint,
+            cluster: CLUSTER_WINDOW_COVERING,
+            command: "goToTiltPercentage",
+            payload: { tiltPercent100thsValue: positionOpenToLift100ths(pct) },
+          },
+        ],
+        applied: { tilt: pct },
       };
     }
 
