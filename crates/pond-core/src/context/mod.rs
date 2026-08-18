@@ -32,6 +32,7 @@
 //! [`RawItem`]: ingest::RawItem
 
 pub mod bus_ingest;
+pub mod chunking;
 pub mod domain;
 pub mod index_maintenance;
 pub mod ingest;
