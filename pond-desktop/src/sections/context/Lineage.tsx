@@ -21,12 +21,16 @@
 // `sqlite_memory` never implements. Drawing an empty DAG as though it were a
 // sparse one would be inventing a picture. It is reported as absent instead.
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
+import { RefreshCw } from "lucide-react";
+import { api } from "../../api/PondApiClient";
 import type { ContextIndexHealth, MemoryFragment } from "../../api/types";
 
 interface Props {
   memories: MemoryFragment[];
   health: ContextIndexHealth | null;
+  /** Re-read what the pond holds after a rebuild clears the index. */
+  onRebuilt?: () => void;
 }
 
 interface Chain {
@@ -79,7 +83,32 @@ function buildChains(memories: MemoryFragment[]): {
   };
 }
 
-export function Lineage({ memories, health }: Props) {
+export function Lineage({ memories, health, onRebuilt }: Props) {
+  const [rebuilding, setRebuilding] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
+
+  /** Clear every vector so the sweep reads everything again. */
+  async function rebuild() {
+    setRebuilding(true);
+    setNote(null);
+    try {
+      const r = await api.rebuildContextIndex();
+      // The route only CLEARS -- refilling is the idle sweep's job, and it is
+      // deferred, so promising "reindexed" would be a promise about something
+      // that has not happened yet.
+      setNote(
+        r.cleared === 0
+          ? "Nothing was indexed, so there was nothing to clear."
+          : `Cleared ${r.cleared} entries. The pond reads them again in the background; this page will fill back in.`,
+      );
+      onRebuilt?.();
+    } catch (e) {
+      setNote(e instanceof Error ? e.message : "Could not start a rebuild.");
+    } finally {
+      setRebuilding(false);
+    }
+  }
+
   const { chains, orphaned, deepest } = useMemo(() => buildChains(memories), [memories]);
 
   const live = memories.filter((m) => !m.lifecycle || m.lifecycle === "active");
@@ -157,7 +186,19 @@ export function Lineage({ memories, health }: Props) {
       )}
 
       <section className="lin__vectors">
-        <h2 className="lin__h">Searchable by meaning</h2>
+        <div className="lin__vectorsHead">
+          <h2 className="lin__h">Searchable by meaning</h2>
+          <button
+            type="button"
+            className="lin__rebuild"
+            onClick={() => void rebuild()}
+            disabled={rebuilding}
+          >
+            <RefreshCw size={14} className={rebuilding ? "connections-spin" : undefined} />
+            <span>{rebuilding ? "Clearing" : "Read everything again"}</span>
+          </button>
+        </div>
+        {note && <p className="lin__note">{note}</p>}
         {!health || !health.indexed ? (
           <p className="lin__empty">
             {health?.reason ??

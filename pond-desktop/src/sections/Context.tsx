@@ -318,7 +318,9 @@ export function Context() {
 
       {view === "sources" && <ConnectionsPanel sessionId={sessionId} />}
 
-      {view === "lineage" && <Lineage memories={memories} health={health} />}
+      {view === "lineage" && (
+        <Lineage memories={memories} health={health} onRebuilt={() => void load()} />
+      )}
     </div>
   );
 }

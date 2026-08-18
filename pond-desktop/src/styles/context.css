@@ -488,3 +488,28 @@
 }
 .coll__with { margin: 0; font-size: 12px; color: var(--color-text-secondary); }
 .coll__pending { margin: 0; font-size: 12px; color: var(--color-warning-fg); }
+
+.lin__vectorsHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.lin__rebuild {
+  font: inherit;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--radius-md, 8px);
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-surface);
+  color: var(--color-text);
+  cursor: pointer;
+}
+.lin__rebuild:hover:not(:disabled) { border-color: var(--color-accent); }
+.lin__rebuild:disabled { opacity: 0.5; cursor: not-allowed; }
+.lin__rebuild:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 1px; }
