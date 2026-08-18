@@ -3,19 +3,25 @@
 //! The sibling of `pond-adapters-caldav` and bound by the same rules, with one
 //! extra restriction that is the whole design:
 //!
-//! **Subjects, senders and dates. Never bodies.** PAI-8 §3 says so, and the
-//! reason is volume as much as privacy: a household's mail is hundreds of items
-//! a week against a calendar's tens, and admitting bodies takes the corpus out
-//! of the brute-force range §1.4 depends on. This crate never issues a `FETCH
-//! BODY`, and a test walks its own source to prove it.
+//! **Subjects, senders, dates AND bodies** — the bodies chunked, so a passage
+//! is what gets embedded rather than a whole message. A single vector over an
+//! entire email describes its signature block as much as its point; that is
+//! the problem chunking exists to solve, and solving it is what makes bodies
+//! affordable. The volume argument in §1.4 was about VECTOR count and holds
+//! fine: ~1,300 messages at a few passages each is a few thousand vectors,
+//! which brute-force cosine crosses in under a millisecond.
+//!
+//! The body is fetched with `BODY.PEEK[TEXT]`, never `BODY[TEXT]`: the latter
+//! sets `\Seen` and would mark a household's mail read merely because the pond
+//! read it. A test pins the PEEK.
 //!
 //! Read-only otherwise, exactly as CalDAV is: no APPEND, no STORE, no flag is
-//! ever set, and the mail is not marked read by looking at it — `BODY.PEEK`
-//! semantics are inherent to `ENVELOPE`, which is one reason to prefer it.
+//! ever set.
 //!
 //! Implicit TLS on 993 only. STARTTLS on 143 begins in the clear and a
 //! downgrade there is invisible to a household, so it is not offered.
 
+mod body;
 mod header;
 mod provider;
 
@@ -176,14 +182,28 @@ impl ImapAdapter {
                 .map(|u| u.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            // ENVELOPE and nothing else. No BODY, no BODYSTRUCTURE, no RFC822.
+            // ENVELOPE for the headers, BODY.PEEK[TEXT] for the words.
+            //
+            // PEEK is the whole of the read-only claim at the fetch level:
+            // plain `BODY[TEXT]` sets \Seen, so reading a mailbox would mark
+            // it read. `EXAMINE` above already refuses flag changes, so this is
+            // the belt to that braces — and the one a future edit is most
+            // likely to drop by shortening the atom.
             let mut stream = session
-                .fetch(set, "ENVELOPE")
+                .fetch(set, "(ENVELOPE BODY.PEEK[TEXT])")
                 .await
                 .context("the mail server refused the fetch")?;
             while let Some(message) = stream.next().await {
                 let Ok(message) = message else { continue };
-                if let Some(item) = envelope_to_item(message.envelope()) {
+                // The body is the message's own words, cleaned of quoted
+                // replies and signatures — text that belongs to other messages
+                // would otherwise be the most repeated, and therefore most
+                // findable, thing in the mailbox.
+                let body = message
+                    .text()
+                    .map(|raw| crate::body::body_to_text(&String::from_utf8_lossy(raw)))
+                    .unwrap_or_default();
+                if let Some(item) = envelope_to_item(message.envelope(), &body) {
                     items.push(item);
                 }
             }
@@ -199,7 +219,10 @@ impl ImapAdapter {
 /// Skipped rather than defaulted when there is no Message-ID or no date: the
 /// Message-ID is the idempotency key for re-sync, and inventing one re-creates
 /// the mail as a duplicate on every sweep forever.
-fn envelope_to_item(envelope: Option<&async_imap::imap_proto::Envelope<'_>>) -> Option<RawItem> {
+fn envelope_to_item(
+    envelope: Option<&async_imap::imap_proto::Envelope<'_>>,
+    body_text: &str,
+) -> Option<RawItem> {
     let envelope = envelope?;
     let text = |field: &Option<std::borrow::Cow<'_, [u8]>>| -> Option<String> {
         field
@@ -249,7 +272,7 @@ fn envelope_to_item(envelope: Option<&async_imap::imap_proto::Envelope<'_>>) -> 
     // Body is the sentence a person would say, because `embedding_text` is
     // `title\nbody` and this IS the retrieval surface. No message body: PAI-8
     // §3 keeps this to subject, sender and date.
-    let (participants, body) = match sender {
+    let (participants, from_line) = match sender {
         Some((name, address)) => {
             let line = match &address {
                 Some(a) if a != &name => format!("From: {name} <{a}>"),
@@ -258,6 +281,15 @@ fn envelope_to_item(envelope: Option<&async_imap::imap_proto::Envelope<'_>>) -> 
             (vec![name], line)
         }
         None => (Vec::new(), String::new()),
+    };
+    // Sender first so the shortest possible body still says who wrote it, then
+    // the message. `embedding_text` is `title\nbody`, and the body is now
+    // CHUNKED — the subject rides in chunk 0 with the opening lines, which is
+    // where a search for the subject should land.
+    let body = match (from_line.is_empty(), body_text.trim().is_empty()) {
+        (_, true) => from_line,
+        (true, false) => body_text.trim().to_string(),
+        (false, false) => format!("{from_line}\n\n{}", body_text.trim()),
     };
 
     Some(RawItem {
@@ -309,18 +341,23 @@ mod tests {
         assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 
-    /// The design's sharpest line about this connector: subjects, senders and
-    /// dates, never bodies. Stated as a test because it is a volume decision as
-    /// much as a privacy one, and the person who later adds a helpful body
-    /// preview will not read PAI-8 §3 first.
+    /// Reading a mailbox must not change it.
     #[test]
-    fn this_connector_never_asks_for_a_message_body() {
+    fn the_body_fetch_never_marks_mail_as_read() {
         let production = production_code();
-        for forbidden in ["RFC822", "BODY[", "BODYSTRUCTURE", "\"BODY\""] {
+        // Bodies ARE fetched now — chunked and embedded per passage, which is
+        // what a vector store is for. What must never appear is the NON-PEEK
+        // form: `BODY[TEXT]` sets \Seen and marks a household's mail read
+        // merely because the pond looked at it. That is one dropped atom away
+        // from the correct line, so it is pinned.
+        assert!(
+            production.contains("BODY.PEEK[TEXT]"),
+            "the body fetch must use PEEK, or reading the mailbox marks it read"
+        );
+        for forbidden in ["RFC822", "\"BODY[", " BODY[", "BODYSTRUCTURE"] {
             assert!(
                 !production.contains(forbidden),
-                "this connector keeps subjects, senders and dates only (PAI-8 §3), but it \
-                 asks for {forbidden}"
+                "a non-PEEK body fetch sets \\Seen: {forbidden}"
             );
         }
         // And it must never write to the mailbox either.
