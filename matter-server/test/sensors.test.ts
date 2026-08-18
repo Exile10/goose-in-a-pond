@@ -92,4 +92,24 @@ describe("sensor readings", () => {
     const paths = SENSORS.map(s => `${s.cluster}.${s.attribute}`);
     expect(new Set(paths).size).toBe(paths.length);
   });
+  it("reports a reading in the unit the device declared, not the substance's default", () => {
+    // The Matter Virtual Device's air quality sensor declares ozone in ppm, where
+    // the conventional default is ppb, and pm1 in ppm where the default is ug/m3.
+    // describe read the declaration and readings did not, so one device described
+    // ozone in ppm and reported it in ppb at the same moment.
+    const ozone = readingFor(NODE, "ozoneConcentrationMeasurement", "measuredValue", 60, new Date(), 0);
+    expect(ozone?.unit).toBe("ppm");
+
+    const pm1 = readingFor(NODE, "pm1ConcentrationMeasurement", "measuredValue", 200, new Date(), 0);
+    expect(pm1?.unit).toBe("ppm");
+
+    // matter.js may hand the enum over decoded.
+    const named = readingFor(NODE, "ozoneConcentrationMeasurement", "measuredValue", 60, new Date(), "ugm3");
+    expect(named?.unit).toBe("ug/m3");
+
+    // A device that declares nothing keeps the substance's conventional unit,
+    // rather than a unit invented for it.
+    const silent = readingFor(NODE, "ozoneConcentrationMeasurement", "measuredValue", 60);
+    expect(silent?.unit).toBe("ppb");
+  });
 });
