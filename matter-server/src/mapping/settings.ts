@@ -60,6 +60,7 @@ const STANDARD_STATES: Record<number, string> = {
   3: "error",
 };
 const TEMPERATURE_CONTROL = "temperatureControl";
+const THERMOSTAT = "thermostat";
 const LAUNDRY_WASHER_CONTROLS = "laundryWasherControls";
 
 /** `laundryWasherMode` → `laundry washer mode`. The device's own word, made speakable. */
@@ -133,6 +134,43 @@ function modeSetting(endpoint: EndpointSnapshot, cluster: string): Setting | und
   };
 }
 
+/**
+ * A thermostat's system mode: what it is willing to do at all.
+ *
+ * Not ModeBase -- it is a plain enum8 on the Thermostat cluster -- so it is read
+ * explicitly, the same way Temperature Control is. It is also the only thermostat
+ * control a person sees on the device itself, where a setpoint change may show
+ * nowhere: setting one while the mode is Off asks a thermostat that is not running
+ * to aim at something.
+ *
+ * The values are Matter's, with their codes: the list is fixed by the spec rather
+ * than published by the device, which is why this cannot be found by shape. Emergency
+ * heat, precooling and fan-only are omitted -- they are optional, rarely implemented,
+ * and offering a mode a device will reject is the failure this whole area exists to
+ * stop.
+ */
+const SYSTEM_MODES: readonly { label: string; code: number }[] = [
+  { label: "off", code: 0 },
+  { label: "auto", code: 1 },
+  { label: "cool", code: 3 },
+  { label: "heat", code: 4 },
+];
+
+function systemModeSetting(endpoint: EndpointSnapshot): Setting | undefined {
+  const state = endpoint.clusters[THERMOSTAT];
+  // Present but unpopulated is still a thermostat; absent is not one.
+  if (state === undefined || !("systemMode" in state)) return undefined;
+
+  return {
+    name: "system mode",
+    endpoint: endpoint.number,
+    cluster: THERMOSTAT,
+    values: SYSTEM_MODES.map(m => m.label),
+    write: { kind: "attribute", attribute: "systemMode" },
+    valueFor: choice => SYSTEM_MODES.find(m => looseEquals(m.label, choice))?.code,
+  };
+}
+
 /** Temperature Control's level variant: levels named in a parallel array. */
 function temperatureLevelSetting(endpoint: EndpointSnapshot): Setting | undefined {
   const levels = labelsOf(endpoint.clusters[TEMPERATURE_CONTROL]?.["supportedTemperatureLevels"]);
@@ -195,6 +233,8 @@ export function settingsOf(node: NodeSnapshot): Setting[] {
     }
     const temperature = temperatureLevelSetting(endpoint);
     if (temperature !== undefined) settings.push(temperature);
+    const systemMode = systemModeSetting(endpoint);
+    if (systemMode !== undefined) settings.push(systemMode);
     settings.push(...washerControlSettings(endpoint));
   }
 

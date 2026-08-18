@@ -68,6 +68,34 @@ pub struct SensorsMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
+impl SensorsMcpServer {
+    /// The registered id for a device reference, resolved the way every other tool
+    /// resolves one.
+    ///
+    /// A reading was looked up under whatever string the caller passed, so asking
+    /// for the temperature of "Thermostat" -- the device's own name, and the name
+    /// every other tool answers to -- found nothing, while "matter-1" found 20 C.
+    /// The visible symptom was a model reporting no reading, calling list_sensors,
+    /// and asking again with the id to get an answer: right twice, in a way that
+    /// reads as a device flickering in and out of existence.
+    ///
+    /// An unresolvable reference is passed through unchanged, so a caller naming a
+    /// device this registry has never heard of still gets the "no readings yet"
+    /// reply rather than a different error about the name.
+    async fn resolved_device(&self, reference: &str) -> String {
+        match self.device_registry.list_devices().await {
+            Ok(devices) => match crate::device_control::resolve_device(reference, &devices) {
+                crate::device_control::DeviceResolution::Resolved(id) => id,
+                _ => reference.to_string(),
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "sensors: device list unavailable for resolution");
+                reference.to_string()
+            }
+        }
+    }
+}
+
 #[tool_router]
 impl SensorsMcpServer {
     pub fn new(
@@ -124,6 +152,8 @@ impl SensorsMcpServer {
                 "Please provide both `device_id` and `sensor_type` (e.g. device_id='bedroom', sensor_type='temperature').",
             )]));
         };
+
+        let device_id = self.resolved_device(&device_id).await;
 
         match self
             .sensor_storage

@@ -592,7 +592,7 @@ fn guidance(msg: String) -> CallToolResult {
 
 /// Outcome of resolving a user/LLM device reference against the registry.
 #[derive(Debug, PartialEq)]
-enum DeviceResolution {
+pub(crate) enum DeviceResolution {
     /// The registered id to hand to the control backend.
     Resolved(String),
     /// Multiple devices plausibly match — names for a disambiguation prompt.
@@ -619,7 +619,7 @@ fn normalize_reference(input: &str) -> String {
 /// 4. device type ("the light" → the only device_type == "light")
 ///
 /// A unique hit resolves; several hits in the same tier are ambiguous.
-fn resolve_device(input: &str, devices: &[Device]) -> DeviceResolution {
+pub(crate) fn resolve_device(input: &str, devices: &[Device]) -> DeviceResolution {
     let raw = input.trim();
     if let Some(device) = devices.iter().find(|d| d.id == raw) {
         return DeviceResolution::Resolved(device.id.clone());
