@@ -122,4 +122,32 @@ describe("device state", () => {
     expect(valueOf(thermostat, "system mode")).toBe("off");
     expect(valueOf(thermostat, "target_temp")).toBe("12 C");
   });
+  it("says what an enum reading means, in the device's own words", () => {
+    // The purifier's own screen shows "Critical" for a spent filter and "OK" for a
+    // good one. GIAP reported "2 state" and "0 state" -- the same fact with the
+    // meaning removed, which is the whole of what was being asked for.
+    const purifier = node(98, [
+      named("Air Purifier"),
+      endpoint(1, {
+        hepaFilterMonitoring: { condition: 0, changeIndication: 2 },
+        activatedCarbonFilterMonitoring: { condition: 100, changeIndication: 0 },
+      }),
+    ]);
+
+    expect(valueOf(purifier, "hepa_filter_change")).toBe("Critical");
+    expect(valueOf(purifier, "carbon_filter_change")).toBe("OK");
+    // The quantities beside them are unaffected.
+    expect(valueOf(purifier, "hepa_filter_condition")).toBe("0%");
+    expect(valueOf(purifier, "carbon_filter_condition")).toBe("100%");
+  });
+
+  it("keeps the number when a value is outside the enum it knows", () => {
+    // A device reporting something this table has no word for must not be
+    // described as any of the words it does have.
+    const odd = node(99, [
+      named("Purifier"),
+      endpoint(1, { hepaFilterMonitoring: { changeIndication: 7 } }),
+    ]);
+    expect(valueOf(odd, "hepa_filter_change")).toBe("7 state");
+  });
 });

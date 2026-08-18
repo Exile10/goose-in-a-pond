@@ -115,11 +115,22 @@ export function stateOf(node: NodeSnapshot): DeviceState {
   for (const sensor of SENSORS) {
     const raw = endpointWith(node, sensor.cluster)?.clusters[sensor.cluster]?.[sensor.attribute];
     const reading = sensor.read(raw);
+    if (reading === undefined) continue;
+
+    // An enum reading is said in the device's own words. The purifier's screen
+    // shows "Critical" for a spent filter while GIAP reported "2 state", which is
+    // the same fact with the meaning removed -- and the meaning is the whole of
+    // what a person asked for. The number stays in the reading itself, where a
+    // rule threshold compares it.
+    const worded = sensor.words?.[reading];
+    if (worded !== undefined) {
+      add(sensor.sensorType, worded);
+      continue;
+    }
+
     // "50%" for a fan speed and "100 %" for a filter, in one list, reads as two
     // different systems. A percentage closes up; everything else keeps its space.
-    if (reading !== undefined) {
-      add(sensor.sensorType, sensor.unit === "%" ? `${reading}%` : `${reading} ${sensor.unit}`);
-    }
+    add(sensor.sensorType, sensor.unit === "%" ? `${reading}%` : `${reading} ${sensor.unit}`);
   }
 
   return { device_id: deviceIdForNode(node.nodeId), values };
