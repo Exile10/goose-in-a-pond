@@ -44,6 +44,9 @@ pub struct DeviceStatePatch {
     /// Covering position as a 0–100 percentage **open** (100 = fully open).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<u8>,
+    /// Slat angle as a 0–100 percentage **open**, a covering's second axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tilt: Option<u8>,
     /// The named setting that changed, and what it became.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<ModeChange>,
@@ -258,6 +261,15 @@ pub trait DeviceControlPort: Send + Sync {
         _operation: &str,
     ) -> Result<DeviceControlOutcome> {
         anyhow::bail!("device '{device_id}' does not run cycles")
+    }
+
+    /// Set a covering's slat angle, as a 0–100 percentage **open**.
+    ///
+    /// Separate from [`Self::set_position`] because they are separate axes: how far
+    /// a blind is lowered and how far its slats are turned. A venetian blind is
+    /// routinely down with its slats open, and position alone cannot ask for that.
+    async fn set_tilt(&self, device_id: &str, _percent_open: u8) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' does not support tilt")
     }
 
     /// Set a covering (blind/curtain/shade) position, as a 0–100 percentage

@@ -68,6 +68,8 @@ export interface DeviceStatePatch {
   fan_speed?: number;
   fan_mode?: string;
   position?: number;
+  /** Slat angle as a 0-100 percentage OPEN, the covering's second axis. */
+  tilt?: number;
 }
 
 /**
@@ -101,6 +103,7 @@ export type Verb =
   | "fan_speed"
   | "fan_mode"
   | "position"
+  | "tilt"
   /** Choose a named setting: `{setting, value}`, both in the device's own words. */
   | "mode"
   /** start / stop / pause / resume, for a device that runs cycles. */

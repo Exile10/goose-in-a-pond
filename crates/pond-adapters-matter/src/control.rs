@@ -188,6 +188,11 @@ impl DeviceControlPort for MatterDeviceControl {
         self.control(device_id, "operation", json!(operation)).await
     }
 
+    async fn set_tilt(&self, device_id: &str, percent_open: u8) -> Result<DeviceControlOutcome> {
+        self.control(device_id, "tilt", json!(percent_open.min(100)))
+            .await
+    }
+
     async fn set_position(
         &self,
         device_id: &str,
