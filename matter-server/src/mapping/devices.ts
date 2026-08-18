@@ -15,6 +15,7 @@ import {
   type NodeSnapshot,
 } from "./snapshot.js";
 import { operationsOf, settingsOf } from "./settings.js";
+import { applianceSetpoint } from "./thermostat.js";
 
 export const CLUSTER_ON_OFF = "onOff";
 export const CLUSTER_LEVEL_CONTROL = "levelControl";
@@ -105,7 +106,13 @@ function capabilitiesOf(node: NodeSnapshot): string[] {
     capabilities.push("fan_speed");
   }
   if (hasCluster(node, CLUSTER_LEVEL_CONTROL)) capabilities.push("brightness");
-  if (hasCluster(node, CLUSTER_THERMOSTAT)) capabilities.push("temperature");
+  // Either source of a temperature target. Gating on the thermostat alone listed a
+  // dishwasher as "power, mode, operation" while `describe` offered it 49 to 82
+  // degrees -- and the listing is what a model reads before deciding whether to ask
+  // for the description at all, so the fuller answer was never reached.
+  if (hasCluster(node, CLUSTER_THERMOSTAT) || applianceSetpoint(node) !== undefined) {
+    capabilities.push("temperature");
+  }
   if (hasCluster(node, CLUSTER_DOOR_LOCK)) capabilities.push("lock");
 
   // Appliance vocabulary, found the same structural way `settingsOf` finds it rather
