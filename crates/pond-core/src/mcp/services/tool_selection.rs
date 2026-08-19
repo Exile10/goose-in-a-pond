@@ -85,20 +85,27 @@ const MAX_SIGNAL_CHARS: usize = 2000;
 
 /// The texts that represent a session's topic, each scored INDEPENDENTLY.
 ///
-/// Returns the question first, then the standing context, and they must never be
-/// concatenated. A 17-character question ("Check the weather") embedded together
-/// with a kilobyte of memories yields a vector dominated by the memories: the
-/// question's own topic drops below the threshold, nothing clears the bar, and
-/// the top-scorer rescue then hands the session whichever group the *memory
-/// blob* happens to resemble. Observed live — "Check the weather" selected
-/// `giap-schedule` and left `giap-weather` dormant, so the model had no weather
-/// tool at all.
+/// Returns the question first, then the standing context, then the active
+/// skills, and they must never be concatenated. A 17-character question
+/// ("Check the weather") embedded together with a kilobyte of memories
+/// yields a vector dominated by the memories: the question's own topic drops
+/// below the threshold, nothing clears the bar, and the top-scorer rescue
+/// then hands the session whichever group the *memory blob* happens to
+/// resemble. Observed live — "Check the weather" selected `giap-schedule`
+/// and left `giap-weather` dormant, so the model had no weather tool at all.
 ///
 /// Scored separately and combined with `max`, a specific question wins on its own
 /// merits, while a vague opener ("what about tomorrow?") still falls back to the
 /// standing context — which is why the memories were included in the first place.
-pub fn selection_signals(first_message: &str, memories: &str) -> Vec<String> {
-    [first_message, memories]
+///
+/// `skills` is each active user skill's "name: description", one per line.
+/// Without it, an active skill whose instructions call for a non-core group
+/// (e.g. a "task reminder" skill needing `giap-schedule`) would only get that
+/// group when the opening message happened to say so too — the skill telling
+/// the model to call a tool is worthless if the tool's schema was never
+/// selected into the prompt.
+pub fn selection_signals(first_message: &str, memories: &str, skills: &str) -> Vec<String> {
+    [first_message, memories, skills]
         .into_iter()
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -690,7 +697,7 @@ mod tests {
     /// left `giap-weather` dormant.
     #[test]
     fn question_and_memories_are_scored_separately() {
-        let sigs = selection_signals("Check the weather", "- [identity] lives in Nairobi");
+        let sigs = selection_signals("Check the weather", "- [identity] lives in Nairobi", "");
         assert_eq!(sigs.len(), 2);
         assert_eq!(sigs[0], "Check the weather", "the question stands alone");
         assert!(sigs[1].contains("Nairobi"));
@@ -702,15 +709,32 @@ mod tests {
 
     #[test]
     fn an_empty_half_is_dropped_not_embedded() {
-        assert_eq!(selection_signals("hi", "   "), vec!["hi".to_string()]);
-        assert_eq!(selection_signals("  ", "mems"), vec!["mems".to_string()]);
-        assert!(selection_signals(" ", "").is_empty());
+        assert_eq!(
+            selection_signals("hi", "   ", ""),
+            vec!["hi".to_string()]
+        );
+        assert_eq!(
+            selection_signals("  ", "mems", ""),
+            vec!["mems".to_string()]
+        );
+        assert!(selection_signals(" ", "", "").is_empty());
+    }
+
+    #[test]
+    fn skills_signal_is_scored_independently() {
+        let sigs = selection_signals(
+            "hi",
+            "",
+            "task-reminder: Creates reminders using the scheduler",
+        );
+        assert_eq!(sigs.len(), 2);
+        assert!(sigs[1].contains("scheduler"));
     }
 
     #[test]
     fn signals_are_bounded_and_utf8_safe() {
         let memories = "e\u{301}".repeat(4000); // multi-byte, well over the cap
-        let sigs = selection_signals("hi", &memories);
+        let sigs = selection_signals("hi", &memories, "");
         assert_eq!(sigs.len(), 2);
         assert!(sigs[1].len() <= 2001);
         // Truncation must not have split a char — the String is valid by
@@ -782,6 +806,44 @@ mod tests {
             "got {:?}",
             sel.groups
         );
+    }
+
+    /// An active skill's own description is a selection signal in its own
+    /// right: an unrelated opening message plus a skill that needs
+    /// `giap-schedule` still selects `giap-schedule`, because a "task
+    /// reminder" skill telling the model to call a tool is worthless if that
+    /// tool's schema was never in the prompt to begin with.
+    #[test]
+    fn a_skill_signal_selects_its_group_despite_an_unrelated_question() {
+        let avail = available();
+        let question = vec![
+            GroupScore {
+                extension: "giap-schedule".into(),
+                score: 0.03,
+            },
+            GroupScore {
+                extension: "giap-weather".into(),
+                score: 0.02,
+            },
+        ];
+        let skill = vec![
+            GroupScore {
+                extension: "giap-schedule".into(),
+                score: 0.58,
+            },
+            GroupScore {
+                extension: "giap-weather".into(),
+                score: 0.01,
+            },
+        ];
+        let merged = merge_scores(&[question, skill]);
+        let sel = select_groups(&avail, Some(&merged), DEFAULT_RELEVANCE_THRESHOLD);
+        assert!(
+            sel.groups.contains(&"giap-schedule".to_string()),
+            "got {:?}",
+            sel.groups
+        );
+        assert!(!sel.groups.contains(&"giap-weather".to_string()));
     }
 
     #[test]

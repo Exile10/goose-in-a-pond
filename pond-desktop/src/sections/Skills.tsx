@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { Card, CardContent, Button, Input, Switch } from "@heroui/react";
-import { Plus, Trash2, Sparkles, Check } from "lucide-react";
+import { Plus, Trash2, Sparkles, Check, Pencil } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { PageHeader, useConfirm } from "../components/shared";
 import type { UserSkill } from "../api/types";
@@ -10,8 +10,10 @@ export function Skills() {
   const [skills, setSkills] = useState<UserSkill[]>([]);
   const [loading, setLoading] = useState(true);
   const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
   const [content, setContent] = useState("");
   const [showForm, setShowForm] = useState(false);
+  const [editingSkill, setEditingSkill] = useState<UserSkill | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   function load() {
@@ -25,13 +27,35 @@ export function Skills() {
 
   useEffect(() => { load(); }, []);
 
-  async function add() {
-    if (!name.trim() || !content.trim()) return;
+  function resetForm() {
+    setShowForm(false);
+    setEditingSkill(null);
+    setName("");
+    setDescription("");
+    setContent("");
+  }
+
+  function startEdit(s: UserSkill) {
+    setEditingSkill(s);
+    setName(s.name);
+    setDescription(s.description);
+    setContent(s.content);
+    setShowForm(true);
+  }
+
+  async function save() {
+    if (!name.trim() || !description.trim() || !content.trim()) return;
     try {
-      await api.addSkill(name.trim(), content.trim());
-      setName("");
-      setContent("");
-      setShowForm(false);
+      if (editingSkill) {
+        await api.updateSkill(editingSkill.id, {
+          name: name.trim(),
+          description: description.trim(),
+          content: content.trim(),
+        });
+      } else {
+        await api.addSkill(name.trim(), description.trim(), content.trim());
+      }
+      resetForm();
       load();
     } catch (e) {
       setError(String(e));
@@ -65,7 +89,7 @@ export function Skills() {
           <Button
             color="secondary"
             radius="md"
-            onPress={() => setShowForm((v) => !v)}
+            onPress={() => (showForm ? resetForm() : setShowForm(true))}
             startContent={showForm ? undefined : <Plus size={14} />}
           >
             {showForm ? "Cancel" : "Add Skill"}
@@ -77,18 +101,30 @@ export function Skills() {
         <Card className="card">
           <CardContent>
             <div className="skills-form">
+              <h3 className="skills-form__title">{editingSkill ? "Edit skill" : "New skill"}</h3>
               <label htmlFor="skill-name" className="ext-form-label">Skill name</label>
               <Input
                 id="skill-name"
-                placeholder="e.g. Code reviewer"
+                placeholder="e.g. Task Reminder"
                 variant="bordered"
                 radius="md"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
               />
+              <label htmlFor="skill-description" className="ext-form-label">Description</label>
+              <Input
+                id="skill-description"
+                placeholder='When should this activate? e.g. "Creates reminders when asked to be reminded of something"'
+                variant="bordered"
+                radius="md"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+              />
+              <label htmlFor="skill-content" className="ext-form-label">Instructions</label>
               <textarea
+                id="skill-content"
                 className="skills-form__textarea"
-                placeholder="Describe what this skill should do, when it should activate, and any constraints..."
+                placeholder="The full instructions Pond follows once this skill activates..."
                 value={content}
                 onChange={(e) => setContent(e.target.value)}
                 rows={4}
@@ -97,18 +133,18 @@ export function Skills() {
                 <Button
                   variant="light"
                   radius="md"
-                  onPress={() => { setShowForm(false); setName(""); setContent(""); }}
+                  onPress={resetForm}
                 >
                   Cancel
                 </Button>
                 <Button
                   color="secondary"
                   radius="md"
-                  onPress={add}
-                  isDisabled={!name.trim() || !content.trim()}
+                  onPress={save}
+                  isDisabled={!name.trim() || !description.trim() || !content.trim()}
                   startContent={<Check size={14} />}
                 >
-                  Save skill
+                  {editingSkill ? "Update skill" : "Save skill"}
                 </Button>
               </div>
             </div>
@@ -142,7 +178,7 @@ export function Skills() {
                 <div className="skill-row__main">
                   <div className="skill-row__name">{s.name}</div>
                   <div className="skill-row__instr">
-                    {s.content || <span className="muted">No instructions</span>}
+                    {s.description || <span className="muted">No description</span>}
                   </div>
                 </div>
                 <Switch
@@ -152,6 +188,15 @@ export function Skills() {
                   onValueChange={() => toggle(s.id, s.active)}
                   aria-label={`Enable ${s.name}`}
                 />
+                <Button
+                  isIconOnly
+                  size="sm"
+                  variant="light"
+                  onPress={() => startEdit(s)}
+                  aria-label={`Edit ${s.name}`}
+                >
+                  <Pencil size={14} />
+                </Button>
                 <Button
                   isIconOnly
                   size="sm"

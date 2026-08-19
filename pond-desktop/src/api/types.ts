@@ -431,6 +431,8 @@ export interface Schedule {
   name: string;
   label?: string;
   cron: string;
+  /** Set when this schedule is a one-shot: fires once at this instant, then never again. */
+  fire_at?: string | null;
   prompt: string;
   enabled: boolean;
   timezone?: string;
@@ -602,6 +604,7 @@ export interface ContextIndexRebuild {
 export interface UserSkill {
   id: string;
   name: string;
+  description: string;
   content: string;
   active: boolean;    // backend field name
   enabled?: boolean;  // alias — some code uses this; prefer active

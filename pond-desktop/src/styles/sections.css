@@ -1913,10 +1913,11 @@
 
 /* ─── Skills ─── */
 .skills-form { display: flex; flex-direction: column; gap: 12px; }
+.skills-form__title { font-family: var(--font-heading); font-weight: 700; font-size: 16px; margin: 0; }
 .skills-form__actions { display: flex; justify-content: flex-end; gap: 8px; }
 .skill-row {
   display: grid;
-  grid-template-columns: auto 1fr auto auto;
+  grid-template-columns: auto 1fr auto auto auto;
   align-items: center;
   gap: 12px;
   padding: 12px;
@@ -4926,6 +4927,15 @@
   padding-top: 6px;
   margin-top: 6px;
 }
+
+.sched-cal__popover-edit {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 12px; font-weight: 600; color: var(--color-text-secondary);
+  background: none; border: none; cursor: pointer; padding: 4px 8px;
+  margin-top: 6px; border-radius: var(--radius-sm); font-family: var(--font-body);
+  transition: background 0.12s, color 0.12s;
+}
+.sched-cal__popover-edit:hover { background: var(--grey-100); color: var(--color-text); }
 
 /* View toggle button group in page header */
 .view-toggle {
