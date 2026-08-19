@@ -345,8 +345,12 @@ enum SkillAction {
     },
     /// Add a new skill (reads content from --content or stdin)
     Add {
-        /// Unique skill slug (e.g. "morning_brief", "light_control")
+        /// Unique skill name (e.g. "Morning Briefing", "Light Control")
         name: String,
+        /// Short description of what the skill does and when it applies.
+        /// Always visible to the model, so keep it brief.
+        #[arg(long, default_value = "")]
+        description: String,
         /// Markdown instruction content. Omit to read from stdin.
         #[arg(long)]
         content: Option<String>,
@@ -2952,6 +2956,8 @@ async fn run_server(
             session_storage.clone(),
             Some(device_control.clone()),
             settings.schedule_max_concurrent,
+            tts.clone(),
+            Some(settings_repo.clone()),
         ));
         deferred_executor
             .init(
@@ -8526,7 +8532,11 @@ async fn run_skills_cmd(action: SkillAction) -> Result<()> {
             }
         }
 
-        SkillAction::Add { name, content } => {
+        SkillAction::Add {
+            name,
+            description,
+            content,
+        } => {
             use pond_core::user_data::domain::skill::UserSkill;
 
             let content = match content {
@@ -8547,10 +8557,15 @@ async fn run_skills_cmd(action: SkillAction) -> Result<()> {
             let skill = UserSkill {
                 id: id.clone(),
                 name: name.clone(),
+                description,
                 content,
                 active: true,
                 created_at: chrono::Utc::now().to_rfc3339(),
             };
+            if let Err(e) = skill.validate() {
+                eprintln!("Invalid skill: {e}");
+                std::process::exit(1);
+            }
             repo.create(&skill).await?;
             println!("✓ Skill '{name}' created (id: {id})");
         }

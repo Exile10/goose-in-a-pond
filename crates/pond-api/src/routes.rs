@@ -9020,6 +9020,10 @@ struct ApiCreateScheduleRequest {
     kind: Option<TaskKind>,
     /// Legacy field: `{"webhook_url": "..."}` or `{"prompt": "..."}`.
     payload: Option<serde_json::Value>,
+    /// Fire once at `cron`'s next occurrence instead of recurring — see
+    /// [`pond_core::user_data::ports::scheduler::CreateScheduleRequest::once`].
+    #[serde(default)]
+    once: bool,
 }
 
 /// `POST /api/v1/schedules` — create a new scheduled task.
@@ -9082,6 +9086,7 @@ async fn create_schedule(
 
     let req = CreateScheduleRequest {
         fire_at: None,
+        once: api_req.once,
         id: api_req
             .id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
@@ -9146,6 +9151,8 @@ async fn update_schedule(
         cron: api_req.cron,
         timezone: api_req.timezone,
         kind,
+        fire_at: api_req.fire_at,
+        once: api_req.once,
     };
 
     match scheduler.update_task(&id, req).await {
@@ -9161,6 +9168,14 @@ struct ApiUpdateScheduleRequest {
     cron: Option<String>,
     timezone: Option<String>,
     prompt: Option<String>,
+    /// Fire ONCE at this instant instead of recurring — see
+    /// [`pond_core::user_data::ports::scheduler::UpdateScheduleRequest::fire_at`].
+    #[serde(default)]
+    fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fire once at `cron`'s next occurrence instead of recurring — see
+    /// [`pond_core::user_data::ports::scheduler::UpdateScheduleRequest::once`].
+    #[serde(default)]
+    once: bool,
 }
 
 /// `POST /api/v1/schedules/:id/pause` — pause a scheduled task.
@@ -9440,6 +9455,7 @@ async fn create_rule(
     // handler's — see `SensorTriggerSpec::validate`.
     let create = CreateScheduleRequest {
         fire_at: None,
+        once: false,
         id: req.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
         label: req.name,
         cron: RULE_CRON.to_string(),
@@ -9516,6 +9532,8 @@ async fn update_rule(
         cron: None,
         timezone: None,
         kind: Some(TaskKind::SensorTrigger(req.spec)),
+        fire_at: None,
+        once: false,
     };
     match scheduler.update_task(&id, update).await {
         Ok(task) => match rule_view(&task) {
@@ -12370,6 +12388,8 @@ async fn list_skills(State(state): State<Arc<AppState>>) -> impl axum::response:
 #[derive(Deserialize)]
 struct CreateSkillRequest {
     name: String,
+    #[serde(default)]
+    description: String,
     content: String,
 }
 
@@ -12400,10 +12420,14 @@ async fn create_skill(
     let skill = UserSkill {
         id: Uuid::new_v4().to_string(),
         name: req.name,
+        description: req.description,
         content: req.content,
         active: true,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
+    if let Err(e) = skill.validate() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    }
     match repo.create(&skill).await {
         Ok(()) => (StatusCode::CREATED, Json(json!(skill))).into_response(),
         Err(e) => (
@@ -12416,6 +12440,8 @@ async fn create_skill(
 
 #[derive(Deserialize)]
 struct UpdateSkillRequest {
+    name: Option<String>,
+    description: Option<String>,
     content: Option<String>,
     active: Option<bool>,
 }
@@ -12464,11 +12490,15 @@ async fn update_skill(
     };
     let updated = UserSkill {
         id: existing.id,
-        name: existing.name,
+        name: req.name.unwrap_or(existing.name),
+        description: req.description.unwrap_or(existing.description),
         content: req.content.unwrap_or(existing.content),
         active: req.active.unwrap_or(existing.active),
         created_at: existing.created_at,
     };
+    if let Err(e) = updated.validate() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    }
     match repo.update(&updated).await {
         Ok(()) => Json(json!(updated)).into_response(),
         Err(e) => (
