@@ -42,11 +42,15 @@ export function NowPlaying({ variant = "bar" }: NowPlayingProps) {
             : `linear-gradient(135deg,hsl(${np.hue},60%,58%),hsl(${np.hue + 40},55%,42%))`,
         }}
       >
-        <HubIco
-          d={errored ? HP_PATHS.alert : HP_PATHS.music}
-          size={variant === "tile" ? 26 : 18}
-          color="rgba(255,255,255,.9)"
-        />
+        {!errored && np.albumArt ? (
+          <img className="np__artImg" src={np.albumArt} alt="" />
+        ) : (
+          <HubIco
+            d={errored ? HP_PATHS.alert : HP_PATHS.music}
+            size={variant === "tile" ? 26 : 18}
+            color="rgba(255,255,255,.9)"
+          />
+        )}
       </div>
       <div className="np__info">
         <span className="np__track">{np.track}</span>
