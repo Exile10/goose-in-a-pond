@@ -1915,22 +1915,117 @@
 .skills-form { display: flex; flex-direction: column; gap: 12px; }
 .skills-form__title { font-family: var(--font-heading); font-weight: 700; font-size: 16px; margin: 0; }
 .skills-form__actions { display: flex; justify-content: flex-end; gap: 8px; }
-.skill-row {
-  display: grid;
-  grid-template-columns: auto 1fr auto auto auto;
-  align-items: center;
-  gap: 12px;
-  padding: 12px;
-  border-radius: 10px;
+.skills-form__icons { display: flex; flex-wrap: wrap; gap: 8px; }
+.skills-form__icon-btn {
+  width: 36px; height: 36px; border-radius: 8px;
+  display: grid; place-items: center;
+  background: var(--grey-100); color: var(--grey-600);
+  border: 1px solid transparent; cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
 }
-.skill-row + .skill-row { border-top: 1px solid var(--grey-100); border-radius: 0; }
-.skill-row__icon {
+.skills-form__icon-btn:hover { background: var(--purple-50); color: var(--purple-600); }
+.skills-form__icon-btn--selected {
+  background: var(--purple-50); color: var(--purple-600);
+  border-color: var(--purple-600);
+}
+/* Individual skill cards — the same ink-bordered, hard-shadow, press-down
+   treatment as the chat history wall (`.chist__card`), so a skill reads as a
+   distinct physical object the same way a conversation card does. */
+.skills-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: var(--space-4);
+}
+
+.skill-card {
+  --ink-lift: 4px;
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-4);
+
+  background: var(--color-surface);
+  border: 2px solid var(--color-text);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--ink-lift) var(--ink-lift) 0 var(--border-ink);
+
+  transform: translate(calc(4px - var(--ink-lift)), calc(4px - var(--ink-lift)));
+  transition: transform 160ms cubic-bezier(0.22, 1, 0.36, 1),
+              box-shadow 160ms cubic-bezier(0.22, 1, 0.36, 1),
+              border-color 160ms ease, opacity 160ms ease;
+}
+
+.skill-card:hover { --ink-lift: 7px; border-color: var(--color-accent); }
+
+.skill-card--inactive { opacity: 0.55; }
+
+.skill-card__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.skill-card__icon {
   width: 32px; height: 32px; border-radius: 8px;
   background: var(--purple-50); color: var(--purple-600);
   display: grid; place-items: center;
 }
-.skill-row__name { font-size: var(--text-base); font-weight: var(--weight-semibold); }
-.skill-row__instr { font-size: var(--text-sm); color: var(--grey-600); margin-top: 2px; }
+
+.skill-card__title {
+  font-family: var(--font-heading);
+  font-size: var(--text-md);
+  font-weight: var(--weight-bold);
+  color: var(--color-text);
+  margin: 0;
+}
+
+.skill-card__desc {
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+  color: var(--color-text-tertiary);
+  margin: 0;
+  flex: 1 1 auto;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.skill-card__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-1);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.skill-card:hover .skill-card__actions,
+.skill-card__action-btn:focus-visible {
+  opacity: 1;
+}
+
+.skill-card__action-btn {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+
+.skill-card__action-btn:hover { background: var(--grey-100); color: var(--color-text); }
+
+.skill-card__action-btn--danger:hover {
+  color: var(--color-destructive);
+  background: var(--color-destructive-soft);
+}
 
 /* ─── Logs ─── */
 .logs-toolbar [role="tablist"] {

@@ -12390,7 +12390,13 @@ struct CreateSkillRequest {
     name: String,
     #[serde(default)]
     description: String,
+    #[serde(default = "default_skill_icon")]
+    icon: String,
     content: String,
+}
+
+fn default_skill_icon() -> String {
+    "sparkles".to_string()
 }
 
 async fn create_skill(
@@ -12421,6 +12427,7 @@ async fn create_skill(
         id: Uuid::new_v4().to_string(),
         name: req.name,
         description: req.description,
+        icon: req.icon,
         content: req.content,
         active: true,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -12442,6 +12449,7 @@ async fn create_skill(
 struct UpdateSkillRequest {
     name: Option<String>,
     description: Option<String>,
+    icon: Option<String>,
     content: Option<String>,
     active: Option<bool>,
 }
@@ -12492,6 +12500,7 @@ async fn update_skill(
         id: existing.id,
         name: req.name.unwrap_or(existing.name),
         description: req.description.unwrap_or(existing.description),
+        icon: req.icon.unwrap_or(existing.icon),
         content: req.content.unwrap_or(existing.content),
         active: req.active.unwrap_or(existing.active),
         created_at: existing.created_at,

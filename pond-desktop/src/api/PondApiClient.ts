@@ -722,8 +722,8 @@ export class PondApiClient {
     return this.get(`/api/v1/skills${all ? "?all=true" : ""}`);
   }
 
-  addSkill(name: string, description: string, content: string): Promise<UserSkill> {
-    return this.post("/api/v1/skills", { name, description, content });
+  addSkill(name: string, description: string, content: string, icon = "sparkles"): Promise<UserSkill> {
+    return this.post("/api/v1/skills", { name, description, content, icon });
   }
 
   toggleSkill(id: string, currentEnabled: boolean): Promise<UserSkill> {
@@ -732,7 +732,7 @@ export class PondApiClient {
 
   updateSkill(
     id: string,
-    patch: { name?: string; description?: string; content?: string },
+    patch: { name?: string; description?: string; content?: string; icon?: string },
   ): Promise<UserSkill> {
     return this.put(`/api/v1/skills/${id}`, patch);
   }

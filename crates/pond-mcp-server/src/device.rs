@@ -450,6 +450,7 @@ mod tests {
                 id: "1".to_string(),
                 name: "morning-briefing".to_string(),
                 description: "Summarizes the day each morning.".to_string(),
+                icon: "sparkles".to_string(),
                 content: "Read the calendar and weather, then summarize.".to_string(),
                 active: true,
                 created_at: "2026-01-01T00:00:00Z".to_string(),
