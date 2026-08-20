@@ -70,6 +70,8 @@ export interface NowPlayingData {
   artist: string;
   elapsed: number;
   hue: number;
+  /** Album art URL from Spotify. Absent for the demo/mock state and while idle/errored. */
+  albumArt?: string | null;
   /** Whether Spotify is connected — gates real playback controls vs. the cosmetic demo toggle. */
   connected: boolean;
   playing: boolean;
