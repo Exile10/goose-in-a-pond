@@ -1,6 +1,6 @@
 //! SQLite-backed implementation of `UserSkillRepository`.
 //!
-//! Uses the `user_skills` table in `pond_system.db` (migrations 0011, 0050).
+//! Uses the `user_skills` table in `pond_system.db` (migrations 0011, 0050, 0051).
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -24,6 +24,7 @@ fn row_to_skill(row: &sqlx::sqlite::SqliteRow) -> Result<UserSkill> {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
         description: row.try_get("description")?,
+        icon: row.try_get("icon")?,
         content: row.try_get("content")?,
         active: row.try_get::<i64, _>("active")? != 0,
         created_at: row.try_get("created_at")?,
@@ -34,7 +35,7 @@ fn row_to_skill(row: &sqlx::sqlite::SqliteRow) -> Result<UserSkill> {
 impl UserSkillRepository for SqliteSkillRepository {
     async fn list_active(&self) -> Result<Vec<UserSkill>> {
         let rows = sqlx::query(
-            "SELECT id, name, description, content, active, created_at \
+            "SELECT id, name, description, icon, content, active, created_at \
              FROM user_skills WHERE active = 1 ORDER BY name ASC",
         )
         .fetch_all(&self.pool)
@@ -45,7 +46,7 @@ impl UserSkillRepository for SqliteSkillRepository {
 
     async fn list_all(&self) -> Result<Vec<UserSkill>> {
         let rows = sqlx::query(
-            "SELECT id, name, description, content, active, created_at \
+            "SELECT id, name, description, icon, content, active, created_at \
              FROM user_skills ORDER BY name ASC",
         )
         .fetch_all(&self.pool)
@@ -56,7 +57,7 @@ impl UserSkillRepository for SqliteSkillRepository {
 
     async fn get(&self, id: &str) -> Result<Option<UserSkill>> {
         let rows = sqlx::query(
-            "SELECT id, name, description, content, active, created_at \
+            "SELECT id, name, description, icon, content, active, created_at \
              FROM user_skills WHERE id = ?",
         )
         .bind(id)
@@ -68,7 +69,7 @@ impl UserSkillRepository for SqliteSkillRepository {
 
     async fn get_by_name(&self, name: &str) -> Result<Option<UserSkill>> {
         let rows = sqlx::query(
-            "SELECT id, name, description, content, active, created_at \
+            "SELECT id, name, description, icon, content, active, created_at \
              FROM user_skills WHERE name = ? AND active = 1",
         )
         .bind(name)
@@ -80,12 +81,13 @@ impl UserSkillRepository for SqliteSkillRepository {
 
     async fn create(&self, skill: &UserSkill) -> Result<()> {
         sqlx::query(
-            "INSERT INTO user_skills (id, name, description, content, active, created_at) \
-             VALUES (?, ?, ?, ?, ?, datetime('now'))",
+            "INSERT INTO user_skills (id, name, description, icon, content, active, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
         )
         .bind(&skill.id)
         .bind(&skill.name)
         .bind(&skill.description)
+        .bind(&skill.icon)
         .bind(&skill.content)
         .bind(skill.active as i64)
         .execute(&self.pool)
@@ -95,10 +97,12 @@ impl UserSkillRepository for SqliteSkillRepository {
 
     async fn update(&self, skill: &UserSkill) -> Result<()> {
         sqlx::query(
-            "UPDATE user_skills SET name = ?, description = ?, content = ?, active = ? WHERE id = ?",
+            "UPDATE user_skills SET name = ?, description = ?, icon = ?, content = ?, active = ? \
+             WHERE id = ?",
         )
         .bind(&skill.name)
         .bind(&skill.description)
+        .bind(&skill.icon)
         .bind(&skill.content)
         .bind(skill.active as i64)
         .bind(&skill.id)

@@ -351,6 +351,9 @@ enum SkillAction {
         /// Always visible to the model, so keep it brief.
         #[arg(long, default_value = "")]
         description: String,
+        /// Icon key from the desktop app's skill-icon set (cosmetic only).
+        #[arg(long, default_value = "sparkles")]
+        icon: String,
         /// Markdown instruction content. Omit to read from stdin.
         #[arg(long)]
         content: Option<String>,
@@ -8535,6 +8538,7 @@ async fn run_skills_cmd(action: SkillAction) -> Result<()> {
         SkillAction::Add {
             name,
             description,
+            icon,
             content,
         } => {
             use pond_core::user_data::domain::skill::UserSkill;
@@ -8558,6 +8562,7 @@ async fn run_skills_cmd(action: SkillAction) -> Result<()> {
                 id: id.clone(),
                 name: name.clone(),
                 description,
+                icon,
                 content,
                 active: true,
                 created_at: chrono::Utc::now().to_rfc3339(),

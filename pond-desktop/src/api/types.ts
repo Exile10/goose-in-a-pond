@@ -605,6 +605,8 @@ export interface UserSkill {
   id: string;
   name: string;
   description: string;
+  /** Icon key from SKILL_ICONS (Skills.tsx) — cosmetic only. */
+  icon: string;
   content: string;
   active: boolean;    // backend field name
   enabled?: boolean;  // alias — some code uses this; prefer active

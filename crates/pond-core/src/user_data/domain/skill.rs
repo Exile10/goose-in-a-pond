@@ -19,6 +19,11 @@ pub struct UserSkill {
     /// Short natural-language description of what the skill is for and when it
     /// applies. Always visible to the model, so it must stay small.
     pub description: String,
+    /// Icon key from the frontend's curated skill-icon set (e.g. "bell",
+    /// "clock"). Purely cosmetic — the model never sees it. Unrecognised
+    /// values fall back to a default icon client-side, so this is never
+    /// validated against a fixed list here.
+    pub icon: String,
     /// Markdown instruction content, loaded into context on demand.
     pub content: String,
     /// Whether this skill is currently active.
