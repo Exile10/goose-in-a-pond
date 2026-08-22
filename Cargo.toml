@@ -126,6 +126,7 @@ bytes = "1"
 # which resolves to rand_core 0.6 and so matches pond-infra's pinned rand 0.8.
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 # Must track the croner that `tokio-cron-scheduler` resolves, because both parse
 # the same stored expression for different purposes: this one computes the
 # `next_run` the UI shows, the scheduler's decides when the job actually fires.

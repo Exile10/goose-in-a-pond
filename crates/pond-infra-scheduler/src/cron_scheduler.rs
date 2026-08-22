@@ -10,7 +10,9 @@ use crate::run_history::JsonRunHistory;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use pond_core::user_data::domain::schedule::{RunStatus, Schedule, ScheduleRun, TaskKind};
+use pond_core::user_data::domain::schedule::{
+    RunStatus, Schedule, ScheduleRun, TaskKind, CRON_ONCE,
+};
 use pond_core::user_data::ports::schedule_execution::ScheduleExecutor;
 use pond_core::user_data::ports::scheduler::{
     CreateScheduleRequest, SchedulerPort, UpdateScheduleRequest,
@@ -240,13 +242,23 @@ impl CronSchedulerAdapter {
             }
 
             // A paused task and an event-triggered rule (#92) both load with
-            // no cron job -- the nil id is what "no job" means for either.
+            // no cron job -- the nil id is what "no job" means for either. A
+            // one-shot's stored `cron` is the `"@once"` sentinel — parsing it
+            // as cron here (rather than checking `fire_at` first, same as
+            // `create_task`) takes down the WHOLE scheduler on this record
+            // alone: `?` on a `ParseSchedule` error fails this loop, which
+            // fails `rehydrate()`, which fails the constructor, which is why
+            // `pond-server` logs "scheduler init failed" and every schedule
+            // endpoint answers 503 — for every household schedule, not just
+            // the one-shot that caused it.
             let job_id = if record.paused {
                 uuid::Uuid::nil()
             } else {
                 let kind = record.kind.clone().unwrap();
                 if kind.is_event_triggered() {
                     uuid::Uuid::nil()
+                } else if let Some(at) = record.fire_at {
+                    self.add_one_shot_to_scheduler(&record.id, at, kind).await?
                 } else {
                     self.add_job_to_scheduler(&record.id, &record.cron, kind)
                         .await?
@@ -416,15 +428,23 @@ impl CronSchedulerAdapter {
     }
 }
 
-/// Compute the next fire time for a cron expression from now.
+/// Compute the next fire time for a cron expression from now, in the given
+/// IANA timezone.
 ///
 /// Returns `None` if the cron expression is invalid or no upcoming occurrence
-/// can be found within a reasonable search window.
+/// can be found within a reasonable search window. An unparseable timezone
+/// falls back to UTC, same as `PersistedTask`'s own default.
 ///
-/// Note: `_timezone` is accepted for future use but computation is done in UTC.
-/// The cron expression is evaluated against UTC; the scheduler job itself
-/// handles timezone-correct firing via `tokio-cron-scheduler`.
-fn compute_next_run(cron_expr: &str, _timezone: &str) -> Option<chrono::DateTime<Utc>> {
+/// This used to ignore `timezone` — "9" in a stored cron was read as 9am UTC
+/// regardless of the schedule's own zone. That was a display-only quirk while
+/// this only fed the `next_run` estimate (the real fire time came from
+/// `tokio-cron-scheduler`'s own timezone-correct engine, via
+/// `add_job_to_scheduler`). It stopped being display-only the moment a
+/// one-shot's `fire_at` started being DERIVED from this function's answer
+/// (`once: true`, see `create_task`/`update_task`): that instant is the one
+/// that actually gets scheduled, so "Once" at 14:00 Africa/Nairobi was firing
+/// at 14:00 UTC — three hours off what was on screen.
+fn compute_next_run(cron_expr: &str, timezone: &str) -> Option<chrono::DateTime<Utc>> {
     // tokio-cron-scheduler uses 6-field cron (sec min hour dom month dow), and
     // both 5- and 6-field expressions have to parse. croner 3 makes that the
     // default — `Seconds::Optional` — so the explicit `.with_seconds_optional()`
@@ -432,11 +452,13 @@ fn compute_next_run(cron_expr: &str, _timezone: &str) -> Option<chrono::DateTime
     //
     // This must stay on the same croner MAJOR as the one inside
     // `tokio-cron-scheduler`: that copy decides when the job actually fires,
-    // this one decides the `next_run` the UI promises. They were 2.x and 3.x.
+    // this one decides the `next_run` the UI promises (and, for a one-shot,
+    // the instant that actually fires). They were 2.x and 3.x.
     let cron: croner::Cron = cron_expr.parse().ok()?;
-    let now = Utc::now();
+    let tz: chrono_tz::Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
+    let now = Utc::now().with_timezone(&tz);
     match cron.find_next_occurrence(&now, false) {
-        Ok(dt) => Some(dt),
+        Ok(dt) => Some(dt.with_timezone(&Utc)),
         Err(e) => {
             tracing::debug!(
                 cron_expr,
@@ -699,17 +721,44 @@ impl SchedulerPort for CronSchedulerAdapter {
             }
         }
 
+        // `once` is an alternate way to arrive at `fire_at`: instead of the
+        // caller supplying an absolute instant, it supplies a normal cron
+        // expression and asks for that expression's NEXT occurrence, fired
+        // once. Resolved here, once, so everything below only ever has to
+        // reason about `fire_at` — the single source of truth for "is this a
+        // one-shot" — exactly as it already did for the explicit-instant path
+        // (e.g. the `set_timer` MCP tool).
+        let fire_at = req.fire_at.or_else(|| {
+            if req.once {
+                compute_next_run(&req.cron, &req.timezone)
+            } else {
+                None
+            }
+        });
+        if req.fire_at.is_none() && req.once && fire_at.is_none() {
+            bail!(
+                "cannot create a one-shot: '{}' is not a valid cron expression \
+                 to derive a next occurrence from",
+                req.cron
+            );
+        }
+        let cron = if fire_at.is_some() {
+            CRON_ONCE.to_string()
+        } else {
+            req.cron.clone()
+        };
+
         let record = PersistedTask {
             id: req.id.clone(),
             label: req.label.clone(),
-            cron: req.cron.clone(),
+            cron: cron.clone(),
             timezone: req.timezone.clone(),
             kind: Some(req.kind.clone()),
             payload: None,
             paused: false,
             created_at: Some(Utc::now()),
             last_run: None,
-            fire_at: req.fire_at,
+            fire_at,
         };
 
         // Event-triggered rules (#92) never register a cron job — the rules
@@ -722,26 +771,26 @@ impl SchedulerPort for CronSchedulerAdapter {
         // "no cron job", same as the paused state.
         let job_id = if req.kind.is_event_triggered() {
             uuid::Uuid::nil()
-        } else if let Some(at) = req.fire_at {
+        } else if let Some(at) = fire_at {
             self.add_one_shot_to_scheduler(&req.id, at, req.kind.clone())
                 .await?
         } else {
-            self.add_job_to_scheduler(&req.id, &req.cron, req.kind.clone())
+            self.add_job_to_scheduler(&req.id, &cron, req.kind.clone())
                 .await?
         };
 
         let next_run = if req.kind.is_event_triggered() {
             None
-        } else if let Some(at) = req.fire_at {
+        } else if let Some(at) = fire_at {
             Some(at)
         } else {
-            compute_next_run(&req.cron, &req.timezone)
+            compute_next_run(&cron, &req.timezone)
         };
         let schedule = Schedule {
             id: req.id.clone(),
             label: req.label,
-            cron: req.cron,
-            fire_at: req.fire_at,
+            cron,
+            fire_at,
             timezone: req.timezone,
             kind: req.kind,
             last_run: None,
@@ -942,10 +991,21 @@ impl SchedulerPort for CronSchedulerAdapter {
         if let Some(kind) = &req.kind {
             validate_kind(kind)?;
         }
-        let cron_changed = req.cron.is_some();
 
-        // Read current state and apply non-cron changes first.
-        let (old_job_id, new_cron, new_kind, was_paused) = {
+        // `fire_at` and `cron` are mutually exclusive shapes, mirroring
+        // `CreateScheduleRequest`: providing `fire_at` (explicit or, via
+        // `once`, derived from `cron`'s next occurrence) converts the
+        // schedule to a one-shot (cron becomes the `"@once"` sentinel, never
+        // parsed); providing a real `cron` without `fire_at`/`once` converts
+        // it back to recurring, clearing any previously stored one-shot
+        // instant. Without this, a schedule edited from "Daily" to "Once" in
+        // the UI kept its old recurring cron forever — the picker had
+        // nowhere to put "once" that survived a round trip through
+        // `parseCronToConfig`.
+        let shape_changed = req.cron.is_some() || req.fire_at.is_some() || req.once;
+
+        // Read current state and apply non-shape changes first.
+        let (old_job_id, new_cron, new_fire_at, new_kind, was_paused) = {
             let mut guard = self.tasks.lock().await;
             let entry = guard
                 .get_mut(id)
@@ -963,32 +1023,54 @@ impl SchedulerPort for CronSchedulerAdapter {
 
             let old_job_id = entry.job_id;
             let paused = entry.persisted.paused;
-            // Use the NEW cron for scheduling but don't commit it to metadata yet.
-            let cron = req.cron.as_ref().unwrap_or(&entry.persisted.cron).clone();
+            // Use the NEW shape for scheduling but don't commit it to metadata yet.
+            let (cron, fire_at) = if let Some(at) = req.fire_at {
+                (CRON_ONCE.to_string(), Some(at))
+            } else if req.once {
+                let basis_cron = req.cron.as_deref().unwrap_or(&entry.persisted.cron);
+                let basis_tz = req.timezone.as_deref().unwrap_or(&entry.persisted.timezone);
+                let at = compute_next_run(basis_cron, basis_tz).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cannot switch '{id}' to a one-shot: '{basis_cron}' is not a valid \
+                         cron expression to derive a next occurrence from"
+                    )
+                })?;
+                (CRON_ONCE.to_string(), Some(at))
+            } else if let Some(cron) = &req.cron {
+                (cron.clone(), None)
+            } else {
+                (entry.persisted.cron.clone(), entry.persisted.fire_at)
+            };
             let kind = Self::resolve_kind(entry);
-            (old_job_id, cron, kind, paused)
+            (old_job_id, cron, fire_at, kind, paused)
         };
 
-        // If the cron changed and the schedule is active, reschedule the job.
+        // If the schedule's shape changed and it is active, reschedule the job.
         // Create the new job FIRST — if it fails (e.g. invalid cron), the old job
-        // stays active and the schedule keeps running with the previous cron.
-        if cron_changed && !was_paused {
-            let new_job_id = self.add_job_to_scheduler(id, &new_cron, new_kind).await?;
+        // stays active and the schedule keeps running with the previous shape.
+        if shape_changed && !was_paused {
+            let new_job_id = if let Some(at) = new_fire_at {
+                self.add_one_shot_to_scheduler(id, at, new_kind).await?
+            } else {
+                self.add_job_to_scheduler(id, &new_cron, new_kind).await?
+            };
             // New job created successfully — now safe to remove the old one and commit
-            // the cron change to in-memory metadata.
+            // the shape change to in-memory metadata.
             if old_job_id != uuid::Uuid::nil() {
                 let _ = self.scheduler.remove(&old_job_id).await;
             }
             let mut guard = self.tasks.lock().await;
             if let Some(entry) = guard.get_mut(id) {
                 entry.persisted.cron = new_cron;
+                entry.persisted.fire_at = new_fire_at;
                 entry.job_id = new_job_id;
             }
-        } else if cron_changed && was_paused {
-            // Schedule is paused — just update the stored cron (no active job to replace).
+        } else if shape_changed && was_paused {
+            // Schedule is paused — just update the stored shape (no active job to replace).
             let mut guard = self.tasks.lock().await;
             if let Some(entry) = guard.get_mut(id) {
                 entry.persisted.cron = new_cron;
+                entry.persisted.fire_at = new_fire_at;
             }
         }
 
@@ -1074,6 +1156,7 @@ mod tests {
             label: format!("Test task {id}"),
             cron: cron.to_string(),
             fire_at: None,
+            once: false,
             timezone: "UTC".to_string(),
             kind: TaskKind::AgentPrompt {
                 prompt: "Hello".to_string(),
@@ -1270,6 +1353,24 @@ mod tests {
         assert!(next.is_none(), "invalid cron should return None");
     }
 
+    /// The bug a real household hit: "14:00" in a schedule's own timezone was
+    /// being read as 14:00 UTC. Harmless while this only fed a display
+    /// estimate; wrong the moment it also derives a one-shot's `fire_at`.
+    #[test]
+    fn compute_next_run_honors_the_schedules_own_timezone() {
+        // 14:00 in Africa/Nairobi (UTC+3, no DST) is 11:00 UTC.
+        let next = super::compute_next_run("0 0 14 * * *", "Africa/Nairobi")
+            .expect("valid cron should produce a next_run");
+        assert_eq!(next.format("%H:%M").to_string(), "11:00", "{next}");
+    }
+
+    #[test]
+    fn compute_next_run_falls_back_to_utc_for_an_unrecognised_timezone() {
+        let next = super::compute_next_run("0 0 14 * * *", "Not/A/Zone")
+            .expect("an unparseable timezone must not make an otherwise-valid cron unparseable");
+        assert_eq!(next.format("%H:%M").to_string(), "14:00", "{next}");
+    }
+
     #[tokio::test]
     async fn update_task_changes_fields() {
         use pond_core::user_data::ports::scheduler::UpdateScheduleRequest;
@@ -1290,6 +1391,8 @@ mod tests {
                     cron: Some("0 30 9 * * *".to_string()),
                     timezone: Some("Africa/Nairobi".to_string()),
                     kind: None,
+                    fire_at: None,
+                    once: false,
                 },
             )
             .await
@@ -1303,6 +1406,138 @@ mod tests {
             TaskKind::AgentPrompt { prompt } => assert_eq!(prompt, "Hello"),
             other => panic!("expected AgentPrompt, got {other:?}"),
         }
+    }
+
+    /// The bug this exists for: editing a schedule's cadence from "Daily" to
+    /// "Once" in the UI kept the old daily cron, because `UpdateScheduleRequest`
+    /// had nowhere to put "once" that survived — a 6-field cron cannot express
+    /// it, so it silently round-tripped back to "Daily" every time.
+    #[tokio::test]
+    async fn switching_a_daily_schedule_to_once_actually_converts_it() {
+        use pond_core::user_data::ports::scheduler::UpdateScheduleRequest;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sched = make_scheduler(tmp.path()).await;
+
+        sched
+            .create_task(create_req("cadence1", "0 0 9 * * *"))
+            .await
+            .unwrap();
+
+        let updated = sched
+            .update_task(
+                "cadence1",
+                UpdateScheduleRequest {
+                    once: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            updated.cron,
+            pond_core::user_data::domain::schedule::CRON_ONCE,
+            "a one-shot's cron must be the sentinel, not the old recurring pattern"
+        );
+        assert!(
+            updated.fire_at.is_some(),
+            "switching to once must set a concrete fire_at"
+        );
+        assert_eq!(
+            updated.next_run,
+            updated.fire_at,
+            "a one-shot's next_run IS its fire_at"
+        );
+
+        // And back: providing a real cron without `once` must clear fire_at,
+        // converting it back to recurring.
+        let reverted = sched
+            .update_task(
+                "cadence1",
+                UpdateScheduleRequest {
+                    cron: Some("0 0 9 * * *".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(reverted.cron, "0 0 9 * * *");
+        assert!(
+            reverted.fire_at.is_none(),
+            "switching back to a real cron must clear the stored fire_at"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_to_once_with_an_unparseable_cron_is_refused() {
+        use pond_core::user_data::ports::scheduler::UpdateScheduleRequest;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sched = make_scheduler(tmp.path()).await;
+
+        sched
+            .create_task(create_req("cadence2", "0 0 9 * * *"))
+            .await
+            .unwrap();
+
+        let err = sched
+            .update_task(
+                "cadence2",
+                UpdateScheduleRequest {
+                    cron: Some("not a cron".to_string()),
+                    once: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an unparseable cron cannot yield a next occurrence");
+        assert!(err.to_string().contains("one-shot"), "{err}");
+
+        // The schedule must be untouched by the failed attempt.
+        let tasks = sched.list_tasks().await.unwrap();
+        let task = tasks.iter().find(|t| t.id == "cadence2").unwrap();
+        assert_eq!(task.cron, "0 0 9 * * *");
+        assert!(task.fire_at.is_none());
+    }
+
+    /// A one-shot's persisted `cron` is the `"@once"` sentinel. Rehydration
+    /// (every server restart) must recognize that from `fire_at` rather than
+    /// trying to parse it as cron — the failure mode when it doesn't is not
+    /// "this one schedule is broken", it is "the constructor's `?` fails,
+    /// `scheduler = None`, and every schedule endpoint answers 503" for the
+    /// whole household, which is exactly what a restart hit in practice.
+    #[tokio::test]
+    async fn a_one_shot_survives_a_restart_instead_of_taking_the_scheduler_down() {
+        use pond_core::user_data::ports::scheduler::UpdateScheduleRequest;
+
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let sched = make_scheduler(tmp.path()).await;
+            sched
+                .create_task(create_req("cadence3", "0 0 9 * * *"))
+                .await
+                .unwrap();
+            sched
+                .update_task(
+                    "cadence3",
+                    UpdateScheduleRequest {
+                        once: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        // Simulate a restart: a fresh adapter rehydrating from the same
+        // schedules.json. Before the fix, this line panicked via
+        // `.expect("scheduler init failed")`.
+        let restarted = make_scheduler(tmp.path()).await;
+        let tasks = restarted.list_tasks().await.unwrap();
+        let task = tasks.iter().find(|t| t.id == "cadence3").unwrap();
+        assert_eq!(task.cron, pond_core::user_data::domain::schedule::CRON_ONCE);
+        assert!(task.fire_at.is_some(), "the one-shot instant must survive rehydration");
     }
 
     #[tokio::test]
@@ -1326,6 +1561,8 @@ mod tests {
                     cron: Some("every morning at 9".to_string()),
                     timezone: None,
                     kind: None,
+                    fire_at: None,
+                    once: false,
                 },
             )
             .await;
@@ -1365,6 +1602,7 @@ mod tests {
         };
         CreateScheduleRequest {
             fire_at: None,
+            once: false,
             id: id.to_string(),
             label: format!("rule {id}"),
             cron: "@event".to_string(),

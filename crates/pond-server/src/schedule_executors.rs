@@ -8,12 +8,14 @@
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use pond_core::models::ports::agent::Agent;
+use pond_core::models::ports::voice_output::VoiceOutput;
 use pond_core::shared::domain::agent::AgentRequest;
 use pond_core::user_data::domain::profile::ProfileScope;
 use pond_core::user_data::domain::schedule::{TaskKind, TriggerAction};
 use pond_core::user_data::ports::device_control::DeviceControlPort;
 use pond_core::user_data::ports::schedule_execution::ScheduleExecutor;
 use pond_core::user_data::ports::session_storage::SessionStorage;
+use pond_core::user_data::ports::settings::SettingsRepository;
 use std::sync::Arc;
 use tokio::sync::{OnceCell, Semaphore};
 
@@ -30,6 +32,12 @@ pub struct AgentScheduleExecutor {
     device_control: Option<Arc<dyn DeviceControlPort>>,
     /// Limit concurrent scheduled runs to avoid starving interactive chat.
     semaphore: Semaphore,
+    /// Speaks a completed `AgentPrompt` task's response out loud, gated by
+    /// `speakable_now` below. `None` when no TTS engine is available (see
+    /// `speakable_now`'s doc comment for why this does NOT reuse
+    /// `ChatService::speak_unprompted`).
+    voice_output: Option<Arc<dyn VoiceOutput>>,
+    settings_repo: Option<Arc<dyn SettingsRepository>>,
 }
 
 impl AgentScheduleExecutor {
@@ -38,6 +46,8 @@ impl AgentScheduleExecutor {
         session_storage: Arc<dyn SessionStorage>,
         device_control: Option<Arc<dyn DeviceControlPort>>,
         max_concurrent: u32,
+        voice_output: Option<Arc<dyn VoiceOutput>>,
+        settings_repo: Option<Arc<dyn SettingsRepository>>,
     ) -> Self {
         Self {
             agent,
@@ -45,7 +55,36 @@ impl AgentScheduleExecutor {
             http_client: reqwest::Client::new(),
             device_control,
             semaphore: Semaphore::new(max_concurrent.max(1) as usize),
+            voice_output,
+            settings_repo,
         }
+    }
+
+    /// Whether a scheduled `AgentPrompt`'s response may be spoken aloud right
+    /// now.
+    ///
+    /// This is NOT `ChatService::speak_unprompted` — that gate requires an
+    /// [`ProfileScope::Owner`] audience with recent presence evidence, and a
+    /// schedule has neither: schedules are not owned by a household member
+    /// (see the comment on `profile_scope` in `run_agent_prompt`), so there
+    /// is nobody to check presence for. What DOES still apply, because it
+    /// isn't about who's in the room: quiet hours (never interrupt sleep for
+    /// something nobody asked to hear right now) and the household's
+    /// `unprompted_speech_enabled` consent toggle (the same switch that
+    /// governs every other proactive utterance). Member-presence gating for
+    /// scheduled reminders needs schedules to carry an owner, which they
+    /// don't today — a real gap, not one this function papers over.
+    fn speakable_now(settings: &pond_core::user_data::domain::settings::Settings) -> bool {
+        if !settings.unprompted_speech_enabled {
+            return false;
+        }
+        let now = chrono::Local::now();
+        !quiet_hours_cover_now(
+            &settings.quiet_hours_start,
+            &settings.quiet_hours_end,
+            chrono::Timelike::hour(&now),
+            chrono::Timelike::minute(&now),
+        )
     }
 
     /// Send `prompt` to the agent in an ephemeral session. Shared by the
@@ -82,6 +121,24 @@ impl AgentScheduleExecutor {
             "[scheduler] task {task_id} completed ({} chars)",
             response.text.len()
         );
+
+        if let (Some(voice), Some(settings_repo)) = (&self.voice_output, &self.settings_repo) {
+            match settings_repo.get().await {
+                Ok(settings) if Self::speakable_now(&settings) => {
+                    tracing::info!("[scheduler] task {task_id}: speaking response aloud");
+                    if let Err(e) = voice.speak(&response.text).await {
+                        tracing::warn!("[scheduler] task {task_id}: TTS failed: {e}");
+                    }
+                }
+                Ok(_) => tracing::debug!(
+                    "[scheduler] task {task_id}: not speaking (consent off or quiet hours)"
+                ),
+                Err(e) => tracing::warn!(
+                    "[scheduler] task {task_id}: could not read settings, staying silent: {e}"
+                ),
+            }
+        }
+
         Ok(response.text)
     }
 
@@ -180,6 +237,31 @@ impl ScheduleExecutor for AgentScheduleExecutor {
                 Ok(summaries.join(" · "))
             }
         }
+    }
+}
+
+/// `true` when `(hour, minute)` falls inside the `[start, end)` quiet window.
+/// Wraps midnight when `start > end` (the normal case, e.g. `22:00`/`07:00`).
+/// An unparseable bound is treated as "quiet all day" — same "on unreadable
+/// input, do less" rule as `ChatService::quiet_hours_cover`, which this
+/// mirrors but does not call (that one is private to `pond-core` and typed
+/// around `UnpromptedUtterance`'s member-audience shape, which schedules
+/// don't have — see `AgentScheduleExecutor::speakable_now`).
+fn quiet_hours_cover_now(start: &str, end: &str, hour: u32, minute: u32) -> bool {
+    let parse = |s: &str| chrono::NaiveTime::parse_from_str(s.trim(), "%H:%M").ok();
+    let (Some(start), Some(end)) = (parse(start), parse(end)) else {
+        return true;
+    };
+    let now = match chrono::NaiveTime::from_hms_opt(hour, minute, 0) {
+        Some(t) => t,
+        None => return true,
+    };
+    if start == end {
+        true
+    } else if start < end {
+        now >= start && now < end
+    } else {
+        now >= start || now < end
     }
 }
 

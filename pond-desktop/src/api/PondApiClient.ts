@@ -467,6 +467,7 @@ export class PondApiClient {
           id: t.id as string,
           name: (t.label ?? t.name ?? "") as string,
           cron: t.cron as string,
+          fire_at: t.fire_at as string | null | undefined,
           prompt,
           enabled: t.paused !== undefined ? !(t.paused as boolean) : (t.enabled as boolean ?? true),
           timezone: (t.timezone as string) ?? "UTC",
@@ -479,12 +480,18 @@ export class PondApiClient {
     );
   }
 
-  createSchedule(body: Omit<Schedule, "id" | "created_at">): Promise<Schedule> {
+  createSchedule(
+    body: Omit<Schedule, "id" | "created_at"> & {
+      /** Fire once at `cron`'s next occurrence instead of recurring. */
+      once?: boolean;
+    },
+  ): Promise<Schedule> {
     return this.post<Record<string, unknown>>("/api/v1/schedules", {
       name: body.name,
       cron: body.cron,
       prompt: body.prompt,
       timezone: body.timezone ?? "UTC",
+      once: body.once ?? false,
     }).then((t) => {
       const kind = t.kind as Record<string, unknown> | undefined;
       const prompt = (kind?.prompt as string) ?? body.prompt;
@@ -492,6 +499,7 @@ export class PondApiClient {
         id: t.id as string,
         name: (t.label ?? t.name ?? body.name) as string,
         cron: t.cron as string,
+        fire_at: t.fire_at as string | null | undefined,
         prompt,
         enabled: t.paused !== undefined ? !(t.paused as boolean) : true,
         timezone: (t.timezone as string) ?? body.timezone ?? "UTC",
@@ -507,7 +515,7 @@ export class PondApiClient {
 
   async updateSchedule(
     id: string,
-    patch: { name?: string; cron?: string; prompt?: string; timezone?: string },
+    patch: { name?: string; cron?: string; prompt?: string; timezone?: string; once?: boolean },
   ): Promise<Schedule> {
     const t = await this.put<Record<string, unknown>>(
       `/api/v1/schedules/${encodeURIComponent(id)}`,
@@ -519,6 +527,7 @@ export class PondApiClient {
       id: t.id as string,
       name: ((t.label ?? t.name) as string) || "",
       cron: t.cron as string,
+      fire_at: t.fire_at as string | null | undefined,
       prompt,
       enabled: t.paused !== undefined ? !(t.paused as boolean) : true,
       timezone: (t.timezone as string) ?? "UTC",
@@ -713,12 +722,19 @@ export class PondApiClient {
     return this.get(`/api/v1/skills${all ? "?all=true" : ""}`);
   }
 
-  addSkill(name: string, content: string): Promise<UserSkill> {
-    return this.post("/api/v1/skills", { name, content });
+  addSkill(name: string, description: string, content: string, icon = "sparkles"): Promise<UserSkill> {
+    return this.post("/api/v1/skills", { name, description, content, icon });
   }
 
   toggleSkill(id: string, currentEnabled: boolean): Promise<UserSkill> {
     return this.put(`/api/v1/skills/${id}`, { active: !currentEnabled });
+  }
+
+  updateSkill(
+    id: string,
+    patch: { name?: string; description?: string; content?: string; icon?: string },
+  ): Promise<UserSkill> {
+    return this.put(`/api/v1/skills/${id}`, patch);
   }
 
   removeSkill(id: string): Promise<void> {

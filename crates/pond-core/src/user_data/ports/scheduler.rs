@@ -25,6 +25,15 @@ pub struct CreateScheduleRequest {
     /// [`crate::user_data::domain::schedule::Schedule::fire_at`].
     #[serde(default)]
     pub fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Alternate way to arrive at a one-shot: fire once at `cron`'s next
+    /// occurrence (computed from `cron` + `timezone`), then delete. Lets a
+    /// caller that only knows "9am, once" — not an absolute instant — ask
+    /// for a one-shot without doing its own cron math. Ignored if `fire_at`
+    /// is already set; `cron` must still be a normal parseable expression
+    /// when this is `true` (it is read once to compute the instant, then
+    /// discarded the same way an explicit `fire_at` discards it).
+    #[serde(default)]
+    pub once: bool,
     /// IANA timezone (e.g. `"Africa/Nairobi"`).
     pub timezone: String,
     /// What to do on each fire.
@@ -39,6 +48,17 @@ pub struct UpdateScheduleRequest {
     pub cron: Option<String>,
     pub timezone: Option<String>,
     pub kind: Option<TaskKind>,
+    /// Fire ONCE at this instant instead of recurring. `Some` converts the
+    /// schedule to a one-shot, mirroring [`CreateScheduleRequest::fire_at`].
+    /// Providing `cron` without `fire_at`/`once` converts a one-shot schedule
+    /// back to recurring, clearing any previously stored fire_at.
+    #[serde(default)]
+    pub fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Alternate way to convert to a one-shot: fire once at `cron`'s next
+    /// occurrence rather than an explicit `fire_at`. See
+    /// [`CreateScheduleRequest::once`]. Ignored if `fire_at` is set.
+    #[serde(default)]
+    pub once: bool,
 }
 
 #[async_trait]

@@ -221,20 +221,20 @@ fn skills_full_crud_cycle() {
         .args([
             "skills",
             "add",
-            "morning_brief",
+            "morning-brief",
             "--content",
             "When asked for a briefing, call giap__get_current_weather first.",
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("morning_brief").and(predicate::str::contains("created")));
+        .stdout(predicate::str::contains("morning-brief").and(predicate::str::contains("created")));
 
     // ── List (active only) shows it ───────────────────────────────────────────
     pond(&tmp)
         .args(["skills", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("morning_brief"));
+        .stdout(predicate::str::contains("morning-brief"));
 
     // ── List --all gives us the UUID ──────────────────────────────────────────
     let out = pond(&tmp)
@@ -242,7 +242,7 @@ fn skills_full_crud_cycle() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let uuid = extract_first_col(&stdout, "morning_brief");
+    let uuid = extract_first_col(&stdout, "morning-brief");
     assert!(
         !uuid.is_empty(),
         "Expected UUID in first column, got:\n{stdout}"
@@ -267,7 +267,7 @@ fn skills_full_crud_cycle() {
         .args(["skills", "list", "--all"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("morning_brief"));
+        .stdout(predicate::str::contains("morning-brief"));
 
     // ── Toggle again (re-enable) ──────────────────────────────────────────────
     pond(&tmp)
@@ -305,11 +305,11 @@ fn skills_multiple_entries_all_listed() {
     let tmp = TempDir::new().unwrap();
 
     pond(&tmp)
-        .args(["skills", "add", "skill_one", "--content", "First skill"])
+        .args(["skills", "add", "skill-one", "--content", "First skill"])
         .assert()
         .success();
     pond(&tmp)
-        .args(["skills", "add", "skill_two", "--content", "Second skill"])
+        .args(["skills", "add", "skill-two", "--content", "Second skill"])
         .assert()
         .success();
 
@@ -317,8 +317,8 @@ fn skills_multiple_entries_all_listed() {
         .args(["skills", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("skill_one"))
-        .stdout(predicate::str::contains("skill_two"));
+        .stdout(predicate::str::contains("skill-one"))
+        .stdout(predicate::str::contains("skill-two"));
 }
 
 // ── Group 4: Memories ─────────────────────────────────────────────────────────
