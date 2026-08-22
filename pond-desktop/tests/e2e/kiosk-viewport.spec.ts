@@ -7,7 +7,7 @@
  *
  * Checks:
  *   1. No horizontal overflow (body.scrollWidth === viewport width).
- *   2. Sidebar is in icon-only mode (≤52px wide).
+ *   2. Sidebar is in icon-only mode, at the width the design token names.
  *   3. Content area fills the remaining width without clipping.
  *   4. Key interactive targets meet the 40px minimum height.
  *   5. Both classic sections UI (app-shell) and hub UI (ghub/.irail) are
@@ -24,15 +24,50 @@ async function checkNoHorizOverflow(page: Page): Promise<void> {
   expect(overflow, "No horizontal overflow expected").toBe(false);
 }
 
+/** Widest the collapsed rail may get before it stops being a rail. */
+const RAIL_CEILING_PX = 72;
+
 async function checkSidebarCompact(page: Page): Promise<void> {
-  const sidebarW = await page.evaluate(() => {
+  // Measured against the token rather than a literal. This assertion was
+  // pinned at ≤52px, which is a pixel count standing in for "the rail is
+  // icon-only" — so a 4px design change to the rail failed a kiosk test that
+  // was not about rail width, and the number in docs/design-system.md drifted
+  // out of date at the same time with nothing to catch it. The property this
+  // file actually cares about is asserted directly by "sidebar is icon-only
+  // (no text labels visible)" below, which checks the brand name and group
+  // labels are display:none.
+  const measured = await page.evaluate(() => {
     const s = document.querySelector(".sidebar");
-    return s ? s.getBoundingClientRect().width : null;
+    if (!s) return null;
+    const token = getComputedStyle(document.documentElement)
+      .getPropertyValue("--sidebar-width-collapsed")
+      .trim();
+    return { width: s.getBoundingClientRect().width, token };
   });
-  if (sidebarW !== null) {
-    // At kiosk widths the sidebar collapses to icon-only (≤52px)
-    expect(sidebarW, "Sidebar should be ≤52px at kiosk viewport").toBeLessThanOrEqual(52);
-  }
+  if (measured === null) return;
+
+  const tokenPx = Number.parseFloat(measured.token);
+  expect(
+    Number.isFinite(tokenPx),
+    `--sidebar-width-collapsed should be a px length, got "${measured.token}"`,
+  ).toBe(true);
+
+  // No WIDER than the token. Equality would be wrong: the 1024x600 rule sets
+  // .sidebar { width: var(--sidebar-width-collapsed) }, but the very-short-panel
+  // rule (@media max-height:500px, the 800x480 target) narrows it further to a
+  // hardcoded 44px. So the token is the ceiling, and anything above it means
+  // something is overriding the rail wider than intended — the regression this
+  // is for.
+  expect(
+    measured.width,
+    `Collapsed rail (${measured.width}px) should be no wider than ` +
+      `--sidebar-width-collapsed (${tokenPx}px) at kiosk viewport`,
+  ).toBeLessThanOrEqual(tokenPx + 0.5);
+
+  expect(
+    tokenPx,
+    `--sidebar-width-collapsed (${tokenPx}px) is too wide to still be an icon rail`,
+  ).toBeLessThanOrEqual(RAIL_CEILING_PX);
 }
 
 async function checkIrailCompact(page: Page): Promise<void> {
