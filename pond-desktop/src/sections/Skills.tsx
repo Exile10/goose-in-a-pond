@@ -1,37 +1,137 @@
 import { useState, useEffect } from "react";
 import { Card, CardContent, Button, Input, Switch } from "@heroui/react";
-import { Plus, Trash2, Sparkles, Check } from "lucide-react";
+import {
+  Plus, Trash2, Sparkles, Check, Pencil,
+  Bell, Clock, Calendar, MessageCircle, Home, Shield, Lightbulb, Wrench, Music,
+} from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { PageHeader, useConfirm } from "../components/shared";
 import type { UserSkill } from "../api/types";
+
+// ── Icon set — a small curated palette, same pattern as Sidebar's NAV_ICONS ──
+const SKILL_ICONS: Record<string, React.ElementType> = {
+  sparkles: Sparkles,
+  bell: Bell,
+  clock: Clock,
+  calendar: Calendar,
+  message: MessageCircle,
+  home: Home,
+  shield: Shield,
+  lightbulb: Lightbulb,
+  wrench: Wrench,
+  music: Music,
+};
+const SKILL_ICON_KEYS = Object.keys(SKILL_ICONS);
+
+// ── Icon inference — guess a fitting icon from the skill's name, so a name
+// like "Settings Helper" gets a wrench rather than the generic sparkles
+// every skill got before this existed. Order matters: first match wins. ──
+const ICON_KEYWORDS: Array<[string, string[]]> = [
+  ["wrench",    ["setting", "config", "tool", "repair", "maintenance", "fix"]],
+  ["bell",      ["remind", "alert", "notify", "notification"]],
+  ["clock",     ["time", "timer", "alarm", "wake"]],
+  ["calendar",  ["schedule", "calendar", "appointment", "event", "meeting"]],
+  ["message",   ["chat", "brief", "summary", "news", "message", "conversation"]],
+  ["home",      ["home", "house", "household", "family"]],
+  ["shield",    ["secur", "safety", "protect", "lock", "guard"]],
+  ["music",     ["music", "song", "playlist", "audio"]],
+  ["lightbulb", ["idea", "automat", "light", "smart"]],
+];
+
+function inferSkillIcon(name: string): string {
+  const lower = name.toLowerCase();
+  for (const [icon, keywords] of ICON_KEYWORDS) {
+    if (keywords.some((k) => lower.includes(k))) return icon;
+  }
+  return "sparkles";
+}
+
+function SkillIcon({ icon, name, size = 16 }: { icon: string; name?: string; size?: number }) {
+  // A skill saved before per-name inference existed (or one nobody has
+  // touched the icon on) is still sitting on the "sparkles" default — infer
+  // for display so old skills read as well as new ones, without a migration.
+  const key = icon === "sparkles" && name ? inferSkillIcon(name) : icon;
+  const Icon = SKILL_ICONS[key] ?? Sparkles;
+  return <Icon size={size} />;
+}
 
 export function Skills() {
   const confirm = useConfirm();
   const [skills, setSkills] = useState<UserSkill[]>([]);
   const [loading, setLoading] = useState(true);
   const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [icon, setIcon] = useState("sparkles");
+  // Whether the icon was deliberately chosen (a picker click, or a saved
+  // skill that already had a real icon) — while false, typing the name
+  // keeps re-inferring a fitting icon; once true, the name no longer
+  // overrides what was chosen.
+  const [iconTouched, setIconTouched] = useState(false);
   const [content, setContent] = useState("");
   const [showForm, setShowForm] = useState(false);
+  const [editingSkill, setEditingSkill] = useState<UserSkill | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   function load() {
     setLoading(true);
     api
       .listSkills(true)
-      .then(setSkills)
+      .then((res) => setSkills(Array.isArray(res) ? res : []))
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
   }
 
   useEffect(() => { load(); }, []);
 
-  async function add() {
-    if (!name.trim() || !content.trim()) return;
+  function resetForm() {
+    setShowForm(false);
+    setEditingSkill(null);
+    setName("");
+    setDescription("");
+    setIcon("sparkles");
+    setIconTouched(false);
+    setContent("");
+  }
+
+  function startEdit(s: UserSkill) {
+    setEditingSkill(s);
+    setName(s.name);
+    setDescription(s.description);
+    // A skill still on the "sparkles" default hasn't had a deliberate icon
+    // chosen for it — infer from its name now, and keep re-inferring if the
+    // name changes, same as a brand-new skill. A skill with a real icon
+    // keeps it untouched by further name edits.
+    const savedIcon = s.icon || "sparkles";
+    setIcon(savedIcon === "sparkles" ? inferSkillIcon(s.name) : savedIcon);
+    setIconTouched(savedIcon !== "sparkles");
+    setContent(s.content);
+    setShowForm(true);
+  }
+
+  function handleNameChange(v: string) {
+    setName(v);
+    if (!iconTouched) setIcon(inferSkillIcon(v));
+  }
+
+  function pickIcon(key: string) {
+    setIcon(key);
+    setIconTouched(true);
+  }
+
+  async function save() {
+    if (!name.trim() || !description.trim() || !content.trim()) return;
     try {
-      await api.addSkill(name.trim(), content.trim());
-      setName("");
-      setContent("");
-      setShowForm(false);
+      if (editingSkill) {
+        await api.updateSkill(editingSkill.id, {
+          name: name.trim(),
+          description: description.trim(),
+          icon,
+          content: content.trim(),
+        });
+      } else {
+        await api.addSkill(name.trim(), description.trim(), content.trim(), icon);
+      }
+      resetForm();
       load();
     } catch (e) {
       setError(String(e));
@@ -65,7 +165,7 @@ export function Skills() {
           <Button
             color="secondary"
             radius="md"
-            onPress={() => setShowForm((v) => !v)}
+            onPress={() => (showForm ? resetForm() : setShowForm(true))}
             startContent={showForm ? undefined : <Plus size={14} />}
           >
             {showForm ? "Cancel" : "Add Skill"}
@@ -77,17 +177,45 @@ export function Skills() {
         <Card className="card">
           <CardContent>
             <div className="skills-form">
+              <h3 className="skills-form__title">{editingSkill ? "Edit skill" : "New skill"}</h3>
+              <label htmlFor="skill-name" className="ext-form-label">Skill name</label>
               <Input
-                label="Skill name"
-                placeholder="e.g. Code reviewer"
+                id="skill-name"
+                placeholder="e.g. Task Reminder"
                 variant="bordered"
                 radius="md"
                 value={name}
-                onValueChange={setName}
+                onChange={(e) => handleNameChange(e.target.value)}
               />
+              <label htmlFor="skill-description" className="ext-form-label">Description</label>
+              <Input
+                id="skill-description"
+                placeholder='When should this activate? e.g. "Creates reminders when asked to be reminded of something"'
+                variant="bordered"
+                radius="md"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+              />
+              <label className="ext-form-label">Icon</label>
+              <div className="skills-form__icons">
+                {SKILL_ICON_KEYS.map((key) => (
+                  <button
+                    key={key}
+                    type="button"
+                    className={`skills-form__icon-btn${icon === key ? " skills-form__icon-btn--selected" : ""}`}
+                    aria-label={key}
+                    aria-pressed={icon === key}
+                    onClick={() => pickIcon(key)}
+                  >
+                    <SkillIcon icon={key} />
+                  </button>
+                ))}
+              </div>
+              <label htmlFor="skill-content" className="ext-form-label">Instructions</label>
               <textarea
+                id="skill-content"
                 className="skills-form__textarea"
-                placeholder="Describe what this skill should do, when it should activate, and any constraints..."
+                placeholder="The full instructions Pond follows once this skill activates..."
                 value={content}
                 onChange={(e) => setContent(e.target.value)}
                 rows={4}
@@ -96,18 +224,18 @@ export function Skills() {
                 <Button
                   variant="light"
                   radius="md"
-                  onPress={() => { setShowForm(false); setName(""); setContent(""); }}
+                  onPress={resetForm}
                 >
                   Cancel
                 </Button>
                 <Button
                   color="secondary"
                   radius="md"
-                  onPress={add}
-                  isDisabled={!name.trim() || !content.trim()}
+                  onPress={save}
+                  isDisabled={!name.trim() || !description.trim() || !content.trim()}
                   startContent={<Check size={14} />}
                 >
-                  Save skill
+                  {editingSkill ? "Update skill" : "Save skill"}
                 </Button>
               </div>
             </div>
@@ -131,19 +259,13 @@ export function Skills() {
           </CardContent>
         </Card>
       ) : skills.length > 0 ? (
-        <Card className="card">
-          <CardContent className="card-body--list">
-            {skills.map((s) => (
-              <div key={s.id} className="skill-row">
-                <div className="skill-row__icon">
-                  <Sparkles size={16} />
-                </div>
-                <div className="skill-row__main">
-                  <div className="skill-row__name">{s.name}</div>
-                  <div className="skill-row__instr">
-                    {s.content || <span className="muted">No instructions</span>}
-                  </div>
-                </div>
+        <div className="skills-grid">
+          {skills.map((s) => (
+            <div key={s.id} className={`skill-card${!s.active ? " skill-card--inactive" : ""}`}>
+              <div className="skill-card__top">
+                <span className="skill-card__icon">
+                  <SkillIcon icon={s.icon} name={s.name} />
+                </span>
                 <Switch
                   size="sm"
                   color="secondary"
@@ -151,19 +273,32 @@ export function Skills() {
                   onValueChange={() => toggle(s.id, s.active)}
                   aria-label={`Enable ${s.name}`}
                 />
-                <Button
-                  isIconOnly
-                  size="sm"
-                  variant="light"
-                  onPress={() => remove(s.id, s.name)}
+              </div>
+              <h3 className="skill-card__title">{s.name}</h3>
+              <p className="skill-card__desc">
+                {s.description || <span className="muted">No description</span>}
+              </p>
+              <div className="skill-card__actions">
+                <button
+                  type="button"
+                  className="skill-card__action-btn"
+                  onClick={() => startEdit(s)}
+                  aria-label={`Edit ${s.name}`}
+                >
+                  <Pencil size={14} />
+                </button>
+                <button
+                  type="button"
+                  className="skill-card__action-btn skill-card__action-btn--danger"
+                  onClick={() => remove(s.id, s.name)}
                   aria-label={`Delete ${s.name}`}
                 >
-                  <Trash2 size={15} />
-                </Button>
+                  <Trash2 size={14} />
+                </button>
               </div>
-            ))}
-          </CardContent>
-        </Card>
+            </div>
+          ))}
+        </div>
       ) : null}
     </div>
   );

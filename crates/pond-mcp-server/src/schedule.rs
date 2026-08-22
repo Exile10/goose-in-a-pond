@@ -368,6 +368,7 @@ repeating use create_schedule instead.")]
             // so the nearest thing is an ANNUAL alarm.
             cron: pond_core::user_data::domain::schedule::CRON_ONCE.to_string(),
             fire_at: Some(fire_at),
+            once: false,
             timezone,
             kind: TaskKind::AgentPrompt { prompt },
         };
@@ -501,6 +502,7 @@ repeating use create_schedule instead.")]
         let id = uuid::Uuid::new_v4().to_string();
         let req = CreateScheduleRequest {
             fire_at: None,
+            once: false,
             id: id.clone(),
             label: name,
             cron: cron.clone(),
@@ -652,6 +654,7 @@ repeating use create_schedule instead.")]
 
         let req = pond_core::user_data::ports::scheduler::CreateScheduleRequest {
             fire_at: None,
+            once: false,
             id: id.clone(),
             label: label.clone(),
             // Sentinel for display — event rules are never cron-registered.
@@ -947,6 +950,8 @@ repeating use create_schedule instead.")]
                 }
             }),
             kind,
+            fire_at: None,
+            once: false,
         };
 
         match self.scheduler.update_task(&id, req).await {
