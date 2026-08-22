@@ -20,6 +20,12 @@
     "active": true,
     "targets": ["app", "dmg"],
     "externalBin": ["binaries/pond-server"],
+    "resources": {
+      "../../matter-server/package.json": "matter-server/package.json",
+      "../../matter-server/package-lock.json": "matter-server/package-lock.json",
+      "../../matter-server/tsconfig.json": "matter-server/tsconfig.json",
+      "../../matter-server/src": "matter-server/src"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

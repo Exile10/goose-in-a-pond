@@ -1,29 +1,28 @@
 //! The Matter bridge task: keeps GIAP's view of the fabric current.
 //!
-//! On start it calls `start_listening`, which returns every commissioned node
-//! and subscribes the connection to live updates. Nodes are synced into the
-//! [`DeviceRegistry`] (stable `matter-<node_id>` ids) and cached for the
-//! control port's endpoint lookups. From then on:
+//! On start it sends `subscribe`, which returns every commissioned device and
+//! every reading they currently hold, and subscribes the connection to changes.
+//! Devices are synced into the [`DeviceRegistry`] under stable `matter-<node_id>`
+//! ids. From then on:
 //!
-//! - `attribute_updated` on a sensor cluster → [`BusEvent::Sensor`] on the
-//!   EventBus — so #92 rules, the activity feed, and notifications react to
-//!   Matter sensors exactly like any other sensor source.
-//! - node lifecycle events refresh the cache and registry.
+//! - a `reading` event → [`BusEvent::Sensor`] on the EventBus, so #92 rules, the
+//!   activity feed and notifications react to Matter sensors exactly like any
+//!   other sensor source;
+//! - device lifecycle events refresh the registry.
 //!
 //! On connection loss `run_matter_bridge` returns. [`run_matter_supervisor`]
-//! wraps it in a reconnect loop (#195): when the connection drops it
-//! re-establishes the WebSocket with backoff, swaps the new client into the
-//! shared handle the control port reads, and re-runs the bridge — which calls
-//! `start_listening` again and resyncs the fabric. A matter-server restart no
-//! longer needs a pond-server restart.
+//! wraps it in a reconnect loop: when the connection drops it re-establishes the
+//! WebSocket with backoff, swaps the new client into the shared handle the
+//! control port reads, and re-runs the bridge — which subscribes again and
+//! resyncs the fabric. A controller restart does not need a pond-server restart.
 //!
 //! Reconnecting only recovers a controller that is up. When the controller
 //! *process* has died there is nothing to reconnect to, so after
 //! [`RESPAWN_AFTER`] consecutive failures the supervisor re-runs the local
 //! controller setup before the next attempt, and keeps doing so on that cadence
-//! until it is back. A killed matter-server no longer needs the user to toggle
-//! Matter off and on.
+//! until it is back.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,17 +30,20 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use pond_core::shared::ports::event_bus::{BusEvent, EventBus};
 use pond_core::user_data::ports::device_registry::{DeviceRegistry, RegisterDeviceRequest};
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::client::{MatterClient, MatterEvent};
-use crate::control::{NodeCache, SharedMatterClient};
-use crate::protocol::{node_to_device, sensor_reading_from_update, MatterNode};
+use crate::control::SharedMatterClient;
+use crate::notify::MatterNotifier;
+use crate::protocol::{
+    describe, AvailabilityEvent, DeviceEvent, DeviceRemovedEvent, Snapshot, WireDevice, WireReading,
+};
 use crate::server_setup::{revive_local_controller, Revival, SharedServerChild};
 
 /// Reconnect backoff bounds. Exponential from `RECONNECT_BASE` doubling to
 /// `RECONNECT_MAX`, with equal jitter so several Ponds pointed at one restarted
-/// matter-server don't reconnect in lockstep.
+/// controller don't reconnect in lockstep.
 const RECONNECT_BASE: Duration = Duration::from_secs(1);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
@@ -52,17 +54,31 @@ const RECONNECT_MAX: Duration = Duration::from_secs(30);
 const RESPAWN_AFTER: u32 = 3;
 
 /// How long a revived controller gets to start listening. Shorter than the
-/// startup budget: by the time the supervisor runs, the venv already exists, so
-/// this waits on a process start rather than on a `pip install`.
+/// startup budget: by the time the supervisor runs, the dependencies are already
+/// installed, so this waits on a process start rather than on an `npm ci`.
 const RESPAWN_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Where the supervisor reconnects to, and what it needs to bring the
-/// controller back when reconnecting is not enough.
+/// The last value published per `(device, sensor)`.
+///
+/// The reason this exists rather than publishing whatever `subscribe` returns:
+/// the bridge re-subscribes on every reconnect, and the rules engine (#92) is
+/// LEVEL-based — republishing a steady "motion = true" is indistinguishable to
+/// it from motion starting again. A controller that reconnects a few times would
+/// re-fire every automation attached to every Matter sensor with nothing in the
+/// house having changed, and the reconnect-often case is exactly the one the
+/// supervisor exists to handle.
+///
+/// First sight still publishes everything, which is the behaviour that makes a
+/// steady sensor knowable at all; the cache is what distinguishes the two.
+type ReadingCache = HashMap<(String, String), f64>;
+
+/// Where the supervisor reconnects to, and what it needs to bring the controller
+/// back when reconnecting is not enough.
 pub struct SupervisorConfig {
-    /// The matter-server WebSocket URL. Also decides whether the controller is
+    /// The controller's WebSocket URL. Also decides whether the controller is
     /// GIAP's to restart: only a loopback URL is.
     pub url: String,
-    /// GIAP's data dir — where the controller's venv and fabric storage live.
+    /// GIAP's data dir — where the controller and its fabric live.
     pub data_dir: PathBuf,
     /// The controller GIAP started, if any. A respawn replaces the dead handle
     /// here, so the reconciler's teardown still kills the live process.
@@ -71,8 +87,8 @@ pub struct SupervisorConfig {
 
 /// Should the reconnect about to be made (1-based `attempt`) re-run controller
 /// setup first? True on the attempt following every [`RESPAWN_AFTER`] failures,
-/// so a controller that stays dead keeps being retried for as long as the
-/// outage lasts rather than once and never again. Pure, so the schedule is
+/// so a controller that stays dead keeps being retried for as long as the outage
+/// lasts rather than once and never again. Pure, so the schedule is
 /// unit-testable without sleeping.
 fn should_respawn_controller(attempt: u32) -> bool {
     attempt > 1 && (attempt - 1).is_multiple_of(RESPAWN_AFTER)
@@ -95,64 +111,38 @@ fn reconnect_backoff(attempt: u32, rand_unit: f64) -> Duration {
     Duration::from_millis(half + jitter)
 }
 
-/// Sync one node into the cache + registry (register if new, heartbeat if known).
-async fn sync_node(
-    node: MatterNode,
-    nodes: &NodeCache,
-    registry: &Arc<dyn DeviceRegistry + Send + Sync>,
-    bus: &Arc<dyn EventBus>,
-) {
-    let device = node_to_device(&node);
-
-    // Publish what the node already reports, before waiting on it to change.
-    // `start_listening` hands over every current attribute, so a sensor that
-    // sits at a steady value is knowable immediately — otherwise it exists in
-    // the device list while every question about its reading is answered "none
-    // recorded", which reads as "that device is not here".
-    //
-    // Only what we have not already seen at that value, though. This function
-    // runs on the initial sync, on every `node_added`/`node_updated`, and on
-    // every supervisor reconnect, and the rules engine (#92) is LEVEL-based:
-    // republishing a steady "motion = true" is indistinguishable to it from
-    // motion starting again. A controller that reconnects a few times would
-    // re-fire every automation attached to every Matter sensor, with nothing in
-    // the house having changed — and the reconnect-often case is exactly the
-    // one the supervisor above exists to handle.
-    //
-    // First sight still publishes everything, which is the behaviour the
-    // paragraph above is about; the cache is what distinguishes the two.
-    let previous = nodes.read().await.get(&node.node_id).cloned();
-    for (path, value) in &node.attributes {
-        let unchanged = previous
-            .as_ref()
-            .and_then(|p| p.attributes.get(path))
-            .is_some_and(|before| before == value);
-        if unchanged {
-            continue;
-        }
-        if let Some(reading) = sensor_reading_from_update(node.node_id, path, value) {
-            bus.publish(BusEvent::Sensor(reading));
-        }
+/// Publish a reading unless it is one we have already published at that value.
+fn publish_reading(reading: &WireReading, cache: &mut ReadingCache, bus: &Arc<dyn EventBus>) {
+    let key = (reading.device_id.clone(), reading.sensor_type.clone());
+    if cache.get(&key) == Some(&reading.value) {
+        return;
     }
+    cache.insert(key, reading.value);
+    bus.publish(BusEvent::Sensor(reading.to_reading()));
+}
 
-    nodes.write().await.insert(node.node_id, node);
+/// Sync one device into the registry (register if new, heartbeat if known).
+async fn sync_device(
+    wire: &WireDevice,
+    registry: &Arc<dyn DeviceRegistry + Send + Sync>,
+    notifier: &MatterNotifier,
+) {
+    let device = wire.to_device();
 
     match registry.get_device(&device.id).await {
         Ok(Some(existing)) => {
             if let Err(e) = registry.heartbeat(&device.id).await {
                 tracing::warn!(device = %device.id, error = %e, "matter: heartbeat failed");
             }
-            // Re-derived typing has to reach a device that already exists, or
-            // it only ever applies to devices commissioned after the improvement
-            // shipped. Registration was the sole writer of these two fields and
-            // this arm is the "already registered" one, so every fan and sensor
-            // already on the fabric kept `device_type: "matter"` and no
-            // capabilities through every restart.
+            // Re-derived typing has to reach a device that already exists, or it
+            // only ever applies to devices commissioned after the improvement
+            // shipped. Registration was the sole writer of these two fields, so
+            // every fan and sensor already on the fabric kept `device_type:
+            // "matter"` and no capabilities through every restart.
             //
-            // Guarded on a real difference because this runs on the initial
-            // sync, on every node_added/node_updated, and on every supervisor
-            // reconnect — an unconditional UPDATE would be a write per node per
-            // reconnect for a value that almost never changes.
+            // Guarded on a real difference because this runs on the initial sync
+            // and on every reconnect — an unconditional UPDATE would be a write
+            // per device per reconnect for a value that almost never changes.
             if existing.device_type != device.device_type
                 || existing.capabilities != device.capabilities
             {
@@ -163,6 +153,8 @@ async fn sync_node(
                     tracing::warn!(device = %device.id, error = %e, "matter: profile refresh failed");
                 } else {
                     tracing::info!(
+                        target: "giap::trace",
+                        kind = "matter_device_retyped",
                         device = %device.id,
                         from = %existing.device_type,
                         to = %device.device_type,
@@ -182,7 +174,17 @@ async fn sync_node(
             };
             match registry.register(request).await {
                 Ok(_) => {
-                    tracing::info!(device = %device.id, name = %device.name, "matter: device registered")
+                    tracing::info!(
+                        target: "giap::trace",
+                        kind = "matter_node_added",
+                        device = %device.id,
+                        name = %device.name,
+                        device_type = %device.device_type,
+                        "matter: device registered"
+                    );
+                    notifier
+                        .device_paired(&device.name, &device.device_type)
+                        .await;
                 }
                 Err(e) => {
                     tracing::warn!(device = %device.id, error = %e, "matter: registration failed")
@@ -193,65 +195,87 @@ async fn sync_node(
     }
 }
 
-/// Run until the connection drops. `client` must be freshly connected;
-/// `events` is its event stream.
+/// Run until the connection drops. `client` must be freshly connected; `events`
+/// is its event stream.
 pub async fn run_matter_bridge(
     client: Arc<MatterClient>,
     mut events: mpsc::Receiver<MatterEvent>,
-    nodes: NodeCache,
     registry: Arc<dyn DeviceRegistry + Send + Sync>,
     bus: Arc<dyn EventBus>,
+    notifier: MatterNotifier,
 ) -> Result<()> {
-    // Initial sync: start_listening returns all commissioned nodes AND
-    // subscribes this connection to subsequent events.
-    let initial = client
-        .send_command("start_listening", json!({}))
-        .await
-        .context("matter start_listening failed")?;
-    let initial_nodes: Vec<MatterNode> =
-        serde_json::from_value(initial).context("unexpected start_listening payload")?;
+    // Initial sync: `subscribe` returns the whole fabric AND subscribes this
+    // connection to subsequent events.
+    let snapshot: Snapshot = serde_json::from_value(
+        client
+            .send("subscribe", json!({}))
+            .await
+            .context("subscribing to the Matter controller failed")?,
+    )
+    .context("the controller sent a snapshot this version does not understand")?;
+
     tracing::info!(
-        count = initial_nodes.len(),
-        "matter: fabric nodes discovered"
+        target: "giap::trace",
+        kind = "matter_subscribed",
+        devices = snapshot.devices.len(),
+        readings = snapshot.readings.len(),
+        "matter: fabric synced"
     );
-    for node in initial_nodes {
-        sync_node(node, &nodes, &registry, &bus).await;
+
+    let mut cache = ReadingCache::new();
+    for device in &snapshot.devices {
+        sync_device(device, &registry, &notifier).await;
+    }
+    for reading in &snapshot.readings {
+        publish_reading(reading, &mut cache, &bus);
     }
 
-    while let Some(MatterEvent { event, data }) = events.recv().await {
+    while let Some(MatterEvent { event, payload }) = events.recv().await {
         match event.as_str() {
-            "attribute_updated" => {
-                // data = [node_id, "endpoint/cluster/attribute", value]
-                let (Some(node_id), Some(path), Some(value)) = (
-                    data.get(0).and_then(Value::as_u64),
-                    data.get(1).and_then(Value::as_str),
-                    data.get(2),
-                ) else {
-                    continue;
-                };
-                // Keep the cache current so endpoint lookups stay accurate.
-                if let Some(node) = nodes.write().await.get_mut(&node_id) {
-                    node.attributes.insert(path.to_string(), value.clone());
-                }
-                if let Some(reading) = sensor_reading_from_update(node_id, path, value) {
+            "reading" => {
+                if let Ok(reading) = serde_json::from_value::<WireReading>(payload) {
                     tracing::debug!(
                         device = %reading.device_id,
                         sensor = %reading.sensor_type,
                         value = reading.value,
                         "matter: sensor update"
                     );
-                    bus.publish(BusEvent::Sensor(reading));
+                    publish_reading(&reading, &mut cache, &bus);
                 }
             }
-            "node_added" | "node_updated" => {
-                if let Ok(node) = serde_json::from_value::<MatterNode>(data) {
-                    sync_node(node, &nodes, &registry, &bus).await;
+            "device_added" | "device_updated" => {
+                if let Ok(DeviceEvent { device }) = serde_json::from_value::<DeviceEvent>(payload) {
+                    sync_device(&device, &registry, &notifier).await;
                 }
             }
-            "node_removed" => {
-                if let Some(node_id) = data.as_u64() {
-                    nodes.write().await.remove(&node_id);
-                    tracing::info!(node_id, "matter: node removed from fabric");
+            "device_removed" => {
+                if let Ok(DeviceRemovedEvent { device_id }) =
+                    serde_json::from_value::<DeviceRemovedEvent>(payload)
+                {
+                    tracing::info!(
+                        target: "giap::trace",
+                        kind = "matter_node_removed",
+                        device = %device_id,
+                        "matter: device removed from the fabric"
+                    );
+                    // Only news if GIAP still thinks it has this device: a user
+                    // deleting one goes through the same removal, and telling
+                    // them about the thing they just did is noise.
+                    if matches!(registry.get_device(&device_id).await, Ok(Some(_))) {
+                        notifier.device_dropped(&device_id).await;
+                    }
+                }
+            }
+            "device_availability" => {
+                if let Ok(AvailabilityEvent { device_id, online }) =
+                    serde_json::from_value::<AvailabilityEvent>(payload)
+                {
+                    tracing::debug!(device = %device_id, online, "matter: availability changed");
+                    if online {
+                        if let Err(e) = registry.heartbeat(&device_id).await {
+                            tracing::warn!(device = %device_id, error = %e, "matter: heartbeat failed");
+                        }
+                    }
                 }
             }
             _ => {}
@@ -260,30 +284,29 @@ pub async fn run_matter_bridge(
     Ok(()) // event channel closed = connection gone; caller reconnects
 }
 
-/// Run the bridge forever, reconnecting transparently when the matter-server
-/// connection drops (#195).
+/// Run the bridge forever, reconnecting transparently when the controller
+/// connection drops.
 ///
 /// Owns the loop that [`run_matter_bridge`] documented as "caller reconnects":
 /// on drop it re-establishes the WebSocket with capped, jittered backoff, swaps
 /// the fresh client into `client_cell` (so the control port the MCP tool holds
-/// keeps working without being rebuilt), and re-runs the bridge — which calls
-/// `start_listening` again and resyncs every node into the cache and registry.
+/// keeps working without being rebuilt), and re-runs the bridge.
 ///
 /// When reconnecting keeps failing it also revives the controller itself — see
 /// [`should_respawn_controller`] — because a process that has exited will never
 /// answer a reconnect, however long the loop runs.
 ///
-/// `client` / `events` are the already-established initial connection (from the
-/// startup connect, which also decided Matter-vs-logging-stub). This never
-/// returns while the process lives; it is expected to be `tokio::spawn`ed.
+/// This never returns while the process lives; it is expected to be
+/// `tokio::spawn`ed.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_matter_supervisor(
     config: SupervisorConfig,
     client_cell: SharedMatterClient,
     mut client: Arc<MatterClient>,
     mut events: mpsc::Receiver<MatterEvent>,
-    nodes: NodeCache,
     registry: Arc<dyn DeviceRegistry + Send + Sync>,
     bus: Arc<dyn EventBus>,
+    notifier: MatterNotifier,
 ) {
     let SupervisorConfig {
         url,
@@ -295,27 +318,44 @@ pub async fn run_matter_supervisor(
         match run_matter_bridge(
             client.clone(),
             events,
-            nodes.clone(),
             registry.clone(),
             bus.clone(),
+            notifier.clone(),
         )
         .await
         {
-            Ok(()) => tracing::warn!("matter: bridge stopped (connection closed); reconnecting"),
-            Err(e) => tracing::warn!(error = %e, "matter: bridge failed; reconnecting"),
+            Ok(()) => tracing::warn!(
+                target: "giap::trace",
+                kind = "matter_bridge_stopped",
+                "matter: bridge stopped (connection closed); reconnecting"
+            ),
+            Err(e) => tracing::warn!(
+                target: "giap::trace",
+                kind = "matter_bridge_failed",
+                error = %describe(&e),
+                "matter: bridge failed; reconnecting"
+            ),
         }
 
         // Reconnect with backoff until it succeeds; the fabric is resynced when
-        // the next run_matter_bridge calls start_listening.
+        // the next run_matter_bridge subscribes.
         let mut attempt: u32 = 1;
         let (new_client, new_events) = loop {
             // Enough failures in a row means the controller is probably gone
             // rather than busy — reconnecting cannot fix that, restarting can.
             if should_respawn_controller(attempt) {
+                // The first revival attempt is also the point at which this stops
+                // looking like a blip to a person: told any earlier, a user would
+                // be notified every time the controller restarted normally.
+                notifier.controller_unreachable(&url).await;
+
                 match revive_local_controller(&data_dir, &url, &child, RESPAWN_READY_TIMEOUT).await
                 {
                     Ok(Revival::Restarted) => tracing::info!(
+                        target: "giap::trace",
+                        kind = "matter_controller_revived",
                         url = %url,
+                        outcome = "restarted",
                         "matter: controller was not running; restarted it"
                     ),
                     // Reused: the controller is up, so the fault is in the
@@ -323,7 +363,9 @@ pub async fn run_matter_supervisor(
                     // NotLocal: another host's controller, not ours to restart.
                     Ok(Revival::Reused | Revival::NotLocal) => {}
                     Err(e) => tracing::warn!(
-                        error = %e,
+                        target: "giap::trace",
+                        kind = "matter_controller_revive_failed",
+                        error = %describe(&e),
                         "matter: controller restart failed; will retry with the next attempts"
                     ),
                 }
@@ -335,9 +377,12 @@ pub async fn run_matter_supervisor(
                 Ok(pair) => break pair,
                 Err(e) => {
                     tracing::warn!(
+                        target: "giap::trace",
+                        kind = "matter_reconnect_attempt",
                         url = %url,
                         attempt,
-                        error = %e,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %describe(&e),
                         "matter: reconnect attempt failed; will retry"
                     );
                     attempt = attempt.saturating_add(1);
@@ -348,13 +393,33 @@ pub async fn run_matter_supervisor(
         *client_cell.write().await = new_client.clone();
         client = new_client;
         events = new_events;
-        tracing::info!(url = %url, "matter: reconnected to matter-server");
+        tracing::info!(
+            target: "giap::trace",
+            kind = "matter_reconnected",
+            url = %url,
+            attempts = attempt,
+            "matter: reconnected to the controller"
+        );
+        notifier.controller_recovered().await;
     }
 }
 
 #[cfg(test)]
 mod backoff_tests {
     use super::*;
+    use futures::StreamExt;
+
+    /// The next event on the bus, or `None` if nothing arrives promptly. The bus
+    /// hands back a stream, so "nothing was published" is a short wait rather
+    /// than an immediate answer.
+    async fn next_event(
+        stream: &mut pond_core::shared::ports::event_bus::BusStream,
+    ) -> Option<BusEvent> {
+        tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .ok()
+            .flatten()
+    }
 
     #[test]
     fn backoff_grows_then_caps_and_stays_within_jitter_bounds() {
@@ -392,5 +457,82 @@ mod backoff_tests {
         assert!(!should_respawn_controller(6));
         assert!(should_respawn_controller(7));
         assert!(should_respawn_controller(10));
+    }
+
+    #[tokio::test]
+    async fn a_steady_reading_is_published_once_however_often_the_bridge_resubscribes() {
+        // The regression this guards: the rules engine is LEVEL-based, so a
+        // republished "motion = true" fires every automation attached to it. A
+        // reconnecting controller would do that on every reconnect.
+        let bus: Arc<dyn EventBus> =
+            Arc::new(pond_core::shared::services::in_process_event_bus::InProcessEventBus::new());
+        let mut received = bus.subscribe();
+        let mut cache = ReadingCache::new();
+
+        let reading = WireReading {
+            device_id: "matter-4".to_string(),
+            sensor_type: "occupancy".to_string(),
+            value: 1.0,
+            unit: "bool".to_string(),
+            at: None,
+        };
+
+        publish_reading(&reading, &mut cache, &bus);
+        publish_reading(&reading, &mut cache, &bus);
+        publish_reading(&reading, &mut cache, &bus);
+
+        assert!(
+            next_event(&mut received).await.is_some(),
+            "first sight must publish"
+        );
+        assert!(
+            next_event(&mut received).await.is_none(),
+            "an unchanged reading must not be republished"
+        );
+
+        // A real change still gets through, or the cache would silence the sensor.
+        let changed = WireReading {
+            value: 0.0,
+            ..reading.clone()
+        };
+        publish_reading(&changed, &mut cache, &bus);
+        assert!(
+            next_event(&mut received).await.is_some(),
+            "a changed reading must publish"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_sensors_on_one_device_do_not_shadow_each_other() {
+        // Keyed by (device, sensor) rather than device: an air purifier reports
+        // several, and a device-keyed cache would let the first one seen
+        // suppress all the rest.
+        let bus: Arc<dyn EventBus> =
+            Arc::new(pond_core::shared::services::in_process_event_bus::InProcessEventBus::new());
+        let mut received = bus.subscribe();
+        let mut cache = ReadingCache::new();
+
+        let base = WireReading {
+            device_id: "matter-7".to_string(),
+            sensor_type: "pm2_5".to_string(),
+            value: 12.0,
+            unit: "ug/m3".to_string(),
+            at: None,
+        };
+        publish_reading(&base, &mut cache, &bus);
+        publish_reading(
+            &WireReading {
+                sensor_type: "carbon_dioxide".to_string(),
+                ..base.clone()
+            },
+            &mut cache,
+            &bus,
+        );
+
+        assert!(next_event(&mut received).await.is_some());
+        assert!(
+            next_event(&mut received).await.is_some(),
+            "the second sensor was shadowed"
+        );
     }
 }

@@ -1,4 +1,5 @@
 import type { MusicProvider, TrackInfo, PlaylistInfo, AlbumInfo, DeviceInfo, RepeatState, ArtistInfo, TimeRange } from './types.js';
+import { describeError, log } from '../log.js';
 
 interface SpotifyTrack {
   id: string;
@@ -59,6 +60,11 @@ export class SpotifyProvider implements MusicProvider {
 
   private get token(): string {
     if (!this.accessToken) {
+      // The one failure a user can fix in ten seconds, and the one that looked
+      // exactly like a broken extension when nothing reported it.
+      log.warn('no_token', 'no Spotify token — the extension has never been signed in', {
+        hint: 'sign in to Spotify from the Extensions tab',
+      });
       throw new Error('SPOTIFY_ACCESS_TOKEN not set. Sign in via GIAP Extensions.');
     }
     return this.accessToken;
@@ -72,6 +78,14 @@ export class SpotifyProvider implements MusicProvider {
    * token from the response so we can retry without a process restart.
    */
   private async refreshToken(): Promise<boolean> {
+    // Every arm below says which one it was. This function used to end in
+    // `catch { /* GIAP may be unreachable */ }` and three silent `return false`s,
+    // so an expired token, a GIAP that could not be reached, a rejected refresh
+    // and a malformed response were one symptom: music stopped working and
+    // nothing anywhere said why. They need different fixes from the user.
+    const started = Date.now();
+    log.debug('token_refresh_started', 'asking GIAP to refresh the Spotify token');
+
     try {
       const refreshResp = await fetch(`${this.giapUrl}/api/v1/oauth/refresh`, {
         method: 'POST',
@@ -81,14 +95,40 @@ export class SpotifyProvider implements MusicProvider {
         },
         body: JSON.stringify({ provider: 'spotify' }),
       });
-      if (!refreshResp.ok) return false;
+
+      if (!refreshResp.ok) {
+        log.warn('token_refresh_rejected', 'GIAP refused to refresh the Spotify token', {
+          status: refreshResp.status,
+          // 401 here is GIAP's own internal token, not Spotify's — a different
+          // fault entirely from the one that sent us here.
+          hint: refreshResp.status === 401
+            ? 'the extension\'s internal token was rejected'
+            : 'sign in to Spotify again from the Extensions tab',
+          duration_ms: Date.now() - started,
+        });
+        return false;
+      }
 
       const data = await refreshResp.json() as { refreshed?: boolean; access_token?: string };
       if (data.access_token) {
         this.accessToken = data.access_token;
+        log.info('token_refreshed', 'Spotify token refreshed', {
+          duration_ms: Date.now() - started,
+        });
         return true;
       }
-    } catch { /* GIAP may be unreachable */ }
+
+      log.warn('token_refresh_empty', 'GIAP accepted the refresh but returned no token', {
+        refreshed: data.refreshed ?? false,
+        duration_ms: Date.now() - started,
+      });
+    } catch (error) {
+      log.warn('token_refresh_unreachable', 'could not reach GIAP to refresh the token', {
+        url: this.giapUrl,
+        error: describeError(error),
+        duration_ms: Date.now() - started,
+      });
+    }
     return false;
   }
 
@@ -110,11 +150,19 @@ export class SpotifyProvider implements MusicProvider {
       body: body ? JSON.stringify(body) : undefined,
     });
 
+    const started = Date.now();
     let resp = await send();
     let afterRefresh = '';
 
     if (resp.status === 401) {
+      log.debug('token_expired', 'Spotify rejected the token; refreshing', { method, path });
       if (!await this.refreshToken()) {
+        // The refresh path has already said which way it failed; this is the
+        // consequence, and the sentence the user reads.
+        log.warn('request_unauthorised', 'a Spotify request could not be authorised', {
+          method,
+          path,
+        });
         throw new Error(
           'Spotify token expired and refresh failed. Re-authenticate via GIAP Extensions.'
         );
@@ -125,6 +173,16 @@ export class SpotifyProvider implements MusicProvider {
 
     if (!resp.ok) {
       const body = await resp.text();
+      log.warn('spotify_api_failed', 'Spotify refused a request', {
+        method,
+        path,
+        status: resp.status,
+        after_refresh: afterRefresh !== '',
+        // Bounded: an error body can be long, and the first line carries the
+        // reason. Redaction happens in the logger.
+        body: body.slice(0, 300),
+        duration_ms: Date.now() - started,
+      });
 
       // A scope the token was never granted. Distinct from the withdrawn
       // endpoints above, which answer 403 with a bare "Forbidden" and stay
@@ -140,6 +198,12 @@ export class SpotifyProvider implements MusicProvider {
       throw new Error(`Spotify API ${resp.status}${afterRefresh}: ${body}`);
     }
 
+    log.debug('spotify_api_ok', 'Spotify answered', {
+      method,
+      path,
+      status: resp.status,
+      duration_ms: Date.now() - started,
+    });
     return resp;
   }
 

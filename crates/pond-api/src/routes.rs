@@ -4428,20 +4428,17 @@ async fn update_settings(
     // model) until someone fixed a field they were not touching.
     let touches_matter = patch
         .as_object()
-        .is_some_and(|o| o.contains_key("matter_enabled") || o.contains_key("matter_ws_url"));
+        .is_some_and(|o| o.contains_key("matter_ws_url"));
     let matter_url = merged.matter_ws_url.trim();
-    if touches_matter
-        && merged.matter_enabled
-        && !(matter_url.starts_with("ws://") || matter_url.starts_with("wss://"))
-    {
+    if touches_matter && !(matter_url.starts_with("ws://") || matter_url.starts_with("wss://")) {
         // An empty address and a malformed one are different mistakes and read
         // as different sentences: "empty" tells the user the field they are
         // looking at is blank, which the placeholder otherwise hides.
         let message = if matter_url.is_empty() {
             "Controller address is empty. Enter the Matter controller's WebSocket URL, \
-             for example ws://127.0.0.1:5580/ws"
+             for example ws://127.0.0.1:5580/giap"
         } else {
-            "Controller address must be a WebSocket URL, for example ws://127.0.0.1:5580/ws"
+            "Controller address must be a WebSocket URL, for example ws://127.0.0.1:5580/giap"
         };
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -4540,19 +4537,15 @@ async fn update_settings(
     // controller. The reconciler treats "enabled but not yet Connected" as
     // needing a restart, so an unconditional send meant that ANY unrelated
     // save during the first controller install — renaming the home, changing a
-    // model — tore down a multi-minute `pip install` and started it again.
+    // model — tore down a multi-minute dependency install and started it again.
     // Repeat that a few times and the Devices panel sits on "Starting..."
     // forever.
     //
-    // Retry from the Devices tab still works: `saveMatter` sends
-    // `matter_enabled` and `matter_ws_url` explicitly, so it is a
-    // `touches_matter` save by construction.
+    // Retry from the Devices tab still works: it sends `matter_ws_url`
+    // explicitly, so it is a `touches_matter` save by construction.
     if touches_matter {
         if let Some(matter) = &state.matter {
-            matter.apply(
-                merged.matter_enabled,
-                merged.matter_ws_url.trim().to_string(),
-            );
+            matter.apply(merged.matter_ws_url.trim().to_string());
         }
     }
 

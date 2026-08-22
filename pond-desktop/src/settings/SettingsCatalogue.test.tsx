@@ -20,7 +20,7 @@ const SERVER_SETTINGS = {
   unprompted_speech_categories: "alert",
   weather_latitude: -1.286,
   weather_longitude: 36.817,
-  matter_ws_url: "ws://127.0.0.1:5580/ws",
+  matter_ws_url: "ws://127.0.0.1:5580/giap",
   chat_model: "gemma-4-E4B",
   agent_max_turns: 50,
   tool_call_validation: true,

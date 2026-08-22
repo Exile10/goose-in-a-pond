@@ -1,47 +1,43 @@
-//! [`MatterDeviceControl`] — the [`DeviceControlPort`] over a live
-//! matter-server connection. Verbs map onto Matter clusters exactly as proven
-//! in the live MVD session (`device_command` with node/endpoint/cluster).
+//! [`MatterDeviceControl`] — the [`DeviceControlPort`] over a live controller
+//! connection.
+//!
+//! Every verb is one `control` op. Which cluster that becomes, which endpoint it
+//! lands on, and what unit the value is in are all the controller's business —
+//! it has matter.js's typed cluster models to decide with, where this crate had
+//! a hand-maintained table of decimal cluster ids.
+//!
+//! The outcome is built from what the controller says it applied, not from what
+//! the caller asked for. That distinction is the reason the wire carries an
+//! `applied` patch at all: reporting the request back as though it were the
+//! result is how a device that rejected a write still got described to the user
+//! as having taken it.
 
-use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use async_trait::async_trait;
-use pond_core::user_data::ports::device_control::{
-    DeviceControlOutcome, DeviceControlPort, DeviceStatePatch,
-};
-use serde_json::json;
+use pond_core::user_data::ports::device_control::{DeviceControlOutcome, DeviceControlPort};
+use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-use crate::client::MatterClient;
-use crate::protocol::{
-    brightness_to_level, celsius_to_setpoint, endpoints_with_cluster, fan_mode_from_name,
-    hue_to_matter, node_id_from_device_id, position_open_to_lift_100ths, saturation_to_matter,
-    MatterNode, ATTR_FAN_MODE, ATTR_FAN_PERCENT_SETTING, ATTR_OCCUPIED_HEATING_SETPOINT,
-    CLUSTER_COLOR_CONTROL, CLUSTER_DOOR_LOCK, CLUSTER_FAN_CONTROL, CLUSTER_LEVEL_CONTROL,
-    CLUSTER_ON_OFF, CLUSTER_THERMOSTAT, CLUSTER_WINDOW_COVERING, FAN_MODE_OFF, FAN_MODE_ON,
-};
-
-/// Shared node cache: the bridge keeps it current from server events; the
-/// control port reads it to resolve endpoints per cluster.
-pub type NodeCache = Arc<RwLock<HashMap<u64, MatterNode>>>;
+use crate::client::{code_of, MatterClient};
+use crate::protocol::{describe, ControlResult};
 
 /// A swappable handle to the live client. The reconnect supervisor replaces the
 /// inner `Arc<MatterClient>` after re-establishing the WebSocket, so the control
-/// port keeps working across a matter-server restart without being rebuilt
-/// (#195). Reads clone the current `Arc` and drop the lock immediately.
+/// port keeps working across a controller restart without being rebuilt.
+/// Reads clone the current `Arc` and drop the lock immediately.
 pub type SharedMatterClient = Arc<RwLock<Arc<MatterClient>>>;
 
 pub struct MatterDeviceControl {
     client: SharedMatterClient,
-    nodes: NodeCache,
 }
 
 impl MatterDeviceControl {
-    pub fn new(client: Arc<MatterClient>, nodes: NodeCache) -> Self {
+    pub fn new(client: Arc<MatterClient>) -> Self {
         Self {
             client: Arc::new(RwLock::new(client)),
-            nodes,
         }
     }
 
@@ -51,175 +47,78 @@ impl MatterDeviceControl {
         self.client.clone()
     }
 
-    /// The client currently in use — cloned so the lock is released before any
-    /// await on the network.
-    async fn client(&self) -> Arc<MatterClient> {
-        self.client.read().await.clone()
-    }
-
-    /// Resolve a GIAP device id to `(node_id, endpoint)` for `cluster`, or
-    /// `None` when the node simply does not carry that cluster.
+    /// Drive one verb and report what the device became.
     ///
-    /// Separate from [`Self::resolve`] so a caller that can drive a device two
-    /// ways — a fan is switched through FanMode, a light through On/Off — can
-    /// ask "does it have this one?" without swallowing the errors that mean
-    /// something genuinely wrong: a malformed id, or a node off the fabric.
-    async fn resolve_opt(&self, device_id: &str, cluster: u32) -> Result<Option<(u64, u16)>> {
-        let node_id = node_id_from_device_id(device_id).ok_or_else(|| {
-            anyhow!(
-                "'{device_id}' is not a Matter device id (expected \"matter-<node>\"; \
-                 pick the id from the device list)"
-            )
-        })?;
-        let nodes = self.nodes.read().await;
-        let node = nodes
-            .get(&node_id)
-            .ok_or_else(|| anyhow!("Matter node {node_id} is not commissioned on this fabric"))?;
-        Ok(endpoints_with_cluster(node, cluster)
-            .first()
-            .map(|endpoint| (node_id, *endpoint)))
-    }
-
-    /// Resolve a GIAP device id to `(node_id, endpoint)` for `cluster`.
-    async fn resolve(&self, device_id: &str, cluster: u32) -> Result<(u64, u16)> {
-        self.resolve_opt(device_id, cluster)
-            .await?
-            .ok_or_else(|| anyhow!("Matter device '{device_id}' does not support this capability"))
-    }
-
-    async fn command(
+    /// This is the only place a device command is logged, and it is logged
+    /// whichever way it goes: a control path that says nothing on success gives
+    /// no way to tell "the command was never sent" from "the device ignored it",
+    /// which was the whole diagnostic position before.
+    async fn control(
         &self,
-        node_id: u64,
-        endpoint: u16,
-        cluster: u32,
-        name: &str,
-        payload: serde_json::Value,
-    ) -> Result<()> {
-        self.client()
-            .await
-            .send_command(
-                "device_command",
-                json!({
-                    "node_id": node_id,
-                    "endpoint_id": endpoint,
-                    "cluster_id": cluster,
-                    "command_name": name,
-                    "payload": payload,
-                }),
+        device_id: &str,
+        verb: &str,
+        value: Value,
+    ) -> Result<DeviceControlOutcome> {
+        let client = self.client.read().await.clone();
+        let started = Instant::now();
+
+        let outcome = client
+            .send(
+                "control",
+                json!({ "device_id": device_id, "verb": verb, "value": value }),
             )
-            .await?;
-        Ok(())
+            .await;
+
+        let elapsed = started.elapsed().as_millis() as u64;
+        match outcome {
+            Ok(result) => {
+                let applied = serde_json::from_value::<ControlResult>(result)
+                    .map(|r| r.applied)
+                    .unwrap_or_default();
+                tracing::debug!(
+                    target: "giap::trace",
+                    kind = "matter_device_command",
+                    device = %device_id,
+                    verb,
+                    duration_ms = elapsed,
+                    "drove a Matter device"
+                );
+                Ok(DeviceControlOutcome::new(device_id, applied))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "giap::trace",
+                    kind = "matter_device_command",
+                    device = %device_id,
+                    verb,
+                    duration_ms = elapsed,
+                    error_code = code_of(&e).unwrap_or("none"),
+                    error = %describe(&e),
+                    "a Matter device command failed"
+                );
+                Err(e)
+            }
+        }
     }
 }
 
 #[async_trait]
 impl DeviceControlPort for MatterDeviceControl {
     async fn set_power(&self, device_id: &str, on: bool) -> Result<DeviceControlOutcome> {
-        if let Some((node, ep)) = self.resolve_opt(device_id, CLUSTER_ON_OFF).await? {
-            self.command(
-                node,
-                ep,
-                CLUSTER_ON_OFF,
-                if on { "On" } else { "Off" },
-                json!({}),
-            )
-            .await?;
-        } else if let Some((node, ep)) = self.resolve_opt(device_id, CLUSTER_FAN_CONTROL).await? {
-            // A fan's power is `FanMode`, written rather than commanded. Most
-            // fans (the Virtual Fan included) implement no On/Off cluster at
-            // all, so without this branch "turn on the fan" could only fail.
-            self.client()
-                .await
-                .send_command(
-                    "write_attribute",
-                    json!({
-                        "node_id": node,
-                        "attribute_path": format!("{ep}/{CLUSTER_FAN_CONTROL}/{ATTR_FAN_MODE}"),
-                        "value": if on { FAN_MODE_ON } else { FAN_MODE_OFF },
-                    }),
-                )
-                .await?;
-        } else {
-            return Err(anyhow!(
-                "Matter device '{device_id}' cannot be switched on or off"
-            ));
-        }
-
-        Ok(DeviceControlOutcome::new(
-            device_id,
-            DeviceStatePatch {
-                on: Some(on),
-                ..Default::default()
-            },
-        ))
+        self.control(device_id, "power", json!(on)).await
     }
 
     async fn set_brightness(&self, device_id: &str, percent: u8) -> Result<DeviceControlOutcome> {
-        let pct = percent.min(100);
-        let (node, ep) = self.resolve(device_id, CLUSTER_LEVEL_CONTROL).await?;
-        self.command(
-            node,
-            ep,
-            CLUSTER_LEVEL_CONTROL,
-            "MoveToLevelWithOnOff",
-            json!({
-                "level": brightness_to_level(pct),
-                "transitionTime": 0,
-                "optionsMask": 0,
-                "optionsOverride": 0,
-            }),
-        )
-        .await?;
-        Ok(DeviceControlOutcome::new(
-            device_id,
-            DeviceStatePatch {
-                brightness: Some(pct),
-                on: Some(pct > 0),
-                ..Default::default()
-            },
-        ))
+        self.control(device_id, "brightness", json!(percent.min(100)))
+            .await
     }
 
     async fn set_target_temp(&self, device_id: &str, celsius: f32) -> Result<DeviceControlOutcome> {
-        let (node, ep) = self.resolve(device_id, CLUSTER_THERMOSTAT).await?;
-        // Setpoints are attribute writes, not commands.
-        self.client()
-            .await
-            .send_command(
-                "write_attribute",
-                json!({
-                    "node_id": node,
-                    "attribute_path": format!("{ep}/{CLUSTER_THERMOSTAT}/{ATTR_OCCUPIED_HEATING_SETPOINT}"),
-                    "value": celsius_to_setpoint(celsius),
-                }),
-            )
-            .await?;
-        Ok(DeviceControlOutcome::new(
-            device_id,
-            DeviceStatePatch {
-                target_temp: Some(celsius),
-                ..Default::default()
-            },
-        ))
+        self.control(device_id, "target_temp", json!(celsius)).await
     }
 
     async fn set_locked(&self, device_id: &str, locked: bool) -> Result<DeviceControlOutcome> {
-        let (node, ep) = self.resolve(device_id, CLUSTER_DOOR_LOCK).await?;
-        self.command(
-            node,
-            ep,
-            CLUSTER_DOOR_LOCK,
-            if locked { "LockDoor" } else { "UnlockDoor" },
-            json!({}),
-        )
-        .await?;
-        Ok(DeviceControlOutcome::new(
-            device_id,
-            DeviceStatePatch {
-                locked: Some(locked),
-                ..Default::default()
-            },
-        ))
+        self.control(device_id, "locked", json!(locked)).await
     }
 
     async fn set_color(
@@ -228,84 +127,21 @@ impl DeviceControlPort for MatterDeviceControl {
         hue_degrees: u16,
         saturation_percent: u8,
     ) -> Result<DeviceControlOutcome> {
-        let sat = saturation_percent.min(100);
-        let (node, ep) = self.resolve(device_id, CLUSTER_COLOR_CONTROL).await?;
-        self.command(
-            node,
-            ep,
-            CLUSTER_COLOR_CONTROL,
-            "MoveToHueAndSaturation",
-            json!({
-                "hue": hue_to_matter(hue_degrees),
-                "saturation": saturation_to_matter(sat),
-                "transitionTime": 0,
-                "optionsMask": 0,
-                "optionsOverride": 0,
-            }),
-        )
-        .await?;
-        Ok(DeviceControlOutcome::new(
+        self.control(
             device_id,
-            DeviceStatePatch {
-                hue: Some(hue_degrees % 360),
-                saturation: Some(sat),
-                ..Default::default()
-            },
-        ))
+            "color",
+            json!({ "hue": hue_degrees, "saturation": saturation_percent.min(100) }),
+        )
+        .await
     }
 
     async fn set_fan_speed(&self, device_id: &str, percent: u8) -> Result<DeviceControlOutcome> {
-        let pct = percent.min(100);
-        let (node, ep) = self.resolve(device_id, CLUSTER_FAN_CONTROL).await?;
-        // Fan speed is the `PercentSetting` attribute (0–100), not a command.
-        self.client()
+        self.control(device_id, "fan_speed", json!(percent.min(100)))
             .await
-            .send_command(
-                "write_attribute",
-                json!({
-                    "node_id": node,
-                    "attribute_path": format!("{ep}/{CLUSTER_FAN_CONTROL}/{ATTR_FAN_PERCENT_SETTING}"),
-                    "value": pct,
-                }),
-            )
-            .await?;
-        Ok(DeviceControlOutcome::new(
-            device_id,
-            DeviceStatePatch {
-                fan_speed: Some(pct),
-                on: Some(pct > 0),
-                ..Default::default()
-            },
-        ))
     }
 
     async fn set_fan_mode(&self, device_id: &str, mode: &str) -> Result<DeviceControlOutcome> {
-        let Some(code) = fan_mode_from_name(mode) else {
-            return Err(anyhow!(
-                "'{mode}' is not a fan mode — use off, low, medium, high, on, auto or smart"
-            ));
-        };
-        let (node, ep) = self.resolve(device_id, CLUSTER_FAN_CONTROL).await?;
-        self.client()
-            .await
-            .send_command(
-                "write_attribute",
-                json!({
-                    "node_id": node,
-                    "attribute_path": format!("{ep}/{CLUSTER_FAN_CONTROL}/{ATTR_FAN_MODE}"),
-                    "value": code,
-                }),
-            )
-            .await?;
-        Ok(DeviceControlOutcome::new(
-            device_id,
-            DeviceStatePatch {
-                fan_mode: Some(mode.trim().to_lowercase()),
-                // Off is the one mode that says something definite about power.
-                on: Some(code != FAN_MODE_OFF),
-                ..Default::default()
-            },
-        ))
+        self.control(device_id, "fan_mode", json!(mode)).await
     }
 
     async fn set_position(
@@ -313,26 +149,7 @@ impl DeviceControlPort for MatterDeviceControl {
         device_id: &str,
         percent_open: u8,
     ) -> Result<DeviceControlOutcome> {
-        let pct = percent_open.min(100);
-        let (node, ep) = self.resolve(device_id, CLUSTER_WINDOW_COVERING).await?;
-        self.command(
-            node,
-            ep,
-            CLUSTER_WINDOW_COVERING,
-            "GoToLiftPercentage",
-            json!({
-                // Matter lift is hundredths-of-a-percent CLOSED; GIAP speaks
-                // percent open.
-                "liftPercent100thsValue": position_open_to_lift_100ths(pct),
-            }),
-        )
-        .await?;
-        Ok(DeviceControlOutcome::new(
-            device_id,
-            DeviceStatePatch {
-                position: Some(pct),
-                ..Default::default()
-            },
-        ))
+        self.control(device_id, "position", json!(percent_open.min(100)))
+            .await
     }
 }

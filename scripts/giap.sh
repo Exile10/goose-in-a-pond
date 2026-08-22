@@ -94,7 +94,7 @@ pause() { [ -t 0 ] || return 0; printf '\n%spress return%s ' "$C_DIM" "$C_RST"; 
 # Plain variables only — bash 3.2 has no associative arrays.
 D_OS=""; D_ARCH=""; D_KERNEL=""; D_BOARD=""; D_IS_JETSON=false; D_L4T=""
 D_CUDA_STATE=""; D_NVCC=""; D_ACCEL=""
-D_RUST=""; D_CMAKE=""; D_NODE=""; D_NODE_OK=false
+D_RUST=""; D_CMAKE=""; D_NODE=""; D_NODE_OK=false; D_NODE_MATTER_OK=false
 D_BRANCH=""; D_SHA=""; D_DIRTY=""; D_SUB_PIN=""; D_SUB_HEAD=""; D_SUB_STATE=""
 D_UI_STATE=""; D_UI_WHEN=""
 D_BIN_REL=""; D_BIN_REL_WHEN=""; D_BIN_DBG=""; D_STAMP=""; D_DESKTOP=""
@@ -168,8 +168,14 @@ detect_toolchain() {
   command -v cmake >/dev/null 2>&1 && D_CMAKE="$(cmake --version 2>/dev/null | head -1 | awk '{print $3}')"
   if command -v node >/dev/null 2>&1; then
     D_NODE="$(node -v 2>/dev/null)"
-    local maj; maj="$(printf '%s' "$D_NODE" | sed 's/^v//' | cut -d. -f1)"
+    local maj min; maj="$(printf '%s' "$D_NODE" | sed 's/^v//' | cut -d. -f1)"
+    min="$(printf '%s' "$D_NODE" | sed 's/^v//' | cut -d. -f2)"
     if [ -n "$maj" ] && [ "$maj" -ge 20 ] 2>/dev/null; then D_NODE_OK=true; fi
+    # The Matter controller (matter.js) has a higher floor than Vite's, and it
+    # is a MINOR one: 20.18 satisfies "20+" and does not satisfy matter.js.
+    if [ -n "$maj" ] && { [ "$maj" -gt 20 ] || { [ "$maj" -eq 20 ] && [ "${min:-0}" -ge 19 ]; }; } 2>/dev/null; then
+      D_NODE_MATTER_OK=true
+    fi
   fi
 }
 
@@ -521,6 +527,13 @@ doctor() {
   # 8. node capability
   if [ "$D_NODE_OK" = true ]; then ok "node $D_NODE can build the web UI"
   else warn "node ${D_NODE:-absent} cannot build the web UI (Vite needs >= 20) — build dist elsewhere and rsync"
+       DOC_WARN=$((DOC_WARN+1)); fi
+
+  # 8b. node capability for the Matter controller — a higher, MINOR-level floor.
+  # Only worth warning about when Matter is something this Pond might use; the
+  # failure is otherwise invisible until someone flips the toggle months later.
+  if [ "$D_NODE_MATTER_OK" = true ]; then ok "node $D_NODE can run the Matter controller"
+  else warn "node ${D_NODE:-absent} cannot run the Matter controller (matter.js needs >= 20.19) — Matter will report it and stay off"
        DOC_WARN=$((DOC_WARN+1)); fi
 
   # 9. desktop app
