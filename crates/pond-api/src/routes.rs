@@ -11786,8 +11786,7 @@ async fn music_now_playing_handler(State(state): State<Arc<AppState>>) -> axum::
     // sometimes has what the leaner one didn't, so it is worth one extra
     // call, but only in the case that actually needs it.
     if body["item"].is_null() {
-        if let Ok(full_resp) = spotify_api_call(&state, reqwest::Method::GET, "/me/player").await
-        {
+        if let Ok(full_resp) = spotify_api_call(&state, reqwest::Method::GET, "/me/player").await {
             if full_resp.status().is_success() {
                 if let Ok(full_body) = full_resp.json::<serde_json::Value>().await {
                     if !full_body["item"].is_null() {
