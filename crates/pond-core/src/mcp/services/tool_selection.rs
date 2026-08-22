@@ -709,10 +709,7 @@ mod tests {
 
     #[test]
     fn an_empty_half_is_dropped_not_embedded() {
-        assert_eq!(
-            selection_signals("hi", "   ", ""),
-            vec!["hi".to_string()]
-        );
+        assert_eq!(selection_signals("hi", "   ", ""), vec!["hi".to_string()]);
         assert_eq!(
             selection_signals("  ", "mems", ""),
             vec!["mems".to_string()]

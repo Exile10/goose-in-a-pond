@@ -1445,8 +1445,7 @@ mod tests {
             "switching to once must set a concrete fire_at"
         );
         assert_eq!(
-            updated.next_run,
-            updated.fire_at,
+            updated.next_run, updated.fire_at,
             "a one-shot's next_run IS its fire_at"
         );
 
@@ -1537,7 +1536,10 @@ mod tests {
         let tasks = restarted.list_tasks().await.unwrap();
         let task = tasks.iter().find(|t| t.id == "cadence3").unwrap();
         assert_eq!(task.cron, pond_core::user_data::domain::schedule::CRON_ONCE);
-        assert!(task.fire_at.is_some(), "the one-shot instant must survive rehydration");
+        assert!(
+            task.fire_at.is_some(),
+            "the one-shot instant must survive rehydration"
+        );
     }
 
     #[tokio::test]
