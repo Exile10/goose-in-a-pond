@@ -206,14 +206,6 @@ impl SettingsRepository for SqliteSettingsRepository {
         );
         upsert!("vision_classifier_model", &settings.vision_classifier_model);
         // Matter (#195)
-        upsert!(
-            "matter_enabled",
-            if settings.matter_enabled {
-                "true"
-            } else {
-                "false"
-            }
-        );
         upsert!("matter_ws_url", &settings.matter_ws_url);
         // Private mesh (#132)
         upsert!(
@@ -889,7 +881,12 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         }
         "vision_classifier_model" => s.vision_classifier_model = value.to_string(),
         // Matter (#195)
-        "matter_enabled" => s.matter_enabled = value == "true",
+        // `matter_enabled` was a setting while Matter was opt-in. A row may
+        // still be here from then, and it is ignored rather than honoured: the
+        // toggle that set it is gone, so an install that had it off would have
+        // no way back and every device command would refuse with advice
+        // pointing at a control that no longer exists.
+        "matter_enabled" => {}
         // An empty row must not defeat the default. `get` starts from
         // `Settings::default()` and overwrites it row by row, so a stored empty
         // string would leave no address at all — and the Devices tab renders
@@ -899,7 +896,13 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         // chosen", which is what the default is for.
         "matter_ws_url" => {
             if !value.trim().is_empty() {
-                s.matter_ws_url = value.to_string();
+                // Migrated on read rather than by a schema migration: the value
+                // is a plain settings row, and rewriting it here means an
+                // install that never touched the field follows the default
+                // across the move to the matter.js controller instead of
+                // pointing at a path nothing serves.
+                s.matter_ws_url =
+                    pond_core::user_data::domain::settings::migrate_matter_ws_url(value);
             }
         }
         // Private mesh (#132)
@@ -1179,6 +1182,44 @@ mod tests {
             repo.get().await.unwrap().matter_ws_url,
             "ws://192.168.1.50:5580/ws"
         );
+    }
+
+    /// Every install predating the matter.js controller holds the old default,
+    /// which points at a path the current controller does not serve. Without
+    /// this rewrite, upgrading would silently break Matter for everyone who
+    /// never touched the field — the worst shape of breakage, because the
+    /// setting still LOOKS right.
+    #[tokio::test]
+    async fn the_superseded_controller_default_is_migrated_on_read() {
+        let repo = fresh_repo().await;
+        repo.set_key(
+            "matter_ws_url",
+            pond_core::user_data::domain::settings::LEGACY_MATTER_WS_URL.to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.get().await.unwrap().matter_ws_url,
+            pond_core::user_data::domain::settings::DEFAULT_MATTER_WS_URL
+        );
+    }
+
+    /// An address the user typed is theirs — another host, another port. Only
+    /// the exact old default moves.
+    #[tokio::test]
+    async fn a_user_chosen_controller_address_is_left_alone() {
+        let repo = fresh_repo().await;
+        for chosen in [
+            "ws://192.168.1.50:5580/ws",
+            "ws://127.0.0.1:9000/ws",
+            "wss://matter.example:443/giap",
+        ] {
+            repo.set_key("matter_ws_url", chosen.to_string())
+                .await
+                .unwrap();
+            assert_eq!(repo.get().await.unwrap().matter_ws_url, chosen);
+        }
     }
 
     /// Perturb every scalar field of a serialised `Settings` to a value that

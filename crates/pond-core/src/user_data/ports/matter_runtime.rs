@@ -30,7 +30,7 @@ pub enum MatterState {
     Disabled,
     /// Enabled and converging: installing or starting the controller, or
     /// opening the WebSocket. The first enable on a fresh install downloads a
-    /// python-matter-server venv, so this can legitimately last minutes.
+    /// controller's dependencies, so this can legitimately last minutes.
     Connecting,
     /// Enabled and connected — commissioning and device control are live.
     Connected,
@@ -49,7 +49,8 @@ impl MatterState {
 /// A snapshot of the runtime, safe to serialize straight to the UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatterStatus {
-    /// The persisted `matter_enabled` setting — what the user asked for.
+    /// Whether the integration is meant to be running at all. On by default;
+    /// not a user-facing toggle.
     pub enabled: bool,
     /// The controller URL currently in effect.
     pub url: String,
@@ -79,7 +80,7 @@ pub trait MatterRuntimePort: Send + Sync {
     /// install plus startup), and the settings write that triggers it must not
     /// block on that. Idempotent — asking for the state already in effect does
     /// nothing, so repeated saves do not churn the connection.
-    fn apply(&self, enabled: bool, url: String);
+    fn apply(&self, url: String);
 
     /// What the runtime is currently doing.
     async fn status(&self) -> MatterStatus;
@@ -115,7 +116,7 @@ mod tests {
     fn status_serializes_flat_with_the_failure_reason() {
         let json = serde_json::to_value(MatterStatus {
             enabled: true,
-            url: "ws://127.0.0.1:5580/ws".into(),
+            url: "ws://127.0.0.1:5580/giap".into(),
             state: MatterState::Unreachable {
                 error: "connection refused".into(),
             },
@@ -123,7 +124,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(json["enabled"], true);
-        assert_eq!(json["url"], "ws://127.0.0.1:5580/ws");
+        assert_eq!(json["url"], "ws://127.0.0.1:5580/giap");
         assert_eq!(json["state"], "unreachable");
         assert_eq!(json["error"], "connection refused");
     }

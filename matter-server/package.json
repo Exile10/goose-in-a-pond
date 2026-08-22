@@ -1,0 +1,28 @@
+{
+  "name": "giap-matter-server",
+  "version": "0.1.0",
+  "description": "GIAP's Matter controller \u2014 matter.js behind the giap-matter WebSocket protocol",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "start": "node --import tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "virtual-device": "node --import tsx tools/virtual-device.ts"
+  },
+  "dependencies": {
+    "@matter/main": "0.17.9",
+    "@matter/nodejs": "0.17.9",
+    "tsx": "4.20.6",
+    "ws": "8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.18.1",
+    "@types/ws": "8.18.1",
+    "typescript": "5.9.3",
+    "vitest": "3.2.4"
+  }
+}

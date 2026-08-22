@@ -44,7 +44,7 @@ impl DeviceCommissioningPort for StubCommissioner {
 pub struct StubMatterRuntime {
     status: Mutex<MatterStatus>,
     commissioner: Option<Arc<dyn DeviceCommissioningPort>>,
-    applied: Mutex<Vec<(bool, String)>>,
+    applied: Mutex<Vec<String>>,
     shutdowns: Mutex<usize>,
 }
 
@@ -87,7 +87,7 @@ impl StubMatterRuntime {
         Self {
             status: Mutex::new(MatterStatus {
                 enabled,
-                url: "ws://127.0.0.1:5580/ws".into(),
+                url: "ws://127.0.0.1:5580/giap".into(),
                 state,
             }),
             commissioner,
@@ -97,7 +97,7 @@ impl StubMatterRuntime {
     }
 
     /// Every `(enabled, url)` pair the runtime was asked to converge to.
-    pub fn applied(&self) -> Vec<(bool, String)> {
+    pub fn applied(&self) -> Vec<String> {
         self.applied.lock().unwrap().clone()
     }
 
@@ -109,8 +109,8 @@ impl StubMatterRuntime {
 
 #[async_trait]
 impl MatterRuntimePort for StubMatterRuntime {
-    fn apply(&self, enabled: bool, url: String) {
-        self.applied.lock().unwrap().push((enabled, url));
+    fn apply(&self, url: String) {
+        self.applied.lock().unwrap().push(url);
     }
 
     async fn status(&self) -> MatterStatus {
