@@ -304,6 +304,8 @@ async fn start_adapter(
             registry_dyn,
             bus_bridge,
             MatterNotifier::disabled(),
+            // Fast enough that a test can watch it happen.
+            Duration::from_millis(50),
         )
         .await;
     });
@@ -347,6 +349,59 @@ async fn the_bridge_syncs_the_fabric_into_the_device_registry() {
     assert_eq!(kitchen.name, "Kitchen Light");
     assert_eq!(kitchen.device_type, "light");
     assert_eq!(kitchen.capabilities, vec!["power", "brightness"]);
+}
+
+#[tokio::test]
+async fn a_device_nobody_touches_keeps_reading_as_present() {
+    // `is_online` is derived from `last_seen` being fresher than five minutes, and
+    // the bridge only said "still here" when an event arrived. An idle Matter device
+    // sends none, so a washer nobody touched went offline five minutes after the
+    // server started, with a "last seen" frozen at the moment it was synced -- which
+    // read like a commissioning timestamp, because that is effectively what it was.
+    let (url, _) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
+    let (_control, registry, _bus, _rx) = start_adapter(&url).await;
+
+    let synced = registry.heartbeats.lock().unwrap().len();
+
+    // No events at all in this window: the device just sits there, as devices do.
+    tokio::time::sleep(Duration::from_millis(180)).await;
+
+    let beats = registry.heartbeats.lock().unwrap();
+    assert!(
+        beats.len() > synced,
+        "an idle device must still be vouched for; heartbeats: {beats:?}"
+    );
+    assert!(
+        beats.iter().all(|id| id == "matter-2"),
+        "only the device the controller can see: {beats:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_device_the_controller_has_lost_stops_being_vouched_for() {
+    // The other half: once the controller says a device is gone, the bridge must
+    // stop saying it is here, or `last_seen` never ages and the card never turns
+    // offline. Letting it age out is what makes one mechanism decide this.
+    let (url, _) = mock_controller(
+        snapshot(vec![light()], vec![]),
+        vec![json!({
+            "event": "device_availability",
+            "payload": { "device_id": "matter-2", "online": false }
+        })],
+        None,
+    )
+    .await;
+    let (_control, registry, _bus, _rx) = start_adapter(&url).await;
+
+    let after_loss = registry.heartbeats.lock().unwrap().len();
+    tokio::time::sleep(Duration::from_millis(180)).await;
+
+    let beats = registry.heartbeats.lock().unwrap();
+    assert_eq!(
+        beats.len(),
+        after_loss,
+        "a device the controller cannot see must not be vouched for: {beats:?}"
+    );
 }
 
 #[tokio::test]
@@ -432,6 +487,7 @@ async fn an_already_registered_device_is_retyped_on_sync() {
             registry_dyn,
             bus,
             MatterNotifier::disabled(),
+            Duration::from_millis(50),
         )
         .await;
     });

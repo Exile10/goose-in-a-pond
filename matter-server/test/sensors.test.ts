@@ -63,16 +63,53 @@ describe("sensor readings", () => {
     expect(readingFor(NODE, "booleanState", "stateValue", 1)).toBeUndefined();
   });
 
-  it("keeps every sensor type distinct", () => {
-    // Two clusters minting the same name would make readings from different devices
-    // indistinguishable downstream. The filter pair is the near miss this guards.
-    const names = SENSORS.map(s => s.sensorType);
-    expect(new Set(names).size).toBe(names.length);
+  it("mints a sensor type from one cluster, save where a quantity has two sources", () => {
+    // Two clusters minting the same name is normally an accident -- the filter pair
+    // is the near miss this was written for. Readings carry a device id, so the harm
+    // is not telling devices apart; it is one device exposing both clusters, where
+    // two sources for one quantity would alternate in the reading cache.
+    //
+    // Temperature is the real exception rather than a slip. A thermostat measures the
+    // room and publishes it as `thermostat.localTemperature`, not through
+    // TemperatureMeasurement, and calling that anything but "temperature" would hide
+    // it from every question a person actually asks.
+    const DUPLICATES_ALLOWED = new Set(["temperature"]);
+
+    const seen = new Set<string>();
+    for (const { sensorType } of SENSORS) {
+      if (seen.has(sensorType)) {
+        expect(
+          DUPLICATES_ALLOWED.has(sensorType),
+          `'${sensorType}' is minted twice and is not a known exception`,
+        ).toBe(true);
+      }
+      seen.add(sensorType);
+    }
   });
 
   it("has no duplicate cluster/attribute pairs", () => {
     // A duplicate would be silently shadowed by whichever entry the map built last.
     const paths = SENSORS.map(s => `${s.cluster}.${s.attribute}`);
     expect(new Set(paths).size).toBe(paths.length);
+  });
+  it("reports a reading in the unit the device declared, not the substance's default", () => {
+    // The Matter Virtual Device's air quality sensor declares ozone in ppm, where
+    // the conventional default is ppb, and pm1 in ppm where the default is ug/m3.
+    // describe read the declaration and readings did not, so one device described
+    // ozone in ppm and reported it in ppb at the same moment.
+    const ozone = readingFor(NODE, "ozoneConcentrationMeasurement", "measuredValue", 60, new Date(), 0);
+    expect(ozone?.unit).toBe("ppm");
+
+    const pm1 = readingFor(NODE, "pm1ConcentrationMeasurement", "measuredValue", 200, new Date(), 0);
+    expect(pm1?.unit).toBe("ppm");
+
+    // matter.js may hand the enum over decoded.
+    const named = readingFor(NODE, "ozoneConcentrationMeasurement", "measuredValue", 60, new Date(), "ugm3");
+    expect(named?.unit).toBe("ug/m3");
+
+    // A device that declares nothing keeps the substance's conventional unit,
+    // rather than a unit invented for it.
+    const silent = readingFor(NODE, "ozoneConcentrationMeasurement", "measuredValue", 60);
+    expect(silent?.unit).toBe("ppb");
   });
 });

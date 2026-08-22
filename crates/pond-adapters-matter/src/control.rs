@@ -15,14 +15,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use pond_core::user_data::ports::device_control::{DeviceControlOutcome, DeviceControlPort};
+use pond_core::user_data::ports::device_control::{
+    DeviceControlOutcome, DeviceControlPort, DeviceDescription, DeviceState,
+};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 use crate::client::{code_of, MatterClient};
-use crate::protocol::{describe, ControlResult};
+use crate::protocol::{describe, ControlResult, DescribeResult, StateResult};
 
 /// A swappable handle to the live client. The reconnect supervisor replaces the
 /// inner `Arc<MatterClient>` after re-establishing the WebSocket, so the control
@@ -104,6 +106,26 @@ impl MatterDeviceControl {
 
 #[async_trait]
 impl DeviceControlPort for MatterDeviceControl {
+    async fn describe(&self, device_id: &str) -> Result<DeviceDescription> {
+        let client = self.client.read().await.clone();
+        let result = client
+            .send("describe", json!({ "device_id": device_id }))
+            .await?;
+        serde_json::from_value::<DescribeResult>(result)
+            .map(|r| r.description)
+            .context("the controller did not describe the device")
+    }
+
+    async fn state(&self, device_id: &str) -> Result<DeviceState> {
+        let client = self.client.read().await.clone();
+        let result = client
+            .send("state", json!({ "device_id": device_id }))
+            .await?;
+        serde_json::from_value::<StateResult>(result)
+            .map(|r| r.state)
+            .context("the controller did not report the device's state")
+    }
+
     async fn set_power(&self, device_id: &str, on: bool) -> Result<DeviceControlOutcome> {
         self.control(device_id, "power", json!(on)).await
     }
@@ -142,6 +164,33 @@ impl DeviceControlPort for MatterDeviceControl {
 
     async fn set_fan_mode(&self, device_id: &str, mode: &str) -> Result<DeviceControlOutcome> {
         self.control(device_id, "fan_mode", json!(mode)).await
+    }
+
+    async fn set_mode(
+        &self,
+        device_id: &str,
+        setting: &str,
+        value: &str,
+    ) -> Result<DeviceControlOutcome> {
+        self.control(
+            device_id,
+            "mode",
+            json!({ "setting": setting, "value": value }),
+        )
+        .await
+    }
+
+    async fn set_operation(
+        &self,
+        device_id: &str,
+        operation: &str,
+    ) -> Result<DeviceControlOutcome> {
+        self.control(device_id, "operation", json!(operation)).await
+    }
+
+    async fn set_tilt(&self, device_id: &str, percent_open: u8) -> Result<DeviceControlOutcome> {
+        self.control(device_id, "tilt", json!(percent_open.min(100)))
+            .await
     }
 
     async fn set_position(

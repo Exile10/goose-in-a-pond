@@ -84,6 +84,8 @@ read a failure carrying a null result as a success.
 | `commission` | `{code, name?}` | `{device: Device}` |
 | `decommission` | `{device_id}` | `{}` |
 | `control` | `{device_id, verb, value}` | `{applied: DeviceStatePatch}` |
+| `describe` | `{device_id}` | `{description: DeviceDescription}` |
+| `state` | `{device_id}` | `{state: DeviceState}` |
 | `ping` | — | `{}` — liveness without a fabric round-trip |
 
 `subscribe` returns the **whole fabric**, readings included, so a fresh
@@ -106,6 +108,9 @@ Exactly GIAP's `DeviceControlPort` vocabulary:
 | `fan_speed` | 0–100 | `fan_speed`, `on` |
 | `fan_mode` | `off`/`low`/`medium`/`high`/`on`/`auto`/`smart` | `fan_mode`, `on` |
 | `position` | 0–100 percent **open** | `position` |
+| `tilt` | 0–100 percent **open** | `tilt` |
+| `mode` | `{setting, value}`, both as the device words them | `mode` |
+| `operation` | one of the operations the device offers | `operation` |
 
 Values are in GIAP's units. The controller converts.
 
@@ -113,6 +118,68 @@ Values are in GIAP's units. The controller converts.
 clamps to its own minimum reports that minimum. This is why the field exists: the
 old adapter built its outcome from the caller's request, so a device that did
 something else was still described to the user as having obeyed.
+
+That holds only if the command's *response* is read. Matter commands do not merely
+succeed or throw: Operational State answers every Start/Stop/Pause/Resume with an
+`ErrorStateID`, and ModeBase answers `changeToMode` with a `status`, so a refusal
+arrives as a perfectly successful invocation carrying a non-zero code. A controller
+that discards the response reports a refusal as a success — which is how GIAP told
+a user a washer was running while the washer sat there saying Stopped. Refusals
+become `device_refused`, worded by the device where it says why.
+
+`operation` accordingly applies the state the device reports being in, not the verb
+that was sent, and the operations offered are derived from `operationalStateList`
+rather than assumed: each of the four commands is optional, and the spec requires a
+device to expose the states matching the commands it supports.
+
+`target_temp` names whichever setpoint the thermostat currently runs on. A
+thermostat has two — one it heats up to, one it cools down to — and writing the
+heating one to a device that is cooling moves a number nobody asked about while the
+cooling carries on unchanged. Cool means the cooling setpoint, Heat means the
+heating one; Auto and Off run neither exclusively, so there the requested value
+picks whichever it is nearer to. Their limits differ and each bounds the other
+across `minSetpointDeadBand`, which is why the range a description reports depends
+on the mode, and why a thermostat advertising a 30 degree maximum can refuse 24
+while heating and accept 30 while cooling.
+
+A range that only holds in one mode says so, through `when` on the number: the
+condition it is true of, and where the device still reaches beyond it. Stated bare
+the number reads as a fact about the device, so the same question minutes apart
+answers 7 to 23.5 and then 7 to 32 with nothing to explain either, and a reader
+concludes 30 is impossible when it is one mode away.
+
+`tilt` is a covering's second axis, not a variant of `position`. Lift is how far a
+blind is lowered and tilt is how far its slats are turned, and a venetian blind is
+routinely down with its slats open — which `position` alone cannot ask for. Offered
+only by a covering that reports a tilt position, since a roller blind has nothing to
+turn and a control a device will reject is the failure this area exists to stop.
+Zero is open on both axes: the spec has `GoToTiltPercentage` treat a zero percentage
+as `UpOrOpen`, so one conversion serves both.
+
+`target_temp` also carries an appliance's own setpoint. Temperature Control has two
+shapes: a washer names levels, which are read as a `mode`, while a dishwasher states
+a number with its own minimum, maximum and `step`, taken by `setTemperature` rather
+than an attribute write. Reading only the levels, GIAP reported "you cannot set a
+temperature for the dishwasher" about a device showing a 49 to 82 degree slider. The
+existing verb carries it rather than a new one, a per-appliance vocabulary being the
+thing this area exists to avoid.
+
+A stated `step` travels with the range, because it is as much a part of what will be
+accepted: 50.5 into a dishwasher taking whole degrees is refused.
+
+The pairing reads backwards until you know what a setpoint is: heating runs BELOW
+its setpoint and cooling ABOVE its own, so heating is always the lower of the two.
+They bracket a band rather than describing how hard either can work.
+
+Reporting a state means waiting for it. A cluster's state is whatever the
+subscription last reported, and the report carrying a change arrives *after* the
+command returns — against the Matter Virtual Device, the command answered in 13ms
+and the new state landed within 500ms. So the controller waits for the state the
+verb asks for (Start for Running, Pause for Paused) before answering, returning as
+soon as it appears and giving up after two seconds. Read without that wait, a
+washer that started perfectly well reports as stopped, which is worse than the echo
+it replaced: an echo is uninformative, while this contradicts a device that did
+exactly as it was told.
 
 ---
 
@@ -148,6 +215,95 @@ device look different from every other kind.
 
 ---
 
+## Describing a device
+
+`capabilities` on `Device` is a list of verb names. It is enough to know a fan has
+a speed and not enough to drive one: it cannot say which modes *that* fan has,
+what a thermostat's limits are, or that an air quality sensor measures eleven
+separate substances. An agent given only the list guesses, and learns the limits
+by failing at them in front of the user.
+
+`describe` answers that, **read from the device rather than assumed**. Where a
+cluster states a constraint it is carried: FanControl's `fanModeSequence` says
+which modes the fan really has, a thermostat states its setpoint limits, a
+concentration cluster declares its unit. Where a cluster states nothing, the
+conventional default stands and nothing further is claimed — an invented
+constraint is worse than an absent one, because it will be believed.
+
+```ts
+DeviceDescription = {
+  device_id, device_type,
+  capabilities: Capability[],      // what it can be told to do
+  sensors: SensorSpec[],           // what it measures, reported or not
+}
+Capability = { verb: Verb, setting?: string, value: ValueSpec }
+ValueSpec =
+  | { kind: "boolean" }
+  | { kind: "percent" }                          // 0–100
+  | { kind: "number", min?, max?, unit? }        // absent key = unstated
+  | { kind: "enum", values: string[] }
+  | { kind: "color" }
+SensorSpec = { sensor_type, unit }
+```
+
+`verb` is exactly a control verb, so a description and a `control` call cannot
+drift apart: anything describable is callable, by construction.
+
+`mode` carries a `setting` name because a device has more than one: a washer has a
+wash cycle, a spin speed, a rinse count and a temperature level, and without the
+name they are indistinguishable in the list. It is the same name `control` is
+called with, and every layer that carries a description has to carry it — a
+renderer that drops it leaves a reader four identical `mode` entries and no way to
+name one, which reads as a device with no controls at all.
+
+**Settings are found by shape, not by a list of cluster names.** Matter's appliance
+controls are nearly all ModeBase derivatives, publishing `supportedModes` as
+`{label, mode}` pairs the device chose. So a cluster nobody has written code for
+works the day a device ships it, and the values offered are the labels that device
+published — "Whites" appears because the washer said "Whites". The two that are
+not ModeBase, Temperature Control and Laundry Washer Controls, are read explicitly
+because their shape differs, not because they are special.
+
+One name-shaped constraint survives, upstream of all this: a snapshot reads a
+bounded set of clusters, because it is rebuilt on every node event and reading all
+of them on a busy fabric costs more than the unread data is worth. The bound admits
+anything named `*Mode`, which is how Matter names every ModeBase derivative, so the
+promise above holds — but a control that is neither in the fixed set nor named that
+way has to be added to it. Settings read by shape from a snapshot filtered by name
+is a contradiction worth knowing about: it is what made a paired washer report
+nothing but power while every unit test passed.
+
+It is answered live rather than cached. A description is derived from what the
+device currently reports, and a stored copy goes stale exactly when a device is
+upgraded or reconfigured — the moment its description matters most.
+
+---
+
+## Reading a device
+
+`describe` says what a device can be told to do. `state` says what it is doing.
+
+```ts
+DeviceState = { device_id, values: StateValue[] }
+StateValue  = { name, value }        // both as the device words them
+```
+
+Every `name` is one `describe` also uses — a control verb for a scalar, a setting
+name for a selectable — so a reading names the thing that changes it: "spin speed
+is Low" leads straight to the call that makes it High. That correspondence is the
+point of the type being this plain, and it is asserted in the controller's tests
+rather than left as an intention.
+
+Values are read through the inverses of the conversions `control` writes with, so a
+covering reported at 40% open is the same 40% that would put it there — not
+WindowCovering's percent *closed*. Anything the device does not report is absent
+rather than filled in: an invented "unknown" cannot be told from a real reading one
+layer up.
+
+Without this the only way to learn a device's state was to change it. "Is the
+washer running?" had no answer that did not involve starting the washer.
+
+
 ## Error codes
 
 A **closed set**, because both the sentence the user reads and the decision to
@@ -162,6 +318,7 @@ failed" the only diagnosis GIAP could offer.
 | `commission_failed` | pairing was attempted and did not complete |
 | `device_unknown` | no such device on this fabric |
 | `capability_unsupported` | the device has no cluster for that verb |
+| `device_refused` | the device answered, and said no |
 | `device_unreachable` | the device is commissioned but did not answer |
 | `bad_request` | the op or its params are malformed |
 | `internal` | anything else |
