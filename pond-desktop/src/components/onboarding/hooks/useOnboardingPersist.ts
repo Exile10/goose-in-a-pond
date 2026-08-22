@@ -87,6 +87,15 @@ function buildSettingsPatch(stepId: string, draft: OnboardingDraft): Partial<Set
         timezone: draft.timezone,
         weather_location_name: draft.locationName,
         weather_enabled: draft.enableWeather,
+        // Carried through when Auto-detect found them. The wizard used to send
+        // only the NAME, so a household finished setup with coordinates of
+        // 0,0 and weather that could not be fetched until the server happened
+        // to geocode the name on a later save. Sent only when they are real:
+        // 0/0 is this struct's unset value, and writing it would overwrite
+        // coordinates the server had already worked out.
+        ...(draft.latitude !== 0 || draft.longitude !== 0
+          ? { weather_latitude: draft.latitude, weather_longitude: draft.longitude }
+          : {}),
       };
 
     case "personality":

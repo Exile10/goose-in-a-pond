@@ -2529,30 +2529,15 @@ async fn run_server(
         // coordinates default to 0), so requiring coordinates here left every
         // onboarded install with weather permanently "not configured"; the
         // adapter geocodes the name on demand.
-        if settings.weather_enabled
-            && (settings.weather_latitude != 0.0
-                || settings.weather_longitude != 0.0
-                || !settings.weather_location_name.trim().is_empty())
-        {
-            let loc = if settings.weather_location_name.is_empty() {
-                format!(
-                    "{:.3}, {:.3}",
-                    settings.weather_latitude, settings.weather_longitude
-                )
-            } else {
-                settings.weather_location_name.clone()
-            };
-            tracing::info!(
-                "weather enabled: {} ({}, {})",
-                loc,
-                settings.weather_latitude,
-                settings.weather_longitude
-            );
-            Some(Arc::new(OpenMeteoWeatherAdapter::new(
-                settings.weather_latitude,
-                settings.weather_longitude,
-                loc,
-            )))
+        // Asked, not read. `Location::weather_target` is the one place that
+        // decides whether this pond knows enough to ask about the weather, and
+        // it is the same answer voice mode gets below — these were two copies
+        // of the same six lines, and both of them missed the time-zone
+        // fallback that `location::resolve` has always applied.
+        let place = pond_core::user_data::services::location::resolve(&settings);
+        if let (true, Some((lat, lon, loc))) = (settings.weather_enabled, place.weather_target()) {
+            tracing::info!("weather enabled: {} ({}, {})", loc, lat, lon);
+            Some(Arc::new(OpenMeteoWeatherAdapter::new(lat, lon, loc)))
         } else {
             tracing::info!(
                 "weather disabled — enable via PUT /api/v1/settings (weather_enabled + lat/lon or location_name)"
@@ -4626,26 +4611,15 @@ async fn run_chat(
     // Wire weather so giap__get_current_weather MCP tool is available in voice mode.
     // Same gate as the primary wiring above: coordinates OR a location name (the
     // adapter geocodes the name), so an onboarded name-only config still works.
-    let weather: Option<Arc<dyn WeatherProvider>> = if settings.weather_enabled
-        && (settings.weather_latitude != 0.0
-            || settings.weather_longitude != 0.0
-            || !settings.weather_location_name.trim().is_empty())
-    {
-        let loc = if settings.weather_location_name.is_empty() {
-            format!(
-                "{:.3}, {:.3}",
-                settings.weather_latitude, settings.weather_longitude
-            )
-        } else {
-            settings.weather_location_name.clone()
-        };
-        Some(Arc::new(OpenMeteoWeatherAdapter::new(
-            settings.weather_latitude,
-            settings.weather_longitude,
-            loc,
-        )))
-    } else {
-        None
+    // The same question the HTTP wiring asks above, through the same function.
+    let weather: Option<Arc<dyn WeatherProvider>> = match (
+        settings.weather_enabled,
+        pond_core::user_data::services::location::resolve(&settings).weather_target(),
+    ) {
+        (true, Some((lat, lon, loc))) => {
+            Some(Arc::new(OpenMeteoWeatherAdapter::new(lat, lon, loc)))
+        }
+        _ => None,
     };
 
     // ── Build the GooseAdapter (MCP tools + model routing) ───────────────────────
@@ -4722,14 +4696,18 @@ async fn run_chat(
                 let persona =
                     pond_core::prompts::sanitize_field(&settings.assistant_personality, 200);
                 let tz = pond_core::prompts::sanitize_field(&settings.timezone, 50);
-                let location = if settings.weather_location_name.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "\nLocation: {}.",
-                        pond_core::prompts::sanitize_field(&settings.weather_location_name, 100)
-                    )
-                };
+                // Through the resolver, like `prompts.rs` already does. This
+                // copy read the raw field, so the two prompt paths described
+                // the same pond differently: one knew the time zone implied a
+                // city and the other said nothing at all.
+                let location =
+                    match pond_core::user_data::services::location::resolve(&settings).describe() {
+                        Some(place) => format!(
+                            "\nLocation: {}.",
+                            pond_core::prompts::sanitize_field(place, 100)
+                        ),
+                        None => String::new(),
+                    };
                 let addendum = pond_core::prompts::sanitize_field(&settings.prompt_addendum, 500);
                 pond_core::prompts::render_template(
                     &tmpl,
@@ -8336,24 +8314,17 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let llamafile_url = format!("http://127.0.0.1:{}", ports::llamafile_port());
 
     // Wire weather from settings so giap__get_current_weather MCP tool is available.
-    let weather: Option<Arc<dyn WeatherProvider>> = if settings.weather_enabled
-        && (settings.weather_latitude != 0.0 || settings.weather_longitude != 0.0)
-    {
-        let loc = if settings.weather_location_name.is_empty() {
-            format!(
-                "{:.3}, {:.3}",
-                settings.weather_latitude, settings.weather_longitude
-            )
-        } else {
-            settings.weather_location_name.clone()
-        };
-        Some(Arc::new(OpenMeteoWeatherAdapter::new(
-            settings.weather_latitude,
-            settings.weather_longitude,
-            loc,
-        )))
-    } else {
-        None
+    // The third copy of this decision, and it was the strictest of the three:
+    // it required COORDINATES, so a pond that had only ever been given a place
+    // name got weather over HTTP and in voice mode, and was refused it here.
+    let weather: Option<Arc<dyn WeatherProvider>> = match (
+        settings.weather_enabled,
+        pond_core::user_data::services::location::resolve(&settings).weather_target(),
+    ) {
+        (true, Some((lat, lon, loc))) => {
+            Some(Arc::new(OpenMeteoWeatherAdapter::new(lat, lon, loc)))
+        }
+        _ => None,
     };
 
     match action {

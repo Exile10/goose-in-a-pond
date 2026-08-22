@@ -43,6 +43,8 @@ vi.mock("../api/PondApiClient", () => ({
     listModels: vi.fn(),
     retitleSessions: vi.fn(),
     resetOnboarding: vi.fn(),
+    listTimeZones: vi.fn(),
+    detectLocation: vi.fn(),
   },
 }));
 
@@ -52,6 +54,8 @@ const mockApi = api as unknown as {
   listModels: ReturnType<typeof vi.fn>;
   retitleSessions: ReturnType<typeof vi.fn>;
   resetOnboarding: ReturnType<typeof vi.fn>;
+  listTimeZones: ReturnType<typeof vi.fn>;
+  detectLocation: ReturnType<typeof vi.fn>;
 };
 
 /** A re-titling reply with the boring fields filled in. */
@@ -72,6 +76,15 @@ function retitleReply(over: Record<string, unknown> = {}) {
 async function renderPage(overrides: Record<string, unknown> = {}) {
   mockApi.getSettings.mockResolvedValue(serverSettings(overrides));
   mockApi.listModels.mockResolvedValue(MODELS);
+  // The zone picker asks the server for the IANA catalogue; a couple of rows
+  // is enough to prove it renders what it is given rather than a hand list.
+  mockApi.listTimeZones.mockResolvedValue({
+    zones: [
+      { zone: "Africa/Nairobi", offset: "+03:00", place: "Nairobi" },
+      { zone: "Africa/Kampala", offset: "+03:00", place: "Kampala" },
+      { zone: "UTC", offset: "+00:00", place: "" },
+    ],
+  });
   mockApi.updateSettings.mockImplementation(async (patch: Record<string, unknown>) =>
     serverSettings({ ...overrides, ...patch }));
   const view = render(<SettingsCatalogueView />);
@@ -200,22 +213,97 @@ describe("SettingsCatalogue", () => {
     expect(document.querySelector(".scat__search")!.getAttribute("data-open")).toBe("false");
   });
 
+  /// Found while wiring the zone picker: with no backend, `dev:vite` serves
+  /// index.html for /api, `request` casts it to `Settings`, and the `errors`
+  /// memo indexes `undefined` by the first catalogue key — so the page died
+  /// with "Cannot read properties of undefined (reading 'user_name')" where
+  /// the docs promise an error state.
+  it("shows an error rather than crashing when the reply is not settings", async () => {
+    mockApi.getSettings.mockResolvedValue(undefined);
+    render(<SettingsCatalogueView />);
+    // The banner, not a blank page and not a thrown render. `ErrorBanner`
+    // rewrites the wording, so the role is what this asserts on.
+    expect(await screen.findByRole("alert")).toBeTruthy();
+  });
+
+  /// The three hand-maintained lists held 16, 18 and 13 zones and none of them
+  /// held Kampala, so a household there could not say where it was.
+  it("offers every zone the server knows, not a hand-picked few", async () => {
+    await renderPage();
+    const picker = (await screen.findByLabelText("Time zone")) as HTMLSelectElement;
+    const values = [...picker.options].map((o) => o.value);
+    expect(values).toContain("Africa/Kampala");
+    // The offset is shown, so two similarly-named zones can be told apart.
+    expect([...picker.options].map((o) => o.textContent).join(" ")).toContain("+03:00");
+  });
+
   it("fills the place and both coordinates from one press", async () => {
-    const getCurrentPosition = vi.fn((ok: (p: unknown) => void) =>
-      ok({ coords: { latitude: -1.2864123, longitude: 36.8172223 } }));
-    vi.stubGlobal("navigator", { ...navigator, geolocation: { getCurrentPosition } });
+    // No browser geolocation, which is the normal case inside Tauri. The old
+    // button depended on it and so produced a name and no coordinates.
+    vi.stubGlobal("navigator", { ...navigator, geolocation: undefined });
+    mockApi.detectLocation.mockResolvedValue({
+      name: "Nairobi, Kenya",
+      latitude: -1.2864,
+      longitude: 36.8172,
+      timezone: "Africa/Nairobi",
+      source: "geocoded",
+      certain: true,
+      has_coordinates: true,
+      note: null,
+    });
 
     await renderPage({ weather_location_name: "" });
     fireEvent.click(screen.getByRole("button", { name: /Detect/ }));
 
-    // Coordinates rounded to four places — finer than weather needs, and it
-    // keeps the stored value from reading like a tracking fix.
     await waitFor(() =>
       expect((screen.getByLabelText("Latitude") as HTMLInputElement).value).toBe("-1.2864"));
     expect((screen.getByLabelText("Longitude") as HTMLInputElement).value).toBe("36.8172");
-    // The name comes from the time zone, matching what `location::resolve` does
-    // server-side, so a detected pond and an undetected one agree.
-    expect((screen.getByLabelText("Location") as HTMLInputElement).value).toBe("Nairobi");
+    expect((screen.getByLabelText("Location") as HTMLInputElement).value).toBe("Nairobi, Kenya");
+    vi.unstubAllGlobals();
+  });
+
+  /// A guess must not be reported as a fact.
+  it("says when the place was inferred rather than found", async () => {
+    vi.stubGlobal("navigator", { ...navigator, geolocation: undefined });
+    mockApi.detectLocation.mockResolvedValue({
+      name: "Nairobi",
+      latitude: 0,
+      longitude: 0,
+      timezone: "Africa/Nairobi",
+      source: "timezone",
+      certain: false,
+      has_coordinates: false,
+      note: "Worked out the time zone, but not the exact spot.",
+    });
+
+    await renderPage({ weather_location_name: "" });
+    fireEvent.click(screen.getByRole("button", { name: /Detect/ }));
+
+    await screen.findByText(/not the exact spot/);
+    // Null Island must never be written as if it were a fix.
+    expect((screen.getByLabelText("Latitude") as HTMLInputElement).value).toBe("-1.286");
+    vi.unstubAllGlobals();
+  });
+
+  /// What is already typed beats what the time zone implies.
+  it("looks up the name already in the box", async () => {
+    vi.stubGlobal("navigator", { ...navigator, geolocation: undefined });
+    mockApi.detectLocation.mockResolvedValue({
+      name: "Kisumu, Kenya",
+      latitude: -0.1022,
+      longitude: 34.7617,
+      timezone: "Africa/Nairobi",
+      source: "geocoded",
+      certain: true,
+      has_coordinates: true,
+      note: null,
+    });
+
+    await renderPage({ weather_location_name: "Kisumu" });
+    fireEvent.click(screen.getByRole("button", { name: /Detect/ }));
+
+    await waitFor(() => expect(mockApi.detectLocation).toHaveBeenCalled());
+    expect(mockApi.detectLocation.mock.calls[0][0]).toMatchObject({ typed_name: "Kisumu" });
     vi.unstubAllGlobals();
   });
 

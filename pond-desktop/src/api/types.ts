@@ -1268,3 +1268,31 @@ export interface ProposalList {
 
 /** Approve or reject. The server accepts no third value. */
 export type ProposalDecision = "approve" | "reject";
+
+// ── Time and place ──────────────────────────────────────────
+
+/** A zone, the offset it is on today, and the place its name implies. */
+export interface ZoneChoice {
+  zone: string;
+  /** e.g. "+03:00". Resolved for today — an offset is not fixed per zone. */
+  offset: string;
+  /** e.g. "Nairobi". Empty for zones like UTC that are not places. */
+  place: string;
+}
+
+/** How the pond worked out where it is. */
+export type PlaceSource = "timezone" | "geocoded" | "device" | "network";
+
+/** The result of one detection pass. */
+export interface DetectedPlace {
+  name: string;
+  latitude: number;
+  longitude: number;
+  timezone: string;
+  source: PlaceSource;
+  /** Whether this is a fact rather than a good guess. */
+  certain: boolean;
+  has_coordinates: boolean;
+  /** Why there are no coordinates, when there are none. Shown as-is. */
+  note: string | null;
+}

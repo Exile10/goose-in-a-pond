@@ -110,6 +110,13 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/onboard/reset", post(reset_onboarding))
         // Settings write is public so onboarding steps can save before completion
         .route("/settings", put(update_settings))
+        // ── Time and place ────────────────────────────────────────────────
+        // One catalogue and one detection, so the three screens that ask
+        // "where is this pond" stop each answering it differently. Public
+        // because the wizard sets location up before any device has paired;
+        // see PUBLIC_ROUTES for what each of the two exposes.
+        .route("/time/zones", get(list_time_zones))
+        .route("/location/detect", post(detect_location))
         // TTS synthesis is public so the onboarding voice-preview can play a
         // sample before onboarding completes. Text→audio via local Piper is not
         // privileged and leaks no user data.
@@ -4336,7 +4343,7 @@ async fn update_settings(
     State(state): State<Arc<AppState>>,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Json(patch) = body.map_err(|e| {
+    let Json(mut patch) = body.map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": format!("Invalid settings body: {}", e)})),
@@ -4350,6 +4357,37 @@ async fn update_settings(
             Json(json!({"error": format!("Failed to load current settings: {}", e)})),
         )
     })?;
+
+    // Refuse a time zone that is not a time zone, and canonicalise one that
+    // merely looks unusual.
+    //
+    // There was NO check at all: whatever a client sent was stored. A zone is
+    // not an inert label -- the cron scheduler evaluates every schedule in it
+    // -- so `Africa/Nairobbi` was accepted, stored, and produced a household
+    // whose reminders silently never fired, with nothing anywhere explaining
+    // why. Refusing at the edge is the only place anybody finds out.
+    //
+    // Normalised rather than only refused, because `africa/nairobi` is a
+    // reasonable thing to type and an unreasonable thing to reject; the STORED
+    // value is always the database's own spelling, so everything downstream
+    // parses one shape.
+    if let Some(zone) = patch.get("timezone").and_then(|v| v.as_str()) {
+        match pond_core::user_data::services::location::normalize_zone(zone) {
+            Some(canonical) => {
+                patch["timezone"] = json!(canonical);
+            }
+            None => {
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({
+                        "error": format!(
+                            "{zone:?} is not an IANA time zone; GET /api/v1/time/zones lists them"
+                        )
+                    })),
+                ));
+            }
+        }
+    }
 
     // Reject an unrecognised network_mode. `NetworkMode::parse` deliberately
     // falls back to "open" rather than to a restrictive mode, so a typo that
@@ -15309,6 +15347,92 @@ fn index_coverage(indexed: u64, rows: u64) -> Option<f64> {
 /// two healthy corpora hid a third that could never populate at all; the shape
 /// that makes that visible is a row each, which is what
 /// [`pond_core::context::vector_index::CorpusHealth`] is for.
+/// Every IANA zone, with the offset it is on today.
+///
+/// Exists so the desktop stops carrying its own list. There were three of them
+/// — 16, 18 and 13 zones, no two alike — which is how a household in
+/// `Africa/Kampala` came to have no way of saying so. Offsets are computed here
+/// rather than in the client because an offset depends on the date, and a
+/// client that cached one would be wrong for whichever half of the year its
+/// zone observes daylight saving.
+async fn list_time_zones() -> Json<Value> {
+    use pond_core::user_data::services::location::zone_catalogue;
+    let now = chrono::Utc::now();
+    let zones: Vec<Value> = zone_catalogue(now)
+        .into_iter()
+        .map(|c| json!({ "zone": c.zone, "offset": c.offset, "place": c.place }))
+        .collect();
+    Json(json!({ "zones": zones }))
+}
+
+/// What the client already knows, offered to the cascade as hints.
+#[derive(Debug, Default, serde::Deserialize)]
+struct DetectLocationRequest {
+    /// The zone this device is set to — `Intl.DateTimeFormat()` on the desktop.
+    #[serde(default)]
+    system_zone: Option<String>,
+    /// A name the household typed, which beats anything derived.
+    #[serde(default)]
+    typed_name: Option<String>,
+    /// Coordinates a real browser answered with, when one did.
+    #[serde(default)]
+    latitude: Option<f64>,
+    #[serde(default)]
+    longitude: Option<f64>,
+}
+
+/// Work out where this pond is, from several sources, cheapest first.
+///
+/// Server-side so onboarding and Settings share ONE implementation. They had
+/// two, and neither worked: onboarding split the zone string and returned no
+/// coordinates at all, while Settings asked a Tauri webview for a browser
+/// geolocation it does not reliably provide.
+///
+/// The network source — the one that would reveal this household's address — is
+/// deliberately not wired here. Everything this returns comes from the device's
+/// own zone and a geocoding call for a place NAME, which tells the far end what
+/// town was asked about and nothing about who asked.
+async fn detect_location(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<DetectLocationRequest>>,
+) -> Json<Value> {
+    use pond_core::user_data::ports::place_lookup::PlaceLookup;
+    use pond_core::user_data::services::place_detection::{detect, Hints};
+
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let geocoder = pond_adapters_weather::Geocoder::new(state.http_client.clone());
+    let lookup: &dyn PlaceLookup = &geocoder;
+
+    let device_coords = match (req.latitude, req.longitude) {
+        (Some(lat), Some(lon)) => Some((lat, lon)),
+        _ => None,
+    };
+
+    let found = detect(
+        Hints {
+            system_zone: req.system_zone.as_deref(),
+            typed_name: req.typed_name.as_deref(),
+            device_coords,
+        },
+        Some(lookup),
+        // See the note above: not wired.
+        None,
+    )
+    .await;
+
+    Json(json!({
+        "name": found.name,
+        "latitude": found.latitude,
+        "longitude": found.longitude,
+        "timezone": found.timezone,
+        "source": found.source.as_str(),
+        // Whether this is a fact or a good guess, so the screen can say which.
+        "certain": found.source.is_certain(),
+        "has_coordinates": found.has_coordinates(),
+        "note": found.note,
+    }))
+}
+
 async fn context_index_health(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {

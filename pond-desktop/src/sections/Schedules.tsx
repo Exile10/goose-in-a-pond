@@ -13,6 +13,7 @@ import { HubIco } from "../hub/primitives/HubIco";
 import { HP_PATHS } from "../hub/primitives/icons";
 import { type RoutineId, ROUTINES } from "../hub/data/routines";
 import "../hub/views/routines.css";
+import { ZonePicker } from "../components/ZonePicker";
 
 /* ── Repeat patterns ──────────────────────────────────────── */
 type RepeatPattern = "once" | "hourly" | "daily" | "weekly" | "monthly" | "custom";
@@ -169,28 +170,6 @@ const RECIPE_PRESETS: Record<string, string> = {
   "Sensor check":         "Check all sensor readings and report any anomalies.",
   "Custom":               "",
 };
-
-/* ── Common IANA timezones ────────────────────────────────── */
-const TIMEZONE_OPTIONS = [
-  "UTC",
-  "Africa/Nairobi",
-  "Africa/Lagos",
-  "Africa/Cairo",
-  "America/New_York",
-  "America/Chicago",
-  "America/Denver",
-  "America/Los_Angeles",
-  "America/Sao_Paulo",
-  "Asia/Tokyo",
-  "Asia/Shanghai",
-  "Asia/Kolkata",
-  "Asia/Dubai",
-  "Europe/London",
-  "Europe/Paris",
-  "Europe/Berlin",
-  "Australia/Sydney",
-  "Pacific/Auckland",
-];
 
 export function Schedules() {
   const state = useAppState();
@@ -713,16 +692,12 @@ export function Schedules() {
                 <Calendar size={13} style={{ color: "var(--grey-500)" }} />
                 Timezone
               </label>
-              <select
+              <ZonePicker
                 className="sched-modal__select"
                 value={timezone}
-                onChange={(e) => setTimezone(e.target.value)}
+                onChange={setTimezone}
                 aria-label="Schedule timezone"
-              >
-                {TIMEZONE_OPTIONS.map((tz) => (
-                  <option key={tz} value={tz}>{tz}</option>
-                ))}
-              </select>
+              />
             </div>
 
             {/* Separator between timing and prompt */}

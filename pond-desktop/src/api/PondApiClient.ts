@@ -54,6 +54,8 @@ import {
   type TranscribeResponse,
   type UserSkill,
   type WeatherApiResponse,
+  type ZoneChoice,
+  type DetectedPlace,
 } from "./types";
 import { voiceTitle } from "../voice/voiceCatalogue";
 
@@ -684,6 +686,28 @@ export class PondApiClient {
    */
   rebuildContextIndex(): Promise<ContextIndexRebuild> {
     return this.post<ContextIndexRebuild>("/api/v1/context/index/rebuild", {});
+  }
+
+  // ── Time and place ────────────────────────────────────────
+
+  /** Every IANA zone with today's offset. Public: the wizard needs it. */
+  listTimeZones(): Promise<{ zones: ZoneChoice[] }> {
+    return this.get<{ zones: ZoneChoice[] }>("/api/v1/time/zones");
+  }
+
+  /**
+   * Work out where this pond is, from several sources, cheapest first.
+   *
+   * Server-side so onboarding and Settings run the SAME cascade — they used to
+   * have one each, and neither produced usable coordinates.
+   */
+  detectLocation(hints: {
+    system_zone?: string;
+    typed_name?: string;
+    latitude?: number;
+    longitude?: number;
+  }): Promise<DetectedPlace> {
+    return this.post<DetectedPlace>("/api/v1/location/detect", hints);
   }
 
   // ── Connected accounts ────────────────────────────────────

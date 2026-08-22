@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  all, atLeast, detectTimezone, hhmm, ianaTimezone, integer, latitude, longitude,
+  all, atLeast, hhmm, ianaTimezone, integer, latitude, longitude,
   oneOf, optional, range, required, retentionMap, speechCategories, url,
 } from "./validation";
 
@@ -146,9 +146,4 @@ describe("timezone", () => {
     bad(ianaTimezone(""));
   });
 
-  it("detects the system zone, and the result validates", () => {
-    const zone = detectTimezone();
-    expect(zone).toBeTypeOf("string");
-    ok(ianaTimezone(zone));
-  });
 });

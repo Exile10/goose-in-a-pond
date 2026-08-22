@@ -2,14 +2,14 @@ import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import { Switch, Button } from "@heroui/react";
 import { Search, Crosshair, AlertCircle, Wand2, ChevronDown, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
-import type { ModelEntry, RetitleResult, Settings } from "../api/types";
+import type { ModelEntry, RetitleResult, Settings, ZoneChoice } from "../api/types";
+import { allZones, detectPlace, deviceZone } from "../lib/place";
 import { diffSettings, foldServerState } from "./state";
 import { ErrorBanner, SkeletonList } from "../components/shared";
 import {
   CATALOGUE, TIER_NOTE, allEntries, inertCount,
   type CatalogueCategory, type Consumer, type Entry, type OptionSource, type Subcategory,
 } from "./catalogue";
-import { detectTimezone, detectLocation, placeFromTimezone } from "./validation";
 import { AppearanceView } from "../hub/views/settings/Appearance";
 import { WakeWordCalibration } from "../components/WakeWordCalibration";
 import "../styles/settings-catalogue.css";
@@ -57,7 +57,10 @@ export function summariseRetitle(r: RetitleResult): string {
  * existing authority on which `provider` value belongs to which role. Kept as
  * one table so the two cannot drift apart silently.
  */
-const PROVIDERS: Record<Exclude<OptionSource, "llm-providers">, (m: ModelEntry) => boolean> = {
+const PROVIDERS: Record<
+  Exclude<OptionSource, "llm-providers" | "time-zones">,
+  (m: ModelEntry) => boolean
+> = {
   "llm-models": (m) => ["gguf", "llamafile", "ollama"].includes(m.provider),
   "whisper-models": (m) => m.provider === "whisper",
   "tts-voices": (m) => ["tts", "tts_piper", "tts_kokoro", "tts_http"].includes(m.provider),
@@ -66,7 +69,20 @@ const PROVIDERS: Record<Exclude<OptionSource, "llm-providers">, (m: ModelEntry) 
 
 interface Option { value: string; label: string }
 
-function optionsFor(source: OptionSource, models: ModelEntry[]): Option[] {
+function optionsFor(
+  source: OptionSource,
+  models: ModelEntry[],
+  zones: ZoneChoice[],
+): Option[] {
+  if (source === "time-zones") {
+    // "Africa/Nairobi — Nairobi (+03:00)". The offset is worth showing: it is
+    // how somebody confirms they picked the right one of two zones with
+    // similar names, and it is resolved for TODAY rather than assumed.
+    return zones.map((z) => ({
+      value: z.zone,
+      label: z.place ? `${z.zone} — ${z.place} (${z.offset})` : `${z.zone} (${z.offset})`,
+    }));
+  }
   if (source === "llm-providers") {
     const seen = [...new Set(models.filter(PROVIDERS["llm-models"]).map((m) => m.provider))];
     return seen.sort().map((p) => ({ value: p, label: p }));
@@ -339,6 +355,7 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
   const [settings, setSettings] = useState<Partial<Settings>>({});
   const [baseline, setBaseline] = useState<Partial<Settings>>({});
   const [models, setModels] = useState<ModelEntry[] | null>(null);
+  const [zones, setZones] = useState<ZoneChoice[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -412,7 +429,21 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
     setLoading(true);
     setLoadError(null);
     api.getSettings()
-      .then((s) => { setSettings(s); setBaseline(structuredClone(s)); })
+      .then((s) => {
+        // Checked, not trusted. `request` casts its parsed body to `T`, so a
+        // reply that is not settings — an empty body, or the SPA's own
+        // index.html, which is what `dev:vite` serves for /api when no backend
+        // is running — arrives typed as `Settings` and undefined at runtime.
+        // The `errors` memo then indexes it by every catalogue key and the
+        // whole page dies on the first one, which is `user_name`. The docs
+        // promise this case shows "their error state"; it showed a crash.
+        if (!s || typeof s !== "object" || Array.isArray(s)) {
+          setLoadError("The pond answered, but not with settings. Is the server running?");
+          return;
+        }
+        setSettings(s);
+        setBaseline(structuredClone(s));
+      })
       .catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
   }, []);
@@ -426,6 +457,12 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
     api.listModels()
       .then((m) => !cancelled && setModels(m))
       .catch(() => !cancelled && setModels(null));
+    // Zones, from the server's IANA catalogue. `allZones` falls back to this
+    // webview's own `Intl` list and never rejects, so this cannot fail the
+    // page — at worst the picker degrades to a text box, same as the rest.
+    allZones()
+      .then((z) => !cancelled && setZones(z))
+      .catch(() => {});
     return () => { cancelled = true; };
   }, []);
 
@@ -504,33 +541,49 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
    * abandoned. A detection that silently persisted would be the one control on
    * the page that acts before you press Save.
    *
-   * The name comes from the time zone, which is what `location::resolve` does
-   * server-side — the two are deliberately the same rule in both languages, so
-   * a detected pond and an undetected one describe themselves identically.
+   * One cascade, run on the server, shared with the wizard. This used to ask
+   * `navigator.geolocation` directly — which a Tauri webview does not reliably
+   * answer, so the button's usual outcome was a refusal and a name guessed
+   * from the time zone, with no coordinates and therefore no weather.
+   * `detectPlace` still offers this device's coordinates when a real browser
+   * provides them; it just no longer depends on that.
    */
   const findLocation = useCallback(async () => {
     setLocating(true);
     setLocationNote(null);
     try {
-      const at = await detectLocation();
-      patch("weather_latitude", at.latitude);
-      patch("weather_longitude", at.longitude);
+      // What is already in the box beats anything derived, so a household that
+      // typed "Kisumu" gets Kisumu's coordinates rather than the capital's.
+      const typed = String(
+        (settings as Record<string, unknown>).weather_location_name ?? "",
+      ).trim();
+      const at = await detectPlace(typed || undefined);
+
+      // Staged, not saved: this writes into the same draft every other control
+      // writes into, so it shows in the change count and can be abandoned.
+      if (at.timezone) patch("timezone", at.timezone);
       if (at.name) patch("weather_location_name", at.name);
-      setLocationNote(at.name ? `Found ${at.name}` : "Found the coordinates");
-    } catch (e) {
-      // A refusal is not a failure, and the fallback still helps: the time zone
-      // names the place even when the device will not give coordinates.
-      const guess = placeFromTimezone();
-      if (guess) {
-        patch("weather_location_name", guess);
-        setLocationNote(`Used ${guess}, from your time zone`);
-      } else {
-        setLocationNote(e instanceof Error ? e.message : String(e));
+      if (at.has_coordinates) {
+        patch("weather_latitude", at.latitude);
+        patch("weather_longitude", at.longitude);
       }
+
+      // Phrased by SOURCE, because "you are in Nairobi" and "your time zone
+      // suggests Nairobi" are different claims and the old code stated the
+      // guess as a fact.
+      setLocationNote(
+        at.note
+          ? at.note
+          : at.certain
+            ? `Found ${at.name}`
+            : `Guessed ${at.name} from your time zone`,
+      );
+    } catch (e) {
+      setLocationNote(e instanceof Error ? e.message : String(e));
     } finally {
       setLocating(false);
     }
-  }, [patch]);
+  }, [patch, settings]);
 
   async function save() {
     const body = diffSettings(baseline, settings);
@@ -613,7 +666,7 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
   const goTo = useCallback((id: string) => { setCategoryId(id); setQuery(""); setAppearance(false); }, []);
 
   const { clauses, reach, tail } = postureClauses(settings);
-  const systemZone = detectTimezone();
+  const systemZone = deviceZone();
   const zoneDiffers = systemZone != null && settings.timezone !== systemZone;
 
   /** The controls with an action beside them. */
@@ -981,7 +1034,17 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
                         entry={e}
                         value={(settings as Record<string, unknown>)[e.key]}
                         error={errors[e.key] ?? null}
-                        options={e.control.kind === "lookup" && models ? optionsFor(e.control.source, models) : null}
+                        options={
+                          e.control.kind === "lookup"
+                            // Zones do not wait on the model registry: they come
+                            // from a different call, and gating them on `models`
+                            // would leave the zone picker as a text box on any
+                            // pond with no models installed.
+                            ? e.control.source === "time-zones"
+                              ? (zones.length ? optionsFor(e.control.source, [], zones) : null)
+                              : (models ? optionsFor(e.control.source, models, zones) : null)
+                            : null
+                        }
                         onChange={patch}
                         extra={extraFor(e)}
                         dev={dev}
