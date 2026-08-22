@@ -7,7 +7,7 @@
     "start": "npx tsx src/server.ts"
   },
   "devDependencies": {
-    "tsx": "^4.23.10",
+    "tsx": "^4.23.12",
     "typescript": "^7.0.2"
   }
 }
