@@ -49,7 +49,7 @@ export type Consumer =
  * Filters mirror `sections/Models.tsx`, which is the app's existing authority
  * on which `provider` values belong to which role.
  */
-export type OptionSource = "llm-models" | "whisper-models" | "tts-voices" | "embedding-models" | "llm-providers";
+export type OptionSource = "llm-models" | "whisper-models" | "tts-voices" | "embedding-models" | "llm-providers" | "time-zones";
 
 export type Control =
   | { kind: "toggle" }
@@ -131,13 +131,6 @@ export const TIER_NOTE: Record<Tier, string> = {
 /** The tiers `pond_adapters_kokoro::model_filename` recognises, smallest first. */
 const TTS_QUALITY = ["q4", "q4f16", "q8", "q8f16", "fp16", "fp32"] as const;
 
-const TIMEZONES = [
-  "UTC", "Africa/Nairobi", "Africa/Lagos", "Africa/Johannesburg",
-  "Europe/London", "Europe/Paris", "Europe/Berlin",
-  "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles",
-  "Asia/Dubai", "Asia/Kolkata", "Asia/Shanghai", "Asia/Tokyo", "Australia/Sydney",
-] as const;
-
 export const CATALOGUE: CatalogueCategory[] = [
   // ── Household ───────────────────────────────────────────────────────────
   {
@@ -163,7 +156,13 @@ export const CATALOGUE: CatalogueCategory[] = [
           },
           {
             key: "timezone", label: "Time zone", description: "The time zone this home is in, so schedules land at the right hour.",
-            control: { kind: "select", options: TIMEZONES }, consumer: "live",
+            // A lookup, not a hand list. There were three lists in this app
+            // — 16, 18 and 13 zones, no two alike — so a household in Kampala
+            // could not pick its own zone anywhere. This one comes from the
+            // server's IANA catalogue, which is also what saving validates
+            // against, so the picker cannot offer a zone the save would reject.
+            control: { kind: "lookup", source: "time-zones", placeholder: "Choose a time zone" },
+            consumer: "live",
             validate: ianaTimezone,
           },
           { key: "weather_location_name", label: "Location", description: "The place name used when the pond talks about the weather.", control: { kind: "text", placeholder: "Nairobi" }, consumer: "live" },

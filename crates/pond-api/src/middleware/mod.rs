@@ -262,6 +262,17 @@ const PUBLIC_ROUTES: &[(Method, &str, Exposure)] = &[
         "/onboard/reset",
         Exposure::UntilOnboardedThenHostOnly,
     ),
+    // The IANA zone catalogue. `Always`, and it is the rare route where that
+    // needs no argument: it is the same few hundred strings for every pond on
+    // earth and says nothing whatever about this one. The wizard needs it
+    // before pairing, and Settings needs it after.
+    (Method::GET, "/time/zones", Exposure::Always),
+    // Detection, which is a different matter: it makes an outbound geocoding
+    // call and answers with a guess about where the caller is. The wizard
+    // cannot do without it -- location is set up before any device has paired
+    // -- so it is open until onboarding finishes and shut afterwards, by which
+    // point Settings is authenticated and does not need the exemption.
+    (Method::POST, "/location/detect", Exposure::UntilOnboarded),
     // Write-only, and only while the wizard is running. GET /settings is NOT
     // here at all: it serialises the whole Settings struct.
     (Method::PUT, "/settings", Exposure::UntilOnboarded),
@@ -946,6 +957,16 @@ mod tests {
         let expected = vec![
             "DELETE /voice/calibrate = UntilOnboarded".to_string(),
             "PATCH /profiles/{id} = UntilOnboarded".to_string(),
+            // Detection reaches the network -- one geocoding call for a place
+            // NAME -- and answers with a guess about where the caller is. Open
+            // during the wizard because location is configured before any
+            // device has paired, and the alternative was the wizard's own
+            // Auto-detect button 401ing. It sends no household data outward:
+            // the query is a town, not an identity, and the source that WOULD
+            // reveal the address (a lookup on the connection itself) is
+            // deliberately not wired into this route. Closes with the rest of
+            // this list the moment onboarding completes.
+            "POST /location/detect = UntilOnboarded".to_string(),
             "POST /onboard = UntilOnboarded".to_string(),
             "POST /onboard/complete = UntilOnboarded".to_string(),
             "POST /onboard/reset = UntilOnboardedThenHostOnly".to_string(),

@@ -581,7 +581,21 @@ impl LocalInferenceLlmAdapter {
             // Leaving 2 cores free for the OS, audio pipeline, and GIAP services.
             n_threads: Some(4),
             // Flash attention halves KV-cache memory on Ampere (native support).
+            // Also a hard prerequisite for `type_v` below.
             flash_attention: Some(true),
+            // KV cache at q8_0. Measured on this board (gemma-4 E4B, ctx 16384):
+            // KV 296 -> 157 MiB, peak footprint 437 -> 307 MB. Quality-neutral by
+            // two independent tests: greedy output is byte-identical to f16, and a
+            // paired per-chunk wikitext-2 run (n = 100) gives dNLL -0.000987 +/-
+            // 0.000551, t = -1.79 — indistinguishable from f16 at 95%.
+            // q4_0 saves ~75 MiB more but its per-chunk variance is 6.4x higher,
+            // so it is not used here.
+            type_k: Some("q8_0".to_string()),
+            type_v: Some("q8_0".to_string()),
+            // Physical batch. The compute buffer is the second-largest allocation
+            // after the weights: 522 MiB at the 512 default, 129 MiB at 128, for
+            // no measured loss (decode 14.4 vs 14.3 tok/s, prefill 38.3 vs 35.6).
+            n_ubatch: Some(128),
             // mlock pins pages in RAM; on unified memory this triggers kernel
             // page faults for every GPU access. Disable for correct performance.
             use_mlock: false,
