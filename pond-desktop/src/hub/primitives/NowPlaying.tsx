@@ -32,22 +32,41 @@ export function NowPlaying({ variant = "bar" }: NowPlayingProps) {
     if (np.connected) void controlNowPlaying(action);
   }
 
+  // A real cover turns the whole card into its background (scrimmed for text
+  // legibility) rather than sitting in a small tile above the track name —
+  // the swatch-and-icon treatment below is only the fallback for when there
+  // is no art to show.
+  const hasArt = !errored && Boolean(np.albumArt);
+
   return (
-    <div className={`np np--${variant}${errored ? " np--error" : ""}`}>
-      <div
-        className="np__art"
-        style={{
-          background: errored
-            ? "linear-gradient(135deg,#94A3B8,#64748B)"
-            : `linear-gradient(135deg,hsl(${np.hue},60%,58%),hsl(${np.hue + 40},55%,42%))`,
-        }}
-      >
-        <HubIco
-          d={errored ? HP_PATHS.alert : HP_PATHS.music}
-          size={variant === "tile" ? 26 : 18}
-          color="rgba(255,255,255,.9)"
-        />
-      </div>
+    <div
+      className={`np np--${variant}${errored ? " np--error" : ""}${hasArt ? " np--has-art" : ""}`}
+      style={
+        hasArt
+          ? {
+              backgroundImage: `linear-gradient(180deg, var(--np-scrim-top), var(--np-scrim-bottom)), url(${np.albumArt})`,
+              backgroundSize: "cover",
+              backgroundPosition: "center",
+            }
+          : undefined
+      }
+    >
+      {!hasArt && (
+        <div
+          className="np__art"
+          style={{
+            background: errored
+              ? "linear-gradient(135deg,#94A3B8,#64748B)"
+              : `linear-gradient(135deg,hsl(${np.hue},60%,58%),hsl(${np.hue + 40},55%,42%))`,
+          }}
+        >
+          <HubIco
+            d={errored ? HP_PATHS.alert : HP_PATHS.music}
+            size={variant === "tile" ? 26 : 18}
+            color="rgba(255,255,255,.9)"
+          />
+        </div>
+      )}
       <div className="np__info">
         <span className="np__track">{np.track}</span>
         <span className="np__artist" title={np.message}>
@@ -71,7 +90,7 @@ export function NowPlaying({ variant = "bar" }: NowPlayingProps) {
         ) : (
           <>
             <button aria-label="Previous" onClick={() => handleSkip("previous")}>
-              <HubIco d={HP_PATHS.skipB} size={16} color="#64748B" />
+              <HubIco d={HP_PATHS.skipB} size={16} color={hasArt ? "rgba(255,255,255,.85)" : "#64748B"} />
             </button>
             <button
               className="np__play"
@@ -81,7 +100,7 @@ export function NowPlaying({ variant = "bar" }: NowPlayingProps) {
               <HubIco d={playing ? pauseEl : HP_PATHS.play} size={16} color="#fff" />
             </button>
             <button aria-label="Next" onClick={() => handleSkip("next")}>
-              <HubIco d={HP_PATHS.skipF} size={16} color="#64748B" />
+              <HubIco d={HP_PATHS.skipF} size={16} color={hasArt ? "rgba(255,255,255,.85)" : "#64748B"} />
             </button>
           </>
         )}
