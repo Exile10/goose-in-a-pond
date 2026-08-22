@@ -113,8 +113,12 @@ nothing else: phones pair with a pairing code from the dashboard, and the deskto
 app is the app, so a "what kind of device" chooser had one real option in it.
 
 `matter_ws_url` remains in Settings for an operator running their own
-controller. `matter_enabled` remains settable through the settings API, for a
-Pond that will never see a Matter device — it is not in the UI and defaults on.
+controller. `matter_enabled` is **gone** — there is no longer any way to turn
+Matter off, through the UI or the settings API. `PUT /api/v1/settings` with that
+key returns 200 and does nothing, and a row left over from before the removal is
+ignored on read. A Pond that never sees a Matter device costs a controller
+process and nothing else; the field existed to avoid that and was not worth the
+install that could turn itself off and never back on.
 
 Verify from the API rather than the UI when in doubt:
 

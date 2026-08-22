@@ -409,9 +409,6 @@ pub struct Settings {
     pub vision_classifier_model: String,
 
     // ── Matter (#195) ──────────────────────────────────────────────────────
-    /// and drive commissioned Matter devices. Off by default — requires the
-    /// controller running on the LAN.
-
     /// WebSocket URL of the Matter controller.
     #[serde(default = "Settings::default_matter_ws_url")]
     pub matter_ws_url: String,

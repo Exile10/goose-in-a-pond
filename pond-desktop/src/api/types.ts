@@ -277,10 +277,11 @@ export interface Settings {
   vision_fps?: number;
   vision_motion_threshold?: number;
 
-  // Matter (smart-home fabric). `matter_enabled` is deliberately absent: the
-  // integration runs by default and installs its own controller, so the app has
-  // nothing to set. It still exists server-side for an operator who wants it
-  // off, which is a settings-API decision rather than a screen.
+  // Matter (smart-home fabric). `matter_enabled` is gone, not just absent from
+  // this type: the integration runs by default and installs its own controller,
+  // so there was nothing left for the field to mean. A stored row from before
+  // the removal is ignored on read rather than honoured, because an install that
+  // had it off would otherwise have no way back once the toggle went.
   matter_ws_url?: string;
 
   // Inference stats display
