@@ -128,7 +128,7 @@ export function Mesh() {
       <PageHeader
         title="Mesh"
         action={
-          <Button size="sm" variant="primary" onPress={openForm}>
+          <Button size="sm" variant="primary" className="page-header-btn" onPress={openForm}>
             <Plus size={14} /> Add trusted peer
           </Button>
         }
