@@ -1118,15 +1118,40 @@ mod tests {
         assert!(is_running(port).await, "a bound port must read as running");
 
         drop(listener);
-        // A port with nothing on it must not read as running (that is what
-        // decides whether GIAP spawns its own controller).
-        let free = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        };
-        assert!(!is_running(free).await);
+
+        // A port with nothing on it must not read as running. That is what decides
+        // whether GIAP spawns its own controller: a false "running" leaves a pond
+        // waiting forever for a controller nobody started.
+        //
+        // Asking about a port we just released is a race that cannot be won outright.
+        // Several tests here bind ephemeral ports at once, and the OS is free to hand
+        // ours straight to one of them between the drop and the question -- which is
+        // what made this fail roughly one run in two.
+        //
+        // So a positive answer is retried with a fresh port rather than trusted. The
+        // check stays honest: an `is_running` that answered "running" for everything
+        // would exhaust every attempt and fail, which is the regression worth
+        // catching. Losing a port to a sibling costs one more attempt instead of a
+        // red build, and losing eight in a row is not a race any more.
+        const ATTEMPTS: usize = 8;
+        let mut read_as_free = false;
+        for _ in 0..ATTEMPTS {
+            let free = {
+                let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let p = l.local_addr().unwrap().port();
+                drop(l);
+                p
+            };
+            if !is_running(free).await {
+                read_as_free = true;
+                break;
+            }
+        }
+        assert!(
+            read_as_free,
+            "no unbound port read as free in {ATTEMPTS} attempts, so is_running \
+             reports every port as running -- GIAP would never spawn a controller"
+        );
     }
 
     #[test]
