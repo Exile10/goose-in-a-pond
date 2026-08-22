@@ -201,8 +201,13 @@ describe("Matter section — turning the fabric on", () => {
   });
 
   it("shows the server's message without the ApiError class name", async () => {
+    // A real 503 body from `routes.rs`, not an invented one: the point of this
+    // test is that whatever the server says reaches the user verbatim, and a
+    // fixture the server can no longer produce stops testing that.
+    const serverMessage =
+      "Matter is still starting up — the controller is not ready yet.";
     mocked(api.commissionDevice).mockRejectedValue(
-      new ApiError(503, "Matter is off on this Pond."),
+      new ApiError(503, serverMessage),
     );
     await openModal();
 
@@ -211,8 +216,8 @@ describe("Matter section — turning the fabric on", () => {
     });
     fireEvent.click(screen.getByText("Commission"));
 
-    const message = await screen.findByText(/Matter is off on this Pond/);
-    expect(message.textContent).toBe("Matter is off on this Pond.");
+    const message = await screen.findByText(/Matter is still starting up/);
+    expect(message.textContent).toBe(serverMessage);
     expect(message.textContent).not.toMatch(/ApiError/);
   });
 });
