@@ -70,7 +70,7 @@ const RESPAWN_READY_TIMEOUT: Duration = Duration::from_secs(60);
 ///
 /// First sight still publishes everything, which is the behaviour that makes a
 /// steady sensor knowable at all; the cache is what distinguishes the two.
-type ReadingCache = HashMap<(String, String), f64>;
+pub(crate) type ReadingCache = HashMap<(String, String), f64>;
 
 /// Where the supervisor reconnects to, and what it needs to bring the controller
 /// back when reconnecting is not enough.
@@ -210,9 +210,14 @@ async fn sync_device(
 
 /// Run until the connection drops. `client` must be freshly connected; `events`
 /// is its event stream.
+///
+/// Starts a fresh [`ReadingCache`], so every reading in the first `subscribe`
+/// snapshot is published. Right for a one-shot run; wrong for the supervisor's
+/// reconnect loop, which calls [`run_matter_bridge_with_cache`] instead so the
+/// cache outlives a single connection.
 pub async fn run_matter_bridge(
     client: Arc<MatterClient>,
-    mut events: mpsc::Receiver<MatterEvent>,
+    events: mpsc::Receiver<MatterEvent>,
     registry: Arc<dyn DeviceRegistry + Send + Sync>,
     bus: Arc<dyn EventBus>,
     notifier: MatterNotifier,
@@ -220,6 +225,39 @@ pub async fn run_matter_bridge(
     // so the behaviour can be tested without waiting a minute for it; production
     // passes LIVENESS_TICK.
     liveness_tick: Duration,
+) -> Result<()> {
+    let mut cache = ReadingCache::new();
+    run_matter_bridge_with_cache(
+        client,
+        events,
+        registry,
+        bus,
+        notifier,
+        liveness_tick,
+        &mut cache,
+    )
+    .await
+}
+
+/// As [`run_matter_bridge`], but the caller owns the dedupe cache.
+///
+/// The cache has to outlive a single bridge run or it does nothing at all.
+/// [`ReadingCache`] exists because the bridge re-subscribes on every reconnect
+/// and the rules engine is level-based, so republishing a steady
+/// "motion = true" re-fires every automation attached to it. A cache rebuilt
+/// per run makes each reconnect's snapshot "first sight" again — which is
+/// exactly the case it was written for, so it was inert precisely when it
+/// mattered. Kept private: callers other than the supervisor have no reason to
+/// hold one, and `run_matter_bridge` is the shape they want.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_matter_bridge_with_cache(
+    client: Arc<MatterClient>,
+    mut events: mpsc::Receiver<MatterEvent>,
+    registry: Arc<dyn DeviceRegistry + Send + Sync>,
+    bus: Arc<dyn EventBus>,
+    notifier: MatterNotifier,
+    liveness_tick: Duration,
+    cache: &mut ReadingCache,
 ) -> Result<()> {
     // Initial sync: `subscribe` returns the whole fabric AND subscribes this
     // connection to subsequent events.
@@ -239,7 +277,6 @@ pub async fn run_matter_bridge(
         "matter: fabric synced"
     );
 
-    let mut cache = ReadingCache::new();
     // Who the controller currently believes is on the fabric. Held here rather than
     // read back from the registry because the controller is the authority on it:
     // the registry only knows when someone last said so.
@@ -251,7 +288,7 @@ pub async fn run_matter_bridge(
         }
     }
     for reading in &snapshot.readings {
-        publish_reading(reading, &mut cache, &bus);
+        publish_reading(reading, cache, &bus);
     }
 
     let mut liveness = tokio::time::interval(liveness_tick);
@@ -287,7 +324,7 @@ pub async fn run_matter_bridge(
                         value = reading.value,
                         "matter: sensor update"
                     );
-                    publish_reading(&reading, &mut cache, &bus);
+                    publish_reading(&reading, cache, &bus);
                 }
             }
             "device_added" | "device_updated" => {
@@ -373,14 +410,19 @@ pub async fn run_matter_supervisor(
         child,
     } = config;
 
+    // Owned out here, not inside the bridge: a reconnect must not re-publish a
+    // reading that has not changed. See `run_matter_bridge_with_cache`.
+    let mut cache = ReadingCache::new();
+
     loop {
-        match run_matter_bridge(
+        match run_matter_bridge_with_cache(
             client.clone(),
             events,
             registry.clone(),
             bus.clone(),
             notifier.clone(),
             LIVENESS_TICK,
+            &mut cache,
         )
         .await
         {

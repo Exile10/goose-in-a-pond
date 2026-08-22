@@ -1133,9 +1133,33 @@ mod tests {
         // would exhaust every attempt and fail, which is the regression worth
         // catching. Losing a port to a sibling costs one more attempt instead of a
         // red build, and losing eight in a row is not a race any more.
-        const ATTEMPTS: usize = 8;
-        let mut read_as_free = false;
-        for _ in 0..ATTEMPTS {
+        assert!(
+            a_port_that_reads_as_free().await.is_some(),
+            "no unbound port read as free in {PORT_ATTEMPTS} attempts, so is_running \
+             reports every port as running -- GIAP would never spawn a controller"
+        );
+    }
+
+    /// How many fresh ports to try before concluding `is_running` is broken
+    /// rather than merely unlucky.
+    const PORT_ATTEMPTS: usize = 8;
+
+    /// A port that is bound to nothing and that `is_running` agrees is free.
+    ///
+    /// Asking about a port we just released is a race that cannot be won
+    /// outright: several tests in this binary bind ephemeral ports at once, and
+    /// the OS may hand ours straight to one of them between the drop and the
+    /// question. That made these tests fail roughly one run in two.
+    ///
+    /// So a positive answer is retried with a fresh port rather than trusted,
+    /// and `None` after every attempt is a real finding, not a shrug — an
+    /// `is_running` that answered "running" for everything would exhaust the
+    /// attempts and the caller asserts on that. The alternative shape, an early
+    /// `return` on the first positive answer, also stops the flake but passes
+    /// forever once `is_running` regresses, which is the one thing these tests
+    /// exist to catch.
+    async fn a_port_that_reads_as_free() -> Option<u16> {
+        for _ in 0..PORT_ATTEMPTS {
             let free = {
                 let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let p = l.local_addr().unwrap().port();
@@ -1143,15 +1167,10 @@ mod tests {
                 p
             };
             if !is_running(free).await {
-                read_as_free = true;
-                break;
+                return Some(free);
             }
         }
-        assert!(
-            read_as_free,
-            "no unbound port read as free in {ATTEMPTS} attempts, so is_running \
-             reports every port as running -- GIAP would never spawn a controller"
-        );
+        None
     }
 
     #[test]
@@ -1207,20 +1226,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_free_port_reads_as_free() {
-        let free = {
-            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        };
-        // A released ephemeral port goes straight back to the pool, and the
-        // other tests in this binary bind ephemeral ports constantly — so
-        // between the drop above and the probe below, one of them can take it.
-        // Without this guard the test fails at random on a busy machine, and a
-        // suite that fails at random teaches people to re-run rather than read.
-        if is_running(free).await {
-            return;
-        }
+        // Was `if is_running(free) { return; }`, which stopped the flake by
+        // skipping the assertion — so a broken `is_running` made this test pass
+        // rather than fail. `a_port_that_reads_as_free` retries instead, and
+        // exhausting it is a failure.
+        let free = a_port_that_reads_as_free()
+            .await
+            .unwrap_or_else(|| panic!("no unbound port read as free in {PORT_ATTEMPTS} attempts"));
         assert_eq!(
             probe_controller(free, &format!("ws://127.0.0.1:{free}/giap")).await,
             Occupant::Free

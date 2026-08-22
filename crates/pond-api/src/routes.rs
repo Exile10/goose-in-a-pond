@@ -3752,11 +3752,16 @@ async fn matter_commissioner(
     };
 
     Err(match status.state {
+        // Reachable only on a build without the Matter feature, since the
+        // toggle that used to produce this state is gone. Naming the build is
+        // the only actionable thing left to say: there is no switch to point at,
+        // and telling someone to find one costs them the trip.
         MatterState::Disabled => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
-                "error": "Matter is off on this Pond. Turn it on in the Matter section \
-                          of the Devices tab, then try again."
+                "error": "This build of GIAP has no Matter support compiled in, so there \
+                          is nothing to turn on. Reinstall with the default features to \
+                          use Matter devices."
             })),
         ),
         MatterState::Connecting => (
