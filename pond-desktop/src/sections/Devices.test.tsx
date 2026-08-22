@@ -163,4 +163,30 @@ describe("Devices section — Configure modal", () => {
       }),
     );
   });
+
+  it("shows an online device as seen now, and an offline one as when it went quiet", async () => {
+    // The pair of bugs behind this: a washer heartbeated a minute ago read
+    // "online" and "3h ago" at the same time, because the timestamp carried no
+    // zone and was parsed as local. With that fixed, an online device still
+    // should not count minutes since its last heartbeat -- it is being vouched
+    // for right now -- while an offline one wants exactly that number.
+    const quiet = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    mocked(api.listDevices).mockResolvedValue([
+      { ...matterLight, is_online: true, last_seen: quiet },
+      {
+        id: "matter-7",
+        name: "Old Sensor",
+        device_type: "sensor",
+        is_online: false,
+        last_seen: quiet,
+      },
+    ]);
+    mocked(api.getMatterStatus).mockResolvedValue({ enabled: true, state: "connected" });
+
+    render(<Devices />);
+
+    await waitFor(() => expect(screen.getByText("Living Room Light")).toBeTruthy());
+    expect(screen.getByText("now")).toBeTruthy();
+    expect(screen.getByText("3h ago")).toBeTruthy();
+  });
 });

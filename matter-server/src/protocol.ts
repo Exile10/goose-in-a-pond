@@ -56,6 +56,10 @@ export interface Reading {
  */
 export interface DeviceStatePatch {
   on?: boolean;
+  /** The setting that changed, and what it became. */
+  mode?: { setting: string; value: string };
+  /** The operation that was run. */
+  operation?: string;
   brightness?: number;
   target_temp?: number;
   locked?: boolean;
@@ -64,6 +68,69 @@ export interface DeviceStatePatch {
   fan_speed?: number;
   fan_mode?: string;
   position?: number;
+  /** Slat angle as a 0-100 percentage OPEN, the covering's second axis. */
+  tilt?: number;
+}
+
+/**
+ * What a device can be told to do and what it measures, in its own terms.
+ *
+ * `capabilities: string[]` on `Device` says a fan has speed; it cannot say which
+ * modes that particular fan has, what a thermostat's limits are, or that an air
+ * quality sensor measures eleven separate substances. A model given only the short
+ * list has to guess, and discovers the limits by failing.
+ *
+ * Read from the device rather than assumed: where a cluster states a constraint —
+ * FanControl's mode sequence, a thermostat's setpoint limits, a concentration's
+ * declared unit — the description carries what it says.
+ */
+export interface DeviceDescription {
+  device_id: string;
+  device_type: string;
+  /** Verbs the device accepts, in `control`'s vocabulary. */
+  capabilities: Capability[];
+  /** What it measures, whether or not it has reported yet. */
+  sensors: SensorSpec[];
+}
+
+/** What a `control` op may ask a device to do. */
+export type Verb =
+  | "power"
+  | "brightness"
+  | "target_temp"
+  | "locked"
+  | "color"
+  | "fan_speed"
+  | "fan_mode"
+  | "position"
+  | "tilt"
+  /** Choose a named setting: `{setting, value}`, both in the device's own words. */
+  | "mode"
+  /** start / stop / pause / resume, for a device that runs cycles. */
+  | "operation";
+
+export interface Capability {
+  /** Exactly a `control` verb, so a description and a call cannot drift apart. */
+  verb: Verb;
+  /**
+   * Which named setting this addresses, for verbs that have more than one. A
+   * washer has a wash mode, a spin speed and a rinse count — all `mode` — and
+   * without the name they are indistinguishable to anything reading the list.
+   */
+  setting?: string;
+  value: ValueSpec;
+}
+
+export type ValueSpec =
+  | { kind: "boolean" }
+  | { kind: "percent" }
+  | { kind: "number"; min?: number; max?: number; step?: number; unit?: string; when?: string }
+  | { kind: "enum"; values: string[] }
+  | { kind: "color" };
+
+export interface SensorSpec {
+  sensor_type: string;
+  unit: string;
 }
 
 // ── Envelope ─────────────────────────────────────────────────────────────────
@@ -74,6 +141,8 @@ export type OpName =
   | "commission"
   | "decommission"
   | "control"
+  | "describe"
+  | "state"
   | "ping";
 
 export interface Request {
@@ -113,10 +182,28 @@ export type ErrorCode =
   | "commission_failed"
   | "device_unknown"
   | "capability_unsupported"
+  | "device_refused"
   | "device_unreachable"
   | "bad_request"
   | "internal";
 
+
+/**
+ * One thing a device currently is: `{name: "spin speed", value: "High"}`.
+ *
+ * `name` is always a name `describe` also uses -- a control verb for a scalar, a
+ * setting name for a selectable -- so a reading names the thing that changes it.
+ */
+export interface StateValue {
+  name: string;
+  value: string;
+}
+
+/** Everything a device currently reports. */
+export interface DeviceState {
+  device_id: string;
+  values: StateValue[];
+}
 
 /** An error carrying a wire code, so the dispatcher does not have to guess one. */
 export class OpError extends Error {

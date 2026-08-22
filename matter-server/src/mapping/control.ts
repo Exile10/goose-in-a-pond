@@ -7,7 +7,7 @@
  * decision below is unit-testable against a recorded device.
  */
 
-import { OpError, type DeviceStatePatch } from "../protocol.js";
+import { OpError, type DeviceStatePatch, type Verb } from "../protocol.js";
 import {
   CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
@@ -17,17 +17,13 @@ import {
   CLUSTER_THERMOSTAT,
   CLUSTER_WINDOW_COVERING,
 } from "./devices.js";
+import { operationsOf, settingNamed, settingsOf } from "./settings.js";
 import { endpointWith, type NodeSnapshot } from "./snapshot.js";
+import { applianceSetpoint, targetSetpoint } from "./thermostat.js";
 
-export type Verb =
-  | "power"
-  | "brightness"
-  | "target_temp"
-  | "locked"
-  | "color"
-  | "fan_speed"
-  | "fan_mode"
-  | "position";
+// `Verb` is protocol vocabulary — it names what a `control` op may ask for — so it
+// lives in protocol.ts and is re-exported here, where every caller already looks.
+export type { Verb };
 
 export const VERBS: ReadonlySet<string> = new Set<Verb>([
   "power",
@@ -38,6 +34,9 @@ export const VERBS: ReadonlySet<string> = new Set<Verb>([
   "fan_speed",
   "fan_mode",
   "position",
+  "tilt",
+  "mode",
+  "operation",
 ]);
 
 /** What the server must actually do to the device. */
@@ -59,9 +58,19 @@ export function brightnessToLevel(percent: number): number {
   return Math.floor((pct * 254 + 50) / 100);
 }
 
+/** Matter's 0-254 level back to a 0-100 GIAP percentage, for reading state. */
+export function levelToBrightness(level: number): number {
+  return clampPercent((level * 100) / 254);
+}
+
 /** Celsius onto a Matter thermostat setpoint (hundredths of a degree). */
 export function celsiusToSetpoint(celsius: number): number {
   return Math.min(32767, Math.max(-32768, Math.round(celsius * 100)));
+}
+
+/** A Matter thermostat setpoint back to Celsius. */
+export function setpointToCelsius(setpoint: number): number {
+  return Math.round(setpoint) / 100;
 }
 
 /** A 0-360 degree hue onto ColorControl's 0-254 scale (360 wraps to 0, matching the
@@ -87,12 +96,19 @@ export function positionOpenToLift100ths(percentOpen: number): number {
   return (100 - clampPercent(percentOpen)) * 100;
 }
 
+/** WindowCovering's hundredths-of-a-percent CLOSED back to GIAP percent OPEN. */
+export function lift100thsToPositionOpen(lift100ths: number): number {
+  return clampPercent(100 - lift100ths / 100);
+}
+
 function clampPercent(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.min(100, Math.max(0, Math.round(value)));
 }
 
 // ── Fan modes ────────────────────────────────────────────────────────────────
+
+const CLUSTER_TEMPERATURE_CONTROL = "temperatureControl";
 
 export const FAN_MODE_OFF = 0;
 
@@ -135,6 +151,28 @@ export function fanModeFromName(name: string): number | undefined {
       return 5;
     case "smart":
       return 6;
+    default:
+      return undefined;
+  }
+}
+
+/** `FanMode` back to the name it is sent by, for reading state. */
+export function fanModeName(code: number): string | undefined {
+  switch (code) {
+    case FAN_MODE_OFF:
+      return "off";
+    case 1:
+      return "low";
+    case 2:
+      return "medium";
+    case 3:
+      return "high";
+    case 4:
+      return "on";
+    case 5:
+      return "auto";
+    case 6:
+      return "smart";
     default:
       return undefined;
   }
@@ -230,13 +268,64 @@ export function planControl(
       if (typeof value !== "number" || !Number.isFinite(value)) {
         throw new OpError("bad_request", "target_temp needs a temperature in Celsius");
       }
-      const endpoint = endpointFor(node, CLUSTER_THERMOSTAT, deviceId);
+      // Which setpoint depends on what the thermostat is doing: writing the
+      // heating one to a device that is cooling moves a number nobody asked about
+      // and leaves the cooling unchanged.
+      // An appliance keeps its target in Temperature Control and takes it by
+      // command, not by writing an attribute.
+      const appliance = applianceSetpoint(node);
+      if (appliance !== undefined) {
+        return {
+          actions: [
+            {
+              kind: "command",
+              endpoint: appliance.endpoint,
+              cluster: CLUSTER_TEMPERATURE_CONTROL,
+              command: "setTemperature",
+              payload: { targetTemperature: celsiusToSetpoint(value) },
+            },
+          ],
+          applied: { target_temp: value },
+        };
+      }
+
+      const setpoint = targetSetpoint(node, value);
+      if (setpoint === undefined) {
+        throw new OpError(
+          "capability_unsupported",
+          `Matter device '${deviceId}' does not support this capability`,
+        );
+      }
       // Setpoints are attribute writes, not commands.
       return {
         actions: [
-          { kind: "write", endpoint, cluster: CLUSTER_THERMOSTAT, attribute: "occupiedHeatingSetpoint", value: celsiusToSetpoint(value) },
+          { kind: "write", endpoint: setpoint.endpoint, cluster: CLUSTER_THERMOSTAT, attribute: setpoint.attribute, value: celsiusToSetpoint(value) },
         ],
         applied: { target_temp: value },
+      };
+    }
+
+    case "tilt": {
+      // A covering's second axis: how far the slats are turned, independent of how
+      // far the blind is raised. A venetian blind is routinely down with its slats
+      // open, which `position` alone cannot ask for.
+      //
+      // Same convention as lift, and the spec is explicit about it: zero is treated
+      // as UpOrOpen. So GIAP speaks percent OPEN here too, and the same conversion
+      // serves both.
+      const pct = asPercent(value, "tilt");
+      const endpoint = endpointFor(node, CLUSTER_WINDOW_COVERING, deviceId);
+      return {
+        actions: [
+          {
+            kind: "command",
+            endpoint,
+            cluster: CLUSTER_WINDOW_COVERING,
+            command: "goToTiltPercentage",
+            payload: { tiltPercent100thsValue: positionOpenToLift100ths(pct) },
+          },
+        ],
+        applied: { tilt: pct },
       };
     }
 
@@ -323,7 +412,112 @@ export function planControl(
         applied: { position: pct },
       };
     }
+
+    case "mode": {
+      const { setting: wanted, value: choice } = readModeRequest(value);
+      const setting = settingNamed(node, wanted);
+      if (setting === undefined) {
+        const available = settingsOf(node).map(s => s.name);
+        throw new OpError(
+          "capability_unsupported",
+          available.length === 0
+            ? `Matter device '${deviceId}' has no settings that can be chosen`
+            : `'${wanted}' is not a setting on '${deviceId}' — it has: ${available.join(", ")}`,
+        );
+      }
+
+      // The device published these labels; anything else was never on offer, and
+      // guessing at the nearest one is how a wash ends up on the wrong cycle.
+      const encoded = setting.valueFor(choice);
+      if (encoded === undefined) {
+        throw new OpError(
+          "bad_request",
+          `'${choice}' is not a ${setting.name} on '${deviceId}' — it accepts: ${setting.values.join(", ")}`,
+        );
+      }
+
+      const action: Action =
+        setting.write.kind === "command"
+          ? {
+              kind: "command",
+              endpoint: setting.endpoint,
+              cluster: setting.cluster,
+              command: setting.write.command,
+              payload: { [setting.write.field]: encoded },
+            }
+          : {
+              kind: "write",
+              endpoint: setting.endpoint,
+              cluster: setting.cluster,
+              attribute: setting.write.attribute,
+              value: encoded,
+            };
+
+      return {
+        actions: [action],
+        // Reported with the label the device uses, not the one the user typed.
+        applied: {
+          mode: {
+            setting: setting.name,
+            value: setting.values.find(v => v.toLowerCase() === choice.trim().toLowerCase()) ?? choice,
+          },
+        },
+      };
+    }
+
+    case "operation": {
+      const wanted = asString(value, "operation").toLowerCase();
+      const operations = operationsOf(node);
+      if (operations === undefined) {
+        throw new OpError(
+          "capability_unsupported",
+          `Matter device '${deviceId}' does not run cycles, so it cannot be started or stopped`,
+        );
+      }
+      if (!operations.values.includes(wanted)) {
+        throw new OpError(
+          "bad_request",
+          `'${wanted}' is not an operation — use ${operations.values.join(", ")}`,
+        );
+      }
+      return {
+        actions: [
+          {
+            kind: "command",
+            endpoint: operations.endpoint,
+            cluster: operations.cluster,
+            command: wanted,
+            payload: {},
+          },
+        ],
+        applied: { operation: wanted },
+      };
+    }
   }
+}
+
+/** A `mode` request names the setting and the choice, both as the device words them. */
+function readModeRequest(value: unknown): { setting: string; value: string } {
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { setting?: unknown }).setting === "string" &&
+    typeof (value as { value?: unknown }).value === "string"
+  ) {
+    const request = value as { setting: string; value: string };
+    return { setting: request.setting.trim(), value: request.value.trim() };
+  }
+  throw new OpError(
+    "bad_request",
+    "a mode needs both the setting and the value, as {setting, value}",
+  );
+}
+
+function asString(value: unknown, verb: string): string {
+  if (typeof value !== "string") {
+    throw new OpError("bad_request", `${verb} takes a name, not ${typeof value}`);
+  }
+  return value.trim();
 }
 
 function readColor(value: unknown): { hue: number; saturation: number } {

@@ -59,7 +59,11 @@ impl DeviceMcpServer {
         }
     }
 
-    #[tool(description = "List registered devices with online status.")]
+    #[tool(
+        description = "List registered devices with their online status and what each can \
+                       be told to do. For the specific values a device accepts (fan modes, \
+                       temperature limits, what a sensor measures), use describe_device."
+    )]
     async fn list_registered_devices(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -72,8 +76,17 @@ impl DeviceMcpServer {
                     devices
                         .iter()
                         .map(|d| {
+                            // Capabilities are the difference between a name and
+                            // something actionable. Without them the model knows a
+                            // fan exists and has to discover what it accepts by
+                            // trying and failing in front of the user.
+                            let can = if d.capabilities.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" — {}", d.capabilities.join(", "))
+                            };
                             format!(
-                                "- {} ({}): {}",
+                                "- {} ({}): {}{can}",
                                 d.name,
                                 d.device_type,
                                 if d.is_online { "online" } else { "offline" }

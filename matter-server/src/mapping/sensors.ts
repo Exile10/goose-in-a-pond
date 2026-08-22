@@ -29,6 +29,48 @@ export interface SensorMapping {
   sensorType: string;
   unit: string;
   read: Read;
+  /**
+   * What the numbers mean, for a reading that is an enum rather than a quantity.
+   *
+   * The value stays the number: a rule comparing "filter change >= 2" needs one,
+   * and readings are stored as numbers. This is for the surfaces a person reads,
+   * where "2 state" says nothing. The device's own screen shows "Critical" beside
+   * the same attribute, and GIAP reporting 2 for it is GIAP knowing the answer and
+   * withholding it.
+   */
+  words?: Record<number, string>;
+}
+
+/**
+ * Matter's `MeasurementUnitEnum`, however matter.js hands it over.
+ *
+ * A concentration cluster states the unit its number is in, and substances do not
+ * share one: this device reports ozone in ppm where the conventional default is
+ * ppb, and pm1 in ppm where the default is ug/m3. Reading only the default gave a
+ * number that was right beside a unit that was not.
+ */
+const MEASUREMENT_UNITS: ReadonlyMap<number, string> = new Map([
+  [0, "ppm"],
+  [1, "ppb"],
+  [2, "ppt"],
+  [3, "mg/m3"],
+  [4, "ug/m3"],
+  [5, "ng/m3"],
+  [6, "/m3"],
+  [7, "Bq/m3"],
+]);
+
+/** The unit a device declared, from its raw `measurementUnit`, if it declared one. */
+export function declaredUnitOf(raw: unknown): string | undefined {
+  if (typeof raw === "number" && Number.isFinite(raw)) return MEASUREMENT_UNITS.get(raw);
+
+  // matter.js may decode the enum to its name.
+  if (typeof raw === "string") {
+    return [...MEASUREMENT_UNITS.values()].find(
+      unit => unit.replace("/", "").toLowerCase() === raw.replace("/", "").toLowerCase(),
+    );
+  }
+  return undefined;
 }
 
 // ── Value readers ────────────────────────────────────────────────────────────
@@ -63,6 +105,37 @@ const occupied: Read = v => {
   return n === undefined ? undefined : (n & 1) === 1 ? 1 : 0;
 };
 
+// ── What the enum readings mean ──────────────────────────────────────────────
+//
+// Matter's own names for these values. Kept beside the sensors that use them so a
+// reading and its meaning cannot drift apart, and so adding a sensor with an enum
+// has an obvious place to say what its numbers are.
+
+/** ResourceMonitoring's ChangeIndicationEnum: does this filter need replacing. */
+const CHANGE_INDICATION: Record<number, string> = {
+  0: "OK",
+  1: "Warning",
+  2: "Critical",
+};
+
+/** SmokeCoAlarm's AlarmStateEnum. */
+const ALARM_STATE: Record<number, string> = {
+  0: "Normal",
+  1: "Warning",
+  2: "Critical",
+};
+
+/** AirQuality's AirQualityEnum, the ordinal the device grades itself on. */
+const AIR_QUALITY: Record<number, string> = {
+  0: "Unknown",
+  1: "Good",
+  2: "Fair",
+  3: "Moderate",
+  4: "Poor",
+  5: "Very poor",
+  6: "Extremely poor",
+};
+
 // ── The table ────────────────────────────────────────────────────────────────
 
 export const SENSORS: readonly SensorMapping[] = [
@@ -72,6 +145,11 @@ export const SENSORS: readonly SensorMapping[] = [
 
   // Ambient measurements.
   { cluster: "temperatureMeasurement", attribute: "measuredValue", sensorType: "temperature", unit: "C", read: hundredths },
+  // A thermostat measures the room it is in, and publishes it here rather than
+  // through TemperatureMeasurement -- so asking a thermostat for the temperature
+  // got "none recorded", from the one device in the house whose whole job is
+  // knowing it. Its setpoint is a separate thing, reachable through `target_temp`.
+  { cluster: "thermostat", attribute: "localTemperature", sensorType: "temperature", unit: "C", read: hundredths },
   { cluster: "relativeHumidityMeasurement", attribute: "measuredValue", sensorType: "humidity", unit: "%", read: hundredths },
   // Lux, reported log-scaled. Passed through unconverted: the raw measurement is what
   // a rule threshold compares against.
@@ -81,9 +159,9 @@ export const SENSORS: readonly SensorMapping[] = [
 
   // An ordinal: 0 unknown, 1 good, rising to 6 extremely poor. Kept as the ordinal
   // rather than invented units, so the scale stays the device's own.
-  { cluster: "airQuality", attribute: "airQuality", sensorType: "air_quality", unit: "level", read: asNumber },
+  { cluster: "airQuality", attribute: "airQuality", sensorType: "air_quality", unit: "level", read: asNumber, words: AIR_QUALITY },
   // Alarm state: 0 normal, non-zero means it is sounding.
-  { cluster: "smokeCoAlarm", attribute: "smokeState", sensorType: "smoke_alarm", unit: "state", read: asNumber },
+  { cluster: "smokeCoAlarm", attribute: "smokeState", sensorType: "smoke_alarm", unit: "state", read: asNumber, words: ALARM_STATE },
 
   // Concentrations are floats in each substance's own unit, passed through unscaled —
   // the number the device shows is the number a rule threshold should compare against.
@@ -108,9 +186,9 @@ export const SENSORS: readonly SensorMapping[] = [
   // questions: how worn the filter is, and whether the device is asking for it to be
   // changed. The change indication is 0 OK, 1 Warning, 2 Critical.
   { cluster: "hepaFilterMonitoring", attribute: "condition", sensorType: "hepa_filter_condition", unit: "%", read: asNumber },
-  { cluster: "hepaFilterMonitoring", attribute: "changeIndication", sensorType: "hepa_filter_change", unit: "state", read: asNumber },
+  { cluster: "hepaFilterMonitoring", attribute: "changeIndication", sensorType: "hepa_filter_change", unit: "state", read: asNumber, words: CHANGE_INDICATION },
   { cluster: "activatedCarbonFilterMonitoring", attribute: "condition", sensorType: "carbon_filter_condition", unit: "%", read: asNumber },
-  { cluster: "activatedCarbonFilterMonitoring", attribute: "changeIndication", sensorType: "carbon_filter_change", unit: "state", read: asNumber },
+  { cluster: "activatedCarbonFilterMonitoring", attribute: "changeIndication", sensorType: "carbon_filter_change", unit: "state", read: asNumber, words: CHANGE_INDICATION },
 ];
 
 const BY_PATH: ReadonlyMap<string, SensorMapping> = new Map(
@@ -128,6 +206,10 @@ export function readingFor(
   attribute: string,
   value: unknown,
   at: Date = new Date(),
+  // What the cluster says its numbers are in. `describe` has always read this;
+  // readings did not, so the same substance was described in one unit and reported
+  // in another -- ozone declared ppm and reported ppb, from one device, at once.
+  declaredUnit?: unknown,
 ): Reading | undefined {
   const mapping = BY_PATH.get(`${cluster}.${attribute}`);
   if (mapping === undefined) return undefined;
@@ -139,7 +221,7 @@ export function readingFor(
     device_id: deviceIdForNode(nodeId),
     sensor_type: mapping.sensorType,
     value: reading,
-    unit: mapping.unit,
+    unit: declaredUnitOf(declaredUnit) ?? mapping.unit,
     at: at.toISOString(),
   };
 }

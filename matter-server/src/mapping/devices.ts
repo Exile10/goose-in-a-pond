@@ -10,10 +10,13 @@ import type { Device } from "../protocol.js";
 import { deviceIdForNode } from "../protocol.js";
 import {
   applicationEndpoints,
+  endpointWith,
   hasCluster,
   rootAttribute,
   type NodeSnapshot,
 } from "./snapshot.js";
+import { operationsOf, settingsOf } from "./settings.js";
+import { applianceSetpoint } from "./thermostat.js";
 
 export const CLUSTER_ON_OFF = "onOff";
 export const CLUSTER_LEVEL_CONTROL = "levelControl";
@@ -104,8 +107,31 @@ function capabilitiesOf(node: NodeSnapshot): string[] {
     capabilities.push("fan_speed");
   }
   if (hasCluster(node, CLUSTER_LEVEL_CONTROL)) capabilities.push("brightness");
-  if (hasCluster(node, CLUSTER_THERMOSTAT)) capabilities.push("temperature");
+  // Either source of a temperature target. Gating on the thermostat alone listed a
+  // dishwasher as "power, mode, operation" while `describe` offered it 49 to 82
+  // degrees -- and the listing is what a model reads before deciding whether to ask
+  // for the description at all, so the fuller answer was never reached.
+  if (hasCluster(node, CLUSTER_THERMOSTAT) || applianceSetpoint(node) !== undefined) {
+    capabilities.push("temperature");
+  }
   if (hasCluster(node, CLUSTER_DOOR_LOCK)) capabilities.push("lock");
+  // A covering was listed with no capabilities at all while `describe` offered it a
+  // position, so the short answer said a controllable device could not be driven.
+  if (hasCluster(node, CLUSTER_WINDOW_COVERING)) {
+    capabilities.push("position");
+    // Only a covering with slats to turn.
+    const tilting = endpointWith(node, CLUSTER_WINDOW_COVERING)?.clusters[CLUSTER_WINDOW_COVERING]?.[
+      "currentPositionTiltPercent100ths"
+    ];
+    if (tilting !== undefined) capabilities.push("tilt");
+  }
+
+  // Appliance vocabulary, found the same structural way `settingsOf` finds it rather
+  // than from a second list that could disagree with the first. Without these a
+  // washer was listed as "capabilities: power", which is what the model reads before
+  // it decides whether to look closer -- so it never looked.
+  if (settingsOf(node).length > 0) capabilities.push("mode");
+  if (operationsOf(node) !== undefined) capabilities.push("operation");
 
   return capabilities;
 }
