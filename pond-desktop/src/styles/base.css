@@ -35,8 +35,12 @@
 }
 
 /* heroui switch thumb position is driven by margin-inline-start.
-   The * { margin: 0 } reset above overrides heroui's @layer CSS (unlayered
-   always beats layered). Re-declare at class specificity so the thumb slides. */
+   The reset above is now inside `@layer reset`, registered before heroui's
+   @import so it sorts below heroui's own layers — it no longer beats them, and
+   the sentence that used to live here ("unlayered always beats layered") is the
+   bug, not the reason. These re-declarations are kept because they sit at class
+   specificity in the same layer heroui uses, and removing them has not been
+   verified against every switch size. */
 .switch__thumb { margin-inline-start: calc(var(--spacing, 0.25rem) * 0.5); }
 .switch[data-selected=true] .switch__thumb { margin-inline-start: calc(100% - 1.5rem); }
 .switch--sm.switch[data-selected=true] .switch__thumb,

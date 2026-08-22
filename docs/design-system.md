@@ -76,7 +76,7 @@ All tokens are CSS custom properties on `:root`. HeroUI's stylesheet is imported
 | Token | Value |
 |---|---|
 | `--sidebar-width` | 232px |
-| `--sidebar-width-collapsed` | 52px |
+| `--sidebar-width-collapsed` | 56px |
 | `--toolbar-height` | 48px |
 | `--row-height-sm/md/lg` | 36px / 44px / 52px |
 
