@@ -184,7 +184,7 @@ fn commission_request() -> Request<Body> {
 }
 
 #[tokio::test]
-async fn commissioning_while_off_says_where_to_turn_matter_on() {
+async fn commissioning_while_matter_is_unavailable_does_not_send_the_user_looking_for_a_control() {
     let (app, _, _tmp) = make_app(Some(Arc::new(StubMatterRuntime::disabled()))).await;
 
     let response = app.oneshot(commission_request()).await.unwrap();
@@ -194,12 +194,25 @@ async fn commissioning_while_off_says_where_to_turn_matter_on() {
         .as_str()
         .unwrap()
         .to_string();
-    // The old message pointed at Settings, where no such control existed.
+
+    // This assertion has now been wrong twice in the same way, which is the
+    // reason it no longer names a place. It first pinned "Settings", where no
+    // such control existed; it was corrected to "Devices tab", and then the
+    // matter.js controller work deleted the Matter toggle from that tab too --
+    // so the test went on enforcing a message that pointed at a switch nobody
+    // could find. `Disabled` is now only reachable on a build with no Matter
+    // support compiled in, where the honest answer names the build.
+    for absent in ["Settings", "Devices tab", "turn it on"] {
+        assert!(
+            !error.contains(absent),
+            "the message sends the user hunting for a control that does not exist ({absent}): \
+             {error}"
+        );
+    }
     assert!(
-        error.contains("Devices tab"),
-        "the message must name a control that exists: {error}"
+        error.contains("compiled in"),
+        "the message must say why Matter is unavailable: {error}"
     );
-    assert!(!error.contains("Settings"), "not Settings: {error}");
 }
 
 /// The headline bug: an enabled Matter whose controller is down used to report
@@ -366,7 +379,10 @@ async fn deleting_a_matter_device_while_off_refuses_with_the_honest_reason() {
         .as_str()
         .unwrap()
         .to_string();
-    assert!(error.contains("Devices tab"), "{error}");
+    // See the commissioning test above: there is no Matter control to point at
+    // any more, so the refusal names the build instead of a tab.
+    assert!(error.contains("compiled in"), "{error}");
+    assert!(!error.contains("Devices tab"), "{error}");
 }
 
 /// This endpoint takes a patch over the whole of Settings, so the Matter check

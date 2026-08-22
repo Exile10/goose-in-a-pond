@@ -408,6 +408,7 @@ impl DeviceControlMcpServer {
             && p.setting.is_none()
             && p.operation.is_none()
             && p.position.is_none()
+            && p.tilt.is_none()
         {
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "No change requested for '{device_id}'. Specify one of: power (on/off), \
@@ -415,7 +416,8 @@ impl DeviceControlMcpServer {
                  saturation (0-100), fan_speed (0-100), fan_mode (off/low/medium/high/on/auto/\
                  smart), setting + setting_value (appliance settings such as a wash \
                  cycle or spin speed — see describe_device), operation (start/stop/\
-                 pause/resume), or position (0-100 percent open)."
+                 pause/resume), position (0-100 percent open), or tilt (0-100 percent \
+                 open, for slats)."
             ))]));
         }
 

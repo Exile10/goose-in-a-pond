@@ -28,7 +28,10 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::bridge::{run_matter_bridge, run_matter_supervisor, SupervisorConfig};
+use crate::bridge::{
+    run_matter_bridge, run_matter_bridge_with_cache, run_matter_supervisor, ReadingCache,
+    SupervisorConfig,
+};
 use crate::client::MatterClient;
 use crate::commissioning::MatterCommissioner;
 use crate::control::{MatterDeviceControl, SharedMatterClient};
@@ -1109,4 +1112,62 @@ async fn control_switches_to_matter_once_connected() {
     control.set_power("matter-2", true).await.unwrap();
     assert_eq!(control_frames(&received).len(), 1);
     assert!(fallback.calls().is_empty());
+}
+
+/// The bridge dedupes readings so a level-based rule does not re-fire on a
+/// steady sensor. The cache that does it has to outlive one connection, because
+/// re-subscribing is exactly when the same values arrive again — and the
+/// supervisor re-runs the bridge on every reconnect.
+///
+/// This drives two full bridge runs against a controller that serves the same
+/// snapshot both times, which is what a controller restart looks like from
+/// here. The cache lived inside `run_matter_bridge` until this was written, so
+/// each run started empty and every reconnect republished the lot; the existing
+/// unit test did not catch it because it calls `publish_reading` directly with
+/// one cache and never actually re-subscribes.
+#[tokio::test]
+async fn a_reconnect_does_not_republish_a_reading_that_has_not_changed() {
+    let (url, _) = mock_controller(
+        snapshot(vec![sensor()], vec![reading("matter-3", "occupancy", 1.0)]),
+        vec![],
+        None,
+    )
+    .await;
+
+    let registry: Arc<dyn DeviceRegistry + Send + Sync> = Arc::new(MockRegistry::default());
+    let bus: Arc<dyn EventBus> = Arc::new(InProcessEventBus::new());
+    let mut received = bus.subscribe();
+
+    // The supervisor owns one cache across every reconnect; mirror that here.
+    let mut cache = ReadingCache::new();
+
+    for run in 1..=2 {
+        let (client, events) = MatterClient::connect(&url).await.unwrap();
+        // Each run ends when its connection's event stream closes, which is the
+        // shape of a dropped connection.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(250),
+            run_matter_bridge_with_cache(
+                client,
+                events,
+                registry.clone(),
+                bus.clone(),
+                MatterNotifier::disabled(),
+                Duration::from_millis(50),
+                &mut cache,
+            ),
+        )
+        .await;
+        assert_eq!(cache.len(), 1, "run {run} should leave the reading cached");
+    }
+
+    assert!(
+        next_event(&mut received).await.is_some(),
+        "the first sync must publish the reading"
+    );
+    assert!(
+        next_event(&mut received).await.is_none(),
+        "the reconnect republished an unchanged reading, so every rule attached \
+         to this sensor fires again with nothing in the house having changed"
+    );
 }
