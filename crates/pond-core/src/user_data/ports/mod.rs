@@ -1,3 +1,4 @@
+pub mod account_credentials;
 pub mod camera_storage;
 pub mod device_attribution;
 pub mod device_commissioning;

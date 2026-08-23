@@ -170,47 +170,10 @@ pub fn build_prompt_partition(
     }
 
     // Profile context lines (same logic as build_system_prompt_from_template_full)
-    if let Some(ctx) = profile {
-        let user = sanitize_field(&settings.user_name, 50);
-
-        if let Some(ref pname) = ctx.preferred_name {
-            let pname = sanitize_field(pname, 50);
-            if !pname.is_empty() && pname != user {
-                dynamic_parts.push(format!("The user prefers to be called {}.", pname));
-            }
-        }
-        if let Some(ref lang) = ctx.language {
-            let lang = sanitize_field(lang, 20);
-            if !lang.is_empty() && lang != "en" {
-                let lang_label = match lang.as_str() {
-                    "fr" => "French",
-                    "es" => "Spanish",
-                    "de" => "German",
-                    "sw" => "Swahili",
-                    "ar" => "Arabic",
-                    "pt" => "Portuguese",
-                    "zh" => "Chinese",
-                    "ja" => "Japanese",
-                    "ko" => "Korean",
-                    other => other,
-                };
-                dynamic_parts.push(format!("Always respond in {}.", lang_label));
-            }
-        }
-        if let Some(ref bday) = ctx.birthday {
-            let bday = sanitize_field(bday, 20);
-            if !bday.is_empty() {
-                dynamic_parts.push(format!("The user's birthday is {}.", bday));
-            }
-        }
-        if ctx.atypical_speech {
-            dynamic_parts.push(
-                "The user may have atypical speech — be patient, never correct speech \
-                 patterns, and interpret incomplete sentences charitably."
-                    .to_string(),
-            );
-        }
-    }
+    dynamic_parts.extend(crate::prompts::profile_context_lines(
+        profile,
+        &settings.user_name,
+    ));
 
     // Prompt addendum
     let addendum = sanitize_field(&settings.prompt_addendum, 500);

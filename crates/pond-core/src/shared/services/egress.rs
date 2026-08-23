@@ -317,18 +317,6 @@ pub fn record_egress(url: &str, method: &str, status: Option<u16>, latency_ms: u
         return;
     };
     let host = extract_host(url).to_string();
-    // An in-machine hop is not egress. Recording it would put one event per
-    // TURN in the feed on a pond whose model server is loopback — the normal
-    // install — and three call sites (the transcription forwards and the
-    // diagnostics probe) had already each invented their own "check but do
-    // not record" suppression to avoid exactly that. The decision belongs
-    // here, keyed on the CLASSIFICATION, so a caller records unconditionally
-    // and the same URL setting pointed at a remote box starts appearing in
-    // the feed the moment it stops being local — which is the moment the
-    // feed needs it.
-    if classify_host(&host) == PrivacySensitivity::Internal {
-        return;
-    }
     let tool = current_tool();
     let session_id = current_session_id();
     let event = egress_event(&host, &tool, &session_id, method, status, latency_ms);
@@ -432,18 +420,26 @@ mod tests {
 
     // ── Network mode (PAI-2 P5) ─────────────────────────────────────────────
 
-    /// The noise rule lives HERE, not at call sites: a loopback hop is not
-    /// egress, and per-call-site suppression is how three routes each grew
-    /// their own copy of that decision.
+    /// Loopback is CLASSIFIED as internal but is still RECORDED.
+    ///
+    /// Suppressing internal hosts inside `record_egress` was tried and undone.
+    /// It read well — an in-machine hop is not egress — but it made every
+    /// loopback call invisible, which is a loss for a feed whose job is showing
+    /// what the pond is doing, and it silently broke the guard asserting that
+    /// the push relay records its two calls at all (they run against a
+    /// loopback mock). Volume, if it becomes a problem, is the consumer's to
+    /// filter: the sensitivity is on every event for exactly that purpose.
     #[test]
-    fn an_internal_host_is_below_the_recording_threshold() {
+    fn loopback_is_classified_internal_and_still_recorded() {
         assert_eq!(classify_host("127.0.0.1"), PrivacySensitivity::Internal);
         assert_eq!(classify_host("localhost"), PrivacySensitivity::Internal);
-        // The same setting pointed off-box must clear the threshold.
         assert_ne!(
             classify_host("gpu-box.tailnet.example"),
             PrivacySensitivity::Internal
         );
+        // The event carries the classification, so a reader can filter on it.
+        let event = egress_event("127.0.0.1", "", "", "LLM", Some(200), 5);
+        assert_eq!(event.privacy_sensitivity, PrivacySensitivity::Internal);
     }
 
     #[test]

@@ -3428,10 +3428,18 @@ impl GooseAdapter {
             // user message — NOT the system prompt. Keeps prefix token-stable.
             dynamic_suffix_for_user_msg = partition.dynamic_suffix;
         } else {
-            // Legacy path: rebuild full system prompt every turn
+            // Legacy path: rebuild full system prompt every turn.
+            //
+            // The profile is passed here for the same reason the partitioned
+            // branch above passes it: without it the prompt loses the user's
+            // preferred name, response language, birthday and the
+            // atypical-speech instruction. This branch used to hand over
+            // `None`, so turning `prefix_cache_prompt` off silently changed WHO
+            // the pond thought it was talking to — a settings toggle with an
+            // undocumented second effect.
             let system_prompt = pond_core::prompts::build_system_prompt_from_template_full(
                 &settings,
-                None,
+                request.profile_context.as_ref(),
                 Some(&prompt_state),
                 &template_content,
             );

@@ -38,7 +38,7 @@
 //! answers "is this real?" for the settings route, the scheduler and the UI.
 
 use crate::user_data::domain::settings::Settings;
-use chrono::{DateTime, Offset, Utc};
+use chrono::{DateTime, FixedOffset, Offset, Utc};
 
 /// How confident the pond is about the name it is using.
 ///
@@ -216,20 +216,55 @@ pub fn now_in(zone: &str, now: DateTime<Utc>) -> Option<DateTime<chrono_tz::Tz>>
     Some(now.with_timezone(&tz))
 }
 
+/// Which spelling of an offset a caller needs.
+///
+/// Both are correct and aimed at different readers, so this is a parameter
+/// rather than one being a prettier version of the other. Three hand-rolled
+/// implementations existed when this was added — this module's, `world_clock`'s
+/// and `get_current_time`'s — and they rendered the same instant three ways in
+/// one conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetStyle {
+    /// `+03:00`, `-09:30`. Fixed width, always minutes. For pickers and data.
+    Iso,
+    /// `UTC+3`, `UTC-9:30`. Hours unpadded, minutes only when non-zero. For
+    /// prose a model reads aloud.
+    Prose,
+}
+
+/// Write an already-resolved offset in the requested style.
+///
+/// Takes the offset rather than a zone so a caller that has parsed a zone does
+/// not parse it twice. The sign handling is the part worth centralising: it is
+/// integer arithmetic on a possibly-negative second count, and the hand-rolled
+/// copies each got the half-hour zones subtly different.
+pub fn format_offset(offset: FixedOffset, style: OffsetStyle) -> String {
+    let total = offset.local_minus_utc();
+    let (sign, secs) = if total < 0 {
+        ('-', -total)
+    } else {
+        ('+', total)
+    };
+    let (h, m) = (secs / 3600, (secs % 3600) / 60);
+    match style {
+        OffsetStyle::Iso => format!("{sign}{h:02}:{m:02}"),
+        OffsetStyle::Prose if m == 0 => format!("UTC{sign}{h}"),
+        OffsetStyle::Prose => format!("UTC{sign}{h}:{m:02}"),
+    }
+}
+
+/// The offset in `zone` at `now`, in the requested style.
+pub fn offset_label_styled(zone: &str, now: DateTime<Utc>, style: OffsetStyle) -> Option<String> {
+    Some(format_offset(now_in(zone, now)?.offset().fix(), style))
+}
+
 /// The UTC offset in `zone` right now, as `+03:00`.
 ///
 /// Computed for an instant rather than stored, because an offset is not a
 /// property of a zone: half the world changes its offset twice a year, and a
 /// cached `+01:00` for `Europe/London` is wrong for four months of it.
 pub fn offset_label(zone: &str, now: DateTime<Utc>) -> Option<String> {
-    let local = now_in(zone, now)?;
-    let secs = local.offset().fix().local_minus_utc();
-    let (sign, secs) = if secs < 0 { ('-', -secs) } else { ('+', secs) };
-    Some(format!(
-        "{sign}{:02}:{:02}",
-        secs / 3600,
-        (secs % 3600) / 60
-    ))
+    offset_label_styled(zone, now, OffsetStyle::Iso)
 }
 
 /// A zone, its current offset, and the place it implies — what a picker shows.
@@ -408,6 +443,40 @@ mod tests {
     #[test]
     fn a_pond_that_knows_nothing_has_nothing_to_ask() {
         assert_eq!(resolve(&with("", "UTC", 0.0, 0.0)).weather_target(), None);
+    }
+
+    /// The three spellings that existed before this: the picker's `+03:00`,
+    /// world_clock's `UTC+3`, and get_current_time's `UTC+03:00`.
+    #[test]
+    fn the_two_styles_are_both_correct_and_differ_only_in_shape() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+        let iso = offset_label_styled("Africa/Nairobi", now, OffsetStyle::Iso);
+        let prose = offset_label_styled("Africa/Nairobi", now, OffsetStyle::Prose);
+        assert_eq!(iso.as_deref(), Some("+03:00"));
+        assert_eq!(prose.as_deref(), Some("UTC+3"));
+        assert_eq!(
+            offset_label_styled("UTC", now, OffsetStyle::Prose).as_deref(),
+            Some("UTC+0")
+        );
+    }
+
+    /// Sign handling on a negative half-hour offset — the arithmetic each
+    /// hand-rolled copy got subtly different.
+    #[test]
+    fn a_negative_half_hour_offset_keeps_its_sign_in_both_styles() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+        assert_eq!(
+            offset_label_styled("Pacific/Marquesas", now, OffsetStyle::Iso).as_deref(),
+            Some("-09:30")
+        );
+        assert_eq!(
+            offset_label_styled("Pacific/Marquesas", now, OffsetStyle::Prose).as_deref(),
+            Some("UTC-9:30")
+        );
+        assert_eq!(
+            offset_label_styled("Asia/Kathmandu", now, OffsetStyle::Prose).as_deref(),
+            Some("UTC+5:45")
+        );
     }
 
     // ── Place ───────────────────────────────────────────────────────────

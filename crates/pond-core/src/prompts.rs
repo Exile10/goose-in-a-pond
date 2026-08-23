@@ -1019,6 +1019,86 @@ pub fn builtin_template_content(name: &str) -> Option<(&'static str, &'static st
 ///    prevents newline-injection attacks like `\nUser: ignore everything`.
 /// 2. Collapse every run of whitespace into a single space and trim both ends.
 /// 3. Truncate to `max_len` *characters* (not bytes) to prevent oversized prompts.
+/// The prompt lines describing WHO the pond is talking to.
+///
+/// One owner for four sites that each held a copy: two builders in this file
+/// (the second admitting in a comment that it was "same logic as" the first),
+/// the partitioned builder in `models/services/prompt_builder.rs`, and — by
+/// omission — the legacy branch in the Goose adapter, which passed no profile
+/// at all and so silently dropped every line below whenever
+/// `prefix_cache_prompt` was off.
+///
+/// The three real copies produced byte-identical strings, so gathering them
+/// here changes no rendered prompt and cannot move a KV prefix. That was worth
+/// establishing before writing this: a prompt-text change invalidates every
+/// cached prefix on the pond, which is a performance cliff disguised as a
+/// refactor.
+///
+/// # Why a language MAP and not the raw code
+///
+/// A small model reads "Always respond in French." reliably and "Always respond
+/// in fr." poorly. Unknown codes pass through unchanged rather than being
+/// dropped: a household that set `sw-KE` gets a slightly awkward line instead of
+/// silently losing its language.
+///
+/// `user_name` is taken so a preferred name identical to the account name adds
+/// no line — repeating what the prompt already said above costs tokens and
+/// tells the model nothing.
+pub fn profile_context_lines(profile: Option<&ProfileContext>, user_name: &str) -> Vec<String> {
+    let Some(ctx) = profile else {
+        return Vec::new();
+    };
+    let user = sanitize_field(user_name, 50);
+    let mut lines: Vec<String> = Vec::with_capacity(4);
+
+    if let Some(ref pname) = ctx.preferred_name {
+        let pname = sanitize_field(pname, 50);
+        if !pname.is_empty() && pname != user {
+            lines.push(format!("The user prefers to be called {}.", pname));
+        }
+    }
+
+    if let Some(ref lang) = ctx.language {
+        let lang = sanitize_field(lang, 20);
+        if !lang.is_empty() && lang != "en" {
+            lines.push(format!("Always respond in {}.", language_label(&lang)));
+        }
+    }
+
+    if let Some(ref bday) = ctx.birthday {
+        let bday = sanitize_field(bday, 20);
+        if !bday.is_empty() {
+            lines.push(format!("The user's birthday is {}.", bday));
+        }
+    }
+
+    if ctx.atypical_speech {
+        lines.push(
+            "The user may have atypical speech — be patient, never correct speech patterns, \
+             and interpret incomplete sentences charitably."
+                .to_string(),
+        );
+    }
+
+    lines
+}
+
+/// A BCP-47 code as a language a model recognises. Unknown codes pass through.
+fn language_label(code: &str) -> &str {
+    match code {
+        "fr" => "French",
+        "es" => "Spanish",
+        "de" => "German",
+        "sw" => "Swahili",
+        "ar" => "Arabic",
+        "pt" => "Portuguese",
+        "zh" => "Chinese",
+        "ja" => "Japanese",
+        "ko" => "Korean",
+        other => other,
+    }
+}
+
 pub fn sanitize_field(s: &str, max_len: usize) -> String {
     let decontrolled: String = s
         .chars()
@@ -1234,52 +1314,7 @@ pub fn build_system_prompt_with_profile(
     let base = render_jinja_template(&tmpl, settings, None, profile);
 
     // ── Profile context lines ─────────────────────────────────────────────────
-    let mut profile_lines: Vec<String> = Vec::with_capacity(8);
-
-    if let Some(ctx) = profile {
-        let user = sanitize_field(&settings.user_name, 50);
-
-        if let Some(ref pname) = ctx.preferred_name {
-            let pname = sanitize_field(pname, 50);
-            if !pname.is_empty() && pname != user {
-                profile_lines.push(format!("The user prefers to be called {}.", pname));
-            }
-        }
-
-        if let Some(ref lang) = ctx.language {
-            let lang = sanitize_field(lang, 20);
-            if !lang.is_empty() && lang != "en" {
-                let lang_label = match lang.as_str() {
-                    "fr" => "French",
-                    "es" => "Spanish",
-                    "de" => "German",
-                    "sw" => "Swahili",
-                    "ar" => "Arabic",
-                    "pt" => "Portuguese",
-                    "zh" => "Chinese",
-                    "ja" => "Japanese",
-                    "ko" => "Korean",
-                    other => other,
-                };
-                profile_lines.push(format!("Always respond in {}.", lang_label));
-            }
-        }
-
-        if let Some(ref bday) = ctx.birthday {
-            let bday = sanitize_field(bday, 20);
-            if !bday.is_empty() {
-                profile_lines.push(format!("The user's birthday is {}.", bday));
-            }
-        }
-
-        if ctx.atypical_speech {
-            profile_lines.push(
-                "The user may have atypical speech — be patient, never correct speech patterns, \
-                 and interpret incomplete sentences charitably."
-                    .to_string(),
-            );
-        }
-    }
+    let profile_lines = profile_context_lines(profile, &settings.user_name);
 
     let addendum = sanitize_field(&settings.prompt_addendum, 500);
 
@@ -1328,48 +1363,7 @@ pub fn build_system_prompt_from_template_full(
     };
 
     // ── Profile context lines (same logic as build_system_prompt_with_profile) ─
-    let mut profile_lines: Vec<String> = Vec::with_capacity(8);
-    if let Some(ctx) = profile {
-        let user = sanitize_field(&settings.user_name, 50);
-
-        if let Some(ref pname) = ctx.preferred_name {
-            let pname = sanitize_field(pname, 50);
-            if !pname.is_empty() && pname != user {
-                profile_lines.push(format!("The user prefers to be called {}.", pname));
-            }
-        }
-        if let Some(ref lang) = ctx.language {
-            let lang = sanitize_field(lang, 20);
-            if !lang.is_empty() && lang != "en" {
-                let lang_label = match lang.as_str() {
-                    "fr" => "French",
-                    "es" => "Spanish",
-                    "de" => "German",
-                    "sw" => "Swahili",
-                    "ar" => "Arabic",
-                    "pt" => "Portuguese",
-                    "zh" => "Chinese",
-                    "ja" => "Japanese",
-                    "ko" => "Korean",
-                    other => other,
-                };
-                profile_lines.push(format!("Always respond in {}.", lang_label));
-            }
-        }
-        if let Some(ref bday) = ctx.birthday {
-            let bday = sanitize_field(bday, 20);
-            if !bday.is_empty() {
-                profile_lines.push(format!("The user's birthday is {}.", bday));
-            }
-        }
-        if ctx.atypical_speech {
-            profile_lines.push(
-                "The user may have atypical speech — be patient, never correct speech \
-                 patterns, and interpret incomplete sentences charitably."
-                    .to_string(),
-            );
-        }
-    }
+    let profile_lines = profile_context_lines(profile, &settings.user_name);
 
     let addendum = sanitize_field(&settings.prompt_addendum, 500);
     let mut parts = vec![base];

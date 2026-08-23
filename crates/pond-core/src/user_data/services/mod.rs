@@ -1,3 +1,4 @@
+pub mod activity_watcher;
 pub mod consolidation_schedule;
 pub mod identity_resolution;
 pub mod inference_lane;
