@@ -2040,157 +2040,162 @@ impl GooseAdapter {
         // ModelConfig construction reads the context limit) and on every turn, so
         // a settings toggle takes effect without a model switch or restart.
 
-        let provider: Option<(Arc<dyn Provider>, goose_providers::model::ModelConfig)> =
-            match settings.chat_provider.as_str() {
-                // In-process GGUF inference via llama.cpp — no HTTP server needed.
-                // Registers the model in Goose's local_model_registry so
-                // LocalInferenceProvider can locate the .gguf file on disk.
-                "local" | "gguf" => {
-                    let model_name = if settings.chat_model.is_empty() {
-                        "llamafile".to_string()
-                    } else {
-                        settings.chat_model.clone()
-                    };
-                    // Register the GGUF model path in Goose's global registry
-                    // Register the model and get back its CANONICAL registry
-                    // key: "gemma-4-E2B-it" and "gemma-4-E2B-it-Q4_K_M" both
-                    // name the same GGUF file, and letting them fork into two
-                    // registry ids splits sessions across identities and can
-                    // keep two multi-GB copies of one model resident in the
-                    // engine's per-id model cache.
-                    let registry_key = match self.data_dir {
-                        Some(ref dd) => Self::register_gguf_model(&model_name, dd),
-                        None => model_name.trim_end_matches(".gguf").to_string(),
-                    };
-                    // Phase F1. `register_gguf_model` leaves `mmproj_path: None`
-                    // (GIAP registers a bare stem, which goose's featured-model
-                    // lookup cannot match), and the engine's vision gate is
-                    // exactly that field. Attach the encoder if it is on disk;
-                    // otherwise start fetching it in the background and stamp the
-                    // registry when it lands — `resolve_model_path` runs on every
-                    // generation, so no restart is needed. Non-blocking on
-                    // purpose: the encoder is ~1 GB.
-                    if let Some(ref dd) = self.data_dir {
-                        crate::vision_encoder::ensure_mmproj_available(dd, &registry_key);
+        // The third element is where that provider SENDS: the resolved base URL
+        // for the HTTP-backed arms, `None` for in-process inference. Captured
+        // here — the same instant the env vars are set — because this is the
+        // one moment the binding between provider and destination is explicit;
+        // the shim gates and records against it (see `GiapProviderShim`).
+        let provider: Option<(
+            Arc<dyn Provider>,
+            goose_providers::model::ModelConfig,
+            Option<String>,
+        )> = match settings.chat_provider.as_str() {
+            // In-process GGUF inference via llama.cpp — no HTTP server needed.
+            // Registers the model in Goose's local_model_registry so
+            // LocalInferenceProvider can locate the .gguf file on disk.
+            "local" | "gguf" => {
+                let model_name = if settings.chat_model.is_empty() {
+                    "llamafile".to_string()
+                } else {
+                    settings.chat_model.clone()
+                };
+                // Register the GGUF model path in Goose's global registry
+                // Register the model and get back its CANONICAL registry
+                // key: "gemma-4-E2B-it" and "gemma-4-E2B-it-Q4_K_M" both
+                // name the same GGUF file, and letting them fork into two
+                // registry ids splits sessions across identities and can
+                // keep two multi-GB copies of one model resident in the
+                // engine's per-id model cache.
+                let registry_key = match self.data_dir {
+                    Some(ref dd) => Self::register_gguf_model(&model_name, dd),
+                    None => model_name.trim_end_matches(".gguf").to_string(),
+                };
+                // Phase F1. `register_gguf_model` leaves `mmproj_path: None`
+                // (GIAP registers a bare stem, which goose's featured-model
+                // lookup cannot match), and the engine's vision gate is
+                // exactly that field. Attach the encoder if it is on disk;
+                // otherwise start fetching it in the background and stamp the
+                // registry when it lands — `resolve_model_path` runs on every
+                // generation, so no restart is needed. Non-blocking on
+                // purpose: the encoder is ~1 GB.
+                if let Some(ref dd) = self.data_dir {
+                    crate::vision_encoder::ensure_mmproj_available(dd, &registry_key);
+                }
+                let cfg = goose_providers::model::ModelConfig::new(&registry_key);
+                tracing::debug!(
+                    "[model-switch] building LocalInferenceProvider for '{}'...",
+                    model_name
+                );
+                // Wire the HF-token / config resolvers before first use — the
+                // ProviderDef path does this; the direct constructor does not.
+                goose::providers::local_inference::configure_local_inference();
+                match goose::providers::local_inference::LocalInferenceProvider::from_env().await {
+                    Ok(p) => {
+                        tracing::debug!(
+                            "[model-switch] LocalInferenceProvider ready for '{}'",
+                            model_name
+                        );
+                        tracing::info!("Built LocalInferenceProvider for model '{}'", model_name);
+                        Some((Arc::new(p), cfg, None))
                     }
-                    let cfg = goose_providers::model::ModelConfig::new(&registry_key);
-                    tracing::debug!(
-                        "[model-switch] building LocalInferenceProvider for '{}'...",
-                        model_name
-                    );
-                    // Wire the HF-token / config resolvers before first use — the
-                    // ProviderDef path does this; the direct constructor does not.
-                    goose::providers::local_inference::configure_local_inference();
-                    match goose::providers::local_inference::LocalInferenceProvider::from_env()
-                        .await
-                    {
-                        Ok(p) => {
-                            tracing::debug!(
-                                "[model-switch] LocalInferenceProvider ready for '{}'",
-                                model_name
-                            );
-                            tracing::info!(
-                                "Built LocalInferenceProvider for model '{}'",
-                                model_name
-                            );
-                            Some((Arc::new(p), cfg))
-                        }
-                        Err(e) => {
-                            tracing::debug!(
+                    Err(e) => {
+                        tracing::debug!(
                             "[model-switch] FAILED to build LocalInferenceProvider for '{}': {e}",
                             model_name
                         );
-                            tracing::warn!(
-                                "Failed to build local inference provider for '{}': {e}",
-                                model_name
-                            );
-                            None
-                        }
+                        tracing::warn!(
+                            "Failed to build local inference provider for '{}': {e}",
+                            model_name
+                        );
+                        None
                     }
                 }
-                // llamafile uses the Ollama wire protocol over HTTP.
-                "llamafile" => {
-                    std::env::set_var("OLLAMA_HOST", &self.llamafile_url);
-                    std::env::set_var("OLLAMA_TIMEOUT", "600");
-                    let model_name = if settings.chat_model.is_empty() {
-                        "llamafile".to_string()
-                    } else {
-                        settings.chat_model.clone()
-                    };
-                    let cfg = goose_providers::model::ModelConfig::new(&model_name);
-                    tracing::debug!(
-                        "[model-switch] building llamafile OllamaProvider for '{}'...",
-                        model_name
-                    );
-                    match goose::providers::ollama_def::from_env(None).await {
-                        Ok(p) => {
-                            tracing::debug!(
-                                "[model-switch] llamafile provider ready for '{}'",
-                                model_name
-                            );
-                            Some((Arc::new(p), cfg))
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "[model-switch] FAILED to build llamafile provider for '{}': {e}",
-                                model_name
-                            );
-                            tracing::warn!("Failed to build llamafile provider: {e}");
-                            None
-                        }
+            }
+            // llamafile uses the Ollama wire protocol over HTTP.
+            "llamafile" => {
+                std::env::set_var("OLLAMA_HOST", &self.llamafile_url);
+                std::env::set_var("OLLAMA_TIMEOUT", "600");
+                let model_name = if settings.chat_model.is_empty() {
+                    "llamafile".to_string()
+                } else {
+                    settings.chat_model.clone()
+                };
+                let cfg = goose_providers::model::ModelConfig::new(&model_name);
+                tracing::debug!(
+                    "[model-switch] building llamafile OllamaProvider for '{}'...",
+                    model_name
+                );
+                match goose::providers::ollama_def::from_env(None).await {
+                    Ok(p) => {
+                        tracing::debug!(
+                            "[model-switch] llamafile provider ready for '{}'",
+                            model_name
+                        );
+                        Some((Arc::new(p), cfg, Some(self.llamafile_url.clone())))
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "[model-switch] FAILED to build llamafile provider for '{}': {e}",
+                            model_name
+                        );
+                        tracing::warn!("Failed to build llamafile provider: {e}");
+                        None
                     }
                 }
-                "ollama" => {
-                    let ollama_host = std::env::var("GIAP_OLLAMA_URL")
-                        .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
-                    std::env::set_var("OLLAMA_HOST", &ollama_host);
-                    std::env::set_var("OLLAMA_TIMEOUT", "600");
-                    let model_name = if settings.chat_model.is_empty() {
-                        "llama3.2".to_string()
-                    } else {
-                        settings.chat_model.clone()
-                    };
-                    tracing::debug!(
-                        "[model-switch] building Ollama provider for '{}'...",
-                        model_name
-                    );
-                    let cfg = goose_providers::model::ModelConfig::new(&model_name);
-                    match goose::providers::ollama_def::from_env(None).await {
-                        Ok(p) => {
-                            tracing::debug!(
-                                "[model-switch] Ollama provider ready for '{}'",
-                                model_name
-                            );
-                            Some((Arc::new(p), cfg))
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "[model-switch] FAILED to build Ollama provider for '{}': {e}",
-                                model_name
-                            );
-                            tracing::warn!("Failed to build ollama provider: {e}");
-                            None
-                        }
+            }
+            "ollama" => {
+                let ollama_host = std::env::var("GIAP_OLLAMA_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+                std::env::set_var("OLLAMA_HOST", &ollama_host);
+                std::env::set_var("OLLAMA_TIMEOUT", "600");
+                let model_name = if settings.chat_model.is_empty() {
+                    "llama3.2".to_string()
+                } else {
+                    settings.chat_model.clone()
+                };
+                tracing::debug!(
+                    "[model-switch] building Ollama provider for '{}'...",
+                    model_name
+                );
+                let cfg = goose_providers::model::ModelConfig::new(&model_name);
+                match goose::providers::ollama_def::from_env(None).await {
+                    Ok(p) => {
+                        tracing::debug!(
+                            "[model-switch] Ollama provider ready for '{}'",
+                            model_name
+                        );
+                        Some((Arc::new(p), cfg, Some(ollama_host.clone())))
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "[model-switch] FAILED to build Ollama provider for '{}': {e}",
+                            model_name
+                        );
+                        tracing::warn!("Failed to build ollama provider: {e}");
+                        None
                     }
                 }
-                _ => {
-                    tracing::debug!(
-                        "[model-switch] unknown provider '{}', keeping current",
-                        settings.chat_provider
-                    );
-                    None
-                }
-            };
+            }
+            _ => {
+                tracing::debug!(
+                    "[model-switch] unknown provider '{}', keeping current",
+                    settings.chat_provider
+                );
+                None
+            }
+        };
 
-        if let Some((p, model_cfg)) = provider {
+        if let Some((p, model_cfg, endpoint)) = provider {
             let model_cfg =
                 Self::with_thinking_param(&settings.chat_provider, model_cfg, enable_thinking);
             // Every provider Goose sees is wrapped in the GIAP shim — the
             // last-mile veto over system prompt, message injections, and the
-            // tools list (see provider_shim.rs).
+            // tools list, and (for the HTTP-backed arms) the PAI-2 egress gate
+            // on the endpoint resolved above (see provider_shim.rs).
             let p: Arc<dyn Provider> = Arc::new(crate::provider_shim::GiapProviderShim::new(
                 p,
                 self.shim_controls.clone(),
+                endpoint,
             ));
             tracing::debug!(
                 "[model-switch] swapping Goose provider to {}:{} for session {}",

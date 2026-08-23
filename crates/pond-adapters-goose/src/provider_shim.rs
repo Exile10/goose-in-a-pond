@@ -295,14 +295,58 @@ pub struct GiapProviderShim {
     /// Guarded by a plain `Mutex` rather than an async one: the critical section
     /// is a pointer comparison and a `Vec` clone, and it never awaits.
     minify_cache: Mutex<Option<MinifyCache>>,
+    /// Where the wrapped provider sends its HTTP, when it sends any.
+    ///
+    /// This is PAI-2's blind spot made visible. The inner provider is Goose
+    /// submodule code holding its own reqwest client, so the workspace's
+    /// egress guard cannot see it send, and `OLLAMA_HOST` can name any box on
+    /// the network — meaning a pond with `chat_provider = ollama` and
+    /// `GIAP_OLLAMA_URL` pointed off-box shipped every conversation, extracted
+    /// memories included, with no gate, no record, and offline mode not
+    /// stopping it. The shim is the one chokepoint every provider call already
+    /// passes, so the gate lives here.
+    ///
+    /// `None` means the provider does not leave the process (in-process GGUF
+    /// inference), and nothing is gated or recorded. A constructor parameter
+    /// rather than a builder so every future construction site is forced to
+    /// answer "where does this send?" — an optional setter would default new
+    /// call sites to ungated silently.
+    endpoint: Option<String>,
 }
 
 impl GiapProviderShim {
-    pub fn new(inner: Arc<dyn Provider>, controls: Arc<ShimControls>) -> Self {
+    pub fn new(
+        inner: Arc<dyn Provider>,
+        controls: Arc<ShimControls>,
+        endpoint: Option<String>,
+    ) -> Self {
         Self {
             inner,
             controls,
             minify_cache: Mutex::new(None),
+            endpoint,
+        }
+    }
+
+    /// Gate one outbound provider call, PAI-2 style: refused before a packet
+    /// leaves, recorded after.
+    ///
+    /// The denial maps to [`ProviderError::RequestFailed`] deliberately.
+    /// `NetworkError` is in goose's retryable class, and a policy refusal is
+    /// not transient — retrying it three times with backoff would turn a
+    /// clear "offline mode refused this host" into thirty seconds of apparent
+    /// hang before the same message.
+    fn begin_egress(
+        &self,
+    ) -> Result<Option<pond_core::shared::services::egress::EgressCall>, ProviderError> {
+        match &self.endpoint {
+            None => Ok(None),
+            Some(url) => match pond_core::shared::services::egress::begin(url, "LLM") {
+                Ok(call) => Ok(Some(call)),
+                Err(denied) => Err(ProviderError::RequestFailed(format!(
+                    "GIAP refused this model call before it left the machine: {denied}"
+                ))),
+            },
         }
     }
 
@@ -575,6 +619,11 @@ impl Provider for GiapProviderShim {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
+        // Before any payload work: a call the gate refuses should cost nothing,
+        // and a refused call must not reach the veto/minify machinery below —
+        // its output would describe a request that never happens.
+        let egress = self.begin_egress()?;
+
         // Which session is this call for? Goose wraps every provider call in
         // `session_context::with_session_id` (reply_parts.rs) — the task-local it
         // already uses to stamp the `agent-session-id` header on provider HTTP
@@ -732,14 +781,23 @@ impl Provider for GiapProviderShim {
             );
         }
 
-        self.inner
+        let result = self
+            .inner
             .stream(
                 model_config,
                 enforced_system.as_deref().unwrap_or(system),
                 final_messages,
                 final_tools,
             )
-            .await
+            .await;
+        if let Some(call) = egress {
+            // The provider abstracts the wire, so the real HTTP status is not
+            // visible here; 200/500 is the same synthesis the IMAP adapter
+            // records for its raw-TLS session. Ok means the stream was
+            // ESTABLISHED — latency is time-to-stream, not time-to-last-token.
+            call.finish(Some(if result.is_ok() { 200 } else { 500 }));
+        }
+        result
     }
 
     async fn get_context_limit(&self, model_config: &ModelConfig) -> Result<usize, ProviderError> {
@@ -751,14 +809,26 @@ impl Provider for GiapProviderShim {
     }
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
-        self.inner.fetch_supported_models().await
+        // Model listing reaches the same host the chat does; an offline pond
+        // has no business pinging a remote registry either.
+        let egress = self.begin_egress()?;
+        let result = self.inner.fetch_supported_models().await;
+        if let Some(call) = egress {
+            call.finish(Some(if result.is_ok() { 200 } else { 500 }));
+        }
+        result
     }
 
     async fn fetch_model_info(
         &self,
         model_name: &str,
     ) -> Result<goose::providers::base::ModelInfo, ProviderError> {
-        self.inner.fetch_model_info(model_name).await
+        let egress = self.begin_egress()?;
+        let result = self.inner.fetch_model_info(model_name).await;
+        if let Some(call) = egress {
+            call.finish(Some(if result.is_ok() { 200 } else { 500 }));
+        }
+        result
     }
 
     fn skip_canonical_filtering(&self) -> bool {
@@ -1088,7 +1158,7 @@ mod tests {
                 unreachable!("the cache tests never reach the inner provider")
             }
         }
-        GiapProviderShim::new(Arc::new(Unused), Arc::new(controls))
+        GiapProviderShim::new(Arc::new(Unused), Arc::new(controls), None)
     }
 
     #[test]
@@ -1392,7 +1462,8 @@ mod tests {
         system: &str,
     ) -> (String, Vec<String>) {
         let seen = Arc::new(Mutex::new(None));
-        let shim = GiapProviderShim::new(Arc::new(Capturing { seen: seen.clone() }), controls);
+        let shim =
+            GiapProviderShim::new(Arc::new(Capturing { seen: seen.clone() }), controls, None);
         let tools = vec![
             Tool::new(
                 "giap-weather__get_forecast".to_string(),
@@ -1413,6 +1484,146 @@ mod tests {
         .await;
         let captured = seen.lock().unwrap().clone();
         captured.expect("the inner provider was never reached")
+    }
+
+    // ── The egress gate (PAI-2) ─────────────────────────────────────────
+    //
+    // These tests are the gate's only guard: the inner provider is submodule
+    // code sending its own reqwest HTTP, so the workspace's egress_guard test
+    // cannot see it and would not fail if the gate were deleted. These do.
+
+    /// `network_mode` is process-global, so the tests that set it take this
+    /// lock and restore Open before releasing — without it, parallel test
+    /// threads race the mode and the failures point at the wrong test.
+    static NETWORK_MODE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A provider that remembers whether the call got through the gate.
+    struct Reached(Arc<Mutex<bool>>);
+
+    #[async_trait]
+    impl Provider for Reached {
+        fn get_name(&self) -> &str {
+            "reached"
+        }
+        async fn stream(
+            &self,
+            _: &ModelConfig,
+            _: &str,
+            _: &[Message],
+            _: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    fn gated_shim(endpoint: Option<&str>) -> (GiapProviderShim, Arc<Mutex<bool>>) {
+        let reached = Arc::new(Mutex::new(false));
+        let shim = GiapProviderShim::new(
+            Arc::new(Reached(reached.clone())),
+            Arc::new(ShimControls::default()),
+            endpoint.map(str::to_string),
+        );
+        (shim, reached)
+    }
+
+    async fn stream_once(shim: &GiapProviderShim) -> Result<(), ProviderError> {
+        shim.stream(&ModelConfig::new("m"), "s", &[], &[])
+            .await
+            .map(|_| ())
+    }
+
+    /// The hole this gate closes, measured before it existed: a pond with
+    /// `chat_provider = ollama` and `GIAP_OLLAMA_URL` pointed off-box shipped
+    /// every conversation — extracted memories included — with no gate, no
+    /// record, and offline mode not stopping it.
+    #[tokio::test]
+    async fn offline_mode_refuses_a_remote_model_host_before_a_packet_leaves() {
+        use pond_core::shared::services::egress::{set_network_mode, NetworkMode};
+        let _guard = NETWORK_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_network_mode(NetworkMode::Offline);
+
+        let (shim, reached) = gated_shim(Some("http://gpu-box.tailnet.example:11434"));
+        let err = stream_once(&shim)
+            .await
+            .expect_err("the gate did not refuse");
+
+        set_network_mode(NetworkMode::Open);
+        assert!(
+            matches!(err, ProviderError::RequestFailed(_)),
+            "a policy denial must not be a retryable error class: {err:?}"
+        );
+        assert!(
+            !*reached.lock().unwrap_or_else(|e| e.into_inner()),
+            "the inner provider was reached — the refusal happened after the send"
+        );
+    }
+
+    /// Offline means loopback-only, not silence: the normal install's own
+    /// model server keeps answering.
+    #[tokio::test]
+    async fn offline_mode_still_reaches_a_loopback_model_server() {
+        use pond_core::shared::services::egress::{set_network_mode, NetworkMode};
+        let _guard = NETWORK_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_network_mode(NetworkMode::Offline);
+
+        let (shim, reached) = gated_shim(Some("http://127.0.0.1:8080"));
+        let result = stream_once(&shim).await;
+
+        set_network_mode(NetworkMode::Open);
+        result.expect("loopback must pass in offline mode");
+        assert!(*reached.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+
+    /// Allowlist refuses hosts that classify as Sensitive — a remote model box
+    /// is exactly that class.
+    #[tokio::test]
+    async fn allowlist_mode_refuses_a_remote_model_host() {
+        use pond_core::shared::services::egress::{set_network_mode, NetworkMode};
+        let _guard = NETWORK_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_network_mode(NetworkMode::Allowlist);
+
+        let (shim, reached) = gated_shim(Some("http://gpu-box.tailnet.example:11434"));
+        let err = stream_once(&shim)
+            .await
+            .expect_err("allowlist did not refuse");
+
+        set_network_mode(NetworkMode::Open);
+        assert!(matches!(err, ProviderError::RequestFailed(_)), "{err:?}");
+        assert!(!*reached.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+
+    /// In-process inference has no wire. `None` must mean "not gated", or
+    /// offline mode would refuse the one provider that never leaves the box.
+    #[tokio::test]
+    async fn a_provider_with_no_endpoint_is_not_gated_even_offline() {
+        use pond_core::shared::services::egress::{set_network_mode, NetworkMode};
+        let _guard = NETWORK_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_network_mode(NetworkMode::Offline);
+
+        let (shim, reached) = gated_shim(None);
+        let result = stream_once(&shim).await;
+
+        set_network_mode(NetworkMode::Open);
+        result.expect("in-process inference must not be gated");
+        assert!(*reached.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+
+    /// The metadata fetches reach the same host the chat does.
+    #[tokio::test]
+    async fn model_listing_is_gated_like_the_chat_is() {
+        use pond_core::shared::services::egress::{set_network_mode, NetworkMode};
+        let _guard = NETWORK_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_network_mode(NetworkMode::Offline);
+
+        let (shim, _) = gated_shim(Some("http://gpu-box.tailnet.example:11434"));
+        let err = shim.fetch_supported_models().await;
+
+        set_network_mode(NetworkMode::Open);
+        assert!(
+            matches!(err, Err(ProviderError::RequestFailed(_))),
+            "model listing bypassed the gate: {err:?}"
+        );
     }
 
     /// A child's system prompt is the parent's static prefix plus GIAP's
