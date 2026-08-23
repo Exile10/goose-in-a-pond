@@ -405,6 +405,7 @@ function nowPlayingFromApi(np: NowPlayingApiResponse | null): NowPlayingData {
     artist: np.artist || "",
     elapsed: duration > 0 ? progress / duration : 0,
     hue: MOCK_HOME.nowPlaying.hue,
+    albumArt: np.album_art,
     connected: true,
     playing: np.playing ?? false,
   };

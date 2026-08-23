@@ -129,7 +129,7 @@ export function Sidebar() {
           onPress={switchToVoice}
           aria-label="Voice mode"
         >
-          <Mic size={14} />
+          <Mic size={16} />
           {!collapsed && "Voice"}
         </Button>
         <Button
@@ -140,7 +140,7 @@ export function Sidebar() {
           onPress={switchToCanvas}
           aria-label="Canvas mode"
         >
-          <Layers size={14} />
+          <Layers size={16} />
           {!collapsed && "Canvas"}
         </Button>
       </div>

@@ -1,266 +1,358 @@
-//! python-matter-server wire protocol (schema 11) — pure functions and types,
-//! so every mapping is unit-testable without a WebSocket.
+//! The `giap-matter` wire protocol — types and pure functions, so every mapping
+//! is unit-testable without a WebSocket.
 //!
-//! The server speaks JSON over a WebSocket:
-//! - requests:  `{"message_id": "…", "command": "…", "args": {…}}`
-//! - responses: `{"message_id": "…", "result": …}` or
-//!   `{"message_id": "…", "error_code": N, "details": "…"}`
-//! - events:    `{"event": "…", "data": …}` (e.g. `attribute_updated` with
-//!   `[node_id, "endpoint/cluster/attribute", value]`)
+//! `docs/matter-protocol.md` is the specification; `matter-server/src/protocol.ts`
+//! is the other implementation. The protocol is domain-level on purpose: it
+//! carries devices, readings and control verbs, and never endpoints, clusters or
+//! attribute paths. All the Matter vocabulary lives in the controller, which has
+//! matter.js's typed cluster models to do it with — so nothing in this crate has
+//! to know what a cluster is.
 //!
-//! Node attributes arrive as a flat map keyed `"endpoint/cluster/attribute"`
-//! (decimal), which is what all the cluster lookups below parse.
+//! ```text
+//! → {"id": "giap-1", "op": "control", "params": {…}}
+//! ← {"id": "giap-1", "ok": true,  "result": {…}}
+//! ← {"id": "giap-1", "ok": false, "error": {"code": "…", "message": "…"}}
+//! ← {"event": "reading", "payload": {…}}
+//! ```
 
-use std::collections::BTreeMap;
-
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use pond_core::user_data::domain::sensor::SensorReading;
+use pond_core::user_data::ports::device_control::{
+    DeviceDescription, DeviceState, DeviceStatePatch,
+};
 use pond_core::user_data::ports::device_registry::Device;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-// ── Matter cluster ids (decimal, per the Matter spec) ────────────────────────
-pub const CLUSTER_ON_OFF: u32 = 6;
-pub const CLUSTER_LEVEL_CONTROL: u32 = 8;
-pub const CLUSTER_BASIC_INFORMATION: u32 = 40;
-/// NodeLabel — the writable, user-assigned name on Basic Information. Preferred
-/// by [`node_to_device`] over the vendor ProductName.
-pub const ATTR_NODE_LABEL: u32 = 5;
-/// Descriptor — every endpoint has one, and its DeviceTypeList states what the
-/// endpoint *is*. The authority on device type: clusters describe what can be
-/// driven, which is a different question (an On/Off plug and an On/Off bulb are
-/// the same cluster).
-pub const CLUSTER_DESCRIPTOR: u32 = 29;
-pub const CLUSTER_AIR_QUALITY: u32 = 91;
-pub const CLUSTER_SMOKE_CO_ALARM: u32 = 92;
-pub const CLUSTER_BOOLEAN_STATE: u32 = 69;
-pub const CLUSTER_DOOR_LOCK: u32 = 257;
-pub const CLUSTER_WINDOW_COVERING: u32 = 258;
-pub const CLUSTER_FAN_CONTROL: u32 = 514;
-pub const CLUSTER_THERMOSTAT: u32 = 513;
-pub const CLUSTER_COLOR_CONTROL: u32 = 768;
-pub const CLUSTER_ILLUMINANCE: u32 = 1024;
-pub const CLUSTER_PRESSURE: u32 = 1027;
-pub const CLUSTER_FLOW: u32 = 1028;
-pub const CLUSTER_TEMPERATURE: u32 = 1026;
-pub const CLUSTER_HUMIDITY: u32 = 1029;
-pub const CLUSTER_OCCUPANCY: u32 = 1030;
+/// Identifies the protocol in the greeting. A controller that does not say this
+/// is not one this crate can talk to.
+pub const PROTOCOL_NAME: &str = "giap-matter";
 
-// Resource monitoring — the air purifier's two filters. Same cluster shape,
-// one instance per filter.
-pub const CLUSTER_HEPA_FILTER: u32 = 113;
-pub const CLUSTER_ACTIVATED_CARBON_FILTER: u32 = 114;
-/// Remaining life as a percentage.
-pub const ATTR_FILTER_CONDITION: u32 = 0;
-/// 0 = OK, 1 = Warning, 2 = Critical.
-pub const ATTR_FILTER_CHANGE_INDICATION: u32 = 2;
+/// Bumped when a change would break a controller that has not been updated with
+/// it. The client refuses a mismatch rather than guessing.
+pub const PROTOCOL_VERSION: u32 = 1;
 
-// Concentration measurement — one cluster per substance, all reporting
-// `MeasuredValue` on attribute 0.
-//
-// Units are the defaults for each substance. The device also publishes a
-// `MeasurementUnit` attribute (8) which is authoritative and which GIAP does
-// not read yet: a device reporting CO2 in ppb rather than ppm would be
-// labelled wrongly. Worth reading before this is trusted for anything but
-// display.
-pub const CLUSTER_CO: u32 = 1036;
-pub const CLUSTER_CO2: u32 = 1037;
-pub const CLUSTER_NO2: u32 = 1043;
-pub const CLUSTER_OZONE: u32 = 1045;
-pub const CLUSTER_PM25: u32 = 1066;
-pub const CLUSTER_FORMALDEHYDE: u32 = 1067;
-pub const CLUSTER_PM1: u32 = 1068;
-pub const CLUSTER_PM10: u32 = 1069;
-pub const CLUSTER_TVOC: u32 = 1070;
-pub const CLUSTER_RADON: u32 = 1071;
+// ── Greeting ─────────────────────────────────────────────────────────────────
 
-/// Thermostat `OccupiedHeatingSetpoint` attribute id.
-pub const ATTR_OCCUPIED_HEATING_SETPOINT: u32 = 18;
-/// FanControl `PercentSetting` attribute id — a 0–100 write, no command.
-pub const ATTR_FAN_PERCENT_SETTING: u32 = 2;
-/// FanControl `FanMode` attribute id. A fan has no On/Off cluster to switch, so
-/// this is where its power lives.
-pub const ATTR_FAN_MODE: u32 = 0;
-/// `FanMode` values GIAP writes. Speed changes go through `PercentSetting`
-/// instead — the server keeps the two in step, so there is no need to pick a
-/// discrete step for those.
-pub const FAN_MODE_OFF: u8 = 0;
-/// "Turn the fan on" writes **High**, not `FanMode::On`.
-///
-/// `On` is 4, and it is the obvious choice until you read `FanModeSequence`:
-/// it was deprecated in Matter 1.2 and appears in none of the sequences a
-/// current device advertises (`OffLowMedHigh`, `OffLowHigh`,
-/// `OffLowMedHighAuto`, `OffLowHighAuto`, `OffHighAuto`, `OffHigh`). Writing
-/// an unsupported mode is a write a conforming fan may reject — so the fix for
-/// "turn on the fan does nothing" would have shipped still not turning on the
-/// fan.
-///
-/// High is the only non-Off value present in *every* sequence, which is what
-/// makes it the safe universal choice without reading `FanModeSequence` first.
-/// Reading that attribute and picking the gentlest supported mode is the
-/// better behaviour and a bigger change; it belongs with the `set_fan_mode`
-/// validation follow-up, which has the same gap.
-pub const FAN_MODE_ON: u8 = 3;
-
-/// `FanMode` by the name a user says it. Auto and Smart are not points on the
-/// percentage scale — they hand the choice back to the device — which is why a
-/// fan needs modes as well as a speed.
-pub fn fan_mode_from_name(name: &str) -> Option<u8> {
-    match name.trim().to_lowercase().as_str() {
-        "off" => Some(FAN_MODE_OFF),
-        "low" => Some(1),
-        "medium" | "med" => Some(2),
-        "high" => Some(3),
-        "on" => Some(FAN_MODE_ON),
-        "auto" => Some(5),
-        "smart" => Some(6),
-        _ => None,
-    }
-}
-
-/// Matter device type ids (Descriptor DeviceTypeList), grouped onto the GIAP
-/// types the UI has icons for. Ids are from the Matter Device Library; the
-/// grouping is ours — a dishwasher and a washing machine are both "appliance"
-/// as far as anything GIAP shows or says is concerned.
-const DEVICE_TYPES: &[(u32, &str)] = &[
-    // Lighting
-    (0x0100, "light"), // On/Off Light
-    (0x0101, "light"), // Dimmable Light
-    (0x010C, "light"), // Colour Temperature Light
-    (0x010D, "light"), // Extended Colour Light
-    // Plugs — the pair of clusters alone cannot tell these from a bulb, which
-    // is why a plug used to arrive wearing a lightbulb.
-    (0x010A, "plug"), // On/Off Plug-in Unit
-    (0x010B, "plug"), // Dimmable Plug-in Unit
-    // Closures
-    (0x000A, "lock"),     // Door Lock
-    (0x0202, "covering"), // Window Covering
-    // Climate and air
-    (0x0301, "thermostat"), // Thermostat
-    (0x0072, "thermostat"), // Room Air Conditioner
-    (0x002B, "fan"),        // Fan
-    (0x002C, "air"),        // Air Purifier
-    // Sensors
-    (0x0015, "sensor"), // Contact Sensor
-    (0x002D, "sensor"), // Air Quality Sensor
-    (0x0106, "sensor"), // Light Sensor
-    (0x0107, "sensor"), // Occupancy Sensor
-    (0x0302, "sensor"), // Temperature Sensor
-    (0x0305, "sensor"), // Pressure Sensor
-    (0x0306, "sensor"), // Flow Sensor
-    (0x0307, "sensor"), // Humidity Sensor
-    // An alarm is not a sensor to a user: it is the thing that wakes them.
-    (0x0076, "alarm"), // Smoke/CO Alarm
-    // Appliances
-    (0x0073, "appliance"), // Laundry Washer
-    (0x0075, "appliance"), // Dishwasher
-    (0x0074, "vacuum"),    // Robotic Vacuum Cleaner
-    (0x0303, "pump"),      // Pump
-    // Media
-    (0x0023, "media"), // Casting Video Player
-    (0x0028, "media"), // Basic Video Player
-];
-
-/// The GIAP device type stated by the node itself, if it says.
-///
-/// Endpoint 0 is the Root Node (0x0016) on every device and never describes the
-/// application, so it is skipped. The first application endpoint that names a
-/// type GIAP knows wins; a composed device (a fan inside an air purifier) is
-/// reported as whatever its first endpoint claims, which is what its own UI
-/// calls it.
-pub fn device_type_from_descriptor(node: &MatterNode) -> Option<&'static str> {
-    let mut endpoints: Vec<(u16, &Value)> = node
-        .attributes
-        .iter()
-        .filter_map(|(key, value)| {
-            let mut parts = key.split('/');
-            let endpoint: u16 = parts.next()?.parse().ok()?;
-            let cluster: u32 = parts.next()?.parse().ok()?;
-            let attribute: u32 = parts.next()?.parse().ok()?;
-            (cluster == CLUSTER_DESCRIPTOR && attribute == 0 && endpoint != 0)
-                .then_some((endpoint, value))
-        })
-        .collect();
-    endpoints.sort_by_key(|(endpoint, _)| *endpoint);
-
-    endpoints.into_iter().find_map(|(_, value)| {
-        // DeviceTypeList entries are structs keyed by field number; "0" is the
-        // device type id, "1" its revision.
-        value.as_array()?.iter().find_map(|entry| {
-            let id = entry.get("0").and_then(Value::as_u64)? as u32;
-            DEVICE_TYPES
-                .iter()
-                .find_map(|(known, giap)| (*known == id).then_some(*giap))
-        })
-    })
-}
-
-/// A commissioned node as reported by `start_listening` / node events.
+/// The controller speaks first.
 #[derive(Debug, Clone, Deserialize)]
-pub struct MatterNode {
-    pub node_id: u64,
+pub struct Greeting {
     #[serde(default)]
-    pub available: bool,
-    /// Flat attribute map keyed `"endpoint/cluster/attribute"`.
+    pub protocol: String,
     #[serde(default)]
-    pub attributes: BTreeMap<String, Value>,
+    pub version: u32,
+    #[serde(default)]
+    pub fabric_id: Option<u64>,
+    #[serde(default)]
+    pub matter_js: String,
 }
 
-/// A parsed message from the server.
+/// Check a greeting frame, naming what was found when it is not ours.
+///
+/// The failure this exists for is an address pointing at a server that is not
+/// this controller: without the check the first `subscribe` fails somewhere
+/// inside serde with a message about an unexpected field, which tells the user
+/// nothing they can act on. A server reachable on the right path and speaking
+/// the wrong protocol is exactly the case the name and version are for.
+pub fn check_greeting(raw: &str) -> Result<Greeting, String> {
+    let greeting: Greeting = serde_json::from_str(raw).map_err(|_| {
+        "the controller's greeting was not JSON this version understands".to_string()
+    })?;
+
+    if greeting.protocol != PROTOCOL_NAME {
+        return Err(format!(
+            "expected a {PROTOCOL_NAME} controller but the server at this address identified \
+             itself as '{}' — check the Matter controller address",
+            if greeting.protocol.is_empty() {
+                "something else"
+            } else {
+                &greeting.protocol
+            }
+        ));
+    }
+    if greeting.version != PROTOCOL_VERSION {
+        return Err(format!(
+            "the controller speaks {PROTOCOL_NAME} v{} but this Pond speaks v{PROTOCOL_VERSION} \
+             — the controller and pond-server are from different releases",
+            greeting.version
+        ));
+    }
+    Ok(greeting)
+}
+
+// ── Frames ───────────────────────────────────────────────────────────────────
+
+/// A parsed frame from the controller.
 #[derive(Debug)]
 pub enum ServerMessage {
-    Result {
-        message_id: String,
-        result: Value,
-    },
-    Error {
-        message_id: String,
-        details: String,
+    /// A reply to a request, successful or not.
+    Response {
+        id: String,
+        outcome: Result<Value, WireError>,
     },
     Event {
         event: String,
-        data: Value,
+        payload: Value,
     },
-    /// The greeting / anything else we don't act on.
+    /// The greeting, or anything else we do not act on.
     Other,
 }
 
-/// Parse one raw server frame.
+/// The controller's structured reason for refusing a request.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WireError {
+    #[serde(default = "internal_code")]
+    pub code: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+fn internal_code() -> String {
+    "internal".to_string()
+}
+
+impl std::fmt::Display for WireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.message.is_empty() {
+            write!(f, "the controller failed ({})", self.code)
+        } else {
+            write!(f, "{}", self.message)
+        }
+    }
+}
+
+/// The controller could not find anything advertising itself for pairing. Named
+/// because the user-facing advice for it is specific and actionable.
+pub const CODE_NOTHING_PAIRABLE: &str = "no_device_in_pairing_mode";
+
+/// Parse one raw frame.
 pub fn parse_server_message(raw: &str) -> ServerMessage {
     let Ok(v) = serde_json::from_str::<Value>(raw) else {
         return ServerMessage::Other;
     };
+
     if let Some(event) = v.get("event").and_then(Value::as_str) {
         return ServerMessage::Event {
             event: event.to_string(),
-            data: v.get("data").cloned().unwrap_or(Value::Null),
+            payload: v.get("payload").cloned().unwrap_or(Value::Null),
         };
     }
-    if let Some(mid) = v.get("message_id").and_then(Value::as_str) {
-        if v.get("error_code").is_some() {
-            return ServerMessage::Error {
-                message_id: mid.to_string(),
-                details: v
-                    .get("details")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown matter-server error")
-                    .to_string(),
-            };
-        }
-        if let Some(result) = v.get("result") {
-            return ServerMessage::Result {
-                message_id: mid.to_string(),
-                result: result.clone(),
-            };
-        }
+
+    if let Some(id) = v.get("id").and_then(Value::as_str) {
+        // `ok` is the discriminant rather than the presence of a `result` key: a
+        // successful op with no result is `{"ok": true, "result": {}}`, and
+        // keying off `result` would read a failure with a null result as one.
+        let outcome = if v.get("ok").and_then(Value::as_bool) == Some(true) {
+            Ok(v.get("result").cloned().unwrap_or(Value::Null))
+        } else {
+            Err(v
+                .get("error")
+                .and_then(|e| serde_json::from_value::<WireError>(e.clone()).ok())
+                .unwrap_or_else(|| WireError {
+                    code: internal_code(),
+                    message: "the controller refused the request without saying why".to_string(),
+                }))
+        };
+        return ServerMessage::Response {
+            id: id.to_string(),
+            outcome,
+        };
     }
+
     ServerMessage::Other
 }
 
-/// Build a command frame.
-pub fn command_frame(message_id: &str, command: &str, args: Value) -> String {
-    json!({ "message_id": message_id, "command": command, "args": args }).to_string()
+/// Build a request frame.
+pub fn request_frame(id: &str, op: &str, params: Value) -> String {
+    json!({ "id": id, "op": op, "params": params }).to_string()
 }
+
+// ── Domain projections ───────────────────────────────────────────────────────
+
+/// A device as the controller reports it. Deliberately smaller than GIAP's own
+/// [`Device`]: the controller knows nothing about rooms, hostnames or when a
+/// device was first registered, and inventing values for those here is what
+/// would make a Matter device look different from every other kind.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WireDevice {
+    pub id: String,
+    pub name: String,
+    pub device_type: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub online: bool,
+}
+
+impl WireDevice {
+    pub fn to_device(&self) -> Device {
+        Device {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            device_type: self.device_type.clone(),
+            hostname: None,
+            ip_address: None,
+            capabilities: self.capabilities.clone(),
+            registered_at: Utc::now().to_rfc3339(),
+            last_seen: Some(Utc::now().to_rfc3339()),
+            is_online: self.online,
+            room: None,
+        }
+    }
+}
+
+/// A sensor reading as the controller reports it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WireReading {
+    pub device_id: String,
+    pub sensor_type: String,
+    pub value: f64,
+    #[serde(default)]
+    pub unit: String,
+    /// RFC 3339. The controller's clock, which is this machine's clock.
+    #[serde(default)]
+    pub at: Option<DateTime<Utc>>,
+}
+
+impl WireReading {
+    pub fn to_reading(&self) -> SensorReading {
+        SensorReading {
+            device_id: self.device_id.clone(),
+            sensor_type: self.sensor_type.clone(),
+            value: self.value,
+            unit: self.unit.clone(),
+            recorded_at: self.at.unwrap_or_else(Utc::now),
+        }
+    }
+}
+
+/// The `subscribe` result: the whole fabric, so a fresh connection knows it
+/// without waiting for anything to change.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Snapshot {
+    #[serde(default)]
+    pub devices: Vec<WireDevice>,
+    #[serde(default)]
+    pub readings: Vec<WireReading>,
+}
+
+/// The `control` result.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ControlResult {
+    #[serde(default)]
+    pub applied: DeviceStatePatch,
+}
+
+/// The `describe` result. The description's own shape is GIAP's, so it
+/// deserialises straight into the domain type with no mapping step.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DescribeResult {
+    pub description: DeviceDescription,
+}
+
+/// The `state` result.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StateResult {
+    pub state: DeviceState,
+}
+
+/// The `commission` result.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommissionResult {
+    pub device: WireDevice,
+}
+
+/// The `discover` result.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DiscoverResult {
+    #[serde(default)]
+    pub commissionable: u32,
+}
+
+/// A `log` event: the controller's own structured record, relayed into `tracing`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WireLog {
+    #[serde(default)]
+    pub level: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub message: String,
+    /// The record's typed fields. Relayed as one rendered string rather than as
+    /// `tracing` fields, which have to be known at compile time — dropping them
+    /// entirely turned "a request failed" into the whole account of a failure
+    /// whose op, error code and reason the controller had all supplied.
+    #[serde(default)]
+    pub fields: Option<Value>,
+}
+
+impl WireLog {
+    /// Re-emit this record into `tracing` at the level it names.
+    ///
+    /// The whole reason the controller logs NDJSON rather than prose: a relay
+    /// that cannot tell an error from a debug line has to flatten everything to
+    /// one level, and a controller whose failures arrive at `debug` is most of
+    /// the way back to being silent.
+    pub fn relay(&self) {
+        let fields = self.rendered_fields();
+        let message = if fields.is_empty() {
+            redact_setup_code(&self.message)
+        } else {
+            format!("{} ({fields})", redact_setup_code(&self.message))
+        };
+        let kind = &self.kind;
+        match self.level.as_str() {
+            "error" => {
+                tracing::error!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
+            }
+            "warn" => {
+                tracing::warn!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
+            }
+            "info" => {
+                tracing::info!(target: "giap::trace", kind = %kind, source = "controller", "{message}")
+            }
+            _ => tracing::debug!(kind = %kind, source = "controller", "{message}"),
+        }
+    }
+
+    /// `k=v k=v`, redacted, or empty when there are none.
+    pub fn rendered_fields(&self) -> String {
+        let Some(Value::Object(map)) = &self.fields else {
+            return String::new();
+        };
+        let rendered = map
+            .iter()
+            .map(|(k, v)| match v {
+                Value::String(s) => format!("{k}={s}"),
+                other => format!("{k}={other}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        redact_setup_code(&rendered)
+    }
+}
+
+/// A `device_availability` event.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AvailabilityEvent {
+    pub device_id: String,
+    #[serde(default)]
+    pub online: bool,
+}
+
+/// A `device_added` / `device_updated` event.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeviceEvent {
+    pub device: WireDevice,
+}
+
+/// A `device_removed` event.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeviceRemovedEvent {
+    pub device_id: String,
+}
+
+// ── Ids ──────────────────────────────────────────────────────────────────────
 
 /// GIAP device id for a Matter node (`"matter-<node_id>"`).
 pub fn device_id_for_node(node_id: u64) -> String {
@@ -272,619 +364,333 @@ pub fn node_id_from_device_id(device_id: &str) -> Option<u64> {
     device_id.strip_prefix("matter-")?.parse().ok()
 }
 
-/// The endpoints (ascending) on which `node` hosts `cluster` — non-root only,
-/// since endpoint 0 carries utility clusters, not application ones.
-pub fn endpoints_with_cluster(node: &MatterNode, cluster: u32) -> Vec<u16> {
-    let mut eps: Vec<u16> = node
-        .attributes
-        .keys()
-        .filter_map(|key| {
-            let mut parts = key.split('/');
-            let ep: u16 = parts.next()?.parse().ok()?;
-            let cl: u32 = parts.next()?.parse().ok()?;
-            (cl == cluster && ep != 0).then_some(ep)
-        })
-        .collect();
-    eps.sort_unstable();
-    eps.dedup();
-    eps
-}
+// ── Redaction ────────────────────────────────────────────────────────────────
 
-/// Project a commissioned node onto GIAP's [`Device`]. Works for ANY Matter
-/// device — real bulbs, locks, thermostats, or virtual test devices; nothing
-/// here is specific to a vendor or to test tooling. Type and capabilities are
-/// inferred from the application clusters present.
+/// What a setup code is replaced with. Matches the controller's own placeholder,
+/// so a redacted string looks the same whichever side redacted it.
+const REDACTED: &str = "[redacted:setup-code]";
+
+/// Strip Matter setup codes out of anything on its way to a log line, an error
+/// message, or the API.
 ///
-/// Naming follows what production controllers do — take the device's own
-/// identity, best source first:
-/// 1. Basic Information NodeLabel (`0/40/5`) — the user-assigned name;
-/// 2. Basic Information ProductName (`0/40/3`) — the vendor's name
-///    (e.g. "Hue color lamp");
-/// 3. `"<Type> <node_id>"` (e.g. "Light 2") — a clean, speakable fallback.
-pub fn node_to_device(node: &MatterNode) -> Device {
-    let has = |cluster: u32| !endpoints_with_cluster(node, cluster).is_empty();
+/// A pairing code grants fabric access: it is a credential, and one in
+/// `pond.log.<date>` or in `pond_logs.db` is a working credential for anyone who
+/// reads the file. There is no `Redactor` on the tracing pipeline — the
+/// `RedactingEventLog` decorator covers the durable event log and egress, not
+/// `tracing` — so this is applied at the call site, in the same spirit as
+/// `wolfram.rs`'s `redact_appid`.
+///
+/// It matters most for errors, which are the strings nobody writes deliberately:
+/// matter.js and the CHIP layer beneath it echo what they were given, and
+/// `MatterState::Unreachable { error }` is **served over HTTP** by
+/// `GET /api/v1/matter/status`.
+///
+/// Deliberately over-eager on the digit forms: redacting a run that happened not
+/// to be a code costs a vaguer log line, while missing one writes a credential to
+/// disk. Idempotent, so a string already redacted by the controller is unchanged.
+pub fn redact_setup_code(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
 
-    let basic_info = |attribute: u32| {
-        node.attributes
-            .get(&format!("0/{CLUSTER_BASIC_INFORMATION}/{attribute}"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-
-    let mut capabilities = Vec::new();
-    if has(CLUSTER_ON_OFF) {
-        capabilities.push("power".to_string());
-    }
-    if has(CLUSTER_FAN_CONTROL) {
-        // A Matter fan need not implement On/Off at all — the Virtual Fan does
-        // not — so without this it advertised no capabilities and "turn on the
-        // fan" had nothing to aim at. `FanMode` is its power switch.
-        if !has(CLUSTER_ON_OFF) {
-            capabilities.push("power".to_string());
-        }
-        capabilities.push("fan_speed".to_string());
-    }
-    if has(CLUSTER_LEVEL_CONTROL) {
-        capabilities.push("brightness".to_string());
-    }
-    if has(CLUSTER_THERMOSTAT) {
-        capabilities.push("temperature".to_string());
-    }
-    if has(CLUSTER_DOOR_LOCK) {
-        capabilities.push("lock".to_string());
-    }
-
-    // The node's own word first. Clusters can only say what is drivable, which
-    // is why every On/Off appliance used to arrive as a light.
-    let device_type = if let Some(stated) = device_type_from_descriptor(node) {
-        stated
-    } else if has(CLUSTER_DOOR_LOCK) {
-        "lock"
-    } else if has(CLUSTER_THERMOSTAT) {
-        "thermostat"
-    } else if has(CLUSTER_FAN_CONTROL) {
-        // Ahead of the On/Off check: a fan that does implement On/Off is still
-        // a fan, and calling it a light gives the model the wrong vocabulary.
-        "fan"
-    } else if has(CLUSTER_ON_OFF) {
-        "light"
-    } else if has(CLUSTER_OCCUPANCY)
-        || has(CLUSTER_BOOLEAN_STATE)
-        || has(CLUSTER_TEMPERATURE)
-        || has(CLUSTER_HUMIDITY)
-    {
-        "sensor"
-    } else {
-        "matter"
-    };
-
-    let name = basic_info(5) // NodeLabel — user-assigned
-        .or_else(|| basic_info(3)) // ProductName — vendor-assigned
-        .unwrap_or_else(|| {
-            // Speakable typed fallback, e.g. "Light 2".
-            let mut typed = device_type.to_string();
-            if let Some(first) = typed.get_mut(..1) {
-                first.make_ascii_uppercase();
+    while i < chars.len() {
+        // QR payloads first, so a digit run inside one cannot be redacted
+        // piecemeal leaving the rest of the payload readable.
+        if chars[i..].starts_with(&['M', 'T', ':']) || chars[i..].starts_with(&['m', 't', ':']) {
+            let mut end = i + 3;
+            while end < chars.len() && is_qr_char(chars[end]) {
+                end += 1;
             }
-            format!("{typed} {}", node.node_id)
-        });
+            out.push_str(REDACTED);
+            i = end;
+            continue;
+        }
 
-    Device {
-        id: device_id_for_node(node.node_id),
-        name,
-        device_type: device_type.to_string(),
-        hostname: None,
-        ip_address: None,
-        capabilities,
-        registered_at: Utc::now().to_rfc3339(),
-        last_seen: Some(Utc::now().to_rfc3339()),
-        is_online: node.available,
-        room: None,
+        if chars[i].is_ascii_digit() && (i == 0 || !chars[i - 1].is_ascii_digit()) {
+            let mut end = i;
+            while end < chars.len() && chars[end].is_ascii_digit() {
+                end += 1;
+            }
+            // 8 is a passcode, 11 and 21 the manual pairing code forms. Bounded
+            // on both sides so a node id, a port or a timestamp is left alone.
+            if matches!(end - i, 8 | 11 | 21) {
+                out.push_str(REDACTED);
+                i = end;
+                continue;
+            }
+            out.extend(&chars[i..end]);
+            i = end;
+            continue;
+        }
+
+        out.push(chars[i]);
+        i += 1;
     }
+    out
 }
 
-/// Translate an `attribute_updated` event into a [`SensorReading`], when the
-/// attribute belongs to a sensor cluster GIAP understands. Everything else
-/// (lights confirming state, utility clusters) returns `None`.
-pub fn sensor_reading_from_update(
-    node_id: u64,
-    path: &str,
-    value: &Value,
-) -> Option<SensorReading> {
-    let mut parts = path.split('/');
-    let _endpoint: u16 = parts.next()?.parse().ok()?;
-    let cluster: u32 = parts.next()?.parse().ok()?;
-    let attribute: u32 = parts.next()?.parse().ok()?;
+fn is_qr_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '$' | '%' | '*' | '+' | '-' | '/' | ':')
+}
 
-    // Filter monitoring is the one thing here that reports on two attributes:
-    // how worn the filter is, and whether the device is asking for it to be
-    // changed. Both are worth knowing and they answer different questions.
-    if let Some((sensor_type, reading, unit)) = match (cluster, attribute) {
-        (CLUSTER_HEPA_FILTER, ATTR_FILTER_CONDITION) => {
-            Some(("hepa_filter_condition", value.as_f64()?, "%"))
-        }
-        (CLUSTER_HEPA_FILTER, ATTR_FILTER_CHANGE_INDICATION) => {
-            Some(("hepa_filter_change", value.as_u64()? as f64, "state"))
-        }
-        (CLUSTER_ACTIVATED_CARBON_FILTER, ATTR_FILTER_CONDITION) => {
-            Some(("carbon_filter_condition", value.as_f64()?, "%"))
-        }
-        (CLUSTER_ACTIVATED_CARBON_FILTER, ATTR_FILTER_CHANGE_INDICATION) => {
-            Some(("carbon_filter_change", value.as_u64()? as f64, "state"))
-        }
-        _ => None,
-    } {
-        return Some(SensorReading {
-            device_id: device_id_for_node(node_id),
-            sensor_type: sensor_type.to_string(),
-            value: reading,
-            unit: unit.to_string(),
-            recorded_at: Utc::now(),
-        });
+/// Render an error for a human: the whole cause chain, redacted.
+///
+/// `anyhow::Error`'s plain `Display` prints only the OUTERMOST context, so
+/// `error = %e` on a failure like "connecting to the controller at ws://…"
+/// showed the attempt and threw away the reason — which is the one thing the
+/// reader needs. `{:#}` walks the chain ("context: cause: cause"), and this is
+/// the only way any error in this crate should reach a log, an API response, or
+/// the model.
+pub fn describe(error: &anyhow::Error) -> String {
+    redact_setup_code(&format!("{error:#}"))
+}
+
+/// Which kind of setup code this is, for logging in place of the value.
+pub fn setup_code_kind(code: &str) -> &'static str {
+    let trimmed = code.trim();
+    if trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("MT:") {
+        return "pairing_code";
     }
-
-    if attribute != 0 {
-        return None; // every other measurement cluster reports on attribute 0
+    let digits: String = trimmed.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() != trimmed.chars().filter(|c| !matches!(c, ' ' | '-')).count() {
+        return "unknown";
     }
-
-    let (sensor_type, reading, unit) = match cluster {
-        // Occupancy bitmap: bit 0 = occupied.
-        CLUSTER_OCCUPANCY => ("occupancy", ((value.as_u64()? & 1) as f64), "bool"),
-        // BooleanState: contact sensors (true = closed per Matter).
-        CLUSTER_BOOLEAN_STATE => ("contact", f64::from(value.as_bool()?), "bool"),
-        // Hundredths of a degree Celsius.
-        CLUSTER_TEMPERATURE => ("temperature", value.as_i64()? as f64 / 100.0, "C"),
-        // Hundredths of a percent.
-        CLUSTER_HUMIDITY => ("humidity", value.as_i64()? as f64 / 100.0, "%"),
-        // Lux, reported as a log-scaled value; the raw measurement is what a
-        // rule threshold compares, so it is passed through unconverted.
-        CLUSTER_ILLUMINANCE => ("illuminance", value.as_i64()? as f64, "lux"),
-        // Tenths of a kPa.
-        CLUSTER_PRESSURE => ("pressure", value.as_i64()? as f64 / 10.0, "kPa"),
-        // Tenths of a cubic metre per hour.
-        CLUSTER_FLOW => ("flow", value.as_i64()? as f64 / 10.0, "m3/h"),
-        // An ordinal: 0 unknown, 1 good, rising to 6 extremely poor. Kept as
-        // the ordinal rather than invented units, so the scale stays the
-        // device's own.
-        CLUSTER_AIR_QUALITY => ("air_quality", value.as_u64()? as f64, "level"),
-        // Alarm state: 0 normal, non-zero means it is sounding.
-        CLUSTER_SMOKE_CO_ALARM => ("smoke_alarm", value.as_u64()? as f64, "state"),
-        // Concentrations are floats in the substance's own unit, passed
-        // through unscaled — the number the device shows is the number a rule
-        // threshold should compare against.
-        CLUSTER_CO => ("carbon_monoxide", value.as_f64()?, "ppm"),
-        CLUSTER_CO2 => ("carbon_dioxide", value.as_f64()?, "ppm"),
-        CLUSTER_NO2 => ("nitrogen_dioxide", value.as_f64()?, "ppb"),
-        CLUSTER_OZONE => ("ozone", value.as_f64()?, "ppb"),
-        CLUSTER_FORMALDEHYDE => ("formaldehyde", value.as_f64()?, "mg/m3"),
-        CLUSTER_PM1 => ("pm1", value.as_f64()?, "ug/m3"),
-        CLUSTER_PM25 => ("pm2_5", value.as_f64()?, "ug/m3"),
-        CLUSTER_PM10 => ("pm10", value.as_f64()?, "ug/m3"),
-        CLUSTER_RADON => ("radon", value.as_f64()?, "ppm"),
-        CLUSTER_TVOC => ("total_volatile_organic_compounds", value.as_f64()?, "ppb"),
-        _ => return None,
-    };
-
-    Some(SensorReading {
-        device_id: device_id_for_node(node_id),
-        sensor_type: sensor_type.to_string(),
-        value: reading,
-        unit: unit.to_string(),
-        recorded_at: Utc::now(),
-    })
-}
-
-/// Map a 0–100 GIAP brightness percentage onto Matter's 0–254 level scale.
-pub fn brightness_to_level(percent: u8) -> u8 {
-    ((u16::from(percent.min(100)) * 254 + 50) / 100) as u8
-}
-
-/// Celsius → Matter thermostat setpoint (hundredths of a degree).
-pub fn celsius_to_setpoint(celsius: f32) -> i16 {
-    (celsius * 100.0)
-        .round()
-        .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
-}
-
-/// Map a 0–360° hue onto Matter ColorControl's 0–254 hue scale (360° wraps to
-/// 0, matching the circular hue space).
-pub fn hue_to_matter(degrees: u16) -> u8 {
-    ((u32::from(degrees % 360) * 254 + 180) / 360) as u8
-}
-
-/// Map a 0–100 saturation percentage onto Matter's 0–254 saturation scale.
-pub fn saturation_to_matter(percent: u8) -> u8 {
-    ((u16::from(percent.min(100)) * 254 + 50) / 100) as u8
-}
-
-/// Map a GIAP covering position (0–100 percent **open**) onto Matter
-/// WindowCovering's lift value in hundredths-of-a-percent **closed**
-/// (`GoToLiftPercentage`): 0 = fully open, 10000 = fully closed. GIAP speaks in
-/// "percent open" because that is how users phrase it ("open the blinds 50%").
-pub fn position_open_to_lift_100ths(percent_open: u8) -> u16 {
-    u16::from(100 - percent_open.min(100)) * 100
+    match digits.len() {
+        11 | 21 => "pairing_code",
+        8 => "passcode",
+        _ => "unknown",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The Matter Virtual Device's fan, as commissioned on 2026-08-05: Fan
-    /// Control on endpoint 1 and **no On/Off cluster at all**, which is what
-    /// left it with no capabilities and unreachable by "turn on the fan".
-    fn fan_node() -> MatterNode {
-        serde_json::from_value(json!({
-            "node_id": 18,
-            "available": true,
-            "attributes": {
-                "0/40/5": "Living Room Fan",
-                "1/514/0": 0,
-                "1/514/2": 0,
-            }
-        }))
-        .unwrap()
+    #[test]
+    fn device_ids_round_trip() {
+        assert_eq!(device_id_for_node(18), "matter-18");
+        assert_eq!(node_id_from_device_id("matter-18"), Some(18));
+        assert_eq!(node_id_from_device_id("mqtt-lamp"), None);
+        assert_eq!(node_id_from_device_id("matter-not-a-number"), None);
     }
 
     #[test]
-    fn a_fan_without_on_off_is_still_powerable_and_typed_as_a_fan() {
-        let device = node_to_device(&fan_node());
-        assert_eq!(device.device_type, "fan", "not a light, and not untyped");
-        // Power comes from FanMode here; fan_speed from PercentSetting.
+    fn responses_are_discriminated_by_ok_not_by_the_result_key() {
+        // A successful op with an empty result must not read as a failure, and a
+        // failure whose result is null must not read as a success.
+        let ok = parse_server_message(r#"{"id":"giap-1","ok":true,"result":{}}"#);
+        assert!(matches!(ok, ServerMessage::Response { outcome: Ok(_), .. }));
+
+        let err = parse_server_message(
+            r#"{"id":"giap-2","ok":false,"error":{"code":"device_unknown","message":"nope"}}"#,
+        );
+        let ServerMessage::Response {
+            outcome: Err(e), ..
+        } = err
+        else {
+            panic!("expected a failure");
+        };
+        assert_eq!(e.code, "device_unknown");
+        assert_eq!(e.to_string(), "nope");
+    }
+
+    #[test]
+    fn a_failure_without_an_error_object_still_names_itself() {
+        let msg = parse_server_message(r#"{"id":"giap-3","ok":false}"#);
+        let ServerMessage::Response {
+            outcome: Err(e), ..
+        } = msg
+        else {
+            panic!("expected a failure");
+        };
+        assert_eq!(e.code, "internal");
+        assert!(
+            e.to_string().contains("without saying why"),
+            "an unexplained failure must still say something"
+        );
+    }
+
+    #[test]
+    fn events_carry_their_payload() {
+        let msg = parse_server_message(r#"{"event":"reading","payload":{"value":1}}"#);
+        let ServerMessage::Event { event, payload } = msg else {
+            panic!("expected an event");
+        };
+        assert_eq!(event, "reading");
+        assert_eq!(payload["value"], 1);
+    }
+
+    #[test]
+    fn the_greeting_names_a_controller_that_is_not_ours() {
+        let ours = check_greeting(
+            r#"{"protocol":"giap-matter","version":1,"fabric_id":1,"matter_js":"0.17.9"}"#,
+        );
+        assert!(ours.is_ok());
+
+        // Some other WebSocket server on the configured address, greeting with
+        // a frame of its own shape.
+        let stranger = check_greeting(r#"{"fabric_id":1,"schema_version":11}"#).unwrap_err();
+        assert!(
+            stranger.contains("Matter controller address"),
+            "must tell the user what to fix, got: {stranger}"
+        );
+
+        let newer = check_greeting(r#"{"protocol":"giap-matter","version":99}"#).unwrap_err();
+        assert!(newer.contains("different releases"), "got: {newer}");
+    }
+
+    #[test]
+    fn setup_codes_never_survive_redaction() {
+        assert_eq!(
+            redact_setup_code("commissioning MT:Y.K9042C00KA0648G00 failed"),
+            format!("commissioning {REDACTED} failed")
+        );
+        assert_eq!(
+            redact_setup_code("code 34970112332 rejected"),
+            format!("code {REDACTED} rejected")
+        );
+        assert_eq!(
+            redact_setup_code("passcode 20202021 rejected"),
+            format!("passcode {REDACTED} rejected")
+        );
+        assert_eq!(
+            redact_setup_code("long 749701123320000000000 x"),
+            format!("long {REDACTED} x")
+        );
+    }
+
+    #[test]
+    fn redaction_leaves_ordinary_numbers_alone() {
+        // Over-eager on length would blank node ids, ports and durations, and a
+        // log that redacts everything is as useless as one that redacts nothing.
+        assert_eq!(
+            redact_setup_code("node 18 on port 5580"),
+            "node 18 on port 5580"
+        );
+        assert_eq!(redact_setup_code("took 1234567 ms"), "took 1234567 ms");
+        assert_eq!(redact_setup_code("matter-18"), "matter-18");
+    }
+
+    #[test]
+    fn redaction_leaves_no_readable_fragment_and_is_idempotent() {
+        let once = redact_setup_code("MT:Y.K9042C00KA0648G00");
+        assert_eq!(once, REDACTED);
+        assert_eq!(redact_setup_code(&once), once, "must be idempotent");
+
+        // The whole payload goes, not the digits inside it.
+        assert!(!once.contains("9042"));
+    }
+
+    #[test]
+    fn code_kind_classifies_without_revealing() {
+        assert_eq!(setup_code_kind("MT:Y.K9042C00KA0648G00"), "pairing_code");
+        assert_eq!(setup_code_kind("3497-011-2332"), "pairing_code");
+        assert_eq!(setup_code_kind("20202021"), "passcode");
+        assert_eq!(setup_code_kind("nonsense"), "unknown");
+    }
+
+    #[test]
+    fn a_relayed_record_carries_its_fields() {
+        // The bug this exists for: the relay read level, kind and message and
+        // dropped `fields`, so a controller that had reported the op, the error
+        // code and the reason arrived in the log as "a request failed".
+        let record: WireLog = serde_json::from_value(json!({
+            "level": "warn",
+            "kind": "op_failed",
+            "message": "a request failed",
+            "fields": { "op": "discover", "error_code": "internal", "duration_ms": 12 },
+        }))
+        .unwrap();
+
+        let fields = record.rendered_fields();
+        assert!(fields.contains("op=discover"), "got: {fields}");
+        assert!(fields.contains("error_code=internal"), "got: {fields}");
+        assert!(fields.contains("duration_ms=12"), "got: {fields}");
+    }
+
+    #[test]
+    fn a_relayed_record_without_fields_renders_nothing_extra() {
+        let record: WireLog =
+            serde_json::from_value(json!({ "level": "info", "kind": "ready", "message": "up" }))
+                .unwrap();
+        assert_eq!(record.rendered_fields(), "");
+    }
+
+    #[test]
+    fn relayed_fields_are_redacted_too() {
+        // Fields are the likeliest place for a code to travel, since that is
+        // where structured values go.
+        let record: WireLog = serde_json::from_value(json!({
+            "level": "warn",
+            "kind": "op_failed",
+            "message": "a request failed",
+            "fields": { "error": "PASE failed for MT:Y.K9042C00KA0648G00" },
+        }))
+        .unwrap();
+        assert!(!record.rendered_fields().contains("MT:"));
+    }
+
+    #[test]
+    fn an_error_is_described_by_its_whole_chain() {
+        // The bug this exists for: the adapter reported "connecting to the
+        // Matter controller at ws://127.0.0.1:5580/giap" and nothing else, so a
+        // controller answering 404 to the handshake and one refusing the
+        // connection outright were the same sentence.
+        let error = anyhow::anyhow!("HTTP error: 404 Not Found")
+            .context("connecting to the Matter controller at ws://127.0.0.1:5580/giap");
+
+        let described = describe(&error);
+        assert!(
+            described.contains("404"),
+            "the reason was dropped: {described}"
+        );
+        assert!(
+            described.contains("connecting to"),
+            "the attempt was dropped"
+        );
+    }
+
+    #[test]
+    fn a_described_error_is_still_redacted() {
+        let error = anyhow::anyhow!("PASE failed for MT:Y.K9042C00KA0648G00")
+            .context("commissioning failed");
+        let described = describe(&error);
+        assert!(
+            !described.contains("MT:"),
+            "leaked a setup code: {described}"
+        );
+    }
+
+    #[test]
+    fn the_wire_device_becomes_a_giap_device() {
+        let wire: WireDevice = serde_json::from_value(json!({
+            "id": "matter-18",
+            "name": "Living Room Fan",
+            "device_type": "fan",
+            "capabilities": ["power", "fan_speed"],
+            "online": true,
+        }))
+        .unwrap();
+
+        let device = wire.to_device();
+        assert_eq!(device.id, "matter-18");
+        assert_eq!(device.device_type, "fan");
         assert_eq!(device.capabilities, vec!["power", "fan_speed"]);
-        assert_eq!(
-            endpoints_with_cluster(&fan_node(), CLUSTER_FAN_CONTROL),
-            vec![1]
-        );
-        assert!(endpoints_with_cluster(&fan_node(), CLUSTER_ON_OFF).is_empty());
-    }
-
-    #[test]
-    fn a_fan_that_does_implement_on_off_reports_power_once() {
-        let mut node = fan_node();
-        node.attributes.insert("1/6/0".to_string(), json!(false));
-
-        let device = node_to_device(&node);
-        assert_eq!(device.device_type, "fan", "a fan with a switch is a fan");
-        assert_eq!(
-            device.capabilities,
-            vec!["power", "fan_speed"],
-            "power must not be listed twice when both clusters are present"
-        );
-    }
-
-    /// A node that states its type the way every real one does: Descriptor
-    /// (cluster 29) attribute 0 on the application endpoint. `device` is the
-    /// Matter device type id.
-    fn described_node(node_id: u64, device: u32, extra: &[(&str, Value)]) -> MatterNode {
-        let mut attributes = json!({
-            "0/29/0": [{ "0": 22, "1": 1 }],
-            "1/29/0": [{ "0": device, "1": 1 }],
-        });
-        for (path, value) in extra {
-            attributes[path] = value.clone();
-        }
-        serde_json::from_value(json!({
-            "node_id": node_id,
-            "available": true,
-            "attributes": attributes,
-        }))
-        .unwrap()
-    }
-
-    /// The regression that started this: a plug and a bulb are both On/Off, so
-    /// cluster inference called every plug a light and the UI drew a lightbulb
-    /// on it. The node says which it is.
-    #[test]
-    fn a_plug_is_a_plug_even_though_it_looks_like_a_light() {
-        let plug = described_node(30, 0x010A, &[("1/6/0", json!(false))]);
-        assert_eq!(node_to_device(&plug).device_type, "plug");
-
-        // And the bulb it was indistinguishable from is still a light.
-        let bulb = described_node(31, 0x0100, &[("1/6/0", json!(false))]);
-        assert_eq!(node_to_device(&bulb).device_type, "light");
-    }
-
-    /// The types that used to land as the generic "matter" with a Monitor icon.
-    #[test]
-    fn appliances_alarms_and_coverings_get_their_own_types() {
-        for (id, want) in [
-            (0x0075u32, "appliance"), // Dishwasher
-            (0x0073, "appliance"),    // Laundry Washer
-            (0x0303, "pump"),         // Pump
-            (0x0028, "media"),        // Basic Video Player
-            (0x0074, "vacuum"),       // Robotic Vacuum
-            (0x0076, "alarm"),        // Smoke/CO Alarm
-            (0x0202, "covering"),     // Window Covering
-            (0x002C, "air"),          // Air Purifier
-            (0x002D, "sensor"),       // Air Quality Sensor
-        ] {
-            let node = described_node(40, id, &[]);
-            assert_eq!(
-                node_to_device(&node).device_type,
-                want,
-                "device type 0x{id:04X}"
-            );
-        }
-    }
-
-    /// Endpoint 0 is the Root Node on every device. Reading it would type the
-    /// whole fabric as one thing.
-    #[test]
-    fn the_root_endpoint_is_not_mistaken_for_the_device() {
-        let node = described_node(41, 0x0075, &[]);
-        assert_eq!(device_type_from_descriptor(&node), Some("appliance"));
-
-        // A node with only the root endpoint states nothing about itself.
-        let root_only: MatterNode = serde_json::from_value(json!({
-            "node_id": 42,
-            "available": true,
-            "attributes": { "0/29/0": [{ "0": 22, "1": 1 }] },
-        }))
-        .unwrap();
-        assert_eq!(device_type_from_descriptor(&root_only), None);
-    }
-
-    /// A node with no readable descriptor — an older device, or one whose
-    /// descriptor GIAP does not recognise — must behave exactly as before.
-    #[test]
-    fn without_a_descriptor_the_cluster_inference_still_decides() {
-        assert_eq!(device_type_from_descriptor(&light_node()), None);
-        assert_eq!(node_to_device(&light_node()).device_type, "light");
-
-        // An unknown device type id falls through to the clusters too.
-        let unknown = described_node(43, 0xBEEF, &[("1/6/0", json!(false))]);
-        assert_eq!(node_to_device(&unknown).device_type, "light");
-    }
-
-    /// Every mode the Virtual Air Purifier offers, by the name a user says.
-    #[test]
-    fn fan_modes_map_from_the_names_a_user_uses() {
-        for (name, code) in [
-            ("off", 0u8),
-            ("low", 1),
-            ("medium", 2),
-            // "on" deliberately maps to High (3), not to `FanMode::On` (4).
-            // See `FAN_MODE_ON`: 4 was deprecated in Matter 1.2 and is in none
-            // of the sequences a current device advertises, so writing it is a
-            // write a conforming fan may reject.
-            ("high", 3),
-            ("on", 3),
-            ("auto", 5),
-            ("smart", 6),
-        ] {
-            assert_eq!(fan_mode_from_name(name), Some(code), "{name}");
-        }
-
-        // Spoken input is not tidy.
-        assert_eq!(fan_mode_from_name("  HIGH "), Some(3));
-        assert_eq!(fan_mode_from_name("Med"), Some(2));
-        // And an invented mode is refused rather than guessed at.
-        assert_eq!(fan_mode_from_name("turbo"), None);
-        assert_eq!(fan_mode_from_name(""), None);
-    }
-
-    /// The Air Quality Sensor's substances. Each is its own cluster reporting
-    /// MeasuredValue on attribute 0, and each needs its own name or they
-    /// collapse into one unreadable "air quality" number.
-    #[test]
-    fn each_measured_substance_reports_under_its_own_name() {
-        let cases = [
-            (CLUSTER_CO, "carbon_monoxide", "ppm"),
-            (CLUSTER_CO2, "carbon_dioxide", "ppm"),
-            (CLUSTER_NO2, "nitrogen_dioxide", "ppb"),
-            (CLUSTER_OZONE, "ozone", "ppb"),
-            (CLUSTER_FORMALDEHYDE, "formaldehyde", "mg/m3"),
-            (CLUSTER_PM1, "pm1", "ug/m3"),
-            (CLUSTER_PM25, "pm2_5", "ug/m3"),
-            (CLUSTER_PM10, "pm10", "ug/m3"),
-            (CLUSTER_RADON, "radon", "ppm"),
-            (CLUSTER_TVOC, "total_volatile_organic_compounds", "ppb"),
-        ];
-        for (cluster, name, unit) in cases {
-            let reading = sensor_reading_from_update(5, &format!("1/{cluster}/0"), &json!(636.0))
-                .unwrap_or_else(|| panic!("cluster {cluster} should report"));
-            assert_eq!(reading.sensor_type, name);
-            assert_eq!(reading.unit, unit);
-            assert!((reading.value - 636.0).abs() < f64::EPSILON);
-        }
-    }
-
-    /// Filter monitoring is the one cluster here reporting on two attributes:
-    /// how worn the filter is, and whether the device is asking for a change.
-    /// They answer different questions and must not be collapsed.
-    #[test]
-    fn both_filters_report_condition_and_change_indication() {
-        let hepa_condition =
-            sensor_reading_from_update(6, &format!("1/{CLUSTER_HEPA_FILTER}/0"), &json!(100.0))
-                .unwrap();
-        assert_eq!(hepa_condition.sensor_type, "hepa_filter_condition");
-        assert_eq!(hepa_condition.unit, "%");
-        assert!((hepa_condition.value - 100.0).abs() < f64::EPSILON);
-
-        // ChangeIndication lives on attribute 2, which the attribute-0 rule
-        // for every other measurement cluster would otherwise discard.
-        let hepa_change =
-            sensor_reading_from_update(6, &format!("1/{CLUSTER_HEPA_FILTER}/2"), &json!(2))
-                .unwrap();
-        assert_eq!(hepa_change.sensor_type, "hepa_filter_change");
-        assert_eq!(hepa_change.value, 2.0, "2 = Critical");
-
-        let carbon = sensor_reading_from_update(
-            6,
-            &format!("1/{CLUSTER_ACTIVATED_CARBON_FILTER}/0"),
-            &json!(45.0),
-        )
-        .unwrap();
-        assert_eq!(carbon.sensor_type, "carbon_filter_condition");
-
-        // The two filters stay distinguishable — one device has both.
-        assert_ne!(hepa_condition.sensor_type, carbon.sensor_type);
-    }
-
-    #[test]
-    fn the_added_sensor_clusters_produce_readings_with_their_units() {
-        let cases = [
-            (
-                CLUSTER_ILLUMINANCE,
-                json!(1200),
-                "illuminance",
-                1200.0,
-                "lux",
-            ),
-            (CLUSTER_PRESSURE, json!(1013), "pressure", 101.3, "kPa"),
-            (CLUSTER_FLOW, json!(25), "flow", 2.5, "m3/h"),
-            (CLUSTER_AIR_QUALITY, json!(3), "air_quality", 3.0, "level"),
-            (
-                CLUSTER_SMOKE_CO_ALARM,
-                json!(1),
-                "smoke_alarm",
-                1.0,
-                "state",
-            ),
-        ];
-        for (cluster, raw, kind, value, unit) in cases {
-            let reading = sensor_reading_from_update(9, &format!("1/{cluster}/0"), &raw)
-                .unwrap_or_else(|| panic!("cluster {cluster} should report"));
-            assert_eq!(reading.sensor_type, kind);
-            assert!((reading.value - value).abs() < f64::EPSILON, "{kind}");
-            assert_eq!(reading.unit, unit);
-            assert_eq!(reading.device_id, "matter-9");
-        }
-    }
-
-    fn light_node() -> MatterNode {
-        serde_json::from_value(json!({
-            "node_id": 2,
-            "available": true,
-            "attributes": {
-                "0/40/5": "Living Room Light",
-                "0/40/1": "TEST_VENDOR",
-                "13/6/0": false,
-                "13/8/0": 1,
-            }
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn parses_results_errors_and_events() {
-        match parse_server_message(r#"{"message_id":"1","result":{"ok":true}}"#) {
-            ServerMessage::Result { message_id, .. } => assert_eq!(message_id, "1"),
-            other => panic!("expected result, got {other:?}"),
-        }
-        match parse_server_message(r#"{"message_id":"2","error_code":1,"details":"boom"}"#) {
-            ServerMessage::Error { details, .. } => assert_eq!(details, "boom"),
-            other => panic!("expected error, got {other:?}"),
-        }
-        match parse_server_message(r#"{"event":"attribute_updated","data":[2,"13/6/0",true]}"#) {
-            ServerMessage::Event { event, data } => {
-                assert_eq!(event, "attribute_updated");
-                assert_eq!(data[1], "13/6/0");
-            }
-            other => panic!("expected event, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn maps_the_live_session_light_to_a_giap_device() {
-        // Cluster layout mirrors the node commissioned in the live session
-        // (OnOff + LevelControl on endpoint 13) — identical for real bulbs.
-        let device = node_to_device(&light_node());
-        assert_eq!(device.id, "matter-2");
-        assert_eq!(device.name, "Living Room Light");
-        assert_eq!(device.device_type, "light");
-        assert_eq!(device.capabilities, vec!["power", "brightness"]);
         assert!(device.is_online);
-        assert_eq!(
-            endpoints_with_cluster(&light_node(), CLUSTER_ON_OFF),
-            vec![13]
-        );
-    }
-
-    /// Production naming chain: user label first, then the vendor's product
-    /// name (what a real bulb reports), then a speakable typed fallback —
-    /// never a raw protocol identifier.
-    #[test]
-    fn naming_falls_back_from_label_to_product_name_to_type() {
-        let mut node = light_node();
-        // No NodeLabel -> vendor ProductName (what real bulbs carry).
-        node.attributes.remove("0/40/5");
-        node.attributes
-            .insert("0/40/3".into(), json!("Hue color lamp"));
-        assert_eq!(node_to_device(&node).name, "Hue color lamp");
-
-        // Neither -> "Light 2", not "Matter node 2".
-        node.attributes.remove("0/40/3");
-        assert_eq!(node_to_device(&node).name, "Light 2");
-
-        // Blank labels are treated as absent, not used verbatim.
-        node.attributes.insert("0/40/5".into(), json!("  "));
-        assert_eq!(node_to_device(&node).name, "Light 2");
+        // The controller has no opinion on these, so nothing is invented.
+        assert!(device.room.is_none());
+        assert!(device.hostname.is_none());
     }
 
     #[test]
-    fn device_id_round_trips_and_rejects_foreign_ids() {
-        assert_eq!(device_id_for_node(2), "matter-2");
-        assert_eq!(node_id_from_device_id("matter-2"), Some(2));
-        assert_eq!(node_id_from_device_id("living-room-light"), None);
-        assert_eq!(node_id_from_device_id("matter-abc"), None);
-    }
-
-    #[test]
-    fn sensor_updates_translate_and_actuator_updates_do_not() {
-        let occ = sensor_reading_from_update(7, "1/1030/0", &json!(1)).unwrap();
-        assert_eq!(
-            (occ.device_id.as_str(), occ.sensor_type.as_str()),
-            ("matter-7", "occupancy")
-        );
-        assert_eq!(occ.value, 1.0);
-
-        let temp = sensor_reading_from_update(8, "1/1026/0", &json!(2150)).unwrap();
-        assert_eq!(temp.sensor_type, "temperature");
-        assert!((temp.value - 21.5).abs() < 1e-9);
-        assert_eq!(temp.unit, "C");
-
-        let contact = sensor_reading_from_update(9, "1/69/0", &json!(false)).unwrap();
-        assert_eq!(
-            (contact.sensor_type.as_str(), contact.value),
-            ("contact", 0.0)
-        );
-
-        // A light confirming its OnOff state is NOT a sensor reading.
-        assert!(sensor_reading_from_update(2, "13/6/0", &json!(true)).is_none());
-        // Non-zero attributes of sensor clusters are ignored too.
-        assert!(sensor_reading_from_update(7, "1/1030/1", &json!(3)).is_none());
-    }
-
-    #[test]
-    fn unit_conversions_hit_matter_scales() {
-        assert_eq!(brightness_to_level(0), 0);
-        assert_eq!(brightness_to_level(100), 254);
-        assert_eq!(brightness_to_level(50), 127);
-        assert_eq!(brightness_to_level(200), 254); // clamped
-        assert_eq!(celsius_to_setpoint(21.5), 2150);
-        assert_eq!(celsius_to_setpoint(-5.25), -525);
-    }
-
-    #[test]
-    fn color_fan_covering_conversions_hit_matter_scales() {
-        // Hue: 0–360° onto 0–254, with 360° wrapping back to 0.
-        assert_eq!(hue_to_matter(0), 0);
-        assert_eq!(hue_to_matter(360), 0);
-        assert_eq!(hue_to_matter(180), 127);
-        assert_eq!(hue_to_matter(720), 0); // wraps
-
-        // Saturation: 0–100% onto 0–254.
-        assert_eq!(saturation_to_matter(0), 0);
-        assert_eq!(saturation_to_matter(100), 254);
-        assert_eq!(saturation_to_matter(200), 254); // clamped
-
-        // Covering: percent-open inverted to Matter's lift (100ths closed).
-        assert_eq!(position_open_to_lift_100ths(100), 0); // fully open
-        assert_eq!(position_open_to_lift_100ths(0), 10000); // fully closed
-        assert_eq!(position_open_to_lift_100ths(50), 5000);
-        assert_eq!(position_open_to_lift_100ths(200), 0); // clamped open
+    fn the_applied_patch_deserialises_straight_into_the_core_type() {
+        // The wire names its fields exactly as `DeviceStatePatch` does, which is
+        // what lets the control port report what the DEVICE did rather than what
+        // the caller asked for.
+        let result: ControlResult =
+            serde_json::from_value(json!({ "applied": { "on": true, "brightness": 40 } })).unwrap();
+        assert_eq!(result.applied.on, Some(true));
+        assert_eq!(result.applied.brightness, Some(40));
+        assert_eq!(result.applied.position, None);
     }
 }

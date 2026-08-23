@@ -1,3 +1,11 @@
+/* Registered before HeroUI's own `@layer theme, base, components, utilities;`
+   (first declared inside the import below) so "reset" sorts as the lowest-
+   priority layer. Per the cascade-layers spec, unlayered rules always beat
+   layered ones regardless of specificity — base.css's `* { padding: 0 }`
+   reset was silently zeroing every HeroUI component's own padding/margin
+   because it was unlayered. Moving it into this layer (see base.css) lets
+   HeroUI's layered styles win instead, as originally intended. */
+@layer reset;
 @import "../../node_modules/@heroui/styles/dist/heroui.min.css";
 
 /* =============================================================================
@@ -85,6 +93,11 @@
   --color-sidebar:        #F5F4F0;   /* warm stone sidebar */
   --color-content:        #FAFAF8;   /* slightly warm content area */
   --color-overlay:        rgba(255, 249, 249, 0.88);  /* canvas frosted glass */
+
+  /* Now Playing album-art scrim — dark enough to keep the track name legible
+     over any cover, without needing per-photo contrast checks. */
+  --np-scrim-top:    rgba(0, 0, 0, 0.2);
+  --np-scrim-bottom: rgba(0, 0, 0, 0.78);
 
   /* Interaction states */
   --color-hover:    rgba(23, 22, 22, 0.04);
@@ -181,7 +194,7 @@
 
   /* ── Layout ─────────────────────────────────────────────── */
   --sidebar-width:           232px;
-  --sidebar-width-collapsed:  52px;
+  --sidebar-width-collapsed:  56px;
   --sidebar-transition: width 200ms ease, min-width 200ms ease;
   --toolbar-height:    48px;
   /* ── Touch ────────────────────────────────────────────────────────────
@@ -282,6 +295,11 @@
   --color-sidebar:        #17141F;
   --color-content:        #161320;
   --color-overlay:        rgba(19, 17, 25, 0.92);
+
+  /* Lighter than the light-mode scrim — the surrounding UI is already dark,
+     so the art needs less dimming to keep the track name readable. */
+  --np-scrim-top:    rgba(0, 0, 0, 0.1);
+  --np-scrim-bottom: rgba(0, 0, 0, 0.58);
 
   /* Text */
   --color-text:           #F3F1F8;

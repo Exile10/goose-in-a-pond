@@ -29,10 +29,10 @@ describe("hhmm", () => {
 });
 
 describe("url", () => {
-  const ws = url(["ws://", "wss://"], "ws://127.0.0.1:5580/ws");
+  const ws = url(["ws://", "wss://"], "ws://127.0.0.1:5580/giap");
 
   it("accepts the schemes the field can open", () => {
-    ok(ws("ws://127.0.0.1:5580/ws"));
+    ok(ws("ws://127.0.0.1:5580/giap"));
     ok(ws("wss://matter.local/ws"));
   });
 

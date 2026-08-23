@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Clock } from "lucide-react";
+import { Clock, Pencil } from "lucide-react";
 import type { Schedule } from "../api/types";
 import {
   cronToSlots,
@@ -9,6 +9,7 @@ import {
 
 interface Props {
   schedules: Schedule[];
+  onEdit?: (schedule: Schedule) => void;
 }
 
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -23,7 +24,7 @@ interface PopoverState {
   y: number;
 }
 
-export function ScheduleCalendar({ schedules }: Props) {
+export function ScheduleCalendar({ schedules, onEdit }: Props) {
   const [popover, setPopover] = useState<PopoverState | null>(null);
   const [nowHour, setNowHour] = useState(() => new Date().getHours());
   const [nowMinute, setNowMinute] = useState(() => new Date().getMinutes());
@@ -71,8 +72,13 @@ export function ScheduleCalendar({ schedules }: Props) {
     bodyRef.current.scrollTop = targetRow * ROW_H;
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Build slots from schedules.
-  const slots: ScheduleSlot[] = schedules.map((s, i) => cronToSlots(s, i));
+  // Build slots from schedules. One-shots (`fire_at` set, `cron` is the
+  // "@once" sentinel) fire a single time rather than on a weekly cadence, so
+  // they don't fit this grid's recurring-slot model — cronToSlots can't
+  // parse the sentinel either. Excluded here rather than shown wrong.
+  const slots: ScheduleSlot[] = schedules
+    .filter((s) => !s.fire_at)
+    .map((s, i) => cronToSlots(s, i));
 
   // Group slots by hour × col (col = 0-6, Mon–Sun).
   type CellKey = `${number}-${number}`;
@@ -221,31 +227,39 @@ export function ScheduleCalendar({ schedules }: Props) {
       </div>
 
       {/* ── Pill popover ─────────────────────────────────── */}
-      {popover && (
-        <div
-          className="sched-cal__popover"
-          style={{ top: popover.y, left: popover.x }}
-          role="tooltip"
-        >
-          <div className="sched-cal__popover-title">{popover.slot.label}</div>
-          <code className="sched-cal__popover-cron">
-            {schedules.find((s) => s.id === popover.slot.scheduleId)?.cron ?? ""}
-          </code>
-          <div className="sched-cal__popover-freq">
-            {frequencyLabel(popover.slot)}
-          </div>
-          {(() => {
-            const s = schedules.find((sc) => sc.id === popover.slot.scheduleId);
-            if (!s?.prompt) return null;
-            return (
+      {popover && (() => {
+        const s = schedules.find((sc) => sc.id === popover.slot.scheduleId);
+        return (
+          <div
+            className="sched-cal__popover"
+            style={{ top: popover.y, left: popover.x }}
+          >
+            <div className="sched-cal__popover-title">{popover.slot.label}</div>
+            <code className="sched-cal__popover-cron">{s?.cron ?? ""}</code>
+            <div className="sched-cal__popover-freq">
+              {frequencyLabel(popover.slot)}
+            </div>
+            {s?.prompt && (
               <div className="sched-cal__popover-result">
                 {s.prompt.slice(0, 120)}
                 {s.prompt.length > 120 ? "..." : ""}
               </div>
-            );
-          })()}
-        </div>
-      )}
+            )}
+            {onEdit && s && (
+              <button
+                className="sched-cal__popover-edit"
+                aria-label={`Edit ${s.name}`}
+                onClick={() => {
+                  onEdit(s);
+                  setPopover(null);
+                }}
+              >
+                <Pencil size={11} /> Edit
+              </button>
+            )}
+          </div>
+        );
+      })()}
     </div>
   );
 }

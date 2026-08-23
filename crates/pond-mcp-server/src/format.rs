@@ -556,13 +556,14 @@ mod tests {
         assert!(!tools.contains("giap-discovery__search_web"), "{tools:?}");
         assert_eq!(
             tools.len(),
-            63,
-            "the tool inventory changed. Update the count in AGENTS.md in the same \
-             commit — it read 64 for months while the real number was 65, and prose \
-             nobody checks is how that happens. This assertion itself proved the \
-             point: it was written as 65 on a branch 17 commits behind main, and \
-             was wrong the moment that branch merged onto a main that had gained \
-             `giap-context__recall`."
+            66,
+            "the tool inventory changed. Update this count in the same commit as \
+             the tool — the number is the record, and a stale one is how a count \
+             read 64 for months while the real number was 65. This assertion has \
+             been wrong twice itself: once written as 65 on a branch 17 commits \
+             behind main, and once pointing at an AGENTS.md that had since been \
+             taken out of the tree entirely (b971f6ab), which is why it no longer \
+             names a file to go and edit."
         );
     }
 

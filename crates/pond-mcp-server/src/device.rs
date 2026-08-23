@@ -1,7 +1,7 @@
 //! Device MCP Server — devices, user profile, model config, skills, recipes.
 //!
-//! Provides 5 tools: `list_registered_devices`, `get_user_profile`,
-//! `get_model_assignments`, `list_skills`, `get_recipe`.
+//! Provides 6 tools: `list_registered_devices`, `get_user_profile`,
+//! `get_model_assignments`, `list_skills`, `load_skill`, `get_recipe`.
 //! Depends on [`DeviceRegistry`], [`SettingsRepository`],
 //! [`UserSkillRepository`], and [`AgentRecipeRepository`].
 
@@ -27,6 +27,12 @@ use std::sync::Arc;
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub struct GetRecipeParams {
     /// Recipe name (slug).
+    pub name: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct LoadSkillParams {
+    /// Skill name, exactly as shown by `list_skills`.
     pub name: String,
 }
 
@@ -59,7 +65,11 @@ impl DeviceMcpServer {
         }
     }
 
-    #[tool(description = "List registered devices with online status.")]
+    #[tool(
+        description = "List registered devices with their online status and what each can \
+                       be told to do. For the specific values a device accepts (fan modes, \
+                       temperature limits, what a sensor measures), use describe_device."
+    )]
     async fn list_registered_devices(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -72,8 +82,17 @@ impl DeviceMcpServer {
                     devices
                         .iter()
                         .map(|d| {
+                            // Capabilities are the difference between a name and
+                            // something actionable. Without them the model knows a
+                            // fan exists and has to discover what it accepts by
+                            // trying and failing in front of the user.
+                            let can = if d.capabilities.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" — {}", d.capabilities.join(", "))
+                            };
                             format!(
-                                "- {} ({}): {}",
+                                "- {} ({}): {}{can}",
                                 d.name,
                                 d.device_type,
                                 if d.is_online { "online" } else { "offline" }
@@ -157,7 +176,10 @@ impl DeviceMcpServer {
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
-    #[tool(description = "List active user skills.")]
+    #[tool(
+        description = "List active user skills by name and description. Call load_skill to get \
+                        a skill's full instructions."
+    )]
     async fn list_skills(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -174,11 +196,60 @@ impl DeviceMcpServer {
         } else {
             skills
                 .iter()
-                .map(|s| format!("- {} ({})", s.name, s.id))
+                .map(|s| format!("- {}: {}", s.name, s.description))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
         Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+
+    #[tool(description = "Load a user skill's full instructions into context by name.")]
+    async fn load_skill(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+        params: Parameters<LoadSkillParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let skill = self
+            .skill_repo
+            .get_by_name(&params.0.name)
+            .await
+            .map_err(|e| {
+                ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("Skills error: {}", e),
+                    None,
+                )
+            })?;
+        match skill {
+            None => {
+                let active = self.skill_repo.list_active().await.unwrap_or_default();
+                let requested = params.0.name.to_lowercase();
+                let suggestions: Vec<&str> = active
+                    .iter()
+                    .filter(|s| {
+                        s.name.to_lowercase().contains(&requested)
+                            || requested.contains(&s.name.to_lowercase())
+                    })
+                    .take(3)
+                    .map(|s| s.name.as_str())
+                    .collect();
+                let hint = if suggestions.is_empty() {
+                    "Call list_skills to see the active skills.".to_string()
+                } else {
+                    format!("Did you mean: {}?", suggestions.join(", "))
+                };
+                Ok(CallToolResult::success(vec![Content::text(
+                    crate::format::format_dead_end(
+                        &format!("an active skill named '{}'", params.0.name),
+                        &hint,
+                    ),
+                )]))
+            }
+            Some(s) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Skill: {}\n{}\n\n{}",
+                s.name, s.description, s.content
+            ))])),
+        }
     }
 
     #[tool(description = "Get a named agent recipe's YAML.")]
@@ -227,7 +298,9 @@ impl ServerHandler for DeviceMcpServer {
                 "GIAP Device MCP server — device registry, user profile, model configuration, \
                  skills, and agent recipes.\n\n\
                  Tools: list_registered_devices, get_user_profile (name/timezone/location), \
-                 get_model_assignments (active LLM config), list_skills (active user skills), \
+                 get_model_assignments (active LLM config), list_skills (active user skill \
+                 names + descriptions), load_skill (a skill's full instructions by name — call \
+                 this when a listed skill looks relevant before acting on it), \
                  get_recipe (YAML agent recipe by name).",
             )
     }
@@ -334,6 +407,9 @@ mod tests {
         async fn get(&self, _: &str) -> anyhow::Result<Option<UserSkill>> {
             Ok(None)
         }
+        async fn get_by_name(&self, _: &str) -> anyhow::Result<Option<UserSkill>> {
+            Ok(None)
+        }
         async fn create(&self, _: &UserSkill) -> anyhow::Result<()> {
             Ok(())
         }
@@ -377,5 +453,114 @@ mod tests {
     #[test]
     fn server_constructs() {
         let _server = test_server();
+    }
+
+    struct StubSkillsWithData;
+    #[async_trait]
+    impl UserSkillRepository for StubSkillsWithData {
+        async fn list_active(&self) -> anyhow::Result<Vec<UserSkill>> {
+            Ok(vec![UserSkill {
+                id: "1".to_string(),
+                name: "morning-briefing".to_string(),
+                description: "Summarizes the day each morning.".to_string(),
+                icon: "sparkles".to_string(),
+                content: "Read the calendar and weather, then summarize.".to_string(),
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            }])
+        }
+        async fn list_all(&self) -> anyhow::Result<Vec<UserSkill>> {
+            self.list_active().await
+        }
+        async fn get(&self, _: &str) -> anyhow::Result<Option<UserSkill>> {
+            Ok(None)
+        }
+        async fn get_by_name(&self, name: &str) -> anyhow::Result<Option<UserSkill>> {
+            Ok(self
+                .list_active()
+                .await?
+                .into_iter()
+                .find(|s| s.name == name))
+        }
+        async fn create(&self, _: &UserSkill) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update(&self, _: &UserSkill) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_server_with_skill() -> DeviceMcpServer {
+        DeviceMcpServer::new(
+            Arc::new(StubDeviceRegistry),
+            Arc::new(StubSettings),
+            Arc::new(StubSkillsWithData),
+            Arc::new(StubRecipes),
+        )
+    }
+
+    async fn make_ctx(server: DeviceMcpServer) -> RequestContext<RoleServer> {
+        use rmcp::model::RequestId;
+        use rmcp::service::serve_directly;
+
+        let (_client, stream) = tokio::io::duplex(64);
+        let running = serve_directly(server, stream, None);
+        RequestContext::new(RequestId::Number(0), running.peer().clone())
+    }
+
+    fn tool_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn load_skill_returns_full_content() {
+        let server = test_server_with_skill();
+        let ctx = make_ctx(server.clone()).await;
+        let result = server
+            .load_skill(
+                ctx,
+                Parameters(LoadSkillParams {
+                    name: "morning-briefing".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        let text = tool_text(&result);
+        assert!(text.contains("Summarizes the day each morning."));
+        assert!(text.contains("Read the calendar and weather, then summarize."));
+    }
+
+    #[tokio::test]
+    async fn load_skill_missing_returns_dead_end_with_suggestion() {
+        let server = test_server_with_skill();
+        let ctx = make_ctx(server.clone()).await;
+        let result = server
+            .load_skill(
+                ctx,
+                Parameters(LoadSkillParams {
+                    name: "morning-brief".to_string(),
+                }),
+            )
+            .await
+            .unwrap();
+        let text = tool_text(&result);
+        assert!(text.contains("Did you mean: morning-briefing?"));
+    }
+
+    #[tokio::test]
+    async fn list_skills_includes_description() {
+        let server = test_server_with_skill();
+        let ctx = make_ctx(server.clone()).await;
+        let result = server.list_skills(ctx).await.unwrap();
+        let text = tool_text(&result);
+        assert!(text.contains("morning-briefing: Summarizes the day each morning."));
     }
 }

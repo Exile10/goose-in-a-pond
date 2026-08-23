@@ -5,6 +5,31 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Where GIAP's own Matter controller listens.
+///
+/// The path names the protocol the controller speaks, so an address left over
+/// from an earlier release fails at the handshake with a sentence naming the
+/// problem rather than half-working.
+pub const DEFAULT_MATTER_WS_URL: &str = "ws://127.0.0.1:5580/giap";
+
+/// The default this setting had before the controller spoke `giap-matter`.
+///
+/// Every install predating that release holds this string, and it points at a
+/// path the current controller does not serve — so without rewriting it,
+/// upgrading would silently break Matter for everyone who never touched the
+/// field. Only the exact old default is migrated: an address the user typed
+/// themselves is their own and is left alone.
+pub const LEGACY_MATTER_WS_URL: &str = "ws://127.0.0.1:5580/ws";
+
+/// Rewrite the superseded default, leaving anything user-chosen alone.
+pub fn migrate_matter_ws_url(stored: &str) -> String {
+    if stored.trim() == LEGACY_MATTER_WS_URL {
+        DEFAULT_MATTER_WS_URL.to_string()
+    } else {
+        stored.to_string()
+    }
+}
+
 /// The turn budget handed to the agent engine when `agent_max_turns == 0`
 /// ("uncapped").
 ///
@@ -384,12 +409,6 @@ pub struct Settings {
     pub vision_classifier_model: String,
 
     // ── Matter (#195) ──────────────────────────────────────────────────────
-    /// Whether to connect to a local Matter controller (python-matter-server)
-    /// and drive commissioned Matter devices. Off by default — requires the
-    /// controller running on the LAN.
-    #[serde(default = "Settings::default_matter_enabled")]
-    pub matter_enabled: bool,
-
     /// WebSocket URL of the Matter controller.
     #[serde(default = "Settings::default_matter_ws_url")]
     pub matter_ws_url: String,
@@ -1135,7 +1154,6 @@ impl Default for Settings {
             vision_fps: Self::default_vision_fps(),
             vision_motion_threshold: Self::default_vision_motion_threshold(),
             vision_classifier_model: Self::default_vision_classifier_model(),
-            matter_enabled: Self::default_matter_enabled(),
             matter_ws_url: Self::default_matter_ws_url(),
             mesh_enabled: Self::default_mesh_enabled(),
             mic_enabled: Self::default_mic_enabled(),
@@ -1347,11 +1365,8 @@ impl Settings {
     fn default_vision_classifier_model() -> String {
         "".to_string()
     }
-    fn default_matter_enabled() -> bool {
-        false
-    }
     fn default_matter_ws_url() -> String {
-        "ws://127.0.0.1:5580/ws".to_string()
+        DEFAULT_MATTER_WS_URL.to_string()
     }
     fn default_mesh_enabled() -> bool {
         false
@@ -2419,7 +2434,6 @@ mod tests {
             "llm_max_tokens",
             "llm_provider",
             "llm_temperature",
-            "matter_enabled",
             "matter_ws_url",
             "memory_archive_threshold",
             "memory_cleanup_enabled",

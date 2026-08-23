@@ -914,7 +914,14 @@
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  overflow: hidden;
   box-shadow: 0 4px 10px rgba(0, 0, 0, 0.12);
+}
+
+.np__artImg {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 .np--tile {
@@ -937,6 +944,21 @@
 
 .np__bar { height: 4px; border-radius: 2px; background: #EEE; margin-top: 9px; overflow: hidden; }
 .np__bar span { display: block; height: 100%; background: var(--pp); border-radius: 2px; }
+
+/* A real cover art background needs light text/controls and a scrim-safe
+   track, since the swatch that used to carry contrast on its own is gone. */
+.np--has-art { border-color: transparent; }
+/* Without the old thumbnail's height, a tile with little text would leave the
+   art as a thin strip rather than an actual background — give it room. */
+.np--tile.np--has-art { min-height: 180px; justify-content: flex-end; }
+/* `.np__info` normally grows to fill the row layout of the `bar` variant;
+   here that swallowed all the height `min-height` added, stranding the
+   controls at the bottom with a gap instead of grouping with the text. */
+.np--tile.np--has-art .np__info { flex: none; }
+.np--has-art .np__track { color: #fff; }
+.np--has-art .np__artist { color: rgba(255, 255, 255, 0.78); }
+.np--has-art .np__bar { background: rgba(255, 255, 255, 0.28); }
+.np--has-art .np__bar span { background: #fff; }
 
 .np__ctrls { display: flex; align-items: center; gap: 4px; }
 .np--tile .np__ctrls { justify-content: center; margin-top: 12px; }

@@ -56,6 +56,16 @@ impl UserSkillRepository for MockSkillRepository {
             .cloned())
     }
 
+    async fn get_by_name(&self, name: &str) -> Result<Option<UserSkill>> {
+        Ok(self
+            .skills
+            .read()
+            .await
+            .iter()
+            .find(|s| s.active && s.name == name)
+            .cloned())
+    }
+
     async fn create(&self, skill: &UserSkill) -> Result<()> {
         self.skills.write().await.push(skill.clone());
         Ok(())

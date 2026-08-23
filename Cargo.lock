@@ -9499,6 +9499,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -9788,6 +9789,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "chrono-tz",
  "croner",
  "futures",
  "pond-core",
