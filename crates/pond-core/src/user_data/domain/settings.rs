@@ -426,6 +426,16 @@ pub struct Settings {
     #[serde(default = "Settings::default_mesh_settlement_millisats_per_token")]
     pub mesh_settlement_millisats_per_token: u64,
 
+    /// Most tokens this Pond will lend a single trusted peer within one
+    /// rolling ~15-minute window before refusing further requests until it
+    /// resets. Default `0` means "not configured", same no-op convention as
+    /// `mesh_settlement_millisats_per_token`. A throttle against runaway
+    /// local-inference cost, not a payment-verified cap — the window resets
+    /// on a timer, not on confirmed payment (see `MeshInferenceService`'s
+    /// lend-window docs).
+    #[serde(default = "Settings::default_mesh_lend_token_ceiling")]
+    pub mesh_lend_token_ceiling: u64,
+
     // ── Privacy / sensor access ────────────────────────────────────────────
     /// User-controlled privacy toggle for microphone access. When false, the
     /// voice pipeline (wake-word + ASR capture) is not permitted to record.
@@ -1162,6 +1172,7 @@ impl Default for Settings {
             lightning_enabled: Self::default_lightning_enabled(),
             mesh_settlement_millisats_per_token: Self::default_mesh_settlement_millisats_per_token(
             ),
+            mesh_lend_token_ceiling: Self::default_mesh_lend_token_ceiling(),
             mic_enabled: Self::default_mic_enabled(),
             cameras_enabled: Self::default_cameras_enabled(),
             cloud_fallback_enabled: Self::default_cloud_fallback_enabled(),
@@ -1384,6 +1395,9 @@ impl Settings {
         false
     }
     fn default_mesh_settlement_millisats_per_token() -> u64 {
+        0
+    }
+    fn default_mesh_lend_token_ceiling() -> u64 {
         0
     }
     fn default_mic_enabled() -> bool {
@@ -2178,6 +2192,9 @@ mod tests {
         // An exchange RATE (millisats per usage-token, a `u64`), not a
         // bearer token — see the field's own doc comment (#132 Milestone 6).
         "mesh_settlement_millisats_per_token",
+        // A token COUNT ceiling (a `u64`), not a bearer token — see the
+        // field's own doc comment.
+        "mesh_lend_token_ceiling",
     ];
 
     /// PAI-2 P2, section 3.2 item 2.
@@ -2405,6 +2422,9 @@ mod tests {
             // credit-to-sats conversion is an open product decision, not yet
             // made — see SettlementService's own docs. No UI until it is.
             "mesh_settlement_millisats_per_token",
+            // Private mesh lend-side throttle: what number is reasonable is
+            // an open product decision, same as the rate above. No UI yet.
+            "mesh_lend_token_ceiling",
         ];
         // Everything else is surfaced in the desktop UI (Settings tabs / hub
         // views / onboarding) and mirrored in the TS Settings type.

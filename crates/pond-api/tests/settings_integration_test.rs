@@ -446,10 +446,14 @@ async fn settings_response_never_carries_a_secret_shaped_key() {
         "apikey",
         "passphrase",
     ];
-    // A token BUDGET / an exchange RATE, not a bearer token. Mirrors
-    // NOT_ACTUALLY_SECRET in pond-core's guard; if the two ever disagree,
-    // one of them is wrong.
-    const NOT_ACTUALLY_SECRET: &[&str] = &["llm_max_tokens", "mesh_settlement_millisats_per_token"];
+    // A token BUDGET / an exchange RATE / a token COUNT ceiling, not a
+    // bearer token. Mirrors NOT_ACTUALLY_SECRET in pond-core's guard; if the
+    // two ever disagree, one of them is wrong.
+    const NOT_ACTUALLY_SECRET: &[&str] = &[
+        "llm_max_tokens",
+        "mesh_settlement_millisats_per_token",
+        "mesh_lend_token_ceiling",
+    ];
 
     let leaked: Vec<&String> = obj
         .keys()

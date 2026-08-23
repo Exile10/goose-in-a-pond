@@ -236,6 +236,10 @@ impl SettingsRepository for SqliteSettingsRepository {
             "mesh_settlement_millisats_per_token",
             settings.mesh_settlement_millisats_per_token.to_string()
         );
+        upsert!(
+            "mesh_lend_token_ceiling",
+            settings.mesh_lend_token_ceiling.to_string()
+        );
         // Privacy / sensor access
         upsert!(
             "mic_enabled",
@@ -920,6 +924,11 @@ fn apply_key(s: &mut Settings, key: &str, value: &str) {
         "mesh_settlement_millisats_per_token" => {
             if let Ok(v) = value.parse() {
                 s.mesh_settlement_millisats_per_token = v;
+            }
+        }
+        "mesh_lend_token_ceiling" => {
+            if let Ok(v) = value.parse() {
+                s.mesh_lend_token_ceiling = v;
             }
         }
         // Privacy / sensor access
@@ -1752,5 +1761,23 @@ mod tests {
 
         let got = repo.get().await.unwrap();
         assert_eq!(got.mesh_settlement_millisats_per_token, 42);
+    }
+
+    #[tokio::test]
+    async fn mesh_lend_token_ceiling_roundtrips() {
+        let repo = fresh_repo().await;
+
+        let s0 = repo.get().await.unwrap();
+        assert_eq!(
+            s0.mesh_lend_token_ceiling, 0,
+            "0 by default — no lend-side cap until one is configured"
+        );
+
+        let mut s = s0;
+        s.mesh_lend_token_ceiling = 100_000;
+        repo.update(&s).await.unwrap();
+
+        let got = repo.get().await.unwrap();
+        assert_eq!(got.mesh_lend_token_ceiling, 100_000);
     }
 }

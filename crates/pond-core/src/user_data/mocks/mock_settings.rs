@@ -57,6 +57,11 @@ fn build_settings(store: &HashMap<String, String>) -> Settings {
             s.mesh_settlement_millisats_per_token = n;
         }
     }
+    if let Some(v) = store.get("mesh_lend_token_ceiling") {
+        if let Ok(n) = v.parse() {
+            s.mesh_lend_token_ceiling = n;
+        }
+    }
     if let Some(v) = store.get("llm_temperature") {
         if let Ok(n) = v.parse() {
             s.llm_temperature = n;
@@ -154,6 +159,10 @@ impl SettingsRepository for MockSettingsRepository {
         store.insert(
             "mesh_settlement_millisats_per_token".into(),
             settings.mesh_settlement_millisats_per_token.to_string(),
+        );
+        store.insert(
+            "mesh_lend_token_ceiling".into(),
+            settings.mesh_lend_token_ceiling.to_string(),
         );
         store.insert(
             "llm_temperature".into(),
