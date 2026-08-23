@@ -224,29 +224,17 @@ impl EventLoop {
                     .behaviour_mut()
                     .kad
                     .add_address(&libp2p_peer, addr.clone());
-                // TEMPORARY (#132 follow-up): the bare-Multiaddr dial below
-                // defaults to `PortUse::Reuse` — libp2p dials from the same
-                // local port this node listens on, which is what DCUtR wants
-                // for hole-punching. Two peers on the SAME machine (both on
-                // 127.0.0.1, as in local dev/testing) collide on that: the
-                // port is already bound in LISTEN state by this very
-                // process, so the dial fails with EADDRINUSE and the peer
-                // never shows connected. Two real Ponds on separate
-                // machines/IPs don't hit this — each dials a genuinely
-                // different address than its own listener.
-                //
-                // `.allocate_new_port()` forces a fresh ephemeral port per
-                // dial instead, trading away that hole-punch optimisation to
-                // unblock same-machine testing. Revisit once there's a real
-                // NAT-traversal scenario to tune against — restoring the
-                // commented-out call below is the whole revert.
-                //
-                // match self.swarm.dial(addr.with(Protocol::P2p(libp2p_peer))) {
-                let opts = DialOpts::peer_id(libp2p_peer)
-                    .addresses(vec![addr.clone()])
-                    .allocate_new_port()
-                    .build();
-                match self.swarm.dial(opts) {
+                // Default `PortUse::Reuse` is required for DCUtR hole-punching
+                // between two real, separately-NATed Ponds. Same-machine
+                // testing collides on that (EADDRINUSE), so
+                // POND_DEV_SAME_MACHINE_MESH=1 opts into a fresh port per
+                // dial instead — unset (production), this behaves exactly
+                // like a bare `swarm.dial(addr)`.
+                let mut opts = DialOpts::peer_id(libp2p_peer).addresses(vec![addr.clone()]);
+                if same_machine_dev_mesh_enabled(std::env::var("POND_DEV_SAME_MACHINE_MESH").ok().as_deref()) {
+                    opts = opts.allocate_new_port();
+                }
+                match self.swarm.dial(opts.build()) {
                     Ok(()) => {
                         self.pending_connect.insert(libp2p_peer, (peer, reply));
                     }
@@ -573,6 +561,12 @@ fn verify_handshake_bytes(
     verified.then_some(claimed_peer)
 }
 
+/// Truthiness check for `POND_DEV_SAME_MACHINE_MESH`, separated from the
+/// env read so it's unit-testable.
+fn same_machine_dev_mesh_enabled(value: Option<&str>) -> bool {
+    matches!(value, Some("1") | Some("true") | Some("TRUE"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,5 +662,22 @@ mod tests {
             verify_handshake_bytes(&forged, conn, harness(), model()),
             None,
         );
+    }
+
+    /// Unset or unrecognised must fail closed to the DCUtR-compatible default.
+    #[test]
+    fn same_machine_dev_mesh_defaults_to_disabled() {
+        assert!(!same_machine_dev_mesh_enabled(None));
+        assert!(!same_machine_dev_mesh_enabled(Some("")));
+        assert!(!same_machine_dev_mesh_enabled(Some("0")));
+        assert!(!same_machine_dev_mesh_enabled(Some("false")));
+        assert!(!same_machine_dev_mesh_enabled(Some("yes")));
+    }
+
+    #[test]
+    fn same_machine_dev_mesh_recognises_truthy_values() {
+        assert!(same_machine_dev_mesh_enabled(Some("1")));
+        assert!(same_machine_dev_mesh_enabled(Some("true")));
+        assert!(same_machine_dev_mesh_enabled(Some("TRUE")));
     }
 }
