@@ -56,8 +56,10 @@ async fn a_chat_turn_over_an_unavailable_mesh_surfaces_a_clean_error() {
         Arc::new(MockPeerDirectory::new()),
         Arc::new(MockCreditLedger::new()),
         Arc::new(MockUsageTally::new()),
+        Arc::new(MeshSettingsRepo),
         Arc::new(MockProvider::new()),
         std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(15 * 60),
         None,
     );
     let mesh_provider: Arc<dyn pond_core::models::ports::provider::LlmProvider> =

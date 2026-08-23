@@ -20,6 +20,7 @@ use pond_core::mesh::ports::peer_capability_query::{
 use pond_core::mesh::ports::peer_directory::PeerDirectory;
 use pond_core::mesh::ports::usage_tally::UsageTally;
 use pond_core::models::ports::provider::{LlmProvider, StreamToken};
+use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_mesh_protocol::wire::{
     CapabilityRequest, CapabilityResponse, ChunkKind, InferenceChunk, InferenceRequest,
     InvoiceRequest, InvoiceResponse, InvoiceResponseKind, MeshFrame, MeshFrameKind,
@@ -65,6 +66,8 @@ pub struct MeshInferenceService {
     pub(crate) peer_directory: Arc<dyn PeerDirectory>,
     pub(crate) credit_ledger: Arc<dyn CreditLedger>,
     pub(crate) usage_tally: Arc<dyn UsageTally>,
+    /// Read live at debit time, never cached — the rate can change without a restart.
+    pub(crate) settings_repo: Arc<dyn SettingsRepository>,
     /// How long `MeshInferenceProvider::stream_complete` waits for each next
     /// chunk (reset on every chunk received, not an overall stream deadline)
     /// before giving up on a peer that's gone silent. A constructor
@@ -82,6 +85,38 @@ pub struct MeshInferenceService {
     pending_invoices: Mutex<HashMap<u64, mpsc::UnboundedSender<InvoiceResponse>>>,
     pending_capabilities: Mutex<HashMap<u64, mpsc::UnboundedSender<CapabilityResponse>>>,
     next_request_id: AtomicU64,
+    /// Lend-side throttle: tokens lent to each peer in the current window.
+    /// Separate from `usage_tally`'s permanent `tokens_lent` receivable —
+    /// this is in-memory, resets every window, and exists only to cap
+    /// volume, not to track real accounting.
+    lend_window: std::sync::Mutex<HashMap<PeerId, LendWindowState>>,
+    /// How long a lend-side window stays open before resetting. A
+    /// constructor param (like `chunk_timeout`) so tests can use a short one.
+    lend_window_duration: std::time::Duration,
+}
+
+/// One peer's lend-side window: start time and tokens lent since.
+struct LendWindowState {
+    started_at: std::time::Instant,
+    tokens_lent: u64,
+}
+
+/// Ensures `unregister_pending` runs even if the stream is dropped early
+/// (not just on normal completion) — otherwise the pending entry leaks.
+/// `Drop` can't `.await`, so cleanup runs on a spawned task.
+pub(crate) struct PendingGuard {
+    service: Arc<MeshInferenceService>,
+    request_id: u64,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        let service = self.service.clone();
+        let request_id = self.request_id;
+        tokio::spawn(async move {
+            service.unregister_pending(request_id).await;
+        });
+    }
 }
 
 impl MeshInferenceService {
@@ -89,13 +124,16 @@ impl MeshInferenceService {
     /// is whatever `LlmProvider` this Pond already has active locally — the
     /// service delegates inbound requests to it, it does not discover or
     /// build one itself.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         transport: Arc<dyn MeshTransport>,
         peer_directory: Arc<dyn PeerDirectory>,
         credit_ledger: Arc<dyn CreditLedger>,
         usage_tally: Arc<dyn UsageTally>,
+        settings_repo: Arc<dyn SettingsRepository>,
         backing_provider: Arc<dyn LlmProvider>,
         chunk_timeout: std::time::Duration,
+        lend_window_duration: std::time::Duration,
         payment_rail: Option<Arc<dyn PaymentRail>>,
     ) -> Arc<Self> {
         let service = Arc::new(Self {
@@ -103,6 +141,7 @@ impl MeshInferenceService {
             peer_directory,
             credit_ledger,
             usage_tally,
+            settings_repo,
             chunk_timeout,
             backing_provider,
             payment_rail,
@@ -110,6 +149,8 @@ impl MeshInferenceService {
             pending_invoices: Mutex::new(HashMap::new()),
             pending_capabilities: Mutex::new(HashMap::new()),
             next_request_id: AtomicU64::new(1),
+            lend_window: std::sync::Mutex::new(HashMap::new()),
+            lend_window_duration,
         });
         tokio::spawn(Self::run(service.clone()));
         service
@@ -128,21 +169,50 @@ impl MeshInferenceService {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Register a channel that receives every `InferenceChunk` decoded for
-    /// `request_id`, until `unregister` is called. Must be called *before*
-    /// the request frame is sent, so a reply arriving unusually fast can't
-    /// race the registration.
+    /// Registers a channel for `request_id`'s replies, returned alongside a
+    /// [`PendingGuard`] that unregisters it on drop. Must be called before
+    /// the request frame is sent, so a fast reply can't race registration.
     pub(crate) async fn register_pending(
-        &self,
+        self: &Arc<Self>,
         request_id: u64,
-    ) -> mpsc::UnboundedReceiver<InferenceChunk> {
+    ) -> (mpsc::UnboundedReceiver<InferenceChunk>, PendingGuard) {
         let (tx, rx) = mpsc::unbounded_channel();
         self.pending.lock().await.insert(request_id, tx);
-        rx
+        let guard = PendingGuard {
+            service: self.clone(),
+            request_id,
+        };
+        (rx, guard)
     }
 
     pub(crate) async fn unregister_pending(&self, request_id: u64) {
         self.pending.lock().await.remove(&request_id);
+    }
+
+    /// Whether `peer` may be served another request under the lend throttle,
+    /// rolling the window over if it's expired. `ceiling == 0` disables it.
+    fn lend_window_check(&self, peer: PeerId, ceiling: u64) -> bool {
+        if ceiling == 0 {
+            return true;
+        }
+        let mut window = self.lend_window.lock().unwrap_or_else(|e| e.into_inner());
+        let state = window.entry(peer).or_insert_with(|| LendWindowState {
+            started_at: std::time::Instant::now(),
+            tokens_lent: 0,
+        });
+        if state.started_at.elapsed() >= self.lend_window_duration {
+            state.started_at = std::time::Instant::now();
+            state.tokens_lent = 0;
+        }
+        state.tokens_lent < ceiling
+    }
+
+    /// Adds tokens lent to `peer`'s current window (no-op if never checked).
+    fn lend_window_record(&self, peer: PeerId, tokens: u64) {
+        let mut window = self.lend_window.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = window.get_mut(&peer) {
+            state.tokens_lent = state.tokens_lent.saturating_add(tokens);
+        }
     }
 
     async fn run(self: Arc<Self>) {
@@ -300,6 +370,30 @@ impl MeshInferenceService {
     /// stream the reply back as a sequence of `InferenceChunk`s, terminated
     /// by exactly one `usage` or `error` chunk.
     async fn serve_request(&self, peer: PeerId, request: InferenceRequest) {
+        // Refuse before spending local compute if the lend throttle is exhausted.
+        let ceiling = self
+            .settings_repo
+            .get()
+            .await
+            .map(|s| s.mesh_lend_token_ceiling)
+            .unwrap_or(0);
+        if !self.lend_window_check(peer, ceiling) {
+            self.send_chunk(
+                peer,
+                InferenceChunk {
+                    request_id: request.request_id,
+                    seq: 0,
+                    kind: Some(ChunkKind::Error(
+                        "lend window exhausted — this pond has reached its lending limit for \
+                         this peer for the current window; try again shortly"
+                            .to_string(),
+                    )),
+                },
+            )
+            .await;
+            return;
+        }
+
         let messages = request.messages.iter().map(from_wire_message).collect();
         let mut stream = self
             .backing_provider
@@ -307,9 +401,14 @@ impl MeshInferenceService {
 
         let mut seq = 0u32;
         let mut usage = None;
+        // No per-chunk token count on the wire, so max_tokens is enforced
+        // against an estimate (chars/4) until real usage is reported below.
+        let mut estimated_tokens: u32 = 0;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(StreamToken::Text(text)) => {
+                    estimated_tokens =
+                        estimated_tokens.saturating_add((text.chars().count() / 4) as u32);
                     self.send_chunk(
                         peer,
                         InferenceChunk {
@@ -320,6 +419,11 @@ impl MeshInferenceService {
                     )
                     .await;
                     seq += 1;
+                    if estimated_tokens >= request.max_tokens {
+                        // Borrower's own cap, not an error — end with a
+                        // usage chunk below, same as a normal completion.
+                        break;
+                    }
                 }
                 Ok(StreamToken::Usage(stats)) => {
                     usage = Some(pond_mesh_protocol::wire::UsageWire {
@@ -342,16 +446,17 @@ impl MeshInferenceService {
             }
         }
 
-        // Not every backing provider reports usage (the trait's default
-        // `stream_complete` never does) — fall back to a zero tally rather
-        // than never sending a terminal chunk. This only affects UsageTally
-        // accuracy for that provider, not the correctness of the reply text
-        // the borrower already received.
-        let usage = usage.unwrap_or_default();
+        // Falls back to the estimate if the provider reported no usage, or
+        // max_tokens cut it short. Lend side: `peer` owes us, so record_lent.
+        let usage = usage.unwrap_or(pond_mesh_protocol::wire::UsageWire {
+            prompt_tokens: 0,
+            completion_tokens: estimated_tokens,
+        });
         let _ = self
             .usage_tally
-            .record_usage(peer, TokenCount::new(usage.completion_tokens as u64))
+            .record_lent(peer, TokenCount::new(usage.completion_tokens as u64))
             .await;
+        self.lend_window_record(peer, usage.completion_tokens as u64);
         self.send_chunk(
             peer,
             InferenceChunk {
