@@ -91,6 +91,24 @@ export interface DeviceDescription {
   capabilities: Capability[];
   /** What it measures, whether or not it has reported yet. */
   sensors: SensorSpec[];
+  /**
+   * Manufacturer-specific clusters: seen, and not drivable.
+   *
+   * An id and an endpoint is the whole of what exists. matter.js discovers no shape
+   * for a cluster it cannot name, and Matter publishes no attribute names, so the
+   * words for these controls live only in the maker's own app. Carried anyway,
+   * because the alternative is worse than saying nothing: a description listing power
+   * and brightness for a device whose app shows a third control reads as a statement
+   * that the third control does not exist, and gets believed.
+   */
+  vendor_clusters: VendorClusterSpec[];
+}
+
+export interface VendorClusterSpec {
+  /** The 32-bit cluster id, e.g. 0xfff1fc01. The upper 16 bits are the vendor code. */
+  cluster_id: number;
+  /** The endpoint carrying it, which is how a user tells two apart on one device. */
+  endpoint: number;
 }
 
 /** What a `control` op may ask a device to do. */

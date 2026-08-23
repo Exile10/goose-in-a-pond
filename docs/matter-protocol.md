@@ -235,7 +235,9 @@ DeviceDescription = {
   device_id, device_type,
   capabilities: Capability[],      // what it can be told to do
   sensors: SensorSpec[],           // what it measures, reported or not
+  vendor_clusters: VendorClusterSpec[],  // what it has and this cannot drive
 }
+VendorClusterSpec = { cluster_id, endpoint }
 Capability = { verb: Verb, setting?: string, value: ValueSpec }
 ValueSpec =
   | { kind: "boolean" }
@@ -272,6 +274,42 @@ promise above holds — but a control that is neither in the fixed set nor named
 way has to be added to it. Settings read by shape from a snapshot filtered by name
 is a contradiction worth knowing about: it is what made a paired washer report
 nothing but power while every unit test passed.
+
+That bound is still there, but `describe` no longer hides what it drops.
+
+### Manufacturer-specific clusters
+
+`vendor_clusters` is what a device has that this cannot drive. A cluster id is 32 bits
+with the vendor code in the upper 16, and a non-zero one is the maker's own — outside
+the snapshot's bound, unreachable by the shape rule, and **unnameable**: Matter
+publishes no attribute names, so the words for these controls ("Flip-Flop",
+"Emoticon" on Google's Matter Virtual Device) exist only in that maker's app.
+
+An id and an endpoint is the whole of what is carried, because it is the whole of what
+exists. matter.js builds a behavior for a cluster its model cannot name but discovers
+no shape for it: measured against a live commissioned device, `cluster$fff1fc01`
+carries zero attributes and a `clusterRevision` of 0. So there is not even a count to
+report, and reporting a count of zero for a device showing two controls would be the
+same silent falsehood this record exists to remove.
+
+It is carried at all because the alternative reads worse than silence. Asked what a
+custom light could do, GIAP answered "power and brightness" — true of everything it
+could see, and taken by the user as a statement that the two controls their app was
+showing did not exist. This is the invented constraint from the other direction: an
+absent capability reads as a fact about the device just as readily as a wrong range
+does.
+
+Not `Capability` entries, deliberately. A capability is a `control` verb, and there is
+no verb here; naming one would break the property the type rests on — anything
+describable is callable — to gain a control nothing could actually work. `control`
+still answers `capability_unsupported`, `state` still says nothing about them, and
+reading or writing a vendor attribute by numeric address is **not** offered: an
+unnamed vendor attribute can be a calibration or factory-reset control, and the caller
+would be writing it on a guess.
+
+Costs nothing to collect. matter.js builds a behavior for every cluster in the
+Descriptor's ServerList, including ones its model cannot name, so the id is already in
+hand — no read, no subscription, and nothing added to what the snapshot bound pays for.
 
 It is answered live rather than cached. A description is derived from what the
 device currently reports, and a stored copy goes stale exactly when a device is

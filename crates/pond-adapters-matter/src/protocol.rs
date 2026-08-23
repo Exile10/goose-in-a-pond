@@ -474,6 +474,52 @@ mod tests {
         assert_eq!(node_id_from_device_id("matter-not-a-number"), None);
     }
 
+    /// The one wire contract nothing checked. `DescribeResult` deserialises straight
+    /// into the domain type with no mapping step, so a field the controller adds and
+    /// the domain type has not got fails the whole call — the device is then reported
+    /// as one that cannot describe itself, naming nothing that would lead to the cause.
+    #[test]
+    fn a_description_carries_the_controller_s_vendor_clusters() {
+        let result: DescribeResult = serde_json::from_value(serde_json::json!({
+            "description": {
+                "device_id": "matter-31",
+                "device_type": "light",
+                "capabilities": [
+                    { "verb": "power", "value": { "kind": "boolean" } },
+                    { "verb": "brightness", "value": { "kind": "percent" } },
+                ],
+                "sensors": [],
+                "vendor_clusters": [{ "cluster_id": 0xfff1_fc01u32, "endpoint": 1 }],
+            }
+        }))
+        .expect("a current controller's describe result");
+
+        assert_eq!(result.description.vendor_clusters.len(), 1);
+        assert_eq!(
+            result.description.vendor_clusters[0].cluster_id,
+            0xfff1_fc01
+        );
+        assert_eq!(result.description.vendor_clusters[0].endpoint, 1);
+    }
+
+    /// The controller lives in the data dir and can be older than the binary reading
+    /// it, so an absent field has to mean "none" rather than failing the description.
+    #[test]
+    fn a_description_without_vendor_clusters_still_reads() {
+        let result: DescribeResult = serde_json::from_value(serde_json::json!({
+            "description": {
+                "device_id": "matter-2",
+                "device_type": "light",
+                "capabilities": [{ "verb": "power", "value": { "kind": "boolean" } }],
+                "sensors": [],
+            }
+        }))
+        .expect("a controller predating vendor clusters");
+
+        assert!(result.description.vendor_clusters.is_empty());
+        assert_eq!(result.description.capabilities.len(), 1);
+    }
+
     #[test]
     fn responses_are_discriminated_by_ok_not_by_the_result_key() {
         // A successful op with an empty result must not read as a failure, and a
