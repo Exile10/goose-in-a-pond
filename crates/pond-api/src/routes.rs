@@ -4363,76 +4363,32 @@ async fn update_settings(
         )
     })?;
 
-    // Refuse a time zone that is not a time zone, and canonicalise one that
-    // merely looks unusual.
+    // Validate and canonicalise every ruled field, in pond-core.
     //
-    // There was NO check at all: whatever a client sent was stored. A zone is
-    // not an inert label -- the cron scheduler evaluates every schedule in it
-    // -- so `Africa/Nairobbi` was accepted, stored, and produced a household
-    // whose reminders silently never fired, with nothing anywhere explaining
-    // why. Refusing at the edge is the only place anybody finds out.
+    // Three arms used to live here by hand — timezone, network_mode and
+    // reasoning_effort — and they were the ONLY server-side rules the pond had.
+    // The rest of the real rules were in the desktop's `validation.ts`, which
+    // meant the backend stored what the browser rejected, and any writer that
+    // was not the catalogue met no rule at all.
     //
-    // Normalised rather than only refused, because `africa/nairobi` is a
-    // reasonable thing to type and an unreasonable thing to reject; the STORED
-    // value is always the database's own spelling, so everything downstream
-    // parses one shape.
-    if let Some(zone) = patch.get("timezone").and_then(|v| v.as_str()) {
-        match pond_core::user_data::services::location::normalize_zone(zone) {
-            Some(canonical) => {
-                patch["timezone"] = json!(canonical);
-            }
-            None => {
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json!({
-                        "error": format!(
-                            "{zone:?} is not an IANA time zone; GET /api/v1/time/zones lists them"
-                        )
-                    })),
-                ));
-            }
-        }
-    }
-
-    // Reject an unrecognised network_mode. `NetworkMode::parse` deliberately
-    // falls back to "open" rather than to a restrictive mode, so a typo that
-    // reached the store would silently be no gate at all. Refusing it here is
-    // the narrowing half of that bargain -- and refusing at the edge is also
-    // the only place a user finds out, since the parse fallback is a log line.
-    if let Some(mode) = patch.get("network_mode").and_then(|v| v.as_str()) {
-        if !pond_core::user_data::domain::settings::NETWORK_MODES.contains(&mode) {
-            return Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({
-                    "error": format!(
-                        "network_mode {:?} is not one of {:?}",
-                        mode,
-                        pond_core::user_data::domain::settings::NETWORK_MODES
-                    )
-                })),
-            ));
-        }
-    }
-
-    // Reject an unrecognised reasoning_effort, for the same reason and in the
-    // same direction as network_mode above. `ReasoningEffort::parse` falls back
-    // to "brief" -- the SMALLEST thinking budget -- so a typo that reached the
-    // store would quietly shrink the model's think rather than widen it. That
-    // is the safe failure, which is exactly why it must not be the silent one:
-    // refusing here is the only place the user ever finds out.
-    if let Some(effort) = patch.get("reasoning_effort").and_then(|v| v.as_str()) {
-        if !pond_core::user_data::domain::settings::REASONING_EFFORTS.contains(&effort) {
-            return Err((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({
-                    "error": format!(
-                        "reasoning_effort {:?} is not one of {:?}",
-                        effort,
-                        pond_core::user_data::domain::settings::REASONING_EFFORTS
-                    )
-                })),
-            ));
-        }
+    // `validate_patch` reports EVERY failing field rather than the first, and
+    // canonicalises in place: `africa/nairobi` is stored as `Africa/Nairobi`,
+    // `9:05` as `09:05`. A refused patch is left exactly as it arrived.
+    if let Err(errors) =
+        pond_core::user_data::domain::settings_validation::validate_patch(&mut patch)
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": pond_core::user_data::domain::settings_validation::render_errors(&errors),
+                // Named per field as well, so a form can mark the box rather
+                // than showing one sentence above the whole page.
+                "fields": errors
+                    .iter()
+                    .map(|e| json!({ "field": e.field, "message": e.message }))
+                    .collect::<Vec<_>>(),
+            })),
+        ));
     }
 
     // Reject agent_backend="pond" — backend is quarantined (Q2-05, not production-ready).

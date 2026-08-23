@@ -90,6 +90,26 @@ impl ModelCategory {
         }
     }
 
+    /// The runtime provider name that serves this category — the inverse of
+    /// [`Self::for_chat_provider`], and here beside it for the reason that
+    /// function's own note gives: each caller had written the mapping again.
+    /// Two hand-written inverses existed when this was added, in
+    /// `pond-server`'s boot sync and in the activate route, and they disagreed
+    /// about the non-LLM categories — one answered `llamafile`, the other
+    /// invented `asr`/`tts`/`embedding`, which are ROLE names and not runtime
+    /// providers at all.
+    ///
+    /// Meaningful only for [`Self::is_llm`] categories: nothing loads a Whisper
+    /// or Kokoro model through a chat provider. The catch-all matches
+    /// `for_chat_provider`'s, so the pair round-trips for every LLM category.
+    pub fn runtime_provider(&self) -> &'static str {
+        match self {
+            Self::Gguf => "local",
+            Self::Ollama => "ollama",
+            _ => "llamafile",
+        }
+    }
+
     /// True for LLM models that can be assigned to a chat/think/task role.
     pub fn is_llm(&self) -> bool {
         matches!(self, Self::Gguf | Self::Llamafile | Self::Ollama)
@@ -243,14 +263,15 @@ pub struct ModelRoleAssignment {
 
 impl ModelRoleAssignment {
     /// Returns true if `model_category` is a legal match for `role`.
+    /// Whether a model of `category` may take `role`.
+    ///
+    /// Delegates to [`ModelRole`], which owns the role vocabulary. Kept as a
+    /// free function because the role arrives here as a free-form string from
+    /// the API and the CLI, and an unknown one must answer `false` rather than
+    /// failing to parse.
     pub fn category_matches_role(category: &ModelCategory, role: &str) -> bool {
-        match role {
-            "chat" | "think" | "task" | "tool" => category.is_llm(),
-            "asr" => category.is_asr(),
-            "tts" => category.is_tts(),
-            "embedding" => category.is_embedding(),
-            _ => false,
-        }
+        crate::models::domain::model_role::ModelRole::from_str(role)
+            .is_some_and(|r| r.accepts(category))
     }
 }
 
