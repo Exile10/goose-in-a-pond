@@ -12,15 +12,26 @@ pub enum UsageTallyError {
 
 /// Driven Port: UsageTally
 ///
-/// Accumulates metered token usage with a peer between settlements.
-/// `record_usage` is the hot-path call (once per served request);
-/// `mark_settled` is called by the same background job that calls
-/// `PaymentRail::batch_settle`, never inline with a request.
+/// Two directions, never conflated: `record_borrowed`/`pending_borrowed`
+/// track what *we* owe a peer, and are all `SettlementService` ever pays
+/// against. `record_lent`/`pending_lent` track what a peer owes *us* —
+/// observability only; collecting it is that peer's job, not ours.
+///
+/// `record_*` are hot-path calls (once per served request); `mark_settled`
+/// runs from the settlement job only, and only ever reduces `tokens_borrowed`.
 #[async_trait]
 pub trait UsageTally: Send + Sync {
-    async fn record_usage(&self, peer: PeerId, tokens: TokenCount) -> Result<(), UsageTallyError>;
+    async fn record_borrowed(
+        &self,
+        peer: PeerId,
+        tokens: TokenCount,
+    ) -> Result<(), UsageTallyError>;
 
-    async fn pending_tally(&self, peer: PeerId) -> Result<TokenCount, UsageTallyError>;
+    async fn record_lent(&self, peer: PeerId, tokens: TokenCount) -> Result<(), UsageTallyError>;
+
+    async fn pending_borrowed(&self, peer: PeerId) -> Result<TokenCount, UsageTallyError>;
+
+    async fn pending_lent(&self, peer: PeerId) -> Result<TokenCount, UsageTallyError>;
 
     async fn mark_settled(&self, peer: PeerId, up_to: TokenCount) -> Result<(), UsageTallyError>;
 }

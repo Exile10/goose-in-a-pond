@@ -19,9 +19,16 @@ use crate::mesh::ports::usage_tally::UsageTally;
 /// What happened when settlement was attempted for one peer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettlementOutcome {
-    /// Nothing owed — `pending_tally` was zero, no invoice was requested.
+    /// Nothing owed — `pending_borrowed` was zero, no invoice was requested.
     NothingPending {
         peer: PeerId,
+    },
+    /// Owed, but under 1 sat at the current rate — paying it would clear
+    /// the full debt for free (see `settle_one`). Left pending until it
+    /// crosses the threshold. No invoice was requested.
+    BelowSettlementMinimum {
+        peer: PeerId,
+        amount: Millisats,
     },
     Settled {
         peer: PeerId,
@@ -90,7 +97,8 @@ impl SettlementService {
     }
 
     async fn settle_one(&self, peer: PeerId, millisats_per_token: u64) -> SettlementOutcome {
-        let pending = match self.usage_tally.pending_tally(peer).await {
+        // Only the borrowed side — tokens_lent is peer's own job to collect.
+        let pending = match self.usage_tally.pending_borrowed(peer).await {
             Ok(t) => t,
             Err(err) => {
                 return SettlementOutcome::Failed {
@@ -110,6 +118,14 @@ impl SettlementService {
             };
         };
         let amount = Millisats::new(amount_value);
+
+        // Invoices are whole-sat; under 1000 msat rounds to a 0-sat invoice.
+        // Paying that moves no money but mark_settled would still clear the
+        // debt in full — bail out first so the tokens roll to the next pass.
+        const MSATS_PER_SAT: u64 = 1000;
+        if amount.value() < MSATS_PER_SAT {
+            return SettlementOutcome::BelowSettlementMinimum { peer, amount };
+        }
 
         let invoice = match self.invoice_requester.request_invoice(peer, amount).await {
             Ok(invoice) => invoice,
@@ -182,6 +198,101 @@ mod tests {
         )
     }
 
+    /// Lending compute to a peer must never make us pay them.
+    #[tokio::test]
+    async fn lending_to_a_peer_never_triggers_a_payment() {
+        let (service, peer_directory, usage_tally, _rail, _invoices) = make_service().await;
+        let peer = PeerId::from([9u8; 32]);
+        peer_directory
+            .add_trusted_peer(peer, TrustScope::Circle)
+            .await
+            .unwrap();
+        // They owe us, not the other way. No invoice configured — a
+        // wrongful payment attempt would fail loudly, not silently succeed.
+        usage_tally
+            .record_lent(peer, TokenCount::new(10_000))
+            .await
+            .unwrap();
+
+        let outcomes = service.run_once(5).await.unwrap();
+        assert_eq!(
+            outcomes,
+            vec![SettlementOutcome::NothingPending { peer }],
+            "tokens_lent must never be read by settlement — only tokens_borrowed"
+        );
+
+        // The receivable is untouched — still owed to us, still visible.
+        assert_eq!(
+            usage_tally.pending_lent(peer).await.unwrap(),
+            TokenCount::new(10_000)
+        );
+    }
+
+    /// 100 tokens at 5 msat/token is 500 msat — under 1 sat, so this must
+    /// not be settled for free (see `BelowSettlementMinimum`).
+    #[tokio::test]
+    async fn sub_sat_debt_is_carried_forward_instead_of_settled_for_free() {
+        let (service, peer_directory, usage_tally, _rail, invoices) = make_service().await;
+        let peer = PeerId::from([10u8; 32]);
+        peer_directory
+            .add_trusted_peer(peer, TrustScope::Circle)
+            .await
+            .unwrap();
+        usage_tally
+            .record_borrowed(peer, TokenCount::new(100))
+            .await
+            .unwrap();
+        // Deliberately no invoice configured: if settlement tried to request
+        // one, MockInvoiceRequester would time out and this test would see
+        // Failed, not BelowSettlementMinimum — the real assertion is that it
+        // must not even try.
+        invoices.set_invoice(peer, "must-not-be-used").await;
+
+        let outcomes = service.run_once(5).await.unwrap(); // 100 * 5 msat = 500 msat, < 1 sat
+        assert_eq!(
+            outcomes,
+            vec![SettlementOutcome::BelowSettlementMinimum {
+                peer,
+                amount: Millisats::new(500),
+            }]
+        );
+
+        // The debt survives — nothing was paid, so nothing should be cleared.
+        assert_eq!(
+            usage_tally.pending_borrowed(peer).await.unwrap(),
+            TokenCount::new(100)
+        );
+    }
+
+    /// The other side of the same guard: once enough tokens accumulate to
+    /// cross the 1-sat threshold, settlement proceeds normally.
+    #[tokio::test]
+    async fn debt_settles_normally_once_it_reaches_one_sat() {
+        let (service, peer_directory, usage_tally, rail, invoices) = make_service().await;
+        let peer = PeerId::from([11u8; 32]);
+        peer_directory
+            .add_trusted_peer(peer, TrustScope::Circle)
+            .await
+            .unwrap();
+        // 200 tokens * 5 msat/token = 1000 msat = exactly 1 sat.
+        usage_tally
+            .record_borrowed(peer, TokenCount::new(200))
+            .await
+            .unwrap();
+        let invoice = rail.issue_invoice(Millisats::new(1000)).await.unwrap();
+        invoices.set_invoice(peer, invoice).await;
+
+        let outcomes = service.run_once(5).await.unwrap();
+        assert!(matches!(
+            &outcomes[0],
+            SettlementOutcome::Settled { amount, .. } if amount.value() == 1000
+        ));
+        assert_eq!(
+            usage_tally.pending_borrowed(peer).await.unwrap(),
+            TokenCount::new(0)
+        );
+    }
+
     #[tokio::test]
     async fn zero_rate_is_a_no_op_even_with_pending_usage() {
         let (service, peer_directory, usage_tally, _rail, _invoices) = make_service().await;
@@ -191,7 +302,7 @@ mod tests {
             .await
             .unwrap();
         usage_tally
-            .record_usage(peer, TokenCount::new(500))
+            .record_borrowed(peer, TokenCount::new(500))
             .await
             .unwrap();
 
@@ -227,18 +338,19 @@ mod tests {
             .add_trusted_peer(peer, TrustScope::Circle)
             .await
             .unwrap();
+        // 1000, not 100 — must clear the 1-sat settlement floor to test this path.
         usage_tally
-            .record_usage(peer, TokenCount::new(100))
+            .record_borrowed(peer, TokenCount::new(1000))
             .await
             .unwrap();
         // MockPaymentRail.batch_settle only accepts invoices it recognizes
         // as issued — mint one through it, standing in for "the peer's own
         // wallet issued this" (in production that peer runs a different
         // instance; the mock's own bookkeeping doesn't distinguish).
-        let invoice = rail.issue_invoice(Millisats::new(500)).await.unwrap();
+        let invoice = rail.issue_invoice(Millisats::new(5000)).await.unwrap();
         invoices.set_invoice(peer, invoice).await;
 
-        let outcomes = service.run_once(5).await.unwrap(); // 100 tokens * 5 msat/token = 500 msat
+        let outcomes = service.run_once(5).await.unwrap(); // 1000 tokens * 5 msat/token = 5000 msat
         assert_eq!(outcomes.len(), 1);
         match &outcomes[0] {
             SettlementOutcome::Settled {
@@ -247,14 +359,14 @@ mod tests {
                 preimage,
             } => {
                 assert_eq!(*p, peer);
-                assert_eq!(amount.value(), 500);
+                assert_eq!(amount.value(), 5000);
                 assert!(!preimage.is_empty());
             }
             other => panic!("expected Settled, got {other:?}"),
         }
 
         // Usage tally cleared — a second pass has nothing left to settle.
-        let remaining = usage_tally.pending_tally(peer).await.unwrap();
+        let remaining = usage_tally.pending_borrowed(peer).await.unwrap();
         assert_eq!(remaining.value(), 0);
     }
 
@@ -266,8 +378,9 @@ mod tests {
             .add_trusted_peer(peer, TrustScope::Circle)
             .await
             .unwrap();
+        // 2000, not 10 — must clear the 1-sat floor to reach the invoice request.
         usage_tally
-            .record_usage(peer, TokenCount::new(10))
+            .record_borrowed(peer, TokenCount::new(2000))
             .await
             .unwrap();
         // Deliberately no invoice set — MockInvoiceRequester times out.
@@ -277,8 +390,8 @@ mod tests {
         assert!(matches!(&outcomes[0], SettlementOutcome::Failed { peer: p, .. } if *p == peer));
 
         // A failed invoice request must not clear the usage — it's still owed.
-        let remaining = usage_tally.pending_tally(peer).await.unwrap();
-        assert_eq!(remaining.value(), 10);
+        let remaining = usage_tally.pending_borrowed(peer).await.unwrap();
+        assert_eq!(remaining.value(), 2000);
     }
 
     #[tokio::test]
@@ -290,7 +403,7 @@ mod tests {
             .await
             .unwrap();
         usage_tally
-            .record_usage(peer, TokenCount::new(u64::MAX))
+            .record_borrowed(peer, TokenCount::new(u64::MAX))
             .await
             .unwrap();
         invoices.set_invoice(peer, "mock-invoice").await;
@@ -313,16 +426,17 @@ mod tests {
             .add_trusted_peer(b, TrustScope::Circle)
             .await
             .unwrap();
+        // 2000/4000, not 20/40 — must clear the 1-sat floor to actually settle.
         usage_tally
-            .record_usage(a, TokenCount::new(20))
+            .record_borrowed(a, TokenCount::new(2000))
             .await
             .unwrap();
         usage_tally
-            .record_usage(b, TokenCount::new(40))
+            .record_borrowed(b, TokenCount::new(4000))
             .await
             .unwrap();
-        let invoice_a = rail.issue_invoice(Millisats::new(20)).await.unwrap();
-        let invoice_b = rail.issue_invoice(Millisats::new(40)).await.unwrap();
+        let invoice_a = rail.issue_invoice(Millisats::new(2000)).await.unwrap();
+        let invoice_b = rail.issue_invoice(Millisats::new(4000)).await.unwrap();
         invoices.set_invoice(a, invoice_a).await;
         invoices.set_invoice(b, invoice_b).await;
 

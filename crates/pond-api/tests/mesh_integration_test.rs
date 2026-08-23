@@ -141,7 +141,6 @@ async fn make_app_with_mesh_provider_and_capabilities(
         usage_tally: Arc::new(SqliteUsageTally::new(pool.clone())),
         mesh_transport: Arc::new(tokio::sync::RwLock::new(None)),
         mesh_provider: Arc::new(tokio::sync::RwLock::new(mesh_provider)),
-        payment_rail: None,
         peer_capability_query: Arc::new(tokio::sync::RwLock::new(peer_capability_query)),
         mesh_rebuild: None,
     });
@@ -254,7 +253,6 @@ async fn make_app_with_settlement_deps() -> (
         usage_tally: usage_tally.clone(),
         mesh_transport: Arc::new(tokio::sync::RwLock::new(None)),
         mesh_provider: Arc::new(tokio::sync::RwLock::new(None)),
-        payment_rail: None,
         peer_capability_query: Arc::new(tokio::sync::RwLock::new(None)),
         mesh_rebuild: None,
     });
@@ -618,7 +616,7 @@ async fn settlement_status_reports_pending_usage_per_peer() {
     )
     .await;
     usage_tally
-        .record_usage(peer, TokenCount::new(250))
+        .record_borrowed(peer, TokenCount::new(250))
         .await
         .unwrap();
 
@@ -650,7 +648,7 @@ async fn settlement_status_reflects_a_real_rate_once_set() {
     )
     .await;
     usage_tally
-        .record_usage(peer, TokenCount::new(100))
+        .record_borrowed(peer, TokenCount::new(100))
         .await
         .unwrap();
 
