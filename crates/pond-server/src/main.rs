@@ -2791,6 +2791,23 @@ async fn run_server(
                 // giving the machine back does not also cancel the sweep task
                 // for the life of the process.
                 let pass = cancel.child_token();
+                // The baseline is the moment this pass was admitted. The
+                // watcher cancels only on activity NEWER than it — somebody
+                // actually came back — never on activity that merely happened
+                // recently. The previous predicate (`elapsed() < chore_idle`)
+                // judged recency, and for a requested pass that inverted the
+                // gate's own decision: the gate waives idleness because the
+                // person pressing Reindex IS the reason to run, and then the
+                // watcher saw that same person's turn, still under fifteen
+                // minutes old, and killed the pass at its first tick — after
+                // the route had already CLEARED the index. Measured: press
+                // Reindex within 15 minutes of any turn and the pass died at
+                // ~15s with requested=true interrupted=true still_missing=1073.
+                // The same predicate also made the first-post-boot pass a
+                // near-miss: boot initialises the activity clock, and the pass
+                // fires at 16 minutes against a 15-minute threshold — one
+                // slow poll from cancelling itself forever.
+                let baseline = *sweep_activity.read().await;
                 let watcher = tokio::spawn({
                     let pass = pass.clone();
                     let activity = sweep_activity.clone();
@@ -2801,7 +2818,7 @@ async fn run_server(
                         // the signal that says "somebody is here NOW".
                         loop {
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            if activity.read().await.elapsed() < chore_idle {
+                            if *activity.read().await > baseline {
                                 pass.cancel();
                                 return;
                             }
