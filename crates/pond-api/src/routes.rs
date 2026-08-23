@@ -4276,15 +4276,24 @@ async fn get_mesh_settlement_status(
 
     let mut peer_list = Vec::with_capacity(peers.len());
     for peer in peers {
-        let pending = state
+        // Borrowed: what we owe (settlement pays this). Lent: what peer
+        // owes us (shown for transparency only — their job to collect).
+        let borrowed = state
             .usage_tally
-            .pending_tally(peer)
+            .pending_borrowed(peer)
+            .await
+            .map_err(mesh_internal_error)?;
+        let lent = state
+            .usage_tally
+            .pending_lent(peer)
             .await
             .map_err(mesh_internal_error)?;
         peer_list.push(json!({
             "peer_id": peer.to_string(),
-            "pending_tokens": pending.value(),
-            "pending_millisats": pending.value().saturating_mul(rate),
+            "pending_tokens": borrowed.value(),
+            "pending_millisats": borrowed.value().saturating_mul(rate),
+            "owed_to_us_tokens": lent.value(),
+            "owed_to_us_millisats": lent.value().saturating_mul(rate),
         }));
     }
 
@@ -4307,12 +4316,14 @@ async fn get_mesh_self(
         return Ok(Json(json!({ "mesh_enabled": false })));
     };
     let peer_id = transport.local_peer_id();
-    let address = transport
-        .listen_addresses()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .next();
+    let addresses = transport.listen_addresses().await.unwrap_or_default();
+    // Prefer a routable address over loopback — an invite is only useful
+    // to a peer on a different machine.
+    let address = addresses
+        .iter()
+        .find(|a| !a.contains("127.0.0.1") && !a.contains("/ip6/::1/"))
+        .or_else(|| addresses.first())
+        .cloned();
     let invite_url = match &address {
         Some(address) => format!(
             "pond-mesh://invite?peer={peer_id}&addr={}",
@@ -4901,37 +4912,7 @@ fn weather_short_weekday(date: &str) -> String {
         .unwrap_or_else(|_| date.to_string())
 }
 
-/// `complete()` always fails with a clear message — the fallback when
-/// `chat_provider = "mesh"` is selected but mesh isn't actually available
-/// (feature not compiled in, or `mesh_enabled` is off). Deliberately not a
-/// silent fallback to llamafile: a user who picked mesh and gets a llamafile
-/// answer instead has no way to tell their choice didn't take effect.
-struct UnavailableProvider {
-    message: String,
-}
-
-impl UnavailableProvider {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl LlmProvider for UnavailableProvider {
-    async fn complete(
-        &self,
-        _system_prompt: &str,
-        _messages: Vec<pond_core::models::domain::message::ChatMessage>,
-    ) -> anyhow::Result<pond_core::models::domain::message::ChatMessage> {
-        Err(anyhow::anyhow!(self.message.clone()))
-    }
-
-    fn model_name(&self) -> String {
-        "mesh (unavailable)".to_string()
-    }
-}
+use pond_core::models::ports::provider::UnavailableProvider;
 
 /// Rebuild and hot-swap the ModelRouter using the new settings.
 /// Called whenever the user changes any provider/model assignment.
@@ -4966,6 +4947,9 @@ async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
         max_tokens: u32,
         temperature: f32,
         mesh_provider: Option<Arc<dyn LlmProvider>>,
+        _model_repo: Option<
+            Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
+        >,
     ) -> Arc<dyn LlmProvider> {
         match provider {
             "mesh" => mesh_provider.unwrap_or_else(|| {
@@ -4985,12 +4969,23 @@ async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
             "local" | "gguf" => {
                 use pond_adapters_local_inference::LocalInferenceLlmAdapter;
 
-                // `new_with_data_dir` handles both raw ".gguf" filenames and
-                // HuggingFace "repo:quant" IDs, registering the model in Goose's
-                // global registry so LocalInferenceProvider can locate the file.
+                // Resolve the catalog's real on-disk filename first — guessing
+                // `{model}.gguf` fails when it doesn't match the catalog alias
+                // (e.g. "llama-3.2-3b" vs "Llama-3.2-3B-Instruct-Q4_K_M.gguf").
+                let resolved_filename = match &_model_repo {
+                    Some(repo) => repo
+                        .get_by_id(&format!("gguf/{model}"))
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|record| record.filename),
+                    None => None,
+                };
+                let model_arg = resolved_filename.as_deref().unwrap_or(model);
+
                 let result = match &_data_dir {
-                    Some(dir) => LocalInferenceLlmAdapter::new_with_data_dir(model, dir).await,
-                    None => LocalInferenceLlmAdapter::new(model).await,
+                    Some(dir) => LocalInferenceLlmAdapter::new_with_data_dir(model_arg, dir).await,
+                    None => LocalInferenceLlmAdapter::new(model_arg).await,
                 };
                 match result {
                     Ok(adapter) => Arc::new(adapter) as Arc<dyn LlmProvider>,
@@ -5029,6 +5024,7 @@ async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
         max_tokens,
         temperature,
         state.mesh_provider.read().await.clone(),
+        state.model_repo.clone(),
     )
     .await;
     // If chat uses llamafile, ensure the process is running before
@@ -11985,7 +11981,8 @@ async fn music_now_playing_handler(State(state): State<Arc<AppState>>) -> axum::
         // made a connection Spotify was actively refusing look like a paused
         // one, leaving the widget with nothing to tell the user.
         let (error, message) = spotify_error_hint(status);
-        tracing::warn!(status = %status, error, "Spotify now-playing request failed");
+        let body_preview = resp.text().await.unwrap_or_default();
+        tracing::warn!(status = %status, error, body = %body_preview, "Spotify now-playing request failed");
         return Json(json!({
             "connected": true,
             "playing": false,

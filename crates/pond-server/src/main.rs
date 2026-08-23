@@ -2618,6 +2618,7 @@ async fn run_server(
         peer_directory.clone(),
         credit_ledger.clone(),
         usage_tally.clone(),
+        settings_repo.clone(),
         llm_provider.clone(),
         payment_rail.clone(),
     );
@@ -2703,6 +2704,7 @@ async fn run_server(
                         peer_directory,
                         credit_ledger,
                         usage_tally,
+                        settings_repo.clone(),
                         llm_provider,
                         payment_rail,
                     );
@@ -7548,37 +7550,7 @@ impl LlmProvider for SharedLlmProvider {
     }
 }
 
-/// `complete()` always fails with a clear message — the fallback when
-/// `chat_provider = "mesh"` is selected but mesh isn't actually available
-/// (feature not compiled in, or `mesh_enabled` is off). Deliberately not a
-/// silent fallback to llamafile: a user who picked mesh and gets a llamafile
-/// answer instead has no way to tell their choice didn't take effect.
-struct UnavailableProvider {
-    message: String,
-}
-
-impl UnavailableProvider {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl LlmProvider for UnavailableProvider {
-    async fn complete(
-        &self,
-        _system_prompt: &str,
-        _messages: Vec<pond_core::models::domain::message::ChatMessage>,
-    ) -> anyhow::Result<pond_core::models::domain::message::ChatMessage> {
-        Err(anyhow::anyhow!(self.message.clone()))
-    }
-
-    fn model_name(&self) -> String {
-        "mesh (unavailable)".to_string()
-    }
-}
+use pond_core::models::ports::provider::UnavailableProvider;
 
 /// Builds the mesh `LlmProvider` (and its capability-query / invoice-request
 /// handles) exactly once at startup, only when `mesh_transport` is `Some` —
@@ -7596,6 +7568,7 @@ fn build_mesh_provider(
     peer_directory: Arc<dyn pond_core::mesh::ports::peer_directory::PeerDirectory + Send + Sync>,
     credit_ledger: Arc<dyn pond_core::mesh::ports::credit_ledger::CreditLedger + Send + Sync>,
     usage_tally: Arc<dyn pond_core::mesh::ports::usage_tally::UsageTally + Send + Sync>,
+    settings_repo: Arc<dyn pond_core::user_data::ports::settings::SettingsRepository>,
     llm_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,
     payment_rail: Option<Arc<dyn pond_core::mesh::ports::payment_rail::PaymentRail>>,
 ) -> (
@@ -7612,8 +7585,10 @@ fn build_mesh_provider(
         peer_directory,
         credit_ledger,
         usage_tally,
+        settings_repo,
         backing_provider,
         std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(15 * 60),
         payment_rail,
     );
     (
@@ -7630,6 +7605,7 @@ fn build_mesh_provider(
     _peer_directory: Arc<dyn pond_core::mesh::ports::peer_directory::PeerDirectory + Send + Sync>,
     _credit_ledger: Arc<dyn pond_core::mesh::ports::credit_ledger::CreditLedger + Send + Sync>,
     _usage_tally: Arc<dyn pond_core::mesh::ports::usage_tally::UsageTally + Send + Sync>,
+    _settings_repo: Arc<dyn pond_core::user_data::ports::settings::SettingsRepository>,
     _llm_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,
     _payment_rail: Option<Arc<dyn pond_core::mesh::ports::payment_rail::PaymentRail>>,
 ) -> (
@@ -7710,6 +7686,14 @@ fn spawn_settlement_job(
                             pond_core::mesh::services::settlement::SettlementOutcome::NothingPending {
                                 ..
                             } => {}
+                            pond_core::mesh::services::settlement::SettlementOutcome::BelowSettlementMinimum {
+                                peer,
+                                amount,
+                            } => {
+                                tracing::info!(
+                                    "settlement: {peer} owes {amount}, below the 1-sat minimum — carried to next pass"
+                                );
+                            }
                         }
                     }
                 }

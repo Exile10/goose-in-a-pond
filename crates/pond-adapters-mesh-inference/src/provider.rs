@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use async_trait::async_trait;
 use futures::StreamExt;
 
+use pond_core::mesh::domain::millisats::Millisats;
 use pond_core::mesh::domain::peer_id::PeerId;
 use pond_core::mesh::domain::token_count::TokenCount;
 use pond_core::mesh::ports::credit_ledger::CreditLedgerError;
@@ -123,7 +124,8 @@ impl LlmProvider for MeshInferenceProvider {
             *self.last_peer.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer);
 
             let request_id = self.service.next_request_id();
-            let mut replies = self.service.register_pending(request_id).await;
+            // Keeps `_pending_guard` alive so its Drop cleans up on any exit.
+            let (mut replies, _pending_guard) = self.service.register_pending(request_id).await;
 
             let request = InferenceRequest {
                 request_id,
@@ -132,22 +134,63 @@ impl LlmProvider for MeshInferenceProvider {
                 max_tokens: DEFAULT_MAX_TOKENS,
             };
             let frame = MeshFrame::request(request).encode_to_vec();
+            let sent_at = std::time::Instant::now();
             if let Err(err) = self.service.transport.send(peer, frame).await {
-                self.service.unregister_pending(request_id).await;
                 yield Err(anyhow::Error::from(MeshInferenceError::Transport(err)));
                 return;
             }
 
+            // First-token latency for the borrow path — issue #132's acceptance
+            // criteria name a sub-300ms budget on a LAN-local trusted chain.
+            // Not wired into Goose's own TurnStats (mesh is a coarse relay,
+            // no `time_to_first_token_ms` from the backing provider), so this
+            // is a standalone log line rather than reusing that plumbing.
+            let mut first_token_logged = false;
+
             loop {
                 match tokio::time::timeout(self.service.chunk_timeout, replies.recv()).await {
                     Ok(Some(chunk)) => match chunk.kind {
-                        Some(ChunkKind::Text(text)) => yield Ok(StreamToken::Text(text)),
+                        Some(ChunkKind::Text(text)) => {
+                            if !first_token_logged {
+                                first_token_logged = true;
+                                tracing::info!(
+                                    peer = %peer,
+                                    ttft_ms = sent_at.elapsed().as_millis() as u64,
+                                    "mesh: borrow first-token latency"
+                                );
+                            }
+                            yield Ok(StreamToken::Text(text));
+                        }
                         Some(ChunkKind::Usage(usage)) => {
+                            // Borrow side: we owe `peer` — record_borrowed, not record_lent.
                             let _ = self
                                 .service
                                 .usage_tally
-                                .record_usage(peer, TokenCount::new(usage.completion_tokens as u64))
+                                .record_borrowed(peer, TokenCount::new(usage.completion_tokens as u64))
                                 .await;
+                            // Spends down the balance select_peer checked.
+                            // Rate 0 = not configured yet, so this no-ops.
+                            let rate = self
+                                .service
+                                .settings_repo
+                                .get()
+                                .await
+                                .map(|s| s.mesh_settlement_millisats_per_token)
+                                .unwrap_or(0);
+                            if rate > 0 {
+                                let spent = usage.completion_tokens as u64 * rate;
+                                if let Err(err) = self
+                                    .service
+                                    .credit_ledger
+                                    .debit(peer, Millisats::new(spent))
+                                    .await
+                                {
+                                    // Log only — don't fail a response already streamed in full.
+                                    tracing::warn!(
+                                        "mesh: failed to debit {peer} {spent} msat: {err}"
+                                    );
+                                }
+                            }
                             yield Ok(StreamToken::Usage(UsageStats {
                                 prompt_tokens: usage.prompt_tokens,
                                 completion_tokens: usage.completion_tokens,
@@ -177,7 +220,7 @@ impl LlmProvider for MeshInferenceProvider {
                     }
                 }
             }
-            self.service.unregister_pending(request_id).await;
+            // `_pending_guard` drops here (or earlier) and unregisters `request_id`.
         })
     }
 }
