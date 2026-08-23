@@ -28,6 +28,7 @@ mod llm_memory_consolidator;
 mod llm_memory_extractor;
 mod mdns_advertiser;
 mod model_download;
+mod node_path;
 mod ports;
 mod reqwest_model_downloader;
 mod schedule_executors;
@@ -345,8 +346,15 @@ enum SkillAction {
     },
     /// Add a new skill (reads content from --content or stdin)
     Add {
-        /// Unique skill slug (e.g. "morning_brief", "light_control")
+        /// Unique skill name (e.g. "Morning Briefing", "Light Control")
         name: String,
+        /// Short description of what the skill does and when it applies.
+        /// Always visible to the model, so keep it brief.
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Icon key from the desktop app's skill-icon set (cosmetic only).
+        #[arg(long, default_value = "sparkles")]
+        icon: String,
         /// Markdown instruction content. Omit to read from stdin.
         #[arg(long)]
         content: Option<String>,
@@ -410,6 +418,14 @@ enum MemoryAction {
 }
 
 fn main() -> Result<()> {
+    // Before the runtime exists, so this is genuinely single-threaded, and
+    // before any child is spawned — which is the only moment it can help. A
+    // GUI-launched process inherits launchd's bare PATH, so nvm's node is
+    // invisible to it and both the Matter controller and the stdio extensions
+    // fail with "not found in PATH". Logged rather than reported: nothing is
+    // wrong yet, and the subsystems that need Node say so themselves if it
+    // turns out not to be there at all.
+    node_path::ensure_node_on_path();
     // Name the TLS provider before anything can ask rustls to guess.
     //
     // This workspace enables BOTH of rustls' crypto backends without meaning
@@ -2844,7 +2860,7 @@ async fn run_server(
     // controller is reachable, else the logging stub.
     //
     // Which of the two is live is the runtime's decision and can change at any
-    // moment, because `matter_enabled` is a user-facing toggle rather than a
+    // moment, because the controller can come and go at runtime rather than being a
     // boot-time constant. `device_control` is therefore a facade — one `Arc`
     // that the agent, the MCP server, and the tool wiring hold for the life of
     // the process while the backend behind it is swapped underneath.
@@ -2856,8 +2872,15 @@ async fn run_server(
         Option<Arc<dyn pond_core::user_data::ports::matter_runtime::MatterRuntimePort>>;
     type DeviceControl = Arc<dyn pond_core::user_data::ports::device_control::DeviceControlPort>;
 
+    // The concrete runtime is kept alongside the trait object because
+    // `attach_notifications` is an adapter concern, not part of `MatterRuntimePort`:
+    // putting it on the port would make every mock and stub in the workspace
+    // answer for a method that only one implementation has any use for.
     #[cfg(feature = "goose-agent")]
-    let (matter_runtime, device_control): (MatterRuntimeHandle, DeviceControl) = {
+    let (matter_concrete, device_control): (
+        Option<Arc<pond_adapters_matter::MatterRuntime>>,
+        DeviceControl,
+    ) = {
         // The bridge holds only a bus handle, so persistence is attached to the
         // handle (#90): the decorator records each BusEvent::Sensor before
         // forwarding it, giving Matter readings the same persist-before-publish
@@ -2884,15 +2907,16 @@ async fn run_server(
         let control = runtime.device_control(Arc::new(
             pond_infra::logging_device_control::LoggingDeviceControl::new(),
         ));
-        // Converge to the persisted setting. Returns immediately by design: a
-        // first enable installs and starts a controller, and serving must not
-        // wait minutes on that. The Devices tab shows the progress.
-        runtime.apply(
-            settings.matter_enabled,
-            settings.matter_ws_url.trim().to_string(),
-        );
-        (Some(runtime as Arc<dyn MatterRuntimePort>), control)
+        // NOT converged here: `apply` waits until the notification sender exists
+        // further down, so a first-run controller install can tell the user it
+        // has started. See the `matter.attach_notifications` call below.
+        (Some(runtime), control)
     };
+
+    #[cfg(feature = "goose-agent")]
+    let matter_runtime: MatterRuntimeHandle = matter_concrete
+        .clone()
+        .map(|runtime| runtime as Arc<dyn MatterRuntimePort>);
 
     #[cfg(not(feature = "goose-agent"))]
     let (matter_runtime, device_control): (MatterRuntimeHandle, DeviceControl) = (
@@ -3014,6 +3038,8 @@ async fn run_server(
             session_storage.clone(),
             Some(device_control.clone()),
             settings.schedule_max_concurrent,
+            tts.clone(),
+            Some(settings_repo.clone()),
         ));
         deferred_executor
             .init(
@@ -3424,6 +3450,41 @@ async fn run_server(
         targeted_notification_sender.clone();
     // Let the `send_notification` MCP tool reach connected phones too (#99).
     pond_mcp_server::init_notification_sender(notification_sender.clone());
+
+    // Matter can now tell the user things, so converge it (#195). Deferred to
+    // here rather than left beside the runtime's construction because the first
+    // enable on a fresh install downloads and installs a controller, which
+    // legitimately takes minutes: without a sender attached first, the one
+    // notification explaining that wait would be sent into nothing.
+    //
+    // Still returns immediately — serving must not wait on the install, and the
+    // Devices tab shows the progress.
+    #[cfg(feature = "goose-agent")]
+    if let Some(matter) = &matter_concrete {
+        matter
+            .attach_notifications(notification_sender.clone())
+            .await;
+        matter.apply(settings.matter_ws_url.trim().to_string());
+
+        // Bounded, so the Matter lines belong to the startup log rather than
+        // arriving after the "listening" banner as though something had
+        // restarted. Free when Matter is off, a second or two when its
+        // controller is already installed, and abandoned rather than waited out
+        // on a first run — which is the only case that takes minutes, and the
+        // one the Devices tab is already reporting progress for.
+        const MATTER_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+        let settled = matter.settle(MATTER_STARTUP_GRACE).await;
+        if matches!(
+            settled.state,
+            pond_core::user_data::ports::matter_runtime::MatterState::Connecting
+        ) {
+            tracing::info!(
+                target: "giap::trace",
+                kind = "matter_startup_deferred",
+                "matter: still starting; continuing without waiting for it"
+            );
+        }
+    }
 
     // Bridge schedule completion/failure events to push notifications (#99), so a
     // reminder/scheduled task surfaces on the phone, not just the dashboard.
@@ -8620,7 +8681,12 @@ async fn run_skills_cmd(action: SkillAction) -> Result<()> {
             }
         }
 
-        SkillAction::Add { name, content } => {
+        SkillAction::Add {
+            name,
+            description,
+            icon,
+            content,
+        } => {
             use pond_core::user_data::domain::skill::UserSkill;
 
             let content = match content {
@@ -8641,10 +8707,16 @@ async fn run_skills_cmd(action: SkillAction) -> Result<()> {
             let skill = UserSkill {
                 id: id.clone(),
                 name: name.clone(),
+                description,
+                icon,
                 content,
                 active: true,
                 created_at: chrono::Utc::now().to_rfc3339(),
             };
+            if let Err(e) = skill.validate() {
+                eprintln!("Invalid skill: {e}");
+                std::process::exit(1);
+            }
             repo.create(&skill).await?;
             println!("✓ Skill '{name}' created (id: {id})");
         }

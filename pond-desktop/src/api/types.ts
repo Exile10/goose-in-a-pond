@@ -277,8 +277,11 @@ export interface Settings {
   vision_fps?: number;
   vision_motion_threshold?: number;
 
-  // Matter (smart-home fabric) — surfaced in the Devices tab
-  matter_enabled?: boolean;
+  // Matter (smart-home fabric). `matter_enabled` is gone, not just absent from
+  // this type: the integration runs by default and installs its own controller,
+  // so there was nothing left for the field to mean. A stored row from before
+  // the removal is ignored on read rather than honoured, because an install that
+  // had it off would otherwise have no way back once the toggle went.
   matter_ws_url?: string;
 
   // Inference stats display
@@ -431,6 +434,8 @@ export interface Schedule {
   name: string;
   label?: string;
   cron: string;
+  /** Set when this schedule is a one-shot: fires once at this instant, then never again. */
+  fire_at?: string | null;
   prompt: string;
   enabled: boolean;
   timezone?: string;
@@ -663,6 +668,9 @@ export interface ContextIndexRebuild {
 export interface UserSkill {
   id: string;
   name: string;
+  description: string;
+  /** Icon key from SKILL_ICONS (Skills.tsx) — cosmetic only. */
+  icon: string;
   content: string;
   active: boolean;    // backend field name
   enabled?: boolean;  // alias — some code uses this; prefer active

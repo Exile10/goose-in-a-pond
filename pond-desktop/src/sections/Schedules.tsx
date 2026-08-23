@@ -163,6 +163,22 @@ function parseCronToConfig(cron: string): { repeat: RepeatPattern; config: Sched
   return { repeat: "custom", config: { ...cfg, customCron: cron } };
 }
 
+/** Resolve a schedule's repeat pattern + picker config, honoring `fire_at` — a
+ *  one-shot's cron is the "@once" sentinel, which `parseCronToConfig` cannot
+ *  parse into anything meaningful. */
+function scheduleToConfig(s: Schedule): { repeat: RepeatPattern; config: ScheduleConfig } {
+  if (!s.fire_at) return parseCronToConfig(s.cron);
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: s.timezone || "UTC",
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+  }).formatToParts(new Date(s.fire_at));
+  const hour = parseInt(parts.find((p) => p.type === "hour")?.value ?? "0", 10) % 24;
+  const minute = parseInt(parts.find((p) => p.type === "minute")?.value ?? "0", 10);
+  return { repeat: "once", config: { ...defaultConfig(), hour, minute } };
+}
+
 /* ── Recipe / prompt presets ───────────────────────────────── */
 const RECIPE_PRESETS: Record<string, string> = {
   "Morning briefing":     "Give me a morning briefing: weather, calendar, and top news.",
@@ -394,6 +410,7 @@ export function Schedules() {
         prompt: prompt.trim(),
         timezone,
         enabled: true,
+        once: repeat === "once",
       });
       setName("");
       setCron("");
@@ -417,11 +434,12 @@ export function Schedules() {
     if (!editingSchedule) return;
     setSubmitting(true);
     try {
-      const patch: Record<string, string> = {};
+      const patch: { name?: string; cron?: string; prompt?: string; timezone?: string; once?: boolean } = {};
       if (name.trim()) patch.name = name.trim();
       if (pickerCron.trim()) patch.cron = pickerCron.trim();
       if (prompt.trim()) patch.prompt = prompt.trim();
       if (timezone) patch.timezone = timezone;
+      patch.once = repeat === "once";
       await api.updateSchedule(editingSchedule.id, patch);
       setEditingSchedule(null);
       setShowForm(false);
@@ -502,6 +520,17 @@ export function Schedules() {
   function closeModal() {
     setShowForm(false);
     setEditingSchedule(null);
+  }
+
+  function startEdit(s: Schedule) {
+    const parsed = scheduleToConfig(s);
+    setName(s.name);
+    setPrompt(s.prompt);
+    setTimezone(s.timezone ?? "UTC");
+    setRepeat(parsed.repeat);
+    setSchedCfg(parsed.config);
+    setEditingSchedule(s);
+    setShowForm(true);
   }
 
   /* ── Create / Edit form modal overlay ───────────────────── */
@@ -836,6 +865,7 @@ export function Schedules() {
           <Button
             size="sm"
             variant="secondary"
+            className="page-header-btn"
             onPress={() => setShowRoutineForm(true)}
           >
             <Plus size={14} /> New Routine
@@ -843,6 +873,7 @@ export function Schedules() {
           <Button
             size="sm"
             variant="primary"
+            className="page-header-btn"
             isDisabled={!state.serverOnline}
             onPress={() => setShowForm(true)}
           >
@@ -877,7 +908,7 @@ export function Schedules() {
             <h2 className="sched-section__title">Schedules</h2>
             <span className="sched-section__sub">Time-triggered · runs automatically</span>
           </div>
-          <ScheduleCalendar schedules={schedules} />
+          <ScheduleCalendar schedules={schedules} onEdit={startEdit} />
         </>
       ) : (
         <>
@@ -889,7 +920,7 @@ export function Schedules() {
         <div className="sched-grid">
           {schedules.slice(0, visibleCount).map((s) => {
             const isRunning = runningIds.has(s.id);
-            const parsed = parseCronToConfig(s.cron);
+            const parsed = scheduleToConfig(s);
             const timePreview = humanPreview(parsed.repeat, parsed.config, s.timezone ?? "UTC");
             const statusClass = isRunning ? "sched-card__chip--running" : s.enabled ? "sched-card__chip--active" : "sched-card__chip--paused";
             const statusLabel = isRunning ? "Running" : s.enabled ? "Active" : "Paused";
@@ -949,15 +980,7 @@ export function Schedules() {
                     className="sched-card__action-btn"
                     disabled={!state.serverOnline}
                     aria-label="Edit schedule"
-                    onClick={() => {
-                      setName(s.name);
-                      setPrompt(s.prompt);
-                      setTimezone(s.timezone ?? "UTC");
-                      setRepeat(parsed.repeat);
-                      setSchedCfg(parsed.config);
-                      setEditingSchedule(s);
-                      setShowForm(true);
-                    }}
+                    onClick={() => startEdit(s)}
                   >
                     <Pencil size={11} /> Edit
                   </button>

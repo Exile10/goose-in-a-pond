@@ -479,6 +479,7 @@ mod tests {
             scheduler
                 .create_task(CreateScheduleRequest {
                     fire_at: None,
+                    once: false,
                     id: "rule-e2e".into(),
                     label: "Backyard motion".into(),
                     cron: "@event".into(),
@@ -565,6 +566,7 @@ mod tests {
                 scheduler
                     .create_task(CreateScheduleRequest {
                         fire_at: None,
+                        once: false,
                         id: "hourly-rule".into(),
                         label: "Backyard motion".into(),
                         cron: "@event".into(),
@@ -632,6 +634,7 @@ mod tests {
             scheduler
                 .create_task(CreateScheduleRequest {
                     fire_at: None,
+                    once: false,
                     id: "control-rule".into(),
                     label: "Control".into(),
                     cron: "@event".into(),

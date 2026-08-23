@@ -44,6 +44,22 @@ pub struct DeviceStatePatch {
     /// Covering position as a 0–100 percentage **open** (100 = fully open).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<u8>,
+    /// Slat angle as a 0–100 percentage **open**, a covering's second axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tilt: Option<u8>,
+    /// The named setting that changed, and what it became.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ModeChange>,
+    /// The operation that was run: start, stop, pause or resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+}
+
+/// A named setting and its new value, both in the device's own words.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModeChange {
+    pub setting: String,
+    pub value: String,
 }
 
 /// Outcome of a control action.
@@ -61,6 +77,101 @@ impl DeviceControlOutcome {
             applied,
         }
     }
+}
+
+/// One thing a device currently is: `spin speed` is `High`.
+///
+/// `name` is always a name [`DeviceDescription`] also uses — a control verb for a
+/// scalar, a setting name for a selectable — so a reading names the thing that
+/// changes it, and reading leads to acting without a second lookup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateValue {
+    pub name: String,
+    pub value: String,
+}
+
+/// Everything a device currently reports.
+///
+/// The counterpart to [`DeviceDescription`]: that says what a device can be told to
+/// do, this says what it is doing. Without it the only way to learn a device's state
+/// was to change it, and "is the washer running?" had no answer that did not involve
+/// starting the washer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceState {
+    pub device_id: String,
+    pub values: Vec<StateValue>,
+}
+
+/// What a device can be told to do and what it measures, in its own terms.
+///
+/// `Device::capabilities` is a list of verb names — enough to know a fan has a
+/// speed, not enough to drive it. It cannot say which modes that fan has, what a
+/// thermostat's limits are, or that an air quality sensor measures eleven
+/// substances. An agent given only the list guesses, and learns the limits by
+/// failing at them in front of the user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceDescription {
+    pub device_id: String,
+    pub device_type: String,
+    /// Verbs the device accepts, named as this port names them.
+    pub capabilities: Vec<Capability>,
+    /// What it measures, whether or not it has reported yet.
+    pub sensors: Vec<SensorSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Capability {
+    pub verb: String,
+    /// Which named setting this is, for a verb a device offers more than once.
+    ///
+    /// A washer has four `mode` capabilities — wash cycle, temperature level, spin
+    /// speed, rinses — and this is the name that tells them apart, and the same name
+    /// [`DeviceControlPort::set_mode`] is called with. Absent for a verb a device can
+    /// only have one of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setting: Option<String>,
+    pub value: ValueSpec,
+}
+
+/// The shape a verb accepts. A constraint is present only when the device stated
+/// it: an invented range is worse than an absent one, because it is believed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ValueSpec {
+    Boolean,
+    /// 0–100.
+    Percent,
+    Number {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<f64>,
+        /// The increment the device accepts, where it states one. A dishwasher
+        /// taking 49 to 82 degrees in whole degrees will refuse 50.5.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unit: Option<String>,
+        /// What this range is true of, where it is not true always.
+        ///
+        /// A thermostat's limits belong to whichever setpoint its mode has live, so
+        /// the same device answers 7 to 23.5 while heating and 16 to 32 while
+        /// cooling. Stated bare, the number reads as a fact about the device and
+        /// goes stale the moment the mode changes — and it hides that the device
+        /// reaches higher elsewhere. Absent for anything whose limits do not move.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when: Option<String>,
+    },
+    Enum {
+        values: Vec<String>,
+    },
+    Color,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SensorSpec {
+    pub sensor_type: String,
+    pub unit: String,
 }
 
 /// Driven Port: actuate a smart device.
@@ -107,6 +218,58 @@ pub trait DeviceControlPort: Send + Sync {
     /// device, which is exactly what a user asking for "auto" wants.
     async fn set_fan_mode(&self, device_id: &str, _mode: &str) -> Result<DeviceControlOutcome> {
         anyhow::bail!("device '{device_id}' does not support fan modes")
+    }
+
+    /// What this device can be told to do, and what it measures.
+    ///
+    /// Optional like the verbs below: a transport that cannot ask a device about
+    /// itself says so rather than inventing an answer. The Matter adapter reads
+    /// it live from the controller, so it reflects the device as it is now
+    /// rather than as it was when it was paired.
+    async fn describe(&self, device_id: &str) -> Result<DeviceDescription> {
+        anyhow::bail!("device '{device_id}' does not describe itself")
+    }
+
+    /// What this device currently is.
+    ///
+    /// Optional in the same way the verbs below are: a backend that cannot read a
+    /// device's state says so rather than returning an empty one, which would be
+    /// indistinguishable from a device reporting nothing.
+    async fn state(&self, device_id: &str) -> Result<DeviceState> {
+        anyhow::bail!("device '{device_id}' cannot report its state")
+    }
+
+    /// Choose a named setting — a wash cycle, a spin speed, a temperature level.
+    ///
+    /// One verb rather than one per appliance: Matter's appliance controls are
+    /// nearly all the same shape, a list of choices the device publishes. The
+    /// setting name and the value both come from [`Self::describe`], so what is
+    /// describable is callable.
+    async fn set_mode(
+        &self,
+        device_id: &str,
+        _setting: &str,
+        _value: &str,
+    ) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' has no settings that can be chosen")
+    }
+
+    /// Start, stop, pause or resume a device that runs cycles.
+    async fn set_operation(
+        &self,
+        device_id: &str,
+        _operation: &str,
+    ) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' does not run cycles")
+    }
+
+    /// Set a covering's slat angle, as a 0–100 percentage **open**.
+    ///
+    /// Separate from [`Self::set_position`] because they are separate axes: how far
+    /// a blind is lowered and how far its slats are turned. A venetian blind is
+    /// routinely down with its slats open, and position alone cannot ask for that.
+    async fn set_tilt(&self, device_id: &str, _percent_open: u8) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' does not support tilt")
     }
 
     /// Set a covering (blind/curtain/shade) position, as a 0–100 percentage

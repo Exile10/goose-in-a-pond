@@ -185,7 +185,7 @@ fn commission_request() -> Request<Body> {
 }
 
 #[tokio::test]
-async fn commissioning_while_off_says_where_to_turn_matter_on() {
+async fn commissioning_while_matter_is_unavailable_does_not_send_the_user_looking_for_a_control() {
     let (app, _, _tmp) = make_app(Some(Arc::new(StubMatterRuntime::disabled()))).await;
 
     let response = app.oneshot(commission_request()).await.unwrap();
@@ -195,12 +195,25 @@ async fn commissioning_while_off_says_where_to_turn_matter_on() {
         .as_str()
         .unwrap()
         .to_string();
-    // The old message pointed at Settings, where no such control existed.
+
+    // This assertion has now been wrong twice in the same way, which is the
+    // reason it no longer names a place. It first pinned "Settings", where no
+    // such control existed; it was corrected to "Devices tab", and then the
+    // matter.js controller work deleted the Matter toggle from that tab too --
+    // so the test went on enforcing a message that pointed at a switch nobody
+    // could find. `Disabled` is now only reachable on a build with no Matter
+    // support compiled in, where the honest answer names the build.
+    for absent in ["Settings", "Devices tab", "turn it on"] {
+        assert!(
+            !error.contains(absent),
+            "the message sends the user hunting for a control that does not exist ({absent}): \
+             {error}"
+        );
+    }
     assert!(
-        error.contains("Devices tab"),
-        "the message must name a control that exists: {error}"
+        error.contains("compiled in"),
+        "the message must say why Matter is unavailable: {error}"
     );
-    assert!(!error.contains("Settings"), "not Settings: {error}");
 }
 
 /// The headline bug: an enabled Matter whose controller is down used to report
@@ -224,7 +237,7 @@ async fn an_unreachable_controller_is_not_reported_as_disabled() {
         .unwrap()
         .to_string();
     assert!(error.contains("connection refused"), "{error}");
-    assert!(error.contains("ws://127.0.0.1:5580/ws"), "{error}");
+    assert!(error.contains("ws://127.0.0.1:5580/giap"), "{error}");
     assert!(
         !error.contains("not enabled") && !error.contains("is off"),
         "it is enabled — do not say otherwise: {error}"
@@ -295,7 +308,7 @@ async fn status_reports_the_state_and_its_failure_reason() {
     assert_eq!(body["state"], "unreachable");
     assert_eq!(body["enabled"], true);
     assert_eq!(body["error"], "no route to host");
-    assert_eq!(body["url"], "ws://127.0.0.1:5580/ws");
+    assert_eq!(body["url"], "ws://127.0.0.1:5580/giap");
 }
 
 /// The whole point of the change: saving the setting reconfigures the running
@@ -311,8 +324,7 @@ async fn saving_the_setting_reconciles_the_runtime_without_a_restart() {
             Method::PUT,
             "/api/v1/settings",
             Some(serde_json::json!({
-                "matter_enabled": true,
-                "matter_ws_url": "ws://127.0.0.1:5580/ws",
+                "matter_ws_url": "ws://127.0.0.1:5580/giap",
             })),
         ))
         .await
@@ -321,7 +333,7 @@ async fn saving_the_setting_reconciles_the_runtime_without_a_restart() {
 
     assert_eq!(
         matter.unwrap().applied(),
-        vec![(true, "ws://127.0.0.1:5580/ws".to_string())],
+        vec!["ws://127.0.0.1:5580/giap".to_string()],
         "the save must ask the runtime to converge"
     );
 }
@@ -368,7 +380,10 @@ async fn deleting_a_matter_device_while_off_refuses_with_the_honest_reason() {
         .as_str()
         .unwrap()
         .to_string();
-    assert!(error.contains("Devices tab"), "{error}");
+    // See the commissioning test above: there is no Matter control to point at
+    // any more, so the refusal names the build instead of a tab.
+    assert!(error.contains("compiled in"), "{error}");
+    assert!(!error.contains("Devices tab"), "{error}");
 }
 
 /// This endpoint takes a patch over the whole of Settings, so the Matter check
@@ -376,21 +391,19 @@ async fn deleting_a_matter_device_while_off_refuses_with_the_honest_reason() {
 /// unrelated save.
 ///
 /// The fixture is the point. It used to store a perfectly valid
-/// `ws://127.0.0.1:5580/ws` while its comment claimed to be testing "no
+/// `ws://127.0.0.1:5580/giap` while its comment claimed to be testing "no
 /// address", so the validation branch it exists for was never reached and the
 /// test passed with `touches_matter &&` deleted from the guard. Seeding the
-/// repository directly is the only way in: the API now rejects
-/// `matter_enabled: true` with a blank URL, which is exactly why a row in that
-/// shape can only be a legacy one.
+/// repository directly is the only way in: the API rejects a blank URL, which
+/// is exactly why a row in that shape can only be a legacy one.
 #[tokio::test]
 async fn a_save_that_does_not_touch_matter_is_not_blocked_by_it() {
     let runtime = Arc::new(StubMatterRuntime::disabled());
     let (app, matter, settings_repo, _tmp) = make_app_with_settings(Some(runtime)).await;
 
     // The shape an install upgraded from the headless-knob era can be in, and
-    // which no API call can produce: enabled, with no address.
+    // which no API call can produce: no address at all.
     let mut stored = settings_repo.get().await.unwrap();
-    stored.matter_enabled = true;
     stored.matter_ws_url = String::new();
     settings_repo.update(&stored).await.unwrap();
 

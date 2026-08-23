@@ -2689,6 +2689,7 @@ impl GooseAdapter {
         giap_session_id: &str,
         first_message: &str,
         memories: &str,
+        skills: &str,
         scope: &ProfileScope,
     ) -> SessionGroups {
         use pond_core::mcp::services::tool_selection as sel;
@@ -2748,10 +2749,12 @@ impl GooseAdapter {
         }
 
         let available: Vec<String> = permitted.clone();
-        // Two signals, scored independently and merged with max. Concatenating
+        // Three signals, scored independently and merged with max. Concatenating
         // them let a kilobyte of memories drown a short question — see
-        // `selection_signals`.
-        let signals = sel::selection_signals(first_message, memories);
+        // `selection_signals`. The skills signal exists so an active skill can
+        // pull in the tool groups its own instructions call for, independent of
+        // whatever the opening message happened to say.
+        let signals = sel::selection_signals(first_message, memories, skills);
 
         // Score, or fall back to every group. Both the "no group embeddings" and
         // the "embedding this signal failed" paths widen — the asymmetry is
@@ -3468,14 +3471,34 @@ impl GooseAdapter {
             }
         }
 
+        // Progressive disclosure, matching goose's own Agent Skills: only
+        // name + description sit in the prompt on every turn. Full
+        // instructions are loaded on demand via `giap-device__load_skill`
+        // (see `device.rs`), so an active skill no longer costs a full
+        // `MAX_CONTENT_LEN` on every turn regardless of relevance.
+        //
+        // The same name+description text also becomes a tool-selection
+        // signal below (6c) — a skill whose instructions call for tools
+        // outside the session's opening-message-scored groups (e.g. a
+        // "task reminder" skill needing `giap-schedule`) would otherwise
+        // never see those tools, no matter how clearly it says to use them.
+        let mut skill_selection_signal = String::new();
         if let Ok(skills) = skills_result {
-            for skill in skills {
-                let key = format!("skill:{}", skill.name);
-                let body = format!(
-                    "<extension-notes name=\"{}\">\n{}\n</extension-notes>",
-                    key, skill.content
+            if !skills.is_empty() {
+                let mut skills_body = String::from(
+                    "Active user-defined skills, as \"name: description\". When one looks \
+                     relevant to what the user is asking, call giap-device__load_skill(name) \
+                     to get its full instructions before acting on it.",
                 );
-                shim_appendix.push(body);
+                for skill in &skills {
+                    skills_body.push_str(&format!("\n- {}: {}", skill.name, skill.description));
+                    skill_selection_signal
+                        .push_str(&format!("{}: {}\n", skill.name, skill.description));
+                }
+                shim_appendix.push(format!(
+                    "<extension-notes name=\"skills\">\n{}\n</extension-notes>",
+                    skills_body
+                ));
             }
         }
 
@@ -3745,6 +3768,7 @@ impl GooseAdapter {
                     &session_id,
                     &request.message,
                     &memory_block_for_user_msg,
+                    &skill_selection_signal,
                     &turn_scope,
                 )
                 .await;

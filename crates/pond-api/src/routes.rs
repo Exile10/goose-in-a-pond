@@ -3761,11 +3761,16 @@ async fn matter_commissioner(
     };
 
     Err(match status.state {
+        // Reachable only on a build without the Matter feature, since the
+        // toggle that used to produce this state is gone. Naming the build is
+        // the only actionable thing left to say: there is no switch to point at,
+        // and telling someone to find one costs them the trip.
         MatterState::Disabled => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
-                "error": "Matter is off on this Pond. Turn it on in the Matter section \
-                          of the Devices tab, then try again."
+                "error": "This build of GIAP has no Matter support compiled in, so there \
+                          is nothing to turn on. Reinstall with the default features to \
+                          use Matter devices."
             })),
         ),
         MatterState::Connecting => (
@@ -4468,20 +4473,17 @@ async fn update_settings(
     // model) until someone fixed a field they were not touching.
     let touches_matter = patch
         .as_object()
-        .is_some_and(|o| o.contains_key("matter_enabled") || o.contains_key("matter_ws_url"));
+        .is_some_and(|o| o.contains_key("matter_ws_url"));
     let matter_url = merged.matter_ws_url.trim();
-    if touches_matter
-        && merged.matter_enabled
-        && !(matter_url.starts_with("ws://") || matter_url.starts_with("wss://"))
-    {
+    if touches_matter && !(matter_url.starts_with("ws://") || matter_url.starts_with("wss://")) {
         // An empty address and a malformed one are different mistakes and read
         // as different sentences: "empty" tells the user the field they are
         // looking at is blank, which the placeholder otherwise hides.
         let message = if matter_url.is_empty() {
             "Controller address is empty. Enter the Matter controller's WebSocket URL, \
-             for example ws://127.0.0.1:5580/ws"
+             for example ws://127.0.0.1:5580/giap"
         } else {
-            "Controller address must be a WebSocket URL, for example ws://127.0.0.1:5580/ws"
+            "Controller address must be a WebSocket URL, for example ws://127.0.0.1:5580/giap"
         };
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -4580,19 +4582,15 @@ async fn update_settings(
     // controller. The reconciler treats "enabled but not yet Connected" as
     // needing a restart, so an unconditional send meant that ANY unrelated
     // save during the first controller install — renaming the home, changing a
-    // model — tore down a multi-minute `pip install` and started it again.
+    // model — tore down a multi-minute dependency install and started it again.
     // Repeat that a few times and the Devices panel sits on "Starting..."
     // forever.
     //
-    // Retry from the Devices tab still works: `saveMatter` sends
-    // `matter_enabled` and `matter_ws_url` explicitly, so it is a
-    // `touches_matter` save by construction.
+    // Retry from the Devices tab still works: it sends `matter_ws_url`
+    // explicitly, so it is a `touches_matter` save by construction.
     if touches_matter {
         if let Some(matter) = &state.matter {
-            matter.apply(
-                merged.matter_enabled,
-                merged.matter_ws_url.trim().to_string(),
-            );
+            matter.apply(merged.matter_ws_url.trim().to_string());
         }
     }
 
@@ -9060,6 +9058,10 @@ struct ApiCreateScheduleRequest {
     kind: Option<TaskKind>,
     /// Legacy field: `{"webhook_url": "..."}` or `{"prompt": "..."}`.
     payload: Option<serde_json::Value>,
+    /// Fire once at `cron`'s next occurrence instead of recurring — see
+    /// [`pond_core::user_data::ports::scheduler::CreateScheduleRequest::once`].
+    #[serde(default)]
+    once: bool,
 }
 
 /// `POST /api/v1/schedules` — create a new scheduled task.
@@ -9122,6 +9124,7 @@ async fn create_schedule(
 
     let req = CreateScheduleRequest {
         fire_at: None,
+        once: api_req.once,
         id: api_req
             .id
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
@@ -9186,6 +9189,8 @@ async fn update_schedule(
         cron: api_req.cron,
         timezone: api_req.timezone,
         kind,
+        fire_at: api_req.fire_at,
+        once: api_req.once,
     };
 
     match scheduler.update_task(&id, req).await {
@@ -9201,6 +9206,14 @@ struct ApiUpdateScheduleRequest {
     cron: Option<String>,
     timezone: Option<String>,
     prompt: Option<String>,
+    /// Fire ONCE at this instant instead of recurring — see
+    /// [`pond_core::user_data::ports::scheduler::UpdateScheduleRequest::fire_at`].
+    #[serde(default)]
+    fire_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fire once at `cron`'s next occurrence instead of recurring — see
+    /// [`pond_core::user_data::ports::scheduler::UpdateScheduleRequest::once`].
+    #[serde(default)]
+    once: bool,
 }
 
 /// `POST /api/v1/schedules/:id/pause` — pause a scheduled task.
@@ -9480,6 +9493,7 @@ async fn create_rule(
     // handler's — see `SensorTriggerSpec::validate`.
     let create = CreateScheduleRequest {
         fire_at: None,
+        once: false,
         id: req.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
         label: req.name,
         cron: RULE_CRON.to_string(),
@@ -9556,6 +9570,8 @@ async fn update_rule(
         cron: None,
         timezone: None,
         kind: Some(TaskKind::SensorTrigger(req.spec)),
+        fire_at: None,
+        once: false,
     };
     match scheduler.update_task(&id, update).await {
         Ok(task) => match rule_view(&task) {
@@ -11806,19 +11822,99 @@ async fn music_now_playing_handler(State(state): State<Arc<AppState>>) -> axum::
         .into_response();
     }
 
-    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    let mut body: serde_json::Value = resp.json().await.unwrap_or_default();
+
+    // Spotify's `/me/player/currently-playing` frequently omits `item` for
+    // podcast episodes even though `currently_playing_type` correctly says
+    // "episode" — a known gap in Spotify's own API, not something this
+    // request got wrong. `/me/player` (the fuller playback-state endpoint)
+    // sometimes has what the leaner one didn't, so it is worth one extra
+    // call, but only in the case that actually needs it.
+    if body["item"].is_null() {
+        if let Ok(full_resp) = spotify_api_call(&state, reqwest::Method::GET, "/me/player").await {
+            if full_resp.status().is_success() {
+                if let Ok(full_body) = full_resp.json::<serde_json::Value>().await {
+                    if !full_body["item"].is_null() {
+                        body = full_body;
+                    }
+                }
+            }
+        }
+    }
+    if body["item"].is_null() {
+        tracing::debug!(
+            playing_type = body["currently_playing_type"].as_str().unwrap_or(""),
+            "Spotify now-playing: item still null after the /me/player fallback"
+        );
+    }
+
+    Json(now_playing_snapshot(&body)).into_response()
+}
+
+/// Shape a Spotify `/me/player/currently-playing` (or `/me/player`) body into
+/// the JSON the dashboard widget expects. Pure and synchronous on purpose —
+/// everything network- and auth-shaped already happened in the caller, so
+/// this is the part that can be pinned with plain fixtures instead of a
+/// mocked `api.spotify.com`.
+fn now_playing_snapshot(body: &serde_json::Value) -> serde_json::Value {
     let item = &body["item"];
 
-    Json(json!({
+    // A track and a podcast episode are shaped differently: an episode has
+    // no `artists` array (so the track-shaped read below silently landed on
+    // "" for every field that mattered) and carries its own `images` rather
+    // than nesting them under `album`. Spotify names which shape `item` is
+    // in via `currently_playing_type`, so branch on that instead of assuming
+    // every playing thing is a song.
+    let playing_type = body["currently_playing_type"].as_str().unwrap_or("");
+    let (track, artist, album_art, duration_ms) = match playing_type {
+        "episode" => (
+            item["name"].as_str().unwrap_or(""),
+            item["show"]["name"].as_str().unwrap_or(""),
+            item["images"][0]["url"].as_str(),
+            item["duration_ms"].as_i64().unwrap_or(0),
+        ),
+        // "track", "ad", "unknown", or absent. An ad or an unknown type may
+        // still carry a track-shaped `item` (or none at all, in which case
+        // every `.as_str()`/`.as_i64()` below is the existing empty-default
+        // behavior — unchanged for that case).
+        _ => (
+            item["name"].as_str().unwrap_or(""),
+            item["artists"][0]["name"].as_str().unwrap_or(""),
+            item["album"]["images"][0]["url"].as_str(),
+            item["duration_ms"].as_i64().unwrap_or(0),
+        ),
+    };
+
+    // Spotify sometimes never populates `item` at all for a playing episode
+    // or ad, on either endpoint the caller tries — a gap on Spotify's side,
+    // with no further in-band workaround. An empty `track` here reads as
+    // "the widget is broken"; naming what IS known (that something is
+    // playing, and roughly what kind) is honest instead.
+    let is_playing = body["is_playing"].as_bool().unwrap_or(false);
+    let track = if track.is_empty() && is_playing {
+        match playing_type {
+            "episode" => "Podcast episode",
+            "ad" => "Advertisement",
+            _ => "Something's playing",
+        }
+    } else {
+        track
+    };
+    let artist = if artist.is_empty() && is_playing && item.is_null() {
+        "Spotify didn't share the title"
+    } else {
+        artist
+    };
+
+    json!({
         "connected": true,
-        "playing": body["is_playing"].as_bool().unwrap_or(false),
-        "track": item["name"].as_str().unwrap_or(""),
-        "artist": item["artists"][0]["name"].as_str().unwrap_or(""),
-        "album_art": item["album"]["images"][0]["url"].as_str(),
+        "playing": is_playing,
+        "track": track,
+        "artist": artist,
+        "album_art": album_art,
         "progress_ms": body["progress_ms"].as_i64().unwrap_or(0),
-        "duration_ms": item["duration_ms"].as_i64().unwrap_or(0),
-    }))
-    .into_response()
+        "duration_ms": duration_ms,
+    })
 }
 
 /// `POST /api/v1/music/control` — body `{ "action": "play"|"pause"|"next"|"previous" }`.
@@ -12446,7 +12542,15 @@ async fn list_skills(State(state): State<Arc<AppState>>) -> impl axum::response:
 #[derive(Deserialize)]
 struct CreateSkillRequest {
     name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default = "default_skill_icon")]
+    icon: String,
     content: String,
+}
+
+fn default_skill_icon() -> String {
+    "sparkles".to_string()
 }
 
 async fn create_skill(
@@ -12476,10 +12580,15 @@ async fn create_skill(
     let skill = UserSkill {
         id: Uuid::new_v4().to_string(),
         name: req.name,
+        description: req.description,
+        icon: req.icon,
         content: req.content,
         active: true,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
+    if let Err(e) = skill.validate() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    }
     match repo.create(&skill).await {
         Ok(()) => (StatusCode::CREATED, Json(json!(skill))).into_response(),
         Err(e) => (
@@ -12492,6 +12601,9 @@ async fn create_skill(
 
 #[derive(Deserialize)]
 struct UpdateSkillRequest {
+    name: Option<String>,
+    description: Option<String>,
+    icon: Option<String>,
     content: Option<String>,
     active: Option<bool>,
 }
@@ -12540,11 +12652,16 @@ async fn update_skill(
     };
     let updated = UserSkill {
         id: existing.id,
-        name: existing.name,
+        name: req.name.unwrap_or(existing.name),
+        description: req.description.unwrap_or(existing.description),
+        icon: req.icon.unwrap_or(existing.icon),
         content: req.content.unwrap_or(existing.content),
         active: req.active.unwrap_or(existing.active),
         created_at: existing.created_at,
     };
+    if let Err(e) = updated.validate() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    }
     match repo.update(&updated).await {
         Ok(()) => Json(json!(updated)).into_response(),
         Err(e) => (
@@ -16075,6 +16192,106 @@ mod tests {
         }
     }
     use super::*;
+
+    /// Shaping a Spotify playback body for the dashboard widget — the part of
+    /// `music_now_playing_handler` that stays pure and can be pinned with
+    /// hand-built fixtures instead of a mocked `api.spotify.com`.
+    mod now_playing_snapshot_tests {
+        use super::now_playing_snapshot;
+        use serde_json::json;
+
+        #[test]
+        fn a_normal_track_reads_its_own_fields() {
+            let body = json!({
+                "is_playing": true,
+                "progress_ms": 1000,
+                "currently_playing_type": "track",
+                "item": {
+                    "name": "Weightless",
+                    "artists": [{"name": "Marconi Union"}],
+                    "album": {"images": [{"url": "https://example.com/art.jpg"}]},
+                    "duration_ms": 500000,
+                },
+            });
+            let snap = now_playing_snapshot(&body);
+            assert_eq!(snap["track"], "Weightless");
+            assert_eq!(snap["artist"], "Marconi Union");
+            assert_eq!(snap["album_art"], "https://example.com/art.jpg");
+            assert_eq!(snap["duration_ms"], 500000);
+        }
+
+        /// A podcast episode has no `artists` array — reading it the
+        /// track-shaped way silently landed on "" for both fields even when
+        /// Spotify DID send episode data. Show name and its own top-level
+        /// `images` are the fix, not the `album.images` a track uses.
+        #[test]
+        fn an_episode_with_a_real_item_reads_the_show_not_an_artist() {
+            let body = json!({
+                "is_playing": true,
+                "progress_ms": 1000,
+                "currently_playing_type": "episode",
+                "item": {
+                    "name": "Episode 42: The Question",
+                    "show": {"name": "Hitchhiker's Weekly"},
+                    "images": [{"url": "https://example.com/cover.jpg"}],
+                    "duration_ms": 3600000,
+                },
+            });
+            let snap = now_playing_snapshot(&body);
+            assert_eq!(snap["track"], "Episode 42: The Question");
+            assert_eq!(snap["artist"], "Hitchhiker's Weekly");
+            assert_eq!(snap["album_art"], "https://example.com/cover.jpg");
+        }
+
+        /// The bug this whole thing exists for: Spotify reports
+        /// `currently_playing_type: "episode"` and `is_playing: true` with
+        /// `item: null` — a real, observed gap in Spotify's own API, not a
+        /// parse failure. Track/artist must read as an honest explanation,
+        /// never a blank field a user reads as "the widget is broken".
+        #[test]
+        fn an_episode_with_a_null_item_says_so_instead_of_going_blank() {
+            let body = json!({
+                "is_playing": true,
+                "progress_ms": 297926,
+                "currently_playing_type": "episode",
+                "item": null,
+            });
+            let snap = now_playing_snapshot(&body);
+            assert_eq!(snap["track"], "Podcast episode");
+            assert_eq!(snap["artist"], "Spotify didn't share the title");
+            assert_eq!(snap["album_art"], serde_json::Value::Null);
+            assert_eq!(snap["playing"], true);
+        }
+
+        #[test]
+        fn an_ad_with_a_null_item_is_named_as_an_ad() {
+            let body = json!({
+                "is_playing": true,
+                "progress_ms": 0,
+                "currently_playing_type": "ad",
+                "item": null,
+            });
+            let snap = now_playing_snapshot(&body);
+            assert_eq!(snap["track"], "Advertisement");
+        }
+
+        /// Paused (not playing) with no item must NOT get an invented label —
+        /// that fallback exists to explain an active, otherwise-silent
+        /// player, not to narrate an idle one.
+        #[test]
+        fn a_paused_null_item_stays_empty_rather_than_inventing_a_label() {
+            let body = json!({
+                "is_playing": false,
+                "progress_ms": 267736,
+                "currently_playing_type": "episode",
+                "item": null,
+            });
+            let snap = now_playing_snapshot(&body);
+            assert_eq!(snap["track"], "");
+            assert_eq!(snap["artist"], "");
+            assert_eq!(snap["playing"], false);
+        }
+    }
 
     // ── direct tool dispatch allowlist ───────────────────────────
 

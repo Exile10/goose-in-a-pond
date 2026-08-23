@@ -31,9 +31,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use pond_core::mcp::ports::notification::NotificationSender;
 use pond_core::shared::ports::event_bus::EventBus;
 use pond_core::user_data::ports::device_commissioning::DeviceCommissioningPort;
-use pond_core::user_data::ports::device_control::{DeviceControlOutcome, DeviceControlPort};
+use pond_core::user_data::ports::device_control::{
+    DeviceControlOutcome, DeviceControlPort, DeviceDescription, DeviceState,
+};
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use pond_core::user_data::ports::matter_runtime::{MatterRuntimePort, MatterState, MatterStatus};
 use tokio::sync::{watch, RwLock};
@@ -42,8 +45,9 @@ use tokio::task::JoinHandle;
 use crate::bridge::{run_matter_supervisor, SupervisorConfig};
 use crate::client::{MatterClient, MatterEvent};
 use crate::commissioning::MatterCommissioner;
-use crate::control::{MatterDeviceControl, NodeCache};
-use crate::protocol::node_id_from_device_id;
+use crate::control::MatterDeviceControl;
+use crate::notify::MatterNotifier;
+use crate::protocol::{describe, node_id_from_device_id};
 use crate::server_setup::{ensure_running, local_port_from_ws_url, SharedServerChild};
 
 /// How long to wait for a freshly installed controller to start listening.
@@ -68,7 +72,6 @@ type ControlCell = Arc<RwLock<Option<Arc<MatterDeviceControl>>>>;
 /// unreachable retries the connection.
 #[derive(Clone, PartialEq, Eq)]
 struct Desired {
-    enabled: bool,
     url: String,
     shutdown: bool,
     nonce: u64,
@@ -76,6 +79,7 @@ struct Desired {
 
 /// Reconciles the Matter integration toward the requested state.
 pub struct MatterRuntime {
+    notifier: MatterNotifier,
     desired: watch::Sender<Desired>,
     status: Arc<RwLock<MatterStatus>>,
     commissioner: Arc<RwLock<Option<Arc<dyn DeviceCommissioningPort>>>>,
@@ -95,13 +99,14 @@ impl MatterRuntime {
         bus: Arc<dyn EventBus>,
     ) -> Arc<Self> {
         let (desired, desired_rx) = watch::channel(Desired {
-            enabled: false,
             url: String::new(),
             shutdown: false,
             nonce: 0,
         });
 
+        let notifier = MatterNotifier::new();
         let runtime = Arc::new(Self {
+            notifier: notifier.clone(),
             desired,
             status: Arc::new(RwLock::new(MatterStatus::disabled())),
             commissioner: Arc::new(RwLock::new(None)),
@@ -116,6 +121,7 @@ impl MatterRuntime {
                 data_dir,
                 registry,
                 bus,
+                notifier,
                 status: runtime.status.clone(),
                 commissioner: runtime.commissioner.clone(),
                 control: runtime.control.clone(),
@@ -124,6 +130,48 @@ impl MatterRuntime {
         ));
 
         runtime
+    }
+
+    /// Wait for the reconciler to reach a settled state, or for `timeout`.
+    ///
+    /// Startup calls this so the Matter lines land with the rest of the startup
+    /// log rather than arriving after the "listening" banner, which reads as if
+    /// something restarted. `apply` is deliberately non-blocking — a first-run
+    /// install takes minutes and serving must not wait on it — so this is the
+    /// bounded compromise: settle quickly in the ordinary case, give up and let
+    /// the install continue in the background in the slow one.
+    ///
+    /// Costs nothing when Matter is off: `apply` reaches `Disabled` without
+    /// touching the network, so this returns on the first poll.
+    pub async fn settle(&self, timeout: Duration) -> MatterStatus {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let status = self.status().await;
+            // `enabled` first, and this is the whole subtlety: `apply` only
+            // SENDS to the watch channel, so for a moment after it returns the
+            // reconciler has not woken and the status is still the initial
+            // `Disabled`. Polling only for "not Connecting" saw that and
+            // returned instantly — which is why the Matter lines still landed
+            // after the banner. Waiting for the reconciler to acknowledge the
+            // request is what makes this a wait rather than a race.
+            if status.enabled && !matches!(status.state, MatterState::Connecting) {
+                return status;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Route the runtime's user-facing notifications through `sender`.
+    ///
+    /// Separate from construction because the notification stack is built after
+    /// the runtime is — see [`MatterNotifier`]. Call it before the first
+    /// [`apply`](MatterRuntimePort::apply), or a first-run install finishes
+    /// without the user ever being told it started.
+    pub async fn attach_notifications(&self, sender: Arc<dyn NotificationSender>) {
+        self.notifier.attach(sender).await;
     }
 
     /// A [`DeviceControlPort`] that follows this runtime: Matter while
@@ -143,7 +191,7 @@ impl MatterRuntime {
 
 #[async_trait]
 impl MatterRuntimePort for MatterRuntime {
-    fn apply(&self, enabled: bool, url: String) {
+    fn apply(&self, url: String) {
         let nonce = self
             .nonce
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -151,7 +199,6 @@ impl MatterRuntimePort for MatterRuntime {
         // A closed channel means the reconciler is gone (shutdown); dropping
         // the request is correct — there is nothing left to converge.
         let _ = self.desired.send(Desired {
-            enabled,
             url,
             shutdown: false,
             nonce,
@@ -175,7 +222,6 @@ impl MatterRuntimePort for MatterRuntime {
         if self
             .desired
             .send(Desired {
-                enabled: false,
                 url: String::new(),
                 shutdown: true,
                 nonce,
@@ -201,6 +247,7 @@ struct Reconciler {
     data_dir: PathBuf,
     registry: Arc<dyn DeviceRegistry + Send + Sync>,
     bus: Arc<dyn EventBus>,
+    notifier: MatterNotifier,
     status: Arc<RwLock<MatterStatus>>,
     commissioner: Arc<RwLock<Option<Arc<dyn DeviceCommissioningPort>>>>,
     control: ControlCell,
@@ -227,7 +274,6 @@ async fn reconcile_loop(mut rx: watch::Receiver<Desired>, r: Reconciler) {
     // What the running state was built from — compared against the request to
     // decide whether anything needs to change.
     let mut current = Desired {
-        enabled: false,
         url: String::new(),
         shutdown: false,
         nonce: 0,
@@ -243,16 +289,37 @@ async fn reconcile_loop(mut rx: watch::Receiver<Desired>, r: Reconciler) {
             return;
         }
 
+        // Nothing has been asked for yet.
+        //
+        // `nonce` is zero only in the channel's initial value, and every `apply`
+        // increments it — so this is the one reliable way to tell "no request"
+        // from "a request that happens to look like the default". Without it the
+        // first pass ran with an EMPTY url: `changed` is false (""=="") and
+        // `healthy` is false, so the guard below fired, `connect` bailed with
+        // "no Matter controller address is set", and the runtime sat in
+        // `Unreachable` before anyone had asked it for anything. Startup's wait
+        // then saw that as a settled state and returned instantly, which is why
+        // the Matter lines landed after the banner on some runs and before it on
+        // others — a race against a cycle that should never have happened.
+        if want.nonce == 0 {
+            if rx.changed().await.is_err() {
+                teardown(&mut running, &r).await;
+                r.stopped.notify_waiters();
+                return;
+            }
+            continue;
+        }
+
         // Idempotent by comparison, not by flag: identical values while
         // connected are a no-op, but the same values while unreachable are a
         // retry — which is what the UI's retry affordance sends.
         let healthy = r.status.read().await.state.is_connected();
-        let changed = want.enabled != current.enabled || want.url != current.url;
-        if changed || (want.enabled && !healthy) {
+        let changed = want.url != current.url;
+        if changed || !healthy {
             teardown(&mut running, &r).await;
             current = want.clone();
 
-            if want.enabled {
+            {
                 *r.status.write().await = MatterStatus {
                     enabled: true,
                     url: want.url.clone(),
@@ -276,31 +343,38 @@ async fn reconcile_loop(mut rx: watch::Receiver<Desired>, r: Reconciler) {
                                 url: want.url.clone(),
                                 state: MatterState::Connected,
                             };
-                            tracing::info!(url = %want.url, "matter: controller connected");
+                            tracing::info!(
+                                target: "giap::trace",
+                                kind = "matter_state_changed",
+                                url = %want.url,
+                                to = "connected",
+                                "matter: controller connected"
+                            );
                         }
                         Err(e) => {
+                            // `describe` and not `to_string`: this string is
+                            // the ONLY account of the failure the user gets, and
+                            // plain Display shows just the outermost context —
+                            // "connecting to the controller at ws://…" with the
+                            // reason thrown away. It is also served by
+                            // `GET /api/v1/matter/status`, hence the redaction.
+                            let error = describe(&e);
                             tracing::warn!(
+                                target: "giap::trace",
+                                kind = "matter_state_changed",
                                 url = %want.url,
-                                error = %e,
+                                to = "unreachable",
+                                error = %error,
                                 "matter: could not start or reach the controller"
                             );
                             *r.status.write().await = MatterStatus {
                                 enabled: true,
                                 url: want.url.clone(),
-                                state: MatterState::Unreachable { error: e.to_string() },
+                                state: MatterState::Unreachable { error },
                             };
                         }
                     },
                 }
-            } else {
-                // Keep the URL visible while off, so the UI's controller field
-                // still shows what will be used when it is turned back on.
-                *r.status.write().await = MatterStatus {
-                    enabled: false,
-                    url: want.url.clone(),
-                    state: MatterState::Disabled,
-                };
-                tracing::info!("matter: disabled");
             }
         }
 
@@ -335,25 +409,41 @@ async fn connect(r: &Reconciler, url: &str) -> Result<Connected> {
     // Only a loopback URL is GIAP's to install and run; anything else is
     // someone else's controller and is used as-is.
     let started = match local_port_from_ws_url(url) {
-        Some(port) => ensure_running(&r.data_dir, port, CONTROLLER_READY_TIMEOUT).await?,
+        Some(port) => {
+            ensure_running(
+                &r.data_dir,
+                port,
+                CONTROLLER_READY_TIMEOUT,
+                &r.notifier,
+                url,
+            )
+            .await?
+        }
         None => None,
     };
+    let started_here = started.is_some();
     // One cell, two writers: this connect puts the first handle in, and the
     // supervisor replaces it if it ever has to restart the process.
     let child: SharedServerChild = Arc::new(tokio::sync::Mutex::new(started));
 
+    // `started` is Some only when GIAP spawned the controller, which is exactly
+    // when its stderr is being piped and relayed — so its log EVENTS would be a
+    // duplicate of every line.
     let (client, events): (Arc<MatterClient>, tokio::sync::mpsc::Receiver<MatterEvent>) =
-        MatterClient::connect(url).await?;
+        if started_here {
+            MatterClient::connect_to_managed(url).await?
+        } else {
+            MatterClient::connect(url).await?
+        };
 
-    let nodes: NodeCache = Arc::new(RwLock::new(std::collections::HashMap::new()));
-    let control = Arc::new(MatterDeviceControl::new(client.clone(), nodes.clone()));
+    let control = Arc::new(MatterDeviceControl::new(client.clone()));
     let commissioner: Arc<dyn DeviceCommissioningPort> =
-        Arc::new(MatterCommissioner::new(client.clone()));
+        Arc::new(MatterCommissioner::new(client.clone(), r.notifier.clone()));
 
     // Supervised: on connection loss it reconnects with backoff and swaps the
-    // fresh client into the control's handle, so a matter-server restart no
-    // longer needs a pond-server restart. It also restarts the controller
-    // itself when reconnecting alone stops being enough.
+    // fresh client into the control's handle, so a controller restart no longer
+    // needs a pond-server restart. It also restarts the controller itself when
+    // reconnecting alone stops being enough.
     let supervisor = tokio::spawn(run_matter_supervisor(
         SupervisorConfig {
             url: url.to_string(),
@@ -363,9 +453,9 @@ async fn connect(r: &Reconciler, url: &str) -> Result<Connected> {
         control.client_handle(),
         client,
         events,
-        nodes,
         r.registry.clone(),
         r.bus.clone(),
+        r.notifier.clone(),
     ));
 
     Ok(Connected {
@@ -389,7 +479,7 @@ async fn teardown(running: &mut Running, r: &Reconciler) {
         // means it cannot revive a controller between here and the kill below.
         supervisor.abort();
     }
-    stop_controller(&running.child).await;
+    stop_controller(&running.child, &r.data_dir).await;
 }
 
 /// Kill the controller GIAP started, whichever process that currently is.
@@ -399,10 +489,14 @@ async fn teardown(running: &mut Running, r: &Reconciler) {
 /// exited long ago, and killing that one would leave the live controller
 /// running past the Pond. Empty cell means GIAP started nothing — the user's
 /// own controller is theirs to stop.
-pub(crate) async fn stop_controller(child: &SharedServerChild) {
+pub(crate) async fn stop_controller(child: &SharedServerChild, data_dir: &std::path::Path) {
     if let Some(mut running) = child.lock().await.take() {
         tracing::info!("matter: stopping the controller GIAP started");
         let _ = running.start_kill();
+        // Cleared on the way out so the next start has nothing stale to
+        // classify. Losing this file is harmless — the pid check would find the
+        // process gone — but leaving it costs a `ps` on every start.
+        crate::server_setup::clear_pidfile(data_dir);
     }
 }
 
@@ -464,6 +558,14 @@ impl SwitchableDeviceControl {
 // moment they went through this facade.
 #[async_trait]
 impl DeviceControlPort for SwitchableDeviceControl {
+    async fn describe(&self, device_id: &str) -> Result<DeviceDescription> {
+        self.backend_for(device_id).await?.describe(device_id).await
+    }
+
+    async fn state(&self, device_id: &str) -> Result<DeviceState> {
+        self.backend_for(device_id).await?.state(device_id).await
+    }
+
     async fn set_power(&self, device_id: &str, on: bool) -> Result<DeviceControlOutcome> {
         self.backend_for(device_id)
             .await?
@@ -508,6 +610,36 @@ impl DeviceControlPort for SwitchableDeviceControl {
         self.backend_for(device_id)
             .await?
             .set_fan_speed(device_id, percent)
+            .await
+    }
+
+    async fn set_mode(
+        &self,
+        device_id: &str,
+        setting: &str,
+        value: &str,
+    ) -> Result<DeviceControlOutcome> {
+        self.backend_for(device_id)
+            .await?
+            .set_mode(device_id, setting, value)
+            .await
+    }
+
+    async fn set_operation(
+        &self,
+        device_id: &str,
+        operation: &str,
+    ) -> Result<DeviceControlOutcome> {
+        self.backend_for(device_id)
+            .await?
+            .set_operation(device_id, operation)
+            .await
+    }
+
+    async fn set_tilt(&self, device_id: &str, percent_open: u8) -> Result<DeviceControlOutcome> {
+        self.backend_for(device_id)
+            .await?
+            .set_tilt(device_id, percent_open)
             .await
     }
 

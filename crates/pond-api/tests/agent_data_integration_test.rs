@@ -679,7 +679,7 @@ async fn skills_full_lifecycle() {
         .oneshot(post(
             "/api/v1/skills",
             serde_json::json!({
-                "name": "light_control",
+                "name": "light-control",
                 "content": "Call giap__list_registered_devices when asked about lights."
             }),
         ))
@@ -688,8 +688,10 @@ async fn skills_full_lifecycle() {
     assert_eq!(resp.status(), StatusCode::CREATED);
     let created = body_json(resp).await;
     let id = created["id"].as_str().unwrap().to_string();
-    assert_eq!(created["name"], "light_control");
+    assert_eq!(created["name"], "light-control");
     assert_eq!(created["active"], true);
+    // No icon supplied — defaults to "sparkles" rather than an empty string.
+    assert_eq!(created["icon"], "sparkles");
 
     // List
     let resp = app.clone().oneshot(get("/api/v1/skills")).await.unwrap();
@@ -710,7 +712,44 @@ async fn skills_full_lifecycle() {
     let updated = body_json(resp).await;
     assert_eq!(updated["active"], false);
     // content should be preserved
-    assert_eq!(updated["name"], "light_control");
+    assert_eq!(updated["name"], "light-control");
+
+    // Update — rename to a human-readable title, and change the description
+    let resp = app
+        .clone()
+        .oneshot(put(
+            &format!("/api/v1/skills/{id}"),
+            serde_json::json!({"name": "Light Control", "description": "Controls the lights"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let renamed = body_json(resp).await;
+    assert_eq!(renamed["name"], "Light Control");
+    assert_eq!(renamed["description"], "Controls the lights");
+    // active and content should be preserved, untouched by this PUT
+    assert_eq!(renamed["active"], false);
+    assert_eq!(
+        renamed["content"],
+        "Call giap__list_registered_devices when asked about lights."
+    );
+    // icon untouched by this PUT either
+    assert_eq!(renamed["icon"], "sparkles");
+
+    // Update — change just the icon
+    let resp = app
+        .clone()
+        .oneshot(put(
+            &format!("/api/v1/skills/{id}"),
+            serde_json::json!({"icon": "lightbulb"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let recolored = body_json(resp).await;
+    assert_eq!(recolored["icon"], "lightbulb");
+    // everything else untouched
+    assert_eq!(recolored["name"], "Light Control");
 
     // Delete
     let resp = app
