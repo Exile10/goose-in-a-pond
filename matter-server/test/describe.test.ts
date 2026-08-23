@@ -1,7 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import { describeNode } from "../src/mapping/describe.js";
-import { describedNode, endpoint, fanNode, lightNode, named, node } from "./fixtures.js";
+import {
+  customLightNode,
+  describedNode,
+  endpoint,
+  fanNode,
+  lightNode,
+  named,
+  node,
+} from "./fixtures.js";
 
 /** The capability for a verb, or undefined if the device does not offer it. */
 function capability(n: Parameters<typeof describeNode>[0], verb: string) {
@@ -85,6 +93,41 @@ describe("device description", () => {
     expect(verbs).not.toContain("fan_mode");
     expect(verbs).not.toContain("locked");
     expect(description.sensors).toEqual([]);
+    // The overwhelmingly common case, and the one a renderer must not print a line for.
+    expect(description.vendor_clusters).toEqual([]);
+  });
+
+  it("says a device has a custom cluster rather than implying it has none", () => {
+    // Google's Matter Virtual Device shows a Flip-Flop toggle and an Emoticon field
+    // under Custom Clusters. Asked what this light could do, the agent answered "power
+    // and brightness" -- true of what GIAP could see, and read by the user as a claim
+    // that the two controls in front of them did not exist.
+    const description = describeNode(customLightNode());
+
+    expect(description.vendor_clusters).toEqual([{ cluster_id: 0xfff1fc01, endpoint: 1 }]);
+  });
+
+  it("keeps a custom cluster out of the verbs, since none of them can drive it", () => {
+    // Anything describable is callable, by construction. A vendor cluster has no verb,
+    // no name for its attributes, and no command matter.js can resolve -- so admitting
+    // one here would trade that property for a control the agent still cannot work.
+    const description = describeNode(customLightNode());
+
+    expect(description.capabilities.map(c => c.verb)).toEqual(["power", "brightness"]);
+  });
+
+  it("ignores a custom cluster on the root endpoint, which is not the device", () => {
+    // Endpoint 0 is the node's own plumbing. A vendor cluster there is not something
+    // the light does, and reporting it as such would send the user looking for a
+    // control their app does not show.
+    const rootOnly = node(31, [
+      endpoint(0, { basicInformation: { nodeLabel: "Custom Light" } }, [0x0016], [
+        { id: 0xfff1fc02 },
+      ]),
+      endpoint(1, { onOff: { onOff: false } }, [0x0100]),
+    ]);
+
+    expect(describeNode(rootOnly).vendor_clusters).toEqual([]);
   });
 
   it("lists what a sensor measures before it has reported anything", () => {

@@ -8,14 +8,20 @@
  * lost in the port.
  */
 
-import type { ClusterState, EndpointSnapshot, NodeSnapshot } from "../src/mapping/snapshot.js";
+import type {
+  ClusterState,
+  EndpointSnapshot,
+  NodeSnapshot,
+  VendorCluster,
+} from "../src/mapping/snapshot.js";
 
 export function endpoint(
   number: number,
   clusters: ClusterState,
   deviceTypes: number[] = [],
+  vendorClusters: VendorCluster[] = [],
 ): EndpointSnapshot {
-  return { number, deviceTypes, clusters };
+  return { number, deviceTypes, clusters, vendorClusters };
 }
 
 export function node(nodeId: number, endpoints: EndpointSnapshot[], online = true): NodeSnapshot {
@@ -44,6 +50,21 @@ export function lightNode(): NodeSnapshot {
   return node(2, [
     endpoint(0, {}),
     endpoint(13, { onOff: { onOff: false }, levelControl: { currentLevel: 128 } }),
+  ]);
+}
+
+/**
+ * Google's Matter Virtual Device 1.7.0 as it ships: a dimmable light, plus the custom
+ * cluster its Controller tab shows as a Flip-Flop toggle and an Emoticon field.
+ * Neither of those names appears anywhere on the wire, and neither does a count of
+ * them, which is the whole reason this fixture is one bare id.
+ */
+export function customLightNode(): NodeSnapshot {
+  return node(31, [
+    named("Virtual Custom OnOff Light"),
+    endpoint(1, { onOff: { onOff: false }, levelControl: { currentLevel: 0 } }, [0x0101], [
+      { id: 0xfff1fc01 },
+    ]),
   ]);
 }
 

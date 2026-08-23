@@ -22,8 +22,52 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Endpoint, Environment, LogFormat, Logger, Minutes, ServerNode, Time } from "@matter/main";
+import {
+  ClusterBehavior,
+  ClusterId,
+  Endpoint,
+  Environment,
+  LogFormat,
+  Logger,
+  Minutes,
+  ServerNode,
+  Time,
+} from "@matter/main";
 import { DimmableLightDevice } from "@matter/main/devices/dimmable-light";
+import { ClusterType, TlvBoolean, TlvString, WritableAttribute } from "@matter/main/types";
+
+/**
+ * A manufacturer-specific cluster, so the one thing GIAP cannot name is reproducible
+ * without a separate download.
+ *
+ * Modelled on the Custom Clusters panel of Google's Matter Virtual Device, which shows
+ * a Flip-Flop toggle and an Emoticon field. The names below are for this file's reader
+ * only: a manufacturer cluster publishes no attribute names, so a controller sees
+ * cluster 0xfff1fc01 with two attributes and nothing more. That is exactly the case
+ * `vendor_clusters` exists to disclose.
+ *
+ * 0xfff1 is the test vendor id this device already uses; 0xfc01 is in Matter's
+ * manufacturer-specific cluster range.
+ */
+const GiapCustomCluster = ClusterType({
+  id: ClusterId(0xfff1fc01),
+  name: "GiapCustom",
+  revision: 1,
+  attributes: {
+    flipFlop: WritableAttribute(0x0, TlvBoolean, { default: false }),
+    emoticon: WritableAttribute(0x1, TlvString, { default: "smile" }),
+  },
+});
+
+class GiapCustomServer extends ClusterBehavior.for(GiapCustomCluster) {
+  // Stated as a literal so the composed device type below keeps its named behaviors.
+  // Derived from the cluster name it is a widened `Uncapitalize<string>`, which turns
+  // the endpoint's options into an index signature that swallows `id`.
+  static override readonly id = "giapCustom" as const;
+}
+
+/** The dev device: a dimmable light that also carries a cluster GIAP cannot name. */
+const CustomLightDevice = DimmableLightDevice.with(GiapCustomServer);
 
 /** Cleared on every start: a half-commissioned device from a previous run is the
  *  most confusing thing this tool could hand you. */
@@ -61,8 +105,10 @@ async function main(): Promise<void> {
   });
 
   // A dimmable light: On/Off gives `power`, Level Control gives `brightness`, so
-  // both of the verbs a user is most likely to try are covered.
-  const light = await node.add(DimmableLightDevice, { id: "light" });
+  // both of the verbs a user is most likely to try are covered. The custom cluster
+  // rides along so the "has a control GIAP cannot drive" path has a device to run
+  // against — `describe` should disclose it and refuse to promise it.
+  const light = await node.add(CustomLightDevice, { id: "light" });
   reportChanges(light);
 
   await node.start();
@@ -84,6 +130,8 @@ async function main(): Promise<void> {
 
   Then try, in chat:   "turn off the light"
                        "set the light to 40%"
+                       "what can the light do?"  -- should name a
+                         manufacturer-specific cluster it cannot drive
 
   Ctrl-C to stop. Its fabric is temporary, so stopping and
   starting gives you a fresh, unpaired device.
@@ -104,7 +152,7 @@ async function main(): Promise<void> {
 
 /** Print what the device is told to do, so a command that reached it is visible
  *  from this side as well as GIAP's. */
-function reportChanges(light: Endpoint<typeof DimmableLightDevice>): void {
+function reportChanges(light: Endpoint<typeof CustomLightDevice>): void {
   light.events.onOff.onOff$Changed.on(value => {
     console.log(`  [device] power  -> ${value ? "on" : "off"}`);
   });

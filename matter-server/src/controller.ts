@@ -17,9 +17,11 @@ import { describeNode } from "./mapping/describe.js";
 import { stateOf } from "./mapping/state.js";
 import { readingFor, sensorClusters } from "./mapping/sensors.js";
 import {
+  isVendorCluster,
   type ClusterState,
   type EndpointSnapshot,
   type NodeSnapshot,
+  type VendorCluster,
 } from "./mapping/snapshot.js";
 import {
   OpError,
@@ -565,13 +567,29 @@ export class Controller {
     const wired = this.#observed.get(peer.id);
     if (wired === undefined) return;
 
+    // Every cluster this pass declined to watch, reported once at the end rather than
+    // per cluster. Before this the allowlist was silent, so a device carrying a control
+    // GIAP cannot see left no trace anywhere -- the only way to find out was to read
+    // `SNAPSHOT_CLUSTERS` and compare by hand.
+    const skipped: string[] = [];
+
     for (const endpoint of peer.endpoints) {
       for (const cluster of Object.keys(endpoint.behaviors.supported)) {
-        if (!isSnapshotCluster(cluster)) continue;
+        if (!isSnapshotCluster(cluster)) {
+          skipped.push(`${endpoint.number}/${cluster}`);
+          continue;
+        }
         const key = `${endpoint.number}/${cluster}`;
         if (wired.has(key)) continue;
         if (this.#observeCluster(peer, endpoint, cluster) > 0) wired.add(key);
       }
+    }
+
+    if (skipped.length > 0) {
+      log.debug("clusters_skipped", "not watching clusters GIAP does not read", {
+        node: peer.id,
+        clusters: skipped.join(", "),
+      });
     }
   }
 
@@ -677,6 +695,7 @@ function snapshotOf(peer: ClientNode, nodeId: bigint): NodeSnapshot {
       number: Number(endpoint.number),
       deviceTypes: readDeviceTypes(endpoint),
       clusters: readClusters(endpoint),
+      vendorClusters: readVendorClusters(endpoint),
     });
   }
   return { nodeId, online: peer.lifecycle.isOnline, endpoints };
@@ -970,6 +989,31 @@ function readClusters(endpoint: Endpoint): ClusterState {
     }
   }
   return clusters;
+}
+
+/**
+ * The manufacturer-specific clusters this endpoint has.
+ *
+ * Free: matter.js already built a behavior for every entry in the Descriptor's
+ * ServerList, including the clusters its own model cannot name, so the id is in hand.
+ * Nothing is read from the device and nothing is subscribed — which is what lets this
+ * sit outside `SNAPSHOT_CLUSTERS` without paying the cost that bound exists to avoid.
+ *
+ * The id is all there is. Measured against a live commissioned device, such a
+ * behavior is named `cluster$fff1fc01` and its schema carries no attributes at all:
+ * matter.js discovers no shape for a cluster it does not know. So there is nothing to
+ * count, and reporting a count of zero for a device showing two controls would be the
+ * same silent falsehood this whole record exists to remove.
+ */
+function readVendorClusters(endpoint: Endpoint): VendorCluster[] {
+  const vendor: VendorCluster[] = [];
+  for (const behavior of Object.values(endpoint.behaviors.supported)) {
+    // `cluster` is on cluster behaviors; an endpoint also carries plain ones.
+    const id = (behavior as { cluster?: { id?: unknown } }).cluster?.id;
+    if (typeof id !== "number" || !isVendorCluster(id)) continue;
+    vendor.push({ id });
+  }
+  return vendor;
 }
 
 /**

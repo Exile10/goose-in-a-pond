@@ -14,7 +14,13 @@
  * because it will be believed.
  */
 
-import type { Capability, DeviceDescription, SensorSpec, ValueSpec } from "../protocol.js";
+import type {
+  Capability,
+  DeviceDescription,
+  SensorSpec,
+  ValueSpec,
+  VendorClusterSpec,
+} from "../protocol.js";
 import { deviceIdForNode } from "../protocol.js";
 import {
   CLUSTER_COLOR_CONTROL,
@@ -29,7 +35,7 @@ import {
 import { declaredUnitOf, SENSORS } from "./sensors.js";
 import { applianceSetpoint, reachableRange, targetSetpoint } from "./thermostat.js";
 import { operationsOf, settingsOf } from "./settings.js";
-import { endpointWith, type NodeSnapshot } from "./snapshot.js";
+import { applicationEndpoints, endpointWith, type NodeSnapshot } from "./snapshot.js";
 
 /**
  * FanControl's `fanModeSequence` says which modes a fan really has — Off/Low/Med/High
@@ -233,6 +239,28 @@ function sensorsOf(node: NodeSnapshot): SensorSpec[] {
   return sensors;
 }
 
+/**
+ * The manufacturer-specific clusters this device has, which is all that can be said
+ * about them.
+ *
+ * Deliberately not folded into `capabilities`: a capability is a verb `control`
+ * accepts, and there is no verb here. Naming one would break the property the whole
+ * type rests on -- that anything describable is callable -- to gain a control the
+ * agent still could not work.
+ *
+ * Application endpoints only, for the reason `applicationEndpoints` exists: endpoint 0
+ * is the node's own plumbing and never something the device does.
+ */
+function vendorClustersOf(node: NodeSnapshot): VendorClusterSpec[] {
+  const vendor: VendorClusterSpec[] = [];
+  for (const endpoint of applicationEndpoints(node)) {
+    for (const cluster of endpoint.vendorClusters) {
+      vendor.push({ cluster_id: cluster.id, endpoint: endpoint.number });
+    }
+  }
+  return vendor;
+}
+
 export function describeNode(node: NodeSnapshot): DeviceDescription {
   return {
     device_id: deviceIdForNode(node.nodeId),
@@ -241,5 +269,6 @@ export function describeNode(node: NodeSnapshot): DeviceDescription {
     device_type: nodeToDevice(node).device_type,
     capabilities: capabilitiesOf(node),
     sensors: sensorsOf(node),
+    vendor_clusters: vendorClustersOf(node),
   };
 }

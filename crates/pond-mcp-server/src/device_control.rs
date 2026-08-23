@@ -265,6 +265,29 @@ fn render_description(d: &DeviceDescription) -> String {
             out.push_str(&format!("\n    {} ({})", sensor.sensor_type, sensor.unit));
         }
     }
+
+    // Printed only when there is one, which is nearly never. A "Manufacturer-specific:
+    // nothing." line on every description in the house would be paid for by every
+    // reader to inform none of them.
+    //
+    // The sentence has to carry both halves — that the control is there, and that
+    // nothing here can work it — because either half alone is a wrong answer. Silence
+    // told a user their light had no emoji setting while the maker's app showed one;
+    // naming it without the caveat would have the agent promise a control it cannot
+    // reach.
+    if !d.vendor_clusters.is_empty() {
+        out.push_str(
+            "\n  Has manufacturer-specific controls that cannot be named or driven from \
+             here — the maker's own app is the only thing that can set them:",
+        );
+        for vendor in &d.vendor_clusters {
+            out.push_str(&format!(
+                "\n    cluster 0x{:08x} on endpoint {}",
+                vendor.cluster_id, vendor.endpoint
+            ));
+        }
+    }
+
     out
 }
 
@@ -742,7 +765,7 @@ mod tests {
     };
     use OperationNote::{Missed, Reached};
 
-    use pond_core::user_data::ports::device_control::{Capability, SensorSpec};
+    use pond_core::user_data::ports::device_control::{Capability, SensorSpec, VendorCluster};
 
     fn spec(verb: &str, value: ValueSpec) -> Capability {
         Capability {
@@ -788,6 +811,7 @@ mod tests {
                 ),
             ],
             sensors: vec![],
+            vendor_clusters: vec![],
         });
 
         // The name is what `set_device_state` is called with, so it has to be in the
@@ -822,6 +846,7 @@ mod tests {
                 ),
             ],
             sensors: vec![],
+            vendor_clusters: vec![],
         });
 
         assert!(rendered.contains("matter-18 (fan)"), "{rendered}");
@@ -848,6 +873,7 @@ mod tests {
                 },
             )],
             sensors: vec![],
+            vendor_clusters: vec![],
         });
         assert!(stated.contains("from 7 to 30 C"), "{stated}");
 
@@ -865,6 +891,7 @@ mod tests {
                 },
             )],
             sensors: vec![],
+            vendor_clusters: vec![],
         });
         assert!(silent.contains("a number in C"), "{silent}");
         assert!(!silent.contains("from"), "no range is implied: {silent}");
@@ -888,6 +915,7 @@ mod tests {
                     unit: "ug/m3".into(),
                 },
             ],
+            vendor_clusters: vec![],
         });
 
         assert!(rendered.contains("carbon_dioxide (ppm)"), "{rendered}");
@@ -919,6 +947,7 @@ mod tests {
                 },
             }],
             sensors: vec![],
+            vendor_clusters: vec![],
         });
 
         assert!(rendered.contains("a number from 7 to 23.5 C"), "{rendered}");
@@ -1180,6 +1209,56 @@ mod tests {
             resolve_device("the thermostat", &devices),
             DeviceResolution::NotFound
         );
+    }
+
+    /// The report this came from: asked what a light with a Flip-Flop toggle and an
+    /// Emoticon field could do, the agent answered "power and brightness". True of
+    /// what it had been given, and read by the user as a claim that the two controls
+    /// in front of them did not exist.
+    #[test]
+    fn a_control_that_cannot_be_driven_is_still_disclosed() {
+        let rendered = render_description(&DeviceDescription {
+            device_id: "matter-31".into(),
+            device_type: "light".into(),
+            capabilities: vec![
+                spec("power", ValueSpec::Boolean),
+                spec("brightness", ValueSpec::Percent),
+            ],
+            sensors: vec![],
+            vendor_clusters: vec![VendorCluster {
+                cluster_id: 0xfff1_fc01,
+                endpoint: 1,
+            }],
+        });
+
+        // Both halves, because either alone is a wrong answer: naming it without the
+        // caveat has the agent promise a control it cannot reach.
+        assert!(
+            rendered.contains("cluster 0xfff1fc01 on endpoint 1"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("cannot be named or driven"), "{rendered}");
+        assert!(rendered.contains("the maker's own app"), "{rendered}");
+        // Disclosure is not a capability. The verbs are what `set_device_state` accepts.
+        assert!(rendered.contains("power — true or false"), "{rendered}");
+        assert!(!rendered.contains("0xfff1fc01 — "), "{rendered}");
+    }
+
+    /// Nearly every device, and the reason the block is conditional: a
+    /// "Manufacturer-specific: nothing." line on all of them would be paid for by
+    /// every reader to inform none of them.
+    #[test]
+    fn a_device_with_no_vendor_cluster_says_nothing_about_them() {
+        let rendered = render_description(&DeviceDescription {
+            device_id: "matter-2".into(),
+            device_type: "light".into(),
+            capabilities: vec![spec("power", ValueSpec::Boolean)],
+            sensors: vec![],
+            vendor_clusters: vec![],
+        });
+
+        assert!(!rendered.contains("manufacturer-specific"), "{rendered}");
+        assert!(!rendered.contains("cluster"), "{rendered}");
     }
 
     #[test]

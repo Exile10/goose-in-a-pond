@@ -117,6 +117,30 @@ pub struct DeviceDescription {
     pub capabilities: Vec<Capability>,
     /// What it measures, whether or not it has reported yet.
     pub sensors: Vec<SensorSpec>,
+    /// Manufacturer-specific controls: present, and not drivable.
+    ///
+    /// Deliberately not [`Capability`] entries — a capability is a verb
+    /// [`DeviceControlPort`] accepts, and there is none for these. They are carried
+    /// because the alternative reads worse than silence: a description listing power
+    /// and brightness for a device whose own app shows a third control states that
+    /// the third does not exist, and gets believed. Empty for all but a few devices.
+    #[serde(default)]
+    pub vendor_clusters: Vec<VendorCluster>,
+}
+
+/// A control the device has and nothing here can name.
+///
+/// An id and an endpoint is the whole of it, and deliberately so. Matter publishes no
+/// attribute names — "Flip-Flop" and "Emoticon" exist only in that maker's app — and a
+/// controller discovers no shape for a cluster it cannot name either, so there is not
+/// even a count of them to carry. Naming what is not there is how this class of bug
+/// started.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VendorCluster {
+    /// The 32-bit Matter cluster id, e.g. `0xfff1fc01`. Upper 16 bits are the vendor.
+    pub cluster_id: u32,
+    /// The endpoint carrying it, which is how a user tells two apart on one device.
+    pub endpoint: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
