@@ -15,7 +15,7 @@ use pond_core::mesh::domain::millisats::Millisats;
 use pond_core::mesh::ports::payment_rail::PaymentRail;
 
 #[tokio::test]
-#[ignore = "requires a real BREEZ_API_KEY (breez.technology/request-api-key) — not available yet"]
+#[ignore = "requires a real BREEZ_API_KEY (breez.technology/request-api-key)"]
 async fn issuing_a_real_invoice_round_trips_through_list_payments() {
     let config = LightningConfig::from_env("/tmp/pond-lightning-live-test".to_string())
         .expect("BREEZ_API_KEY must be set to run this test");
@@ -23,9 +23,14 @@ async fn issuing_a_real_invoice_round_trips_through_list_payments() {
         .await
         .expect("failed to connect to Spark network");
     if let Some(mnemonic) = generated_mnemonic {
+        // Write to a file instead of logging it — a real wallet seed
+        // must never land in a terminal/CI log via --nocapture.
+        let path = "/tmp/pond-lightning-live-test/generated-mnemonic.txt";
+        std::fs::write(path, &mnemonic).expect("failed to save generated mnemonic to disk");
         eprintln!(
-            "generated a fresh wallet mnemonic for this test run — not persisted \
-             anywhere, a real Pond would need to save this via SettingsRepository: {mnemonic}"
+            "generated a fresh wallet mnemonic for this test run — not persisted by \
+             the test itself, saved to {path} (delete after copying it into \
+             SettingsRepository, if this run is meant to be kept)"
         );
     }
 

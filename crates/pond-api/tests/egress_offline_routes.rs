@@ -457,7 +457,6 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         usage_tally: Arc::new(pond_core::mesh::mocks::mock_usage_tally::MockUsageTally::new()),
         mesh_transport: Arc::new(tokio::sync::RwLock::new(None)),
         mesh_provider: Arc::new(tokio::sync::RwLock::new(None)),
-        payment_rail: None,
         peer_capability_query: Arc::new(tokio::sync::RwLock::new(None)),
         mesh_rebuild: None,
     });

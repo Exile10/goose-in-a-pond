@@ -4012,7 +4012,6 @@ async fn run_server(
         usage_tally,
         mesh_transport,
         mesh_provider: mesh_provider.clone(),
-        payment_rail: payment_rail.clone(),
         peer_capability_query,
         mesh_rebuild: Some(mesh_rebuild),
     });

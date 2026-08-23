@@ -101,3 +101,34 @@ pub trait LlmProvider: Send + Sync {
         })
     }
 }
+
+/// `complete()` always fails with a clear message — the fallback when a
+/// requested provider is selected but isn't actually available. Not a
+/// silent fallback to a working provider: the user should know their
+/// choice didn't take effect, not get a different model's answer instead.
+pub struct UnavailableProvider {
+    message: String,
+}
+
+impl UnavailableProvider {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for UnavailableProvider {
+    async fn complete(
+        &self,
+        _system_prompt: &str,
+        _messages: Vec<ChatMessage>,
+    ) -> Result<ChatMessage> {
+        Err(anyhow::anyhow!(self.message.clone()))
+    }
+
+    fn model_name(&self) -> String {
+        "mesh (unavailable)".to_string()
+    }
+}
