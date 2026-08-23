@@ -241,11 +241,13 @@ export function Mesh() {
       {!loading && meshEnabledSetting !== null && (
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
           <Switch
+            aria-label="Enable mesh"
             isSelected={meshEnabledSetting}
             isDisabled={meshToggling}
             onChange={toggleMesh}
           >
-            <Switch.Control><Switch.Thumb /></Switch.Control>
+            {/* Switch.Content wires up the aria-label — without it the toggle has no accessible name. */}
+            <Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control></Switch.Content>
           </Switch>
           <span className="muted-12">Enable mesh</span>
           {/* Turning mesh ON hot-builds the real transport synchronously

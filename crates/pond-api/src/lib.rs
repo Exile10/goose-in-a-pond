@@ -405,19 +405,6 @@ pub struct AppState {
     /// happen at runtime via `mesh_rebuild` instead of only at startup.
     pub mesh_provider:
         Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::models::ports::provider::LlmProvider>>>>,
-    /// Private mesh (#132 Milestone 5): Lightning settlement with trusted
-    /// peers via Breez/Spark. `None` unless both the `lightning` Cargo
-    /// feature is compiled in and `settings.lightning_enabled` is true —
-    /// same gating discipline as `mesh_transport`/`mesh_provider`.
-    /// `batch_settle` pays a peer's invoice, obtained beforehand via the
-    /// `InvoiceRequester` port over the mesh (#132 Milestone 5's
-    /// `InvoiceRequest`/`InvoiceResponse` wire messages). A periodic
-    /// settlement job (#132 Milestone 6, `pond-server`'s own
-    /// `spawn_settlement_job`) calls both together — it isn't wired into
-    /// `AppState`/any route, since nothing here needs to trigger it
-    /// on-demand yet (see `Settings.mesh_settlement_millisats_per_token`'s
-    /// own docs for why the job is a no-op until that rate is set).
-    pub payment_rail: Option<Arc<dyn pond_core::mesh::ports::payment_rail::PaymentRail>>,
     /// Private mesh (#132 Milestone 5): live "what does this peer offer
     /// right now" queries, so the UI can show what a trusted peer actually
     /// provides instead of guessing from trust scope alone. `None` inside
