@@ -233,6 +233,37 @@ export function coOnlyAlarmNode(): NodeSnapshot {
   ]);
 }
 
+/**
+ * A Basic Video Player as one really reports itself, verified against a live commissioned
+ * device: the player on endpoint 1 (type 0x28) and a SPEAKER on endpoint 2 (type 0x22),
+ * which is where Level Control lives. Searching the node for that cluster found the
+ * speaker's level and called it brightness.
+ */
+export function videoPlayerNode(): NodeSnapshot {
+  return node(81, [
+    named("Basic Video Player"),
+    endpoint(1, {
+      onOff: { onOff: true },
+      mediaPlayback: { currentState: 0 },
+      mediaInput: {
+        currentInput: 1,
+        inputList: [
+          { index: 1, inputType: 4, name: "HDMI 1" },
+          { index: 2, inputType: 4, name: "HDMI 2" },
+        ],
+      },
+      audioOutput: {
+        currentOutput: 1,
+        outputList: [
+          { index: 1, outputType: 0, name: "TV Speaker" },
+          { index: 2, outputType: 3, name: "Soundbar" },
+        ],
+      },
+    }, [0x0028]),
+    endpoint(2, { onOff: { onOff: true }, levelControl: { currentLevel: 127 } }, [0x0022]),
+  ]);
+}
+
 /** A node that states its type the way every real one does: a Descriptor
  *  DeviceTypeList on the application endpoint. */
 export function describedNode(

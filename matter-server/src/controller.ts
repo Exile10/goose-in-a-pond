@@ -723,11 +723,20 @@ const OPERATION_SETTLE_MS = 2000;
 const OPERATION_POLL_MS = 100;
 
 /** The state each operation asks the device to reach. */
-const INTENDED_STATE: Record<string, string> = {
-  start: "running",
-  resume: "running",
-  stop: "stopped",
-  pause: "paused",
+/**
+ * The state each operation asks the device to reach, in every vocabulary that means it.
+ *
+ * Two clusters answer this verb and they do not share words: OperationalState says
+ * "stopped" where MediaPlayback says "not playing". Listing both is what lets one verb
+ * serve an appliance and a television without either waiting out the full window for a
+ * word the device is never going to say.
+ */
+const INTENDED_STATE: Record<string, readonly string[]> = {
+  start: ["running"],
+  resume: ["running"],
+  stop: ["stopped", "not playing"],
+  pause: ["paused"],
+  play: ["playing"],
 };
 
 /**
@@ -739,7 +748,7 @@ const INTENDED_STATE: Record<string, string> = {
  * took the command and did nothing.
  */
 export async function settleTo(
-  wanted: string | undefined,
+  wanted: string | readonly string[] | undefined,
   read: () => string | undefined,
   waitMs: number = OPERATION_SETTLE_MS,
   pollMs: number = OPERATION_POLL_MS,
@@ -748,8 +757,11 @@ export async function settleTo(
   // Nothing to wait for: a verb with no state of its own to reach.
   if (wanted === undefined) return seen;
 
+  // One target or several: the same idea can have a different word per cluster, and
+  // arriving at any of them is arriving.
+  const accepted = typeof wanted === "string" ? [wanted] : wanted;
   const deadline = Date.now() + waitMs;
-  while (seen !== wanted && Date.now() < deadline) {
+  while (!(seen !== undefined && accepted.includes(seen)) && Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, pollMs));
     seen = read();
   }
@@ -762,7 +774,8 @@ async function settledOperation(
   nodeId: bigint,
   requested: string | undefined,
 ): Promise<string | undefined> {
-  const wanted = requested === undefined ? undefined : INTENDED_STATE[requested.toLowerCase()];
+  const wanted: readonly string[] | undefined =
+    requested === undefined ? undefined : INTENDED_STATE[requested.toLowerCase()];
   return settleTo(wanted, () => observedOperation(snapshotOf(peer, nodeId)));
 }
 

@@ -606,6 +606,13 @@ impl DeviceControlPort for SwitchableDeviceControl {
             .await
     }
 
+    async fn set_volume(&self, device_id: &str, percent: u8) -> Result<DeviceControlOutcome> {
+        self.backend_for(device_id)
+            .await?
+            .set_volume(device_id, percent)
+            .await
+    }
+
     async fn set_color_temp(&self, device_id: &str, kelvin: u32) -> Result<DeviceControlOutcome> {
         self.backend_for(device_id)
             .await?

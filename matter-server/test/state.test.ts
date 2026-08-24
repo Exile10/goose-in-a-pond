@@ -13,6 +13,7 @@ import {
   named,
   node,
   smokeCoAlarmNode,
+  videoPlayerNode,
   tunableWhiteNode,
 } from "./fixtures.js";
 
@@ -206,6 +207,16 @@ describe("device state", () => {
         ).toBe(true);
       }
     }
+  });
+
+  it("reports a television's volume, its playback and its input", () => {
+    const tv = videoPlayerNode();
+
+    expect(valueOf(tv, "volume")).toBe("50%");
+    expect(valueOf(tv, "brightness")).toBeUndefined();
+    expect(valueOf(tv, "operation")).toBe("playing");
+    expect(valueOf(tv, "input")).toBe("HDMI 1");
+    expect(valueOf(tv, "audio output")).toBe("TV Speaker");
   });
 
   it("reports what a device measures, not only what it can be told to be", () => {

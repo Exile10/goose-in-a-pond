@@ -22,6 +22,10 @@ pub struct DeviceStatePatch {
     /// Brightness as a 0–100 percentage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brightness: Option<u8>,
+    /// Speaker level as a 0–100 percentage. A different control from brightness, even
+    /// though Matter carries both on the same cluster — the endpoint says which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<u8>,
     /// Target temperature in degrees Celsius.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_temp: Option<f32>,
@@ -256,6 +260,15 @@ pub trait DeviceControlPort: Send + Sync {
         _saturation_percent: u8,
     ) -> Result<DeviceControlOutcome> {
         anyhow::bail!("device '{device_id}' does not support colour control")
+    }
+
+    /// Set a speaker's volume as a 0–100 percentage.
+    ///
+    /// Not brightness. Matter carries both on Level Control and the ENDPOINT's device
+    /// type says whose level it is: a composed television has a speaker endpoint, and
+    /// reporting its level as brightness offered a control that turned the sound down.
+    async fn set_volume(&self, device_id: &str, _percent: u8) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' has no speaker to set a volume on")
     }
 
     /// Set colour temperature in kelvin — warm white to cool white.

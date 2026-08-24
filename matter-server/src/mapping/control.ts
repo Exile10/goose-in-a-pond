@@ -9,6 +9,8 @@
 
 import { OpError, type DeviceStatePatch, type Verb } from "../protocol.js";
 import {
+  levelIsBrightness,
+  speakerEndpoint,
   CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
   CLUSTER_FAN_CONTROL,
@@ -39,6 +41,7 @@ export type { Verb };
 const ALL_VERBS: Record<Verb, true> = {
   power: true,
   brightness: true,
+  volume: true,
   target_temp: true,
   locked: true,
   color: true,
@@ -97,8 +100,17 @@ export function observedFor(node: NodeSnapshot, verb: Verb): DeviceStatePatch {
       return pct === undefined ? {} : { fan_speed: clampPercent(pct) };
     }
     case "brightness": {
+      // Mirrors the split in `describe`: a television's Level Control belongs to its
+      // speaker, and reading it back as a brightness would report the volume under the
+      // wrong name -- the same confusion at the other end of the same command.
+      if (!levelIsBrightness(node)) return {};
       const level = at(CLUSTER_LEVEL_CONTROL, "currentLevel");
       return level === undefined ? {} : { brightness: levelToBrightness(level) };
+    }
+    case "volume": {
+      const speaker = speakerEndpoint(node);
+      const level = speaker?.clusters[CLUSTER_LEVEL_CONTROL]?.["currentLevel"];
+      return typeof level === "number" ? { volume: levelToBrightness(level) } : {};
     }
     case "color": {
       const hue = at(CLUSTER_COLOR_CONTROL, "currentHue");
@@ -367,6 +379,32 @@ export function planControl(
         "capability_unsupported",
         `Matter device '${deviceId}' cannot be switched on or off`,
       );
+    }
+
+    case "volume": {
+      const pct = asPercent(value, "volume");
+      const speaker = speakerEndpoint(node);
+      if (speaker === undefined) {
+        throw new OpError(
+          "capability_unsupported",
+          `Matter device '${deviceId}' has no speaker to set a volume on`,
+        );
+      }
+      // The speaker's own Level Control, on the speaker's own endpoint. Written the same
+      // way brightness is because it is the same cluster and the same 0-254 scale -- what
+      // differs is whose level it is, and that is settled by the endpoint.
+      return {
+        actions: [
+          {
+            kind: "write",
+            endpoint: speaker.number,
+            cluster: CLUSTER_LEVEL_CONTROL,
+            attribute: "currentLevel",
+            value: brightnessToLevel(pct),
+          },
+        ],
+        applied: { volume: pct },
+      };
     }
 
     case "brightness": {
