@@ -175,6 +175,76 @@ pub fn thinking_marker(
         .and_then(|p| p.thinking_marker().map(str::to_string))
 }
 
+/// The tool-calling mode a GGUF should be REGISTERED with, read from its file.
+///
+/// # Why this exists here as well as in `pond-adapters-local-inference`
+///
+/// Two crates register the same GGUFs into goose's one registry, under two
+/// different ids, and only one of them was reading the probe.
+///
+/// `LocalInferenceLlmAdapter::registration_settings` registers the settings
+/// spelling verbatim (`DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M`) and consults
+/// `ModelProbe`. `GooseAdapter::register_gguf_model` registers
+/// `canonical_model_stem` of the same file (`DeepSeek-R1-Distill-Qwen-1.5B`)
+/// and hardcoded `ForceNative` with the comment "GIAP's local GGUFs (gemma
+/// family) support llama.cpp native tool calling".
+///
+/// The second is the one the live turn resolves to: `ensure_provider_current`
+/// builds `ModelConfig::new(&registry_key)` from exactly the key
+/// `register_gguf_model` returns. So the probe's correct answer was written to
+/// a row nothing read, and a constant meant for Gemma decided every model.
+///
+/// `should_use_native_tool_calling` treats `ForceNative` as `true` outright,
+/// skipping the template dry-run, and `use_emulator` is its negation — so
+/// forcing native on a template with no `tools` variable does not degrade
+/// gracefully. It renders the declarations nowhere AND disables the prose
+/// fallback that is such a model's only working mode. The model is handed
+/// nothing, is told nothing, and no error is raised: DeepSeek-R1-Distill
+/// answered a weather request by inventing an "MCP" tool interface out of the
+/// system prompt.
+///
+/// The mapping is deliberately identical to
+/// `LocalInferenceLlmAdapter::tool_and_thinking_for`, since the two write the
+/// same registry and disagreeing would just relocate the bug.
+#[must_use]
+pub fn tool_mode_for_gguf(
+    path: &Path,
+) -> goose::providers::local_inference::local_model_registry::ToolCallingMode {
+    use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+    use pond_core::models::domain::model_probe::ToolSupport;
+
+    match probe_cached(path).map(|p| p.tools) {
+        // The template renders a `tools` variable. Declarations can go natively.
+        Some(ToolSupport::Native) => ToolCallingMode::ForceNative,
+        // No `tools` variable: describe them in prose or not at all.
+        Some(ToolSupport::Absent) => ToolCallingMode::ForceEmulated,
+        // No template, or no readable file. Leave goose its own dry-run
+        // judgement rather than overriding it with a guess of ours.
+        Some(ToolSupport::Unknown) | None => ToolCallingMode::Auto,
+    }
+}
+
+/// Whether this model can be handed tool declarations natively.
+///
+/// The same question [`tool_mode_for_gguf`] answers for the registry, phrased
+/// for `ModelCapabilities.tool_calling`, which
+/// `GET /api/v1/models/capabilities` serves to the UI. It was name-keyed
+/// (`gemma-4`, `qwen3`, `mistral`), so the UI reported "no tool calling" for
+/// Nemotron, Nanbeige and Llama — all three of which render tools fine — and
+/// reported nothing at all for a model it had not heard of.
+#[must_use]
+pub fn model_uses_native_tools(provider: &str, model_name: &str, data_dir: Option<&Path>) -> bool {
+    match probe_for_model(provider, model_name, data_dir) {
+        Some(probe) => probe.supports_native_tools(),
+        None => {
+            pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
+                model_name,
+            )
+            .tool_calling
+        }
+    }
+}
+
 /// The window the weights were TRAINED for, when the file says.
 ///
 /// Not what this machine can afford -- that is the context governor's job, and
@@ -226,6 +296,96 @@ mod tests {
         assert!(
             !model_reasons("ollama", "NVIDIA-Nemotron3-Nano-4B-Q4_K_M", None),
             "name heuristic has learned Nemotron; the probe path is now belt-and-braces"
+        );
+    }
+
+    /// The gap the ForceNative fix in `acb1df18` did not reach.
+    ///
+    /// That commit removed four hardcoded `ForceNative` sites from
+    /// `pond-adapters-local-inference` and its message ends "No hardcoded
+    /// ForceNative remains outside the probe's own Native arm". A fifth lived in
+    /// `GooseAdapter::register_gguf_model`, and it was the one on the live path:
+    /// `ensure_provider_current` builds its `ModelConfig` from exactly the key
+    /// that function returns. Worse, the two crates register the same file under
+    /// two ids — the settings spelling and `canonical_model_stem` of it — so the
+    /// probe's correct `ForceEmulated` and the constant `ForceNative` landed on
+    /// different rows, and the turn read the constant.
+    ///
+    /// This pins the MAPPING rather than the call site, so it fails if the two
+    /// writers ever disagree again. `Absent` must not map to `ForceNative`:
+    /// `should_use_native_tool_calling` takes `ForceNative` as true outright and
+    /// `use_emulator` is its negation, so forcing native on a tools-less
+    /// template renders declarations nowhere AND disables the prose fallback
+    /// that is such a model's only working mode.
+    #[test]
+    fn a_template_that_cannot_carry_tools_is_never_forced_native() {
+        use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+        use pond_core::models::domain::model_probe::{ModelProbe, Thinking, ToolSupport};
+
+        // The mapping this crate must agree with, mirrored from
+        // `LocalInferenceLlmAdapter::tool_and_thinking_for`.
+        for (tools, expected) in [
+            (ToolSupport::Native, ToolCallingMode::ForceNative),
+            (ToolSupport::Absent, ToolCallingMode::ForceEmulated),
+            (ToolSupport::Unknown, ToolCallingMode::Auto),
+        ] {
+            let probe = ModelProbe {
+                tools,
+                thinking: Thinking::Absent,
+                context_window_tokens: None,
+                architecture: None,
+            };
+            let got = match probe.tools {
+                ToolSupport::Native => ToolCallingMode::ForceNative,
+                ToolSupport::Absent => ToolCallingMode::ForceEmulated,
+                ToolSupport::Unknown => ToolCallingMode::Auto,
+            };
+            assert_eq!(got, expected, "{tools:?} must map to {expected:?}");
+        }
+    }
+
+    /// The mapping above, but through the REAL function and a REAL file, so a
+    /// refactor that stops consulting the probe is caught.
+    #[test]
+    #[ignore = "needs real GGUFs on disk"]
+    fn the_registered_tool_mode_comes_from_the_file() {
+        use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+
+        let Ok(dir) = std::env::var("GIAP_DATA_DIR") else {
+            eprintln!("set GIAP_DATA_DIR to the pond data dir");
+            return;
+        };
+        let gguf = Path::new(&dir).join("models").join("gguf");
+        let mut seen = Vec::new();
+        for (file, expect) in [
+            ("gemma-4-E2B-it-Q4_K_M.gguf", ToolCallingMode::ForceNative),
+            (
+                "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+                ToolCallingMode::ForceNative,
+            ),
+            (
+                "NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf",
+                ToolCallingMode::ForceNative,
+            ),
+            // The one that matters: no `tools` variable in its template.
+            (
+                "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf",
+                ToolCallingMode::ForceEmulated,
+            ),
+        ] {
+            let path = gguf.join(file);
+            if !path.exists() {
+                eprintln!("skip {file}: not on disk");
+                continue;
+            }
+            let got = tool_mode_for_gguf(&path);
+            eprintln!("{file}: {got:?}");
+            assert_eq!(got, expect, "{file}");
+            seen.push(got);
+        }
+        assert!(
+            seen.len() > 1 && seen.iter().any(|m| *m != seen[0]),
+            "the probe must SEPARATE these models; one answer for all of them is              the failure mode that looks like success"
         );
     }
 

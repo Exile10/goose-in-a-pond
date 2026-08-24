@@ -20,24 +20,13 @@
 /// Paired tags whose entire contents (and the tags themselves) are dropped.
 /// Each pair = (open marker, close marker). The first pair encountered wins
 /// — we don't expect nesting in practice.
-const PAIRED_TAGS: &[(&str, &str)] = &[
-    ("<|channel>thought", "<channel|>"),
-    ("<|tool_call>", "<tool_call|>"),
-    ("<think>", "</think>"),
-    ("<thought>", "</thought>"),
-];
-
-/// Standalone sentinels that get silently dropped wherever they appear in
-/// the stream. Some models (Gemma-family especially) keep emitting `<eos>`
-/// after the real reply ends; the chat UI then renders them literally.
-const STANDALONE_SENTINELS: &[&str] = &[
-    "<eos>",
-    "<|eos|>",
-    "<end_of_turn>",
-    // Orphaned close tags (model emitted close without a matching open):
-    "</think>",
-    "</thought>",
-];
+///
+/// RE-EXPORTED from `pond-core` rather than restated here. This was a second
+/// copy, and it drifted: `pond-core` grew `<thinking>`/`</thinking>` after a
+/// model using the longer spelling had its entire reasoning spoken aloud in
+/// voice mode, and this copy kept only `<think>`. Two filters, one table, so a
+/// marker learned once is learned everywhere.
+use pond_core::models::services::thought_filter::{PAIRED_TAGS, STANDALONE_SENTINELS};
 
 /// Maximum tag length across PAIRED_TAGS (open + close) and STANDALONE_SENTINELS.
 /// Used to decide how many trailing bytes to hold back as lookahead. Computed
@@ -290,6 +279,42 @@ fn safe_emit_len(s: &str, tag_len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The drift this table's sharing exists to stop.
+    ///
+    /// `<thinking>` was added to `pond-core`'s table for a model whose entire
+    /// reasoning was otherwise spoken aloud in voice mode; this filter, a
+    /// separate copy, kept only `<think>` and would have leaked it to every SSE
+    /// consumer. Asserting the LONGER spellings specifically, because they are
+    /// the ones a Gemma-shaped table does not think to include.
+    #[test]
+    fn every_reasoning_spelling_pond_core_knows_is_stripped_here_too() {
+        for (open_tag, close_tag) in [
+            ("<think>", "</think>"),
+            ("<thinking>", "</thinking>"),
+            ("<thought>", "</thought>"),
+        ] {
+            let raw = format!("{open_tag}secret reasoning{close_tag}Hello.");
+            assert_eq!(
+                run(&[&raw]),
+                "Hello.",
+                "{open_tag} reasoning reached the consumer"
+            );
+        }
+    }
+
+    /// The two filters must not be able to disagree again.
+    #[test]
+    fn the_table_is_the_one_pond_core_owns() {
+        assert_eq!(
+            PAIRED_TAGS,
+            pond_core::models::services::thought_filter::PAIRED_TAGS
+        );
+        assert_eq!(
+            STANDALONE_SENTINELS,
+            pond_core::models::services::thought_filter::STANDALONE_SENTINELS
+        );
+    }
 
     fn run(chunks: &[&str]) -> String {
         let mut f = ThoughtFilter::new();
