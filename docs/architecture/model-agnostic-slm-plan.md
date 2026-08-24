@@ -400,6 +400,100 @@ The last two are the columns that matter: a capability mismatch presents as
 slowness, and a model that answers a weather question from imagination looks
 identical to one that answered it correctly unless you check.
 
+
+### Measured 2026-08-24: before and after, on the Mac
+
+`scripts/model-matrix.sh`, three turns per model in an isolated scratch pond,
+`thinking_mode = "auto"`, `tool_selection_mode = "all"`, 61 tools. Both halves
+driven from the SAME harness against two binaries — a kept copy of the pre-fix
+one and the fixed one — rather than a rebuild between halves.
+
+Debug build on an M4. The absolute numbers are therefore not release
+performance; the comparison is what they are for.
+
+| | Nemotron 3 Nano 4B | | gemma-4-E2B (control) | |
+|---|---|---|---|---|
+| | before | after | before | after |
+| turn-1 TTFT | 187.25 s | **38.93 s** | 14.94 s | 13.96 s |
+| prompt tokens | 17,376 | **10,092** | 7,837 | 7,837 |
+| completion tokens (t1/t2/t3) | 2 / 18 / 3 | **517 / 858 / 425** | 89 / 236 / 41 | 89 / 225 / 41 |
+| reasoning tokens | 0 / 0 / 0 | **54 / 654 / 160** | 0 | 0 |
+| called the weather tool | **no** | **yes** | yes | yes |
+
+Nemotron before was not slow so much as absent: two, eighteen and three
+completion tokens are the length of a stub, it never reasoned once, and it
+answered "what is the weather right now?" without calling the weather tool.
+After, it reasons and calls it. The control is unchanged within noise, which is
+the other half of the claim — the models whose classification does not move
+must not move.
+
+**The before behaviour is INTERMITTENT, and that bounds what the table above
+can claim.** A second run of the same pre-fix binary DID call the weather tool
+(13 / 51 / 14 completion tokens, still 0 reasoning). So "before never calls the
+tool" is not a safe statement from n = 1; "before is unreliable" is. What
+reproduces across both pre-fix runs, and is therefore the honest claim:
+
+| | before (n = 2) | after |
+|---|---|---|
+| reasoning tokens | 0, every turn, both runs | 54 / 654 / 160 |
+| prompt tokens | 17,376 and 17,377 | 10,092 |
+| completion tokens | 2-51 (stubs) | 425-858 |
+| turn-1 TTFT | 187.25 s, 69.34 s | 38.93 s |
+| weather tool | once in two runs | called |
+
+The deterministic, log-confirmed change is `capabilities: thinking=false` →
+`thinking=true` and reasoning tokens going from exactly zero to real. The
+tool-call reliability claim needs repetitions and is being measured; the
+latency figures have a wide before-spread and should be read as directional.
+
+**Why the prompt SHRANK, which was not the intent.** The shim's accounting says
+the system prompt went from 30,848 chars to 2,170, with
+`tools_json_chars = 28,534` unchanged in both, and its `system_rebuilt` flag
+reads `false` before and `true` after.
+
+The arithmetic settles what was in there: 2,170 + 28,534 = 30,704, against an
+observed 30,848. The tool JSON was inlined into the system prompt AND passed
+as 61 native tool declarations — the model was handed the whole tool surface
+twice, in two formats. 28,534 chars of JSON is ~7,284 tokens, and the prompt
+difference is 17,376 - 10,092 = **7,284**. Exact.
+
+So GIAP's system-prompt veto was not firing for this model, and the cost of it
+not firing was a duplicated tool surface. WHY it declined to fire is still
+open: `enforce_system` returns `None` when the incoming prompt neither starts
+with GIAP's prefix nor carries the goose default marker, which means goose
+handed over something GIAP did not recognise as its own. Worth chasing on its
+own account — a veto that silently declines is a larger problem than the token
+count that exposed it — and worth recording that two plausible explanations
+(a prose-tools section keyed on `caps.tool_calling`, and the context governor
+resolving a different window) were both checked against the source and are
+wrong.
+
+### Llama 3.2 3B: the family the pond had never seen
+
+Downloaded fresh and run through the same harness. The probe reads it
+correctly — `tools=Native, thinking=Absent`, which is right on both counts —
+and it called `giap-system__get_current_time` unprompted on its first turn.
+
+But its turn-1 TTFT is **145 s**, on a prompt of **18,001 tokens**, against
+Gemma's 7,837 for the same 61 tools and the same 28,534 chars of tool JSON
+handed to both by the shim.
+
+That gap is a property of the chat template, not of the pond: Gemma's renders
+tool declarations in its own reduced form and Llama's renders them close to
+verbatim. So the tool surface the pond was tuned around costs Llama roughly
+2.6x what it costs Gemma, and 16K of its 18K-token prompt is spent before the
+user says anything.
+
+The budgeting cannot see this. `ContextGovernor::prompt_window` clamps the
+preamble GIAP writes to `LOCAL_PROMPT_CLAMP` = 8192 for local providers, but
+tool schemas are rendered by the model's own template downstream of that clamp
+and are never counted against it. The reasoning recorded above
+`COMPACT_SHAPE_CEILING` in `prompts.rs` rests on "at `all` the schemas are
+~6,500 tokens" — Gemma's number, treated as every model's.
+
+Turn 3 prefills in 148 ms, so the KV prompt-session cache is working exactly as
+designed. This is a cold-turn cost. It is also the first thing a user meets.
+
 ## 5. Suggested order of work
 
 1. **Capture the failing error string** (`RUST_LOG` run, one prompt). Everything about E4B is
