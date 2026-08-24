@@ -49,12 +49,109 @@ pub struct GgufInfo {
     pub parameter_count: Option<u64>,
     /// Tensors in the file. Always present in a well-formed header.
     pub tensor_count: Option<u64>,
+
+    // ── Attention geometry, for KV-cache arithmetic ─────────────────────────
+    //
+    // These sit in the first ~2 KB of every file measured (offsets 924-1,829
+    // on gemma-4-E2B), i.e. long before `tokenizer.ggml.tokens`, so a short
+    // head read reaches all of them.
+    /// `{arch}.attention.head_count_kv` — KV heads, the multiplier on cache size.
+    pub head_count_kv: Option<u32>,
+    /// `{arch}.attention.key_length` — K width per head, full-attention layers.
+    pub key_length: Option<u32>,
+    /// `{arch}.attention.value_length` — V width per head, full-attention layers.
+    pub value_length: Option<u32>,
+    /// `{arch}.attention.key_length_swa` — K width on sliding-window layers,
+    /// where present. Gemma 4 halves it (256 against 512).
+    pub key_length_swa: Option<u32>,
+    /// `{arch}.attention.value_length_swa`, where present.
+    pub value_length_swa: Option<u32>,
+    /// `{arch}.attention.shared_kv_layers` — layers that share another layer's
+    /// KV and therefore allocate none of their own. Gemma 4 E4B shares 18 of
+    /// 42; E2B shares 20 of 35.
+    pub shared_kv_layers: Option<u32>,
 }
 
 impl GgufInfo {
     /// Did the header yield anything worth showing?
     pub fn is_empty(&self) -> bool {
         *self == GgufInfo::default()
+    }
+
+    /// Bytes of KV cache this model needs per token of context, computed from
+    /// its own header.
+    ///
+    /// # Why this is worth having
+    ///
+    /// `jetson_context_size` divides the memory budget by a per-token KV cost
+    /// to decide a context window, and that constant carries a comment saying
+    /// it "moves on a measurement from the Orin and nothing less" -- because
+    /// getting it wrong OOM-killed the board once, and because a figure
+    /// measured on a Mac understated the real cost by roughly three times.
+    ///
+    /// It does not have to be measured. It is arithmetic over four keys that
+    /// sit in the first two kilobytes of the file, and it reproduces both
+    /// device measurements exactly (see the tests): E2B 18 KiB/token, E4B 56.
+    /// That turns "measure every new model on the hardware or risk the board"
+    /// into something answerable before the weights are read.
+    ///
+    /// # The shape of the sum
+    ///
+    /// Only layers that own KV allocate any: `block_count - shared_kv_layers`.
+    /// Of those, sliding-window layers use the narrower `*_swa` widths where
+    /// the architecture declares them. Each layer stores K and V for every KV
+    /// head at two bytes an element (f16, the default cache type).
+    ///
+    /// # The part that is inferred rather than read
+    ///
+    /// The split between full-attention and sliding-window layers is **not**
+    /// in these headers. Both Gemma 4 models measured 1 global to 5 SWA
+    /// (E4B 4+20 of 24, E2B 3+12 of 15), and that ratio is assumed here via
+    /// `swa_per_global`. An architecture with a different pattern needs its own
+    /// value, so this returns `None` rather than guessing when the widths that
+    /// would make the answer wrong are absent.
+    ///
+    /// Returns `None` when the header lacks what the sum needs -- callers keep
+    /// their conservative fallback rather than receiving a confident wrong
+    /// number.
+    pub fn kv_bytes_per_token(&self, swa_per_global: u32) -> Option<u64> {
+        const BYTES_PER_ELEMENT: u64 = 2; // f16 cache
+
+        let blocks = self.block_count?;
+        let kv_heads = u64::from(self.head_count_kv?);
+        let k = u64::from(self.key_length?);
+        let v = u64::from(self.value_length?);
+
+        let owning = blocks.saturating_sub(self.shared_kv_layers.unwrap_or(0));
+        if owning == 0 || kv_heads == 0 {
+            return None;
+        }
+
+        // No SWA widths declared: every owning layer pays the full width.
+        let (Some(k_swa), Some(v_swa)) = (
+            self.key_length_swa.or(self.key_length),
+            self.value_length_swa.or(self.value_length),
+        ) else {
+            return Some(u64::from(owning) * (k + v) * kv_heads * BYTES_PER_ELEMENT);
+        };
+
+        let group = swa_per_global.saturating_add(1);
+        let (global, swa) = if group <= 1 || self.key_length_swa.is_none() {
+            (owning, 0)
+        } else {
+            let g = owning.div_ceil(group);
+            (g, owning.saturating_sub(g))
+        };
+
+        let per_global = (k + v) * kv_heads * BYTES_PER_ELEMENT;
+        let per_swa = (u64::from(k_swa) + u64::from(v_swa)) * kv_heads * BYTES_PER_ELEMENT;
+        Some(u64::from(global) * per_global + u64::from(swa) * per_swa)
+    }
+
+    /// [`Self::kv_bytes_per_token`] in KiB, which is the unit the context
+    /// arithmetic actually works in.
+    pub fn kv_kib_per_token(&self, swa_per_global: u32) -> Option<u64> {
+        self.kv_bytes_per_token(swa_per_global).map(|b| b / 1024)
     }
 
     /// A one-line description, in the order a person reads a model name.
@@ -251,6 +348,26 @@ pub fn parse_gguf_header(head: &[u8]) -> Option<GgufInfo> {
                 info.embedding_length = Some(v)
             }
             (k, Value::U32(v)) if k.ends_with(".block_count") => info.block_count = Some(v),
+            (k, Value::U32(v)) if k.ends_with(".attention.head_count_kv") => {
+                info.head_count_kv = Some(v)
+            }
+            // `_swa` first: ".attention.key_length_swa" also ends with
+            // nothing else, but ".key_length" is a suffix-match that would
+            // never fire for it -- kept explicit so a reader does not have to
+            // work that out.
+            (k, Value::U32(v)) if k.ends_with(".attention.key_length_swa") => {
+                info.key_length_swa = Some(v)
+            }
+            (k, Value::U32(v)) if k.ends_with(".attention.value_length_swa") => {
+                info.value_length_swa = Some(v)
+            }
+            (k, Value::U32(v)) if k.ends_with(".attention.key_length") => info.key_length = Some(v),
+            (k, Value::U32(v)) if k.ends_with(".attention.value_length") => {
+                info.value_length = Some(v)
+            }
+            (k, Value::U32(v)) if k.ends_with(".attention.shared_kv_layers") => {
+                info.shared_kv_layers = Some(v)
+            }
             _ => {}
         }
     }
@@ -300,6 +417,163 @@ fn title_case(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The two Gemma 4 models as their headers describe them, read off the
+    /// real files on 2026-08-16 (`gemma4.attention.*`, offsets 924-1,829).
+    fn gemma_e2b() -> GgufInfo {
+        GgufInfo {
+            architecture: Some("gemma4".into()),
+            block_count: Some(35),
+            head_count_kv: Some(1),
+            key_length: Some(512),
+            value_length: Some(512),
+            key_length_swa: Some(256),
+            value_length_swa: Some(256),
+            shared_kv_layers: Some(20),
+            ..Default::default()
+        }
+    }
+
+    fn gemma_e4b() -> GgufInfo {
+        GgufInfo {
+            architecture: Some("gemma4".into()),
+            block_count: Some(42),
+            head_count_kv: Some(2),
+            key_length: Some(512),
+            value_length: Some(512),
+            key_length_swa: Some(256),
+            value_length_swa: Some(256),
+            shared_kv_layers: Some(18),
+            ..Default::default()
+        }
+    }
+
+    /// The claim this whole function exists to make: the header alone
+    /// reproduces what the device measured, so the constant in
+    /// `jetson_context_size` does not have to be measured per model.
+    ///
+    /// Measured on the Orin 2026-08-12 by reading llama.cpp's own
+    /// `llama_kv_cache ... size = N MiB (C cells, L layers)` lines:
+    /// E2B 96 + 192 MiB at n_ctx 16384 = 18 KiB/token; E4B 128 + 320 MiB at
+    /// n_ctx 8192 = 56 KiB/token. Both caches carry `n_ctx` cells, so the cost
+    /// is linear with no constant term.
+    #[test]
+    fn kv_cost_reproduces_the_device_measurements() {
+        assert_eq!(
+            gemma_e2b().kv_kib_per_token(5),
+            Some(18),
+            "E2B: 15 owning layers (35 - 20), 3 global at 2 KiB + 12 SWA at 1 KiB"
+        );
+        assert_eq!(
+            gemma_e4b().kv_kib_per_token(5),
+            Some(56),
+            "E4B: 24 owning layers (42 - 18), 4 global at 4 KiB + 20 SWA at 2 KiB"
+        );
+    }
+
+    /// The same claim, against real files rather than transcribed numbers.
+    ///
+    /// `#[ignore]` and env-gated, following the convention the local-inference
+    /// crate uses: the GGUFs are gigabytes and are not in the repo. Run with
+    ///
+    /// ```text
+    /// GIAP_TEST_GGUF_DIR="$HOME/Library/Application Support/goose-in-a-pond/models/gguf" \
+    ///   cargo test -p pond-core --lib gguf -- --ignored --nocapture
+    /// ```
+    ///
+    /// Transcribing header values into a fixture and asserting on the
+    /// transcription proves the arithmetic, not the reading. This proves both.
+    #[test]
+    #[ignore = "needs real GGUF files; set GIAP_TEST_GGUF_DIR"]
+    fn kv_cost_from_the_real_files_on_disk() {
+        let Ok(dir) = std::env::var("GIAP_TEST_GGUF_DIR") else {
+            eprintln!("GIAP_TEST_GGUF_DIR unset");
+            return;
+        };
+        // Geometry lives in the first ~2 KB, long before the token array.
+        const HEAD: usize = 64 * 1024;
+        let expected = [
+            ("gemma-4-E2B-it-Q4_K_M.gguf", 18u64),
+            ("gemma-4-E4B-it-Q4_K_M.gguf", 56),
+        ];
+
+        let mut checked = 0;
+        for (file, want) in expected {
+            let path = std::path::Path::new(&dir).join(file);
+            let Ok(bytes) = std::fs::read(&path) else {
+                eprintln!("skip (absent): {}", path.display());
+                continue;
+            };
+            let head = &bytes[..bytes.len().min(HEAD)];
+            let info = parse_gguf_header(head).expect("real GGUF should parse");
+            let got = info.kv_kib_per_token(5);
+            eprintln!(
+                "{file}: blocks={:?} shared={:?} kv_heads={:?} k={:?} k_swa={:?} -> {got:?} KiB/token",
+                info.block_count, info.shared_kv_layers, info.head_count_kv,
+                info.key_length, info.key_length_swa
+            );
+            assert_eq!(got, Some(want), "{file} KV cost");
+            checked += 1;
+        }
+        assert!(checked > 0, "no model files found under {dir}");
+    }
+
+    /// Shared layers allocate nothing, and forgetting that is a 1.75x
+    /// overestimate on E4B -- which reads as "this model does not fit" and
+    /// silently costs context.
+    #[test]
+    fn shared_layers_allocate_no_cache() {
+        let mut all_owning = gemma_e4b();
+        all_owning.shared_kv_layers = None;
+        let shared = gemma_e4b().kv_bytes_per_token(5).expect("computed");
+        let unshared = all_owning.kv_bytes_per_token(5).expect("computed");
+        assert!(
+            unshared > shared,
+            "ignoring shared_kv_layers must cost more, got {unshared} vs {shared}"
+        );
+    }
+
+    /// An architecture with no sliding window pays full width on every layer.
+    /// This is the conservative direction, which is the right one to be wrong in.
+    #[test]
+    fn no_swa_widths_means_full_width_everywhere() {
+        let dense = GgufInfo {
+            block_count: Some(28),
+            head_count_kv: Some(2),
+            key_length: Some(128),
+            value_length: Some(128),
+            ..Default::default()
+        };
+        // 28 layers x (128+128) x 2 heads x 2 bytes = 28,672 bytes = 28 KiB.
+        assert_eq!(dense.kv_kib_per_token(5), Some(28));
+    }
+
+    /// A header missing what the sum needs must yield nothing, so the caller
+    /// keeps its measured fallback instead of acting on a confident guess.
+    /// This is the constant that can OOM a board.
+    #[test]
+    fn incomplete_headers_refuse_rather_than_guess() {
+        assert_eq!(GgufInfo::default().kv_kib_per_token(5), None);
+
+        let no_heads = GgufInfo {
+            block_count: Some(35),
+            key_length: Some(512),
+            value_length: Some(512),
+            ..Default::default()
+        };
+        assert_eq!(no_heads.kv_kib_per_token(5), None);
+
+        let zero_heads = GgufInfo {
+            block_count: Some(35),
+            head_count_kv: Some(0),
+            key_length: Some(512),
+            value_length: Some(512),
+            ..Default::default()
+        };
+        assert_eq!(zero_heads.kv_kib_per_token(5), None);
+    }
+
     use super::*;
 
     /// Build a GGUF header the way a writer would, so the parser is tested
