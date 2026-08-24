@@ -236,8 +236,10 @@ DeviceDescription = {
   capabilities: Capability[],      // what it can be told to do
   sensors: SensorSpec[],           // what it measures, reported or not
   vendor_clusters: VendorClusterSpec[],  // what it has and this cannot drive
+  states: StateSpec[],             // what it reports and nothing can set
 }
 VendorClusterSpec = { cluster_id, endpoint }
+StateSpec = { name, value: ValueSpec }
 Capability = { verb: Verb, setting?: string, value: ValueSpec }
 ValueSpec =
   | { kind: "boolean" }
@@ -276,6 +278,41 @@ is a contradiction worth knowing about: it is what made a paired washer report
 nothing but power while every unit test passed.
 
 That bound is still there, but `describe` no longer hides what it drops.
+
+### What a device reports and nothing can set
+
+`states` is the third kind of thing a device has. `capabilities` are verbs `control`
+accepts; `sensors` are numeric measurements, carried on the same feed as `Reading`. A
+door's position is neither — a word the lock reports, writable by nobody — so it fell
+through both, and a lock that can say **jammed**, **forced open** or **ajar** was
+described as a device with one boolean. Asked what a door lock could do, GIAP answered
+"locked or unlocked; it does not measure any data" for a device whose own app showed a
+door state beside the lock state. Both attributes were in the snapshot the entire time:
+`doorLock` is read whole, and there was simply nowhere in the description to put them.
+
+`value` declares the exact words `state` will use, so the two cannot drift — for a
+read-only value the list of words *is* the description, which is why the vocabulary
+lives in `describe.ts` and `state.ts` imports it.
+
+Each entry is gated on the attribute actually being present, because both belong to
+optional DoorLock features: `doorState` to DoorPositionSensor, and
+`requirePinForRemoteOperation` to CredentialOverTheAirAccess **and** PinCredential
+together — matter.js refuses the attribute without both. A plain deadbolt has neither,
+and declaring one would promise a reading that never arrives — the same failure as
+offering `tilt` to a roller blind.
+
+`doorState` is also nullable, so a lock with the sensor can have the attribute and no
+value in it. The description still declares the door, exactly as `sensors` declares
+what a sensor measures before it has reported; the reading stays absent rather than
+being filled in, because an invented "closed" cannot be told from a real one.
+
+**Read-only by construction, not by convention.** `requirePinForRemoteOperation` is a
+security control: off means remote lock and unlock stop requiring a PIN. The same
+cluster carries `sendPinOverTheAir`, `enableLocalProgramming`, `wrongCodeEntryLimit`,
+`autoRelockTime` and `operatingMode` in the same snapshot. A verb for any of them puts a
+lock's security configuration one sentence of natural language away from being turned
+off, so the whole class is closed here rather than guarded case by case. `control` has
+no verb that reaches them.
 
 ### Manufacturer-specific clusters
 
@@ -327,10 +364,11 @@ StateValue  = { name, value }        // both as the device words them
 ```
 
 Every `name` is one `describe` also uses — a control verb for a scalar, a setting
-name for a selectable — so a reading names the thing that changes it: "spin speed
-is Low" leads straight to the call that makes it High. That correspondence is the
-point of the type being this plain, and it is asserted in the controller's tests
-rather than left as an intention.
+name for a selectable, a `states` entry for something only reported — so a reading
+names the thing that changes it: "spin speed is Low" leads straight to the call that
+makes it High, and "door is jammed" names something with no such call by design.
+That correspondence is the point of the type being this plain, and it is asserted in
+the controller's tests rather than left as an intention.
 
 Values are read through the inverses of the conversions `control` writes with, so a
 covering reported at 40% open is the same 40% that would put it there — not

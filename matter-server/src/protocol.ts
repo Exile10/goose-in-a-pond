@@ -102,6 +102,25 @@ export interface DeviceDescription {
    * that the third control does not exist, and gets believed.
    */
   vendor_clusters: VendorClusterSpec[];
+  /**
+   * What the device reports and nothing can set.
+   *
+   * The third kind of thing a device has, and the one there was previously nowhere to
+   * put. `capabilities` are verbs `control` accepts; `sensors` are numeric
+   * measurements, carried on the same feed as `Reading`. A door's position is neither
+   * — a word the lock reports, writable by nobody — so it fell out of both, and a lock
+   * that could say "jammed" or "forced open" was described as a thing with one boolean.
+   *
+   * `value` declares the exact words `state` will use, so the two cannot drift.
+   */
+  states: StateSpec[];
+}
+
+export interface StateSpec {
+  /** The name `state` reports it under. */
+  name: string;
+  /** The words it takes. An enum here is a closed list of what `state` may say. */
+  value: ValueSpec;
 }
 
 export interface VendorClusterSpec {

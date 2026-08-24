@@ -126,6 +126,28 @@ pub struct DeviceDescription {
     /// the third does not exist, and gets believed. Empty for all but a few devices.
     #[serde(default)]
     pub vendor_clusters: Vec<VendorCluster>,
+    /// What the device reports and nothing can set.
+    ///
+    /// The third kind of thing a device has. [`Capability`] is a verb this port
+    /// accepts; [`SensorSpec`] is a numeric measurement. A door's position is neither
+    /// — a word the lock reports, writable by nobody — so it fell through both, and a
+    /// lock that can say "jammed" or "forced open" was described as one boolean.
+    ///
+    /// Read-only by construction, not by convention. Every writable attribute on
+    /// Matter's DoorLock cluster is a security control, and a verb for one of them puts
+    /// a lock's security configuration one sentence of natural language away.
+    #[serde(default)]
+    pub states: Vec<StateSpec>,
+}
+
+/// Something a device reports under a name, which nothing can write.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateSpec {
+    /// The name [`DeviceControlPort::state`] reports it under.
+    pub name: String,
+    /// The words it takes. An enum here is the closed list of what `state` may say,
+    /// declared by the description so the two cannot drift.
+    pub value: ValueSpec,
 }
 
 /// A control the device has and nothing here can name.

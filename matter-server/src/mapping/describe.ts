@@ -18,6 +18,7 @@ import type {
   Capability,
   DeviceDescription,
   SensorSpec,
+  StateSpec,
   ValueSpec,
   VendorClusterSpec,
 } from "../protocol.js";
@@ -54,8 +55,51 @@ const FAN_MODE_SEQUENCES: ReadonlyMap<number, string[]> = new Map([
 /** Every mode GIAP can send, for a fan that does not narrow it down. */
 const ALL_FAN_MODES = ["off", "low", "medium", "high", "on", "auto", "smart"];
 
+/**
+ * DoorLock's `doorState`, in the order Matter numbers it.
+ *
+ * Three of these six are the reason the attribute is worth reading at all: a lock can
+ * say jammed, forced open, or ajar, and none of them is answerable from `lockState`.
+ * A bolt thrown into a frame that is standing open reports "locked" perfectly happily.
+ *
+ * Declared here rather than in `state.ts` because for a read-only value the list of
+ * words *is* the description — `state` imports it so the two cannot drift.
+ */
+export const DOOR_STATES = [
+  "open",
+  "closed",
+  "jammed",
+  "forced open",
+  "unspecified error",
+  "ajar",
+] as const;
+
+/** The same six by matter.js's enum name, which it may hand over instead of the number. */
+const DOOR_STATE_NAMES: ReadonlyMap<string, string> = new Map(
+  DOOR_STATES.map(word => [`door${word.replace(/ /g, "")}`, word]),
+);
+
+/** What PIN enforcement reads as. Both words, so `state` cannot invent a third. */
+export const PIN_REQUIREMENTS = ["required", "not required"] as const;
+
 function attribute(node: NodeSnapshot, cluster: string, name: string): unknown {
   return endpointWith(node, cluster)?.clusters[cluster]?.[name];
+}
+
+/**
+ * A lock's `doorState` as a word, or undefined if it does not have one.
+ *
+ * Both encodings, for the reason `fanModes` reads both: matter.js may decode an enum
+ * to its name rather than its number, and a door reported as "DoorJammed" must not
+ * come out the same as a door that said nothing.
+ */
+export function doorStateWord(raw: unknown): string | undefined {
+  const numeric = asNumber(raw);
+  if (numeric !== undefined) return DOOR_STATES[numeric];
+  if (typeof raw === "string") {
+    return DOOR_STATE_NAMES.get(raw.toLowerCase().replace(/[\s_-]/g, ""));
+  }
+  return undefined;
 }
 
 function asNumber(value: unknown): number | undefined {
@@ -261,6 +305,43 @@ function vendorClustersOf(node: NodeSnapshot): VendorClusterSpec[] {
   return vendor;
 }
 
+/**
+ * What the device reports and nothing can set.
+ *
+ * Both of these sat in the snapshot already — `doorLock` is read whole — and fell
+ * through every slot there was: not a verb, so not a capability, and not a number, so
+ * not a sensor. Asked what a door lock could do, GIAP answered "locked or unlocked"
+ * for a device whose own app showed a door position and a PIN requirement beside it.
+ *
+ * Each is gated on the attribute actually being there, because both belong to optional
+ * DoorLock features: a lock with no position sensor has no `doorState`, and declaring
+ * one would promise a reading that never arrives.
+ */
+function statesOf(node: NodeSnapshot): StateSpec[] {
+  const states: StateSpec[] = [];
+
+  // Read whether or not the value decodes: a lock with the DoorPositionSensor feature
+  // has the attribute, and an encoding this does not recognise is still a device that
+  // reports its door.
+  if (attribute(node, CLUSTER_DOOR_LOCK, "doorState") !== undefined) {
+    states.push({ name: "door", value: { kind: "enum", values: [...DOOR_STATES] } });
+  }
+
+  // Whether remote lock and unlock require a PIN. Reported, never written — and not a
+  // `mode` for that reason. Every writable attribute on this cluster is a security
+  // control (`sendPinOverTheAir`, `enableLocalProgramming`, `wrongCodeEntryLimit`), and
+  // a verb for one of them puts a lock's security configuration one sentence of natural
+  // language away from being turned off.
+  // Gated on CredentialOverTheAirAccess *and* PinCredential, not PIN alone -- measured
+  // against a live lock, matter.js refuses the attribute without both. So a PIN lock
+  // with no over-the-air credential access has no such setting to report.
+  if (typeof attribute(node, CLUSTER_DOOR_LOCK, "requirePinForRemoteOperation") === "boolean") {
+    states.push({ name: "pin_required", value: { kind: "enum", values: [...PIN_REQUIREMENTS] } });
+  }
+
+  return states;
+}
+
 export function describeNode(node: NodeSnapshot): DeviceDescription {
   return {
     device_id: deviceIdForNode(node.nodeId),
@@ -270,5 +351,6 @@ export function describeNode(node: NodeSnapshot): DeviceDescription {
     capabilities: capabilitiesOf(node),
     sensors: sensorsOf(node),
     vendor_clusters: vendorClustersOf(node),
+    states: statesOf(node),
   };
 }

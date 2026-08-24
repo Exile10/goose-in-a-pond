@@ -68,6 +68,26 @@ export function customLightNode(): NodeSnapshot {
   ]);
 }
 
+/**
+ * Google's Virtual Door Lock as its Controller tab shows it: a door state, a lock
+ * state, and a PIN requirement for remote operation. Both DoorPositionSensor and
+ * PinCredential are optional DoorLock features, so a lock without them has neither
+ * attribute — which is why the bare-lock fixture below exists beside this one.
+ */
+export function doorLockNode(): NodeSnapshot {
+  return node(44, [
+    named("Virtual Door Lock"),
+    endpoint(1, {
+      doorLock: { lockState: 1, doorState: 0, requirePinForRemoteOperation: false },
+    }, [0x000a]),
+  ]);
+}
+
+/** A lock with neither optional feature: lockState and nothing else. */
+export function bareLockNode(): NodeSnapshot {
+  return node(45, [named("Deadbolt"), endpoint(1, { doorLock: { lockState: 1 } }, [0x000a])]);
+}
+
 /** A node that states its type the way every real one does: a Descriptor
  *  DeviceTypeList on the application endpoint. */
 export function describedNode(
