@@ -366,6 +366,65 @@ impl LocalInferenceLlmAdapter {
     ///
     /// This is intentionally NOT implemented in the cross-platform loader: it is
     /// unsafe to change from the macOS Metal build and cannot be tested here.
+    /// The model's KV cost per token, read from its own GGUF header, or `None`
+    /// when the header cannot settle it.
+    ///
+    /// `pond_core::models::domain::gguf` does the arithmetic and is exact for a
+    /// dense model. The one thing the header does NOT carry is the split
+    /// between full-attention and sliding-window layers, and that split is
+    /// worth a factor of two: assume more SWA layers than a model really has
+    /// and the cost comes out LOW, which is the direction that OOMs a board.
+    ///
+    /// So the rule is asymmetric on purpose:
+    ///
+    /// - **No `key_length_swa`** — the model is dense, every owning layer pays
+    ///   the same width, and the pattern cannot change the answer. Trust it for
+    ///   any architecture.
+    /// - **`key_length_swa` present** — the answer depends on a ratio the file
+    ///   does not state. Trust it only for an architecture whose pattern has
+    ///   been confirmed against a real allocation on the device.
+    ///
+    /// Anything else returns `None` and the caller keeps the measured constant,
+    /// so an unfamiliar model behaves exactly as it did before this existed.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn kv_cost_from_header(path: &std::path::Path) -> Option<u64> {
+        use pond_core::models::domain::gguf::parse_gguf_header;
+
+        /// Architectures whose global:SWA layer ratio has been confirmed against
+        /// llama.cpp's own `llama_kv_cache ... size = N MiB (C cells, L layers)`
+        /// lines on the Orin. Gemma 4: 1 global per 5 sliding, verified at both
+        /// sizes (E4B 4+20 of 24 owning layers, E2B 3+12 of 15).
+        const CONFIRMED_SWA_PATTERNS: &[(&str, u32)] = &[("gemma4", 5)];
+
+        // Geometry sits in the first ~2 KB of every file measured -- offsets
+        // 924-1,829 on gemma-4-E2B, well before `tokenizer.ggml.tokens` at
+        // 2,061. 64 KiB is generous cover for that without reading the token
+        // array, let alone the 15 MB it takes to reach the chat template.
+        const HEAD_BYTES: usize = 64 * 1024;
+
+        let mut buf = vec![0u8; HEAD_BYTES];
+        let n = {
+            use std::io::Read as _;
+            let mut f = std::fs::File::open(path).ok()?;
+            f.read(&mut buf).ok()?
+        };
+        buf.truncate(n);
+
+        let info = parse_gguf_header(&buf)?;
+        let arch = info.architecture.as_deref().unwrap_or_default();
+
+        if info.key_length_swa.is_none() {
+            // Dense: exact whatever the architecture. The ratio argument is
+            // unused on this path.
+            return info.kv_kib_per_token(0);
+        }
+
+        let (_, swa_per_global) = CONFIRMED_SWA_PATTERNS
+            .iter()
+            .find(|(name, _)| *name == arch)?;
+        info.kv_kib_per_token(*swa_per_global)
+    }
+
     /// Context size that fits THIS model in the Jetson's LLM budget.
     ///
     /// A single hardcoded constant is wrong, and shipping one OOM-killed a
@@ -456,7 +515,7 @@ impl LocalInferenceLlmAdapter {
     /// arithmetic is pure, it is the part that can kill a board, and gating it
     /// meant neither it nor its tests ever ran on a developer machine or in CI.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    fn jetson_context_size(model_bytes: u64) -> u32 {
+    fn jetson_context_size(model_bytes: u64, kv_kib_per_token: Option<u64>) -> u32 {
         /// Per-token KV cost for the widest geometry we ship, measured on the
         /// DEVICE: E4B is 56 KiB/token across both caches, E2B 18.
         ///
@@ -512,7 +571,15 @@ impl LocalInferenceLlmAdapter {
         let kv_mb = crate::scheduler::LLM_BUDGET_MB
             .saturating_sub(model_mb)
             .saturating_sub(COMPUTE_BUFFER_MB);
-        let tokens = (kv_mb * 1024) / KV_KIB_PER_TOKEN;
+        // The model's own header, when it could answer; the conservative
+        // fallback when it could not. `kv_cost_from_header` returns None rather
+        // than guessing, so this is a strict improvement and never a new risk:
+        // an unreadable or unfamiliar model gets exactly the behaviour it had
+        // before this existed.
+        let slope = kv_kib_per_token
+            .filter(|k| *k > 0)
+            .unwrap_or(KV_KIB_PER_TOKEN);
+        let tokens = (kv_mb * 1024) / slope;
 
         // Largest multiple of CTX_GRANULARITY that fits, clamped. Saturating at
         // MAX_CTX before the cast keeps a huge allowance (E2B's is ~41k) from
@@ -542,10 +609,16 @@ impl LocalInferenceLlmAdapter {
                     .map(|m| m.len())
             })
             .unwrap_or(ASSUMED_LARGEST_MODEL_BYTES);
-        let context_size = Self::jetson_context_size(model_bytes);
+        let kv_kib = get_registry()
+            .lock()
+            .ok()
+            .and_then(|reg| reg.get_model(model_id).map(|e| e.local_path.clone()))
+            .and_then(|p| Self::kv_cost_from_header(&p));
+        let context_size = Self::jetson_context_size(model_bytes, kv_kib);
         tracing::info!(
             model = model_id,
             model_mb = model_bytes / (1024 * 1024),
+            kv_kib_per_token = kv_kib.map_or("fallback".to_string(), |k| k.to_string()),
             context_size,
             "Jetson context sized to fit this model's KV cache in the LLM budget"
         );
@@ -752,8 +825,8 @@ mod tests {
         // different step than the board does. E4B in particular was carrying
         // 4_640_000_000 here against a real 4_977_171_584 -- a 336 MB gap, over
         // half of the free KV budget it now has.
-        let e2b = LocalInferenceLlmAdapter::jetson_context_size(3_106_738_272);
-        let e4b = LocalInferenceLlmAdapter::jetson_context_size(4_977_171_584);
+        let e2b = LocalInferenceLlmAdapter::jetson_context_size(3_106_738_272, None);
+        let e4b = LocalInferenceLlmAdapter::jetson_context_size(4_977_171_584, None);
         assert_eq!(e2b, 16384, "E2B should keep the full window");
         assert_eq!(
             e4b, 8192,
@@ -783,7 +856,7 @@ mod tests {
         let weights_mb = 4_640_000_000u64 / (1024 * 1024);
         let free_mb = crate::scheduler::LLM_BUDGET_MB - weights_mb - 600;
 
-        let chosen = LocalInferenceLlmAdapter::jetson_context_size(4_640_000_000) as u64;
+        let chosen = LocalInferenceLlmAdapter::jetson_context_size(4_640_000_000, None) as u64;
         let needed_mb = (chosen * MEASURED_KIB_PER_TOKEN) / 1024;
         assert!(
             needed_mb < free_mb,
@@ -831,7 +904,7 @@ mod tests {
     /// than the slope it is named for.
     #[test]
     fn the_per_token_slope_is_observable_on_a_model_the_ceiling_does_not_cap() {
-        let ctx = LocalInferenceLlmAdapter::jetson_context_size(4_739_563_520);
+        let ctx = LocalInferenceLlmAdapter::jetson_context_size(4_739_563_520, None);
         assert_eq!(
             ctx, 12288,
             "a 4.5 GB model got {ctx} tokens. At the device-measured cost it should get 12288; \
@@ -851,7 +924,7 @@ mod tests {
     #[test]
     fn rounding_does_not_discard_context_the_budget_affords() {
         // The real IQ4_XS file on the device: 4,715,416,704 bytes.
-        let ctx = LocalInferenceLlmAdapter::jetson_context_size(4_715_416_704);
+        let ctx = LocalInferenceLlmAdapter::jetson_context_size(4_715_416_704, None);
         assert_eq!(
             ctx, 12288,
             "E4B IQ4_XS got {ctx}. Its budget affords 13,220 tokens, so anything at or below \
@@ -861,7 +934,7 @@ mod tests {
 
         // And the floor still rounds DOWN, never up, at every offset.
         for bytes in [4_600_000_000u64, 4_700_000_000, 4_800_000_000] {
-            let ctx = LocalInferenceLlmAdapter::jetson_context_size(bytes) as u64;
+            let ctx = LocalInferenceLlmAdapter::jetson_context_size(bytes, None) as u64;
             let model_mb = bytes / (1024 * 1024);
             let kv_mb = crate::scheduler::LLM_BUDGET_MB
                 .saturating_sub(model_mb)
@@ -903,10 +976,85 @@ mod tests {
         );
     }
 
+    /// Wiring the header-derived cost in must not move either shipped model.
+    ///
+    /// That is the whole reason this could land without the device: E2B
+    /// computes 18 KiB/token but is `MAX_CTX`-bound either way, and both E4B
+    /// quants compute exactly the 56 the constant already carried. A diff that
+    /// changes nothing today changes only models nobody has loaded yet.
+    #[test]
+    fn header_derived_cost_is_a_no_op_for_the_shipped_models() {
+        // (weights, computed KiB/token, expected window)
+        let cases = [
+            (3_106_738_272u64, 18u64, 16384u32), // E2B Q4_K_M
+            (4_977_171_584, 56, 8192),           // E4B Q4_K_M
+            (4_715_416_704, 56, 12288),          // E4B IQ4_XS
+        ];
+        for (bytes, kv, want) in cases {
+            let fallback = LocalInferenceLlmAdapter::jetson_context_size(bytes, None);
+            let derived = LocalInferenceLlmAdapter::jetson_context_size(bytes, Some(kv));
+            assert_eq!(
+                derived, want,
+                "{bytes} bytes at {kv} KiB/token should give {want}, got {derived}"
+            );
+            assert_eq!(
+                derived, fallback,
+                "{bytes} bytes: header-derived {derived} must match the fallback {fallback}                  for a model we already ship -- if this moved, the wiring changed behaviour                  on hardware nobody re-measured"
+            );
+        }
+    }
+
+    /// A cheaper model gets the context its own geometry affords, which is the
+    /// point of reading the header at all.
+    ///
+    /// The size has to be chosen with care: a light model is `MAX_CTX`-bound at
+    /// BOTH costs and the comparison proves nothing. At 4,500 MB the KV budget
+    /// is 720 MB, which affords 13,166 tokens at 56 KiB (budget-bound, floors
+    /// to 12,288) and 26,331 at 28 (ceiling-bound at 16,384). That gap is the
+    /// context a blanket constant was quietly charging for.
+    #[test]
+    fn a_cheaper_model_is_no_longer_charged_the_widest_geometry() {
+        let bytes = 4_500u64 * 1024 * 1024;
+        let blanket = LocalInferenceLlmAdapter::jetson_context_size(bytes, None);
+        let real = LocalInferenceLlmAdapter::jetson_context_size(bytes, Some(28));
+        assert!(
+            real > blanket,
+            "a 28 KiB/token model should get more than the 56 KiB/token fallback allows,              got {real} against {blanket}"
+        );
+    }
+
+    /// The direction that matters: a WIDER model must be charged more and get
+    /// less, rather than inheriting a constant that flatters it.
+    ///
+    /// 168 KiB/token is the figure this file once carried for E4B before the
+    /// device corrected it -- a real number from a real mistake.
+    #[test]
+    fn a_wider_model_is_charged_for_it() {
+        let bytes = 4_000_000_000u64;
+        let blanket = LocalInferenceLlmAdapter::jetson_context_size(bytes, None);
+        let real = LocalInferenceLlmAdapter::jetson_context_size(bytes, Some(168));
+        assert!(
+            real < blanket,
+            "a 168 KiB/token model must get LESS than the 56 fallback grants, got {real}              against {blanket}; this is the direction that OOMs the board"
+        );
+    }
+
+    /// A zero or absent slope must fall back, never divide by zero and never
+    /// hand out an unbounded window.
+    #[test]
+    fn a_useless_slope_falls_back_rather_than_dividing_by_zero() {
+        let bytes = 4_977_171_584u64;
+        let fallback = LocalInferenceLlmAdapter::jetson_context_size(bytes, None);
+        assert_eq!(
+            LocalInferenceLlmAdapter::jetson_context_size(bytes, Some(0)),
+            fallback
+        );
+    }
+
     #[test]
     fn jetson_context_floors_for_an_oversized_model() {
         assert_eq!(
-            LocalInferenceLlmAdapter::jetson_context_size(9_000_000_000),
+            LocalInferenceLlmAdapter::jetson_context_size(9_000_000_000, None),
             2048
         );
     }

@@ -218,7 +218,24 @@ after the token array. So the split is:
 `shared_kv_layers`, with `kv_bytes_per_token(swa_per_global)` / `kv_kib_per_token`. Tested
 against transcribed fixtures and, via an `#[ignore]`d env-gated test, against the real files
 on disk -- both paths return 18 KiB/token for E2B and 56 for E4B, matching the Orin.
-Not yet wired into `jetson_context_size`, which still uses the hardcoded 56.
+**Wired into `jetson_context_size` the same day.** It now takes
+`kv_kib_per_token: Option<u64>`, and `apply_jetson_settings` reads the header via
+`kv_cost_from_header`. The rule there is deliberately asymmetric, because assuming more
+sliding-window layers than a model has makes the cost come out LOW, which is the direction
+that OOMs a board: a model with **no** `key_length_swa` is dense, the pattern cannot change
+the answer, and it is trusted for any architecture; a model **with** `key_length_swa` is
+trusted only for an architecture whose ratio has been confirmed against a real allocation on
+the device (today: `gemma4` at 1:5). Anything else returns `None` and the caller keeps the
+measured constant.
+
+This is a **no-op for every model currently shipped** -- E2B computes 18 KiB/token but is
+`MAX_CTX`-bound either way, and both E4B quants compute exactly the 56 the constant already
+carried -- which is what made it safe to land from the Mac. A regression test pins that
+equivalence, so if wiring ever moves a shipped model the build says so.
+
+**Not verified on hardware.** The caller lives inside `#[cfg(feature = "cuda")]`, which
+cannot compile without `nvcc`, and CI's `cargo check` does not pass that feature either --
+so those few lines are reviewed, not compiled, until the next device build.
 
 ## 5. Suggested order of work
 
