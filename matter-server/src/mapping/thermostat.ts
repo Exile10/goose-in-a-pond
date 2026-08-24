@@ -46,6 +46,71 @@ function attr(endpoint: EndpointSnapshot, name: string): number | undefined {
   return typeof value === "number" ? value : undefined;
 }
 
+/** Matter's SystemModeEnum by name, for the encoding matter.js may hand over instead. */
+const SYSTEM_MODE_NAMES: ReadonlyMap<string, number> = new Map([
+  ["off", 0],
+  ["auto", 1],
+  ["cool", MODE_COOL],
+  ["heat", MODE_HEAT],
+  ["emergencyheat", MODE_EMERGENCY_HEAT],
+  ["precooling", 6],
+  ["fanonly", 7],
+  ["dry", 8],
+  ["sleep", 9],
+]);
+
+/**
+ * The mode the thermostat is in, whichever way matter.js decoded it.
+ *
+ * Read as a number only, every comparison against it failed for a device that reported
+ * "Cool" — so a cooling-only air conditioner sitting in Cool mode was treated as a
+ * thermostat with no settled mode, and got the union of both setpoints' ranges: 7 to
+ * 32 C on a device that cannot go anywhere near 7. The same tolerance `fanModes` and
+ * `doorStateWord` already apply, for the same reason.
+ */
+export function systemMode(endpoint: EndpointSnapshot): number | undefined {
+  const raw = endpoint.clusters[CLUSTER_THERMOSTAT]?.["systemMode"];
+  if (typeof raw === "number") return raw;
+  if (typeof raw === "string") {
+    return SYSTEM_MODE_NAMES.get(raw.toLowerCase().replace(/[\s_-]/g, ""));
+  }
+  return undefined;
+}
+
+/**
+ * Which setpoints this thermostat actually has.
+ *
+ * `controlSequenceOfOperation` is MANDATORY on the cluster and says exactly this —
+ * whether the device cools, heats, or both — and nothing here read it. Presence was
+ * inferred with `"occupiedCoolingSetpoint" in clusters` instead, which is a KEY check:
+ * matter.js populates a key for every attribute in the cluster model and leaves the
+ * unsupported ones `undefined`, so every thermostat looked like it had both. A
+ * cooling-only air conditioner was offered a heating setpoint it does not implement.
+ *
+ * Claims first, evidence second, and neither is allowed to STRIP a control that might
+ * work: a device stating nothing at all keeps both, because withholding a setpoint on
+ * silence would break a thermostat that under-reports. Same order as `colorSupport`.
+ */
+export function setpointsAvailable(endpoint: EndpointSnapshot): {
+  heating: boolean;
+  cooling: boolean;
+} {
+  // 0 CoolingOnly, 1 CoolingWithReheat, 2 HeatingOnly, 3 HeatingWithReheat,
+  // 4 CoolingAndHeating, 5 CoolingAndHeatingWithReheat.
+  const sequence = attr(endpoint, "controlSequenceOfOperation");
+  if (sequence !== undefined) {
+    return { cooling: sequence <= 1 || sequence >= 4, heating: sequence >= 2 };
+  }
+
+  const heating = attr(endpoint, "occupiedHeatingSetpoint") !== undefined;
+  const cooling = attr(endpoint, "occupiedCoolingSetpoint") !== undefined;
+  if (heating || cooling) return { heating, cooling };
+
+  // Says nothing and reports nothing. Keep offering both rather than describing a
+  // thermostat as having no temperature control at all.
+  return { heating: true, cooling: true };
+}
+
 /** The tighter of a configured limit and the absolute one the hardware states. */
 function floor(endpoint: EndpointSnapshot, configured: string, absolute: string) {
   return attr(endpoint, configured) ?? attr(endpoint, absolute);
@@ -115,13 +180,15 @@ export function targetSetpoint(node: NodeSnapshot, celsius?: number): Setpoint |
   const endpoint = endpointWith(node, CLUSTER_THERMOSTAT);
   if (endpoint === undefined) return undefined;
 
+  const available = setpointsAvailable(endpoint);
   const heating = heatingSetpoint(endpoint);
-  const hasCooling = "occupiedCoolingSetpoint" in (endpoint.clusters[CLUSTER_THERMOSTAT] ?? {});
-  // A heat-only thermostat has nothing to choose between.
-  if (!hasCooling) return heating;
+  // A cool-only device has no heating setpoint to write, and vice versa. Naming one the
+  // device does not implement is a write it refuses.
+  if (!available.cooling) return available.heating ? heating : undefined;
+  if (!available.heating) return coolingSetpoint(endpoint);
 
   const cooling = coolingSetpoint(endpoint);
-  switch (attr(endpoint, "systemMode")) {
+  switch (systemMode(endpoint)) {
     case MODE_COOL:
       return cooling;
     case MODE_HEAT:
@@ -148,13 +215,21 @@ export function reachableRange(node: NodeSnapshot): { min?: number; max?: number
   const endpoint = endpointWith(node, CLUSTER_THERMOSTAT);
   if (endpoint === undefined) return undefined;
 
+  const available = setpointsAvailable(endpoint);
   const heating = heatingSetpoint(endpoint);
-  if (!("occupiedCoolingSetpoint" in (endpoint.clusters[CLUSTER_THERMOSTAT] ?? {}))) {
+  if (!available.cooling) {
     return { ...(heating.min === undefined ? {} : { min: heating.min }),
              ...(heating.max === undefined ? {} : { max: heating.max }) };
   }
 
   const cooling = coolingSetpoint(endpoint);
+  // Cool-only: the union below would take its floor from a heating setpoint that does
+  // not exist, which is how an air conditioner came to advertise 7 C.
+  if (!available.heating) {
+    return { ...(cooling.min === undefined ? {} : { min: cooling.min }),
+             ...(cooling.max === undefined ? {} : { max: cooling.max }) };
+  }
+
   const min = heating.min ?? cooling.min;
   const max = cooling.max ?? heating.max;
   return { ...(min === undefined ? {} : { min }), ...(max === undefined ? {} : { max }) };

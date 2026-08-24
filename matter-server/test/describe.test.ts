@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { describeNode } from "../src/mapping/describe.js";
 import {
+  airConditionerNode,
   bareLockNode,
   customLightNode,
   describedNode,
@@ -312,13 +313,51 @@ describe("device description", () => {
     });
   });
 
+  it("offers an air conditioner only the range it can cool to", () => {
+    // The report this came from: "you can set its target temperature between 7 and 32 C"
+    // for a cooling-only air conditioner. 7 is the floor of a HEATING setpoint the device
+    // does not implement, unioned in because presence was inferred from a key rather than
+    // a value -- and matter.js keys every attribute in the cluster model, unsupported
+    // ones included. Verified against a live device: controlSequenceOfOperation says
+    // CoolingOnly and occupiedHeatingSetpoint has no value at all.
+    expect(capability(airConditionerNode(), "target_temp")?.value).toEqual({
+      kind: "number",
+      unit: "C",
+      min: 16,
+      max: 32,
+      // Names which setpoint moved, and carries no "reaches ... across its modes" tail:
+      // there is no other mode, and the existing heat-only case settled that the label
+      // itself stays. What was wrong was the RANGE, not the qualifier.
+      when: "while cooling",
+    });
+  });
+
+  it("reads a system mode matter.js decoded to its enum name", () => {
+    // "Cool" compared against 3 is never equal, so the mode read as unsettled and the
+    // description fell back to the union of both setpoints' ranges.
+    const spec = capability(airConditionerNode(), "target_temp")?.value;
+
+    // Settled on the cooling setpoint, so the floor is the COOLING minimum (16) and not
+    // the heating one (7) that the union would have supplied.
+    expect(spec).toMatchObject({ min: 16 });
+  });
+
   it("keeps the setpoints from crossing when no deadband is stated", () => {
     // An absent deadband means zero, not "no rule": heating still may not pass
     // cooling.
     const noDeadband = node(92, [
       named("Thermostat"),
       endpoint(1, {
-        thermostat: { absMaxHeatSetpointLimit: 3000, occupiedCoolingSetpoint: 2400 },
+        // States that it both heats and cools (controlSequenceOfOperation 4), which is
+        // the premise the deadband rule needs: the cap exists to stop TWO setpoints
+        // crossing. Without it this fixture reads as cool-only -- it has a cooling
+        // setpoint and no heating one -- and a cool-only device has no heating ceiling
+        // to report.
+        thermostat: {
+          controlSequenceOfOperation: 4,
+          absMaxHeatSetpointLimit: 3000,
+          occupiedCoolingSetpoint: 2400,
+        },
       }),
     ]);
 

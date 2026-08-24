@@ -164,6 +164,31 @@ export function tunableWhiteNode(): NodeSnapshot {
   ]);
 }
 
+/**
+ * A Room Air Conditioner as one really reports itself: cooling only, stated through the
+ * mandatory `controlSequenceOfOperation`, with a cooling setpoint and NO heating one —
+ * verified against a live commissioned device. `systemMode` arrives as the enum NAME
+ * here, which is the encoding that made every numeric comparison miss.
+ */
+export function airConditionerNode(): NodeSnapshot {
+  return node(61, [
+    named("Room Air Conditioner"),
+    endpoint(1, {
+      onOff: { onOff: false },
+      thermostat: {
+        controlSequenceOfOperation: 0,
+        systemMode: "Cool",
+        localTemperature: 2500,
+        occupiedCoolingSetpoint: 2400,
+        absMinCoolSetpointLimit: 1600,
+        absMaxCoolSetpointLimit: 3200,
+        absMinHeatSetpointLimit: 700,
+        absMaxHeatSetpointLimit: 3000,
+      },
+    }, [0x0072]),
+  ]);
+}
+
 /** A node that states its type the way every real one does: a Descriptor
  *  DeviceTypeList on the application endpoint. */
 export function describedNode(
