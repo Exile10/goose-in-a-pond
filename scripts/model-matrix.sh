@@ -10,6 +10,7 @@
 #   scripts/model-matrix.sh --thinking auto|on|off which thinking_mode to set
 #   scripts/model-matrix.sh --tools all|relevant   which tool_selection_mode
 #   scripts/model-matrix.sh --bin PATH             drive a specific pond-server
+#   scripts/model-matrix.sh --keep                 keep each scratch pond for inspection
 #
 # --bin is what makes a before/after honest. Keep a copy of the OLD binary and
 # point this at it, rather than rebuilding between the two runs: a rebuild in
@@ -50,6 +51,7 @@ JSON_OUT=""
 THINKING="auto"
 TOOLS="all"
 BIN_OVERRIDE=""
+KEEP=0
 PORT="${PORT:-4988}"
 
 while [ $# -gt 0 ]; do
@@ -60,6 +62,7 @@ while [ $# -gt 0 ]; do
     --thinking) THINKING="${2:-}"; shift ;;
     --tools)    TOOLS="${2:-}"; shift ;;
     --bin)      BIN_OVERRIDE="${2:-}"; shift ;;
+    --keep)     KEEP=1 ;;
     --port)     PORT="${2:-}"; shift ;;
     -h|--help)  sed -n '2,34p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
@@ -243,7 +246,14 @@ PY
   for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
   kill -9 "$pid" 2>/dev/null
   wait "$pid" 2>/dev/null
-  rm -rf "$data_dir"
+  if [ "$KEEP" = "1" ]; then
+    # goose keeps its own store under GOOSE_PATH_ROOT, which GIAP points inside
+    # the data dir — so the assembled prompt each turn actually received only
+    # survives if the scratch pond does.
+    echo "  kept: $data_dir"
+  else
+    rm -rf "$data_dir"
+  fi
   echo "  done $model"
 }
 
