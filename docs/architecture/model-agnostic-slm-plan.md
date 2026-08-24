@@ -237,6 +237,54 @@ equivalence, so if wiring ever moves a shipped model the build says so.
 cannot compile without `nvcc`, and CI's `cargo check` does not pass that feature either --
 so those few lines are reviewed, not compiled, until the next device build.
 
+### Landed 2026-08-16: the seek fix and `ModelProbe` (Mac only)
+
+**The seek fix.** My earlier suggestion in this document -- "let it report where it stopped
+and have the caller do one targeted second read" -- was wrong, and worth recording as wrong.
+You cannot compute where `tokenizer.ggml.tokens` ends: it is an array of variable-length
+strings, so the only way past it is to walk its per-element length prefixes. There is no
+offset to seek to.
+
+What works is a `GgufSource` trait, so the walk reads through a buffered file rather than a
+slice. The win is not the seeking, it is that **skipping stops requiring the bytes**: a
+scalar or a whole string becomes position arithmetic, and a string array costs one 8-byte
+length read per element instead of allocating a `String` for each of a quarter-million
+tokens. `parse_gguf_file` reaches a template 15 MB in having read a few hundred kilobytes,
+in about 40 ms per model.
+
+`parse_gguf_header(&[u8])` is unchanged for callers that only want geometry.
+
+**`ModelProbe`** (`pond-core/src/models/domain/model_probe.rs`) reads `ToolSupport`
+(Native / Absent / Unknown) and `Thinking` (Gated / Always / Absent / Unknown, each carrying
+the real marker) from the template. Against all eleven GGUFs it produces five distinct
+classifications:
+
+| classification | models |
+|---|---|
+| Native + Gated `<\|think\|>` | Gemma 4 E2B, E4B x2, 12B |
+| Native + Gated `<think>` | Nemotron3-Nano-4B, Nanbeige4.2-3B |
+| **Absent + Always `<think>`** | **DeepSeek-R1-Distill-Qwen** |
+| Native + Absent | gemma3-270m |
+| Unknown + Unknown | the three MTP/assistant drafts, which carry no template |
+
+Three design points that the evidence forced:
+
+1. **Control flow, not substrings.** DeepSeek mentions `tool_call` once while supporting no
+   tools. The probe scans only inside `{% ... %}` and only for whole words.
+2. **`Unknown` is not `Absent`.** A model with no template has not said it cannot use tools.
+   `supports_native_tools()` answers false for both, but the states stay distinct so a
+   caller can tell "cannot" from "did not say".
+3. **The marker is read, never assumed.** Gemma 4 emits `<|think|>` -- **not** the
+   `<|channel>thought` that `model_capabilities.rs` documents. That doc comment is stale.
+
+Not yet wired: `apply_*_settings` still forces `ToolCallingMode::ForceNative` on every
+model, which is what DeepSeek-R1 would break on. That is the next step and it changes
+behaviour, so it wants the device in the loop.
+
+Worth noting for later: now that skipping is free, `read_gguf_head` in `pond-api` could use
+`parse_gguf_file` and get templates during the catalogue sweep for ~40 ms per model, rather
+than the 1 MB slice that cannot reach them.
+
 ## 5. Suggested order of work
 
 1. **Capture the failing error string** (`RUST_LOG` run, one prompt). Everything about E4B is

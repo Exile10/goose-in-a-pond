@@ -66,6 +66,15 @@ pub struct GgufInfo {
     pub key_length_swa: Option<u32>,
     /// `{arch}.attention.value_length_swa`, where present.
     pub value_length_swa: Option<u32>,
+    /// `tokenizer.chat_template` — the model's own Jinja template, and the
+    /// only ground truth about what it can be asked to do. Whether it renders
+    /// tool declarations, and whether it gates reasoning, are properties of
+    /// this string and of nothing in the filename.
+    ///
+    /// Only populated by a walk that reaches it: it sits 3.8-15 MB into the
+    /// files measured, after `tokenizer.ggml.tokens`. `parse_gguf_header` on a
+    /// short slice leaves it `None`; [`parse_gguf_file`] finds it.
+    pub chat_template: Option<String>,
     /// `{arch}.attention.shared_kv_layers` — layers that share another layer's
     /// KV and therefore allocate none of their own. Gemma 4 E4B shares 18 of
     /// 42; E2B shares 20 of 35.
@@ -222,18 +231,144 @@ fn file_type_name(v: u32) -> Option<&'static str> {
     })
 }
 
-/// A cursor that refuses to read past the end.
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
+/// Where a GGUF walk gets its bytes.
+///
+/// The parser used to take a `&[u8]`, which is fine for the geometry keys —
+/// they sit in the first two kilobytes — and useless for the chat template,
+/// which sits **3.8 to 15 MB in**, immediately after `tokenizer.ggml.tokens`.
+///
+/// It is tempting to reach it by computing where the token array ends and
+/// reading from there. That does not work: the array is variable-length
+/// strings, so the only way past it is to walk its per-element length
+/// prefixes. There is no offset to seek to.
+///
+/// What a source buys instead is that **skipping stops requiring the bytes**.
+/// A scalar or a whole string is stepped over with position arithmetic and no
+/// read at all, and a string array costs one 8-byte length read per element
+/// rather than materialising a `String` for each of a quarter-million tokens.
+pub trait GgufSource {
+    /// Fill `out` from `offset`. `false` if the source cannot satisfy it in
+    /// full — a short read is indistinguishable from truncation here, and both
+    /// end the walk.
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> bool;
 }
 
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
-        let end = self.pos.checked_add(n)?;
-        let slice = self.buf.get(self.pos..end)?;
-        self.pos = end;
-        Some(slice)
+impl GgufSource for &[u8] {
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> bool {
+        let Ok(start) = usize::try_from(offset) else {
+            return false;
+        };
+        let Some(end) = start.checked_add(out.len()) else {
+            return false;
+        };
+        match self.get(start..end) {
+            Some(src) => {
+                out.copy_from_slice(src);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// A file read through a small sliding window.
+///
+/// The walk is essentially sequential, so a modest buffer turns a quarter of a
+/// million 8-byte length reads into a few hundred real ones.
+pub struct FileSource {
+    file: std::fs::File,
+    buf: Vec<u8>,
+    /// Absolute offset of `buf[0]`.
+    base: u64,
+    /// Valid bytes in `buf`.
+    len: usize,
+}
+
+impl FileSource {
+    const WINDOW: usize = 64 * 1024;
+
+    /// Open a file for walking. `None` if it cannot be opened at all.
+    pub fn open(path: &std::path::Path) -> Option<Self> {
+        Some(Self {
+            file: std::fs::File::open(path).ok()?,
+            buf: vec![0u8; Self::WINDOW],
+            base: 0,
+            len: 0,
+        })
+    }
+
+    fn refill(&mut self, offset: u64) -> bool {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        if self.file.seek(SeekFrom::Start(offset)).is_err() {
+            return false;
+        }
+        let mut filled = 0;
+        while filled < self.buf.len() {
+            match self.file.read(&mut self.buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return false,
+            }
+        }
+        self.base = offset;
+        self.len = filled;
+        filled > 0
+    }
+}
+
+impl GgufSource for FileSource {
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> bool {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        if out.len() > Self::WINDOW {
+            return self.file.seek(SeekFrom::Start(offset)).is_ok()
+                && self.file.read_exact(out).is_ok();
+        }
+        let end = match offset.checked_add(out.len() as u64) {
+            Some(e) => e,
+            None => return false,
+        };
+        let hit = offset >= self.base && end <= self.base + self.len as u64;
+        if !hit && !self.refill(offset) {
+            return false;
+        }
+        let Ok(start) = usize::try_from(offset.saturating_sub(self.base)) else {
+            return false;
+        };
+        let Some(src) = self.buf.get(start..start.saturating_add(out.len())) else {
+            return false;
+        };
+        out.copy_from_slice(src);
+        true
+    }
+}
+
+/// A cursor that refuses to read past the end.
+struct Reader<S> {
+    src: S,
+    pos: u64,
+}
+
+/// The widest string this parser will materialise.
+///
+/// A length field is 64 bits wide and comes from the file; refusing an absurd
+/// one is what stops a corrupt header asking for a 16 EB allocation. Chat
+/// templates run to about 19 KB, so 4 MiB is generous cover.
+const MAX_STRING_BYTES: u64 = 4 * 1024 * 1024;
+
+impl<S: GgufSource> Reader<S> {
+    fn take(&mut self, n: usize) -> Option<Vec<u8>> {
+        let mut out = vec![0u8; n];
+        if !self.src.read_at(self.pos, &mut out) {
+            return None;
+        }
+        self.pos = self.pos.checked_add(n as u64)?;
+        Some(out)
+    }
+    /// Step over `n` bytes without reading them. This is the point of the
+    /// source abstraction: the token array costs position arithmetic.
+    fn skip(&mut self, n: u64) -> Option<()> {
+        self.pos = self.pos.checked_add(n)?;
+        Some(())
     }
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
@@ -242,25 +377,28 @@ impl<'a> Reader<'a> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
     fn string(&mut self) -> Option<String> {
-        let len = self.u64()? as usize;
-        // A length field is 64 bits wide and comes from the file. Refusing an
-        // absurd one here is what stops a corrupt header asking for a 16 EB
-        // allocation.
-        if len > self.buf.len() {
+        let len = self.u64()?;
+        if len > MAX_STRING_BYTES {
             return None;
         }
-        Some(String::from_utf8_lossy(self.take(len)?).into_owned())
+        let bytes = self.take(usize::try_from(len).ok()?)?;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+    /// A string we do not want: read its length, step over its bytes.
+    fn skip_string(&mut self) -> Option<()> {
+        let len = self.u64()?;
+        self.skip(len)
     }
 }
 
 /// Fixed widths for the scalar value types, so a value we do not care about
 /// can be stepped over without interpreting it.
-fn scalar_width(kind: u32) -> Option<usize> {
+fn scalar_width(kind: u32) -> Option<u64> {
     Some(match kind {
-        0 | 1 | 7 => 1,    // u8, i8, bool
-        2 | 3 => 2,        // u16, i16
-        4 | 5 | 6 => 4,    // u32, i32, f32
-        10 | 11 | 12 => 8, // u64, i64, f64
+        0 | 1 | 7 => 1, // u8, i8, bool
+        2 | 3 => 2,     // u16, i16
+        4..=6 => 4,     // u32, i32, f32
+        10..=12 => 8,   // u64, i64, f64
         _ => return None,
     })
 }
@@ -273,9 +411,13 @@ enum Value {
     Other,
 }
 
-fn read_value(r: &mut Reader<'_>, kind: u32) -> Option<Value> {
+fn read_value<S: GgufSource>(r: &mut Reader<S>, kind: u32, want_string: bool) -> Option<Value> {
     match kind {
-        8 => Some(Value::Str(r.string()?)),
+        8 if want_string => Some(Value::Str(r.string()?)),
+        8 => {
+            r.skip_string()?;
+            Some(Value::Other)
+        }
         4 => Some(Value::U32(r.u32()?)),
         10 => Some(Value::U64(r.u64()?)),
         9 => {
@@ -283,33 +425,31 @@ fn read_value(r: &mut Reader<'_>, kind: u32) -> Option<Value> {
             // collected — nothing here needs one, and skipping keeps the walk
             // going so later keys are still read.
             let elem = r.u32()?;
-            let count = r.u64()? as usize;
+            let count = r.u64()?;
             if elem == 8 {
+                // Variable-length: the only way past is one length per element.
                 for _ in 0..count {
-                    r.string()?;
+                    r.skip_string()?;
                 }
             } else {
-                let w = scalar_width(elem)?;
-                r.take(w.checked_mul(count)?)?;
+                r.skip(scalar_width(elem)?.checked_mul(count)?)?;
             }
             Some(Value::Other)
         }
         other => {
-            r.take(scalar_width(other)?)?;
+            r.skip(scalar_width(other)?)?;
             Some(Value::Other)
         }
     }
 }
 
-/// Read what a GGUF header says about its model.
+/// Read what a GGUF header says about its model, from any source.
 ///
-/// `head` need only be the first slice of the file — a megabyte is far more
-/// than any real header. A short read simply yields fewer fields.
-///
-/// Returns `None` when the bytes are not GGUF at all, so a caller can tell
-/// "not this kind of file" from "a header with little in it".
-pub fn parse_gguf_header(head: &[u8]) -> Option<GgufInfo> {
-    let mut r = Reader { buf: head, pos: 0 };
+/// The walk is identical whatever the bytes come from; only how far it gets
+/// differs. A short slice stops when it runs out and returns what it
+/// understood, which is the geometry. A file source reaches everything.
+fn walk<S: GgufSource>(src: S) -> Option<GgufInfo> {
+    let mut r = Reader { src, pos: 0 };
     if r.take(4)? != b"GGUF" {
         return None;
     }
@@ -327,13 +467,20 @@ pub fn parse_gguf_header(head: &[u8]) -> Option<GgufInfo> {
     for _ in 0..kv_count.min(4096) {
         let Some(key) = r.string() else { break };
         let Some(kind) = r.u32() else { break };
-        let Some(value) = read_value(&mut r, kind) else {
+        // Only materialise the strings we actually keep. Everything else is
+        // stepped over, which matters most for the token array.
+        let want_string = matches!(
+            key.as_str(),
+            "general.architecture" | "general.name" | "tokenizer.chat_template"
+        );
+        let Some(value) = read_value(&mut r, kind, want_string) else {
             break;
         };
 
         match (key.as_str(), value) {
             ("general.architecture", Value::Str(s)) => info.architecture = Some(s),
             ("general.name", Value::Str(s)) => info.name = Some(s),
+            ("tokenizer.chat_template", Value::Str(s)) => info.chat_template = Some(s),
             ("general.file_type", Value::U32(v)) => {
                 info.quantization = file_type_name(v).map(str::to_string)
             }
@@ -351,10 +498,6 @@ pub fn parse_gguf_header(head: &[u8]) -> Option<GgufInfo> {
             (k, Value::U32(v)) if k.ends_with(".attention.head_count_kv") => {
                 info.head_count_kv = Some(v)
             }
-            // `_swa` first: ".attention.key_length_swa" also ends with
-            // nothing else, but ".key_length" is a suffix-match that would
-            // never fire for it -- kept explicit so a reader does not have to
-            // work that out.
             (k, Value::U32(v)) if k.ends_with(".attention.key_length_swa") => {
                 info.key_length_swa = Some(v)
             }
@@ -373,6 +516,28 @@ pub fn parse_gguf_header(head: &[u8]) -> Option<GgufInfo> {
     }
 
     Some(info)
+}
+
+/// Read what a GGUF header says about its model, from a slice.
+///
+/// `head` need only be the first slice of the file. The geometry keys live in
+/// the first two kilobytes, so a small read answers everything the context
+/// arithmetic needs — but **not** `chat_template`, which is megabytes in. Use
+/// [`parse_gguf_file`] when that matters.
+///
+/// Returns `None` when the bytes are not GGUF at all, so a caller can tell
+/// "not this kind of file" from "a header with little in it".
+pub fn parse_gguf_header(head: &[u8]) -> Option<GgufInfo> {
+    walk(head)
+}
+
+/// Read a GGUF file's header from disk, walking far enough to reach every key
+/// including the chat template.
+///
+/// Costs a few hundred kilobytes of real reading regardless of model size,
+/// because everything between the keys is stepped over rather than read.
+pub fn parse_gguf_file(path: &std::path::Path) -> Option<GgufInfo> {
+    walk(FileSource::open(path)?)
 }
 
 /// "4.3B", "270M" — parameter counts as they are spoken.
@@ -517,6 +682,73 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 0, "no model files found under {dir}");
+    }
+
+    /// The seek fix, against real files: the walk must now reach a key that
+    /// lives megabytes past the token array.
+    ///
+    /// Run with
+    ///
+    /// ```text
+    /// GIAP_TEST_GGUF_DIR="$HOME/Library/Application Support/goose-in-a-pond/models/gguf" \
+    ///   cargo test -p pond-core --lib gguf -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs real GGUF files; set GIAP_TEST_GGUF_DIR"]
+    fn reaches_the_chat_template_past_the_token_array() {
+        let Ok(dir) = std::env::var("GIAP_TEST_GGUF_DIR") else {
+            eprintln!("GIAP_TEST_GGUF_DIR unset");
+            return;
+        };
+        let mut checked = 0;
+        let mut with_template = 0;
+        for entry in std::fs::read_dir(&dir).expect("dir") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+                continue;
+            }
+            let Some(info) = parse_gguf_file(&path) else {
+                continue;
+            };
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let tpl = info.chat_template.as_deref().unwrap_or("");
+            eprintln!(
+                "{name}: arch={:?} ctx={:?} template={} chars kv={:?} KiB/tok",
+                info.architecture,
+                info.context_length,
+                tpl.len(),
+                info.kv_kib_per_token(5),
+            );
+            // Geometry must agree between the two walks; the slice must NOT
+            // have reached the template, which is the whole reason the file
+            // walk exists.
+            if let Ok(all) = std::fs::read(&path) {
+                let head = &all[..all.len().min(65536)];
+                let short = parse_gguf_header(head).expect("parses");
+                assert!(
+                    short.chat_template.is_none(),
+                    "{name}: a 64 KiB slice reached the template, so this test proves nothing"
+                );
+                assert_eq!(
+                    short.block_count, info.block_count,
+                    "{name}: geometry must agree between the slice and file walks"
+                );
+            }
+            // A template is not universal: `gemma-4-E4B-it-assistant.Q8_0` is a
+            // 95 MB draft model and carries none at all. That is a real state
+            // the capability probe has to represent (a model with no template
+            // cannot be asked to render tools), not a parse failure.
+            if !tpl.is_empty() {
+                with_template += 1;
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no GGUF files under {dir}");
+        assert!(
+            with_template >= 3,
+            "only {with_template} of {checked} models yielded a chat template; the walk is \
+             not getting past the token array"
+        );
     }
 
     /// Shared layers allocate nothing, and forgetting that is a 1.75x
