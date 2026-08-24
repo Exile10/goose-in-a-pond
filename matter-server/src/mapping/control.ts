@@ -63,6 +63,29 @@ export function levelToBrightness(level: number): number {
   return clampPercent((level * 100) / 254);
 }
 
+/**
+ * Kelvin onto ColorControl's mireds, and back.
+ *
+ * Mireds are reciprocal megakelvin — 1e6/K — so the mapping is its own inverse and the
+ * ORDER INVERTS: fewer mireds is a hotter, bluer white. Kelvin is what a person says
+ * ("2700K", "warm white") and mireds is what the cluster takes, which is the whole
+ * reason this conversion exists rather than the wire carrying mireds.
+ *
+ * Clamped to the cluster's own field range (1..0xfeff). Zero mireds is not a colour and
+ * would divide to infinity; the spec's own defaults include it, so it has to be handled
+ * rather than assumed away.
+ */
+export function kelvinToMireds(kelvin: number): number {
+  if (!Number.isFinite(kelvin) || kelvin <= 0) return 0xfeff;
+  return Math.min(0xfeff, Math.max(1, Math.round(1_000_000 / kelvin)));
+}
+
+/** Mireds back to kelvin, rounded to a whole degree — no device is that precise. */
+export function miredsToKelvin(mireds: number): number {
+  if (!Number.isFinite(mireds) || mireds <= 0) return 0;
+  return Math.round(1_000_000 / mireds);
+}
+
 /** Celsius onto a Matter thermostat setpoint (hundredths of a degree). */
 export function celsiusToSetpoint(celsius: number): number {
   return Math.min(32767, Math.max(-32768, Math.round(celsius * 100)));
@@ -80,10 +103,21 @@ export function hueToMatter(degrees: number): number {
   return Math.floor((wrapped * 254 + 180) / 360);
 }
 
+/** ColorControl's 0-254 hue back to degrees, for reading state. */
+export function matterToHue(raw: number): number {
+  const clamped = Math.min(254, Math.max(0, Math.round(raw)));
+  return Math.round((clamped * 360) / 254) % 360;
+}
+
 /** A 0-100 saturation percentage onto Matter's 0-254 scale. */
 export function saturationToMatter(percent: number): number {
   const pct = clampPercent(percent);
   return Math.floor((pct * 254 + 50) / 100);
+}
+
+/** Matter's 0-254 saturation back to a percentage. */
+export function matterToSaturation(raw: number): number {
+  return clampPercent((Math.min(254, Math.max(0, raw)) * 100) / 254);
 }
 
 /**
@@ -337,6 +371,38 @@ export function planControl(
           { kind: "command", endpoint, cluster: CLUSTER_DOOR_LOCK, command: locked ? "lockDoor" : "unlockDoor", payload: {} },
         ],
         applied: { locked },
+      };
+    }
+
+    case "color_temp": {
+      if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+        throw new OpError(
+          "bad_request",
+          "color_temp needs a colour temperature in kelvin, e.g. 2700 for warm white",
+        );
+      }
+      const kelvin = value;
+      const endpoint = endpointFor(node, CLUSTER_COLOR_CONTROL, deviceId);
+      return {
+        actions: [
+          {
+            kind: "command",
+            endpoint,
+            cluster: CLUSTER_COLOR_CONTROL,
+            command: "moveToColorTemperature",
+            payload: {
+              colorTemperatureMireds: kelvinToMireds(kelvin),
+              transitionTime: 0,
+              optionsMask: {},
+              optionsOverride: {},
+            },
+          },
+        ],
+        // Reported as the kelvin the device will actually sit at, not the kelvin that
+        // was asked for: the round trip through mireds is lossy at whole-mired
+        // granularity, and echoing the request would overstate the precision by a few
+        // degrees at the warm end and rather more at the cool one.
+        applied: { color_temp: miredsToKelvin(kelvinToMireds(kelvin)) },
       };
     }
 

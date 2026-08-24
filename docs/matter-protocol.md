@@ -105,6 +105,7 @@ Exactly GIAP's `DeviceControlPort` vocabulary:
 | `target_temp` | degrees Celsius | `target_temp` |
 | `locked` | `true` / `false` | `locked` |
 | `color` | `{hue: 0–360, saturation: 0–100}` | `hue`, `saturation` |
+| `color_temp` | kelvin | `color_temp` |
 | `fan_speed` | 0–100 | `fan_speed`, `on` |
 | `fan_mode` | `off`/`low`/`medium`/`high`/`on`/`auto`/`smart` | `fan_mode`, `on` |
 | `position` | 0–100 percent **open** | `position` |
@@ -155,6 +156,27 @@ only by a covering that reports a tilt position, since a roller blind has nothin
 turn and a control a device will reject is the failure this area exists to stop.
 Zero is open on both axes: the spec has `GoToTiltPercentage` treat a zero percentage
 as `UpOrOpen`, so one conversion serves both.
+
+`color_temp` is a second colour control, not a second way to reach the first. 2700K white
+has no hue, so it cannot be asked for through hue and saturation at all — which is why it
+earns its own verb while XY, which addresses the same perceptual space hue and saturation
+already cover, does not get one.
+
+Both are offered strictly according to the device's own `colorCapabilities`. Presence of
+the ColorControl cluster used to imply hue and saturation outright, and that is wrong in a
+way that shows: a tunable-white bulb has the cluster and no hue whatsoever, and was
+offered a hue it rejects — the same failure as offering `tilt` to a roller blind.
+
+The wire carries **kelvin**; the cluster takes mireds. Mireds are reciprocal megakelvin,
+so the conversion inverts the bounds — the smallest mired value is the hottest colour —
+and a range built without inverting has a minimum above its maximum, which reads as a
+broken device rather than a broken conversion. The range itself comes from
+`colorTempPhysicalMinMireds`/`MaxMireds` where the device states them, and is absent where
+it does not: the spec's own default for those is 0, which converts to infinite kelvin.
+
+`applied` reports the kelvin the device will sit at rather than the kelvin requested,
+because the round trip through whole mireds is lossy — asked for 2700 a device lands on
+2703, and echoing the request would overstate the precision.
 
 `target_temp` also carries an appliance's own setpoint. Temperature Control has two
 shapes: a washer names levels, which are read as a `mode`, while a dishwasher states
@@ -369,6 +391,10 @@ names the thing that changes it: "spin speed is Low" leads straight to the call 
 makes it High, and "door is jammed" names something with no such call by design.
 That correspondence is the point of the type being this plain, and it is asserted in
 the controller's tests rather than left as an intention.
+
+A colour reading names the mode the device is IN, not every attribute it holds: a bulb
+sitting at 2700K still carries whatever hue it was last set to, and reporting both makes
+the reading contradict itself.
 
 Values are read through the inverses of the conversions `control` writes with, so a
 covering reported at 40% open is the same 40% that would put it there — not

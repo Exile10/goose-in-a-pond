@@ -7,9 +7,11 @@ import {
   bareLockNode,
   doorLockNode,
   endpoint,
+  extendedColorLightNode,
   laundryWasherNode,
   named,
   node,
+  tunableWhiteNode,
 } from "./fixtures.js";
 
 /** The value reported for a name, or undefined if it was not reported at all. */
@@ -104,6 +106,66 @@ describe("device state", () => {
     expect(valueOf(bareLockNode(), "door")).toBeUndefined();
     expect(valueOf(bareLockNode(), "pin_required")).toBeUndefined();
     expect(valueOf(bareLockNode(), "locked")).toBe("locked");
+  });
+
+  it("says what colour a light is, which it could not before", () => {
+    // `state` never touched ColorControl, so the only way to learn a light's colour was
+    // to change it -- the same failure the whole op exists to remove.
+    const light = extendedColorLightNode();
+
+    expect(valueOf(light, "color")).toBe("hue 0, saturation 0%");
+  });
+
+  it("reports a white bulb's temperature in kelvin, not mireds", () => {
+    // 370 mireds is 2703 K. Mireds are the cluster's unit; kelvin is the one a person
+    // says and the one `color_temp` is written in.
+    expect(valueOf(tunableWhiteNode(), "color_temp")).toBe("2703 K");
+  });
+
+  it("reports the colour mode the device is in, not every attribute it holds", () => {
+    // A bulb sitting at 2700K still carries whatever hue it was last set to. Reporting
+    // both makes the reading contradict itself -- "it is warm white" and "it is red".
+    const warm = node(54, [
+      named("Lamp"),
+      endpoint(1, {
+        colorControl: {
+          colorCapabilities: 0x19,
+          colorMode: 2,
+          currentHue: 200,
+          currentSaturation: 254,
+          colorTemperatureMireds: 370,
+        },
+      }, [0x010d]),
+    ]);
+
+    expect(valueOf(warm, "color_temp")).toBe("2703 K");
+    expect(valueOf(warm, "color")).toBeUndefined();
+  });
+
+  it("reads a colour mode matter.js decoded to its enum name", () => {
+    const named2 = node(55, [
+      named("Lamp"),
+      endpoint(1, {
+        colorControl: {
+          colorCapabilities: 0x19,
+          colorMode: "ColorTemperatureMireds",
+          colorTemperatureMireds: 250,
+        },
+      }, [0x010d]),
+    ]);
+
+    expect(valueOf(named2, "color_temp")).toBe("4000 K");
+  });
+
+  it("names every colour reading with a word the description also uses", () => {
+    // The invariant, applied to the new names: `color` and `color_temp` are both verbs
+    // `control` accepts, so a reading leads straight to the call that changes it.
+    for (const device of [extendedColorLightNode(), tunableWhiteNode()]) {
+      const settable = new Set(describeNode(device).capabilities.map(c => c.setting ?? c.verb));
+      for (const { name } of stateOf(device).values) {
+        expect(settable.has(name), `'${name}' is reported but not settable`).toBe(true);
+      }
+    }
   });
 
   it("reports what a device measures, not only what it can be told to be", () => {
