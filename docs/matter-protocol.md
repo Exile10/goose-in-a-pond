@@ -106,6 +106,7 @@ Exactly GIAP's `DeviceControlPort` vocabulary:
 | `locked` | `true` / `false` | `locked` |
 | `color` | `{hue: 0–360, saturation: 0–100}` | `hue`, `saturation` |
 | `color_temp` | kelvin | `color_temp` |
+| `volume` | 0–100 | `volume` |
 | `fan_speed` | 0–100 | `fan_speed`, `on` |
 | `fan_mode` | `off`/`low`/`medium`/`high`/`on`/`auto`/`smart` | `fan_mode`, `on` |
 | `position` | 0–100 percent **open** | `position` |
@@ -365,6 +366,27 @@ cluster carries `sendPinOverTheAir`, `enableLocalProgramming`, `wrongCodeEntryLi
 lock's security configuration one sentence of natural language away from being turned
 off, so the whole class is closed here rather than guarded case by case. `control` has
 no verb that reaches them.
+
+### Media
+
+**Level Control means volume on a speaker and brightness on a light**, and the ENDPOINT's
+device type is what says which. A Basic Video Player is composed — the player on one
+endpoint, a Speaker (`0x0022`) on another — and Level Control lives on the speaker.
+Searching the node for the cluster found it and reported brightness, so a television
+advertised a brightness control that would have turned the sound down. Split by endpoint
+type, and a device can have both: a television with a backlight is not a contradiction.
+
+**Playback rides `operation`, and inputs ride `mode` — no new vocabulary for either.**
+Play, pause and stop are what start, pause and stop already mean, so `operationsOf` simply
+points the existing verb at MediaPlayback where there is no Operational State. And an
+input list is exactly what `mode` was built for: a named setting whose values are labels
+the DEVICE published, chosen by sending an index back. "HDMI 2" is offered because the
+television said so, the same way a washer's cycles are its own.
+
+The two clusters do not share words for the same idea — Operational State says "stopped"
+where MediaPlayback says "not playing" — so the settle target for an operation is a set of
+acceptable words rather than one. Without that a television's stop waited out the full
+window for a word it was never going to say.
 
 ### Alarms
 

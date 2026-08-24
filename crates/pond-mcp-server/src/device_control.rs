@@ -58,6 +58,9 @@ pub struct SetDeviceStateParams {
     /// 0-100 percent.
     #[serde(default)]
     pub saturation: Option<u8>,
+    /// Speaker volume 0-100. A television's level is its VOLUME, not its brightness.
+    #[serde(default)]
+    pub volume: Option<u8>,
     /// Colour temperature in kelvin — roughly 2000 (warm/amber) to 6500 (cool/daylight).
     /// A device's own achievable range comes from describe_device; this is not the same
     /// control as hue + saturation, and a white cannot be asked for as a hue.
@@ -447,6 +450,7 @@ impl DeviceControlMcpServer {
             && p.hue.is_none()
             && p.saturation.is_none()
             && p.color_temp.is_none()
+            && p.volume.is_none()
             && p.fan_speed.is_none()
             && p.fan_mode.is_none()
             && p.setting.is_none()
@@ -458,6 +462,7 @@ impl DeviceControlMcpServer {
                 "No change requested for '{device_id}'. Specify one of: power (on/off), \
                  brightness (0-100), target_temp (°C), locked (true/false), hue (0-360) + \
                  saturation (0-100), color_temp (kelvin, e.g. 2700 for warm white), \
+                 volume (0-100, a speaker's level), \
                  fan_speed (0-100), fan_mode (off/low/medium/high/on/auto/\
                  smart), setting + setting_value (appliance settings such as a wash \
                  cycle or spin speed — see describe_device), operation (start/stop/\
@@ -556,6 +561,17 @@ impl DeviceControlMcpServer {
         // Its own action, not a variant of colour. A device may take one, both, or
         // neither, and setting hue on a tunable-white bulb is a rejection rather than a
         // near miss -- so the two are never substituted for one another here.
+        if let Some(level) = p.volume {
+            let pct = level.min(100);
+            match self.control.set_volume(device_id, pct).await {
+                Ok(_) => applied.push(format!("volume={pct}%")),
+                Err(e) => {
+                    return Ok(guidance(format!(
+                        "Couldn't set volume on '{device_id}': {e}"
+                    )))
+                }
+            }
+        }
         if let Some(kelvin) = p.color_temp {
             match self.control.set_color_temp(device_id, kelvin).await {
                 Ok(_) => applied.push(format!("color_temp={kelvin}K")),

@@ -35,6 +35,8 @@ import {
   setpointToCelsius,
 } from "./control.js";
 import {
+  levelIsBrightness,
+  speakerEndpoint,
   CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
   CLUSTER_SMOKE_CO_ALARM,
@@ -76,8 +78,16 @@ export function stateOf(node: NodeSnapshot): DeviceState {
   const on = endpointWith(node, CLUSTER_ON_OFF)?.clusters[CLUSTER_ON_OFF]?.["onOff"];
   if (typeof on === "boolean") add("power", on ? "on" : "off");
 
-  const level = numberAt(node, CLUSTER_LEVEL_CONTROL, "currentLevel");
-  if (level !== undefined) add("brightness", `${levelToBrightness(level)}%`);
+  const speaker = speakerEndpoint(node);
+  const speakerLevel = speaker?.clusters[CLUSTER_LEVEL_CONTROL]?.["currentLevel"];
+  if (typeof speakerLevel === "number") add("volume", `${levelToBrightness(speakerLevel)}%`);
+
+  // Only where the level is NOT a speaker's, or a television reports its volume twice
+  // and calls one of them brightness.
+  if (levelIsBrightness(node)) {
+    const level = numberAt(node, CLUSTER_LEVEL_CONTROL, "currentLevel");
+    if (level !== undefined) add("brightness", `${levelToBrightness(level)}%`);
+  }
 
   // The setpoint `target_temp` would write, which is the one the mode has live.
   // Reporting the heating one to a cooling thermostat describes a number that is
@@ -237,9 +247,11 @@ function currentLabel(
   // `currentMode` and matches it against the codes the device published, while the
   // attribute-written ones are an index into the labels themselves.
   const current =
-    setting.write.kind === "command"
-      ? state["currentMode"]
-      : state[setting.write.attribute];
+    setting.current !== undefined
+      ? state[setting.current]
+      : setting.write.kind === "command"
+        ? state["currentMode"]
+        : state[setting.write.attribute];
   if (typeof current !== "number") return undefined;
 
   // ModeBase codes need not be positions in the list, so ask the setting which label

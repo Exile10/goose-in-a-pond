@@ -61,6 +61,8 @@ export interface DeviceStatePatch {
   /** The operation that was run. */
   operation?: string;
   brightness?: number;
+  /** Speaker level as a 0-100 percentage. Not brightness: a different thing entirely. */
+  volume?: number;
   target_temp?: number;
   /** Colour temperature in KELVIN, not the cluster's mireds. See the `color_temp` verb. */
   color_temp?: number;
@@ -136,6 +138,14 @@ export interface VendorClusterSpec {
 export type Verb =
   | "power"
   | "brightness"
+  /**
+   * Speaker level, 0-100.
+   *
+   * Level Control on a SPEAKER endpoint is volume, and it was being reported as
+   * brightness — so "set the television's brightness to 20" turned the sound down.
+   * Same cluster, different device type, and the device type is what says which.
+   */
+  | "volume"
   | "target_temp"
   | "locked"
   | "color"

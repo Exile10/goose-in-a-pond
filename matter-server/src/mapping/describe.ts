@@ -25,6 +25,8 @@ import type {
 import { deviceIdForNode } from "../protocol.js";
 import {
   colorSupport,
+  levelIsBrightness,
+  speakerEndpoint,
   CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
   CLUSTER_SMOKE_CO_ALARM,
@@ -255,7 +257,11 @@ function capabilitiesOf(node: NodeSnapshot): Capability[] {
 
   // A fan need not implement On/Off at all; FanMode is its power switch.
   if (hasOnOff || hasFan) add("power", { kind: "boolean" });
-  if (has(CLUSTER_LEVEL_CONTROL)) add("brightness", { kind: "percent" });
+  // Whose level it is decides which control it is. A composed television carries Level
+  // Control on its SPEAKER endpoint, and describing that as brightness offered a control
+  // that would have turned the sound down instead.
+  if (speakerEndpoint(node) !== undefined) add("volume", { kind: "percent" });
+  if (levelIsBrightness(node)) add("brightness", { kind: "percent" });
   if (hasFan) {
     add("fan_speed", { kind: "percent" });
     add("fan_mode", { kind: "enum", values: fanModes(node) });

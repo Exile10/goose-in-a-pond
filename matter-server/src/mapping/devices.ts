@@ -13,6 +13,7 @@ import {
   endpointWith,
   hasCluster,
   rootAttribute,
+  type EndpointSnapshot,
   type NodeSnapshot,
 } from "./snapshot.js";
 import { operationsOf, settingsOf } from "./settings.js";
@@ -31,6 +32,24 @@ export const CLUSTER_BOOLEAN_STATE = "booleanState";
 export const CLUSTER_TEMPERATURE = "temperatureMeasurement";
 export const CLUSTER_HUMIDITY = "relativeHumidityMeasurement";
 export const CLUSTER_SMOKE_CO_ALARM = "smokeCoAlarm";
+
+/** Matter's Speaker device type. Its Level Control is volume, not brightness. */
+export const SPEAKER_DEVICE_TYPE = 0x0022;
+
+/**
+ * The endpoint whose Level Control is a volume, if the device has one.
+ *
+ * A Basic Video Player is composed: the player on one endpoint, a Speaker on another,
+ * and Level Control lives on the speaker. Searching the node for the cluster found it
+ * and called it brightness, so a television advertised a brightness control that would
+ * have turned the sound down instead. The endpoint's own device type is what tells them
+ * apart, and it is already in the snapshot.
+ */
+export function speakerEndpoint(node: NodeSnapshot): EndpointSnapshot | undefined {
+  return applicationEndpoints(node).find(
+    e => e.deviceTypes.includes(SPEAKER_DEVICE_TYPE) && CLUSTER_LEVEL_CONTROL in e.clusters,
+  );
+}
 
 /**
  * Matter device type ids (Descriptor DeviceTypeList), grouped onto the GIAP types the
@@ -155,6 +174,19 @@ export function colorSupport(node: NodeSnapshot): { hueSaturation: boolean; temp
   };
 }
 
+/**
+ * Is there a Level Control that is NOT a speaker's?
+ *
+ * A composed device can have both — a television with a backlight would — so this asks
+ * whether any endpoint carries the cluster without claiming to be a speaker, rather than
+ * treating the two as alternatives.
+ */
+export function levelIsBrightness(node: NodeSnapshot): boolean {
+  return applicationEndpoints(node).some(
+    e => CLUSTER_LEVEL_CONTROL in e.clusters && !e.deviceTypes.includes(SPEAKER_DEVICE_TYPE),
+  );
+}
+
 function capabilitiesOf(node: NodeSnapshot): string[] {
   const capabilities: string[] = [];
   const hasOnOff = hasCluster(node, CLUSTER_ON_OFF);
@@ -167,7 +199,10 @@ function capabilitiesOf(node: NodeSnapshot): string[] {
     if (!hasOnOff) capabilities.push("power");
     capabilities.push("fan_speed");
   }
-  if (hasCluster(node, CLUSTER_LEVEL_CONTROL)) capabilities.push("brightness");
+  // Volume where the level belongs to a speaker, brightness where it does not.
+  const speaker = speakerEndpoint(node);
+  if (speaker !== undefined) capabilities.push("volume");
+  if (levelIsBrightness(node)) capabilities.push("brightness");
   // Either source of a temperature target. Gating on the thermostat alone listed a
   // dishwasher as "power, mode, operation" while `describe` offered it 49 to 82
   // degrees -- and the listing is what a model reads before deciding whether to ask

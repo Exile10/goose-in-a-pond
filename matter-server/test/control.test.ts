@@ -27,6 +27,7 @@ import {
   named,
   node,
   tunableWhiteNode,
+  videoPlayerNode,
 } from "./fixtures.js";
 
 describe("unit conversions", () => {
@@ -344,5 +345,55 @@ describe("reading back what the device actually did", () => {
     for (const verb of ["power", "brightness", "color", "color_temp", "fan_speed", "mode"]) {
       expect(VERBS.has(verb), `'${verb}' would be refused as an unknown verb`).toBe(true);
     }
+  });
+});
+
+describe("media control", () => {
+  it("writes the volume to the speaker's endpoint, not the player's", () => {
+    const plan = planControl(videoPlayerNode(), "matter-81", "volume", 50);
+
+    expect(plan.actions).toEqual([
+      { kind: "write", endpoint: 2, cluster: "levelControl", attribute: "currentLevel", value: 127 },
+    ]);
+    expect(plan.applied).toEqual({ volume: 50 });
+  });
+
+  it("refuses a volume on a device with no speaker", () => {
+    expect(() => planControl(lightNode(), "matter-2", "volume", 50)).toThrow(OpError);
+  });
+
+  it("sends playback commands to MediaPlayback", () => {
+    const plan = planControl(videoPlayerNode(), "matter-81", "operation", "pause");
+
+    expect(plan.actions).toEqual([
+      { kind: "command", endpoint: 1, cluster: "mediaPlayback", command: "pause", payload: {} },
+    ]);
+  });
+
+  it("selects an input by the index behind the device's own label", () => {
+    // The label is the device's; the index is what goes on the wire.
+    const plan = planControl(videoPlayerNode(), "matter-81", "mode", {
+      setting: "input",
+      value: "HDMI 2",
+    });
+
+    expect(plan.actions).toEqual([
+      { kind: "command", endpoint: 1, cluster: "mediaInput", command: "selectInput", payload: { index: 2 } },
+    ]);
+  });
+
+  it("refuses an input the television never offered", () => {
+    expect(() =>
+      planControl(videoPlayerNode(), "matter-81", "mode", { setting: "input", value: "SCART" }),
+    ).toThrow(OpError);
+  });
+
+  it("reads the volume back off the speaker", () => {
+    expect(observedFor(videoPlayerNode(), "volume")).toEqual({ volume: 50 });
+    // And does not report the same level under the wrong name: a television has no
+    // brightness to read, so reading one would be the volume wearing a disguise.
+    expect(observedFor(videoPlayerNode(), "brightness")).toEqual({});
+    // A bulb is unaffected -- its level is still a brightness.
+    expect(observedFor(lightNode(), "brightness")).toEqual({ brightness: 50 });
   });
 });

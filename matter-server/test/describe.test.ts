@@ -16,6 +16,7 @@ import {
   named,
   node,
   smokeCoAlarmNode,
+  videoPlayerNode,
   tunableWhiteNode,
 } from "./fixtures.js";
 
@@ -147,7 +148,43 @@ describe("device description", () => {
     expect(temp?.value).toEqual({ kind: "number", unit: "K" });
   });
 
+  it("calls a speaker's level a volume, not a brightness", () => {
+    // The report this came from: a Basic Video Player described as accepting "power and
+    // brightness". Level Control was on its SPEAKER endpoint, so setting that brightness
+    // would have turned the sound down. Verified against a live device: the player is
+    // endpoint 1 type 0x28, the speaker endpoint 2 type 0x22.
+    const verbs = describeNode(videoPlayerNode()).capabilities.map(c => c.verb);
+
+    expect(verbs).toContain("volume");
+    expect(verbs).not.toContain("brightness");
+  });
+
+  it("offers a television its playback and its inputs", () => {
+    // Playback rides the existing `operation` verb -- play/pause/stop is what
+    // start/pause/stop already means -- and the input lists ride `mode`, whose whole
+    // design is a named setting whose values are labels the device published.
+    const described = describeNode(videoPlayerNode());
+    const operation = described.capabilities.find(c => c.verb === "operation");
+    const settings = described.capabilities.filter(c => c.verb === "mode");
+
+    expect(operation?.value).toEqual({ kind: "enum", values: ["play", "pause", "stop"] });
+    expect(settings.map(c => c.setting)).toEqual(["input", "audio output"]);
+    // The device's own words, not a list GIAP keeps.
+    expect(settings[0]?.value).toEqual({ kind: "enum", values: ["HDMI 1", "HDMI 2"] });
+    expect(settings[1]?.value).toEqual({ kind: "enum", values: ["TV Speaker", "Soundbar"] });
+  });
+
+  it("still calls a light's level a brightness", () => {
+    // The split is by endpoint device type, not by "has a speaker anywhere" -- a bulb has
+    // no speaker endpoint and must keep the control it has always had.
+    const verbs = describeNode(lightNode()).capabilities.map(c => c.verb);
+
+    expect(verbs).toContain("brightness");
+    expect(verbs).not.toContain("volume");
+  });
+
   it("describes only what the device has", () => {
+
     const description = describeNode(lightNode());
     const verbs = description.capabilities.map(c => c.verb);
 
