@@ -110,31 +110,48 @@ function asNumber(value: unknown): number | undefined {
  * the description need it, and `describe.ts` already imports this module — the other
  * direction would be a cycle.
  *
- * The default when the device says nothing is hue/saturation and NOT colour
- * temperature. Presence of the cluster used to imply hue/saturation outright, which is
- * wrong in a way that shows: a tunable-white bulb has ColorControl and no hue at all,
- * and was told it accepted a hue it would reject. Assuming the other direction instead
- * — claiming a temperature range on a plain colour bulb — would invent a control, and
- * an invented one gets believed.
+ * Claims first, evidence second. Where the bitmap names a capability it is believed;
+ * where it claims NOTHING — absent, or every flag false — the attributes the device
+ * actually publishes decide instead. That fallback is not a nicety: Google's Matter
+ * Virtual Device offers hue/saturation, XY and colour temperature in its own Controller
+ * tab while claiming none of them here, and trusting the bitmap outright described that
+ * light as having no colour whatsoever. A device that exposes `currentHue` has a hue
+ * whatever its bitmap says.
+ *
+ * Presence of the CLUSTER is still not evidence of either, which is the bug this
+ * replaced: a tunable-white bulb has ColorControl and no hue at all, and was being told
+ * it accepted one it would reject. matter.js omits the attributes a device's features
+ * do not cover, so `currentHue` is absent on exactly those bulbs — the same signal
+ * `tilt` reads to tell a venetian blind from a roller.
  */
 export function colorSupport(node: NodeSnapshot): { hueSaturation: boolean; temperature: boolean } {
   const raw = endpointWith(node, CLUSTER_COLOR_CONTROL)?.clusters[CLUSTER_COLOR_CONTROL]?.[
     "colorCapabilities"
   ];
 
+  // Bit 0 HueSaturation, bit 4 ColorTemperature (Matter 1.4, ColorControl 5.2.2.9).
+  // matter.js decodes the bitmap to named flags, but a raw number is read too — the
+  // same tolerance `fanModes` applies, and neither shape is guaranteed by the wire.
   const numeric = asNumber(raw);
-  if (numeric !== undefined) {
-    // Bit 0 HueSaturation, bit 4 ColorTemperature (Matter 1.4, ColorControl 5.2.2.9).
-    return { hueSaturation: (numeric & 0x01) !== 0, temperature: (numeric & 0x10) !== 0 };
-  }
-  if (typeof raw === "object" && raw !== null) {
-    const flags = raw as { hueSaturation?: unknown; colorTemperature?: unknown };
-    return {
-      hueSaturation: flags.hueSaturation === true,
-      temperature: flags.colorTemperature === true,
-    };
-  }
-  return { hueSaturation: true, temperature: false };
+  const claimed =
+    numeric !== undefined
+      ? { hueSaturation: (numeric & 0x01) !== 0, temperature: (numeric & 0x10) !== 0 }
+      : typeof raw === "object" && raw !== null
+        ? {
+            hueSaturation: (raw as { hueSaturation?: unknown }).hueSaturation === true,
+            temperature: (raw as { colorTemperature?: unknown }).colorTemperature === true,
+          }
+        : { hueSaturation: false, temperature: false };
+
+  if (claimed.hueSaturation || claimed.temperature) return claimed;
+
+  // The device claimed nothing. Read what it publishes instead of concluding it has no
+  // colour: an attribute is only there because a feature covers it.
+  const state = endpointWith(node, CLUSTER_COLOR_CONTROL)?.clusters[CLUSTER_COLOR_CONTROL];
+  return {
+    hueSaturation: state?.["currentHue"] !== undefined || state?.["currentSaturation"] !== undefined,
+    temperature: state?.["colorTemperatureMireds"] !== undefined,
+  };
 }
 
 function capabilitiesOf(node: NodeSnapshot): string[] {
