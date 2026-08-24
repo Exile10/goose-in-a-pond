@@ -11,12 +11,9 @@ CREATE TABLE mesh_credit_balances (
     updated_at         TEXT NOT NULL
 );
 
--- tokens_borrowed: what we owe the peer (settlement pays this).
--- tokens_lent: what the peer owes us (their job to settle, not ours).
 CREATE TABLE mesh_usage_tally (
     peer_id         TEXT PRIMARY KEY,
-    tokens_borrowed INTEGER NOT NULL DEFAULT 0,
-    tokens_lent     INTEGER NOT NULL DEFAULT 0,
+    pending_tokens  INTEGER NOT NULL DEFAULT 0,
     updated_at      TEXT NOT NULL
 );
 
