@@ -39,6 +39,30 @@ export interface SensorMapping {
    * withholding it.
    */
   words?: Record<number, string>;
+  /**
+   * A featureMap flag the cluster must claim for this reading to exist at all.
+   *
+   * `describe` lists a sensor whether or not it has reported yet, which is right — a
+   * device that has not spoken still measures the thing. But that made cluster presence
+   * stand in for attribute presence, and the two differ: a CO-only alarm has the
+   * SmokeCoAlarm cluster and no smoke sensor whatsoever, and was credited with a smoke
+   * reading it can never produce. Value presence cannot tell "unsupported" from "not yet
+   * reported" — both are `undefined` — so the feature map is the only thing that can.
+   */
+  feature?: string;
+}
+
+/** Does the cluster claim the feature this reading needs? Absent claim means yes. */
+export function clusterHasFeature(state: Record<string, unknown> | undefined, feature: string): boolean {
+  const raw = state?.["featureMap"];
+  // matter.js decodes the bitmap to named flags; a raw number is tolerated for the same
+  // reason `colorSupport` tolerates one.
+  if (typeof raw === "object" && raw !== null) {
+    return (raw as Record<string, unknown>)[feature] === true;
+  }
+  // Nothing stated. Keep the reading rather than withholding one that works -- the same
+  // order used for colour capabilities and thermostat setpoints.
+  return true;
 }
 
 /**
@@ -161,7 +185,18 @@ export const SENSORS: readonly SensorMapping[] = [
   // rather than invented units, so the scale stays the device's own.
   { cluster: "airQuality", attribute: "airQuality", sensorType: "air_quality", unit: "level", read: asNumber, words: AIR_QUALITY },
   // Alarm state: 0 normal, non-zero means it is sounding.
-  { cluster: "smokeCoAlarm", attribute: "smokeState", sensorType: "smoke_alarm", unit: "state", read: asNumber, words: ALARM_STATE },
+  //
+  // Smoke and CO are separate sensors on the same device because they are separate
+  // dangers with separate responses -- one says leave, the other says ventilate. Only
+  // smoke was read, so an alarm sounding for carbon monoxide reported nothing at all,
+  // and a CO-only alarm looked like a device that measures nothing. Both are gated by
+  // the cluster's feature map, so a device without one simply has no value there.
+  { cluster: "smokeCoAlarm", attribute: "smokeState", sensorType: "smoke_alarm", unit: "state", read: asNumber, words: ALARM_STATE, feature: "smokeAlarm" },
+  { cluster: "smokeCoAlarm", attribute: "coState", sensorType: "co_alarm", unit: "state", read: asNumber, words: ALARM_STATE, feature: "coAlarm" },
+  // The same ordinal, about the thing that makes the alarm able to sound at all. A
+  // life-safety device with a flat battery is the failure everyone already knows about
+  // and nobody is told about.
+  { cluster: "smokeCoAlarm", attribute: "batteryAlert", sensorType: "alarm_battery", unit: "state", read: asNumber, words: ALARM_STATE },
 
   // Concentrations are floats in each substance's own unit, passed through unscaled —
   // the number the device shows is the number a rule threshold should compare against.

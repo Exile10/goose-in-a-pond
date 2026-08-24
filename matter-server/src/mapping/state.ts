@@ -37,13 +37,14 @@ import {
 import {
   CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
+  CLUSTER_SMOKE_CO_ALARM,
   CLUSTER_FAN_CONTROL,
   CLUSTER_LEVEL_CONTROL,
   CLUSTER_ON_OFF,
   CLUSTER_THERMOSTAT,
   CLUSTER_WINDOW_COVERING,
 } from "./devices.js";
-import { doorStateWord } from "./describe.js";
+import { doorStateWord, expressedStateWord } from "./describe.js";
 import { SENSORS } from "./sensors.js";
 import { observedOperation, settingsOf } from "./settings.js";
 import { applianceSetpoint, targetSetpoint } from "./thermostat.js";
@@ -126,6 +127,23 @@ export function stateOf(node: NodeSnapshot): DeviceState {
       add("color", `hue ${matterToHue(hue)}, saturation ${matterToSaturation(saturation)}%`);
     }
   }
+
+  // What the alarm is expressing, which neither the smoke reading nor the CO reading
+  // says on its own: a device sounding for carbon monoxide while its smoke level sits at
+  // Critical is reporting two different facts, and only this one answers "what is it
+  // doing".
+  add("alarm", expressedStateWord(valueAt(node, CLUSTER_SMOKE_CO_ALARM, "expressedState")));
+
+  const service = valueAt(node, CLUSTER_SMOKE_CO_ALARM, "endOfServiceAlert");
+  if (service !== undefined) {
+    // EndOfServiceEnum: 0 normal, 1 expired. Tolerant of the name, as everywhere else.
+    const expired =
+      service === 1 || (typeof service === "string" && /expire/i.test(service));
+    add("alarm_service", expired ? "expired" : "normal");
+  }
+
+  const fault = valueAt(node, CLUSTER_SMOKE_CO_ALARM, "hardwareFaultAlert");
+  if (typeof fault === "boolean") add("alarm_fault", fault ? "faulty" : "ok");
 
   const speed = numberAt(node, CLUSTER_FAN_CONTROL, "percentCurrent");
   if (speed !== undefined) add("fan_speed", `${speed}%`);

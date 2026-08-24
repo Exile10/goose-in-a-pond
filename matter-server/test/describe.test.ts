@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { describeNode } from "../src/mapping/describe.js";
 import {
   airConditionerNode,
+  coOnlyAlarmNode,
   bareLockNode,
   customLightNode,
   describedNode,
@@ -14,6 +15,7 @@ import {
   mvdColorLightNode,
   named,
   node,
+  smokeCoAlarmNode,
   tunableWhiteNode,
 } from "./fixtures.js";
 
@@ -225,6 +227,37 @@ describe("device description", () => {
     // plain deadbolt would promise a reading that never arrives -- the same failure as
     // offering tilt to a roller blind.
     expect(describeNode(bareLockNode()).states).toEqual([]);
+  });
+
+  it("measures carbon monoxide as well as smoke", () => {
+    // The report this came from: an alarm expressing a CO alarm, described as measuring
+    // "the smoke alarm state" and nothing else. Two dangers with two different responses
+    // -- one says leave, the other says ventilate -- and only one was mapped.
+    const sensors = describeNode(smokeCoAlarmNode()).sensors.map(s => s.sensor_type);
+
+    expect(sensors).toContain("smoke_alarm");
+    expect(sensors).toContain("co_alarm");
+    expect(sensors).toContain("alarm_battery");
+  });
+
+  it("names which alarm is sounding, which neither reading says", () => {
+    // expressedState is the attribute the device's own screen shows, and the only one
+    // that answers "what is it doing". Categorical rather than a magnitude, so it is a
+    // state and not a sensor with an ordinal a threshold rule could compare.
+    const states = describeNode(smokeCoAlarmNode()).states;
+
+    expect(states.map(s => s.name)).toEqual(["alarm", "alarm_service", "alarm_fault"]);
+    expect(states[0]?.value).toMatchObject({ kind: "enum" });
+    expect((states[0]?.value as { values: string[] }).values).toContain("co alarm");
+  });
+
+  it("describes a CO-only alarm without inventing a smoke reading", () => {
+    // The smoke feature is absent, so the attribute has no value and the reading does
+    // not exist. Before this the device measured nothing GIAP could name at all.
+    const sensors = describeNode(coOnlyAlarmNode()).sensors.map(s => s.sensor_type);
+
+    expect(sensors).toContain("co_alarm");
+    expect(sensors).not.toContain("smoke_alarm");
   });
 
   it("lists what a sensor measures before it has reported anything", () => {

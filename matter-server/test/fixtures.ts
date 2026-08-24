@@ -189,6 +189,50 @@ export function airConditionerNode(): NodeSnapshot {
   ]);
 }
 
+/**
+ * A Smoke CO Alarm as one really reports itself, verified against a live commissioned
+ * device: a mandatory `expressedState` summary, separate smoke and CO readings, and the
+ * three health attributes that say whether it can still sound at all.
+ *
+ * Set the way the reported device was: sounding for CARBON MONOXIDE while its smoke
+ * reading also sits at Critical. Only the smoke reading was mapped, so the one attribute
+ * naming which danger it is was the one GIAP could not see.
+ */
+export function smokeCoAlarmNode(): NodeSnapshot {
+  return node(71, [
+    named("Smoke CO Alarm"),
+    endpoint(1, {
+      smokeCoAlarm: {
+        featureMap: { smokeAlarm: true, coAlarm: true },
+        expressedState: 2,
+        smokeState: 2,
+        coState: 2,
+        batteryAlert: 0,
+        endOfServiceAlert: 0,
+        hardwareFaultAlert: false,
+      },
+    }, [0x0076]),
+  ]);
+}
+
+/** A CO-only alarm: no smoke feature, so no smoke reading exists at all. */
+export function coOnlyAlarmNode(): NodeSnapshot {
+  return node(72, [
+    named("CO Alarm"),
+    endpoint(1, {
+      smokeCoAlarm: {
+        // The feature map is what says the smoke sensor is absent. Value presence
+        // cannot: an unsupported attribute and one that has not reported yet are both
+        // undefined.
+        featureMap: { smokeAlarm: false, coAlarm: true },
+        expressedState: 0,
+        coState: 0,
+        batteryAlert: 0,
+      },
+    }, [0x0076]),
+  ]);
+}
+
 /** A node that states its type the way every real one does: a Descriptor
  *  DeviceTypeList on the application endpoint. */
 export function describedNode(
