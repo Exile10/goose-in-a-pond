@@ -546,6 +546,46 @@ Two ways that bit during this very measurement, both worth knowing:
 Read `reason="no_embedder"` on the `tool_selection_widened` trace line before
 believing any measurement of this setting.
 
+### The same lever on Llama 3.2 3B, where it matters most
+
+| | `"all"` (61 tools) | `"relevant"` (17) |
+|---|---|---|
+| turn-1 prompt | 19,449 tok | **3,436 tok** |
+| turn-1 TTFT | 82.2 s | **22.7 s** |
+| turn-2 TTFT | 56.9 s | **3.5 s** |
+| turn-3 TTFT | 61.8 s | **4.5 s** |
+| tool calls on "say hello in one short sentence" | **16** | **1** |
+| reply to that greeting | 3,805 chars | 31 chars |
+
+The prompt is 82% smaller and the reuse turns are an order of magnitude
+faster, but the row that explains the rest is the tool-call count.
+
+At 61 tools this model does not answer a greeting: it goes on a spree, calling
+`giap-toolkit__enable_tool_group` and `giap-toolkit__list_tool_groups` over and
+over and emitting 3,805 characters at a request for one short sentence. Those
+calls are what inflate the prompt — `prompt_tokens` is the LAST inference of a
+turn, so a turn containing sixteen tool round-trips reports the accumulated
+context, not the preamble. At 17 tools it calls one tool and says hello.
+
+So the reuse-turn figures (56.9 s -> 3.5 s) are not the KV cache working better.
+They are the KV cache finally being *given a chance*: a turn that keeps calling
+tools keeps changing its own suffix, so there is little stable prefix to reuse.
+
+Two things follow that are worth stating plainly.
+
+**A small model with a large tool surface is not merely slower, it behaves
+differently.** The Orin's standing 61-tool preamble was measured as a prompt
+cost; on a 3B model it is also a behavioural one, and no amount of KV caching
+addresses that.
+
+**Narrowing is a starting position, not a ceiling.** `enable_tool_group` lets
+the model widen its own surface, and this one used it 24 times in a single run.
+Any claim that `"relevant"` bounds prompt cost has to account for a model that
+can undo the bound from inside the turn.
+
+Against the pre-fix baseline the whole stack, for Llama on this Mac:
+turn-1 TTFT **162.6 s -> 22.7 s** and turn-1 prompt **18,135 -> 3,436 tokens**.
+
 ## 5. Suggested order of work
 
 1. **Capture the failing error string** (`RUST_LOG` run, one prompt). Everything about E4B is
