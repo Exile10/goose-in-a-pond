@@ -366,6 +366,31 @@ lock's security configuration one sentence of natural language away from being t
 off, so the whole class is closed here rather than guarded case by case. `control` has
 no verb that reaches them.
 
+### Alarms
+
+A smoke/CO alarm carries two separate dangers with two separate responses — one says
+leave, the other says ventilate — so `smoke_alarm` and `co_alarm` are separate readings,
+each gated on the cluster's own feature map. Only smoke was read for a while, which meant
+an alarm sounding for carbon monoxide reported nothing about it and a CO-only alarm looked
+like a device that measures nothing at all. `alarm_battery` rides alongside them: a
+life-safety device with a flat battery is the failure everyone knows about and nobody was
+told about.
+
+`expressedState` is a `states` entry rather than a sensor, and the distinction is the one
+`states` exists for. It is the attribute a device's own screen shows and the only one that
+says WHICH alarm is sounding — a unit expressing a CO alarm while its smoke level reads
+Critical is stating something neither reading does. It is categorical, not a magnitude:
+"interconnected CO alarm" is not eight times worse than "normal", so an ordinal a
+threshold rule could compare would be actively misleading. `alarm_service` and
+`alarm_fault` join it, because an expired or faulty alarm is a decoration.
+
+**A cluster's presence is not a sensor's presence** where features decide. `describe`
+lists a sensor whether or not it has reported yet, which is right — a device that has not
+spoken still measures the thing — but that let cluster presence stand in for attribute
+presence. Value presence cannot separate the two cases either: an unsupported attribute
+and one that has not reported are both absent. The feature map is the only thing that can,
+so a reading naming a `feature` is listed only where the cluster claims it.
+
 ### Manufacturer-specific clusters
 
 `vendor_clusters` is what a device has that this cannot drive. A cluster id is 32 bits

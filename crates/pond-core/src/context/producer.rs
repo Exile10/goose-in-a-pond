@@ -120,6 +120,12 @@ pub const DISCRETE_SENSOR_TYPES: &[&str] = &[
     // corpus exists to be able to say. Grouped with `smoke` above rather than
     // replacing it, because the two names come from different bridges.
     "smoke_alarm",
+    // Carbon monoxide, and the battery that lets either alarm sound at all. The same
+    // shape as `smoke_alarm` and, for CO, the same urgency by a different route: smoke
+    // says leave, CO says ventilate. Only smoke was mapped for a while, so an alarm
+    // sounding for carbon monoxide produced no reading anything here could keep.
+    "co_alarm",
+    "alarm_battery",
     // An air purifier asking for its filter to be changed. Same argument as
     // `smoke_alarm`: 0/1/2 rather than a boolean, but it is a device asking for
     // something to be DONE, it changes a handful of times a year, and "the

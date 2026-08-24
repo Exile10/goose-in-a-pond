@@ -5,12 +5,14 @@ import { describeNode } from "../src/mapping/describe.js";
 import { stateOf } from "../src/mapping/state.js";
 import {
   bareLockNode,
+  coOnlyAlarmNode,
   doorLockNode,
   endpoint,
   extendedColorLightNode,
   laundryWasherNode,
   named,
   node,
+  smokeCoAlarmNode,
   tunableWhiteNode,
 } from "./fixtures.js";
 
@@ -164,6 +166,44 @@ describe("device state", () => {
       const settable = new Set(describeNode(device).capabilities.map(c => c.setting ?? c.verb));
       for (const { name } of stateOf(device).values) {
         expect(settable.has(name), `'${name}' is reported but not settable`).toBe(true);
+      }
+    }
+  });
+
+  it("says which alarm is sounding, not just a level", () => {
+    // The report this came from: asked for the states of an alarm expressing a CO alarm,
+    // GIAP answered "the current state is Critical" -- the SMOKE level, with no mention
+    // of carbon monoxide. Two dangers, two responses, and the attribute naming which one
+    // was the attribute nothing read.
+    const alarm = smokeCoAlarmNode();
+
+    expect(valueOf(alarm, "alarm")).toBe("co alarm");
+    expect(valueOf(alarm, "alarm_service")).toBe("normal");
+    expect(valueOf(alarm, "alarm_fault")).toBe("ok");
+  });
+
+  it("reads an expressed state matter.js decoded to its enum name", () => {
+    const named2 = node(73, [
+      named("Hall Alarm"),
+      endpoint(1, { smokeCoAlarm: { expressedState: "InterconnectSmoke" } }, [0x0076]),
+    ]);
+
+    expect(valueOf(named2, "alarm")).toBe("interconnected smoke alarm");
+  });
+
+  it("names every alarm reading with a word the description also uses", () => {
+    // The invariant, across a device whose readings and states are both new.
+    for (const device of [smokeCoAlarmNode(), coOnlyAlarmNode()]) {
+      const described = describeNode(device);
+      const settable = new Set(described.capabilities.map(c => c.setting ?? c.verb));
+      const measured = new Set(described.sensors.map(s => s.sensor_type));
+      const reported = new Set(described.states.map(s => s.name));
+
+      for (const { name } of stateOf(device).values) {
+        expect(
+          settable.has(name) || measured.has(name) || reported.has(name),
+          `'${name}' is reported but the description neither sets, measures nor reports it`,
+        ).toBe(true);
       }
     }
   });

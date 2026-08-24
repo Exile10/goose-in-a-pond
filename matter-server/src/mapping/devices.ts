@@ -30,6 +30,7 @@ export const CLUSTER_OCCUPANCY = "occupancySensing";
 export const CLUSTER_BOOLEAN_STATE = "booleanState";
 export const CLUSTER_TEMPERATURE = "temperatureMeasurement";
 export const CLUSTER_HUMIDITY = "relativeHumidityMeasurement";
+export const CLUSTER_SMOKE_CO_ALARM = "smokeCoAlarm";
 
 /**
  * Matter device type ids (Descriptor DeviceTypeList), grouped onto the GIAP types the

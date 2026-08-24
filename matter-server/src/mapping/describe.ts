@@ -27,6 +27,7 @@ import {
   colorSupport,
   CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
+  CLUSTER_SMOKE_CO_ALARM,
   CLUSTER_FAN_CONTROL,
   CLUSTER_LEVEL_CONTROL,
   CLUSTER_ON_OFF,
@@ -35,7 +36,7 @@ import {
   nodeToDevice,
 } from "./devices.js";
 import { miredsToKelvin } from "./control.js";
-import { declaredUnitOf, SENSORS } from "./sensors.js";
+import { clusterHasFeature, declaredUnitOf, SENSORS } from "./sensors.js";
 import {
   applianceSetpoint,
   reachableRange,
@@ -313,7 +314,15 @@ function sensorsOf(node: NodeSnapshot): SensorSpec[] {
   const sensors: SensorSpec[] = [];
 
   for (const mapping of SENSORS) {
-    if (endpointWith(node, mapping.cluster) === undefined) continue;
+    const endpoint = endpointWith(node, mapping.cluster);
+    if (endpoint === undefined) continue;
+    // Cluster presence is not sensor presence where the cluster's own features decide.
+    if (
+      mapping.feature !== undefined &&
+      !clusterHasFeature(endpoint.clusters[mapping.cluster], mapping.feature)
+    ) {
+      continue;
+    }
     if (seen.has(mapping.sensorType)) continue;
     seen.add(mapping.sensorType);
     sensors.push({
@@ -350,6 +359,45 @@ function vendorClustersOf(node: NodeSnapshot): VendorClusterSpec[] {
   return vendor;
 }
 
+/** SmokeCoAlarm's ExpressedStateEnum: WHICH alarm the device is currently sounding. */
+export const EXPRESSED_STATES = [
+  "normal",
+  "smoke alarm",
+  "co alarm",
+  "battery alert",
+  "testing",
+  "hardware fault",
+  "end of service",
+  "interconnected smoke alarm",
+  "interconnected co alarm",
+] as const;
+
+/** The same nine by matter.js's enum name, which it may send instead of the number. */
+const EXPRESSED_STATE_NAMES: ReadonlyMap<string, string> = new Map([
+  ["normal", "normal"],
+  ["smokealarm", "smoke alarm"],
+  ["coalarm", "co alarm"],
+  ["batteryalert", "battery alert"],
+  ["testing", "testing"],
+  ["hardwarefault", "hardware fault"],
+  ["endofservice", "end of service"],
+  ["interconnectsmoke", "interconnected smoke alarm"],
+  ["interconnectco", "interconnected co alarm"],
+]);
+
+/** What the alarm says it is expressing, or undefined if it does not say. */
+export function expressedStateWord(raw: unknown): string | undefined {
+  const numeric = asNumber(raw);
+  if (numeric !== undefined) return EXPRESSED_STATES[numeric];
+  if (typeof raw === "string") {
+    return EXPRESSED_STATE_NAMES.get(raw.toLowerCase().replace(/[\s_-]/g, ""));
+  }
+  return undefined;
+}
+
+/** SmokeCoAlarm's EndOfServiceEnum. An expired alarm is a decoration. */
+export const SERVICE_STATES = ["normal", "expired"] as const;
+
 /**
  * What the device reports and nothing can set.
  *
@@ -382,6 +430,28 @@ function statesOf(node: NodeSnapshot): StateSpec[] {
   // with no over-the-air credential access has no such setting to report.
   if (typeof attribute(node, CLUSTER_DOOR_LOCK, "requirePinForRemoteOperation") === "boolean") {
     states.push({ name: "pin_required", value: { kind: "enum", values: [...PIN_REQUIREMENTS] } });
+  }
+
+  // A smoke/CO alarm's summary of what it is doing, and whether it can still do it.
+  //
+  // `expressedState` is the one the device's own screen shows, and it is the only
+  // attribute that says WHICH alarm is sounding — smoke and CO have separate readings
+  // but a device expressing a CO alarm while its smoke reading sits at Critical is
+  // telling you something neither reading does. Categorical, not a magnitude:
+  // "interconnected CO alarm" is not eight times worse than "normal", so it is a state
+  // rather than a sensor with an ordinal a rule could compare.
+  if (attribute(node, CLUSTER_SMOKE_CO_ALARM, "expressedState") !== undefined) {
+    states.push({ name: "alarm", value: { kind: "enum", values: [...EXPRESSED_STATES] } });
+  }
+  // Whether the unit is past its service life. Not an ordinal either — expired is not a
+  // worse Normal, it is a different fact about the device.
+  if (attribute(node, CLUSTER_SMOKE_CO_ALARM, "endOfServiceAlert") !== undefined) {
+    states.push({ name: "alarm_service", value: { kind: "enum", values: [...SERVICE_STATES] } });
+  }
+  // A fault means the alarm may not sound at all, which is the one thing a smoke alarm
+  // exists to do.
+  if (typeof attribute(node, CLUSTER_SMOKE_CO_ALARM, "hardwareFaultAlert") === "boolean") {
+    states.push({ name: "alarm_fault", value: { kind: "enum", values: ["ok", "faulty"] } });
   }
 
   return states;
