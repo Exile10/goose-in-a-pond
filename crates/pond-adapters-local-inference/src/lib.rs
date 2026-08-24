@@ -1495,4 +1495,49 @@ mod tests {
         let (_repo_id, quantization) = model_id.rsplit_once(':').unwrap_or((model_id, "Q4_K_M"));
         assert_eq!(quantization, "Q4_K_M");
     }
+
+    /// The Jetson tuning block, type-checked on a machine that cannot build it.
+    ///
+    /// `apply_jetson_settings` is `#[cfg(feature = "cuda")]`, so it is compiled
+    /// by no developer machine and by no CI job — `cargo check -p pond-server`
+    /// does not pass that feature. Everything it writes is therefore reviewed
+    /// rather than compiled, and that gap has already cost a real breakage:
+    /// the parent set `type_k`, `type_v` and `n_ubatch` from fe68ccdd against
+    /// `ModelSettings` fields that existed only in the goose submodule's
+    /// WORKING TREE, so the pinned commit could not build for CUDA and nothing
+    /// on any Mac or in CI could notice.
+    ///
+    /// This constructs the same struct literal, with the same field names and
+    /// the same types, on whatever platform is running the tests. It cannot
+    /// check the VALUES are right for the Orin — only hardware can — but it
+    /// fails the build the moment the submodule stops carrying a field the
+    /// device code sets.
+    #[test]
+    fn the_jetson_settings_block_still_type_checks_off_device() {
+        use goose::providers::local_inference::local_model_registry::{
+            ModelSettings, ToolCallingMode,
+        };
+
+        let settings = ModelSettings {
+            n_gpu_layers: Some(99),
+            context_size: Some(16384),
+            n_batch: Some(512),
+            n_threads: Some(4),
+            flash_attention: Some(true),
+            type_k: Some("q8_0".to_string()),
+            type_v: Some("q8_0".to_string()),
+            n_ubatch: Some(128),
+            use_mlock: false,
+            tool_calling: ToolCallingMode::ForceNative,
+            enable_thinking: true,
+            ..Default::default()
+        };
+
+        assert_eq!(settings.n_ubatch, Some(128));
+        assert_eq!(settings.type_k.as_deref(), Some("q8_0"));
+        assert_eq!(settings.type_v.as_deref(), Some("q8_0"));
+        // Quantising V without flash attention is refused by llama.cpp, so the
+        // pairing is part of what this pins.
+        assert_eq!(settings.flash_attention, Some(true));
+    }
 }
