@@ -122,7 +122,6 @@ impl LocalInferenceLlmAdapter {
     pub async fn new_with_data_dir(model_id: &str, data_dir: &std::path::Path) -> Result<Self> {
         use goose::providers::local_inference::local_model_registry::{
             get_registry, model_id_from_repo, LocalModelEntry, LocalModelStorage, ModelSettings,
-            ToolCallingMode,
         };
 
         let gguf_dir = data_dir.join("models").join("gguf");
@@ -165,12 +164,14 @@ impl LocalInferenceLlmAdapter {
                 gguf_dir.join(&filename)
             };
 
+            let (tool_mode, thinking) = Self::registration_settings(&local_path);
             {
                 match get_registry().lock() {
                     Ok(mut registry) => {
                         if !registry.has_model(&stem) {
                             let mut settings = ModelSettings::default();
-                            settings.tool_calling = ToolCallingMode::ForceNative;
+                            settings.tool_calling = tool_mode;
+                            settings.enable_thinking = thinking;
                             let entry = LocalModelEntry {
                                 id: stem.clone(),
                                 repo_id: format!("local/{}", stem),
@@ -193,8 +194,9 @@ impl LocalInferenceLlmAdapter {
                             }
                         } else if let Some(entry) = registry.get_model(&stem) {
                             let mut s = entry.settings.clone();
-                            if s.tool_calling == ToolCallingMode::Auto {
-                                s.tool_calling = ToolCallingMode::ForceNative;
+                            if s.tool_calling != tool_mode || s.enable_thinking != thinking {
+                                s.tool_calling = tool_mode;
+                                s.enable_thinking = thinking;
                                 let _ = registry.update_model_settings(&stem, s);
                             }
                         }
@@ -225,12 +227,14 @@ impl LocalInferenceLlmAdapter {
 
         // Register / update local_path in Goose's global registry.
         // The lock is dropped before calling Self::new() to avoid deadlock.
+        let (tool_mode, thinking) = Self::registration_settings(&local_path);
         {
             match get_registry().lock() {
                 Ok(mut registry) => {
                     if !registry.has_model(&id) {
                         let mut settings = ModelSettings::default();
-                        settings.tool_calling = ToolCallingMode::ForceNative;
+                        settings.tool_calling = tool_mode;
+                        settings.enable_thinking = thinking;
                         let entry = LocalModelEntry {
                             id: id.clone(),
                             repo_id: repo_id.to_string(),
@@ -253,8 +257,9 @@ impl LocalInferenceLlmAdapter {
                         }
                     } else if let Some(entry) = registry.get_model(&id) {
                         let mut s = entry.settings.clone();
-                        if s.tool_calling == ToolCallingMode::Auto {
-                            s.tool_calling = ToolCallingMode::ForceNative;
+                        if s.tool_calling != tool_mode || s.enable_thinking != thinking {
+                            s.tool_calling = tool_mode;
+                            s.enable_thinking = thinking;
                             let _ = registry.update_model_settings(&id, s);
                         }
                     }
@@ -390,6 +395,40 @@ impl LocalInferenceLlmAdapter {
     ///
     /// This is intentionally NOT implemented in the cross-platform loader: it is
     /// unsafe to change from the macOS Metal build and cannot be tested here.
+    /// The tool mode and thinking flag a GGUF at `path` should be registered
+    /// with, read from its own chat template.
+    ///
+    /// Registration happens in `new_with_data_dir`, before any
+    /// `apply_*_settings` runs, and it used to hardcode `ForceNative` in four
+    /// places. Two of those only fired when the stored mode was `Auto`, which
+    /// meant an entry already persisted as `ForceNative` was never revisited --
+    /// so a model registered before the probe existed kept a mode its template
+    /// cannot honour, forever.
+    ///
+    /// That is not hypothetical. DeepSeek-R1-Distill ended up with two registry
+    /// rows: the quant-tagged id read `force_emulated` from the probe while the
+    /// canonical stem still read `force_native`, and the stem is what the turn
+    /// resolved to. The model was handed native tool declarations by a template
+    /// with no `tools` variable, saw none of them, and invented an "MCP" tool
+    /// interface out of the system prompt instead.
+    ///
+    /// So this re-stamps rather than upgrading, which matches what
+    /// `apply_*_settings` already does to the same rows at every provider init.
+    /// A file that cannot be read yields `Auto`, leaving goose its own
+    /// judgement rather than a guess of ours.
+    fn registration_settings(
+        path: &std::path::Path,
+    ) -> (
+        goose::providers::local_inference::local_model_registry::ToolCallingMode,
+        bool,
+    ) {
+        use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+        match Self::probe_model(path) {
+            Some(probe) => Self::tool_and_thinking_for(&probe),
+            None => (ToolCallingMode::Auto, true),
+        }
+    }
+
     /// What the registry should say for a model, given what its own file says
     /// it can do.
     ///
