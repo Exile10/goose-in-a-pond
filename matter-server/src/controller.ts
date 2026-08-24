@@ -129,8 +129,8 @@ export class Controller {
     // DEVICES can be found on it. A controller squatting it means no Matter
     // device can start on the same machine: Google's Matter Virtual Device dies
     // with "OS Error 0x02000030: Address already in use ... UDP::Init
-    // bind&listen port=5540" and shows an empty Controller tab, and this repo's
-    // own virtual-device tool had to be moved off 5540 for the same reason.
+    // bind&listen port=5540" and shows an empty Controller tab, with nothing in
+    // either place pointing back at the controller that took the port.
     //
     // A controller has no need of a well-known port. It initiates the
     // connections; devices answer whatever source port it used. Verified by
