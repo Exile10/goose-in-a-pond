@@ -113,6 +113,37 @@ export function extendedColorLightNode(): NodeSnapshot {
 }
 
 /**
+ * Google's Extended Color Light as it actually reports itself: every colour mode
+ * offered in its Controller tab, and a `colorCapabilities` bitmap claiming none of
+ * them. Non-conformant, and shipped — describing this device as having no colour is
+ * the regression the claims-then-evidence order exists to prevent.
+ */
+export function mvdColorLightNode(): NodeSnapshot {
+  return node(56, [
+    named("Virtual Extended Color Light"),
+    endpoint(1, {
+      onOff: { onOff: true },
+      levelControl: { currentLevel: 254 },
+      colorControl: {
+        colorCapabilities: {
+          hueSaturation: false,
+          enhancedHue: false,
+          colorLoop: false,
+          xy: false,
+          colorTemperature: false,
+        },
+        colorMode: 0,
+        currentHue: 0,
+        currentSaturation: 0,
+        currentX: 24939,
+        currentY: 24701,
+        colorTemperatureMireds: 250,
+      },
+    }, [0x010d]),
+  ]);
+}
+
+/**
  * A tunable-white bulb: ColorControl with colour temperature and NO hue at all
  * (`colorCapabilities` bit 4 only). Very common, and the reason colour is gated on what
  * the device claims — offered a hue, this device rejects it.

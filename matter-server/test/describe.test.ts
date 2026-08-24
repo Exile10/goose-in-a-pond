@@ -10,6 +10,7 @@ import {
   extendedColorLightNode,
   fanNode,
   lightNode,
+  mvdColorLightNode,
   named,
   node,
   tunableWhiteNode,
@@ -109,6 +110,17 @@ describe("device description", () => {
     );
 
     expect(temp?.value).toEqual({ kind: "number", unit: "K", min: 2000, max: 6536 });
+  });
+
+  it("believes the attributes when the capability bitmap claims nothing", () => {
+    // Google's Matter Virtual Device, exactly: three colour modes in its own Controller
+    // tab and a colorCapabilities bitmap claiming none of them. Trusting the bitmap
+    // outright described that light as having no colour at all -- strictly worse than
+    // the over-claiming it replaced, because the control is right there in the app.
+    const verbs = describeNode(mvdColorLightNode()).capabilities.map(c => c.verb);
+
+    expect(verbs).toContain("color");
+    expect(verbs).toContain("color_temp");
   });
 
   it("does not offer a hue to a bulb that only does white", () => {
