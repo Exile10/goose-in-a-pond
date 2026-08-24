@@ -67,6 +67,9 @@ interface ChatMessage {
   text: string;
   tool?: string;
   status?: "running" | "ok";
+  /** Set when this bubble is showing an error, so later text starts a new one
+   *  instead of being appended onto the error sentence. */
+  error?: boolean;
 }
 
 // ── Canvas section ─────────────────────────────────────────────
@@ -293,6 +296,8 @@ export function Canvas() {
           setThread((t) => {
             const last = t[t.length - 1];
             if (!last || last.role !== "assistant") return t;
+            // See Chat.tsx: the error arm overwrites `text`, this one appends.
+            if (last.error) return [...t, { role: "assistant" as const, text: raw }];
             return [...t.slice(0, -1), { ...last, text: last.text + raw }];
           });
 
@@ -365,7 +370,7 @@ export function Canvas() {
           setThread((t) => {
             const last = t[t.length - 1];
             if (!last || last.role !== "assistant") return t;
-            return [...t.slice(0, -1), { ...last, text: `Error: ${ev.error ?? "Unknown error"}` }];
+            return [...t.slice(0, -1), { ...last, text: `Error: ${ev.error ?? "Unknown error"}`, error: true }];
           });
 
         } else if (ev.done && ev.session_id) {

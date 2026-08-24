@@ -2018,18 +2018,33 @@ impl GooseAdapter {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            if let Some((p, cfg)) = cached {
-                self.agent.update_provider(p, cfg, session_id).await?;
-                self.provider_configured_sessions
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(session_id.to_string());
-                tracing::debug!(
-                    "[model-switch] session {} configured with current provider {}",
-                    session_id,
-                    key
+            let Some((p, cfg)) = cached else {
+                // The hole this used to be. `if let Some(..)` with no else meant a
+                // session that could not be configured was reported as configured:
+                // the row kept `model_config: None`, the reply path fell through to
+                // Goose's GLOBAL config, and the turn died there instead — as
+                // "Could not resolve model config: missing provider", naming
+                // neither the session nor the reason. Nothing was logged at any
+                // level, so the only evidence was a 9-token prompt and no inference.
+                anyhow::bail!(
+                    "no chat provider has been built yet, so Goose session \
+                     '{session_id}' cannot be configured for {key}"
                 );
-            }
+            };
+            self.agent.update_provider(p, cfg, session_id).await?;
+            self.provider_configured_sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(session_id.to_string());
+            // INFO, not DEBUG. This is once per session, and the DEBUG version was
+            // invisible in the deployment where this bug lived — `pond_adapters_goose`
+            // was filtered to INFO, so the one line that would have explained a
+            // months-old failure could never appear in a log anyone read.
+            tracing::info!(
+                session_id = %session_id,
+                provider_key = %key,
+                "configured a new Goose session with the current provider"
+            );
             return Ok(());
         }
         tracing::debug!("[model-switch] provider change detected -> {}", key);
@@ -2236,6 +2251,13 @@ impl GooseAdapter {
             // name a model that no longer exists. The env override makes that
             // fallback resolve the model GIAP is actually serving.
             std::env::set_var("GOOSE_MODEL", &settings.chat_model);
+            // The other half, absent since this line was written. Goose reads the
+            // PROVIDER before the model, so exporting only the model left the fallback
+            // dying on the provider and made this very line unreachable — every session
+            // without a `model_config` row failed with "missing provider" regardless of
+            // the model named here. A backstop, not the mechanism: the fix that matters
+            // is that the row is always written above.
+            std::env::set_var("GOOSE_PROVIDER", &settings.chat_provider);
 
             // Update model capabilities from the new model name
             let mut caps =
@@ -2276,8 +2298,15 @@ impl GooseAdapter {
 
             tracing::debug!("[model-switch] swap complete, key={}", key);
         } else {
-            tracing::debug!(
-                "[model-switch] no provider built for {}:{}",
+            // Also silent before, and also fatal one layer later. Reaching here means
+            // either `chat_provider` matched no arm of the match above (only
+            // local/gguf, llamafile and ollama are handled) or the build failed. For a
+            // turn that needs a provider both are configuration failures, and the only
+            // caller is a turn that needs one — so saying `Ok(())` here bought nothing
+            // except a worse error message further on.
+            anyhow::bail!(
+                "no chat provider could be built for '{}' with model '{}' — check the \
+                 provider and model in Settings",
                 settings.chat_provider,
                 settings.chat_model
             );
@@ -3595,11 +3624,24 @@ impl GooseAdapter {
         // The old global-state path (registry.rs) has been removed.
 
         // ── 5. Provider hot-swap ──────────────────────────────────────────────
+        // Fails the turn rather than continuing. "Continuing with current provider" was
+        // only ever true when there WAS one; when there was not, this warning was
+        // followed by Goose failing on its own global fallback, and the user was shown
+        // an engine-internal string about model config instead of the configuration
+        // problem it actually was.
         if let Err(e) = self
             .ensure_provider_current(&settings, &goose_sid, thinking_enabled)
             .await
         {
-            tracing::warn!("Provider update failed (continuing with current provider): {e}");
+            tracing::warn!(
+                session_id = %goose_sid,
+                error = %e,
+                "provider not configured for this session — refusing the turn"
+            );
+            anyhow::bail!(
+                "I have no chat model configured to answer with. {e}. Set a provider and \
+                 model in Settings, then try again."
+            );
         }
 
         // ── 6. Extension cleanup ──────────────────────────────────────────────
@@ -4211,6 +4253,13 @@ impl GooseAdapter {
                     };
                     // Text or a tool call — anything the user actually receives.
                     let mut produced_visible = false;
+                    // Whether this attempt died rather than went quiet. The two need
+                    // telling apart: re-engaging a model that returned nothing is the
+                    // point of the loop, and re-engaging a turn that ERRORED just runs
+                    // the same failure twice more and then buries it under a generic
+                    // sentence. Measured live: three attempts in 9ms, no inference at
+                    // all, and the real cause reaching no log.
+                    let mut stream_failed = false;
                 let mut goose_stream = match agent_clone.reply(attempt_msg, attempt_cfg, Some(cancel_token.clone())).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -4504,6 +4553,18 @@ impl GooseAdapter {
                             _ => {}
                         },
                         Err(e) => {
+                            // The first place this cause is ever written down. A
+                            // configuration failure surfaced here as an `Err` item of
+                            // goose's reply stream, was reported to the user, and then
+                            // existed nowhere else -- not in the pond log, not in
+                            // `pond_logs.db`. The only trace was the re-engagement
+                            // warning below, which named the wrong problem.
+                            tracing::warn!(
+                                session_id = %session_id,
+                                error = %e,
+                                "turn failed mid-stream; not re-engaging"
+                            );
+                            stream_failed = true;
                             yield Ok(AgentStreamEvent::Error { content: e.to_string() });
                         }
                     }
@@ -4517,6 +4578,13 @@ impl GooseAdapter {
                     // both the per-attempt and the end-of-stream flush.
                     if let Some(content) = reasoning.flush() {
                         yield Ok(AgentStreamEvent::Thinking { content });
+                    }
+                    // Before the produced_visible check, because an attempt that
+                    // errored must not be retried whether or not it managed to say
+                    // something first. The user already has the reason; a fallback
+                    // claiming nothing could be produced would contradict it.
+                    if stream_failed {
+                        break 'attempts;
                     }
                     if produced_visible {
                         break 'attempts;
@@ -6426,6 +6494,105 @@ mod tests {
              A literal `None` in either one drops the number on the providers that take \
              that path, and every unit test here still passes because they all call the \
              pure counter."
+        );
+    }
+
+    /// A turn that ERRORED must not be re-engaged as though it had gone quiet.
+    ///
+    /// The failure this pins, measured live: a new chat could not resolve its
+    /// provider, the error arrived as an `Err` item of goose's reply stream, and
+    /// because that arm set neither `produced_visible` nor a break, the loop ran the
+    /// identical failure twice more — three attempts in 9ms, no inference at all —
+    /// and then emitted `EMPTY_TURN_EXHAUSTED_MESSAGE` over the top. The user was
+    /// told the model could not produce a response; the real cause reached no log.
+    ///
+    /// Structural for the same reason as the guards around it: the arm lives inside a
+    /// several-hundred-line `async_stream` needing a real goose `Agent`, a provider and
+    /// a model to drive. What can be checked without one is the wiring that broke.
+    #[test]
+    fn a_turn_that_errored_is_not_re_engaged_as_an_empty_one() {
+        let lines = stream_body_code();
+
+        let set = lines
+            .iter()
+            .position(|l| l.contains("stream_failed = true"))
+            .expect(
+                "nothing sets `stream_failed`. The mid-stream error arm is back to \
+                 falling through into the re-engagement logic, which retries a failure \
+                 that cannot succeed and then buries its cause under a generic sentence.",
+            );
+
+        let checked = lines
+            .iter()
+            .position(|l| l.contains("if stream_failed {"))
+            .expect("`stream_failed` is set but never checked, so nothing breaks the loop");
+
+        let exhausted = lines
+            .iter()
+            .position(|l| l.contains("EMPTY_TURN_EXHAUSTED_MESSAGE.to_string()"))
+            .expect("the exhausted-fallback emit has moved; this guard anchors on it");
+
+        assert!(
+            set < checked,
+            "`stream_failed` is checked at line {checked}, above the assignment at line \
+             {set} — so the flag read is always the previous attempt's.",
+        );
+        assert!(
+            checked < exhausted,
+            "the `stream_failed` break is at line {checked}, BELOW the fallback emit at \
+             line {exhausted}. An errored turn would still be given \
+             EMPTY_TURN_EXHAUSTED_MESSAGE, which is the bug this guards: a sentence \
+             saying nothing could be produced, printed over a cause that was known.",
+        );
+    }
+
+    /// Both silent exits from `ensure_provider_current` must stay loud.
+    ///
+    /// A new chat mints a goose session row with `model_config: None`, and this
+    /// function is the only thing that fills it. Two of its exits used to return
+    /// `Ok(())` having done nothing — `if let Some(cached)` with no `else`, and the
+    /// `else` that only logged at DEBUG — so a session that could not be configured
+    /// was reported as configured. Goose then fell back to its GLOBAL config, which
+    /// GIAP never sets a provider in, and the turn died there instead with
+    /// "Could not resolve model config: missing provider": an engine-internal string
+    /// naming neither the session nor the cause.
+    #[test]
+    fn failing_to_configure_a_session_is_an_error_not_a_shrug() {
+        let src = include_str!("goose_agent.rs");
+        let body = src.split("mod tests").next().unwrap_or(src);
+        let start = body
+            .find("async fn ensure_provider_current")
+            .expect("ensure_provider_current has been renamed; this guard is checking nothing");
+        // To the next `\n    async fn` / `\n    fn` at the same indent, so the scan is
+        // bounded to this function rather than drifting into its neighbours.
+        let rest = &body[start..];
+        let end = rest[1..]
+            .find("\n    async fn ")
+            .or_else(|| rest[1..].find("\n    fn "))
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let func = &rest[..end];
+
+        // Positive, and deliberately not "contains no `if let Some(cached)`": the
+        // thinking re-stamp branch above legitimately uses that shape, because when
+        // there is no cached provider it FALLS THROUGH to the backfill below rather
+        // than returning — so it lands on the bail this guard is about. The backfill
+        // itself is the one that must not be able to fall out silently, and the
+        // let-else form is what makes that structural.
+        assert!(
+            func.contains("let Some((p, cfg)) = cached else {"),
+            "the new-session backfill no longer uses `let ... else`. With `if let` and \
+             no else it configures nothing and returns Ok when no provider has been \
+             built, and the turn then fails one layer later inside goose with a message \
+             about model config that names neither the session nor the cause.",
+        );
+        assert_eq!(
+            func.matches("anyhow::bail!").count(),
+            2,
+            "expected both no-provider exits to bail — the missing cached provider and \
+             the provider that could not be built. Found {}. One of them has gone back \
+             to reporting success for a session it did not configure.",
+            func.matches("anyhow::bail!").count(),
         );
     }
 
