@@ -137,7 +137,8 @@ carries the underlying error.
 nothing external — no Google Matter Virtual Device, no bulb:
 
 ```bash
-cd matter-server && npm run virtual-device
+cd matter-server && npm run virtual-device          # a dimmable light
+cd matter-server && npm run virtual-device -- lock  # a door lock
 ```
 
 It prints a pairing code and waits. Pair it from the Devices tab, then drive it
@@ -148,6 +149,28 @@ process report what it was told:
   [device] power  -> on
   [device] level  -> 102 (40%)
 ```
+
+**One device per run.** A light and a lock on one node is a composed device, which
+GIAP types by its first application endpoint — so the lock's controls would be
+described as things a light can do. That is a worse test than either device alone,
+and not a shape any real product ships.
+
+The light carries a manufacturer-specific cluster, so `describe` has something to
+disclose and refuse to drive. The lock has the two optional DoorLock features whose
+attributes GIAP reports and cannot set — a door position sensor and a PIN requirement
+for remote operation — and starts with its bolt thrown while the door stands open,
+which is the state `lockState` alone answers wrongly.
+
+Nothing on GIAP's side can move a door, so the lock mode reads commands on stdin:
+
+```
+open / closed / jammed / forced / ajar
+pin on / pin off
+```
+
+Type one and ask again in chat. That is the stand-in for the dropdown Google's app
+has, and without it the only door reading you could ever ask about is the one the
+device started on.
 
 Two lines, one from each side, is the check worth making: GIAP reporting success
 and the device reporting the same change are different claims, and only the
