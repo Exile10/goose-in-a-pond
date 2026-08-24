@@ -277,9 +277,44 @@ Three design points that the evidence forced:
 3. **The marker is read, never assumed.** Gemma 4 emits `<|think|>` -- **not** the
    `<|channel>thought` that `model_capabilities.rs` documents. That doc comment is stale.
 
-Not yet wired: `apply_*_settings` still forces `ToolCallingMode::ForceNative` on every
-model, which is what DeepSeek-R1 would break on. That is the next step and it changes
-behaviour, so it wants the device in the loop.
+**Wired the same day.** Both `apply_platform_settings` and `apply_jetson_settings` now read
+the model before deciding, through a pure `tool_and_thinking_for(&ModelProbe)` -- pure
+because the CUDA caller is compiled by nothing on a developer machine or in CI, so a decision
+buried inside it would be tested by neither.
+
+| probe | tool mode | why |
+|---|---|---|
+| `Native` | `ForceNative` | unchanged from the blanket behaviour |
+| `Absent` | `ForceEmulated` | the template cannot carry tools; describe them in prose instead |
+| `Unknown` | `Auto` | no template was readable, so leave goose its own judgement |
+
+Run over the eleven real GGUFs through the adapter's own `probe_model`:
+
+```
+gemma-4-E2B-it-Q4_K_M          ForceNative   thinking=true
+gemma-4-E4B-it-Q4_K_M/Q5_K_M   ForceNative   thinking=true
+gemma-4-12b-it-IQ4_XS          ForceNative   thinking=true
+NVIDIA-Nemotron3-Nano-4B       ForceNative   thinking=true
+Nanbeige4.2-3B                 ForceNative   thinking=true
+DeepSeek-R1-Distill-Qwen-1.5B  ForceEmulated thinking=true
+old_functiongemma-270m-it       ForceNative   thinking=false
+gemma-4-*-assistant (MTP x3)   Auto          thinking=false
+```
+
+**Every model in service keeps exactly what it had** -- all four Gemmas stay
+`ForceNative, thinking=true`. The only rows that move are DeepSeek and the template-less
+drafts, none of which is being served. That is what made this safe to land from the Mac,
+and a test asserts the probe *separates* the collection rather than quietly returning one
+answer for everything, which is the failure mode that looks like success.
+
+`enable_thinking` is now stated rather than inherited. It was never set, so it took goose's
+`default_true()` while the comment above it read "Thinking OFF" -- the registry on the device
+sided with the code. A gated thinker still gets `true`, so nothing that currently reasons
+stops; the only change is that a model with no reasoning markers gets `false` instead of a
+flag it has nothing to do with. The stale comments are corrected in place.
+
+**Still not verified on hardware.** The CUDA caller needs `nvcc`, and CI's `cargo check` does
+not pass that feature, so those lines are reviewed and not compiled.
 
 Worth noting for later: now that skipping is free, `read_gguf_head` in `pond-api` could use
 `parse_gguf_file` and get templates during the catalogue sweep for ~40 ms per model, rather
