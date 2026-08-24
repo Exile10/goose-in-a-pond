@@ -8,6 +8,14 @@
 #   scripts/model-matrix.sh --no-build             use the existing binary
 #   scripts/model-matrix.sh --json OUT.json        machine-readable results
 #   scripts/model-matrix.sh --thinking auto|on|off which thinking_mode to set
+#   scripts/model-matrix.sh --tools all|relevant   which tool_selection_mode
+#   scripts/model-matrix.sh --bin PATH             drive a specific pond-server
+#
+# --bin is what makes a before/after honest. Keep a copy of the OLD binary and
+# point this at it, rather than rebuilding between the two runs: a rebuild in
+# between means the two halves were measured minutes apart on a machine whose
+# thermal and cache state moved, and it makes it impossible to re-run the
+# "before" once the source has changed.
 #
 # WHY THIS EXISTS, SEPARATELY FROM pai-bench.sh
 #
@@ -40,6 +48,8 @@ DO_BUILD=1
 MODELS=""
 JSON_OUT=""
 THINKING="auto"
+TOOLS="all"
+BIN_OVERRIDE=""
 PORT="${PORT:-4988}"
 
 while [ $# -gt 0 ]; do
@@ -48,6 +58,8 @@ while [ $# -gt 0 ]; do
     --models)   MODELS="${2:-}"; shift ;;
     --json)     JSON_OUT="${2:-}"; shift ;;
     --thinking) THINKING="${2:-}"; shift ;;
+    --tools)    TOOLS="${2:-}"; shift ;;
+    --bin)      BIN_OVERRIDE="${2:-}"; shift ;;
     --port)     PORT="${2:-}"; shift ;;
     -h|--help)  sed -n '2,34p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
@@ -76,12 +88,27 @@ if [ -z "$MODELS" ]; then
     | grep -Ev "$SKIP_RE" | paste -sd, -)"
 fi
 
+if [ -n "$BIN_OVERRIDE" ]; then DO_BUILD=0; fi
 if [ "$DO_BUILD" = "1" ]; then
   echo "building pond-server ..."
   SQLX_OFFLINE=true cargo build -p pond-server 2>&1 | tail -3
 fi
-BIN="$REPO_ROOT/target/debug/pond-server"
+BIN="${BIN_OVERRIDE:-$REPO_ROOT/target/debug/pond-server}"
 [ -x "$BIN" ] || { echo "FATAL: no binary at $BIN" >&2; exit 1; }
+
+# An ONNX Runtime already present on this machine, so each model does not
+# re-download one into its own throwaway data dir.
+if [ -z "${ORT_DYLIB_PATH:-}" ]; then
+  for cand in \
+    "$HOME/Library/Application Support/goose-in-a-pond/lib/libonnxruntime."*.dylib \
+    "$HOME/.local/share/goose-in-a-pond/lib/libonnxruntime."*.so \
+    /opt/homebrew/lib/libonnxruntime.dylib \
+    /usr/local/lib/libonnxruntime.dylib \
+    /usr/lib/libonnxruntime.so; do
+    if [ -e "$cand" ]; then ORT_DYLIB_PATH="$cand"; export ORT_DYLIB_PATH; break; fi
+  done
+fi
+[ -n "${ORT_DYLIB_PATH:-}" ] && echo "onnxruntime: $ORT_DYLIB_PATH (reused)"
 
 RESULTS_DIR="$(mktemp -d)"
 echo "results: $RESULTS_DIR"
@@ -100,7 +127,18 @@ run_model() {
   local log="$RESULTS_DIR/$model.log"
   local out="$RESULTS_DIR/$model.json"
 
-  mkdir -p "$data_dir/models/gguf"
+  mkdir -p "$data_dir/models/gguf" "$data_dir/bin"
+
+  # Pre-seed espeak-ng-data. A fresh data dir otherwise downloads ~18 MB of it
+  # during startup, per model, and the health check times out waiting. Safe to
+  # SYMLINK unlike the models directory: the hf_cache migration walks only
+  # `models/gguf` and MOVES what it finds, which is why a symlinked models/ once
+  # ate a real pond's weights. Nothing rewrites `bin/`.
+  for esp in /opt/homebrew/share/espeak-ng-data /usr/share/espeak-ng-data \
+             "$HOME/Library/Application Support/goose-in-a-pond/bin/espeak-ng-data" \
+             "$HOME/.local/share/goose-in-a-pond/bin/espeak-ng-data"; do
+    if [ -d "$esp" ]; then ln -s "$esp" "$data_dir/bin/espeak-ng-data" 2>/dev/null; break; fi
+  done
 
   local entry=""
   for path in "$REAL_MODELS/gguf/$model.gguf" "$REAL_MODELS/gguf/$model"-*.gguf; do
@@ -117,13 +155,21 @@ run_model() {
     || cp "$src" "$data_dir/models/gguf/$entry" \
     || { echo "  SKIP $model — could not stage"; rm -rf "$data_dir"; return; }
 
+  # ORT_DYLIB_PATH is exported at the top when a runtime was found on this
+  # machine, and inherited from here. Without it every model re-downloads ~30 MB
+  # into its own scratch dir, because the dir is wiped between models -- minutes
+  # per model of the harness measuring the network rather than the model.
+  # Deliberately NOT an inline `VAR=x cmd` prefix: the macOS path contains a
+  # space ("Application Support") and `${VAR:+VAR="$VAR"}` does not survive word
+  # splitting, which turned the assignment into a command and failed every model
+  # instantly with "No such file or directory".
   POND_DATA_DIR="$data_dir" POND_DEV_ALLOW_LOOPBACK=1 \
     RUST_LOG="warn,giap::trace=info,pond_adapters_goose=debug,pond_adapters_local_inference=debug,goose_local_inference=debug" \
     "$BIN" serve --port "$PORT" > "$log" 2>&1 &
   local pid=$!
 
   local ready=0
-  for _ in $(seq 1 120); do
+  for _ in $(seq 1 180); do
     curl -sf -o /dev/null "http://127.0.0.1:$PORT/api/v1/health" && { ready=1; break; }
     kill -0 "$pid" 2>/dev/null || break
     sleep 2
@@ -138,7 +184,7 @@ run_model() {
 
   curl -s -X PUT "http://127.0.0.1:$PORT/api/v1/settings" \
     -H 'Content-Type: application/json' \
-    -d "{\"chat_provider\":\"local\",\"chat_model\":\"$model\",\"thinking_mode\":\"$THINKING\",\"show_turn_stats\":true}" \
+    -d "{\"chat_provider\":\"local\",\"chat_model\":\"$model\",\"thinking_mode\":\"$THINKING\",\"tool_selection_mode\":\"$TOOLS\",\"show_turn_stats\":true}" \
     > /dev/null
 
   local sid="matrix-$$"
@@ -189,13 +235,22 @@ PY
   done
   echo "]" >> "$out"
 
-  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  # Stop the server and do not hang if it declines to go. A bare
+  # `kill; wait` hung a completed run indefinitely: the child holds the model
+  # and an audio device, and a TERM it does not act on leaves `wait` blocking
+  # forever with every result already on disk.
+  kill "$pid" 2>/dev/null
+  for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+  kill -9 "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
   rm -rf "$data_dir"
   echo "  done $model"
 }
 
 echo "models: $MODELS"
 echo "thinking_mode: $THINKING"
+echo "tool_selection_mode: $TOOLS"
+echo "binary: $BIN"
 echo
 IFS=',' read -ra LIST <<< "$MODELS"
 for m in "${LIST[@]}"; do

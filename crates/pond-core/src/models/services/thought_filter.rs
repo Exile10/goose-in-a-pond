@@ -13,7 +13,13 @@
 //! Reuse a single instance across all chunks of one response.
 
 /// Paired tags whose entire contents (and the tags themselves) are dropped.
-const PAIRED_TAGS: &[(&str, &str)] = &[
+///
+/// PUBLIC because there is a second streaming filter at the SSE seam
+/// (`pond_api::thought_filter`) that needs exactly this list. The two tables
+/// were separate copies and they drifted: `<thinking>` was added here, for a
+/// model whose whole reasoning was otherwise spoken aloud in voice mode, and
+/// the copy in `pond-api` never got it. One table, two filters.
+pub const PAIRED_TAGS: &[(&str, &str)] = &[
     ("<|channel>thought", "<channel|>"),
     ("<|tool_call>", "<tool_call|>"),
     ("<think>", "</think>"),
@@ -27,7 +33,9 @@ const PAIRED_TAGS: &[(&str, &str)] = &[
 ];
 
 /// Standalone sentinels silently dropped wherever they appear.
-const STANDALONE_SENTINELS: &[&str] = &[
+///
+/// Public for the same reason as [`PAIRED_TAGS`].
+pub const STANDALONE_SENTINELS: &[&str] = &[
     "<eos>",
     "<|eos|>",
     "<end_of_turn>",

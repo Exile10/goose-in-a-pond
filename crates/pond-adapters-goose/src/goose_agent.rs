@@ -2281,6 +2281,19 @@ impl GooseAdapter {
                 &settings.chat_model,
                 self.data_dir.as_deref(),
             );
+            caps.tool_calling = crate::model_traits::model_uses_native_tools(
+                &settings.chat_provider,
+                &settings.chat_model,
+                self.data_dir.as_deref(),
+            );
+            if matches!(settings.chat_provider.as_str(), "local" | "gguf") {
+                // Every GGUF served through llama.cpp can be constrained with a
+                // GBNF grammar. The name rule looked for a quant tag in the
+                // model string (`q4_k`, `q8_0`, ...) and so answered "no" for
+                // any model whose configured name omits one -- which is how the
+                // catalogue spells the canonical stem.
+                caps.structured_output = true;
+            }
             if let Some(trained) = crate::model_traits::trained_context_window(
                 &settings.chat_provider,
                 &settings.chat_model,
@@ -3006,7 +3019,7 @@ impl GooseAdapter {
     /// key. Idempotent: skips registration if the model is already known.
     fn register_gguf_model(model_name: &str, data_dir: &std::path::Path) -> String {
         use goose::providers::local_inference::local_model_registry::{
-            get_registry, LocalModelEntry, LocalModelStorage, ToolCallingMode,
+            get_registry, LocalModelEntry, LocalModelStorage,
         };
 
         let gguf_dir = data_dir.join("models").join("gguf");
@@ -3058,9 +3071,15 @@ impl GooseAdapter {
                         .get_model(&stem)
                         .map(|entry| entry.settings.clone())
                         .unwrap_or_default();
-                    // GIAP's local GGUFs (gemma family) support llama.cpp native
-                    // tool calling; force it rather than relying on Auto detection.
-                    settings.tool_calling = ToolCallingMode::ForceNative;
+                    // What THIS model's chat template can actually carry, not
+                    // what the gemma family can. This line read
+                    // `ToolCallingMode::ForceNative` with the comment "GIAP's
+                    // local GGUFs (gemma family) support llama.cpp native tool
+                    // calling" — and it is the row the live turn resolves to,
+                    // because `ensure_provider_current` builds its `ModelConfig`
+                    // from the key this function returns. The probe's answer was
+                    // going to the OTHER id the same file is registered under.
+                    settings.tool_calling = crate::model_traits::tool_mode_for_gguf(&local_path);
                     let entry = LocalModelEntry {
                         id: stem.clone(),
                         repo_id: format!("local/{}", stem),
@@ -3087,9 +3106,18 @@ impl GooseAdapter {
                         Err(e) => tracing::warn!("Could not register GGUF model '{}': {}", stem, e),
                     }
                 } else if let Some(entry) = registry.get_model(&stem) {
+                    // RE-STAMP rather than upgrade. This used to move `Auto` to
+                    // `ForceNative` and leave everything else alone, so a row
+                    // persisted as `ForceNative` before the probe existed kept a
+                    // mode its template cannot honour, forever — the same
+                    // never-revisited shape `registration_settings` was fixed
+                    // for. Re-reading the file every time is what
+                    // `apply_*_settings` already does to these rows, and the
+                    // read is a memoised hashmap hit after the first.
                     let mut s = entry.settings.clone();
-                    if s.tool_calling == ToolCallingMode::Auto {
-                        s.tool_calling = ToolCallingMode::ForceNative;
+                    let mode = crate::model_traits::tool_mode_for_gguf(&local_path);
+                    if s.tool_calling != mode {
+                        s.tool_calling = mode;
                         let _ = registry.update_model_settings(&stem, s);
                     }
                 }
