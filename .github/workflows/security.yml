@@ -42,7 +42,7 @@ jobs:
 
       # Prebuilt binary — installs in seconds vs minutes for cargo install.
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2.85.13
+        uses: taiki-e/install-action@v2.86.5
         with:
           tool: cargo-audit
 
@@ -140,7 +140,7 @@ jobs:
       # its dependencies reach us through the workspace lockfile, which is
       # scanned.
       - name: osv-scanner
-        uses: google/osv-scanner-action/osv-scanner-action@v2.5.0
+        uses: google/osv-scanner-action/osv-scanner-action@v2.5.1
         with:
           scan-args: |-
             --lockfile=Cargo.lock
