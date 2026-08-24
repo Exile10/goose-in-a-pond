@@ -374,3 +374,27 @@ mod tests {
         assert_eq!(caps.context_window_tokens, caps2.context_window_tokens);
     }
 }
+
+#[cfg(test)]
+mod probe_gap_tests {
+    use super::*;
+
+    /// The gap that made Nemotron hallucinate instead of calling a tool.
+    ///
+    /// `thinking_mode = "auto"` resolves through this function, which reads the
+    /// FILENAME. Nemotron reasons -- its template gates a `<think>` block and
+    /// `ModelProbe` reads that correctly -- but nothing in the name says so, so
+    /// the prompt-side thinking section was omitted while the engine had
+    /// `enable_thinking = true`. Measured on 2026-08-24: with `auto` the model
+    /// produced an empty first turn, got re-engaged, and fabricated a weather
+    /// report; with `"on"` it called the weather tool and reported real data.
+    #[test]
+    fn the_name_heuristic_does_not_know_nemotron_reasons() {
+        let caps = ModelCapabilities::from_model_name("NVIDIA-Nemotron3-Nano-4B-Q4_K_M");
+        assert!(
+            !caps.thinking,
+            "if the name heuristic has learned Nemotron, this gap is closed and \
+             thinking_mode=auto no longer needs the probe"
+        );
+    }
+}
