@@ -277,6 +277,27 @@ impl LocalInferenceLlmAdapter {
             get_registry, ModelSettings, ToolCallingMode,
         };
 
+        // Ask the model what it can do. A file we cannot read leaves goose its
+        // own judgement (`Auto`) rather than inheriting the old blanket
+        // ForceNative.
+        let probe = get_registry()
+            .lock()
+            .ok()
+            .and_then(|reg| reg.get_model(model_id).map(|e| e.local_path.clone()))
+            .and_then(|p| Self::probe_model(&p));
+        let (tools, thinking) = match &probe {
+            Some(p) => Self::tool_and_thinking_for(p),
+            None => (ToolCallingMode::Auto, true),
+        };
+        if let Some(p) = &probe {
+            tracing::info!(
+                model = model_id,
+                tools = ?p.tools,
+                thinking = ?p.thinking,
+                "model capabilities read from its chat template"
+            );
+        }
+
         let settings = ModelSettings {
             // Full GPU offload — Apple Silicon has unified memory so all layers
             // fit without any CPU/GPU split.
@@ -290,14 +311,17 @@ impl LocalInferenceLlmAdapter {
             flash_attention: Some(true),
             // Unified memory — mlock is unnecessary and can cause issues.
             use_mlock: false,
-            // Native tool calling forced ON — Gemma 4 produces
-            // <|tool_call>call:NAME{...}<tool_call|> in its trained format. The
-            // GGUF's embedded (Jinja) chat template renders tool declarations;
-            // ChatTemplate::Embedded is the default so no override is needed.
-            tool_calling: ToolCallingMode::ForceNative,
-            // Thinking OFF — GIAP handles thinking display through its own
-            // PromptState + ThoughtFilter pipeline, not llama.cpp's native
-            // reasoning_format which causes Gemma 4 E2B to produce immediate EOS.
+            // Tool calling and thinking now come from the model's own chat
+            // template rather than being forced. Gemma renders declarations and
+            // keeps ForceNative; a template with no `tools` variable gets
+            // ForceEmulated instead of declarations with nowhere to go.
+            tool_calling: tools,
+            enable_thinking: thinking,
+            // `enable_thinking` is set above from the template rather than
+            // left to inherit goose's `default_true()`. It said "Thinking OFF"
+            // here for a long time while the code set nothing and the registry
+            // on the device read `true` -- the comment described an intention
+            // the code never carried out.
             // Let llama.cpp auto-detect thread count (good on Apple Silicon).
             ..Default::default()
         };
@@ -366,6 +390,76 @@ impl LocalInferenceLlmAdapter {
     ///
     /// This is intentionally NOT implemented in the cross-platform loader: it is
     /// unsafe to change from the macOS Metal build and cannot be tested here.
+    /// What the registry should say for a model, given what its own file says
+    /// it can do.
+    ///
+    /// Kept as a pure function over [`ModelProbe`] on purpose: the two callers
+    /// are `apply_jetson_settings` (CUDA-gated, compiles only on the device) and
+    /// `apply_platform_settings`. A decision buried in either would be tested by
+    /// neither on a developer machine, and the CUDA one is compiled by nothing
+    /// in CI.
+    ///
+    /// # Tools
+    ///
+    /// Both callers used to set `ForceNative` unconditionally. That is right for
+    /// Gemma and wrong for the first model whose template takes no `tools`
+    /// variable -- DeepSeek-R1-Distill, already on the development machine,
+    /// renders no declarations at all, so forcing native puts them nowhere.
+    ///
+    /// - `Native`  -> `ForceNative`, as before.
+    /// - `Absent`  -> `ForceEmulated`: the template cannot carry tools, so they
+    ///   have to be described in the system prompt or not offered.
+    /// - `Unknown` -> `Auto`: no template was readable, so leave goose its own
+    ///   judgement rather than overriding it with a guess.
+    ///
+    /// # Thinking
+    ///
+    /// `enable_thinking` was never set, so it inherited goose's `default_true()`
+    /// while the comment above it claimed "Thinking OFF". The registry on the
+    /// device sided with the code. This states the value instead of inheriting
+    /// it, and does not change what any currently-reasoning model does: a gated
+    /// thinker still gets `true`.
+    ///
+    /// A model with no reasoning markers gets `false`, which is the only case
+    /// this changes, and it changes it from "flag set for a model that has
+    /// nothing to flag" to "off".
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn tool_and_thinking_for(
+        probe: &pond_core::models::domain::model_probe::ModelProbe,
+    ) -> (
+        goose::providers::local_inference::local_model_registry::ToolCallingMode,
+        bool,
+    ) {
+        use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+        use pond_core::models::domain::model_probe::{Thinking, ToolSupport};
+
+        let tools = match probe.tools {
+            ToolSupport::Native => ToolCallingMode::ForceNative,
+            ToolSupport::Absent => ToolCallingMode::ForceEmulated,
+            ToolSupport::Unknown => ToolCallingMode::Auto,
+        };
+        let thinking = matches!(
+            probe.thinking,
+            Thinking::Gated { .. } | Thinking::Always { .. }
+        );
+        (tools, thinking)
+    }
+
+    /// Read a model's own account of itself, for the settings above.
+    ///
+    /// Walks far enough to reach `tokenizer.chat_template`, which sits 3.8-15 MB
+    /// into a GGUF, behind the token array. Costs a few hundred kilobytes of
+    /// real reading and about 40 ms, because everything between the keys it
+    /// wants is stepped over rather than read.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn probe_model(
+        path: &std::path::Path,
+    ) -> Option<pond_core::models::domain::model_probe::ModelProbe> {
+        use pond_core::models::domain::gguf::parse_gguf_file;
+        use pond_core::models::domain::model_probe::ModelProbe;
+        parse_gguf_file(path).map(|info| ModelProbe::from_gguf(&info))
+    }
+
     /// The model's KV cost per token, read from its own GGUF header, or `None`
     /// when the header cannot settle it.
     ///
@@ -623,6 +717,24 @@ impl LocalInferenceLlmAdapter {
             "Jetson context sized to fit this model's KV cache in the LLM budget"
         );
 
+        let probe = get_registry()
+            .lock()
+            .ok()
+            .and_then(|reg| reg.get_model(model_id).map(|e| e.local_path.clone()))
+            .and_then(|p| Self::probe_model(&p));
+        let (tools, thinking) = match &probe {
+            Some(p) => Self::tool_and_thinking_for(p),
+            None => (ToolCallingMode::Auto, true),
+        };
+        if let Some(p) = &probe {
+            tracing::info!(
+                model = model_id,
+                tools = ?p.tools,
+                thinking = ?p.thinking,
+                "model capabilities read from its chat template"
+            );
+        }
+
         let jetson_settings = ModelSettings {
             // Full GPU offload: Jetson unified memory means all layers fit in
             // the same 8 GB pool — no split between CPU and GPU DRAM.
@@ -672,11 +784,11 @@ impl LocalInferenceLlmAdapter {
             // mlock pins pages in RAM; on unified memory this triggers kernel
             // page faults for every GPU access. Disable for correct performance.
             use_mlock: false,
-            // Native tool calling forced ON — Gemma 4 produces tool calls in its
-            // trained format; the GGUF's embedded (Jinja) chat template renders the
-            // declarations (ChatTemplate::Embedded is the default).
-            tool_calling: ToolCallingMode::ForceNative,
-            // Thinking OFF — GIAP handles thinking via PromptState + ThoughtFilter.
+            // From the model's own template, not forced. See
+            // `tool_and_thinking_for`.
+            tool_calling: tools,
+            enable_thinking: thinking,
+            // `enable_thinking` is set above from the template, not inherited.
             ..Default::default()
         };
 
@@ -1049,6 +1161,145 @@ mod tests {
             LocalInferenceLlmAdapter::jetson_context_size(bytes, Some(0)),
             fallback
         );
+    }
+
+    /// The decision the two `apply_*_settings` paths share, tested here because
+    /// the CUDA one is compiled by nothing on a developer machine or in CI.
+    /// The adapter's own path, end to end, against the real files.
+    ///
+    /// The unit tests above build a `ModelProbe` by hand and check the
+    /// decision. This checks that `probe_model` actually reads one off a GGUF
+    /// and that the decision it produces differs across the collection -- the
+    /// failure mode being a probe that quietly returns the same answer for
+    /// everything and looks like it works.
+    ///
+    /// ```text
+    /// GIAP_TEST_GGUF_DIR="$HOME/Library/Application Support/goose-in-a-pond/models/gguf" \
+    ///   cargo test -p pond-adapters-local-inference --lib -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs real GGUF files; set GIAP_TEST_GGUF_DIR"]
+    fn probe_model_reads_real_files_and_separates_them() {
+        use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+
+        let Ok(dir) = std::env::var("GIAP_TEST_GGUF_DIR") else {
+            eprintln!("GIAP_TEST_GGUF_DIR unset");
+            return;
+        };
+        let mut modes = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(&dir).expect("dir") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
+                continue;
+            }
+            let (mode, thinking) = match LocalInferenceLlmAdapter::probe_model(&path) {
+                Some(p) => LocalInferenceLlmAdapter::tool_and_thinking_for(&p),
+                None => (ToolCallingMode::Auto, true),
+            };
+            eprintln!(
+                "{:<44} {:?} thinking={}",
+                path.file_name().unwrap().to_string_lossy(),
+                mode,
+                thinking
+            );
+            *modes.entry(format!("{mode:?}")).or_insert(0) += 1;
+        }
+        assert!(!modes.is_empty(), "no GGUF files under {dir}");
+        assert!(
+            modes.len() > 1,
+            "every model resolved to the same tool mode ({modes:?}); a probe that cannot \
+             tell them apart is the blanket ForceNative with extra steps"
+        );
+        assert!(
+            modes.contains_key("ForceEmulated"),
+            "expected at least one model whose template carries no `tools` variable; \
+             got {modes:?}"
+        );
+    }
+
+    #[test]
+    fn a_tool_using_model_keeps_native_calling() {
+        use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+        use pond_core::models::domain::model_probe::{ModelProbe, Thinking, ToolSupport};
+
+        let gemma = ModelProbe {
+            tools: ToolSupport::Native,
+            thinking: Thinking::Gated {
+                marker: "<|think|>".into(),
+            },
+            context_window_tokens: Some(131072),
+            architecture: Some("gemma4".into()),
+        };
+        let (tools, thinking) = LocalInferenceLlmAdapter::tool_and_thinking_for(&gemma);
+        assert_eq!(tools, ToolCallingMode::ForceNative);
+        assert!(
+            thinking,
+            "a gated thinker must still get true -- this wiring must not change what \
+             a currently-reasoning model does"
+        );
+    }
+
+    /// The case the blanket ForceNative gets wrong, and the reason any of this
+    /// exists. DeepSeek-R1-Distill's template takes no `tools` variable.
+    #[test]
+    fn a_model_whose_template_cannot_carry_tools_is_not_forced_native() {
+        use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+        use pond_core::models::domain::model_probe::{ModelProbe, Thinking, ToolSupport};
+
+        let deepseek = ModelProbe {
+            tools: ToolSupport::Absent,
+            thinking: Thinking::Always {
+                marker: "<think>".into(),
+            },
+            context_window_tokens: Some(131072),
+            architecture: Some("qwen2".into()),
+        };
+        let (tools, thinking) = LocalInferenceLlmAdapter::tool_and_thinking_for(&deepseek);
+        assert_eq!(
+            tools,
+            ToolCallingMode::ForceEmulated,
+            "forcing native on a template with no `tools` variable renders declarations \
+             nowhere at all"
+        );
+        assert!(
+            thinking,
+            "it reasons unconditionally; there is no flag to clear"
+        );
+    }
+
+    /// A file we could not read is not evidence of anything, so goose keeps its
+    /// own judgement rather than inheriting our guess.
+    #[test]
+    fn an_unreadable_model_defers_rather_than_forcing() {
+        use goose::providers::local_inference::local_model_registry::ToolCallingMode;
+        use pond_core::models::domain::model_probe::{ModelProbe, Thinking, ToolSupport};
+
+        let unknown = ModelProbe {
+            tools: ToolSupport::Unknown,
+            thinking: Thinking::Unknown,
+            context_window_tokens: None,
+            architecture: None,
+        };
+        let (tools, thinking) = LocalInferenceLlmAdapter::tool_and_thinking_for(&unknown);
+        assert_eq!(tools, ToolCallingMode::Auto);
+        assert!(!thinking, "nothing said it reasons");
+    }
+
+    /// A tool user with no reasoning markers gets the flag cleared. This is the
+    /// only case the thinking half changes, and it changes it from "set for a
+    /// model with nothing to set" to off.
+    #[test]
+    fn a_model_with_no_reasoning_markers_does_not_get_the_flag() {
+        use pond_core::models::domain::model_probe::{ModelProbe, Thinking, ToolSupport};
+
+        let plain = ModelProbe {
+            tools: ToolSupport::Native,
+            thinking: Thinking::Absent,
+            context_window_tokens: Some(32768),
+            architecture: Some("gemma3".into()),
+        };
+        let (_, thinking) = LocalInferenceLlmAdapter::tool_and_thinking_for(&plain);
+        assert!(!thinking);
     }
 
     #[test]
