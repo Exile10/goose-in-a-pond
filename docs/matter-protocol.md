@@ -148,6 +148,21 @@ that was sent, and the operations offered are derived from `operationalStateList
 rather than assumed: each of the four commands is optional, and the spec requires a
 device to expose the states matching the commands it supports.
 
+**Which setpoints a thermostat has comes from `controlSequenceOfOperation`**, the
+mandatory attribute that states whether the device cools, heats, or both. It was not read
+at all, and presence was inferred as `"occupiedCoolingSetpoint" in clusters` instead —
+a KEY check, where matter.js populates a key for every attribute in the cluster model and
+leaves the unsupported ones `undefined`. So every thermostat looked like it had both
+setpoints, and a cooling-only air conditioner advertised a range from 7 C: the floor of a
+heating setpoint it does not implement, unioned in. Claims first, evidence second, and
+neither strips a control on silence — a device stating nothing keeps both, because
+withholding a setpoint from an under-reporting thermostat would be the worse failure.
+
+`systemMode` is read through the same number-or-enum-name tolerance as FanControl's mode
+sequence. Compared as a raw number it never matched a device reporting `"Cool"`, so the
+mode read as unsettled and the description fell back to the union of both setpoints'
+ranges — which is the other half of how 7 to 32 reached the user.
+
 `target_temp` names whichever setpoint the thermostat currently runs on. A
 thermostat has two — one it heats up to, one it cools down to — and writing the
 heating one to a device that is cooling moves a number nobody asked about while the

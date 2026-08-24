@@ -36,7 +36,12 @@ import {
 } from "./devices.js";
 import { miredsToKelvin } from "./control.js";
 import { declaredUnitOf, SENSORS } from "./sensors.js";
-import { applianceSetpoint, reachableRange, targetSetpoint } from "./thermostat.js";
+import {
+  applianceSetpoint,
+  reachableRange,
+  systemMode,
+  targetSetpoint,
+} from "./thermostat.js";
 import { operationsOf, settingsOf } from "./settings.js";
 import { applicationEndpoints, endpointWith, type NodeSnapshot } from "./snapshot.js";
 
@@ -190,7 +195,11 @@ function temperatureSpec(node: NodeSnapshot): ValueSpec {
     };
   }
 
-  const mode = attribute(node, CLUSTER_THERMOSTAT, "systemMode");
+  // Through the tolerant reader: compared as a raw number this failed for every device
+  // that reported its mode as a NAME, and a cool-only air conditioner in Cool mode fell
+  // through to the union of both setpoints -- 7 to 32 C on a device that cannot reach 7.
+  const endpoint = endpointWith(node, CLUSTER_THERMOSTAT);
+  const mode = endpoint === undefined ? undefined : systemMode(endpoint);
   // Auto (1) and Off (0) do not name a setpoint; the requested value would.
   const settled = mode === MODE_COOL || mode === MODE_HEAT || mode === MODE_EMERGENCY_HEAT;
   const live = settled ? targetSetpoint(node) : undefined;
