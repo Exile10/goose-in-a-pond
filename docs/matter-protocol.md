@@ -120,6 +120,21 @@ clamps to its own minimum reports that minimum. This is why the field exists: th
 old adapter built its outcome from the caller's request, so a device that did
 something else was still described to the user as having obeyed.
 
+That was true of `operation` alone for a while, and of nothing else — every other verb
+echoed the request straight back. A fan told to run at 85% reported 85% while the device
+had quantised it onto its High mode and was sitting at 90, and the number the user read
+was the number they typed. So the controller now reads the value back for every verb
+whose result can differ from the request: `fan_speed`, `brightness`, `color`,
+`color_temp`, `target_temp`, `position`, `tilt` — quantised onto a cluster's scale,
+clamped to a device's stated limits, or still travelling.
+
+It reads through the same inverses `state` reads with, so the number reported is one that
+would put the device back where it is. It returns as soon as the reading moves rather than
+waiting a fixed window, and a device already at the requested value is not waited on at
+all. `power`, `locked` and `fan_mode` are deliberately not read back: a value with nowhere
+else to land buys nothing for the latency. Where a device reports nothing for the verb the
+request stands, because an absent reading is not evidence of a different one.
+
 That holds only if the command's *response* is read. Matter commands do not merely
 succeed or throw: Operational State answers every Start/Stop/Pause/Resume with an
 `ErrorStateID`, and ModeBase answers `changeToMode` with a `status`, so a refusal

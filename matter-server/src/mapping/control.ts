@@ -25,19 +25,33 @@ import { applianceSetpoint, targetSetpoint } from "./thermostat.js";
 // lives in protocol.ts and is re-exported here, where every caller already looks.
 export type { Verb };
 
-export const VERBS: ReadonlySet<string> = new Set<Verb>([
-  "power",
-  "brightness",
-  "target_temp",
-  "locked",
-  "color",
-  "fan_speed",
-  "fan_mode",
-  "position",
-  "tilt",
-  "mode",
-  "operation",
-]);
+/**
+ * Every verb, as a record rather than a list — so the COMPILER enforces coverage.
+ *
+ * `new Set<Verb>([...])` type-checks happily while missing an entry, and it did: adding
+ * `color_temp` to the union left it out of this set, and `server.ts` rejects any verb the
+ * set does not hold. The control was unreachable at the wire boundary while every unit
+ * test passed, because the tests call `planControl` directly and never cross it.
+ *
+ * A `Record<Verb, true>` cannot be missing a key. Add a verb to the union without adding
+ * it here and the build fails, which is the only guard that survives someone in a hurry.
+ */
+const ALL_VERBS: Record<Verb, true> = {
+  power: true,
+  brightness: true,
+  target_temp: true,
+  locked: true,
+  color: true,
+  color_temp: true,
+  fan_speed: true,
+  fan_mode: true,
+  position: true,
+  tilt: true,
+  mode: true,
+  operation: true,
+};
+
+export const VERBS: ReadonlySet<string> = new Set(Object.keys(ALL_VERBS));
 
 /** What the server must actually do to the device. */
 export type Action =
@@ -48,6 +62,80 @@ export interface Plan {
   actions: Action[];
   /** The state the device is in once the actions succeed. */
   applied: DeviceStatePatch;
+}
+
+/**
+ * What the device NOW reports for a verb, in the verb's own units.
+ *
+ * `applied` is supposed to be what the device did rather than what it was asked for —
+ * the protocol doc says so, and it is the reason the field exists at all. Until now only
+ * `operation` honoured it: every other verb echoed the request back, so a fan told to run
+ * at 85% reported 85% while the device had quantised it to its High mode and was sitting
+ * at 90. The number the user reads was the number they typed, which makes it worthless
+ * for noticing that anything happened at all.
+ *
+ * These are the verbs whose result can differ from the request: a value quantised onto a
+ * cluster's own scale, clamped to a device's stated limits, or still travelling. Power
+ * and lock are absent deliberately — a boolean cannot land somewhere else, so making
+ * them wait for a report would be latency bought for nothing.
+ *
+ * Read through the same inverses `state` reads with, so the number reported here is the
+ * number that would put the device back where it is.
+ */
+export function observedFor(node: NodeSnapshot, verb: Verb): DeviceStatePatch {
+  const at = (cluster: string, attribute: string): number | undefined => {
+    const raw = endpointWith(node, cluster)?.clusters[cluster]?.[attribute];
+    return typeof raw === "number" && Number.isFinite(raw) ? raw : undefined;
+  };
+
+  switch (verb) {
+    case "fan_speed": {
+      // percentCURRENT, not percentSetting: the setting is what was written, the current
+      // is what the fan is doing. Reading the setting back would echo the request with
+      // extra steps.
+      const pct = at(CLUSTER_FAN_CONTROL, "percentCurrent");
+      return pct === undefined ? {} : { fan_speed: clampPercent(pct) };
+    }
+    case "brightness": {
+      const level = at(CLUSTER_LEVEL_CONTROL, "currentLevel");
+      return level === undefined ? {} : { brightness: levelToBrightness(level) };
+    }
+    case "color": {
+      const hue = at(CLUSTER_COLOR_CONTROL, "currentHue");
+      const saturation = at(CLUSTER_COLOR_CONTROL, "currentSaturation");
+      if (hue === undefined || saturation === undefined) return {};
+      return { hue: matterToHue(hue), saturation: matterToSaturation(saturation) };
+    }
+    case "color_temp": {
+      const mireds = at(CLUSTER_COLOR_CONTROL, "colorTemperatureMireds");
+      if (mireds === undefined) return {};
+      const kelvin = miredsToKelvin(mireds);
+      return kelvin > 0 ? { color_temp: kelvin } : {};
+    }
+    case "target_temp": {
+      // Whichever setpoint is live, by the same rule `target_temp` writes with: an
+      // appliance's own, or the thermostat setpoint its mode has running.
+      if (applianceSetpoint(node) !== undefined) {
+        const set = at("temperatureControl", "temperatureSetpoint");
+        return set === undefined ? {} : { target_temp: setpointToCelsius(set) };
+      }
+      const target = targetSetpoint(node);
+      const setpoint = target === undefined ? undefined : at(CLUSTER_THERMOSTAT, target.attribute);
+      return setpoint === undefined ? {} : { target_temp: setpointToCelsius(setpoint) };
+    }
+    case "position": {
+      const lift = at(CLUSTER_WINDOW_COVERING, "currentPositionLiftPercent100ths");
+      return lift === undefined ? {} : { position: lift100thsToPositionOpen(lift) };
+    }
+    case "tilt": {
+      const tilt = at(CLUSTER_WINDOW_COVERING, "currentPositionTiltPercent100ths");
+      return tilt === undefined ? {} : { tilt: lift100thsToPositionOpen(tilt) };
+    }
+    default:
+      // power, locked, fan_mode, mode, operation. `operation` has its own settle path
+      // in the controller; the rest cannot land on a value other than the one asked for.
+      return {};
+  }
 }
 
 // ── Unit conversions ─────────────────────────────────────────────────────────

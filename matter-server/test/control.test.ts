@@ -6,7 +6,9 @@ import {
   fanModeFromName,
   hueToMatter,
   kelvinToMireds,
+  VERBS,
   matterToHue,
+  observedFor,
   matterToSaturation,
   miredsToKelvin,
   planControl,
@@ -22,6 +24,7 @@ import {
   extendedColorLightNode,
   fanNode,
   lightNode,
+  named,
   node,
   tunableWhiteNode,
 } from "./fixtures.js";
@@ -278,6 +281,68 @@ describe("colour temperature control", () => {
       expect(() => planControl(tunableWhiteNode(), "matter-52", "color_temp", bad)).toThrow(
         OpError,
       );
+    }
+  });
+});
+
+describe("reading back what the device actually did", () => {
+  it("reports the fan speed the device settled on, not the one requested", () => {
+    // The report this came from. Asked for 85%, the fan quantised onto its High mode and
+    // sat at 90 -- and GIAP said "speed is set to 85%", which is the number the user
+    // typed. A result that echoes the request cannot show that anything happened.
+    const fan = node(1, [
+      named("Fan"),
+      endpoint(1, { fanControl: { fanMode: 3, percentSetting: 85, percentCurrent: 90 } }),
+    ]);
+
+    expect(observedFor(fan, "fan_speed")).toEqual({ fan_speed: 90 });
+  });
+
+  it("reads percentCurrent rather than the setting that was written", () => {
+    // percentSetting is the request stored on the device. Reading it back would echo the
+    // request with extra steps and look like it had been verified.
+    const disagreeing = node(2, [
+      named("Fan"),
+      endpoint(1, { fanControl: { percentSetting: 20, percentCurrent: 55 } }),
+    ]);
+
+    expect(observedFor(disagreeing, "fan_speed")).toEqual({ fan_speed: 55 });
+  });
+
+  it("reads every verb whose result can differ from the request", () => {
+    const light = node(3, [
+      named("Lamp"),
+      endpoint(1, {
+        levelControl: { currentLevel: 127 },
+        colorControl: { currentHue: 84, currentSaturation: 254, colorTemperatureMireds: 370 },
+      }),
+    ]);
+
+    expect(observedFor(light, "brightness")).toEqual({ brightness: 50 });
+    expect(observedFor(light, "color_temp")).toEqual({ color_temp: 2703 });
+    expect(observedFor(light, "color")).toEqual({ hue: 119, saturation: 100 });
+  });
+
+  it("says nothing for a verb that cannot land somewhere else", () => {
+    // A boolean has nowhere else to land, so waiting for a report buys nothing. Empty
+    // here is what tells the controller not to wait.
+    expect(observedFor(lightNode(), "power")).toEqual({});
+    expect(observedFor(lightNode(), "locked")).toEqual({});
+  });
+
+  it("says nothing when the device reports no value for the verb", () => {
+    // Absent is not evidence of a different value: the plan's own applied stands rather
+    // than a reading being invented.
+    expect(observedFor(lightNode(), "fan_speed")).toEqual({});
+    expect(observedFor(lightNode(), "tilt")).toEqual({});
+  });
+
+  it("accepts every verb at the wire boundary", () => {
+    // `server.ts` rejects a verb this set does not hold, and `color_temp` was missing
+    // from it for a whole commit -- unreachable in production while every unit test
+    // passed, because these tests call planControl directly and never cross that check.
+    for (const verb of ["power", "brightness", "color", "color_temp", "fan_speed", "mode"]) {
+      expect(VERBS.has(verb), `'${verb}' would be refused as an unknown verb`).toBe(true);
     }
   });
 });

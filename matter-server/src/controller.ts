@@ -11,7 +11,7 @@ import { Endpoint, Environment, Seconds, ServerNode, type ClientNode } from "@ma
 
 import { log, describeError, setupCodeKind } from "./log.js";
 import { nodeToDevice } from "./mapping/devices.js";
-import { planControl, type Verb } from "./mapping/control.js";
+import { observedFor, planControl, type Verb } from "./mapping/control.js";
 import { observedOperation } from "./mapping/settings.js";
 import { describeNode } from "./mapping/describe.js";
 import { stateOf } from "./mapping/state.js";
@@ -400,6 +400,11 @@ export class Controller {
     }
 
     const plan = planControl(snapshotOf(peer, nodeId), deviceId, verb, value);
+    // Captured BEFORE the write, so the settle below can tell "the device has reported
+    // its new value" from "the report has not arrived yet". Without a baseline the two
+    // are indistinguishable and the first read wins, which is the state before the
+    // command.
+    const before = observedFor(snapshotOf(peer, nodeId), verb);
 
     for (const action of plan.actions) {
       const endpoint = peer.endpoints.for(action.endpoint);
@@ -441,6 +446,8 @@ export class Controller {
     if (verb === "operation") {
       const observed = await settledOperation(peer, nodeId, plan.applied.operation);
       if (observed !== undefined) plan.applied.operation = observed;
+    } else {
+      Object.assign(plan.applied, await settledObservation(peer, nodeId, verb, before, plan.applied));
     }
 
     return plan.applied;
@@ -757,6 +764,45 @@ async function settledOperation(
 ): Promise<string | undefined> {
   const wanted = requested === undefined ? undefined : INTENDED_STATE[requested.toLowerCase()];
   return settleTo(wanted, () => observedOperation(snapshotOf(peer, nodeId)));
+}
+
+/**
+ * What the device reports for this verb once it has had a chance to report it.
+ *
+ * Returns as soon as the reading MOVES, so a device that obeys is not held up: measured
+ * against Google's Matter Virtual Device the command answers in ~13ms and the new state
+ * lands within ~500ms. A device already sitting at the requested value has nothing to
+ * report, so it is not waited on at all — otherwise every no-op command would cost the
+ * full window.
+ *
+ * Where the device reports nothing for the verb, the plan's own `applied` stands. That is
+ * the request echoed back, which is what this exists to replace — but an absent reading
+ * is not evidence of a different one, and inventing a value would be worse than echoing.
+ */
+async function settledObservation(
+  peer: ClientNode,
+  nodeId: bigint,
+  verb: Verb,
+  before: DeviceStatePatch,
+  requested: DeviceStatePatch,
+): Promise<DeviceStatePatch> {
+  const read = () => observedFor(snapshotOf(peer, nodeId), verb);
+  const keys = Object.keys(read()) as (keyof DeviceStatePatch)[];
+  if (keys.length === 0) return {};
+
+  // Already there: the device has nothing to move to, so there is nothing to wait for.
+  if (keys.every(k => before[k] !== undefined && before[k] === requested[k])) return before;
+
+  const deadline = Date.now() + OPERATION_SETTLE_MS;
+  let seen = before;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, OPERATION_POLL_MS));
+    seen = read();
+    if (keys.some(k => seen[k] !== before[k])) return seen;
+  }
+  // Never moved. Reporting what it still says is the honest answer for a device that
+  // took the command and did nothing -- the same choice `settleTo` makes.
+  return seen;
 }
 
 /**
