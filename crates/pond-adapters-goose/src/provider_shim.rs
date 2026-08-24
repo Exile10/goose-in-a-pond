@@ -387,7 +387,25 @@ fn enforce_system(
     appendices: &[&Option<String>],
 ) -> Option<String> {
     let prefix = prefix.as_ref()?;
-    let giap_owned = incoming.starts_with(prefix.as_str());
+    // Recognise OUR prompt ignoring trailing whitespace.
+    //
+    // This was `incoming.starts_with(prefix)`, and it failed by a few
+    // characters in the one direction that matters. GIAP's static prefix ends
+    // `</output-quality>\n\n\n\n`; goose appends its own block after
+    // `</output-quality>\n\n`, so the two diverge inside GIAP's own trailing
+    // newlines. `starts_with` said false, the veto concluded the prompt was
+    // somebody else's and passed it through untouched — carrying the ~28 KB of
+    // "# Additional Instructions / ### Project Hints" this function exists to
+    // remove, into a household assistant's prompt.
+    //
+    // Measured on the Mac 2026-08-24: the prompts were byte-identical for 1,986
+    // characters of a 2,002-character prefix. The failure was silent, it was
+    // model-dependent (whichever prompt shape happened to end in a newline run),
+    // and `system_rebuilt = false` reported it identically to the healthy
+    // "already exactly right" case — which is why it survived so long and why
+    // the provenance trace below now distinguishes the two.
+    let anchor = prefix.trim_end();
+    let giap_owned = !anchor.is_empty() && incoming.starts_with(anchor);
     let goose_default = incoming.contains(GOOSE_DEFAULT_MARKER);
     if !giap_owned && !goose_default {
         return None;
@@ -779,6 +797,56 @@ impl Provider for GiapProviderShim {
                 session_scoped = session.is_some(),
                 "provider payload size"
             );
+            // WHY the veto did or did not fire, which the size alone cannot say.
+            //
+            // `system_rebuilt = false` is two different states wearing one flag:
+            // "the incoming prompt was already exactly GIAP's" and "GIAP did not
+            // recognise it, so it was passed through untouched". The second is a
+            // silent hole in the ownership guarantee, and telling them apart
+            // needed the prefix and the incoming head side by side — which is
+            // what cost an evening when a model's prompt turned out to be 28.5 KB
+            // larger than GIAP builds and nothing logged said whose it was.
+            let prefix_snapshot = self
+                .controls
+                .system_prefix
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            tracing::trace!(
+                incoming_chars = system.len(),
+                final_chars = final_system.len(),
+                giap_prefix_chars = prefix_snapshot.as_ref().map(String::len),
+                starts_with_giap_prefix = prefix_snapshot
+                    .as_deref()
+                    .map(|p| system.starts_with(p)),
+                // `?` not `%`: these are multi-line prompts, and a raw newline
+                // ends the log line mid-field — which is how the first capture
+                // of this came back with the one value that mattered missing.
+                incoming_head = ?system.chars().take(160).collect::<String>(),
+                giap_prefix_head = ?prefix_snapshot
+                    .as_deref()
+                    .map(|p| p.chars().take(160).collect::<String>())
+                    .unwrap_or_default(),
+                first_divergence = ?prefix_snapshot.as_deref().map(|p| {
+                    p.chars()
+                        .zip(system.chars())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(p.chars().count())
+                }),
+                // The window either side of the divergence, which is what says
+                // whether goose APPENDED to GIAP's prompt (harmless, and what
+                // `starts_with` assumes) or INSERTED into it (fatal to the
+                // check, and invisible without this).
+                prefix_at_divergence = ?prefix_snapshot.as_deref().map(|p| {
+                    let d = p.chars().zip(system.chars()).position(|(a, b)| a != b).unwrap_or(0);
+                    p.chars().skip(d.saturating_sub(60)).take(140).collect::<String>()
+                }),
+                incoming_at_divergence = ?prefix_snapshot.as_deref().map(|p| {
+                    let d = p.chars().zip(system.chars()).position(|(a, b)| a != b).unwrap_or(0);
+                    system.chars().skip(d.saturating_sub(60)).take(140).collect::<String>()
+                }),
+                "provider system prompt provenance"
+            );
         }
 
         let result = self
@@ -839,6 +907,53 @@ impl Provider for GiapProviderShim {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The veto declining by four newlines.
+    ///
+    /// GIAP's static prefix ends `</output-quality>\n\n\n\n`. Goose appends
+    /// its own "# Additional Instructions / ### Project Hints" block after
+    /// `</output-quality>\n\n`, so the two diverge INSIDE GIAP's own trailing
+    /// whitespace -- 1,986 characters into a 2,002-character prefix, measured on
+    /// the Mac 2026-08-24.
+    ///
+    /// `starts_with` therefore said "not ours", the veto passed the prompt
+    /// through untouched, and ~28 KB of goose's developer-agent hints reached a
+    /// household assistant. It was silent, it was model-dependent -- only prompt
+    /// shapes ending in a newline run were affected -- and `system_rebuilt =
+    /// false` reported it exactly like the healthy "already correct" case.
+    #[test]
+    fn goose_extras_are_vetoed_even_when_our_prefix_ends_in_blank_lines() {
+        let prefix = "<identity>\nYou are Goose.\n</output-quality>\n\n\n\n".to_string();
+        let incoming = "<identity>\nYou are Goose.\n</output-quality>\n\n\
+# Additional Instructions:\n\n### Project Hints\nhints here";
+
+        let out = enforce_system(incoming, &Some(prefix.clone()), &[]);
+
+        assert_eq!(
+            out.as_deref(),
+            Some(prefix.as_str()),
+            "goose's appended block must be vetoed, not passed through"
+        );
+    }
+
+    /// The healthy case must keep answering `None`, or every turn pays an
+    /// allocation swap to rewrite a prompt that was already right.
+    #[test]
+    fn an_already_correct_prompt_is_still_left_alone() {
+        let prefix = "<identity>\nYou are Goose.\n".to_string();
+        assert_eq!(enforce_system(&prefix, &Some(prefix.clone()), &[]), None);
+    }
+
+    /// Somebody else's prompt is still not ours to rewrite. Trimming the anchor
+    /// must not widen recognition to prompts that share no prefix at all.
+    #[test]
+    fn a_foreign_prompt_is_still_passed_through() {
+        let prefix = "<identity>\nYou are Goose.\n\n\n".to_string();
+        assert_eq!(
+            enforce_system("Something else entirely.", &Some(prefix), &[]),
+            None
+        );
+    }
 
     const PREFIX: &str = "<identity>\nYou are Goose, a home assistant.\n</identity>";
 
