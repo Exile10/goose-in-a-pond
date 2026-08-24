@@ -320,6 +320,86 @@ Worth noting for later: now that skipping is free, `read_gguf_head` in `pond-api
 `parse_gguf_file` and get templates during the catalogue sweep for ~40 ms per model, rather
 than the 1 MB slice that cannot reach them.
 
+
+### Landed 2026-08-24: the probe reaches the PROMPT side (Mac only)
+
+Steps 3-5 of the order of work below put `ModelProbe` into the ENGINE's
+settings. Step 6 -- a second family -- then found what that left open: the
+probe was a private helper on `LocalInferenceLlmAdapter`, consulted once at
+model-registration time, and its answer went into goose's `ModelSettings` and
+nowhere else. The prompt side could not reach it.
+
+`GooseAdapter::thinking_section_applies` resolved `thinking_mode = "auto"`
+through `ModelCapabilities::from_model_name`, which knows `gemma-4`, `qwen3`,
+`qwq` and `deepseek-r1`. For any other reasoning model the two layers
+disagreed:
+
+| layer | source | Nemotron |
+|---|---|---|
+| engine `enable_thinking` | the template (gated `<think>`) | **true** |
+| prompt `<thinking>` section | the filename | **false** |
+
+A model switched into reasoning mode and given no prompt section telling it
+what to do with it produced an empty first turn, was re-engaged with
+`EMPTY_TURN_STEER`, and fabricated a weather report rather than calling the
+weather tool. `5b04a197` pins the gap; this closes it.
+
+**Why the filename was there, and what the replacement had to preserve.** The
+doc comment on `thinking_section_applies` was right about its reason: the
+`model_capabilities` cache is refreshed inside the provider-SWAP branch of
+`ensure_provider_current`, which runs LATER in the turn that builds the prompt,
+so on turn 1 it still held `ModelCapabilities::default()`. Turn 1 rendered a
+prompt without the section and turn 2 rendered one with it -- 78 characters at
+the top of the static prefix, which moved `prefix_hash` and cost every session
+a full re-prefill on its second turn (3.7 s on the Orin). Any replacement had
+to be synchronous, cheap, and identical on turn 1 and turn 2.
+
+Reading the file satisfies all three. `probe_cached`
+(`pond-core/src/models/domain/model_probe.rs`) memoises on
+`(path, mtime, len)`: ~40 ms once per model per process, a hashmap lookup
+thereafter, and a pure function of bytes that are not changing mid-session.
+`model_traits` (`pond-adapters-goose`) resolves a settings model name to its
+GGUF through the existing `resolve_gguf_filename` and answers three questions
+-- does it reason, what marker does its template carry, what was it trained
+for. HTTP providers keep the name heuristic, which is the right answer there
+rather than a concession: for Ollama the name genuinely is all there is.
+
+The capability CACHE is now overridden from the same source, so the cache and
+the prompt agree by construction rather than by both guessing the same way.
+
+Read off the real files through the new resolver:
+
+| model | marker | trained context |
+|---|---|---|
+| gemma-4-E2B-it-Q4_K_M | `<\|think\|>` | 131,072 |
+| NVIDIA-Nemotron3-Nano-4B-Q4_K_M | `<think>` | 1,048,576 |
+| DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M | `<think>` | 131,072 |
+| Nanbeige_Nanbeige4.2-3B-Q4_K_M | `<think>` | 262,144 |
+
+The name heuristic answered "no reasoning, 4096 tokens" for Nemotron.
+
+**A correction worth recording, because it nearly became a bug.** `ModelProbe`
+returns `<|think|>` for Gemma 4, and the obvious next move -- feed the probe's
+marker to `ThoughtFilter` so each family's tag is stripped -- is WRONG. Checked
+against the file rather than assumed: `<|think|>` is a vocabulary token that
+Gemma's template emits at the top of the first system turn to put the model
+INTO reasoning mode (`{%- if enable_thinking ... -%}{{- '<|think|>' -}}`). It is
+a prompt-side SWITCH. What Gemma then emits is `<|channel>thought ... <channel|>`,
+which `ThoughtFilter` already strips. Nemotron, Nanbeige and DeepSeek use
+`<think>` as a genuine OUTPUT tag, which `ThoughtFilter` also already covers.
+So the probe's marker answers "how does this template express reasoning" and
+not "what should the filter strip"; wiring it to the filter would have told the
+filter to hunt for Gemma's input switch in Gemma's output. It is logged for
+diagnosis and deliberately not plumbed.
+
+**Measurement instrument.** `scripts/model-matrix.sh` drives several models
+through the same three turns in isolated scratch ponds (one GGUF HARD-LINKED
+in, never symlinked) and reports TTFT cold, TTFT on the reuse turn, prompt
+tokens, prefill, **reengagements** and **whether a tool was actually called**.
+The last two are the columns that matter: a capability mismatch presents as
+slowness, and a model that answers a weather question from imagination looks
+identical to one that answered it correctly unless you check.
+
 ## 5. Suggested order of work
 
 1. **Capture the failing error string** (`RUST_LOG` run, one prompt). Everything about E4B is

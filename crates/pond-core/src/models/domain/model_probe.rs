@@ -155,6 +155,63 @@ impl ModelProbe {
     }
 }
 
+/// Read a probe from a GGUF on disk, remembering the answer.
+///
+/// # Why this is memoised rather than simply called
+///
+/// The prompt side asks this question on EVERY turn, from a synchronous block,
+/// and the answer feeds `PromptState` -- so it lands inside the static prefix
+/// that the engine's KV prompt-session cache keys on. Two properties follow,
+/// and both are load-bearing:
+///
+/// - **Cheap.** [`parse_gguf_file`] steps over the token array rather than
+///   reading it, so a template 15 MB in costs a few hundred kilobytes and about
+///   40 ms. That is fine once and not fine every turn.
+/// - **Stable.** The answer must be identical on turn 1 and turn 2. This is the
+///   exact failure `thinking_section_applies` was written around: a capability
+///   cache that filled in mid-session rendered a prompt without the `<thinking>`
+///   section on turn 1 and with it on turn 2, moved `prefix_hash`, and cost
+///   every session a full re-prefill on its second turn -- 3.7 s on the Orin,
+///   for the turn the cache exists to make nearly free.
+///
+/// Keying on `(path, mtime, len)` rather than path alone means a model file
+/// replaced in place is re-read rather than answered from a stale entry. A
+/// `None` is cached too: a file that cannot be parsed will not start parsing
+/// because it was asked twice, and re-walking it every turn is the cost this
+/// exists to avoid.
+pub fn probe_cached(path: &std::path::Path) -> Option<ModelProbe> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    /// `(path, mtime-as-nanos, len)`. `mtime` is `None` when the filesystem
+    /// would not say, which simply makes the key coarser -- never wrong, since
+    /// `len` still moves when the file does.
+    type Key = (std::path::PathBuf, Option<u128>, u64);
+
+    static CACHE: OnceLock<Mutex<HashMap<Key, Option<ModelProbe>>>> = OnceLock::new();
+
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos());
+    let key: Key = (path.to_path_buf(), mtime, meta.len());
+
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = cache.lock() {
+        if let Some(hit) = map.get(&key) {
+            return hit.clone();
+        }
+    }
+
+    let probe = super::gguf::parse_gguf_file(path).map(|info| ModelProbe::from_gguf(&info));
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, probe.clone());
+    }
+    probe
+}
+
 /// Does `ident` appear as a whole word inside a Jinja control block?
 ///
 /// The scan is over `{% ... %}` only. Text outside a control block is what the

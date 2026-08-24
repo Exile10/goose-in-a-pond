@@ -1671,31 +1671,46 @@ impl GooseAdapter {
     /// Voice mode always says no: reasoning tokens waste TTS time and leak as
     /// spoken text if any filter layer misses them.
     ///
-    /// In `"auto"` the answer comes from the model NAME, deliberately, and not
-    /// from the `model_capabilities` cache. That cache is only refreshed inside
-    /// the provider-SWAP branch of `ensure_provider_current`, which runs LATER
-    /// in the same turn that builds the prompt. On the first turn of a process
-    /// it therefore still holds `ModelCapabilities::default()`, whose `thinking`
-    /// is false — so turn 1 rendered a prompt without the section and turn 2
-    /// rendered one with it, 78 characters appearing at the top of the static
-    /// prefix. That moved `prefix_hash`, and with it the engine's KV
-    /// prompt-session prefix, so every session paid one full re-prefill on its
-    /// second turn: 3.7 s on the Orin, for the turn the cache exists to make
-    /// nearly free. `from_model_name` is pure and cheap, and agrees with the
-    /// cache the moment the cache is right.
-    fn thinking_section_applies(mode: &str, model: &str, voice: bool) -> bool {
+    /// In `"auto"` the answer comes from the model's own FILE — its embedded
+    /// chat template — and not from the `model_capabilities` cache. That cache
+    /// is only refreshed inside the provider-SWAP branch of
+    /// `ensure_provider_current`, which runs LATER in the same turn that builds
+    /// the prompt. On the first turn of a process it therefore still holds
+    /// `ModelCapabilities::default()`, whose `thinking` is false — so turn 1
+    /// rendered a prompt without the section and turn 2 rendered one with it, 78
+    /// characters appearing at the top of the static prefix. That moved
+    /// `prefix_hash`, and with it the engine's KV prompt-session prefix, so every
+    /// session paid one full re-prefill on its second turn: 3.7 s on the Orin,
+    /// for the turn the cache exists to make nearly free.
+    ///
+    /// The template read has the same three properties that made the name
+    /// heuristic safe here — synchronous, cheap, and identical on turn 1 and
+    /// turn 2 — because `probe_cached` memoises on `(path, mtime, len)`. What it
+    /// does not share is the name heuristic's blind spot. That heuristic knows
+    /// `gemma-4`, `qwen3`, `qwq` and `deepseek-r1`; for any other reasoning
+    /// model it answered false while the ENGINE, which reads the template
+    /// through `ModelProbe`, set `enable_thinking = true`. Nemotron was switched
+    /// into reasoning mode and given no prompt section telling it what to do
+    /// with it: measured 2026-08-24, it produced an empty first turn, was
+    /// re-engaged with `EMPTY_TURN_STEER`, and fabricated a weather report
+    /// instead of calling the weather tool.
+    ///
+    /// The name heuristic remains the answer for HTTP providers, where there is
+    /// no file and the name genuinely is all there is.
+    fn thinking_section_applies(
+        mode: &str,
+        provider: &str,
+        model: &str,
+        data_dir: Option<&std::path::Path>,
+        voice: bool,
+    ) -> bool {
         if voice {
             return false;
         }
         match mode {
             "on" => true,
             "off" => false,
-            _ => {
-                pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
-                    model,
-                )
-                .thinking
-            }
+            _ => crate::model_traits::model_reasons(provider, model, data_dir),
         }
     }
 
@@ -2242,13 +2257,41 @@ impl GooseAdapter {
             // fallback resolve the model GIAP is actually serving.
             std::env::set_var("GOOSE_MODEL", &settings.chat_model);
 
-            // Update model capabilities from the new model name
+            // Update model capabilities for the new model. The name heuristic
+            // supplies the axes nothing else can answer; the three that CAN be
+            // read are then overridden from evidence, because this cache is
+            // what other layers ask and it must not contradict what the prompt
+            // was built from.
+            //
+            // `thinking` and `context_window_tokens` come from the model's own
+            // chat template and metadata for a local GGUF, the same source
+            // `thinking_section_applies` uses — so the cache and the prompt
+            // agree by construction rather than by both happening to guess the
+            // same way. They did not: for Nemotron the name heuristic said no
+            // reasoning and 4096 tokens, while the file says gated `<think>`
+            // and 1,048,576.
             let mut caps =
                 pond_core::models::domain::model_capabilities::ModelCapabilities::from_model_name(
                     &settings.chat_model,
                 );
             caps.vision =
                 Self::model_supports_vision(&settings.chat_provider, &settings.chat_model);
+            caps.thinking = crate::model_traits::model_reasons(
+                &settings.chat_provider,
+                &settings.chat_model,
+                self.data_dir.as_deref(),
+            );
+            if let Some(trained) = crate::model_traits::trained_context_window(
+                &settings.chat_provider,
+                &settings.chat_model,
+                self.data_dir.as_deref(),
+            ) {
+                // What the WEIGHTS were trained for, which is an upper bound and
+                // not an allocation. `ContextGovernor` ranks a registry pin and
+                // the engine's memory cap above this; it exists to stop the
+                // 4096 default from being mistaken for a real answer.
+                caps.context_window_tokens = trained;
+            }
             tracing::debug!(
                 "[model-switch] capabilities: thinking={}, vision={}, context={}k",
                 caps.thinking,
@@ -3247,8 +3290,13 @@ impl GooseAdapter {
         // engine-level `enable_thinking` request-param (B4). Previously only the
         // prompt knew, so the engine kept its registry default of `true` and the
         // ThoughtFilter had to mop up the leakage.
-        let thinking_enabled =
-            Self::thinking_section_applies(&settings.thinking_mode, &settings.chat_model, is_voice);
+        let thinking_enabled = Self::thinking_section_applies(
+            &settings.thinking_mode,
+            &settings.chat_provider,
+            &settings.chat_model,
+            self.data_dir.as_deref(),
+            is_voice,
+        );
 
         // The turn's budget profile, built once from the resolution
         // `apply_goose_env_knobs` cached at the top of this function.
@@ -5305,7 +5353,7 @@ fn truncate_tool_response_text(
 ///    deterministic (lexicographically first) so repeated runs agree;
 /// 4. failing all that, the naive `{name}.gguf`, so the caller's
 ///    file-not-found warning still fires.
-fn resolve_gguf_filename(model_name: &str, gguf_dir: &std::path::Path) -> String {
+pub(crate) fn resolve_gguf_filename(model_name: &str, gguf_dir: &std::path::Path) -> String {
     if model_name.ends_with(".gguf") {
         return model_name.to_string();
     }
@@ -5732,20 +5780,43 @@ mod tests {
     // ── thinking section stability ────────────────────────────────────────
 
     /// The regression that cost a full re-prefill on every session's second
-    /// turn: in "auto", turn 1 and turn 2 must agree, which they only do if the
-    /// answer comes from the model name rather than a cache filled in later.
+    /// turn: in "auto", turn 1 and turn 2 must agree. They do because the
+    /// answer is a pure function of bytes that are not changing mid-session --
+    /// a memoised read of the model's own chat template -- rather than a cache
+    /// that fills in later.
+    ///
+    /// Asserted here for an HTTP provider, where there is no file and the name
+    /// heuristic answers. The local-GGUF path is exercised against real files
+    /// in `model_traits`, and its stability comes from `probe_cached`.
     #[test]
-    fn auto_thinking_is_decided_by_the_model_name_alone() {
+    fn auto_thinking_is_decided_without_a_cache_that_fills_in_later() {
         assert!(GooseAdapter::thinking_section_applies(
             "auto",
+            "ollama",
             "gemma-4-E2B-it",
+            None,
             false
         ));
         assert!(!GooseAdapter::thinking_section_applies(
             "auto",
+            "ollama",
             "llama-3.2-3b",
+            None,
             false
         ));
+    }
+
+    /// Two calls must agree, which is the property the KV prefix depends on.
+    /// A cheap direct check: the same inputs asked twice, as turn 1 and turn 2
+    /// would ask them.
+    #[test]
+    fn auto_thinking_gives_the_same_answer_twice() {
+        for model in ["gemma-4-E2B-it", "llama-3.2-3b", "NVIDIA-Nemotron3-Nano-4B"] {
+            let first = GooseAdapter::thinking_section_applies("auto", "local", model, None, false);
+            let second =
+                GooseAdapter::thinking_section_applies("auto", "local", model, None, false);
+            assert_eq!(first, second, "{model} answered differently on turn 2");
+        }
     }
 
     // ── PAI-4 P5: which reason a provider swap records ────────────────────
@@ -5796,17 +5867,27 @@ mod tests {
     fn explicit_thinking_modes_ignore_the_model_and_voice_always_wins() {
         assert!(GooseAdapter::thinking_section_applies(
             "on",
+            "ollama",
             "llama-3.2-3b",
+            None,
             false
         ));
         assert!(!GooseAdapter::thinking_section_applies(
             "off",
+            "ollama",
             "gemma-4-E2B-it",
+            None,
             false
         ));
         for mode in ["on", "off", "auto"] {
             assert!(
-                !GooseAdapter::thinking_section_applies(mode, "gemma-4-E2B-it", true),
+                !GooseAdapter::thinking_section_applies(
+                    mode,
+                    "ollama",
+                    "gemma-4-E2B-it",
+                    None,
+                    true
+                ),
                 "voice mode must suppress <thinking> regardless of mode ({mode})"
             );
         }

@@ -7,6 +7,7 @@ pub mod goose_agent;
 #[cfg(test)]
 mod goose_nudges;
 pub mod logging;
+pub mod model_traits;
 pub mod orchestrator;
 pub mod provider_adapter;
 pub mod provider_shim;
