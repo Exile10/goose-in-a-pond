@@ -5,6 +5,10 @@ import {
   celsiusToSetpoint,
   fanModeFromName,
   hueToMatter,
+  kelvinToMireds,
+  matterToHue,
+  matterToSaturation,
+  miredsToKelvin,
   planControl,
   positionOpenToLift100ths,
   saturationToMatter,
@@ -12,7 +16,15 @@ import {
   FAN_MODE_ON,
 } from "../src/mapping/control.js";
 import { OpError } from "../src/protocol.js";
-import { describedNode, endpoint, fanNode, lightNode, node } from "./fixtures.js";
+import {
+  describedNode,
+  endpoint,
+  extendedColorLightNode,
+  fanNode,
+  lightNode,
+  node,
+  tunableWhiteNode,
+} from "./fixtures.js";
 
 describe("unit conversions", () => {
   it("maps brightness onto Matter's 0-254 level scale", () => {
@@ -21,6 +33,42 @@ describe("unit conversions", () => {
     expect(brightnessToLevel(100)).toBe(254);
     // Over-range input is clamped rather than wrapping into a dim bulb.
     expect(brightnessToLevel(200)).toBe(254);
+  });
+
+  it("maps kelvin onto mireds, inverting the order", () => {
+    // Mireds are reciprocal megakelvin, so the mapping is its own inverse and hotter is
+    // SMALLER. A conversion that preserved order would put warm white where cool goes.
+    expect(kelvinToMireds(2700)).toBe(370);
+    expect(kelvinToMireds(6500)).toBe(154);
+    expect(miredsToKelvin(370)).toBe(2703);
+    expect(miredsToKelvin(154)).toBe(6494);
+
+    // Clamped to the cluster's own field range, and zero is not a colour: the spec's
+    // defaults include 0 mireds, which would divide to infinity.
+    expect(kelvinToMireds(0)).toBe(0xfeff);
+    expect(kelvinToMireds(-1)).toBe(0xfeff);
+    expect(miredsToKelvin(0)).toBe(0);
+  });
+
+  it("reads a hue back as one that would put the device where it is", () => {
+    // NOT numeric equality, and the difference is the point. ColorControl quantises 360
+    // degrees onto 0-254, so a step is ~1.4 degrees and 90 comes back as 91 -- there is
+    // no conversion that avoids that. What the doc actually promises is that a value
+    // read here would put the device back where it is, and THAT is exact: writing the
+    // read-back lands on the same raw value.
+    for (const degrees of [0, 45, 90, 180, 300, 359]) {
+      const raw = hueToMatter(degrees);
+      expect(hueToMatter(matterToHue(raw))).toBe(raw);
+      // And it is never off by more than a step, so a reading is never misleading.
+      expect(Math.abs(matterToHue(raw) - degrees)).toBeLessThanOrEqual(2);
+    }
+  });
+
+  it("reads saturation back exactly", () => {
+    // 0-100 onto 0-254 and back is exact at every whole percent, unlike hue.
+    for (const pct of [0, 1, 50, 99, 100]) {
+      expect(matterToSaturation(saturationToMatter(pct))).toBe(pct);
+    }
   });
 
   it("maps Celsius onto hundredths of a degree", () => {
@@ -192,6 +240,44 @@ describe("control planning", () => {
       expect.unreachable("turbo is not a fan mode");
     } catch (error) {
       expect((error as OpError).message).toContain("off, low, medium, high, on, auto or smart");
+    }
+  });
+});
+
+describe("colour temperature control", () => {
+  it("sends the device mireds for the kelvin it was asked for", () => {
+    const plan = planControl(extendedColorLightNode(), "matter-51", "color_temp", 2700);
+
+    expect(plan.actions).toEqual([
+      {
+        kind: "command",
+        endpoint: 1,
+        cluster: "colorControl",
+        command: "moveToColorTemperature",
+        payload: {
+          colorTemperatureMireds: 370,
+          transitionTime: 0,
+          optionsMask: {},
+          optionsOverride: {},
+        },
+      },
+    ]);
+  });
+
+  it("reports the kelvin the device will sit at, not the one requested", () => {
+    // The round trip through whole mireds is lossy. Echoing 2700 back would overstate
+    // the precision -- the device is actually at 2703 -- and `applied` exists precisely
+    // so the answer is what happened rather than what was asked.
+    const plan = planControl(extendedColorLightNode(), "matter-51", "color_temp", 2700);
+
+    expect(plan.applied).toEqual({ color_temp: 2703 });
+  });
+
+  it("refuses a colour temperature that is not a positive number", () => {
+    for (const bad of ["warm", 0, -100, null]) {
+      expect(() => planControl(tunableWhiteNode(), "matter-52", "color_temp", bad)).toThrow(
+        OpError,
+      );
     }
   });
 });

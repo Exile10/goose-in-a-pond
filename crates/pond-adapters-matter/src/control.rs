@@ -157,6 +157,10 @@ impl DeviceControlPort for MatterDeviceControl {
         .await
     }
 
+    async fn set_color_temp(&self, device_id: &str, kelvin: u32) -> Result<DeviceControlOutcome> {
+        self.control(device_id, "color_temp", json!(kelvin)).await
+    }
+
     async fn set_fan_speed(&self, device_id: &str, percent: u8) -> Result<DeviceControlOutcome> {
         self.control(device_id, "fan_speed", json!(percent.min(100)))
             .await

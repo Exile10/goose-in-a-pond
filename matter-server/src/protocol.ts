@@ -62,6 +62,8 @@ export interface DeviceStatePatch {
   operation?: string;
   brightness?: number;
   target_temp?: number;
+  /** Colour temperature in KELVIN, not the cluster's mireds. See the `color_temp` verb. */
+  color_temp?: number;
   locked?: boolean;
   hue?: number;
   saturation?: number;
@@ -137,6 +139,14 @@ export type Verb =
   | "target_temp"
   | "locked"
   | "color"
+  /**
+   * Colour temperature in kelvin — warm white to cool white.
+   *
+   * A separate verb from `color` because it is a separate control: 2700K white has
+   * no hue, so it cannot be asked for through hue and saturation at all. Offered
+   * only by a device whose `colorCapabilities` claims it.
+   */
+  | "color_temp"
   | "fan_speed"
   | "fan_mode"
   | "position"

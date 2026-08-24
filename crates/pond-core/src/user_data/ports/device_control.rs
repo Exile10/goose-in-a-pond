@@ -33,6 +33,12 @@ pub struct DeviceStatePatch {
     /// Colour saturation as a 0–100 percentage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub saturation: Option<u8>,
+    /// Colour temperature in KELVIN — warm white to cool white.
+    ///
+    /// Kelvin, not the cluster's mireds: kelvin is what a person says, and the
+    /// controller owns the conversion for the same reason it owns every other unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_temp: Option<u32>,
     /// Fan speed as a 0–100 percentage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fan_speed: Option<u8>,
@@ -250,6 +256,16 @@ pub trait DeviceControlPort: Send + Sync {
         _saturation_percent: u8,
     ) -> Result<DeviceControlOutcome> {
         anyhow::bail!("device '{device_id}' does not support colour control")
+    }
+
+    /// Set colour temperature in kelvin — warm white to cool white.
+    ///
+    /// Separate from [`Self::set_color`] because it is a separate control, not a second
+    /// way to reach the same one: 2700K white has no hue, so it cannot be asked for
+    /// through hue and saturation at all. A device offers one, the other, or both, and
+    /// `describe` says which.
+    async fn set_color_temp(&self, device_id: &str, _kelvin: u32) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' does not support colour temperature")
     }
 
     /// Set fan speed as a 0–100 percentage.

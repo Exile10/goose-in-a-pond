@@ -24,6 +24,7 @@ import type {
 } from "../protocol.js";
 import { deviceIdForNode } from "../protocol.js";
 import {
+  colorSupport,
   CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
   CLUSTER_FAN_CONTROL,
@@ -33,6 +34,7 @@ import {
   CLUSTER_WINDOW_COVERING,
   nodeToDevice,
 } from "./devices.js";
+import { miredsToKelvin } from "./control.js";
 import { declaredUnitOf, SENSORS } from "./sensors.js";
 import { applianceSetpoint, reachableRange, targetSetpoint } from "./thermostat.js";
 import { operationsOf, settingsOf } from "./settings.js";
@@ -100,6 +102,32 @@ export function doorStateWord(raw: unknown): string | undefined {
     return DOOR_STATE_NAMES.get(raw.toLowerCase().replace(/[\s_-]/g, ""));
   }
   return undefined;
+}
+
+/**
+ * The colour temperatures this device can actually reach, in kelvin.
+ *
+ * Mireds are reciprocal megakelvin, so the conversion inverts the bounds: the SMALLEST
+ * mired value is the HOTTEST colour. Getting that backwards yields a range whose
+ * minimum exceeds its maximum, which reads as a broken device rather than a broken
+ * conversion.
+ *
+ * Zero is not a temperature. The spec's default for `colorTempPhysicalMinMireds` is 0,
+ * which converts to infinite kelvin — so a device that has not stated a real bound gets
+ * no bound stated for it, and the capability stands without an invented range.
+ */
+function colorTemperatureSpec(node: NodeSnapshot): ValueSpec {
+  const coolestMireds = asNumber(attribute(node, CLUSTER_COLOR_CONTROL, "colorTempPhysicalMinMireds"));
+  const warmestMireds = asNumber(attribute(node, CLUSTER_COLOR_CONTROL, "colorTempPhysicalMaxMireds"));
+
+  const spec: ValueSpec = { kind: "number", unit: "K" };
+  if (warmestMireds !== undefined && warmestMireds > 0) {
+    spec.min = miredsToKelvin(warmestMireds);
+  }
+  if (coolestMireds !== undefined && coolestMireds > 0) {
+    spec.max = miredsToKelvin(coolestMireds);
+  }
+  return spec;
 }
 
 function asNumber(value: unknown): number | undefined {
@@ -229,7 +257,15 @@ function capabilitiesOf(node: NodeSnapshot): Capability[] {
     add("target_temp", temperatureSpec(node));
   }
   if (has(CLUSTER_DOOR_LOCK)) add("locked", { kind: "boolean" });
-  if (has(CLUSTER_COLOR_CONTROL)) add("color", { kind: "color" });
+  // Gated on what the device claims, not on the cluster being present. A tunable-white
+  // bulb has ColorControl with no hue, and offering it one is the failure this whole
+  // area exists to stop — the same reason `tilt` is offered only to a covering that
+  // reports a tilt position.
+  if (has(CLUSTER_COLOR_CONTROL)) {
+    const colour = colorSupport(node);
+    if (colour.hueSaturation) add("color", { kind: "color" });
+    if (colour.temperature) add("color_temp", colorTemperatureSpec(node));
+  }
   if (has(CLUSTER_WINDOW_COVERING)) add("position", { kind: "percent" });
   // The second axis, offered only by a covering that has it. A roller blind has no
   // slats to turn, and offering a control the device will reject is the failure this

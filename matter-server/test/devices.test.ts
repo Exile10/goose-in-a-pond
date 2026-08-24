@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
 
 import { deviceTypeFromDescriptor, nodeToDevice } from "../src/mapping/devices.js";
-import { describedNode, endpoint, fanNode, lightNode, named, node } from "./fixtures.js";
+import {
+  describedNode,
+  endpoint,
+  extendedColorLightNode,
+  fanNode,
+  lightNode,
+  named,
+  node,
+  tunableWhiteNode,
+} from "./fixtures.js";
 
 describe("device typing", () => {
   it("keeps a fan with no On/Off cluster powerable, and types it as a fan", () => {
@@ -126,5 +135,24 @@ describe("device typing", () => {
     ]);
     expect(nodeToDevice(washer).capabilities).not.toContain("temperature");
     expect(nodeToDevice(washer).capabilities).toContain("mode");
+  });
+});
+
+describe("colour in the short capability list", () => {
+  it("lists the colour controls the device claims", () => {
+    // Colour was missing from this list entirely while `describe` offered it, and the
+    // short list is what a model reads before deciding whether to look closer.
+    const caps = nodeToDevice(extendedColorLightNode()).capabilities;
+
+    expect(caps).toContain("color");
+    expect(caps).toContain("color_temp");
+  });
+
+  it("does not list a hue for a bulb that only does white", () => {
+    // Gated on the same claim `describe` reads, so the two cannot disagree.
+    const caps = nodeToDevice(tunableWhiteNode()).capabilities;
+
+    expect(caps).toContain("color_temp");
+    expect(caps).not.toContain("color");
   });
 });

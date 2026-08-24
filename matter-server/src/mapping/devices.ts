@@ -94,6 +94,49 @@ export function deviceTypeFromDescriptor(node: NodeSnapshot): string | undefined
   return undefined;
 }
 
+/** Local to this module: matter.js hands numbers over as numbers, or not at all. */
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Which colour controls the device says it has.
+ *
+ * `colorCapabilities` is a bitmap, and matter.js may hand it over decoded into named
+ * flags or as the raw number, so both are read — the same tolerance `fanModes` applies
+ * to `fanModeSequence`.
+ *
+ * Lives here rather than in `describe.ts` because both the short capability list and
+ * the description need it, and `describe.ts` already imports this module — the other
+ * direction would be a cycle.
+ *
+ * The default when the device says nothing is hue/saturation and NOT colour
+ * temperature. Presence of the cluster used to imply hue/saturation outright, which is
+ * wrong in a way that shows: a tunable-white bulb has ColorControl and no hue at all,
+ * and was told it accepted a hue it would reject. Assuming the other direction instead
+ * — claiming a temperature range on a plain colour bulb — would invent a control, and
+ * an invented one gets believed.
+ */
+export function colorSupport(node: NodeSnapshot): { hueSaturation: boolean; temperature: boolean } {
+  const raw = endpointWith(node, CLUSTER_COLOR_CONTROL)?.clusters[CLUSTER_COLOR_CONTROL]?.[
+    "colorCapabilities"
+  ];
+
+  const numeric = asNumber(raw);
+  if (numeric !== undefined) {
+    // Bit 0 HueSaturation, bit 4 ColorTemperature (Matter 1.4, ColorControl 5.2.2.9).
+    return { hueSaturation: (numeric & 0x01) !== 0, temperature: (numeric & 0x10) !== 0 };
+  }
+  if (typeof raw === "object" && raw !== null) {
+    const flags = raw as { hueSaturation?: unknown; colorTemperature?: unknown };
+    return {
+      hueSaturation: flags.hueSaturation === true,
+      temperature: flags.colorTemperature === true,
+    };
+  }
+  return { hueSaturation: true, temperature: false };
+}
+
 function capabilitiesOf(node: NodeSnapshot): string[] {
   const capabilities: string[] = [];
   const hasOnOff = hasCluster(node, CLUSTER_ON_OFF);
@@ -124,6 +167,17 @@ function capabilitiesOf(node: NodeSnapshot): string[] {
       "currentPositionTiltPercent100ths"
     ];
     if (tilting !== undefined) capabilities.push("tilt");
+  }
+
+  // Colour, absent from this list entirely until now: `describe` offered a colour bulb
+  // hue and saturation while `list_registered_devices` said "power, brightness", and the
+  // short list is what the model reads before deciding whether to look closer. Split the
+  // same way `describe` splits it, and gated on the same claim, so the two cannot
+  // disagree about what a tunable-white bulb can do.
+  if (hasCluster(node, CLUSTER_COLOR_CONTROL)) {
+    const colour = colorSupport(node);
+    if (colour.hueSaturation) capabilities.push("color");
+    if (colour.temperature) capabilities.push("color_temp");
   }
 
   // Appliance vocabulary, found the same structural way `settingsOf` finds it rather

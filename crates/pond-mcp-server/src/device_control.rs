@@ -58,6 +58,11 @@ pub struct SetDeviceStateParams {
     /// 0-100 percent.
     #[serde(default)]
     pub saturation: Option<u8>,
+    /// Colour temperature in kelvin — roughly 2000 (warm/amber) to 6500 (cool/daylight).
+    /// A device's own achievable range comes from describe_device; this is not the same
+    /// control as hue + saturation, and a white cannot be asked for as a hue.
+    #[serde(default)]
+    pub color_temp: Option<u32>,
     /// 0-100 percent.
     #[serde(default)]
     pub fan_speed: Option<u8>,
@@ -441,6 +446,7 @@ impl DeviceControlMcpServer {
             && p.locked.is_none()
             && p.hue.is_none()
             && p.saturation.is_none()
+            && p.color_temp.is_none()
             && p.fan_speed.is_none()
             && p.fan_mode.is_none()
             && p.setting.is_none()
@@ -451,7 +457,8 @@ impl DeviceControlMcpServer {
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "No change requested for '{device_id}'. Specify one of: power (on/off), \
                  brightness (0-100), target_temp (°C), locked (true/false), hue (0-360) + \
-                 saturation (0-100), fan_speed (0-100), fan_mode (off/low/medium/high/on/auto/\
+                 saturation (0-100), color_temp (kelvin, e.g. 2700 for warm white), \
+                 fan_speed (0-100), fan_mode (off/low/medium/high/on/auto/\
                  smart), setting + setting_value (appliance settings such as a wash \
                  cycle or spin speed — see describe_device), operation (start/stop/\
                  pause/resume), position (0-100 percent open), or tilt (0-100 percent \
@@ -542,6 +549,19 @@ impl DeviceControlMcpServer {
                 Err(e) => {
                     return Ok(guidance(format!(
                         "Couldn't set colour on '{device_id}': {e}"
+                    )))
+                }
+            }
+        }
+        // Its own action, not a variant of colour. A device may take one, both, or
+        // neither, and setting hue on a tunable-white bulb is a rejection rather than a
+        // near miss -- so the two are never substituted for one another here.
+        if let Some(kelvin) = p.color_temp {
+            match self.control.set_color_temp(device_id, kelvin).await {
+                Ok(_) => applied.push(format!("color_temp={kelvin}K")),
+                Err(e) => {
+                    return Ok(guidance(format!(
+                        "Couldn't set colour temperature on '{device_id}': {e}"
                     )))
                 }
             }
@@ -1342,6 +1362,55 @@ mod tests {
         });
 
         assert!(!rendered.contains("Reports"), "{rendered}");
+    }
+
+    /// The report this came from: asked what the Extended Color Light could do, GIAP
+    /// answered power, brightness and hue/saturation — for a device whose own Color mode
+    /// dropdown offered hue/saturation, XY and colour temperature. Temperature is the
+    /// one a person actually asks for, and it was missing from every layer.
+    #[test]
+    fn a_colour_temperature_range_reads_in_kelvin() {
+        let rendered = render_description(&DeviceDescription {
+            device_id: "matter-51".into(),
+            device_type: "light".into(),
+            capabilities: vec![
+                spec("power", ValueSpec::Boolean),
+                spec("color", ValueSpec::Color),
+                spec(
+                    "color_temp",
+                    ValueSpec::Number {
+                        min: Some(2000.0),
+                        max: Some(6536.0),
+                        step: None,
+                        unit: Some("K".into()),
+                        when: None,
+                    },
+                ),
+            ],
+            sensors: vec![],
+            vendor_clusters: vec![],
+            states: vec![],
+        });
+
+        assert!(
+            rendered.contains("color_temp — a number from 2000 to 6536 K"),
+            "{rendered}"
+        );
+        // Both colour controls, named separately: a white cannot be asked for as a hue,
+        // so collapsing them would lose the one the user wanted.
+        assert!(
+            rendered.contains("color — hue 0-360 with saturation 0-100"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn colour_temperature_is_a_thing_the_tool_accepts() {
+        let p: SetDeviceStateParams =
+            serde_json::from_str(r#"{"device_id":"lamp","color_temp":2700}"#).unwrap();
+        assert_eq!(p.color_temp, Some(2700));
+        // And it is not confused with the hue/saturation pair beside it.
+        assert!(p.hue.is_none() && p.saturation.is_none());
     }
 
     #[test]

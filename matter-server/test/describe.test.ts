@@ -7,10 +7,12 @@ import {
   describedNode,
   doorLockNode,
   endpoint,
+  extendedColorLightNode,
   fanNode,
   lightNode,
   named,
   node,
+  tunableWhiteNode,
 } from "./fixtures.js";
 
 /** The capability for a verb, or undefined if the device does not offer it. */
@@ -85,6 +87,49 @@ describe("device description", () => {
     // constraint is honest, a guessed one gets believed.
     const silent = describedNode(31, 0x0301, { thermostat: {} });
     expect(capability(silent, "target_temp")?.value).toEqual({ kind: "number", unit: "C" });
+  });
+
+  it("offers every colour control the device claims, not just hue", () => {
+    // The report this came from: asked what the Extended Color Light could do, GIAP
+    // answered power, brightness and hue/saturation -- for a device whose own Color mode
+    // dropdown offered hue/saturation, XY and colour temperature. Temperature was
+    // missing entirely, and it is the one a person actually asks for ("warmer").
+    const verbs = describeNode(extendedColorLightNode()).capabilities.map(c => c.verb);
+
+    expect(verbs).toContain("color");
+    expect(verbs).toContain("color_temp");
+  });
+
+  it("states the kelvin range the device says it can reach", () => {
+    // Mireds invert: the SMALLEST mired value is the HOTTEST colour, so 153..500 mireds
+    // is 2000..6536 K and not the other way round. Getting it backwards yields a range
+    // whose minimum exceeds its maximum, which reads as a broken device.
+    const temp = describeNode(extendedColorLightNode()).capabilities.find(
+      c => c.verb === "color_temp",
+    );
+
+    expect(temp?.value).toEqual({ kind: "number", unit: "K", min: 2000, max: 6536 });
+  });
+
+  it("does not offer a hue to a bulb that only does white", () => {
+    // A tunable-white bulb has ColorControl and no hue whatsoever. Offering one is a
+    // command the device rejects -- the same failure as offering tilt to a roller blind.
+    const verbs = describeNode(tunableWhiteNode()).capabilities.map(c => c.verb);
+
+    expect(verbs).toContain("color_temp");
+    expect(verbs).not.toContain("color");
+  });
+
+  it("invents no kelvin range when the device states none", () => {
+    // The spec's own default for colorTempPhysicalMinMireds is 0, which converts to
+    // infinite kelvin. The capability stands; the range does not get made up.
+    const silent = node(53, [
+      named("Bulb"),
+      endpoint(1, { colorControl: { colorCapabilities: 0x10 } }, [0x010c]),
+    ]);
+    const temp = describeNode(silent).capabilities.find(c => c.verb === "color_temp");
+
+    expect(temp?.value).toEqual({ kind: "number", unit: "K" });
   });
 
   it("describes only what the device has", () => {

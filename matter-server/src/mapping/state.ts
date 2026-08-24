@@ -27,11 +27,15 @@ import type { DeviceState, StateValue } from "../protocol.js";
 import { deviceIdForNode } from "../protocol.js";
 import {
   fanModeName,
+  matterToHue,
+  matterToSaturation,
+  miredsToKelvin,
   levelToBrightness,
   lift100thsToPositionOpen,
   setpointToCelsius,
 } from "./control.js";
 import {
+  CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
   CLUSTER_FAN_CONTROL,
   CLUSTER_LEVEL_CONTROL,
@@ -99,6 +103,29 @@ export function stateOf(node: NodeSnapshot): DeviceState {
   // Reported so it can be checked, never set. See `statesOf` in describe.ts.
   const pin = valueAt(node, CLUSTER_DOOR_LOCK, "requirePinForRemoteOperation");
   if (typeof pin === "boolean") add("pin_required", pin ? "required" : "not required");
+  // What colour it is, which had no answer at all before: `state` never touched
+  // ColorControl, so "what colour is the light?" could only be answered by changing it.
+  //
+  // Reported by the mode the device says it is IN, not by every attribute it holds. A
+  // bulb sitting at 2700K still has a stale hue in `currentHue` from whenever it was
+  // last set that way, and reporting both makes the reading contradict itself.
+  const colorMode = valueAt(node, CLUSTER_COLOR_CONTROL, "colorMode");
+  const inTemperatureMode =
+    colorMode === 2 || (typeof colorMode === "string" && /temperature|mireds/i.test(colorMode));
+
+  if (inTemperatureMode) {
+    const mireds = numberAt(node, CLUSTER_COLOR_CONTROL, "colorTemperatureMireds");
+    const kelvin = mireds === undefined ? 0 : miredsToKelvin(mireds);
+    if (kelvin > 0) add("color_temp", `${kelvin} K`);
+  } else {
+    const hue = numberAt(node, CLUSTER_COLOR_CONTROL, "currentHue");
+    const saturation = numberAt(node, CLUSTER_COLOR_CONTROL, "currentSaturation");
+    if (hue !== undefined && saturation !== undefined) {
+      // Back through the inverses of what `color` writes, so the numbers read here are
+      // the numbers that would put it here.
+      add("color", `hue ${matterToHue(hue)}, saturation ${matterToSaturation(saturation)}%`);
+    }
+  }
 
   const speed = numberAt(node, CLUSTER_FAN_CONTROL, "percentCurrent");
   if (speed !== undefined) add("fan_speed", `${speed}%`);

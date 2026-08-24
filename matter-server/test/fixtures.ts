@@ -88,6 +88,51 @@ export function bareLockNode(): NodeSnapshot {
   return node(45, [named("Deadbolt"), endpoint(1, { doorLock: { lockState: 1 } }, [0x000a])]);
 }
 
+/**
+ * Google's Virtual Extended Color Light: hue/saturation, XY and colour temperature, the
+ * three modes its Color mode dropdown offers. `colorCapabilities` bit 0 is
+ * HueSaturation, bit 3 Xy, bit 4 ColorTemperature.
+ */
+export function extendedColorLightNode(): NodeSnapshot {
+  return node(51, [
+    named("Virtual Extended Color Light"),
+    endpoint(1, {
+      onOff: { onOff: true },
+      levelControl: { currentLevel: 254 },
+      colorControl: {
+        colorCapabilities: 0x19,
+        colorMode: 0,
+        currentHue: 0,
+        currentSaturation: 0,
+        colorTemperatureMireds: 250,
+        colorTempPhysicalMinMireds: 153,
+        colorTempPhysicalMaxMireds: 500,
+      },
+    }, [0x010d]),
+  ]);
+}
+
+/**
+ * A tunable-white bulb: ColorControl with colour temperature and NO hue at all
+ * (`colorCapabilities` bit 4 only). Very common, and the reason colour is gated on what
+ * the device claims — offered a hue, this device rejects it.
+ */
+export function tunableWhiteNode(): NodeSnapshot {
+  return node(52, [
+    named("Reading Lamp"),
+    endpoint(1, {
+      onOff: { onOff: true },
+      colorControl: {
+        colorCapabilities: 0x10,
+        colorMode: 2,
+        colorTemperatureMireds: 370,
+        colorTempPhysicalMinMireds: 200,
+        colorTempPhysicalMaxMireds: 454,
+      },
+    }, [0x010c]),
+  ]);
+}
+
 /** A node that states its type the way every real one does: a Descriptor
  *  DeviceTypeList on the application endpoint. */
 export function describedNode(
