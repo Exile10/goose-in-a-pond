@@ -585,6 +585,15 @@ export function Chat() {
             setMessages((prev) => {
               const last = prev[prev.length - 1];
               if (!last || last.role !== "agent") return prev;
+              // A bubble already showing an error is finished. The error arm
+              // OVERWRITES `text` while this one APPENDS to it, so text arriving
+              // after an error ran straight onto the end of the error sentence --
+              // "…missing providerI could not produce a response". The server sends
+              // these as two separate frames and deliberately keeps streaming past an
+              // error, so the honest rendering is two messages, not one string.
+              if (last.error) {
+                return [...prev, { id: ++_msgId, role: "agent", text: visible, streaming: true }];
+              }
               return [...prev.slice(0, -1), { ...last, text: last.text + visible, status: undefined }];
             });
           }
