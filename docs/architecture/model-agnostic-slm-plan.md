@@ -506,6 +506,46 @@ and are never counted against it. The reasoning recorded above
 Turn 3 prefills in 148 ms, so the KV prompt-session cache is working exactly as
 designed. This is a cold-turn cost. It is also the first thing a user meets.
 
+
+### The tool-selection lever, measured 2026-08-24 (Mac, gemma-4-E2B)
+
+| | `tool_selection_mode = "all"` | `"relevant"` |
+|---|---|---|
+| tools offered | 61 | **17** |
+| turn-1 prompt | 7,837 tok | **2,644 tok** |
+| turn-1 TTFT | 33.9 s | **9.6 s** |
+| reuse-turn TTFT | 2.97 s | 2.82 s |
+| called the weather tool | yes | yes |
+
+3.5x on the cold turn and a 66% smaller prompt, with the tool still called. It
+does nothing for the reuse turn, which is the expected shape: the KV cache had
+already made that cheap, and what this buys is the turn the cache cannot help.
+
+**It needs the embedder, and it fails OPEN and QUIETLY.** `select_groups`
+returns `SelectionBasis::NoEmbedder` -> every tool when it has no scores, which
+is the right call — withholding tools on no evidence would be worse — but the
+consequence is that a pond whose embedder is unavailable silently runs at 61
+tools and ~7,800 prompt tokens forever, with one WARN at startup as the only
+sign.
+
+Two ways that bit during this very measurement, both worth knowing:
+
+1. **Wrong ONNX Runtime.** A pond's `lib/` can hold several. The harness picked
+   the first glob match — `libonnxruntime.1.22.0.dylib` ahead of `1.24.2` — and
+   the embedder refused it. Chat was unaffected, so three runs looked healthy
+   while `"relevant"` was silently measuring `"all"`. Fixed with `sort -V -r`.
+2. **A 30-second init timeout.** On a machine already loaded with hours of
+   inference, the embedder init simply ran out of time, and the same widening
+   followed. **This one matters far more on the Orin than on a Mac**: the device
+   is much slower, so the timeout that is occasional here may be routine there —
+   which would mean `"relevant"` never engages on the hardware it was measured
+   3.0x for. Worth confirming on-device before relying on the setting, and worth
+   asking whether 30 s is the right budget for a board that takes 40-90 minutes
+   to build.
+
+Read `reason="no_embedder"` on the `tool_selection_widened` trace line before
+believing any measurement of this setting.
+
 ## 5. Suggested order of work
 
 1. **Capture the failing error string** (`RUST_LOG` run, one prompt). Everything about E4B is

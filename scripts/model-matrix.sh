@@ -101,13 +101,24 @@ BIN="${BIN_OVERRIDE:-$REPO_ROOT/target/debug/pond-server}"
 
 # An ONNX Runtime already present on this machine, so each model does not
 # re-download one into its own throwaway data dir.
+# HIGHEST version, not the first the glob happens to name.
+#
+# A pond's lib/ can hold several. Taking the first match picked
+# libonnxruntime.1.22.0.dylib over 1.24.2 — lexicographic order — and the
+# EMBEDDER then failed to initialise with "ONNX Runtime may be
+# version-incompatible (need ORT 1.24.2)". Nothing about chat broke, so the
+# runs looked fine; what broke was `tool_selection_mode = "relevant"`, which
+# needs embeddings to score groups and correctly widens to every tool when it
+# cannot get them. Three measurements of "relevant" were really measurements of
+# "all", and the log said `reason="no_embedder"` the whole time.
 if [ -z "${ORT_DYLIB_PATH:-}" ]; then
-  for cand in \
-    "$HOME/Library/Application Support/goose-in-a-pond/lib/libonnxruntime."*.dylib \
-    "$HOME/.local/share/goose-in-a-pond/lib/libonnxruntime."*.so \
-    /opt/homebrew/lib/libonnxruntime.dylib \
-    /usr/local/lib/libonnxruntime.dylib \
-    /usr/lib/libonnxruntime.so; do
+  for cand in $(ls -1 \
+        "$HOME/Library/Application Support/goose-in-a-pond/lib/"libonnxruntime.*.dylib \
+        "$HOME/.local/share/goose-in-a-pond/lib/"libonnxruntime.*.so \
+        2>/dev/null | sort -V -r) \
+      /opt/homebrew/lib/libonnxruntime.dylib \
+      /usr/local/lib/libonnxruntime.dylib \
+      /usr/lib/libonnxruntime.so; do
     if [ -e "$cand" ]; then ORT_DYLIB_PATH="$cand"; export ORT_DYLIB_PATH; break; fi
   done
 fi
@@ -167,7 +178,7 @@ run_model() {
   # splitting, which turned the assignment into a command and failed every model
   # instantly with "No such file or directory".
   POND_DATA_DIR="$data_dir" POND_DEV_ALLOW_LOOPBACK=1 \
-    RUST_LOG="warn,giap::trace=info,pond_adapters_goose=debug,pond_adapters_local_inference=debug,goose_local_inference=debug" \
+    RUST_LOG="${MATRIX_RUST_LOG:-warn,giap::trace=info,pond_adapters_goose=debug,pond_adapters_local_inference=debug,goose_local_inference=debug}" \
     "$BIN" serve --port "$PORT" > "$log" 2>&1 &
   local pid=$!
 
