@@ -11,12 +11,14 @@ use crate::mesh::ports::peer_directory::{PeerDirectory, PeerDirectoryError};
 /// In-memory peer directory for testing.
 pub struct MockPeerDirectory {
     peers: Arc<RwLock<HashMap<PeerId, TrustScope>>>,
+    addresses: Arc<RwLock<HashMap<PeerId, String>>>,
 }
 
 impl MockPeerDirectory {
     pub fn new() -> Self {
         Self {
             peers: Arc::new(RwLock::new(HashMap::new())),
+            addresses: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -57,6 +59,25 @@ impl PeerDirectory for MockPeerDirectory {
 
     async fn trust_scope_of(&self, peer: PeerId) -> Result<Option<TrustScope>, PeerDirectoryError> {
         Ok(self.peers.read().await.get(&peer).copied())
+    }
+
+    async fn record_peer_address(
+        &self,
+        peer: PeerId,
+        address: String,
+    ) -> Result<(), PeerDirectoryError> {
+        self.addresses.write().await.insert(peer, address);
+        Ok(())
+    }
+
+    async fn known_addresses(&self) -> Result<Vec<(PeerId, String)>, PeerDirectoryError> {
+        Ok(self
+            .addresses
+            .read()
+            .await
+            .iter()
+            .map(|(peer, addr)| (*peer, addr.clone()))
+            .collect())
     }
 }
 

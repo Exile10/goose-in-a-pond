@@ -100,6 +100,38 @@ impl PeerDirectory for SqlitePeerDirectory {
                 .map_err(|e| PeerDirectoryError::General(e.to_string()))?;
         row.map(|(s,)| str_to_trust_scope(&s)).transpose()
     }
+
+    async fn record_peer_address(
+        &self,
+        peer: PeerId,
+        address: String,
+    ) -> Result<(), PeerDirectoryError> {
+        sqlx::query("UPDATE mesh_trusted_peers SET last_known_address = ? WHERE peer_id = ?")
+            .bind(address)
+            .bind(peer.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| PeerDirectoryError::General(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn known_addresses(&self) -> Result<Vec<(PeerId, String)>, PeerDirectoryError> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT peer_id, last_known_address FROM mesh_trusted_peers \
+             WHERE last_known_address IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| PeerDirectoryError::General(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|(id, addr)| {
+                id.parse::<PeerId>()
+                    .map(|peer| (peer, addr))
+                    .map_err(|e| PeerDirectoryError::General(e.to_string()))
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

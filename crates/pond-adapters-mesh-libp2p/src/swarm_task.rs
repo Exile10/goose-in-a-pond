@@ -6,11 +6,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use libp2p::core::multiaddr::Protocol;
 use libp2p::request_response::{self, OutboundRequestId};
-use libp2p::swarm::dial_opts::DialOpts;
+use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{gossipsub, identify, kad, noise, relay, tcp, yamux, Multiaddr, Swarm};
 use tokio::sync::{mpsc, oneshot};
@@ -87,6 +88,7 @@ pub fn spawn(config: Libp2pMeshTransportConfig) -> anyhow::Result<SwarmHandles> 
         pending_connect: HashMap::new(),
         pending_handshake: HashMap::new(),
         connected: HashMap::new(),
+        known_addresses: HashMap::new(),
         listen_addrs: Vec::new(),
     };
     let task = tokio::spawn(event_loop.run());
@@ -180,13 +182,28 @@ struct EventLoop {
     pending_handshake: HashMap<OutboundRequestId, Libp2pPeerId>,
     /// Peers whose handshake has been verified in either direction.
     connected: HashMap<Libp2pPeerId, DomainPeerId>,
+    /// The last address we were given for each peer we've ever been asked to
+    /// dial, so the background retry loop (`retry_disconnected_known_peers`)
+    /// has something to redial with — it never learns addresses on its own.
+    /// In-memory only: a restart forgets these, same as `connected`.
+    known_addresses: HashMap<Libp2pPeerId, (DomainPeerId, Multiaddr)>,
     /// Every address we're confirmed listening on, including relay-circuit
     /// addresses once a reservation is accepted.
     listen_addrs: Vec<Multiaddr>,
 }
 
+/// How often the background loop checks for trusted-but-disconnected peers
+/// and redials them. Not configurable — this is a low-cost background
+/// safety net, not a latency-sensitive path.
+const RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
+
 impl EventLoop {
     async fn run(mut self) {
+        self.load_known_addresses().await;
+        let mut reconnect_tick = tokio::time::interval(RECONNECT_INTERVAL);
+        // The first tick fires immediately; nothing is disconnected yet at
+        // startup, so that tick is a harmless no-op rather than useful work.
+        reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => self.handle_swarm_event(event).await,
@@ -194,7 +211,68 @@ impl EventLoop {
                     Some(command) => self.handle_command(command).await,
                     None => return,
                 },
+                _ = reconnect_tick.tick() => self.retry_disconnected_known_peers().await,
             }
+        }
+    }
+
+    /// Seeds `known_addresses` from `PeerDirectory` at startup, so the
+    /// background reconnect loop can redial peers this Pond already trusted
+    /// before a restart — without this, `known_addresses` only ever gets
+    /// populated by a fresh `Command::Connect`, and a restart would silently
+    /// forget every peer until the user re-shared an invite.
+    async fn load_known_addresses(&mut self) {
+        let rows = match self.peer_directory.known_addresses().await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!("mesh: failed to load persisted peer addresses: {err}");
+                return;
+            }
+        };
+        for (peer, addr_str) in rows {
+            let Ok(libp2p_peer) = domain_peer_to_libp2p(peer) else {
+                continue;
+            };
+            let Ok(addr) = addr_str.parse::<Multiaddr>() else {
+                continue;
+            };
+            self.known_addresses.insert(libp2p_peer, (peer, addr));
+        }
+    }
+
+    /// Background half of the force-reconnect path: `Command::Connect`
+    /// handles a caller explicitly asking to (re)connect, but nothing was
+    /// watching for a peer that drops out from under an idle connection (the
+    /// far side restarts, a network blip, etc.) — the mesh would just stay
+    /// disconnected until something happened to call `connect()` again.
+    ///
+    /// Every trusted peer we have a last-known address for and are not
+    /// currently connected (or mid-dial) to gets a fresh dial attempt, same
+    /// as if the caller had retried by hand.
+    async fn retry_disconnected_known_peers(&mut self) {
+        let candidates: Vec<(Libp2pPeerId, DomainPeerId, Multiaddr)> = self
+            .known_addresses
+            .iter()
+            .filter(|(libp2p_peer, _)| {
+                !self.connected.contains_key(libp2p_peer)
+                    && !self.pending_connect.contains_key(libp2p_peer)
+            })
+            .map(|(libp2p_peer, (peer, addr))| (*libp2p_peer, *peer, addr.clone()))
+            .collect();
+
+        for (libp2p_peer, peer, addr) in candidates {
+            // Trust may have been revoked since the address was learned —
+            // don't keep hammering a peer that was removed from the circle.
+            if !Self::is_trusted(self.peer_directory.clone(), peer).await {
+                continue;
+            }
+            // Fire-and-forget: nobody is awaiting this attempt's outcome, so
+            // the reply goes to a receiver we immediately drop. `dial_peer`
+            // still needs a sender to satisfy `pending_connect`'s shape and
+            // to report the eventual handshake result through the normal
+            // `ConnectionEstablished`/`OutgoingConnectionError` handling.
+            let (reply, _ignored) = oneshot::channel();
+            self.dial_peer(libp2p_peer, peer, addr, reply);
         }
     }
 
@@ -220,28 +298,21 @@ impl EventLoop {
                         return;
                     }
                 };
-                self.swarm
-                    .behaviour_mut()
-                    .kad
-                    .add_address(&libp2p_peer, addr.clone());
-                // Default `PortUse::Reuse` is required for DCUtR hole-punching
-                // between two real, separately-NATed Ponds. Same-machine
-                // testing collides on that (EADDRINUSE), so
-                // POND_DEV_SAME_MACHINE_MESH=1 opts into a fresh port per
-                // dial instead — unset (production), this behaves exactly
-                // like a bare `swarm.dial(addr)`.
-                let mut opts = DialOpts::peer_id(libp2p_peer).addresses(vec![addr.clone()]);
-                if same_machine_dev_mesh_enabled(std::env::var("POND_DEV_SAME_MACHINE_MESH").ok().as_deref()) {
-                    opts = opts.allocate_new_port();
+                self.known_addresses
+                    .insert(libp2p_peer, (peer, addr.clone()));
+                // Best-effort: a peer this is dialed for is already trusted
+                // (routes.rs adds trust before ever calling `connect()`), so
+                // there's a row to update. If there somehow isn't (or the
+                // write fails), the retry loop just falls back to the
+                // in-memory copy above for the rest of this process's life.
+                if let Err(err) = self
+                    .peer_directory
+                    .record_peer_address(peer, addr.to_string())
+                    .await
+                {
+                    tracing::warn!("mesh: failed to persist last-known address for {peer}: {err}");
                 }
-                match self.swarm.dial(opts.build()) {
-                    Ok(()) => {
-                        self.pending_connect.insert(libp2p_peer, (peer, reply));
-                    }
-                    Err(err) => {
-                        let _ = reply.send(Err(MeshTransportError::Transport(err.to_string())));
-                    }
-                }
+                self.dial_peer(libp2p_peer, peer, addr, reply);
             }
             Command::Send { peer, frame, reply } => {
                 let libp2p_peer = match domain_peer_to_libp2p(peer) {
@@ -300,6 +371,71 @@ impl EventLoop {
                         let _ = reply.send(Err(MeshTransportError::Transport(err.to_string())));
                     }
                 }
+            }
+        }
+    }
+
+    /// Shared by `Command::Connect` (a caller explicitly asking to connect)
+    /// and `retry_disconnected_known_peers` (the background reconnect loop) —
+    /// same dial, the only difference is who's waiting on `reply`.
+    fn dial_peer(
+        &mut self,
+        libp2p_peer: Libp2pPeerId,
+        peer: DomainPeerId,
+        addr: Multiaddr,
+        reply: oneshot::Sender<Result<(), MeshTransportError>>,
+    ) {
+        self.swarm
+            .behaviour_mut()
+            .kad
+            .add_address(&libp2p_peer, addr.clone());
+        // Default `PortUse::Reuse` is required for DCUtR hole-punching
+        // between two real, separately-NATed Ponds. Same-machine
+        // testing collides on that (EADDRINUSE), so
+        // POND_DEV_SAME_MACHINE_MESH=1 opts into a fresh port per
+        // dial instead — unset (production), this behaves exactly
+        // like a bare `swarm.dial(addr)`.
+        //
+        // `condition(Always)` overrides the default
+        // `DisconnectedAndNotDialing`: a handshake rejection (peer not
+        // yet in the other side's trust circle) deliberately leaves
+        // the underlying connection open — see the comment at the
+        // `HandshakeRejected` send below — so swarm still considers
+        // the peer "connected" even though `self.connected` never got
+        // populated. Without `Always`, retrying `connect()` after
+        // fixing trust (e.g. adding it on both sides) hits
+        // `DialError::DialPeerConditionFalse` and never redials at
+        // all. This is the retry/force-reconnect path for that: every
+        // dial attempt — explicit or from the background retry loop —
+        // always attempts a fresh dial.
+        let mut opts = DialOpts::peer_id(libp2p_peer)
+            .condition(PeerCondition::Always)
+            .addresses(vec![addr.clone()]);
+        if same_machine_dev_mesh_enabled(std::env::var("POND_DEV_SAME_MACHINE_MESH").ok().as_deref())
+        {
+            opts = opts.allocate_new_port();
+        }
+        match self.swarm.dial(opts.build()) {
+            Ok(()) => {
+                // `Always` above means a retry can now succeed while an
+                // earlier dial to this same peer is still outstanding.
+                // `pending_connect` is keyed by peer, so inserting
+                // without checking would silently drop the earlier
+                // caller's reply sender — its `connect().await` would
+                // then see a dropped channel and report the misleading
+                // "mesh swarm task has stopped", instead of a clear
+                // reason. Tell it plainly that a newer attempt
+                // superseded it before we overwrite the entry.
+                if let Some((_, stale_reply)) =
+                    self.pending_connect.insert(libp2p_peer, (peer, reply))
+                {
+                    let _ = stale_reply.send(Err(MeshTransportError::Transport(
+                        "superseded by a newer connect attempt to the same peer".to_string(),
+                    )));
+                }
+            }
+            Err(err) => {
+                let _ = reply.send(Err(MeshTransportError::Transport(err.to_string())));
             }
         }
     }
