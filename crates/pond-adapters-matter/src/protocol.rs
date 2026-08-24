@@ -490,6 +490,9 @@ mod tests {
                 ],
                 "sensors": [],
                 "vendor_clusters": [{ "cluster_id": 0xfff1_fc01u32, "endpoint": 1 }],
+                "states": [
+                    { "name": "door", "value": { "kind": "enum", "values": ["open", "closed"] } },
+                ],
             }
         }))
         .expect("a current controller's describe result");
@@ -500,6 +503,8 @@ mod tests {
             0xfff1_fc01
         );
         assert_eq!(result.description.vendor_clusters[0].endpoint, 1);
+        assert_eq!(result.description.states.len(), 1);
+        assert_eq!(result.description.states[0].name, "door");
     }
 
     /// The controller lives in the data dir and can be older than the binary reading
@@ -517,6 +522,7 @@ mod tests {
         .expect("a controller predating vendor clusters");
 
         assert!(result.description.vendor_clusters.is_empty());
+        assert!(result.description.states.is_empty());
         assert_eq!(result.description.capabilities.len(), 1);
     }
 

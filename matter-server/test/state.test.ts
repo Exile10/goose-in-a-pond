@@ -3,7 +3,14 @@ import { describe, expect, it } from "vitest";
 import { planControl } from "../src/mapping/control.js";
 import { describeNode } from "../src/mapping/describe.js";
 import { stateOf } from "../src/mapping/state.js";
-import { endpoint, laundryWasherNode, named, node } from "./fixtures.js";
+import {
+  bareLockNode,
+  doorLockNode,
+  endpoint,
+  laundryWasherNode,
+  named,
+  node,
+} from "./fixtures.js";
 
 /** The value reported for a name, or undefined if it was not reported at all. */
 function valueOf(n: Parameters<typeof stateOf>[0], name: string) {
@@ -42,6 +49,7 @@ describe("device state", () => {
     const described = describeNode(purifier);
     const settable = new Set(described.capabilities.map(c => c.setting ?? c.verb));
     const measured = new Set(described.sensors.map(s => s.sensor_type));
+    const reportedOnly = new Set(described.states.map(s => s.name));
 
     const reported = stateOf(purifier).values.map(v => v.name);
     // It has to report both kinds, or this passes by reporting nothing.
@@ -50,10 +58,52 @@ describe("device state", () => {
 
     for (const name of reported) {
       expect(
-        settable.has(name) || measured.has(name),
-        `'${name}' is reported but the description neither sets nor measures it`,
+        settable.has(name) || measured.has(name) || reportedOnly.has(name),
+        `'${name}' is reported but the description neither sets, measures nor reports it`,
       ).toBe(true);
     }
+  });
+
+  it("says where the door is, which the lock state cannot", () => {
+    // A bolt thrown into a frame standing open reports "locked" quite happily. Asked
+    // whether the door was shut, that answer is worse than no answer.
+    const lock = doorLockNode();
+
+    expect(valueOf(lock, "locked")).toBe("locked");
+    expect(valueOf(lock, "door")).toBe("open");
+    expect(valueOf(lock, "pin_required")).toBe("not required");
+  });
+
+  it("reads a door state matter.js decoded to its enum name", () => {
+    // Both encodings, for the reason the fan mode sequence reads both: a door reported
+    // as "DoorJammed" must not come out the same as a door that said nothing.
+    const jammed = node(46, [
+      named("Side Door"),
+      endpoint(1, { doorLock: { lockState: 1, doorState: "DoorJammed" } }, [0x000a]),
+    ]);
+
+    expect(valueOf(jammed, "door")).toBe("jammed");
+  });
+
+  it("declares a door it has no reading for yet, and reports nothing for it", () => {
+    // doorState is nullable in Matter, so a lock with a position sensor can have the
+    // attribute and no value in it. Describing it is right -- the device does report a
+    // door -- and inventing "closed" for the reading is not: an invented value cannot
+    // be told from a real one, and this is a door.
+    const unknown = node(47, [
+      named("Back Door"),
+      endpoint(1, { doorLock: { lockState: 1, doorState: null } }, [0x000a]),
+    ]);
+
+    expect(describeNode(unknown).states.map(s => s.name)).toContain("door");
+    expect(valueOf(unknown, "door")).toBeUndefined();
+  });
+
+  it("says nothing about a door a lock has no sensor for", () => {
+    // Absent rather than filled in: an invented "closed" cannot be told from a real one.
+    expect(valueOf(bareLockNode(), "door")).toBeUndefined();
+    expect(valueOf(bareLockNode(), "pin_required")).toBeUndefined();
+    expect(valueOf(bareLockNode(), "locked")).toBe("locked");
   });
 
   it("reports what a device measures, not only what it can be told to be", () => {

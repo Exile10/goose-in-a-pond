@@ -39,6 +39,7 @@ import {
   CLUSTER_THERMOSTAT,
   CLUSTER_WINDOW_COVERING,
 } from "./devices.js";
+import { doorStateWord } from "./describe.js";
 import { SENSORS } from "./sensors.js";
 import { observedOperation, settingsOf } from "./settings.js";
 import { applianceSetpoint, targetSetpoint } from "./thermostat.js";
@@ -51,8 +52,12 @@ const LOCK_STATES: Record<number, string> = {
   2: "unlocked",
 };
 
+function valueAt(node: NodeSnapshot, cluster: string, attribute: string): unknown {
+  return endpointWith(node, cluster)?.clusters[cluster]?.[attribute];
+}
+
 function numberAt(node: NodeSnapshot, cluster: string, attribute: string): number | undefined {
-  const value = endpointWith(node, cluster)?.clusters[cluster]?.[attribute];
+  const value = valueAt(node, cluster, attribute);
   return typeof value === "number" ? value : undefined;
 }
 
@@ -85,6 +90,15 @@ export function stateOf(node: NodeSnapshot): DeviceState {
 
   const lock = numberAt(node, CLUSTER_DOOR_LOCK, "lockState");
   if (lock !== undefined) add("locked", LOCK_STATES[lock]);
+
+  // Where the door itself is, which `locked` cannot answer: a bolt thrown into an open
+  // frame reports "locked" quite happily, and jammed and forced open have no reading
+  // here at all otherwise.
+  add("door", doorStateWord(valueAt(node, CLUSTER_DOOR_LOCK, "doorState")));
+
+  // Reported so it can be checked, never set. See `statesOf` in describe.ts.
+  const pin = valueAt(node, CLUSTER_DOOR_LOCK, "requirePinForRemoteOperation");
+  if (typeof pin === "boolean") add("pin_required", pin ? "required" : "not required");
 
   const speed = numberAt(node, CLUSTER_FAN_CONTROL, "percentCurrent");
   if (speed !== undefined) add("fan_speed", `${speed}%`);

@@ -266,6 +266,21 @@ fn render_description(d: &DeviceDescription) -> String {
         }
     }
 
+    // Named separately from Accepts and Measures because it is neither, and the
+    // difference is the whole point: asked to shut the door, an agent that read these
+    // as settable would try, and a lock refusing a write it never offered is a worse
+    // answer than "I can see it and cannot change it".
+    if !d.states.is_empty() {
+        out.push_str("\n  Reports, and cannot be told to change:");
+        for state in &d.states {
+            out.push_str(&format!(
+                "\n    {} — {}",
+                state.name,
+                render_value(&state.value)
+            ));
+        }
+    }
+
     // Printed only when there is one, which is nearly never. A "Manufacturer-specific:
     // nothing." line on every description in the house would be paid for by every
     // reader to inform none of them.
@@ -765,7 +780,9 @@ mod tests {
     };
     use OperationNote::{Missed, Reached};
 
-    use pond_core::user_data::ports::device_control::{Capability, SensorSpec, VendorCluster};
+    use pond_core::user_data::ports::device_control::{
+        Capability, SensorSpec, StateSpec, VendorCluster,
+    };
 
     fn spec(verb: &str, value: ValueSpec) -> Capability {
         Capability {
@@ -812,6 +829,7 @@ mod tests {
             ],
             sensors: vec![],
             vendor_clusters: vec![],
+            states: vec![],
         });
 
         // The name is what `set_device_state` is called with, so it has to be in the
@@ -847,6 +865,7 @@ mod tests {
             ],
             sensors: vec![],
             vendor_clusters: vec![],
+            states: vec![],
         });
 
         assert!(rendered.contains("matter-18 (fan)"), "{rendered}");
@@ -874,6 +893,7 @@ mod tests {
             )],
             sensors: vec![],
             vendor_clusters: vec![],
+            states: vec![],
         });
         assert!(stated.contains("from 7 to 30 C"), "{stated}");
 
@@ -892,6 +912,7 @@ mod tests {
             )],
             sensors: vec![],
             vendor_clusters: vec![],
+            states: vec![],
         });
         assert!(silent.contains("a number in C"), "{silent}");
         assert!(!silent.contains("from"), "no range is implied: {silent}");
@@ -916,6 +937,7 @@ mod tests {
                 },
             ],
             vendor_clusters: vec![],
+            states: vec![],
         });
 
         assert!(rendered.contains("carbon_dioxide (ppm)"), "{rendered}");
@@ -948,6 +970,7 @@ mod tests {
             }],
             sensors: vec![],
             vendor_clusters: vec![],
+            states: vec![],
         });
 
         assert!(rendered.contains("a number from 7 to 23.5 C"), "{rendered}");
@@ -1229,6 +1252,7 @@ mod tests {
                 cluster_id: 0xfff1_fc01,
                 endpoint: 1,
             }],
+            states: vec![],
         });
 
         // Both halves, because either alone is a wrong answer: naming it without the
@@ -1255,10 +1279,69 @@ mod tests {
             capabilities: vec![spec("power", ValueSpec::Boolean)],
             sensors: vec![],
             vendor_clusters: vec![],
+            states: vec![],
         });
 
         assert!(!rendered.contains("manufacturer-specific"), "{rendered}");
         assert!(!rendered.contains("cluster"), "{rendered}");
+    }
+
+    /// The report this came from: asked what the Door Lock could do, GIAP answered
+    /// "locked or unlocked. It does not measure any data" — for a device whose own app
+    /// showed a door state and a PIN requirement beside the lock state.
+    #[test]
+    fn a_reading_that_cannot_be_set_is_named_as_one() {
+        let rendered = render_description(&DeviceDescription {
+            device_id: "matter-44".into(),
+            device_type: "lock".into(),
+            capabilities: vec![spec("locked", ValueSpec::Boolean)],
+            sensors: vec![],
+            vendor_clusters: vec![],
+            states: vec![
+                StateSpec {
+                    name: "door".into(),
+                    value: ValueSpec::Enum {
+                        values: vec!["open".into(), "closed".into(), "jammed".into()],
+                    },
+                },
+                StateSpec {
+                    name: "pin_required".into(),
+                    value: ValueSpec::Enum {
+                        values: vec!["required".into(), "not required".into()],
+                    },
+                },
+            ],
+        });
+
+        assert!(
+            rendered.contains("door — one of: open, closed, jammed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("pin_required — one of: required, not required"),
+            "{rendered}"
+        );
+        // The distinction the block exists for. Read as settable, an agent would try to
+        // shut the door, and the refusal is a worse answer than the honest one.
+        assert!(rendered.contains("cannot be told to change"), "{rendered}");
+        // And it is not in Accepts, which is what `set_device_state` reads.
+        let accepts = rendered.split("Reports").next().unwrap_or_default();
+        assert!(!accepts.contains("pin_required"), "{rendered}");
+    }
+
+    /// Nearly every device, and the reason the block is conditional.
+    #[test]
+    fn a_device_that_reports_nothing_read_only_says_nothing_about_it() {
+        let rendered = render_description(&DeviceDescription {
+            device_id: "matter-2".into(),
+            device_type: "light".into(),
+            capabilities: vec![spec("power", ValueSpec::Boolean)],
+            sensors: vec![],
+            vendor_clusters: vec![],
+            states: vec![],
+        });
+
+        assert!(!rendered.contains("Reports"), "{rendered}");
     }
 
     #[test]

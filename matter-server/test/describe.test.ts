@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import { describeNode } from "../src/mapping/describe.js";
 import {
+  bareLockNode,
   customLightNode,
   describedNode,
+  doorLockNode,
   endpoint,
   fanNode,
   lightNode,
@@ -95,6 +97,7 @@ describe("device description", () => {
     expect(description.sensors).toEqual([]);
     // The overwhelmingly common case, and the one a renderer must not print a line for.
     expect(description.vendor_clusters).toEqual([]);
+    expect(description.states).toEqual([]);
   });
 
   it("says a device has a custom cluster rather than implying it has none", () => {
@@ -128,6 +131,42 @@ describe("device description", () => {
     ]);
 
     expect(describeNode(rootOnly).vendor_clusters).toEqual([]);
+  });
+
+  it("names what a lock reports and cannot be told to be", () => {
+    // The report this came from: asked what the Door Lock could do, GIAP answered
+    // "locked or unlocked. It does not measure any data" -- for a device whose own app
+    // showed a door state and a PIN requirement beside the lock state. Both sat in the
+    // snapshot the whole time; there was no slot in the description to put them in.
+    const description = describeNode(doorLockNode());
+
+    expect(description.capabilities.map(c => c.verb)).toEqual(["locked"]);
+    expect(description.states).toEqual([
+      {
+        name: "door",
+        value: {
+          kind: "enum",
+          values: ["open", "closed", "jammed", "forced open", "unspecified error", "ajar"],
+        },
+      },
+      { name: "pin_required", value: { kind: "enum", values: ["required", "not required"] } },
+    ]);
+  });
+
+  it("keeps a lock's PIN requirement out of the verbs", () => {
+    // Read, never written. Every writable attribute on DoorLock is a security control,
+    // and a verb for one puts "turn off the pin requirement" a sentence away.
+    const verbs = describeNode(doorLockNode()).capabilities;
+
+    expect(verbs.map(c => c.verb)).not.toContain("mode");
+    expect(verbs.map(c => c.setting)).not.toContain("pin_required");
+  });
+
+  it("promises no door reading for a lock that has no position sensor", () => {
+    // DoorPositionSensor and PinCredential are both optional. Declaring either on a
+    // plain deadbolt would promise a reading that never arrives -- the same failure as
+    // offering tilt to a roller blind.
+    expect(describeNode(bareLockNode()).states).toEqual([]);
   });
 
   it("lists what a sensor measures before it has reported anything", () => {
