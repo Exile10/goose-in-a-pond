@@ -427,24 +427,36 @@ After, it reasons and calls it. The control is unchanged within noise, which is
 the other half of the claim — the models whose classification does not move
 must not move.
 
-**The before behaviour is INTERMITTENT, and that bounds what the table above
-can claim.** A second run of the same pre-fix binary DID call the weather tool
-(13 / 51 / 14 completion tokens, still 0 reasoning). So "before never calls the
-tool" is not a safe statement from n = 1; "before is unreliable" is. What
-reproduces across both pre-fix runs, and is therefore the honest claim:
+**The before behaviour is INTERMITTENT, so the single-run table above is not
+the claim.** Repeated three times per side, same harness, same two binaries:
 
-| | before (n = 2) | after |
-|---|---|---|
-| reasoning tokens | 0, every turn, both runs | 54 / 654 / 160 |
-| prompt tokens | 17,376 and 17,377 | 10,092 |
-| completion tokens | 2-51 (stubs) | 425-858 |
-| turn-1 TTFT | 187.25 s, 69.34 s | 38.93 s |
-| weather tool | once in two runs | called |
+| run | prompt tok | completion (t1/t2/t3) | reasoning | turn-1 TTFT | tool |
+|---|---|---|---|---|---|
+| before 1 | 17,376 | 2 / 18 / 3 | 0 / 0 / 0 | 187.3 s | no |
+| before 2 | 17,377 | 13 / 51 / 14 | 0 / 0 / 0 | 71.2 s | yes |
+| before 3 | 17,377 | 13 / 46 / 13 | 0 / 0 / 0 | 72.0 s | yes |
+| after 1 | 10,092 | 517 / 858 / 425 | 54 / 654 / 160 | 38.9 s | yes |
+| after 2 | 10,092 | 403 / 658 / 756 | 48 / 419 / 196 | 38.8 s | yes |
+| after 3 | 10,092 | 477 / -- / 604 | 115 / -- / 144 | 87.5 s | yes |
 
-The deterministic, log-confirmed change is `capabilities: thinking=false` →
-`thinking=true` and reasoning tokens going from exactly zero to real. The
-tool-call reliability claim needs repetitions and is being measured; the
-latency figures have a wide before-spread and should be read as directional.
+What is DETERMINISTIC across all six runs, and is therefore the claim:
+
+- **Reasoning tokens are exactly 0 in every before run and non-zero in every
+  after run.** The fix doing precisely what it says: Nemotron's template gates a
+  `<think>` block, the probe reads that, and the prompt now carries the section
+  the engine was already switched into.
+- **Prompt tokens are 17,376-17,377 before and a flat 10,092 after**, no
+  variance on either side. 42% smaller; see below for where it comes from.
+- **Answers go from stub length (2-51 completion tokens) to substantive
+  (403-858).**
+
+What is NOT safe from n = 3: the tool call went 2/3 -> 3/3, consistent but too
+small to call a reliability fix. And turn-1 TTFT spreads widely on both sides
+(187/71/72 against 39/39/87); the medians are 72 s -> 39 s, which is
+directional, not a benchmark. Debug build, one machine.
+
+(`after 3` recorded no stats for its second turn -- one dropped sample, left in
+rather than quietly discarded.)
 
 **Why the prompt SHRANK, which was not the intent.** The shim's accounting says
 the system prompt went from 30,848 chars to 2,170, with
