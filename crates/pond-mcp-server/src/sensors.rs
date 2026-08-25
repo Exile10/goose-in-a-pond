@@ -333,7 +333,12 @@ impl SensorsMcpServer {
 
         let (Some(device_id), Some(sensor_type)) = (device_id, sensor_type) else {
             return Ok(CallToolResult::success(vec![Content::text(
-                "Please provide both `device_id` and `sensor_type` (e.g. device_id='bedroom', sensor_type='temperature').",
+                // No sample values: `resolved_device` falls through to the
+                // literal string when the registry has no match, so a copied
+                // device_id='bedroom' queries a device that does not exist and
+                // reports on it as though it did.
+                "Please provide both `device_id` and `sensor_type`, taken from the \
+                 device and reading the user asked about.",
             )]));
         };
 
