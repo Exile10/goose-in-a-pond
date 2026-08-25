@@ -5,7 +5,7 @@
 //! each field below) — no public/OpenLane discovery anywhere in this stack.
 
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::{dcutr, gossipsub, identify, kad, relay, request_response};
+use libp2p::{dcutr, gossipsub, identify, kad, ping, relay, request_response};
 use serde::{Deserialize, Serialize};
 
 /// The one request/response protocol a mesh node speaks: a `Handshake` right
@@ -65,4 +65,11 @@ pub struct MeshBehaviour {
     /// Attempts to upgrade a relayed connection to a direct one.
     pub dcutr: dcutr::Behaviour,
     pub mesh_rr: request_response::cbor::Behaviour<MeshRequest, MeshResponse>,
+    /// Keeps an idle connection alive. With no periodic traffic, libp2p's
+    /// default idle-connection timeout closes a peer link shortly after its
+    /// last request — `connected_peers()` then flips back to "disconnected"
+    /// between mesh calls even though the peer is reachable and about to be
+    /// re-dialed anyway. A steady ping heartbeat keeps the link (and
+    /// `connected`) accurate instead of flapping.
+    pub ping: ping::Behaviour,
 }
