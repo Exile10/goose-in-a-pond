@@ -17,6 +17,16 @@
 //! debug level, not warned — GIAP's `giap-draft` extension is always-on, so
 //! tools are present on nearly every real turn, and a per-request warning
 //! for expected, by-design behavior would just be noise.
+//!
+//! Dropping `tools` used to be the whole story, and it left the borrowed
+//! model holding a `system` prompt built as if those tools worked (Goose
+//! names them there regardless of the separate structured argument). The
+//! model would spend its answer reasoning about which tool to reach for, or
+//! announcing that none were needed, instead of just answering — a real
+//! chat turn returning "no tools or memory are needed for this question"
+//! instead of an answer is this exact failure. [`NO_TOOLS_OVER_MESH_NOTICE`]
+//! is appended to `system` whenever this happens, telling the model plainly
+//! that the tools it was just described no longer exist this turn.
 
 use std::sync::Arc;
 
@@ -29,6 +39,14 @@ use goose_providers::model::ModelConfig;
 use pond_core::models::domain::message::{ChatMessage, Role};
 use pond_core::models::ports::provider::{LlmProvider, StreamToken};
 use rmcp::model::Tool;
+
+/// Appended to `system` whenever `tools` is non-empty and about to be
+/// dropped, so the borrowed model is told plainly that the tools it was just
+/// described no longer work this turn — instead of silently discovering it
+/// mid-answer and narrating that discovery instead of replying.
+const NO_TOOLS_OVER_MESH_NOTICE: &str = "\n\n(Tool calls and memory search are not available for \
+this response — it is running on a borrowed peer over the mesh. Answer directly from the \
+conversation so far. Do not attempt to call a tool or describe deciding whether one is needed.)";
 
 pub struct MeshProvider {
     inner: Arc<dyn LlmProvider>,
@@ -70,16 +88,23 @@ impl Provider for MeshProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
+        let chat_messages: Vec<ChatMessage> =
+            messages.iter().map(Self::from_goose_message).collect();
+        let mut system = system.to_string();
         if !tools.is_empty() {
             tracing::debug!(
                 tool_count = tools.len(),
                 "mesh provider: dropping tools — MCP tool-calling is not available over the mesh yet"
             );
+            // `system` was built assuming the tools listed there actually work —
+            // it names all `tools.len()` of them and invites the model to use
+            // them. Silently dropping only the structured `tools` argument left
+            // that invitation standing with nothing behind it: the borrowed
+            // model would reason out loud about which tool to reach for, or
+            // announce that none were needed, instead of just answering,
+            // because as far as its prompt is concerned they still exist.
+            system.push_str(NO_TOOLS_OVER_MESH_NOTICE);
         }
-
-        let chat_messages: Vec<ChatMessage> =
-            messages.iter().map(Self::from_goose_message).collect();
-        let system = system.to_string();
         // Owned clones moved into the generator below so the returned stream
         // is 'static (Goose's `MessageStream` alias carries no lifetime) —
         // `self.inner.stream_complete(...)` itself returns a stream borrowing
@@ -198,6 +223,85 @@ mod tests {
         // Each StreamToken::Text is its own delta, in order — not accumulated.
         assert_eq!(texts, vec!["hi ".to_string(), "there".to_string()]);
         assert!(saw_usage, "expected a terminal usage item");
+    }
+
+    /// Records the `system_prompt` it was called with, so tests can assert on
+    /// what actually reached the "model" rather than just that the call
+    /// succeeded.
+    struct CapturingProvider {
+        seen_system: std::sync::Mutex<Option<String>>,
+    }
+
+    impl CapturingProvider {
+        fn new() -> Self {
+            Self {
+                seen_system: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for CapturingProvider {
+        async fn complete(
+            &self,
+            system_prompt: &str,
+            _messages: Vec<ChatMessage>,
+        ) -> anyhow::Result<ChatMessage> {
+            *self.seen_system.lock().unwrap() = Some(system_prompt.to_string());
+            Ok(ChatMessage::assistant("ok"))
+        }
+
+        fn model_name(&self) -> String {
+            "capturing".to_string()
+        }
+    }
+
+    /// The exact failure this notice exists for: `system` names tools that
+    /// `tools: &[Tool]` is about to make non-functional. Without the notice,
+    /// the borrowed model reasons about — or announces — tool use that can
+    /// never happen, instead of just answering.
+    #[tokio::test]
+    async fn a_nonempty_tools_list_gets_a_no_tools_notice_appended_to_system() {
+        let provider = Arc::new(CapturingProvider::new());
+        let mesh_provider = MeshProvider::new(provider.clone());
+        let cfg = ModelConfig::new("mesh");
+        let tool = Tool::new("device_control", "control a device", serde_json::Map::new());
+
+        let mut stream = mesh_provider
+            .stream(
+                &cfg,
+                "You are helpful. You have access to: device_control.",
+                &[user_message("turn off the lights")],
+                std::slice::from_ref(&tool),
+            )
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        let seen = provider.seen_system.lock().unwrap().clone().unwrap();
+        assert!(seen.starts_with("You are helpful. You have access to: device_control."));
+        assert!(
+            seen.contains("not available for this response"),
+            "expected the no-tools-over-mesh notice, got: {seen}"
+        );
+    }
+
+    /// A turn with no tools offered in the first place needs no override —
+    /// `system` reaches the peer byte-for-byte.
+    #[tokio::test]
+    async fn an_empty_tools_list_leaves_system_untouched() {
+        let provider = Arc::new(CapturingProvider::new());
+        let mesh_provider = MeshProvider::new(provider.clone());
+        let cfg = ModelConfig::new("mesh");
+
+        let mut stream = mesh_provider
+            .stream(&cfg, "You are helpful.", &[user_message("hi")], &[])
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        let seen = provider.seen_system.lock().unwrap().clone().unwrap();
+        assert_eq!(seen, "You are helpful.");
     }
 
     #[tokio::test]
