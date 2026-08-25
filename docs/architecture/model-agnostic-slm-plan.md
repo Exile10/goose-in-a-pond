@@ -586,6 +586,81 @@ can undo the bound from inside the turn.
 Against the pre-fix baseline the whole stack, for Llama on this Mac:
 turn-1 TTFT **162.6 s -> 22.7 s** and turn-1 prompt **18,135 -> 3,436 tokens**.
 
+
+## 7. Prompt safety: a worked example is a thing the model may emit
+
+Found on 2026-08-25 from a screenshot of the desktop app, not from any harness.
+
+NVIDIA-Nemotron3-Nano-4B was asked to check the weather. The tool returned **18
+degrees, Overcast**. The model answered **"It is 24 degrees and cloudy in
+Nairobi, with no rain this evening."** Its visible reasoning quotes the source:
+
+> The answer contract: "It is 24 degrees and cloudy in Nairobi, with rain this
+> evening."
+
+`answer_contract()` had been handing every turn a worked example of the answer
+SHAPE. Three properties made it unsafe:
+
+1. **A complete, fluent answer.** Nothing distinguishes it structurally from a
+   real reply, so copying it is not a visible error.
+2. **Plausible fake data.** "24 degrees" is what a weather question expects, so
+   the copy reads as correct.
+3. **The user's own city.** It collided with the most likely real question —
+   which is why it was chosen, and why it was dangerous.
+
+The function's own doc comment already warned that an example can be obeyed
+*instead of* the instruction it illustrates, citing `format.rs` recording
+exactly that. It then did it.
+
+**gemma-4 never had this problem.** It treats the example as a shape. That is
+the whole point: the prompt has to be safe for the weakest model the pond will
+run, not the strongest one it was tuned on. This is a model-agnosticity defect
+that happens to present as a factual one.
+
+### The rule that decides which source wins
+
+The same turn showed a second cause. The four styles called `<memories>`
+"authoritative"; `<tool-synthesis>` called a tool result "the authoritative
+answer". Two authorities and no precedence, so the model spent 2m48s arguing
+with itself — "But that contradicts... Maybe the system context is wrong?" —
+and sided with a stale memory over live data. Now stated explicitly, in every
+style and both compact and full: a tool result from this turn outranks a memory.
+Three of the eight renderings still lacked it after the first pass; the test is
+what caught that.
+
+### The sweep this prompted
+
+Every string reaching a model was checked for the same pattern: a "shape"
+demonstration that is simultaneously a complete, valid, plausible instance.
+Eleven survived adversarial verification. The worst were not the wordy ones.
+
+| where | the example | what a copy does |
+|---|---|---|
+| `REVIEW_SYSTEM_PROMPT` | `{"pass": true, "score": 4, ...}` | the review loop returns the answer unrevised and the UI reports "Answer verified (score: 4/5)" about an answer nobody checked |
+| `EXTRACTION_PROMPT` | "The user's mother Florence lives in Kisumu." | invented family facts written to the memory store, permanently and silently |
+| `schedule` error | `'0 0 8 * * *'` | creates a real daily 8 AM schedule nobody asked for |
+| `discovery` error | barcode `'3017620422003'` | a real, correct lookup of a real product the user never mentioned |
+| `finance` error | "convert 100 USD to EUR" | a real, current, correct rate for a pair nobody named, to a household using KES |
+| `session_title` | "Wake word fires twice on the Jetson" | persisted as a conversation's real name |
+
+Two principles came out of fixing them, and both are cheap:
+
+**When an example will be copied, make the copy fail closed.** The review
+verdict is now `{"pass": false, "score": 2, ...}`. A model that copies it asks
+for a revision it did not need — one wasted turn, and visible. The old failure
+cost nothing and could not be seen.
+
+**Name the parameter, not a value.** Every tool error now says which argument it
+wants rather than showing one to reuse. It teaches as much and cannot be pasted
+back as an answer.
+
+Where the demonstration is genuinely load-bearing — the memory extractor's
+few-shot is what carries JSON compliance at this size — it stays, and its own
+output is refused deterministically in `fact_defect`. A guard the model cannot
+argue with is the only kind worth having against a model copying text. Matched
+verbatim, never fuzzily: a real user can have a mother called Florence, and
+silently losing a true memory is the worse failure.
+
 ## 5. Suggested order of work
 
 1. **Capture the failing error string** (`RUST_LOG` run, one prompt). Everything about E4B is
