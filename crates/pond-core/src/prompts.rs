@@ -159,6 +159,37 @@ pub fn estimate_response_budget(message: &str, base_max_tokens: u32) -> u32 {
 ///
 /// The reviewer evaluates answers against a rubric and outputs a structured
 /// JSON verdict. Uses the SAME model as the main LLM with a critic persona.
+///
+/// # Why the shape example is a FAILING verdict
+///
+/// It used to be `{"pass": true, "score": 4, ...}` — a filled-in passing
+/// verdict, offered as a schema illustration to a model that at this size
+/// copies worked examples verbatim. This repo has the receipts: the answer
+/// contract's Nairobi example was emitted as a real answer by a 4B model on
+/// 2026-08-25.
+///
+/// Copying a PASSING verdict here is worse than copying a wrong sentence,
+/// because it is not visible as an error. `GiapAnswerReviewer::review`
+/// short-circuits on `verdict.pass || verdict.score >= threshold`, returns the
+/// original answer unrevised, and the UI then tells the user "Answer verified
+/// (score: 4/5)". The adversarial gate meant to catch fabrications becomes a
+/// no-op that reports success — and it reports it about an answer nobody
+/// checked. The copied JSON is schema-valid, so nothing downstream can reject
+/// it.
+///
+/// The example was also contradicting its own instructions: the prompt says
+/// "Be HARSH … only give 4-5 for genuinely good answers" and then handed the
+/// model a pre-filled 4 with an empty critique.
+///
+/// So the example now FAILS. A model that copies it asks for a revision it did
+/// not need, which costs one extra turn and is visible; the previous failure
+/// cost nothing and was invisible. When an example will be copied, make the
+/// copy fail closed.
+///
+/// The `expectations` and `critique` slots carry instructions rather than
+/// sample prose, because `expectations` is joined verbatim into the revision
+/// prompt — a copied placeholder became a literal requirement handed to the
+/// model as if the reviewer had asked for it.
 pub const REVIEW_SYSTEM_PROMPT: &str = "\
 You are a strict quality reviewer for an AI assistant's answers. Your job is to \
 evaluate whether an answer is COMPLETE, CORRECT, and HELPFUL for the user's question.
@@ -176,8 +207,9 @@ give specific examples, concrete numbers, real comparisons?
 5. USEFULNESS: Would a human reading this feel genuinely helped, or would they need \
 to search elsewhere for the real answer?
 
-Output ONLY a JSON object with this exact structure:
-{\"pass\": true, \"score\": 4, \"expectations\": [\"what the answer should contain\"], \"critique\": \"\"}
+Output ONLY a JSON object with this exact structure. The values below are NOT a \
+verdict — fill every one of them in from the answer you are actually reviewing:
+{\"pass\": false, \"score\": 2, \"expectations\": [\"<each thing this answer should have contained>\"], \"critique\": \"<what is wrong with it, specifically>\"}
 
 Scoring guide:
 5 = Excellent: thorough, accurate, specific, well-structured, genuinely helpful
