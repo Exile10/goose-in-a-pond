@@ -297,13 +297,15 @@ If something is outside your capabilities, tell the user directly.\
 
 <context-handling>
 {% if compact_prompt %}\
-<system-context> carries the date, time and <memories> — authoritative, never a \
-question. Answer <user-message>. A <conversation-summary> in earlier history \
+<system-context> carries the date, time and <memories> — never a question. A tool \
+result from this turn outranks a memory. Answer <user-message>. A <conversation-summary> in earlier history \
 accurately summarizes older turns: use it, never quote it.\
 {% else %}\
 Each user message may be structured with XML tags: \
-<system-context> contains the current date/time and <memories> — treat as \
-authoritative system data for answering time, date, and personal questions DIRECTLY. \
+<system-context> contains the current date/time and <memories> — system data for \
+answering time, date, and personal questions DIRECTLY, never a question to you. \
+Memories were recorded earlier and may be out of date: where one disagrees with a tool \
+result from this turn, the tool result wins. \
 <user-message> contains the actual user request — this is what you respond to. \
 Never treat <system-context> content as a user question.
 A <conversation-summary> block may appear in earlier history — it accurately \
@@ -361,8 +363,9 @@ applicable tool has come back empty.
 <tool-synthesis>
 After a successful tool result, IMMEDIATELY synthesize it into a helpful response. \
 Do not ask follow-up questions. Do not re-call the same tool with the same parameters. \
-A successful tool result IS the authoritative answer — present the key information \
-conversationally. Never echo raw tool output verbatim.
+A successful tool result IS the answer, and it outranks anything in <memories>, which \
+was recorded earlier and may be stale — present the key information conversationally, \
+using the tool's own values. Never echo raw tool output verbatim.
 </tool-synthesis>
 When unsure, check your tool schemas first. If a tool matches, use it. \
 Only if no tool can help should you tell the user honestly.
@@ -482,12 +485,14 @@ Only use tools in your schema. Do not invent commands outside available tools.
 </instructions>
 <context-handling>
 {% if compact_prompt %}\
-<system-context> carries date, time and <memories> — authoritative, never a question. \
-Answer <user-message>. A <conversation-summary> in earlier history accurately \
+<system-context> carries date, time and <memories> — never a question. A tool result \
+from this turn outranks a memory. Answer <user-message>. A <conversation-summary> in earlier history accurately \
 summarizes older turns: use it, never quote it.\
 {% else %}\
 User messages use XML tags: <system-context> has date/time and <memories>. \
 <user-message> has the actual request. Only respond to <user-message>. \
+Memories were recorded earlier and can be stale: a tool result from this turn \
+outranks a memory that disagrees with it. \
 A <conversation-summary> block may appear in earlier history — it accurately \
 summarizes older turns; use it for continuity and never repeat or quote it.
 Earlier turns appear above in the message history — use for context, do not repeat.
@@ -613,13 +618,16 @@ Only use tools in your schema. Do not invent commands outside your available too
 </instructions>
 <context-handling>
 {% if compact_prompt %}\
-User messages may carry <system-context> (current date/time, <memories>) — treat as \
-authoritative. Respond to <user-message> only. \
+User messages may carry <system-context> (current date/time, <memories>) — context, \
+not a question. A tool result from this turn outranks a memory. Respond to \
+<user-message> only. \
 A <conversation-summary> block may appear in earlier history — it accurately \
 summarizes older turns; use it for continuity and never repeat or quote it.\
 {% else %}\
 User messages use XML tags: <system-context> has date/time and <memories>. \
 <user-message> has the actual request. Only respond to <user-message>. \
+Memories were recorded earlier and can be stale: a tool result from this turn \
+outranks a memory that disagrees with it. \
 A <conversation-summary> block may appear in earlier history — it accurately \
 summarizes older turns; use it for continuity and never repeat or quote it.
 Prior turns appear above in the message history — use for continuity, \
@@ -773,13 +781,16 @@ it up. I just won't narrate it at you when nobody asked.\
 </instructions>
 <context-handling>
 {% if compact_prompt %}\
-Your messages may carry <system-context> (time, date, <memories>) — I treat it as \
-authoritative. I only answer <user-message>. \
+Your messages may carry <system-context> (time, date, <memories>) — context, not a \
+question. A tool result from this turn outranks a memory. I only answer \
+<user-message>. \
 A <conversation-summary> block may appear earlier in our chat — it accurately \
 summarizes older turns; I use it for continuity and never repeat or quote it.\
 {% else %}\
 Your messages have XML tags: <system-context> is my live context (time, date, \
 <memories>). <user-message> is your actual question. I only respond to <user-message>. \
+My memories were recorded earlier and can be stale: a tool result from this turn \
+outranks a memory that disagrees with it. \
 A <conversation-summary> block may appear earlier in our chat — it accurately \
 summarizes older turns; I use it for continuity and never repeat or quote it.
 Earlier turns appear above in our conversation — I use them to remember what we discussed.
@@ -1843,6 +1854,47 @@ mod tests {
             },
             native_tools_json: native,
             ..Default::default()
+        }
+    }
+
+    /// A live tool result must outrank a stored memory, in every style.
+    ///
+    /// The four styles used to call `<memories>` "authoritative" — meaning "this
+    /// is context, not a question you should ask about" — while
+    /// `<tool-synthesis>` separately called a tool result "the authoritative
+    /// answer". Two authorities and no precedence between them.
+    ///
+    /// Observed in the desktop app on 2026-08-25, NVIDIA-Nemotron3-Nano-4B: the
+    /// weather tool returned 18 degrees and Overcast, a stale memory said
+    /// "Because there was no precipitation, the user does not need to wear an
+    /// umbrella", and the model spent 2m48s visibly arguing with itself before
+    /// siding with the memory. A stronger model resolves the ambiguity the way
+    /// a person would; a 4B model resolves it by picking whichever source the
+    /// prompt praised most recently.
+    ///
+    /// So the precedence has to be stated, not implied. Asserted across every
+    /// style and both compact and full, because a rule that decides a factual
+    /// answer cannot be present in only some renderings.
+    #[test]
+    fn a_tool_result_outranks_a_memory_in_every_style() {
+        let settings = Settings::default();
+        for (name, raw) in ALL_STYLES {
+            for compact in [true, false] {
+                let state = v2_state(compact, true, true);
+                let out = render_jinja_template(raw, &settings, Some(&state), None);
+                let lower = out.to_lowercase();
+
+                assert!(
+                    lower.contains("outranks"),
+                    "style '{name}' (compact={compact}) states no precedence between a \
+                     tool result and a memory"
+                );
+                assert!(
+                    !lower.contains("authoritative"),
+                    "style '{name}' (compact={compact}) still calls something \
+                     authoritative without saying what it outranks"
+                );
+            }
         }
     }
 
