@@ -247,7 +247,11 @@ impl FinanceMcpServer {
             Some(t) => t,
             None => {
                 return Ok(CallToolResult::success(vec![Content::text(
-                    "I need a target currency. Say something like 'convert 100 USD to EUR'.",
+                    // No worked conversion here. 'convert 100 USD to EUR' returns
+                    // a real, current, correct rate — for a pair the user never
+                    // named, in a household that transacts in KES. A right answer
+                    // to the wrong question is the hardest kind to notice.
+                    "I need a target currency — the one the user asked to convert into.",
                 )]));
             }
         };

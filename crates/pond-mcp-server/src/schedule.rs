@@ -457,9 +457,15 @@ repeating use create_schedule instead.")]
                 Some(c) => c,
                 None => {
                     return Ok(CallToolResult::success(vec![Content::text(format!(
+                        // The field ORDER is what the model gets wrong, so that is
+                        // what this teaches. It used to give two ready-made cron
+                        // strings, and a copied one creates a real recurring
+                        // schedule at a time nobody asked for — persistent state
+                        // the user has to discover and delete, unlike a wrong
+                        // sentence they can simply ignore.
                         "Could not parse a schedule from: \"{}\". \
-                         Retry with cron (sec min hr dom mon dow). \
-                         Examples: '0 0 8 * * *' = daily 8 AM, '0 30 9 * * 1' = Monday 9:30 AM.",
+                         Retry with cron in the order: sec min hr dom mon dow. \
+                         Build it from the time the user actually said.",
                         user_msg
                     ))]));
                 }

@@ -221,8 +221,14 @@ Look up a food product by barcode or name: nutrition, ingredients, allergens, Nu
 
         if barcode.is_none() && name.is_none() {
             return Ok(CallToolResult::success(vec![Content::text(
-                "I need a product barcode or name. Retry with a 'barcode' parameter \
-                 (e.g. '3017620422003') or 'name' parameter (e.g. 'nutella').",
+                // No sample VALUES here on purpose. This used to offer
+                // '3017620422003' and 'nutella' — a real EAN for a real product —
+                // and a model that retries with the example gets a real, correct
+                // lookup for something the user never asked about. The failure
+                // then looks like a successful answer. Name the parameters, not
+                // values to reuse.
+                "I need a product barcode or name. Retry with the barcode or the \
+                 product name the user actually gave.",
             )]));
         }
 
