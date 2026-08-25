@@ -7389,12 +7389,22 @@ async fn build_mesh_transport(
     let keypair = MeshKeypair::from_bytes(secret_bytes);
     tracing::info!("mesh enabled: peer_id={}", keypair.peer_id());
 
+    // An OS-assigned ephemeral port (`tcp/0`) meant a fresh, unpredictable
+    // port on every restart — any peer holding an older invite/address then
+    // gets a real "connection refused" the moment this Pond restarts, with
+    // no way to tell that's what happened. Derived from the identity secret
+    // (already persisted, one value per install) rather than stored
+    // separately: stable across restarts for free, and naturally different
+    // per machine/instance since each generates its own secret.
+    let listen_port = 40000 + (u16::from_be_bytes([secret_bytes[0], secret_bytes[1]]) % 10000);
+    tracing::info!("mesh listening on a stable, identity-derived port: {listen_port}");
+
     // Harness/model attestation isn't wired up yet (ties to reproducible
     // builds — explicitly out of scope for this milestone per the issue's
     // risk list); a fixed placeholder lets any two Milestone-2 Ponds pair
     // during development. Replace once harness/model pinning lands.
     let config = Libp2pMeshTransportConfig {
-        listen_addr: "/ip4/0.0.0.0/tcp/0"
+        listen_addr: format!("/ip4/0.0.0.0/tcp/{listen_port}")
             .parse()
             .expect("valid multiaddr literal"),
         harness_hash: pond_mesh_protocol::hashing::hash_harness(b"pond-mesh-v1-dev"),

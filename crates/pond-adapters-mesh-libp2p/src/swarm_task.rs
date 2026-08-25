@@ -147,8 +147,15 @@ fn build_swarm(
                     )],
                     request_response::Config::default(),
                 ),
+                ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::new()),
             })
         })?
+        .with_swarm_config(|cfg| {
+            // Comfortably above the ping interval, so the ping heartbeat —
+            // not a race against this timeout — is what decides whether an
+            // idle-but-reachable connection stays open.
+            cfg.with_idle_connection_timeout(Duration::from_secs(60))
+        })
         .build();
 
     swarm.behaviour_mut().kad.set_mode(Some(kad::Mode::Server));

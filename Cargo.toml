@@ -227,7 +227,7 @@ bip39 = { version = "2", features = ["rand"] }
 # alongside the ones already transitive via reqwest/sqlx.
 libp2p = { version = "0.56", features = [
     "tokio", "tcp", "noise", "yamux", "ed25519",
-    "kad", "gossipsub", "relay", "dcutr", "identify",
+    "kad", "gossipsub", "relay", "dcutr", "identify", "ping",
     "request-response", "cbor", "macros",
 ] }
 
