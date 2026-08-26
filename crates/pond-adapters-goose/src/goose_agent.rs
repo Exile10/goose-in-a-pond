@@ -3882,6 +3882,33 @@ impl GooseAdapter {
             }
         });
 
+        // A recipe run whose YAML declared `extensions:` narrows the turn to
+        // only those tool groups, on top of whatever selection already chose.
+        // Same enforcement point as the Guest subtraction above -- this is the
+        // one place every mode converges before publishing to the shim.
+        let allowed_tools = if let Some(allowlist) = &request.tool_group_allowlist {
+            let before = allowed_tools.len();
+            let kept: HashSet<String> = allowed_tools
+                .into_iter()
+                .filter(|tool| {
+                    pond_core::mcp::domain::tool_group::group_of_tool(tool)
+                        .is_some_and(|group| allowlist.iter().any(|g| g == group))
+                })
+                .collect();
+            tracing::info!(
+                target: "giap::trace",
+                kind = "recipe_tools_restricted",
+                session_id = %session_id,
+                allowlist = ?allowlist,
+                removed = before - kept.len(),
+                kept = kept.len(),
+                "recipe extensions restricted this turn's tools"
+            );
+            kept
+        } else {
+            allowed_tools
+        };
+
         tracing::debug!(target: "pond_adapters_goose::goose_agent", "Allowed tools for turn: {:?}", allowed_tools);
 
         // Publish the allow-set to this SESSION's shim controls — anything Goose
@@ -7974,6 +8001,7 @@ mod tests {
             canvas_mode: false,
             profile_scope: ProfileScope::Household,
             profile_context: None,
+            tool_group_allowlist: None,
         };
 
         let mut stream = adapter.chat_stream(request).await.unwrap();

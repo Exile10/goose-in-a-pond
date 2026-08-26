@@ -8343,6 +8343,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                 // theatre rather than a boundary.
                 profile_scope: ProfileScope::Household,
                 profile_context: None,
+                tool_group_allowlist: None,
             };
             stream_agent_response(&agent, request).await?;
         }
@@ -8411,6 +8412,7 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
                     // Same as the single-shot arm above.
                     profile_scope: ProfileScope::Household,
                     profile_context: None,
+                    tool_group_allowlist: None,
                 };
                 if let Err(e) = stream_agent_response(&agent, request).await {
                     eprintln!("\n  error: {e}");

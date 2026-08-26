@@ -846,6 +846,7 @@ impl ChatService {
             // Voice has no speaker identification, so there is no member
             // whose preferences these would be.
             profile_context: None,
+            tool_group_allowlist: None,
         };
         let response_text = self.agent.chat(request).await?.text;
 
@@ -1347,6 +1348,7 @@ impl ChatService {
             // Voice has no speaker identification, so there is no member
             // whose preferences these would be.
             profile_context: None,
+            tool_group_allowlist: None,
         };
 
         // Clear any interrupt left over from the previous turn. Exactly once
