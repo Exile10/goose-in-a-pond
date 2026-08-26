@@ -38,13 +38,13 @@ pub struct Libp2pMeshTransport {
 }
 
 impl Libp2pMeshTransport {
-    pub fn new(config: Libp2pMeshTransportConfig) -> anyhow::Result<Self> {
+    pub async fn new(config: Libp2pMeshTransportConfig) -> anyhow::Result<Self> {
         let local_peer_id = config.keypair.peer_id();
         let SwarmHandles {
             command_tx,
             inbound_rx,
             task,
-        } = swarm_task::spawn(config)?;
+        } = swarm_task::spawn(config).await?;
         Ok(Self {
             local_peer_id,
             command_tx,

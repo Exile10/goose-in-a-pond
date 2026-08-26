@@ -7412,7 +7412,7 @@ async fn build_mesh_transport(
         keypair,
         peer_directory,
     };
-    match Libp2pMeshTransport::new(config) {
+    match Libp2pMeshTransport::new(config).await {
         Ok(transport) => {
             Some(Arc::new(transport)
                 as Arc<
