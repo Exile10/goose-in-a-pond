@@ -710,10 +710,34 @@ export interface AgentTool {
   description?: string;
 }
 
+export interface RecipeParameter {
+  key: string;
+  input_type?: "string" | "number" | "boolean" | "date" | "file" | "select";
+  requirement?: "required" | "optional" | "user_prompt";
+  description?: string;
+  default?: string;
+  options?: string[];
+}
+
+export interface RecipeExtensionSpec {
+  type?: string;
+  name: string;
+  timeout?: number;
+  bundled?: boolean;
+}
+
 export interface AgentRecipe {
+  id?: string;
   name: string;
   description?: string;
   yaml: string;
+  active?: boolean;
+  created_at?: string;
+  /** Parsed out of `yaml` server-side; present on list/create/update responses. */
+  title?: string;
+  parameters?: RecipeParameter[];
+  extensions?: RecipeExtensionSpec[];
+  activities?: string[];
 }
 
 // ── Chat / Streaming ──────────────────────────────────────────
