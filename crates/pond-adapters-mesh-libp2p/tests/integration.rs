@@ -60,7 +60,7 @@ async fn spawn_node(model_hash: ModelHash) -> Node {
         peer_directory: directory.clone(),
     };
     Node {
-        transport: Libp2pMeshTransport::new(config).unwrap(),
+        transport: Libp2pMeshTransport::new(config).await.unwrap(),
         directory,
     }
 }
