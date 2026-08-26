@@ -55,7 +55,7 @@ async fn spawn_transport() -> (Arc<Libp2pMeshTransport>, Arc<MockPeerDirectory>)
         peer_directory: directory.clone(),
     };
     (
-        Arc::new(Libp2pMeshTransport::new(config).unwrap()),
+        Arc::new(Libp2pMeshTransport::new(config).await.unwrap()),
         directory,
     )
 }

@@ -228,7 +228,7 @@ bip39 = { version = "2", features = ["rand"] }
 libp2p = { version = "0.56", features = [
     "tokio", "tcp", "noise", "yamux", "ed25519",
     "kad", "gossipsub", "relay", "dcutr", "identify", "ping",
-    "request-response", "cbor", "macros",
+    "request-response", "cbor", "macros", "websocket", "dns",
 ] }
 
 # Internal workspace crates
