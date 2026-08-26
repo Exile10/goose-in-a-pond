@@ -68,11 +68,11 @@ pub struct SwarmHandles {
     pub task: JoinHandle<()>,
 }
 
-pub fn spawn(config: Libp2pMeshTransportConfig) -> anyhow::Result<SwarmHandles> {
+pub async fn spawn(config: Libp2pMeshTransportConfig) -> anyhow::Result<SwarmHandles> {
     let local_handshake_bytes =
         build_local_handshake(&config.keypair, config.harness_hash, config.model_hash)
             .encode_to_vec();
-    let swarm = build_swarm(config.keypair, config.listen_addr)?;
+    let swarm = build_swarm(config.keypair, config.listen_addr).await?;
 
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
@@ -110,11 +110,36 @@ fn build_local_handshake(
     Handshake::new(keypair.peer_id(), harness, model, signature)
 }
 
-fn build_swarm(
+/// The port a WebSocket listener binds to, alongside the plain-TCP one.
+///
+/// A raw TCP mesh connection can't cross a plain HTTP/TLS tunnel (the free
+/// tunnel services that don't need port-forwarding or an account only proxy
+/// HTTP/WS) — WebSocket is the transport that can. Offset from the TCP port
+/// rather than independently derived, so the same "stable per identity"
+/// property applies without a second derivation; `0` stays `0` (OS-assigned,
+/// what the test suite's dynamic ports need) since `0 + 1 = 1` is a
+/// privileged port no test process can bind.
+fn ws_port_for(tcp_port: u16) -> u16 {
+    if tcp_port == 0 { 0 } else { tcp_port + 1 }
+}
+
+async fn build_swarm(
     keypair: MeshKeypair,
     listen_addr: Multiaddr,
 ) -> anyhow::Result<Swarm<MeshBehaviour>> {
     let libp2p_keypair = to_libp2p_keypair(&keypair);
+
+    let tcp_port = listen_addr
+        .iter()
+        .find_map(|p| match p {
+            Protocol::Tcp(port) => Some(port),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let ws_listen_addr: Multiaddr =
+        format!("/ip4/0.0.0.0/tcp/{}/ws", ws_port_for(tcp_port))
+            .parse()
+            .expect("valid multiaddr literal");
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(libp2p_keypair)
         .with_tokio()
@@ -123,6 +148,8 @@ fn build_swarm(
             noise::Config::new,
             yamux::Config::default,
         )?
+        .with_websocket(noise::Config::new, yamux::Config::default)
+        .await?
         .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(|local_keypair, relay_client| {
             let peer_id = local_keypair.public().to_peer_id();
@@ -160,6 +187,7 @@ fn build_swarm(
 
     swarm.behaviour_mut().kad.set_mode(Some(kad::Mode::Server));
     swarm.listen_on(listen_addr)?;
+    swarm.listen_on(ws_listen_addr)?;
     Ok(swarm)
 }
 
