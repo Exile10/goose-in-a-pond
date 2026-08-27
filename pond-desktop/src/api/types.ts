@@ -707,6 +707,19 @@ export interface ModelEntry {
   config_filename?: string;
 }
 
+/** GET /api/v1/warmup — the boot/model-change prefix warm-up (see Agent::prewarm). */
+export interface WarmupStatus {
+  /** warming | ready | skipped | failed */
+  state: "warming" | "ready" | "skipped" | "failed";
+  /** Present on skipped/failed. */
+  reason?: string;
+  /** Chat model the warm-up ran against ("" before the first run). */
+  model: string;
+  started_unix_ms: number;
+  finished_unix_ms: number | null;
+  elapsed_ms: number;
+}
+
 export interface ModelMemoryStatus {
   total_mb: number;
   available_for_llm_mb: number;

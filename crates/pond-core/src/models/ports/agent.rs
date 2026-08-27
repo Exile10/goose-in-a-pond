@@ -1,6 +1,8 @@
 use crate::models::domain::model_capabilities::ModelCapabilities;
 use crate::models::services::context::prefix_cache::PrefixCacheState;
-pub use crate::shared::domain::agent::{AgentRequest, AgentResponse, AgentStreamEvent};
+pub use crate::shared::domain::agent::{
+    AgentRequest, AgentResponse, AgentStreamEvent, WarmupPhase,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -87,6 +89,37 @@ pub trait Agent: Send + Sync {
     /// moved on.
     fn prefix_cache_state(&self) -> Option<PrefixCacheState> {
         None
+    }
+
+    /// Precompile the static prompt prefix into the engine's KV cache, before
+    /// the user's first message.
+    ///
+    /// A cold first turn pays model load plus a multi-thousand-token preamble
+    /// prefill (measured: ~12 s on the Mac at 61 tools, ~5 s on the Orin) while
+    /// the user watches. The prefix is knowable the moment settings are — so an
+    /// implementation runs one throwaway generation at startup or on a model
+    /// change, and the first real turn hits the engine's `ReusePrefix` path
+    /// instead.
+    ///
+    /// `voice_mode` must match the surface being warmed: the voice prompt
+    /// renders its own section, so a prefix warmed for chat does not serve a
+    /// voice session, and vice versa.
+    ///
+    /// `progress` is called on phase transitions (`Warming`, then exactly one
+    /// of `Ready`/`Skipped`/`Failed`). It must be cheap and must not block.
+    ///
+    /// The default reports `Skipped` and does nothing — the CORRECT
+    /// implementation for every agent without a prefix-caching engine (mocks,
+    /// HTTP providers). Failure is never propagated: a pond that could not
+    /// warm is a pond that behaves exactly as it did before this existed.
+    async fn prewarm(
+        &self,
+        _voice_mode: bool,
+        progress: std::sync::Arc<dyn Fn(WarmupPhase) + Send + Sync>,
+    ) {
+        progress(WarmupPhase::Skipped {
+            reason: "this agent keeps no prefix cache".to_string(),
+        });
     }
 }
 
