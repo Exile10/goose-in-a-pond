@@ -92,10 +92,38 @@ const GOOSE_EMPTY_TURN_MESSAGE: &str =
 /// How many times GIAP re-engages the model after a turn that produced no text
 /// and no tool call.
 ///
-/// Deliberately small: each attempt is a full turn, and on-device that is a real
-/// wait. Two buys the recovery without turning a bad turn into a minute of
+/// Deliberately small: each attempt is a real full turn, and on-device that is a
+/// real wait. Two buys the recovery without turning a bad turn into a minute of
 /// silence.
 const MAX_EMPTY_TURN_REENGAGEMENTS: usize = 2;
+
+/// GIAP's own tag names, injected into every turn's `<system-context>` (see
+/// `goose_agent.rs`'s `user_text` construction). None of them can ever be a
+/// legitimate answer — nobody asks a question shaped like
+/// `<answer-contract>...</answer-contract>` — so any of them surviving into
+/// the model's VISIBLE output means it echoed scaffolding instead of
+/// following it, not that it answered.
+const SCAFFOLD_TAGS: &[&str] = &[
+    "<system-context>",
+    "<user-message>",
+    "<answer-contract>",
+    "<memories>",
+    "<turn-context>",
+];
+
+/// Whether `text` — a turn's visible output, already checked non-empty — is
+/// GIAP's own prompt scaffolding leaking back out rather than an answer.
+///
+/// Observed in the wild over a mesh-borrowed model: asked "when is today?", it
+/// replied `<answer-contract> When is today? </answer-contract>` — the
+/// wrapper tag name from the prompt, with the user's own question stuffed
+/// inside instead of the worked example's answer shape. That is exactly as
+/// useless to the user as [`GOOSE_EMPTY_TURN_MESSAGE`], so it gets the same
+/// treatment: swallowed and re-engaged, not shown.
+fn looks_like_leaked_scaffold(text: &str) -> bool {
+    let trimmed = text.trim();
+    SCAFFOLD_TAGS.iter().any(|tag| trimmed.contains(tag))
+}
 
 /// Appended to the user message when re-engaging after an empty turn.
 ///
@@ -4472,6 +4500,16 @@ impl GooseAdapter {
                                         session_id = %session_id,
                                         "goose reported an empty turn",
                                     );
+                                } else if !raw_text.is_empty() && looks_like_leaked_scaffold(&raw_text) {
+                                    // The model echoed one of GIAP's own prompt tags
+                                    // instead of answering — as useless to the user as
+                                    // an empty turn, so it gets the same recovery path
+                                    // rather than being shown.
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        leaked = %raw_text,
+                                        "model echoed internal scaffolding instead of answering",
+                                    );
                                 } else if !raw_text.is_empty() {
                                     // Goose signals "budget exhausted" by streaming a
                                     // fixed sentence as ordinary assistant text (see
@@ -7708,6 +7746,38 @@ mod tests {
             "The model returned an empty response. Please resend your message to continue."
         );
         assert_ne!(GOOSE_EMPTY_TURN_MESSAGE, EMPTY_TURN_EXHAUSTED_MESSAGE);
+    }
+
+    /// The exact failure observed over a mesh-borrowed model: asked "when is
+    /// today?", it echoed the wrapper tag with the question stuffed inside
+    /// instead of answering. Reproduced verbatim so a fix can't quietly stop
+    /// catching the real case it was written for.
+    #[test]
+    fn a_leaked_answer_contract_tag_is_recognised() {
+        assert!(looks_like_leaked_scaffold(
+            "<answer-contract> When is today? </answer-contract>"
+        ));
+    }
+
+    /// Every scaffold tag GIAP injects is covered, not just the one observed —
+    /// a model that leaks a different one must not slip through.
+    #[test]
+    fn every_injected_scaffold_tag_is_recognised() {
+        for tag in SCAFFOLD_TAGS {
+            let leaked = format!("some preamble {tag} and more");
+            assert!(looks_like_leaked_scaffold(&leaked), "tag: {tag}");
+        }
+    }
+
+    /// A real answer that happens to mention something in prose must not be
+    /// mistaken for leaked scaffolding — only GIAP's own bracketed tag names
+    /// trip this, not ordinary words.
+    #[test]
+    fn an_ordinary_answer_is_not_mistaken_for_leaked_scaffolding() {
+        assert!(!looks_like_leaked_scaffold("The sky is blue on a clear day."));
+        assert!(!looks_like_leaked_scaffold(
+            "Today's context and your message history look fine."
+        ));
     }
 
     /// The knob set doubles as the change signature that gates `set_var`, so a

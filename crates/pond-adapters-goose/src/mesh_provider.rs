@@ -24,9 +24,27 @@
 //! model would spend its answer reasoning about which tool to reach for, or
 //! announcing that none were needed, instead of just answering — a real
 //! chat turn returning "no tools or memory are needed for this question"
-//! instead of an answer is this exact failure. [`NO_TOOLS_OVER_MESH_NOTICE`]
-//! is appended to `system` whenever this happens, telling the model plainly
-//! that the tools it was just described no longer exist this turn.
+//! instead of an answer is this exact failure.
+//!
+//! [`NO_TOOLS_OVER_MESH_NOTICE`] tells the model plainly that the tools it
+//! was just described no longer exist this turn — appended to the LAST
+//! message, not `system`. That is not incidental: `answer_contract()`
+//! (`pond-core`) is deliberately placed last inside `<system-context>`,
+//! immediately before `<user-message>`, on the documented finding that an
+//! instruction surviving to generation depends on how close it sits to
+//! it — `system` comes first in the prompt and is exactly the position that
+//! decays worst. A turn with no tools offered in the first place needs no
+//! override, so `messages` reaches the peer byte-for-byte in that case.
+//!
+//! Measured against a real mesh peer (a slower, Jetson-class lender): even
+//! trivial turns like "say hi" can still produce an empty first attempt, and
+//! `system` itself is lean (~2.3K chars for 62 tools — the tool JSON schemas
+//! live entirely in the dropped structured `tools` argument, never baked
+//! into prompt text). The failure is behavioral, not prompt size: a bare
+//! completion call has none of Goose's harness holding the model to a clean
+//! final answer, so nothing here should be mistaken for a fix to that —
+//! only for making the one instruction mesh depends on survive as well as
+//! this codebase already knows how.
 
 use std::sync::Arc;
 
@@ -40,13 +58,21 @@ use pond_core::models::domain::message::{ChatMessage, Role};
 use pond_core::models::ports::provider::{LlmProvider, StreamToken};
 use rmcp::model::Tool;
 
-/// Appended to `system` whenever `tools` is non-empty and about to be
-/// dropped, so the borrowed model is told plainly that the tools it was just
-/// described no longer work this turn — instead of silently discovering it
-/// mid-answer and narrating that discovery instead of replying.
+/// Appended to the last message whenever `tools` is non-empty and about to
+/// be dropped, so the borrowed model is told plainly that the tools it was
+/// just described no longer work this turn — instead of silently
+/// discovering it mid-answer and narrating that discovery instead of
+/// replying.
+///
+/// Spelled out negatively as well as positively (not just "answer plainly"
+/// but "do not use tags / do not narrate") because both leaked failures
+/// observed were about FORM, not just content: one echoed `<answer-contract>`
+/// verbatim with the question stuffed inside, the other narrated a decision
+/// about tools instead of making one.
 const NO_TOOLS_OVER_MESH_NOTICE: &str = "\n\n(Tool calls and memory search are not available for \
-this response — it is running on a borrowed peer over the mesh. Answer directly from the \
-conversation so far. Do not attempt to call a tool or describe deciding whether one is needed.)";
+this response — it is running on a borrowed peer over the mesh. Answer directly and briefly, in \
+plain prose. Do not call a tool, do not describe deciding whether one is needed, and do not use or \
+repeat any angle-bracket tags — write only the answer itself.)";
 
 pub struct MeshProvider {
     inner: Arc<dyn LlmProvider>,
@@ -88,9 +114,9 @@ impl Provider for MeshProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
-        let chat_messages: Vec<ChatMessage> =
+        let mut chat_messages: Vec<ChatMessage> =
             messages.iter().map(Self::from_goose_message).collect();
-        let mut system = system.to_string();
+        let system = system.to_string();
         if !tools.is_empty() {
             tracing::debug!(
                 tool_count = tools.len(),
@@ -103,7 +129,18 @@ impl Provider for MeshProvider {
             // model would reason out loud about which tool to reach for, or
             // announce that none were needed, instead of just answering,
             // because as far as its prompt is concerned they still exist.
-            system.push_str(NO_TOOLS_OVER_MESH_NOTICE);
+            //
+            // Appended to the LAST message, not `system` — see the module
+            // docs on why position matters this much for a small model.
+            // `messages` is never empty for a real turn (it always carries at
+            // least the current user turn), but an empty conversation falls
+            // back to `system` rather than silently dropping the notice.
+            match chat_messages.last_mut() {
+                Some(last) => last.content.push_str(NO_TOOLS_OVER_MESH_NOTICE),
+                None => {
+                    chat_messages.push(ChatMessage::user(NO_TOOLS_OVER_MESH_NOTICE.trim_start()))
+                }
+            }
         }
         // Owned clones moved into the generator below so the returned stream
         // is 'static (Goose's `MessageStream` alias carries no lifetime) —
@@ -225,17 +262,19 @@ mod tests {
         assert!(saw_usage, "expected a terminal usage item");
     }
 
-    /// Records the `system_prompt` it was called with, so tests can assert on
-    /// what actually reached the "model" rather than just that the call
-    /// succeeded.
+    /// Records the `system_prompt` and `messages` it was called with, so
+    /// tests can assert on what actually reached the "model" rather than
+    /// just that the call succeeded.
     struct CapturingProvider {
         seen_system: std::sync::Mutex<Option<String>>,
+        seen_messages: std::sync::Mutex<Option<Vec<ChatMessage>>>,
     }
 
     impl CapturingProvider {
         fn new() -> Self {
             Self {
                 seen_system: std::sync::Mutex::new(None),
+                seen_messages: std::sync::Mutex::new(None),
             }
         }
     }
@@ -245,9 +284,10 @@ mod tests {
         async fn complete(
             &self,
             system_prompt: &str,
-            _messages: Vec<ChatMessage>,
+            messages: Vec<ChatMessage>,
         ) -> anyhow::Result<ChatMessage> {
             *self.seen_system.lock().unwrap() = Some(system_prompt.to_string());
+            *self.seen_messages.lock().unwrap() = Some(messages);
             Ok(ChatMessage::assistant("ok"))
         }
 
@@ -256,12 +296,17 @@ mod tests {
         }
     }
 
-    /// The exact failure this notice exists for: `system` names tools that
+    /// The exact failure this notice exists for: the prompt names tools that
     /// `tools: &[Tool]` is about to make non-functional. Without the notice,
     /// the borrowed model reasons about — or announces — tool use that can
     /// never happen, instead of just answering.
+    ///
+    /// Appended to the LAST message, not `system` — see the module docs on
+    /// why: an instruction survives a small model's attention better the
+    /// closer it sits to generation, and `system` is the position furthest
+    /// from it.
     #[tokio::test]
-    async fn a_nonempty_tools_list_gets_a_no_tools_notice_appended_to_system() {
+    async fn a_nonempty_tools_list_gets_a_no_tools_notice_appended_to_the_last_message() {
         let provider = Arc::new(CapturingProvider::new());
         let mesh_provider = MeshProvider::new(provider.clone());
         let cfg = ModelConfig::new("mesh");
@@ -278,18 +323,30 @@ mod tests {
             .unwrap();
         while stream.next().await.is_some() {}
 
-        let seen = provider.seen_system.lock().unwrap().clone().unwrap();
-        assert!(seen.starts_with("You are helpful. You have access to: device_control."));
+        let seen_system = provider.seen_system.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            seen_system, "You are helpful. You have access to: device_control.",
+            "system must reach the peer unmodified — the notice belongs on the last message"
+        );
+
+        let seen_messages = provider.seen_messages.lock().unwrap().clone().unwrap();
+        let last = seen_messages.last().expect("at least one message");
         assert!(
-            seen.contains("not available for this response"),
-            "expected the no-tools-over-mesh notice, got: {seen}"
+            last.content.starts_with("turn off the lights"),
+            "the original ask must survive: {}",
+            last.content
+        );
+        assert!(
+            last.content.contains("not available for this response"),
+            "expected the no-tools-over-mesh notice on the last message, got: {}",
+            last.content
         );
     }
 
     /// A turn with no tools offered in the first place needs no override —
-    /// `system` reaches the peer byte-for-byte.
+    /// both `system` and the last message reach the peer byte-for-byte.
     #[tokio::test]
-    async fn an_empty_tools_list_leaves_system_untouched() {
+    async fn an_empty_tools_list_leaves_the_conversation_untouched() {
         let provider = Arc::new(CapturingProvider::new());
         let mesh_provider = MeshProvider::new(provider.clone());
         let cfg = ModelConfig::new("mesh");
@@ -300,8 +357,11 @@ mod tests {
             .unwrap();
         while stream.next().await.is_some() {}
 
-        let seen = provider.seen_system.lock().unwrap().clone().unwrap();
-        assert_eq!(seen, "You are helpful.");
+        let seen_system = provider.seen_system.lock().unwrap().clone().unwrap();
+        assert_eq!(seen_system, "You are helpful.");
+
+        let seen_messages = provider.seen_messages.lock().unwrap().clone().unwrap();
+        assert_eq!(seen_messages.last().unwrap().content, "hi");
     }
 
     #[tokio::test]
