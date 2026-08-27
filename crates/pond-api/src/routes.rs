@@ -110,6 +110,10 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/onboard/reset", post(reset_onboarding))
         // Settings write is public so onboarding steps can save before completion
         .route("/settings", put(update_settings))
+        // Prefix warm-up status: is the pond ready for a first message yet.
+        // Public and read-only for the same reason /settings write is public —
+        // the desktop shows it before onboarding-gated auth exists.
+        .route("/warmup", get(get_warmup))
         // ── Time and place ────────────────────────────────────────────────
         // One catalogue and one detection, so the three screens that ask
         // "where is this pond" stop each answering it differently. Public
@@ -4596,6 +4600,13 @@ async fn update_settings(
         }
     }
 
+    // A provider or model change makes the engine's warmed prefix stale, so
+    // re-run the warm-up in the background. Fire-and-forget: the save must not
+    // wait on a model load.
+    if current.chat_provider != merged.chat_provider || current.chat_model != merged.chat_model {
+        crate::spawn_prefix_prewarm(state.clone(), false);
+    }
+
     // Return the full merged Settings so the frontend can sync its local state
     // without a second GET request.
     //
@@ -4610,6 +4621,29 @@ async fn update_settings(
     Ok(Json(
         serde_json::to_value(&merged).unwrap_or(json!({ "status": "ok" })),
     ))
+}
+
+/// Prefix warm-up status for the boot banner and voice greeting gate.
+async fn get_warmup(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let snapshot = state
+        .warmup
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let elapsed_ms = match (snapshot.started_unix_ms, snapshot.finished_unix_ms) {
+        (0, _) => 0,
+        (s, Some(f)) => f.saturating_sub(s),
+        (s, None) => now.saturating_sub(s),
+    };
+    let mut v = serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("elapsed_ms".into(), json!(elapsed_ms));
+    }
+    Json(v)
 }
 
 /// Current conditions + short forecast for the dashboard weather widget.

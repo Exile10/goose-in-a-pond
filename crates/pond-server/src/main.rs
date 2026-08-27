@@ -3936,6 +3936,7 @@ async fn run_server(
         session_storage,
         http_client: reqwest::Client::new(),
         agent,
+        warmup: Default::default(),
         llm_provider,
         llamafile_url: llamafile_url.clone(),
         tts,
@@ -4162,6 +4163,13 @@ async fn run_server(
     }
 
     // Build router
+    // Precompile the static prompt prefix before the first message arrives:
+    // the model load and the multi-thousand-token preamble prefill move to
+    // boot, and turn 1 hits the engine's ReusePrefix path. Progress is
+    // mirrored into `state.warmup` for GET /api/v1/warmup (the UI's boot
+    // banner); the settings handler re-runs this on a provider/model change.
+    pond_api::spawn_prefix_prewarm(state.clone(), false);
+
     let app = pond_api::build_router(state, static_dir);
 
     // Resolve hostname — strip trailing ".local" if the OS already appended it
@@ -4815,6 +4823,7 @@ async fn run_chat(
         }
     }
 
+    let warm_agent = agent.clone();
     let mut chat_service = ChatService::new(agent, session_id.clone(), storage)
         .with_system_prompt(system_prompt)
         .with_thinking_tone(settings.voice_thinking_tone_enabled);
@@ -5177,7 +5186,7 @@ async fn run_chat(
             tts_unavailable(&reason)
         }
     };
-    chat_service = chat_service.with_voice_output(voice_out);
+    chat_service = chat_service.with_voice_output(voice_out.clone());
 
     // The console is deliberately near-silent from here on (tracing is pinned
     // to WARN for it), so point at the file that is not — every detail of the
@@ -5187,6 +5196,56 @@ async fn run_chat(
         "  Log      {}",
         data_dir.join("logs").join("pond.log").display()
     );
+
+    // ── Prefix warm-up + spoken readiness ─────────────────────────────────────
+    // The voice child used to pay model load + preamble prefill on the FIRST
+    // utterance, with the user already mid-sentence. Move that cost to session
+    // start, say so aloud while it runs, and greet by name when the pond is
+    // ready — the greeting doubles as the audible "you can speak now" signal.
+    // Under --json-events every spoken line goes through `voice_out`, which is
+    // SilentOutput when no TTS engine is up, so stdout stays pure NDJSON.
+    {
+        use pond_core::models::ports::agent::WarmupPhase;
+        use pond_core::shared::domain::agent::WorkflowEvent;
+        let will_warm = effective_provider != "mock"
+            && matches!(settings.chat_provider.as_str(), "local" | "gguf")
+            && std::env::var("POND_DISABLE_PREWARM").as_deref() != Ok("1");
+        if will_warm {
+            if json_events {
+                write_ndjson_line(&WorkflowEvent::Warmup {
+                    state: "warming".to_string(),
+                });
+            }
+            let _ = voice_out.speak("Warming up.").await;
+            let last = Arc::new(std::sync::Mutex::new(None::<WarmupPhase>));
+            let sink = last.clone();
+            warm_agent
+                .prewarm(
+                    true, // voice prompt: the warmed prefix must match voice turns
+                    Arc::new(move |phase| {
+                        *sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(phase);
+                    }),
+                )
+                .await;
+            let state = match last.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                Some(WarmupPhase::Ready) => "ready",
+                Some(WarmupPhase::Skipped { .. }) => "skipped",
+                _ => "failed",
+            };
+            if json_events {
+                write_ndjson_line(&WorkflowEvent::Warmup {
+                    state: state.to_string(),
+                });
+            }
+        }
+        let name = settings.user_name.trim();
+        let greeting = if name.is_empty() {
+            "Hi, ready to take your first request.".to_string()
+        } else {
+            format!("Hi {name}, ready to take your first request.")
+        };
+        let _ = voice_out.speak(&greeting).await;
+    }
 
     // ── Emit `ready` (contract) ────────────────────────────────────────────────
     // All models are loaded and every adapter is wired; announce readiness

@@ -2331,6 +2331,9 @@ impl ChatService {
             WorkflowEvent::Ready { session_id } => {
                 tracing::debug!(session_id = %session_id, "Voice session ready");
             }
+            WorkflowEvent::Warmup { state } => {
+                tracing::debug!("Prefix warm-up: {}", state);
+            }
             WorkflowEvent::Transcript { text } => {
                 tracing::debug!("Transcript: {}", text);
             }

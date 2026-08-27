@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { WarmupBanner } from "../components/WarmupBanner";
 import { ArrowLeft, ArrowUp, Brain, Check, ChevronDown, Copy, Cpu, Loader2, Paperclip, Pencil, PenSquare, PlayCircle, RefreshCw, ThumbsDown, ThumbsUp, Wand2, Wrench, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
@@ -922,6 +923,7 @@ export function Chat() {
         ? ({ "--open-x": `${openOrigin.x}px`, "--open-y": `${openOrigin.y}px` } as React.CSSProperties)
         : undefined}
     >
+      <WarmupBanner />
       {/* Header — what this conversation is, and the way back to the others.
           The assistant's name and status used to live here; neither told you
           anything you could act on, and the status is already in the sidebar.

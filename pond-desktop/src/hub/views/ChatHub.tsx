@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { WarmupBanner } from "../../components/WarmupBanner";
 import { Paperclip } from "lucide-react";
 import { api } from "../../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../../state/AppContext";
@@ -375,6 +376,7 @@ export function ChatHubView() {
 
   return (
     <div className="chat2">
+      <WarmupBanner />
       {/* Header */}
       <header className="chat2__head">
         <div className="chat2__id">

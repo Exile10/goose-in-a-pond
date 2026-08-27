@@ -9,7 +9,7 @@ use goose::session::SessionManager;
 use pond_core::mcp::ports::tools::tool_registry::ToolRegistryPort;
 use pond_core::models::domain::model_record::{ModelCategory, ModelRecord};
 use pond_core::models::ports::agent::{
-    Agent as AgentPort, AgentRequest, AgentResponse, AgentStreamEvent,
+    Agent as AgentPort, AgentRequest, AgentResponse, AgentStreamEvent, WarmupPhase,
 };
 use pond_core::models::ports::embedding::EmbeddingProvider;
 use pond_core::models::ports::model_repository::ModelRepository;
@@ -4703,6 +4703,112 @@ impl GooseAdapter {
 
 #[async_trait]
 impl AgentPort for GooseAdapter {
+    /// Precompile the static prefix: one throwaway generation through the
+    /// REAL turn path (shim-enforced system, session-loaded tools, the
+    /// engine's own chat template), so the retained `SessionKv` afterwards
+    /// holds exactly the tokens turn 1 will open with. `prefill_plan` then
+    /// grants `ReusePrefix` at the first real message and the user pays only
+    /// the suffix.
+    ///
+    /// A fresh session id per call keeps the warm-up conversation empty —
+    /// reusing one id would replay its own past markers into the prompt and
+    /// prefill garbage that matches nothing.
+    ///
+    /// Skips unless the active provider is `local`/`gguf` (nothing to warm
+    /// elsewhere) or when `POND_DISABLE_PREWARM=1`.
+    async fn prewarm(
+        &self,
+        voice_mode: bool,
+        progress: std::sync::Arc<dyn Fn(WarmupPhase) + Send + Sync>,
+    ) {
+        if std::env::var("POND_DISABLE_PREWARM").as_deref() == Ok("1") {
+            progress(WarmupPhase::Skipped {
+                reason: "POND_DISABLE_PREWARM=1".to_string(),
+            });
+            return;
+        }
+        let settings = self.settings_repo.get().await.unwrap_or_default();
+        if !matches!(settings.chat_provider.as_str(), "local" | "gguf") {
+            progress(WarmupPhase::Skipped {
+                reason: format!(
+                    "provider '{}' keeps no local prefix cache",
+                    settings.chat_provider
+                ),
+            });
+            return;
+        }
+
+        progress(WarmupPhase::Warming);
+        let started = std::time::Instant::now();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default();
+        let request = AgentRequest {
+            message: "Warm-up ping. Reply with only: ok".to_string(),
+            session_id: format!("prewarm-{stamp}"),
+            model_role: "chat".to_string(),
+            images: Vec::new(),
+            voice_mode,
+            canvas_mode: false,
+            // Household scope + no profile: the static prefix is
+            // speaker-independent by design (per-speaker context rides the
+            // user message), so this warm prefix serves every member.
+            profile_scope: ProfileScope::household(),
+            profile_context: None,
+        };
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            let mut stream = self.chat_stream(request).await?;
+            use futures::StreamExt;
+            while let Some(event) = stream.next().await {
+                // Errors mid-stream end the warm-up; events themselves are
+                // discarded — the point is the prefill, not the reply.
+                event?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match outcome {
+            Ok(Ok(())) => {
+                tracing::info!(
+                    target: "giap::trace",
+                    kind = "prefix_prewarm",
+                    elapsed_ms,
+                    voice_mode,
+                    model = %settings.chat_model,
+                    "static prefix precompiled; first turn will reuse it"
+                );
+                progress(WarmupPhase::Ready);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "giap::trace",
+                    kind = "prefix_prewarm",
+                    elapsed_ms,
+                    error = %e,
+                    "prefix warm-up failed; first turn pays the full prefill"
+                );
+                progress(WarmupPhase::Failed {
+                    reason: e.to_string(),
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "giap::trace",
+                    kind = "prefix_prewarm",
+                    elapsed_ms,
+                    "prefix warm-up timed out; the prefill may still have landed"
+                );
+                progress(WarmupPhase::Failed {
+                    reason: "timed out after 300s".to_string(),
+                });
+            }
+        }
+    }
+
     fn capabilities(&self) -> pond_core::models::domain::model_capabilities::ModelCapabilities {
         let mut caps = self
             .model_capabilities

@@ -1072,6 +1072,11 @@ export class PondApiClient {
     return this.get("/api/v1/models/memory-status");
   }
 
+  /** Prefix warm-up status — is the pond ready for a first message yet. */
+  getWarmupStatus(): Promise<import("./types").WarmupStatus> {
+    return this.get("/api/v1/warmup");
+  }
+
   getActiveRoles(): Promise<ModelActiveRoles> {
     // Backend may return { model_id: "provider/name" } for ASR/TTS instead of { provider, model }.
     // Normalize all roles to { provider, model } | null.
