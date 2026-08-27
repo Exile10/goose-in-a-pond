@@ -3,7 +3,19 @@ import { describe, expect, it } from "vitest";
 import { planControl } from "../src/mapping/control.js";
 import { describeNode } from "../src/mapping/describe.js";
 import { stateOf } from "../src/mapping/state.js";
-import { endpoint, laundryWasherNode, named, node } from "./fixtures.js";
+import {
+  bareLockNode,
+  coOnlyAlarmNode,
+  doorLockNode,
+  endpoint,
+  extendedColorLightNode,
+  laundryWasherNode,
+  named,
+  node,
+  smokeCoAlarmNode,
+  videoPlayerNode,
+  tunableWhiteNode,
+} from "./fixtures.js";
 
 /** The value reported for a name, or undefined if it was not reported at all. */
 function valueOf(n: Parameters<typeof stateOf>[0], name: string) {
@@ -42,6 +54,7 @@ describe("device state", () => {
     const described = describeNode(purifier);
     const settable = new Set(described.capabilities.map(c => c.setting ?? c.verb));
     const measured = new Set(described.sensors.map(s => s.sensor_type));
+    const reportedOnly = new Set(described.states.map(s => s.name));
 
     const reported = stateOf(purifier).values.map(v => v.name);
     // It has to report both kinds, or this passes by reporting nothing.
@@ -50,10 +63,160 @@ describe("device state", () => {
 
     for (const name of reported) {
       expect(
-        settable.has(name) || measured.has(name),
-        `'${name}' is reported but the description neither sets nor measures it`,
+        settable.has(name) || measured.has(name) || reportedOnly.has(name),
+        `'${name}' is reported but the description neither sets, measures nor reports it`,
       ).toBe(true);
     }
+  });
+
+  it("says where the door is, which the lock state cannot", () => {
+    // A bolt thrown into a frame standing open reports "locked" quite happily. Asked
+    // whether the door was shut, that answer is worse than no answer.
+    const lock = doorLockNode();
+
+    expect(valueOf(lock, "locked")).toBe("locked");
+    expect(valueOf(lock, "door")).toBe("open");
+    expect(valueOf(lock, "pin_required")).toBe("not required");
+  });
+
+  it("reads a door state matter.js decoded to its enum name", () => {
+    // Both encodings, for the reason the fan mode sequence reads both: a door reported
+    // as "DoorJammed" must not come out the same as a door that said nothing.
+    const jammed = node(46, [
+      named("Side Door"),
+      endpoint(1, { doorLock: { lockState: 1, doorState: "DoorJammed" } }, [0x000a]),
+    ]);
+
+    expect(valueOf(jammed, "door")).toBe("jammed");
+  });
+
+  it("declares a door it has no reading for yet, and reports nothing for it", () => {
+    // doorState is nullable in Matter, so a lock with a position sensor can have the
+    // attribute and no value in it. Describing it is right -- the device does report a
+    // door -- and inventing "closed" for the reading is not: an invented value cannot
+    // be told from a real one, and this is a door.
+    const unknown = node(47, [
+      named("Back Door"),
+      endpoint(1, { doorLock: { lockState: 1, doorState: null } }, [0x000a]),
+    ]);
+
+    expect(describeNode(unknown).states.map(s => s.name)).toContain("door");
+    expect(valueOf(unknown, "door")).toBeUndefined();
+  });
+
+  it("says nothing about a door a lock has no sensor for", () => {
+    // Absent rather than filled in: an invented "closed" cannot be told from a real one.
+    expect(valueOf(bareLockNode(), "door")).toBeUndefined();
+    expect(valueOf(bareLockNode(), "pin_required")).toBeUndefined();
+    expect(valueOf(bareLockNode(), "locked")).toBe("locked");
+  });
+
+  it("says what colour a light is, which it could not before", () => {
+    // `state` never touched ColorControl, so the only way to learn a light's colour was
+    // to change it -- the same failure the whole op exists to remove.
+    const light = extendedColorLightNode();
+
+    expect(valueOf(light, "color")).toBe("hue 0, saturation 0%");
+  });
+
+  it("reports a white bulb's temperature in kelvin, not mireds", () => {
+    // 370 mireds is 2703 K. Mireds are the cluster's unit; kelvin is the one a person
+    // says and the one `color_temp` is written in.
+    expect(valueOf(tunableWhiteNode(), "color_temp")).toBe("2703 K");
+  });
+
+  it("reports the colour mode the device is in, not every attribute it holds", () => {
+    // A bulb sitting at 2700K still carries whatever hue it was last set to. Reporting
+    // both makes the reading contradict itself -- "it is warm white" and "it is red".
+    const warm = node(54, [
+      named("Lamp"),
+      endpoint(1, {
+        colorControl: {
+          colorCapabilities: 0x19,
+          colorMode: 2,
+          currentHue: 200,
+          currentSaturation: 254,
+          colorTemperatureMireds: 370,
+        },
+      }, [0x010d]),
+    ]);
+
+    expect(valueOf(warm, "color_temp")).toBe("2703 K");
+    expect(valueOf(warm, "color")).toBeUndefined();
+  });
+
+  it("reads a colour mode matter.js decoded to its enum name", () => {
+    const named2 = node(55, [
+      named("Lamp"),
+      endpoint(1, {
+        colorControl: {
+          colorCapabilities: 0x19,
+          colorMode: "ColorTemperatureMireds",
+          colorTemperatureMireds: 250,
+        },
+      }, [0x010d]),
+    ]);
+
+    expect(valueOf(named2, "color_temp")).toBe("4000 K");
+  });
+
+  it("names every colour reading with a word the description also uses", () => {
+    // The invariant, applied to the new names: `color` and `color_temp` are both verbs
+    // `control` accepts, so a reading leads straight to the call that changes it.
+    for (const device of [extendedColorLightNode(), tunableWhiteNode()]) {
+      const settable = new Set(describeNode(device).capabilities.map(c => c.setting ?? c.verb));
+      for (const { name } of stateOf(device).values) {
+        expect(settable.has(name), `'${name}' is reported but not settable`).toBe(true);
+      }
+    }
+  });
+
+  it("says which alarm is sounding, not just a level", () => {
+    // The report this came from: asked for the states of an alarm expressing a CO alarm,
+    // GIAP answered "the current state is Critical" -- the SMOKE level, with no mention
+    // of carbon monoxide. Two dangers, two responses, and the attribute naming which one
+    // was the attribute nothing read.
+    const alarm = smokeCoAlarmNode();
+
+    expect(valueOf(alarm, "alarm")).toBe("co alarm");
+    expect(valueOf(alarm, "alarm_service")).toBe("normal");
+    expect(valueOf(alarm, "alarm_fault")).toBe("ok");
+  });
+
+  it("reads an expressed state matter.js decoded to its enum name", () => {
+    const named2 = node(73, [
+      named("Hall Alarm"),
+      endpoint(1, { smokeCoAlarm: { expressedState: "InterconnectSmoke" } }, [0x0076]),
+    ]);
+
+    expect(valueOf(named2, "alarm")).toBe("interconnected smoke alarm");
+  });
+
+  it("names every alarm reading with a word the description also uses", () => {
+    // The invariant, across a device whose readings and states are both new.
+    for (const device of [smokeCoAlarmNode(), coOnlyAlarmNode()]) {
+      const described = describeNode(device);
+      const settable = new Set(described.capabilities.map(c => c.setting ?? c.verb));
+      const measured = new Set(described.sensors.map(s => s.sensor_type));
+      const reported = new Set(described.states.map(s => s.name));
+
+      for (const { name } of stateOf(device).values) {
+        expect(
+          settable.has(name) || measured.has(name) || reported.has(name),
+          `'${name}' is reported but the description neither sets, measures nor reports it`,
+        ).toBe(true);
+      }
+    }
+  });
+
+  it("reports a television's volume, its playback and its input", () => {
+    const tv = videoPlayerNode();
+
+    expect(valueOf(tv, "volume")).toBe("50%");
+    expect(valueOf(tv, "brightness")).toBeUndefined();
+    expect(valueOf(tv, "operation")).toBe("playing");
+    expect(valueOf(tv, "input")).toBe("HDMI 1");
+    expect(valueOf(tv, "audio output")).toBe("TV Speaker");
   });
 
   it("reports what a device measures, not only what it can be told to be", () => {

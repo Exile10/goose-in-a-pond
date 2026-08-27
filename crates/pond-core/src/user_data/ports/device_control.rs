@@ -22,6 +22,10 @@ pub struct DeviceStatePatch {
     /// Brightness as a 0–100 percentage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub brightness: Option<u8>,
+    /// Speaker level as a 0–100 percentage. A different control from brightness, even
+    /// though Matter carries both on the same cluster — the endpoint says which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<u8>,
     /// Target temperature in degrees Celsius.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_temp: Option<f32>,
@@ -33,6 +37,12 @@ pub struct DeviceStatePatch {
     /// Colour saturation as a 0–100 percentage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub saturation: Option<u8>,
+    /// Colour temperature in KELVIN — warm white to cool white.
+    ///
+    /// Kelvin, not the cluster's mireds: kelvin is what a person says, and the
+    /// controller owns the conversion for the same reason it owns every other unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_temp: Option<u32>,
     /// Fan speed as a 0–100 percentage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fan_speed: Option<u8>,
@@ -117,6 +127,52 @@ pub struct DeviceDescription {
     pub capabilities: Vec<Capability>,
     /// What it measures, whether or not it has reported yet.
     pub sensors: Vec<SensorSpec>,
+    /// Manufacturer-specific controls: present, and not drivable.
+    ///
+    /// Deliberately not [`Capability`] entries — a capability is a verb
+    /// [`DeviceControlPort`] accepts, and there is none for these. They are carried
+    /// because the alternative reads worse than silence: a description listing power
+    /// and brightness for a device whose own app shows a third control states that
+    /// the third does not exist, and gets believed. Empty for all but a few devices.
+    #[serde(default)]
+    pub vendor_clusters: Vec<VendorCluster>,
+    /// What the device reports and nothing can set.
+    ///
+    /// The third kind of thing a device has. [`Capability`] is a verb this port
+    /// accepts; [`SensorSpec`] is a numeric measurement. A door's position is neither
+    /// — a word the lock reports, writable by nobody — so it fell through both, and a
+    /// lock that can say "jammed" or "forced open" was described as one boolean.
+    ///
+    /// Read-only by construction, not by convention. Every writable attribute on
+    /// Matter's DoorLock cluster is a security control, and a verb for one of them puts
+    /// a lock's security configuration one sentence of natural language away.
+    #[serde(default)]
+    pub states: Vec<StateSpec>,
+}
+
+/// Something a device reports under a name, which nothing can write.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateSpec {
+    /// The name [`DeviceControlPort::state`] reports it under.
+    pub name: String,
+    /// The words it takes. An enum here is the closed list of what `state` may say,
+    /// declared by the description so the two cannot drift.
+    pub value: ValueSpec,
+}
+
+/// A control the device has and nothing here can name.
+///
+/// An id and an endpoint is the whole of it, and deliberately so. Matter publishes no
+/// attribute names — "Flip-Flop" and "Emoticon" exist only in that maker's app — and a
+/// controller discovers no shape for a cluster it cannot name either, so there is not
+/// even a count of them to carry. Naming what is not there is how this class of bug
+/// started.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VendorCluster {
+    /// The 32-bit Matter cluster id, e.g. `0xfff1fc01`. Upper 16 bits are the vendor.
+    pub cluster_id: u32,
+    /// The endpoint carrying it, which is how a user tells two apart on one device.
+    pub endpoint: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -204,6 +260,25 @@ pub trait DeviceControlPort: Send + Sync {
         _saturation_percent: u8,
     ) -> Result<DeviceControlOutcome> {
         anyhow::bail!("device '{device_id}' does not support colour control")
+    }
+
+    /// Set a speaker's volume as a 0–100 percentage.
+    ///
+    /// Not brightness. Matter carries both on Level Control and the ENDPOINT's device
+    /// type says whose level it is: a composed television has a speaker endpoint, and
+    /// reporting its level as brightness offered a control that turned the sound down.
+    async fn set_volume(&self, device_id: &str, _percent: u8) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' has no speaker to set a volume on")
+    }
+
+    /// Set colour temperature in kelvin — warm white to cool white.
+    ///
+    /// Separate from [`Self::set_color`] because it is a separate control, not a second
+    /// way to reach the same one: 2700K white has no hue, so it cannot be asked for
+    /// through hue and saturation at all. A device offers one, the other, or both, and
+    /// `describe` says which.
+    async fn set_color_temp(&self, device_id: &str, _kelvin: u32) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' does not support colour temperature")
     }
 
     /// Set fan speed as a 0–100 percentage.

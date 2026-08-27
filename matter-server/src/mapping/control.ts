@@ -9,6 +9,8 @@
 
 import { OpError, type DeviceStatePatch, type Verb } from "../protocol.js";
 import {
+  levelIsBrightness,
+  speakerEndpoint,
   CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
   CLUSTER_FAN_CONTROL,
@@ -25,19 +27,34 @@ import { applianceSetpoint, targetSetpoint } from "./thermostat.js";
 // lives in protocol.ts and is re-exported here, where every caller already looks.
 export type { Verb };
 
-export const VERBS: ReadonlySet<string> = new Set<Verb>([
-  "power",
-  "brightness",
-  "target_temp",
-  "locked",
-  "color",
-  "fan_speed",
-  "fan_mode",
-  "position",
-  "tilt",
-  "mode",
-  "operation",
-]);
+/**
+ * Every verb, as a record rather than a list — so the COMPILER enforces coverage.
+ *
+ * `new Set<Verb>([...])` type-checks happily while missing an entry, and it did: adding
+ * `color_temp` to the union left it out of this set, and `server.ts` rejects any verb the
+ * set does not hold. The control was unreachable at the wire boundary while every unit
+ * test passed, because the tests call `planControl` directly and never cross it.
+ *
+ * A `Record<Verb, true>` cannot be missing a key. Add a verb to the union without adding
+ * it here and the build fails, which is the only guard that survives someone in a hurry.
+ */
+const ALL_VERBS: Record<Verb, true> = {
+  power: true,
+  brightness: true,
+  volume: true,
+  target_temp: true,
+  locked: true,
+  color: true,
+  color_temp: true,
+  fan_speed: true,
+  fan_mode: true,
+  position: true,
+  tilt: true,
+  mode: true,
+  operation: true,
+};
+
+export const VERBS: ReadonlySet<string> = new Set(Object.keys(ALL_VERBS));
 
 /** What the server must actually do to the device. */
 export type Action =
@@ -48,6 +65,89 @@ export interface Plan {
   actions: Action[];
   /** The state the device is in once the actions succeed. */
   applied: DeviceStatePatch;
+}
+
+/**
+ * What the device NOW reports for a verb, in the verb's own units.
+ *
+ * `applied` is supposed to be what the device did rather than what it was asked for —
+ * the protocol doc says so, and it is the reason the field exists at all. Until now only
+ * `operation` honoured it: every other verb echoed the request back, so a fan told to run
+ * at 85% reported 85% while the device had quantised it to its High mode and was sitting
+ * at 90. The number the user reads was the number they typed, which makes it worthless
+ * for noticing that anything happened at all.
+ *
+ * These are the verbs whose result can differ from the request: a value quantised onto a
+ * cluster's own scale, clamped to a device's stated limits, or still travelling. Power
+ * and lock are absent deliberately — a boolean cannot land somewhere else, so making
+ * them wait for a report would be latency bought for nothing.
+ *
+ * Read through the same inverses `state` reads with, so the number reported here is the
+ * number that would put the device back where it is.
+ */
+export function observedFor(node: NodeSnapshot, verb: Verb): DeviceStatePatch {
+  const at = (cluster: string, attribute: string): number | undefined => {
+    const raw = endpointWith(node, cluster)?.clusters[cluster]?.[attribute];
+    return typeof raw === "number" && Number.isFinite(raw) ? raw : undefined;
+  };
+
+  switch (verb) {
+    case "fan_speed": {
+      // percentCURRENT, not percentSetting: the setting is what was written, the current
+      // is what the fan is doing. Reading the setting back would echo the request with
+      // extra steps.
+      const pct = at(CLUSTER_FAN_CONTROL, "percentCurrent");
+      return pct === undefined ? {} : { fan_speed: clampPercent(pct) };
+    }
+    case "brightness": {
+      // Mirrors the split in `describe`: a television's Level Control belongs to its
+      // speaker, and reading it back as a brightness would report the volume under the
+      // wrong name -- the same confusion at the other end of the same command.
+      if (!levelIsBrightness(node)) return {};
+      const level = at(CLUSTER_LEVEL_CONTROL, "currentLevel");
+      return level === undefined ? {} : { brightness: levelToBrightness(level) };
+    }
+    case "volume": {
+      const speaker = speakerEndpoint(node);
+      const level = speaker?.clusters[CLUSTER_LEVEL_CONTROL]?.["currentLevel"];
+      return typeof level === "number" ? { volume: levelToBrightness(level) } : {};
+    }
+    case "color": {
+      const hue = at(CLUSTER_COLOR_CONTROL, "currentHue");
+      const saturation = at(CLUSTER_COLOR_CONTROL, "currentSaturation");
+      if (hue === undefined || saturation === undefined) return {};
+      return { hue: matterToHue(hue), saturation: matterToSaturation(saturation) };
+    }
+    case "color_temp": {
+      const mireds = at(CLUSTER_COLOR_CONTROL, "colorTemperatureMireds");
+      if (mireds === undefined) return {};
+      const kelvin = miredsToKelvin(mireds);
+      return kelvin > 0 ? { color_temp: kelvin } : {};
+    }
+    case "target_temp": {
+      // Whichever setpoint is live, by the same rule `target_temp` writes with: an
+      // appliance's own, or the thermostat setpoint its mode has running.
+      if (applianceSetpoint(node) !== undefined) {
+        const set = at("temperatureControl", "temperatureSetpoint");
+        return set === undefined ? {} : { target_temp: setpointToCelsius(set) };
+      }
+      const target = targetSetpoint(node);
+      const setpoint = target === undefined ? undefined : at(CLUSTER_THERMOSTAT, target.attribute);
+      return setpoint === undefined ? {} : { target_temp: setpointToCelsius(setpoint) };
+    }
+    case "position": {
+      const lift = at(CLUSTER_WINDOW_COVERING, "currentPositionLiftPercent100ths");
+      return lift === undefined ? {} : { position: lift100thsToPositionOpen(lift) };
+    }
+    case "tilt": {
+      const tilt = at(CLUSTER_WINDOW_COVERING, "currentPositionTiltPercent100ths");
+      return tilt === undefined ? {} : { tilt: lift100thsToPositionOpen(tilt) };
+    }
+    default:
+      // power, locked, fan_mode, mode, operation. `operation` has its own settle path
+      // in the controller; the rest cannot land on a value other than the one asked for.
+      return {};
+  }
 }
 
 // ── Unit conversions ─────────────────────────────────────────────────────────
@@ -61,6 +161,29 @@ export function brightnessToLevel(percent: number): number {
 /** Matter's 0-254 level back to a 0-100 GIAP percentage, for reading state. */
 export function levelToBrightness(level: number): number {
   return clampPercent((level * 100) / 254);
+}
+
+/**
+ * Kelvin onto ColorControl's mireds, and back.
+ *
+ * Mireds are reciprocal megakelvin — 1e6/K — so the mapping is its own inverse and the
+ * ORDER INVERTS: fewer mireds is a hotter, bluer white. Kelvin is what a person says
+ * ("2700K", "warm white") and mireds is what the cluster takes, which is the whole
+ * reason this conversion exists rather than the wire carrying mireds.
+ *
+ * Clamped to the cluster's own field range (1..0xfeff). Zero mireds is not a colour and
+ * would divide to infinity; the spec's own defaults include it, so it has to be handled
+ * rather than assumed away.
+ */
+export function kelvinToMireds(kelvin: number): number {
+  if (!Number.isFinite(kelvin) || kelvin <= 0) return 0xfeff;
+  return Math.min(0xfeff, Math.max(1, Math.round(1_000_000 / kelvin)));
+}
+
+/** Mireds back to kelvin, rounded to a whole degree — no device is that precise. */
+export function miredsToKelvin(mireds: number): number {
+  if (!Number.isFinite(mireds) || mireds <= 0) return 0;
+  return Math.round(1_000_000 / mireds);
 }
 
 /** Celsius onto a Matter thermostat setpoint (hundredths of a degree). */
@@ -80,10 +203,21 @@ export function hueToMatter(degrees: number): number {
   return Math.floor((wrapped * 254 + 180) / 360);
 }
 
+/** ColorControl's 0-254 hue back to degrees, for reading state. */
+export function matterToHue(raw: number): number {
+  const clamped = Math.min(254, Math.max(0, Math.round(raw)));
+  return Math.round((clamped * 360) / 254) % 360;
+}
+
 /** A 0-100 saturation percentage onto Matter's 0-254 scale. */
 export function saturationToMatter(percent: number): number {
   const pct = clampPercent(percent);
   return Math.floor((pct * 254 + 50) / 100);
+}
+
+/** Matter's 0-254 saturation back to a percentage. */
+export function matterToSaturation(raw: number): number {
+  return clampPercent((Math.min(254, Math.max(0, raw)) * 100) / 254);
 }
 
 /**
@@ -247,6 +381,32 @@ export function planControl(
       );
     }
 
+    case "volume": {
+      const pct = asPercent(value, "volume");
+      const speaker = speakerEndpoint(node);
+      if (speaker === undefined) {
+        throw new OpError(
+          "capability_unsupported",
+          `Matter device '${deviceId}' has no speaker to set a volume on`,
+        );
+      }
+      // The speaker's own Level Control, on the speaker's own endpoint. Written the same
+      // way brightness is because it is the same cluster and the same 0-254 scale -- what
+      // differs is whose level it is, and that is settled by the endpoint.
+      return {
+        actions: [
+          {
+            kind: "write",
+            endpoint: speaker.number,
+            cluster: CLUSTER_LEVEL_CONTROL,
+            attribute: "currentLevel",
+            value: brightnessToLevel(pct),
+          },
+        ],
+        applied: { volume: pct },
+      };
+    }
+
     case "brightness": {
       const pct = asPercent(value, "brightness");
       const endpoint = endpointFor(node, CLUSTER_LEVEL_CONTROL, deviceId);
@@ -337,6 +497,38 @@ export function planControl(
           { kind: "command", endpoint, cluster: CLUSTER_DOOR_LOCK, command: locked ? "lockDoor" : "unlockDoor", payload: {} },
         ],
         applied: { locked },
+      };
+    }
+
+    case "color_temp": {
+      if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+        throw new OpError(
+          "bad_request",
+          "color_temp needs a colour temperature in kelvin, e.g. 2700 for warm white",
+        );
+      }
+      const kelvin = value;
+      const endpoint = endpointFor(node, CLUSTER_COLOR_CONTROL, deviceId);
+      return {
+        actions: [
+          {
+            kind: "command",
+            endpoint,
+            cluster: CLUSTER_COLOR_CONTROL,
+            command: "moveToColorTemperature",
+            payload: {
+              colorTemperatureMireds: kelvinToMireds(kelvin),
+              transitionTime: 0,
+              optionsMask: {},
+              optionsOverride: {},
+            },
+          },
+        ],
+        // Reported as the kelvin the device will actually sit at, not the kelvin that
+        // was asked for: the round trip through mireds is lossy at whole-mired
+        // granularity, and echoing the request would overstate the precision by a few
+        // degrees at the warm end and rather more at the cool one.
+        applied: { color_temp: miredsToKelvin(kelvinToMireds(kelvin)) },
       };
     }
 

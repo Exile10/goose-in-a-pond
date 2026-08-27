@@ -61,7 +61,11 @@ export interface DeviceStatePatch {
   /** The operation that was run. */
   operation?: string;
   brightness?: number;
+  /** Speaker level as a 0-100 percentage. Not brightness: a different thing entirely. */
+  volume?: number;
   target_temp?: number;
+  /** Colour temperature in KELVIN, not the cluster's mireds. See the `color_temp` verb. */
+  color_temp?: number;
   locked?: boolean;
   hue?: number;
   saturation?: number;
@@ -91,15 +95,68 @@ export interface DeviceDescription {
   capabilities: Capability[];
   /** What it measures, whether or not it has reported yet. */
   sensors: SensorSpec[];
+  /**
+   * Manufacturer-specific clusters: seen, and not drivable.
+   *
+   * An id and an endpoint is the whole of what exists. matter.js discovers no shape
+   * for a cluster it cannot name, and Matter publishes no attribute names, so the
+   * words for these controls live only in the maker's own app. Carried anyway,
+   * because the alternative is worse than saying nothing: a description listing power
+   * and brightness for a device whose app shows a third control reads as a statement
+   * that the third control does not exist, and gets believed.
+   */
+  vendor_clusters: VendorClusterSpec[];
+  /**
+   * What the device reports and nothing can set.
+   *
+   * The third kind of thing a device has, and the one there was previously nowhere to
+   * put. `capabilities` are verbs `control` accepts; `sensors` are numeric
+   * measurements, carried on the same feed as `Reading`. A door's position is neither
+   * — a word the lock reports, writable by nobody — so it fell out of both, and a lock
+   * that could say "jammed" or "forced open" was described as a thing with one boolean.
+   *
+   * `value` declares the exact words `state` will use, so the two cannot drift.
+   */
+  states: StateSpec[];
+}
+
+export interface StateSpec {
+  /** The name `state` reports it under. */
+  name: string;
+  /** The words it takes. An enum here is a closed list of what `state` may say. */
+  value: ValueSpec;
+}
+
+export interface VendorClusterSpec {
+  /** The 32-bit cluster id, e.g. 0xfff1fc01. The upper 16 bits are the vendor code. */
+  cluster_id: number;
+  /** The endpoint carrying it, which is how a user tells two apart on one device. */
+  endpoint: number;
 }
 
 /** What a `control` op may ask a device to do. */
 export type Verb =
   | "power"
   | "brightness"
+  /**
+   * Speaker level, 0-100.
+   *
+   * Level Control on a SPEAKER endpoint is volume, and it was being reported as
+   * brightness — so "set the television's brightness to 20" turned the sound down.
+   * Same cluster, different device type, and the device type is what says which.
+   */
+  | "volume"
   | "target_temp"
   | "locked"
   | "color"
+  /**
+   * Colour temperature in kelvin — warm white to cool white.
+   *
+   * A separate verb from `color` because it is a separate control: 2700K white has
+   * no hue, so it cannot be asked for through hue and saturation at all. Offered
+   * only by a device whose `colorCapabilities` claims it.
+   */
+  | "color_temp"
   | "fan_speed"
   | "fan_mode"
   | "position"

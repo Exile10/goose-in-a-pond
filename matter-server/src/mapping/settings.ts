@@ -38,6 +38,15 @@ export interface Setting {
   cluster: string;
   values: string[];
   write: SettingWrite;
+  /**
+   * The attribute holding the live choice, where it is not the conventional one.
+   *
+   * ModeBase keeps it in `currentMode` and an attribute-written setting keeps it in the
+   * attribute it writes, which covered every setting until media arrived: MediaInput
+   * uses `currentInput` and AudioOutput `currentOutput`. Naming it here beats a second
+   * special case in the reader, which is how the first one got hardcoded.
+   */
+  current?: string;
   /** The number to send for a label, or undefined if the device never offered it. */
   valueFor: (choice: string) => number | undefined;
 }
@@ -51,6 +60,56 @@ export interface Operations {
 }
 
 const OPERATIONAL_STATE = "operationalState";
+const MEDIA_PLAYBACK = "mediaPlayback";
+const MEDIA_INPUT = "mediaInput";
+const AUDIO_OUTPUT = "audioOutput";
+
+/** MediaPlayback's PlaybackStateEnum, in the words a person would use. */
+const PLAYBACK_STATES: Record<number, string> = {
+  0: "playing",
+  1: "paused",
+  2: "not playing",
+  3: "buffering",
+};
+
+/**
+ * A media device's input or output list, as a chooseable setting.
+ *
+ * These are exactly the shape `mode` was built for and nothing was reading them: a named
+ * setting whose values are labels the DEVICE published, chosen by sending an index back.
+ * `inputList` gives "HDMI 1", "HDMI 2" because the television said so, the same way a
+ * washer's cycles are its own. Without this a TV's inputs were invisible and "switch to
+ * HDMI 2" had nothing to aim at.
+ */
+function mediaListSetting(
+  endpoint: EndpointSnapshot,
+  cluster: string,
+  attribute: string,
+  command: string,
+  name: string,
+): Setting | undefined {
+  const list = endpoint.clusters[cluster]?.[attribute];
+  if (!Array.isArray(list) || list.length === 0) return undefined;
+
+  const entries: { label: string; index: number }[] = [];
+  for (const entry of list) {
+    if (typeof entry !== "object" || entry === null) return undefined;
+    const label = (entry as { name?: unknown }).name;
+    const index = (entry as { index?: unknown }).index;
+    if (typeof label !== "string" || typeof index !== "number") return undefined;
+    entries.push({ label, index });
+  }
+
+  return {
+    name,
+    endpoint: endpoint.number,
+    cluster,
+    values: entries.map(e => e.label),
+    write: { kind: "command", command, field: "index" },
+    current: attribute === "inputList" ? "currentInput" : "currentOutput",
+    valueFor: choice => entries.find(e => looseEquals(e.label, choice))?.index,
+  };
+}
 
 /** OperationalStateEnum's own values, for a device that labels a state with nothing. */
 const STANDARD_STATES: Record<number, string> = {
@@ -231,6 +290,16 @@ export function settingsOf(node: NodeSnapshot): Setting[] {
       const mode = modeSetting(endpoint, cluster);
       if (mode !== undefined) settings.push(mode);
     }
+    const input = mediaListSetting(endpoint, MEDIA_INPUT, "inputList", "selectInput", "input");
+    if (input !== undefined) settings.push(input);
+    const output = mediaListSetting(
+      endpoint,
+      AUDIO_OUTPUT,
+      "outputList",
+      "selectOutput",
+      "audio output",
+    );
+    if (output !== undefined) settings.push(output);
     const temperature = temperatureLevelSetting(endpoint);
     if (temperature !== undefined) settings.push(temperature);
     const systemMode = systemModeSetting(endpoint);
@@ -305,7 +374,15 @@ function operationalStates(endpoint: EndpointSnapshot): Map<number, string> {
  */
 export function operationsOf(node: NodeSnapshot): Operations | undefined {
   const endpoint = applicationEndpoints(node).find(e => OPERATIONAL_STATE in e.clusters);
-  if (endpoint === undefined) return undefined;
+  if (endpoint === undefined) {
+    // A video player runs playback the way an appliance runs a cycle, and MediaPlayback
+    // names its commands play/pause/stop. The verb already sends whatever it is given on
+    // whichever cluster it is pointed at, so a television needs no new vocabulary --
+    // only somewhere for `operation` to aim.
+    const media = applicationEndpoints(node).find(e => MEDIA_PLAYBACK in e.clusters);
+    if (media === undefined) return undefined;
+    return { endpoint: media.number, cluster: MEDIA_PLAYBACK, values: ["play", "pause", "stop"] };
+  }
 
   const states = new Set(operationalStates(endpoint).values());
   const values: string[] = [];
@@ -331,7 +408,20 @@ export function operationsOf(node: NodeSnapshot): Operations | undefined {
  */
 export function observedOperation(node: NodeSnapshot): string | undefined {
   const endpoint = applicationEndpoints(node).find(e => OPERATIONAL_STATE in e.clusters);
-  if (endpoint === undefined) return undefined;
+  if (endpoint === undefined) {
+    // The media half, so a television's `operation` is settled against what it reports
+    // rather than the verb that was sent -- the same rule, for the same reason.
+    const media = applicationEndpoints(node).find(e => MEDIA_PLAYBACK in e.clusters);
+    if (media === undefined) return undefined;
+    const state = media.clusters[MEDIA_PLAYBACK]?.["currentState"];
+    if (typeof state === "number") return PLAYBACK_STATES[state];
+    if (typeof state === "string") {
+      // matter.js may decode the enum to its name, as everywhere else.
+      const key = state.toLowerCase().replace(/[\s_-]/g, "");
+      return Object.values(PLAYBACK_STATES).find(w => w.replace(/ /g, "") === key);
+    }
+    return undefined;
+  }
 
   const current = endpoint.clusters[OPERATIONAL_STATE]?.["operationalState"];
   if (typeof current !== "number") return undefined;

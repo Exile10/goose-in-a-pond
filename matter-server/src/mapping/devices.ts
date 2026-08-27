@@ -13,6 +13,7 @@ import {
   endpointWith,
   hasCluster,
   rootAttribute,
+  type EndpointSnapshot,
   type NodeSnapshot,
 } from "./snapshot.js";
 import { operationsOf, settingsOf } from "./settings.js";
@@ -30,6 +31,25 @@ export const CLUSTER_OCCUPANCY = "occupancySensing";
 export const CLUSTER_BOOLEAN_STATE = "booleanState";
 export const CLUSTER_TEMPERATURE = "temperatureMeasurement";
 export const CLUSTER_HUMIDITY = "relativeHumidityMeasurement";
+export const CLUSTER_SMOKE_CO_ALARM = "smokeCoAlarm";
+
+/** Matter's Speaker device type. Its Level Control is volume, not brightness. */
+export const SPEAKER_DEVICE_TYPE = 0x0022;
+
+/**
+ * The endpoint whose Level Control is a volume, if the device has one.
+ *
+ * A Basic Video Player is composed: the player on one endpoint, a Speaker on another,
+ * and Level Control lives on the speaker. Searching the node for the cluster found it
+ * and called it brightness, so a television advertised a brightness control that would
+ * have turned the sound down instead. The endpoint's own device type is what tells them
+ * apart, and it is already in the snapshot.
+ */
+export function speakerEndpoint(node: NodeSnapshot): EndpointSnapshot | undefined {
+  return applicationEndpoints(node).find(
+    e => e.deviceTypes.includes(SPEAKER_DEVICE_TYPE) && CLUSTER_LEVEL_CONTROL in e.clusters,
+  );
+}
 
 /**
  * Matter device type ids (Descriptor DeviceTypeList), grouped onto the GIAP types the
@@ -94,6 +114,79 @@ export function deviceTypeFromDescriptor(node: NodeSnapshot): string | undefined
   return undefined;
 }
 
+/** Local to this module: matter.js hands numbers over as numbers, or not at all. */
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Which colour controls the device says it has.
+ *
+ * `colorCapabilities` is a bitmap, and matter.js may hand it over decoded into named
+ * flags or as the raw number, so both are read — the same tolerance `fanModes` applies
+ * to `fanModeSequence`.
+ *
+ * Lives here rather than in `describe.ts` because both the short capability list and
+ * the description need it, and `describe.ts` already imports this module — the other
+ * direction would be a cycle.
+ *
+ * Claims first, evidence second. Where the bitmap names a capability it is believed;
+ * where it claims NOTHING — absent, or every flag false — the attributes the device
+ * actually publishes decide instead. That fallback is not a nicety: Google's Matter
+ * Virtual Device offers hue/saturation, XY and colour temperature in its own Controller
+ * tab while claiming none of them here, and trusting the bitmap outright described that
+ * light as having no colour whatsoever. A device that exposes `currentHue` has a hue
+ * whatever its bitmap says.
+ *
+ * Presence of the CLUSTER is still not evidence of either, which is the bug this
+ * replaced: a tunable-white bulb has ColorControl and no hue at all, and was being told
+ * it accepted one it would reject. matter.js omits the attributes a device's features
+ * do not cover, so `currentHue` is absent on exactly those bulbs — the same signal
+ * `tilt` reads to tell a venetian blind from a roller.
+ */
+export function colorSupport(node: NodeSnapshot): { hueSaturation: boolean; temperature: boolean } {
+  const raw = endpointWith(node, CLUSTER_COLOR_CONTROL)?.clusters[CLUSTER_COLOR_CONTROL]?.[
+    "colorCapabilities"
+  ];
+
+  // Bit 0 HueSaturation, bit 4 ColorTemperature (Matter 1.4, ColorControl 5.2.2.9).
+  // matter.js decodes the bitmap to named flags, but a raw number is read too — the
+  // same tolerance `fanModes` applies, and neither shape is guaranteed by the wire.
+  const numeric = asNumber(raw);
+  const claimed =
+    numeric !== undefined
+      ? { hueSaturation: (numeric & 0x01) !== 0, temperature: (numeric & 0x10) !== 0 }
+      : typeof raw === "object" && raw !== null
+        ? {
+            hueSaturation: (raw as { hueSaturation?: unknown }).hueSaturation === true,
+            temperature: (raw as { colorTemperature?: unknown }).colorTemperature === true,
+          }
+        : { hueSaturation: false, temperature: false };
+
+  if (claimed.hueSaturation || claimed.temperature) return claimed;
+
+  // The device claimed nothing. Read what it publishes instead of concluding it has no
+  // colour: an attribute is only there because a feature covers it.
+  const state = endpointWith(node, CLUSTER_COLOR_CONTROL)?.clusters[CLUSTER_COLOR_CONTROL];
+  return {
+    hueSaturation: state?.["currentHue"] !== undefined || state?.["currentSaturation"] !== undefined,
+    temperature: state?.["colorTemperatureMireds"] !== undefined,
+  };
+}
+
+/**
+ * Is there a Level Control that is NOT a speaker's?
+ *
+ * A composed device can have both — a television with a backlight would — so this asks
+ * whether any endpoint carries the cluster without claiming to be a speaker, rather than
+ * treating the two as alternatives.
+ */
+export function levelIsBrightness(node: NodeSnapshot): boolean {
+  return applicationEndpoints(node).some(
+    e => CLUSTER_LEVEL_CONTROL in e.clusters && !e.deviceTypes.includes(SPEAKER_DEVICE_TYPE),
+  );
+}
+
 function capabilitiesOf(node: NodeSnapshot): string[] {
   const capabilities: string[] = [];
   const hasOnOff = hasCluster(node, CLUSTER_ON_OFF);
@@ -106,7 +199,10 @@ function capabilitiesOf(node: NodeSnapshot): string[] {
     if (!hasOnOff) capabilities.push("power");
     capabilities.push("fan_speed");
   }
-  if (hasCluster(node, CLUSTER_LEVEL_CONTROL)) capabilities.push("brightness");
+  // Volume where the level belongs to a speaker, brightness where it does not.
+  const speaker = speakerEndpoint(node);
+  if (speaker !== undefined) capabilities.push("volume");
+  if (levelIsBrightness(node)) capabilities.push("brightness");
   // Either source of a temperature target. Gating on the thermostat alone listed a
   // dishwasher as "power, mode, operation" while `describe` offered it 49 to 82
   // degrees -- and the listing is what a model reads before deciding whether to ask
@@ -124,6 +220,17 @@ function capabilitiesOf(node: NodeSnapshot): string[] {
       "currentPositionTiltPercent100ths"
     ];
     if (tilting !== undefined) capabilities.push("tilt");
+  }
+
+  // Colour, absent from this list entirely until now: `describe` offered a colour bulb
+  // hue and saturation while `list_registered_devices` said "power, brightness", and the
+  // short list is what the model reads before deciding whether to look closer. Split the
+  // same way `describe` splits it, and gated on the same claim, so the two cannot
+  // disagree about what a tunable-white bulb can do.
+  if (hasCluster(node, CLUSTER_COLOR_CONTROL)) {
+    const colour = colorSupport(node);
+    if (colour.hueSaturation) capabilities.push("color");
+    if (colour.temperature) capabilities.push("color_temp");
   }
 
   // Appliance vocabulary, found the same structural way `settingsOf` finds it rather

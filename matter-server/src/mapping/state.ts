@@ -27,18 +27,26 @@ import type { DeviceState, StateValue } from "../protocol.js";
 import { deviceIdForNode } from "../protocol.js";
 import {
   fanModeName,
+  matterToHue,
+  matterToSaturation,
+  miredsToKelvin,
   levelToBrightness,
   lift100thsToPositionOpen,
   setpointToCelsius,
 } from "./control.js";
 import {
+  levelIsBrightness,
+  speakerEndpoint,
+  CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
+  CLUSTER_SMOKE_CO_ALARM,
   CLUSTER_FAN_CONTROL,
   CLUSTER_LEVEL_CONTROL,
   CLUSTER_ON_OFF,
   CLUSTER_THERMOSTAT,
   CLUSTER_WINDOW_COVERING,
 } from "./devices.js";
+import { doorStateWord, expressedStateWord } from "./describe.js";
 import { SENSORS } from "./sensors.js";
 import { observedOperation, settingsOf } from "./settings.js";
 import { applianceSetpoint, targetSetpoint } from "./thermostat.js";
@@ -51,8 +59,12 @@ const LOCK_STATES: Record<number, string> = {
   2: "unlocked",
 };
 
+function valueAt(node: NodeSnapshot, cluster: string, attribute: string): unknown {
+  return endpointWith(node, cluster)?.clusters[cluster]?.[attribute];
+}
+
 function numberAt(node: NodeSnapshot, cluster: string, attribute: string): number | undefined {
-  const value = endpointWith(node, cluster)?.clusters[cluster]?.[attribute];
+  const value = valueAt(node, cluster, attribute);
   return typeof value === "number" ? value : undefined;
 }
 
@@ -66,8 +78,16 @@ export function stateOf(node: NodeSnapshot): DeviceState {
   const on = endpointWith(node, CLUSTER_ON_OFF)?.clusters[CLUSTER_ON_OFF]?.["onOff"];
   if (typeof on === "boolean") add("power", on ? "on" : "off");
 
-  const level = numberAt(node, CLUSTER_LEVEL_CONTROL, "currentLevel");
-  if (level !== undefined) add("brightness", `${levelToBrightness(level)}%`);
+  const speaker = speakerEndpoint(node);
+  const speakerLevel = speaker?.clusters[CLUSTER_LEVEL_CONTROL]?.["currentLevel"];
+  if (typeof speakerLevel === "number") add("volume", `${levelToBrightness(speakerLevel)}%`);
+
+  // Only where the level is NOT a speaker's, or a television reports its volume twice
+  // and calls one of them brightness.
+  if (levelIsBrightness(node)) {
+    const level = numberAt(node, CLUSTER_LEVEL_CONTROL, "currentLevel");
+    if (level !== undefined) add("brightness", `${levelToBrightness(level)}%`);
+  }
 
   // The setpoint `target_temp` would write, which is the one the mode has live.
   // Reporting the heating one to a cooling thermostat describes a number that is
@@ -85,6 +105,55 @@ export function stateOf(node: NodeSnapshot): DeviceState {
 
   const lock = numberAt(node, CLUSTER_DOOR_LOCK, "lockState");
   if (lock !== undefined) add("locked", LOCK_STATES[lock]);
+
+  // Where the door itself is, which `locked` cannot answer: a bolt thrown into an open
+  // frame reports "locked" quite happily, and jammed and forced open have no reading
+  // here at all otherwise.
+  add("door", doorStateWord(valueAt(node, CLUSTER_DOOR_LOCK, "doorState")));
+
+  // Reported so it can be checked, never set. See `statesOf` in describe.ts.
+  const pin = valueAt(node, CLUSTER_DOOR_LOCK, "requirePinForRemoteOperation");
+  if (typeof pin === "boolean") add("pin_required", pin ? "required" : "not required");
+  // What colour it is, which had no answer at all before: `state` never touched
+  // ColorControl, so "what colour is the light?" could only be answered by changing it.
+  //
+  // Reported by the mode the device says it is IN, not by every attribute it holds. A
+  // bulb sitting at 2700K still has a stale hue in `currentHue` from whenever it was
+  // last set that way, and reporting both makes the reading contradict itself.
+  const colorMode = valueAt(node, CLUSTER_COLOR_CONTROL, "colorMode");
+  const inTemperatureMode =
+    colorMode === 2 || (typeof colorMode === "string" && /temperature|mireds/i.test(colorMode));
+
+  if (inTemperatureMode) {
+    const mireds = numberAt(node, CLUSTER_COLOR_CONTROL, "colorTemperatureMireds");
+    const kelvin = mireds === undefined ? 0 : miredsToKelvin(mireds);
+    if (kelvin > 0) add("color_temp", `${kelvin} K`);
+  } else {
+    const hue = numberAt(node, CLUSTER_COLOR_CONTROL, "currentHue");
+    const saturation = numberAt(node, CLUSTER_COLOR_CONTROL, "currentSaturation");
+    if (hue !== undefined && saturation !== undefined) {
+      // Back through the inverses of what `color` writes, so the numbers read here are
+      // the numbers that would put it here.
+      add("color", `hue ${matterToHue(hue)}, saturation ${matterToSaturation(saturation)}%`);
+    }
+  }
+
+  // What the alarm is expressing, which neither the smoke reading nor the CO reading
+  // says on its own: a device sounding for carbon monoxide while its smoke level sits at
+  // Critical is reporting two different facts, and only this one answers "what is it
+  // doing".
+  add("alarm", expressedStateWord(valueAt(node, CLUSTER_SMOKE_CO_ALARM, "expressedState")));
+
+  const service = valueAt(node, CLUSTER_SMOKE_CO_ALARM, "endOfServiceAlert");
+  if (service !== undefined) {
+    // EndOfServiceEnum: 0 normal, 1 expired. Tolerant of the name, as everywhere else.
+    const expired =
+      service === 1 || (typeof service === "string" && /expire/i.test(service));
+    add("alarm_service", expired ? "expired" : "normal");
+  }
+
+  const fault = valueAt(node, CLUSTER_SMOKE_CO_ALARM, "hardwareFaultAlert");
+  if (typeof fault === "boolean") add("alarm_fault", fault ? "faulty" : "ok");
 
   const speed = numberAt(node, CLUSTER_FAN_CONTROL, "percentCurrent");
   if (speed !== undefined) add("fan_speed", `${speed}%`);
@@ -178,9 +247,11 @@ function currentLabel(
   // `currentMode` and matches it against the codes the device published, while the
   // attribute-written ones are an index into the labels themselves.
   const current =
-    setting.write.kind === "command"
-      ? state["currentMode"]
-      : state[setting.write.attribute];
+    setting.current !== undefined
+      ? state[setting.current]
+      : setting.write.kind === "command"
+        ? state["currentMode"]
+        : state[setting.write.attribute];
   if (typeof current !== "number") return undefined;
 
   // ModeBase codes need not be positions in the list, so ask the setting which label

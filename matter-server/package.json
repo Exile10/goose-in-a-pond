@@ -10,8 +10,7 @@
   "scripts": {
     "start": "node --import tsx src/server.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "virtual-device": "node --import tsx tools/virtual-device.ts"
+    "test": "vitest run"
   },
   "dependencies": {
     "@matter/main": "0.17.9",

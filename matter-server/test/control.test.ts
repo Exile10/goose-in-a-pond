@@ -5,6 +5,12 @@ import {
   celsiusToSetpoint,
   fanModeFromName,
   hueToMatter,
+  kelvinToMireds,
+  VERBS,
+  matterToHue,
+  observedFor,
+  matterToSaturation,
+  miredsToKelvin,
   planControl,
   positionOpenToLift100ths,
   saturationToMatter,
@@ -12,7 +18,17 @@ import {
   FAN_MODE_ON,
 } from "../src/mapping/control.js";
 import { OpError } from "../src/protocol.js";
-import { describedNode, endpoint, fanNode, lightNode, node } from "./fixtures.js";
+import {
+  describedNode,
+  endpoint,
+  extendedColorLightNode,
+  fanNode,
+  lightNode,
+  named,
+  node,
+  tunableWhiteNode,
+  videoPlayerNode,
+} from "./fixtures.js";
 
 describe("unit conversions", () => {
   it("maps brightness onto Matter's 0-254 level scale", () => {
@@ -21,6 +37,42 @@ describe("unit conversions", () => {
     expect(brightnessToLevel(100)).toBe(254);
     // Over-range input is clamped rather than wrapping into a dim bulb.
     expect(brightnessToLevel(200)).toBe(254);
+  });
+
+  it("maps kelvin onto mireds, inverting the order", () => {
+    // Mireds are reciprocal megakelvin, so the mapping is its own inverse and hotter is
+    // SMALLER. A conversion that preserved order would put warm white where cool goes.
+    expect(kelvinToMireds(2700)).toBe(370);
+    expect(kelvinToMireds(6500)).toBe(154);
+    expect(miredsToKelvin(370)).toBe(2703);
+    expect(miredsToKelvin(154)).toBe(6494);
+
+    // Clamped to the cluster's own field range, and zero is not a colour: the spec's
+    // defaults include 0 mireds, which would divide to infinity.
+    expect(kelvinToMireds(0)).toBe(0xfeff);
+    expect(kelvinToMireds(-1)).toBe(0xfeff);
+    expect(miredsToKelvin(0)).toBe(0);
+  });
+
+  it("reads a hue back as one that would put the device where it is", () => {
+    // NOT numeric equality, and the difference is the point. ColorControl quantises 360
+    // degrees onto 0-254, so a step is ~1.4 degrees and 90 comes back as 91 -- there is
+    // no conversion that avoids that. What the doc actually promises is that a value
+    // read here would put the device back where it is, and THAT is exact: writing the
+    // read-back lands on the same raw value.
+    for (const degrees of [0, 45, 90, 180, 300, 359]) {
+      const raw = hueToMatter(degrees);
+      expect(hueToMatter(matterToHue(raw))).toBe(raw);
+      // And it is never off by more than a step, so a reading is never misleading.
+      expect(Math.abs(matterToHue(raw) - degrees)).toBeLessThanOrEqual(2);
+    }
+  });
+
+  it("reads saturation back exactly", () => {
+    // 0-100 onto 0-254 and back is exact at every whole percent, unlike hue.
+    for (const pct of [0, 1, 50, 99, 100]) {
+      expect(matterToSaturation(saturationToMatter(pct))).toBe(pct);
+    }
   });
 
   it("maps Celsius onto hundredths of a degree", () => {
@@ -193,5 +245,155 @@ describe("control planning", () => {
     } catch (error) {
       expect((error as OpError).message).toContain("off, low, medium, high, on, auto or smart");
     }
+  });
+});
+
+describe("colour temperature control", () => {
+  it("sends the device mireds for the kelvin it was asked for", () => {
+    const plan = planControl(extendedColorLightNode(), "matter-51", "color_temp", 2700);
+
+    expect(plan.actions).toEqual([
+      {
+        kind: "command",
+        endpoint: 1,
+        cluster: "colorControl",
+        command: "moveToColorTemperature",
+        payload: {
+          colorTemperatureMireds: 370,
+          transitionTime: 0,
+          optionsMask: {},
+          optionsOverride: {},
+        },
+      },
+    ]);
+  });
+
+  it("reports the kelvin the device will sit at, not the one requested", () => {
+    // The round trip through whole mireds is lossy. Echoing 2700 back would overstate
+    // the precision -- the device is actually at 2703 -- and `applied` exists precisely
+    // so the answer is what happened rather than what was asked.
+    const plan = planControl(extendedColorLightNode(), "matter-51", "color_temp", 2700);
+
+    expect(plan.applied).toEqual({ color_temp: 2703 });
+  });
+
+  it("refuses a colour temperature that is not a positive number", () => {
+    for (const bad of ["warm", 0, -100, null]) {
+      expect(() => planControl(tunableWhiteNode(), "matter-52", "color_temp", bad)).toThrow(
+        OpError,
+      );
+    }
+  });
+});
+
+describe("reading back what the device actually did", () => {
+  it("reports the fan speed the device settled on, not the one requested", () => {
+    // The report this came from. Asked for 85%, the fan quantised onto its High mode and
+    // sat at 90 -- and GIAP said "speed is set to 85%", which is the number the user
+    // typed. A result that echoes the request cannot show that anything happened.
+    const fan = node(1, [
+      named("Fan"),
+      endpoint(1, { fanControl: { fanMode: 3, percentSetting: 85, percentCurrent: 90 } }),
+    ]);
+
+    expect(observedFor(fan, "fan_speed")).toEqual({ fan_speed: 90 });
+  });
+
+  it("reads percentCurrent rather than the setting that was written", () => {
+    // percentSetting is the request stored on the device. Reading it back would echo the
+    // request with extra steps and look like it had been verified.
+    const disagreeing = node(2, [
+      named("Fan"),
+      endpoint(1, { fanControl: { percentSetting: 20, percentCurrent: 55 } }),
+    ]);
+
+    expect(observedFor(disagreeing, "fan_speed")).toEqual({ fan_speed: 55 });
+  });
+
+  it("reads every verb whose result can differ from the request", () => {
+    const light = node(3, [
+      named("Lamp"),
+      endpoint(1, {
+        levelControl: { currentLevel: 127 },
+        colorControl: { currentHue: 84, currentSaturation: 254, colorTemperatureMireds: 370 },
+      }),
+    ]);
+
+    expect(observedFor(light, "brightness")).toEqual({ brightness: 50 });
+    expect(observedFor(light, "color_temp")).toEqual({ color_temp: 2703 });
+    expect(observedFor(light, "color")).toEqual({ hue: 119, saturation: 100 });
+  });
+
+  it("says nothing for a verb that cannot land somewhere else", () => {
+    // A boolean has nowhere else to land, so waiting for a report buys nothing. Empty
+    // here is what tells the controller not to wait.
+    expect(observedFor(lightNode(), "power")).toEqual({});
+    expect(observedFor(lightNode(), "locked")).toEqual({});
+  });
+
+  it("says nothing when the device reports no value for the verb", () => {
+    // Absent is not evidence of a different value: the plan's own applied stands rather
+    // than a reading being invented.
+    expect(observedFor(lightNode(), "fan_speed")).toEqual({});
+    expect(observedFor(lightNode(), "tilt")).toEqual({});
+  });
+
+  it("accepts every verb at the wire boundary", () => {
+    // `server.ts` rejects a verb this set does not hold, and `color_temp` was missing
+    // from it for a whole commit -- unreachable in production while every unit test
+    // passed, because these tests call planControl directly and never cross that check.
+    for (const verb of ["power", "brightness", "color", "color_temp", "fan_speed", "mode"]) {
+      expect(VERBS.has(verb), `'${verb}' would be refused as an unknown verb`).toBe(true);
+    }
+  });
+});
+
+describe("media control", () => {
+  it("writes the volume to the speaker's endpoint, not the player's", () => {
+    const plan = planControl(videoPlayerNode(), "matter-81", "volume", 50);
+
+    expect(plan.actions).toEqual([
+      { kind: "write", endpoint: 2, cluster: "levelControl", attribute: "currentLevel", value: 127 },
+    ]);
+    expect(plan.applied).toEqual({ volume: 50 });
+  });
+
+  it("refuses a volume on a device with no speaker", () => {
+    expect(() => planControl(lightNode(), "matter-2", "volume", 50)).toThrow(OpError);
+  });
+
+  it("sends playback commands to MediaPlayback", () => {
+    const plan = planControl(videoPlayerNode(), "matter-81", "operation", "pause");
+
+    expect(plan.actions).toEqual([
+      { kind: "command", endpoint: 1, cluster: "mediaPlayback", command: "pause", payload: {} },
+    ]);
+  });
+
+  it("selects an input by the index behind the device's own label", () => {
+    // The label is the device's; the index is what goes on the wire.
+    const plan = planControl(videoPlayerNode(), "matter-81", "mode", {
+      setting: "input",
+      value: "HDMI 2",
+    });
+
+    expect(plan.actions).toEqual([
+      { kind: "command", endpoint: 1, cluster: "mediaInput", command: "selectInput", payload: { index: 2 } },
+    ]);
+  });
+
+  it("refuses an input the television never offered", () => {
+    expect(() =>
+      planControl(videoPlayerNode(), "matter-81", "mode", { setting: "input", value: "SCART" }),
+    ).toThrow(OpError);
+  });
+
+  it("reads the volume back off the speaker", () => {
+    expect(observedFor(videoPlayerNode(), "volume")).toEqual({ volume: 50 });
+    // And does not report the same level under the wrong name: a television has no
+    // brightness to read, so reading one would be the volume wearing a disguise.
+    expect(observedFor(videoPlayerNode(), "brightness")).toEqual({});
+    // A bulb is unaffected -- its level is still a brightness.
+    expect(observedFor(lightNode(), "brightness")).toEqual({ brightness: 50 });
   });
 });
