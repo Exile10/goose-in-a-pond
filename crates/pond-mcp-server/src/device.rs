@@ -337,7 +337,16 @@ pub fn init_device_deps(
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_device_server(reader: DuplexStream, writer: DuplexStream) {
-    let deps = DEVICE_DEPS.get().expect("init_device_deps() not called");
+    // Missing deps = this path never initialised this extension (the voice/CLI
+    // binary vs `serve` install different families). A skipped extension is a
+    // logged, contained failure; a panic here took down every builtin server's
+    // startup at once (2026-08-27, giap-context in the voice child).
+    let Some(deps) = DEVICE_DEPS.get() else {
+        tracing::error!(
+            "spawn_device_server called before init_device_deps — extension will not start"
+        );
+        return;
+    };
     let server = DeviceMcpServer::new(
         deps.device_registry.clone(),
         deps.settings_repo.clone(),

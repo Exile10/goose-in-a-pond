@@ -299,7 +299,16 @@ pub fn init_weather_deps(weather: Option<Arc<dyn WeatherProvider>>) {
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_weather_server(reader: DuplexStream, writer: DuplexStream) {
-    let deps = WEATHER_DEPS.get().expect("init_weather_deps() not called");
+    // Missing deps = this path never initialised this extension (the voice/CLI
+    // binary vs `serve` install different families). A skipped extension is a
+    // logged, contained failure; a panic here took down every builtin server's
+    // startup at once (2026-08-27, giap-context in the voice child).
+    let Some(deps) = WEATHER_DEPS.get() else {
+        tracing::error!(
+            "spawn_weather_server called before init_weather_deps — extension will not start"
+        );
+        return;
+    };
     let server = WeatherMcpServer::new(deps.weather.clone());
     crate::serve_builtin("giap-weather", server, reader, writer);
 }

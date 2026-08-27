@@ -4433,6 +4433,23 @@ async fn run_chat(
         Arc::new(SqliteDeviceRegistry::new(db.system.clone())),
     );
 
+    // And the personal-context read handles — the fourth verse of the same
+    // song (audit #115/#157, vision #130, sensors above): `serve` installed
+    // them and this path did not, so the first voice session that loaded
+    // giap-context panicked with "init_context_deps() not called"
+    // (2026-08-27) — and, before the spawn fns learned to degrade, took every
+    // other builtin server down with it. No vector index or embedder here:
+    // like the serve path without an embedding provider, `recall` answers
+    // nothing rather than quietly degrading to context-only results.
+    pond_mcp_server::context::init_context_deps(
+        Arc::new(pond_infra::sqlite_context::SqliteContextRepository::new(
+            db.system.clone(),
+            Arc::new(pond_infra::rule_redactor::RuleRedactor::new()),
+        )),
+        None,
+        None,
+    );
+
     // Load settings and model registry early — drives provider, model, TTS, and wake word.
     // Falls back to Settings::default() when the DB has no rows yet (first run).
     let settings_repo_chat = SqliteSettingsRepository::new(db.system.clone());
