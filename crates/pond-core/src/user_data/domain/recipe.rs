@@ -2,15 +2,24 @@ use serde::{Deserialize, Serialize};
 
 /// A saved Goose Recipe stored in the database.
 ///
-/// Recipes are reusable automations expressed as Goose YAML. The agent
-/// can execute them on demand via the `giap__run_recipe` MCP tool or
-/// via `POST /api/v1/recipes/{name}/run`.
+/// Recipes are reusable automations expressed as Goose YAML, executed via
+/// `POST /api/v1/recipes/{name}/run`. There is no MCP tool for
+/// self-invocation by the agent; a recipe run is always caller-initiated.
 ///
-/// Minimal recipe YAML:
+/// Recipe YAML with the fields GIAP reads (see `RecipeYaml` in
+/// `pond-api::routes` for the full parsed shape):
 /// ```yaml
 /// title: Morning Brief
 /// description: Daily weather and schedule summary
-/// prompt: Give me the weather and list any scheduled tasks for today.
+/// prompt: Give me the weather in {{city}} and list any scheduled tasks for today.
+/// parameters:
+///   - key: city
+///     requirement: required
+/// extensions:
+///   - type: builtin
+///     name: weather
+/// activities:
+///   - "Give me my morning brief"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRecipe {

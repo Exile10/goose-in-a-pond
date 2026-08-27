@@ -48,6 +48,13 @@ pub struct AgentRequest {
     /// can actually reach a `ProfileRepository`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_context: Option<crate::prompts::ProfileContext>,
+    /// When set, restricts this turn to only the listed tool-group prefixes
+    /// (e.g. `"giap-weather"`), on top of whatever tool selection would
+    /// otherwise choose. Set by a recipe run whose YAML declares
+    /// `extensions:`; `None` means "no recipe-imposed restriction" -- the
+    /// ordinary case for chat turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_group_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -548,6 +555,7 @@ mod agent_request_scope_tests {
             canvas_mode: false,
             profile_scope: scope,
             profile_context: None,
+            tool_group_allowlist: None,
         }
     }
 

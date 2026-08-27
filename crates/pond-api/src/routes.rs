@@ -49,7 +49,7 @@ use pond_core::user_data::ports::scheduler::{CreateScheduleRequest, UpdateSchedu
 use pond_core::user_data::ports::session_storage::SessionStorageError;
 use pond_core::user_data::services::identity_resolution;
 use pond_core::user_data::services::onboarding::OnboardingService;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::str::FromStr;
@@ -1071,6 +1071,12 @@ struct ChatRequest {
     /// always prefer tool calls so results render as visual cards.
     #[serde(default)]
     canvas_mode: bool,
+    /// Restricts this turn to only these tool-group prefixes. Set internally
+    /// by `run_recipe` from a recipe's `extensions:`; ordinary chat clients
+    /// have no reason to set it, but nothing stops one that wants to narrow
+    /// its own turn.
+    #[serde(default)]
+    tool_group_allowlist: Option<Vec<String>>,
 }
 
 /// Send a message and get a response.
@@ -1813,6 +1819,7 @@ fn chat_stream_inner(
             canvas_mode: req.canvas_mode,
             profile_scope: turn_scope.clone(),
             profile_context: profile_context_for(&state, &turn_scope).await,
+            tool_group_allowlist: req.tool_group_allowlist.clone(),
         };
 
         // The turn's own state: the visible answer, the tool results that go
@@ -10128,6 +10135,7 @@ async fn agent_chat_stream(
             canvas_mode: false,
             profile_scope: turn_scope.clone(),
             profile_context: profile_context_for(&state, &turn_scope).await,
+            tool_group_allowlist: None,
         };
 
         let mut agent_stream = match agent.chat_stream(request).await {
@@ -12622,6 +12630,132 @@ async fn delete_skill(
 
 // ── Recipes ───────────────────────────────────────────────────────────────────
 
+/// A recipe parameter, as goose's own `RecipeParameter` shape.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+struct RecipeParameter {
+    key: String,
+    #[serde(default = "RecipeParameter::default_input_type")]
+    input_type: String, // string | number | boolean | date | file | select
+    #[serde(default = "RecipeParameter::default_requirement")]
+    requirement: String, // required | optional | user_prompt
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    default: Option<String>,
+    #[serde(default)]
+    options: Option<Vec<String>>,
+}
+
+impl RecipeParameter {
+    fn default_input_type() -> String {
+        "string".to_string()
+    }
+    fn default_requirement() -> String {
+        "optional".to_string()
+    }
+    fn is_required(&self) -> bool {
+        self.requirement == "required" && self.default.is_none()
+    }
+}
+
+/// A recipe extension entry, as goose's own `extensions:` shape
+/// (`{type, name, timeout?, bundled?}`).
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+struct RecipeExtensionSpec {
+    #[serde(rename = "type", default)]
+    ext_type: String,
+    name: String,
+    #[serde(default)]
+    timeout: Option<u64>,
+    #[serde(default)]
+    bundled: Option<bool>,
+}
+
+/// The fields GIAP reads out of a recipe's YAML.
+///
+/// `deny_unknown_fields` is deliberately NOT set: a recipe may legally carry
+/// anything Goose understands, and refusing to run it because we do not read a
+/// field would be worse than ignoring it. What we do instead is say so — see
+/// [`RecipeYaml::warn_about_dropped_fields`].
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+struct RecipeYaml {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
+    parameters: Vec<RecipeParameter>,
+    #[serde(default)]
+    extensions: Vec<RecipeExtensionSpec>,
+    #[serde(default)]
+    activities: Vec<String>,
+    /// Present only so the warning below can notice them — sub-recipe
+    /// composition and structured response schemas are out of scope for
+    /// GIAP's recipe runner; both parse cleanly and are silently dropped.
+    #[serde(default)]
+    sub_recipes: Option<Value>,
+    #[serde(default)]
+    response: Option<Value>,
+}
+
+impl RecipeYaml {
+    fn parse(yaml: &str) -> Result<Self, serde_yaml::Error> {
+        serde_yaml::from_str(yaml)
+    }
+
+    /// Recipes carrying `sub_recipes` or a structured `response` schema parse
+    /// cleanly and then run as a bare prompt with those fields silently
+    /// dropped — GIAP delegates to the ordinary chat-stream pipeline, which
+    /// has no sub-recipe execution and no structured-output enforcement.
+    /// Silence here reads as support.
+    fn warn_about_dropped_fields(&self, name: &str) {
+        if self.sub_recipes.is_some() || self.response.is_some() {
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "recipe_fields_dropped",
+                recipe = name,
+                sub_recipes = self.sub_recipes.is_some(),
+                response = self.response.is_some(),
+                "this recipe declares fields GIAP does not execute"
+            );
+        }
+    }
+}
+
+/// Maps a recipe's `extensions[].name` (goose's own extension vocabulary) to
+/// GIAP tool-group prefixes. Names with no GIAP equivalent are dropped, not
+/// refused — an `extensions:` list is a narrowing request, never a widening
+/// one, so an unrecognised name simply grants nothing rather than erroring.
+fn recipe_extension_to_tool_group(name: &str) -> Option<&'static str> {
+    match name {
+        "weather" => Some("giap-weather"),
+        "schedule" | "scheduler" => Some("giap-schedule"),
+        "memory" => Some("giap-memory"),
+        "device" | "developer" => Some("giap-device"),
+        "matter" | "home" => Some("giap-matter"),
+        "vision" => Some("giap-vision"),
+        _ => None,
+    }
+}
+
+/// Merge a recipe's parsed YAML fields into its JSON representation, so list
+/// and write responses surface `title`/`parameters`/`extensions`/`activities`
+/// alongside the raw `yaml`. A recipe with YAML GIAP cannot parse still lists
+/// — it degrades to empty arrays rather than breaking the response.
+fn recipe_view_json(recipe: &AgentRecipe) -> Value {
+    let mut value = json!(recipe);
+    let parsed = RecipeYaml::parse(&recipe.yaml).unwrap_or_default();
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("title".to_string(), json!(parsed.title));
+        obj.insert("parameters".to_string(), json!(parsed.parameters));
+        obj.insert("extensions".to_string(), json!(parsed.extensions));
+        obj.insert("activities".to_string(), json!(parsed.activities));
+    }
+    value
+}
+
 async fn list_recipes(State(state): State<Arc<AppState>>) -> impl axum::response::IntoResponse {
     let repo = match &state.recipe_repo {
         Some(r) => r,
@@ -12634,7 +12768,10 @@ async fn list_recipes(State(state): State<Arc<AppState>>) -> impl axum::response
         }
     };
     match repo.list().await {
-        Ok(recipes) => Json(json!(recipes)).into_response(),
+        Ok(recipes) => {
+            let views: Vec<Value> = recipes.iter().map(recipe_view_json).collect();
+            Json(json!(views)).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -12684,7 +12821,7 @@ async fn create_recipe(
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     match repo.upsert(&recipe).await {
-        Ok(()) => (StatusCode::CREATED, Json(json!(recipe))).into_response(),
+        Ok(()) => (StatusCode::CREATED, Json(recipe_view_json(&recipe))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -12751,7 +12888,7 @@ async fn update_recipe(
         created_at: existing.created_at,
     };
     match repo.upsert(&updated).await {
-        Ok(()) => Json(json!(updated)).into_response(),
+        Ok(()) => Json(recipe_view_json(&updated)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -12792,59 +12929,26 @@ struct RunRecipeRequest {
     voice_mode: bool,
     #[serde(default)]
     canvas_mode: bool,
+    /// Values for the recipe's declared `parameters:`. Keyed by `key`.
+    #[serde(default)]
+    parameters: Option<std::collections::HashMap<String, String>>,
 }
 
-/// The two fields GIAP reads out of a recipe's YAML.
-///
-/// This used to be `goose::recipe::Recipe::from_content`, which was the only
-/// `goose::` reference in the whole of `pond-api` — a path dependency on the
-/// entire agent framework, in the crate AGENTS.md defines as framework-free, for
-/// two `Option<String>`s. `pond-api` also sits in CI's "fast crates" list, whose
-/// stated definition is "every crate that does not pull the Goose submodule", so
-/// the split the list encodes did not exist while that dependency was there.
-///
-/// `deny_unknown_fields` is deliberately NOT set: a recipe may legally carry
-/// anything Goose understands, and refusing to run it because we do not read a
-/// field would be worse than ignoring it. What we do instead is say so — see
-/// [`RecipePrompt::warn_about_dropped_fields`].
-#[derive(Debug, Default, Deserialize)]
-struct RecipePrompt {
-    #[serde(default)]
-    prompt: Option<String>,
-    #[serde(default)]
-    instructions: Option<String>,
-    /// Present only so the warning below can notice them.
-    #[serde(default)]
-    parameters: Option<Value>,
-    #[serde(default)]
-    sub_recipes: Option<Value>,
-}
-
-impl RecipePrompt {
-    fn parse(yaml: &str) -> Result<Self, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+/// Substitute `{{key}}` placeholders in `text` with values from `values`.
+/// Plain string replacement, matching goose's own `{{key}}` recipe syntax —
+/// there is no conditional/loop logic in a recipe prompt, so a templating
+/// engine would be pulling in machinery to do what `str::replace` already does.
+fn substitute_recipe_params(text: &str, values: &std::collections::HashMap<String, String>) -> String {
+    let mut out = text.to_string();
+    for (key, value) in values {
+        out = out.replace(&format!("{{{{{key}}}}}"), value);
     }
-
-    /// Recipes carrying `parameters` or `sub_recipes` parse cleanly and then run
-    /// as a bare prompt with those fields silently dropped — GIAP delegates to
-    /// the ordinary chat-stream pipeline, which has no parameter substitution and
-    /// no sub-recipe execution. Silence here reads as support.
-    fn warn_about_dropped_fields(&self, name: &str) {
-        if self.parameters.is_some() || self.sub_recipes.is_some() {
-            tracing::warn!(
-                target: "giap::trace",
-                kind = "recipe_fields_dropped",
-                recipe = name,
-                parameters = self.parameters.is_some(),
-                sub_recipes = self.sub_recipes.is_some(),
-                "this recipe declares fields GIAP does not execute; it will run as a bare prompt"
-            );
-        }
-    }
+    out
 }
 
-/// Execute a recipe by name. Looks up the AgentRecipe, parses its YAML to
-/// extract the prompt, and delegates to the shared chat-stream pipeline so
+/// Execute a recipe by name. Looks up the AgentRecipe, parses its YAML,
+/// validates and substitutes `parameters`, resolves `extensions` to a
+/// tool-group allowlist, and delegates to the shared chat-stream pipeline so
 /// the response matches `POST /api/v1/chat/stream` event-for-event.
 async fn run_recipe(
     State(state): State<Arc<AppState>>,
@@ -12885,18 +12989,72 @@ async fn run_recipe(
         tracing::warn!(name = %name, "running inactive recipe");
     }
 
-    let prompt = match RecipePrompt::parse(&recipe.yaml) {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let supplied_params = body.parameters.clone().unwrap_or_default();
+
+    let parsed = match RecipeYaml::parse(&recipe.yaml) {
         Ok(parsed) => {
             parsed.warn_about_dropped_fields(&name);
             parsed
-                .prompt
-                .or(parsed.instructions)
-                .unwrap_or_else(|| format!("Run routine: {}", name))
         }
         Err(e) => {
             tracing::warn!(name = %name, error = %e, "failed to parse recipe YAML; using fallback prompt");
-            format!("Run routine: {}", name)
+            RecipeYaml::default()
         }
+    };
+
+    // Validate required parameters before touching the chat pipeline — a
+    // half-substituted prompt is worse than a 400.
+    let missing: Vec<&str> = parsed
+        .parameters
+        .iter()
+        .filter(|p| p.is_required() && !supplied_params.contains_key(&p.key))
+        .map(|p| p.key.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "missing required parameters",
+                "missing": missing,
+            })),
+        ));
+    }
+
+    // Effective values: declared defaults, overridden by whatever the caller
+    // supplied.
+    let mut effective_params = std::collections::HashMap::new();
+    for p in &parsed.parameters {
+        if let Some(default) = &p.default {
+            effective_params.insert(p.key.clone(), default.clone());
+        }
+    }
+    effective_params.extend(supplied_params);
+
+    let raw_prompt = parsed
+        .prompt
+        .clone()
+        .or(parsed.instructions.clone())
+        .unwrap_or_else(|| format!("Run routine: {}", name));
+    let prompt = substitute_recipe_params(&raw_prompt, &effective_params);
+
+    // `extensions:` is a narrowing request: unrecognised names are dropped
+    // with a warning rather than refusing the run.
+    let tool_group_allowlist = if parsed.extensions.is_empty() {
+        None
+    } else {
+        let mut groups: Vec<String> = Vec::new();
+        for ext in &parsed.extensions {
+            match recipe_extension_to_tool_group(&ext.name) {
+                Some(group) => groups.push(group.to_string()),
+                None => tracing::warn!(
+                    name = %name,
+                    extension = %ext.name,
+                    "recipe extension has no GIAP tool-group equivalent; dropped"
+                ),
+            }
+        }
+        Some(groups)
     };
 
     // Resets the inactivity clock and interrupts any background consolidation.
@@ -12913,14 +13071,13 @@ async fn run_recipe(
             )
         })?;
 
-    let body = body.map(|Json(b)| b).unwrap_or_default();
-
     let chat_req = ChatRequest {
         session_id: body.session_id,
         message: prompt,
         images: Vec::new(),
         voice_mode: body.voice_mode,
         canvas_mode: body.canvas_mode,
+        tool_group_allowlist,
     };
 
     Ok(chat_stream_inner(state, permit, chat_req, device))
