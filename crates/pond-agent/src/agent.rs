@@ -282,14 +282,21 @@ impl PondAgent {
             }
         }
 
-        // Append user skills.
+        // Append user skills — name + description only (progressive disclosure).
+        // Full instructions load on demand via giap-device__load_skill.
         if let Some(ref repo) = self.skill_repo {
             if let Ok(skills) = repo.list_active().await {
-                for skill in &skills {
-                    prompt.push_str("\n\n## Skill: ");
-                    prompt.push_str(&skill.name);
-                    prompt.push('\n');
-                    prompt.push_str(&skill.content);
+                if !skills.is_empty() {
+                    prompt.push_str(
+                        "\n\n<extension-notes name=\"skills\">\nActive user-defined skills, as \
+                         \"name: description\". When one looks relevant to what the user is \
+                         asking, call giap-device__load_skill(name) to get its full \
+                         instructions before acting on it.",
+                    );
+                    for skill in &skills {
+                        prompt.push_str(&format!("\n- {}: {}", skill.name, skill.description));
+                    }
+                    prompt.push_str("\n</extension-notes>");
                 }
             }
         }
@@ -848,6 +855,7 @@ mod tests {
                 // the fixture, not evidence the loop honours a scope.
                 profile_scope: ProfileScope::Household,
                 profile_context: None,
+                tool_group_allowlist: None,
             })
             .await
             .unwrap();
@@ -868,6 +876,7 @@ mod tests {
                 canvas_mode: false,
                 profile_scope: ProfileScope::Household,
                 profile_context: None,
+                tool_group_allowlist: None,
             })
             .await
             .unwrap();
@@ -905,5 +914,62 @@ mod tests {
         // EchoProvider returns default caps.
         assert!(!caps.thinking);
         assert!(!caps.tool_calling);
+    }
+
+    #[tokio::test]
+    async fn system_prompt_injects_skill_description_but_not_content() {
+        use pond_core::user_data::domain::skill::UserSkill;
+        use pond_core::user_data::mocks::mock_skill::MockSkillRepository;
+
+        let skill_repo = MockSkillRepository::new();
+        skill_repo
+            .create(&UserSkill {
+                id: "skill-1".to_string(),
+                name: "Morning Briefing".to_string(),
+                description: "Summarise weather and today's schedule".to_string(),
+                icon: "sparkles".to_string(),
+                content: "SECRET_FULL_INSTRUCTIONS_SHOULD_NOT_APPEAR_EVERY_TURN".to_string(),
+                active: true,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let agent = PondAgent::new(
+            Arc::new(EchoProvider),
+            vec![],
+            Arc::new(MockSettingsRepo),
+            None,
+            None,
+            Some(Arc::new(skill_repo)),
+            Arc::new(MockDeviceRegistry),
+            Arc::new(MockSessionStorage),
+            None,
+        );
+
+        let request = AgentRequest {
+            message: "hello".to_string(),
+            session_id: "test-session".to_string(),
+            model_role: "chat".to_string(),
+            images: vec![],
+            voice_mode: false,
+            canvas_mode: false,
+            profile_scope: ProfileScope::Household,
+            profile_context: None,
+            tool_group_allowlist: None,
+        };
+        let prompt = agent
+            .build_system_prompt(&Settings::default(), &request)
+            .await;
+
+        assert!(
+            prompt.contains("Morning Briefing: Summarise weather and today's schedule"),
+            "expected name + description in prompt, got: {prompt}"
+        );
+        assert!(prompt.contains("giap-device__load_skill"));
+        assert!(
+            !prompt.contains("SECRET_FULL_INSTRUCTIONS_SHOULD_NOT_APPEAR_EVERY_TURN"),
+            "full skill content must not be injected every turn, got: {prompt}"
+        );
     }
 }

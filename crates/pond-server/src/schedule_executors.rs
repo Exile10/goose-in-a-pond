@@ -113,6 +113,7 @@ impl AgentScheduleExecutor {
             profile_scope: ProfileScope::Household,
             // Nobody is in the room for a scheduled task.
             profile_context: None,
+            tool_group_allowlist: None,
         };
 
         tracing::info!("[scheduler] executing prompt for task {task_id}");
