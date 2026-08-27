@@ -84,7 +84,17 @@ fn strip_line_comments(src: &str) -> String {
 /// Returns `(anchor, literal_text)` with `{...}` interpolations removed — the
 /// variable is *named* `goal`, and `{goal}` is a value, not vocabulary.
 fn injected_message_texts(src: &str) -> Vec<(String, String)> {
-    const ANCHORS: &[&str] = &["let nudge = format!(", "let kickoff = Message::user()"];
+    // `fn goal_nudge` joined the list when the fork extracted the completeness
+    // nudge into a named helper (fix/goal-check-narrated-aloud) -- the binding
+    // became `let nudge = goal_nudge(&goal)` and the text moved into the fn,
+    // where the old anchors could not see it. The helper body is a single
+    // `format!` expression, so the statement-to-first-semicolon walk below
+    // captures exactly its string.
+    const ANCHORS: &[&str] = &[
+        "let nudge = format!(",
+        "let kickoff = Message::user()",
+        "fn goal_nudge",
+    ];
     let code = strip_line_comments(src);
     let mut found = Vec::new();
 
