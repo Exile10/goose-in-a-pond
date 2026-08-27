@@ -61,13 +61,12 @@ pub struct SetDeviceStateParams {
     /// 0-100 percent.
     #[serde(default)]
     pub fan_speed: Option<u8>,
-    /// Fan mode: off, low, medium, high, on, auto, smart. Use this rather than
-    /// fan_speed when the user names a mode — auto and smart have no percentage.
+    /// Fan mode: off, low, medium, high, on, auto, smart. Prefer over fan_speed
+    /// when a mode is named — auto and smart have no percentage.
     #[serde(default)]
     pub fan_mode: Option<String>,
-    /// A named setting on an appliance — wash cycle, spin speed, temperature
-    /// level. Both the name and the value come from describe_device; they are
-    /// the device's own words, so do not translate or abbreviate them.
+    /// A named appliance setting (wash cycle, spin speed). Name and value come
+    /// from describe_device verbatim — never translate or abbreviate them.
     #[serde(default)]
     pub setting: Option<String>,
     /// The value for `setting`. Ignored unless `setting` is given.
@@ -79,8 +78,8 @@ pub struct SetDeviceStateParams {
     /// 0-100 percent open (100=fully open).
     #[serde(default)]
     pub position: Option<u8>,
-    /// A covering's slat angle, 0-100 percent open. Separate from position: a
-    /// blind can be fully down with its slats open. Only blinds with slats.
+    /// Slat angle, 0-100 percent open. Distinct from position: a blind can be
+    /// fully down with slats open. Slatted blinds only.
     #[serde(default)]
     pub tilt: Option<u8>,
     #[serde(flatten)]
@@ -321,11 +320,10 @@ impl DeviceControlMcpServer {
     }
 
     #[tool(
-        description = "What a device can be told to do and what it measures: the verbs it \
-                       accepts, the values each takes (fan modes, temperature limits), and \
-                       its sensors. Consult this before driving a device you have not driven \
-                       before, rather than attempting a verb to find out whether it works. \
-                       device_id: id, name, or natural ref like \"the fan\"."
+        description = "What a device can do and measures: accepted verbs, the values each \
+                       takes, its sensors. Consult before driving an unfamiliar device -- \
+                       never probe by trying verbs. device_id: id, name, or a ref like \
+                       \"the fan\"."
     )]
     async fn describe_device(
         &self,
@@ -350,11 +348,10 @@ impl DeviceControlMcpServer {
     }
 
     #[tool(
-        description = "What a device currently is: whether it is on, what each of its \
-                       settings is set to, and whether it is running. Use this to answer \
-                       questions about a device's state rather than driving it to find out. \
-                       Names match describe_device, so a reading names what changes it. \
-                       device_id: id, name, or natural ref like \"the washer\"."
+        description = "What a device currently is: on/off, each setting's value, running or \
+                       not. Answer state questions with this, never by driving the device. \
+                       Names match describe_device. device_id: id, name, or a ref like \
+                       \"the washer\"."
     )]
     async fn get_device_state(
         &self,

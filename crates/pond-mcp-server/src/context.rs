@@ -278,10 +278,9 @@ impl ContextMcpServer {
     }
 
     #[tool(
-        description = "Search the household member's own incoming personal context -- messages, \
-        calendar entries, documents and sensor observations that arrived from the sources they \
-        connected. Use it for questions about what has happened or is about to happen, rather \
-        than for what the user told you directly, which is `recall_memories`."
+        description = "Search the member's incoming personal context (messages, calendar, \
+        documents, sensor observations from connected sources) -- what has happened or is \
+        coming up. What the user told you directly lives in `recall_memories`."
     )]
     async fn search_context(
         &self,
@@ -292,11 +291,10 @@ impl ContextMcpServer {
     }
 
     #[tool(
-        description = "Recall anything this household knows that bears on a question, across all \
-        three of what the member told you, what this pond observed, and what earlier \
-        conversations were summarised to. Prefer this when a question could be answered by any \
-        of them and you do not know which. Every line says where it came from; pass that \
-        provenance on rather than presenting a summary as something the member said."
+        description = "Recall anything this household knows about a question -- what the member \
+        told you, what this pond observed, and summarised past conversations. Prefer it when \
+        you do not know which would answer. Lines carry provenance; pass it on, never present \
+        a summary as the member's words."
     )]
     async fn recall(
         &self,

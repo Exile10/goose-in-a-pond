@@ -93,15 +93,16 @@ pub struct DelegateParams {
     pub inputs: Option<serde_json::Value>,
     /// Run without waiting for the answer. Only on a pond whose model runs
     /// somewhere else; on this device it is refused. Default false.
-    ///
-    /// **Typed as a `Value` and schema'd as a boolean, on purpose.** Declaring
-    /// it `Option<bool>` would make `{"background": "true"}` — which small
-    /// models emit constantly — an rmcp deserialization failure of the whole
-    /// call, and an MCP protocol error is precisely what this module avoids: it
-    /// makes a small model retry the identical bad call. As a `Value` every
-    /// spelling reaches [`into_request`], the common ones are recovered like the
-    /// aliases beside them, and anything else is refused by [`TaskRequest`] with
-    /// a sentence naming the field.
+    //
+    // **Typed as a `Value` and schema'd as a boolean, on purpose.** Declaring
+    // it `Option<bool>` would make `{"background": "true"}` — which small
+    // models emit constantly — an rmcp deserialization failure of the whole
+    // call, and an MCP protocol error is precisely what this module avoids: it
+    // makes a small model retry the identical bad call. As a `Value` every
+    // spelling reaches [`into_request`], the common ones are recovered like the
+    // aliases beside them, and anything else is refused by [`TaskRequest`] with
+    // a sentence naming the field. (Plain comments: maintainer rationale must
+    // not ship to the model inside the schema.)
     #[serde(default)]
     #[schemars(with = "Option<bool>")]
     pub background: Option<serde_json::Value>,
@@ -552,14 +553,11 @@ impl OrchestratorMcpServer {
     }
 
     #[tool(description = "\
-Hand a piece of work to a saved specialist agent and wait for what it finds. Give it `role` \
-(the exact name of a saved role on this device) and `instructions` (what it should do). The \
-agent runs with a NARROWER set of tools and permissions than you have -- derived from yours, \
-never chosen -- so you cannot ask for its scope, tools or identity. Use it for work that would \
-otherwise take you many steps; do simple things yourself. Set `background` to true only for \
-long work you do not need the answer to right now: you get a task id back instead of an answer \
-and check it later with check_task, and on a pond that runs its model on the device itself this \
-is refused, because there one agent can work at a time.")]
+Hand work to a saved specialist agent and wait for its findings. `role` = exact saved role \
+name, `instructions` = what to do. It runs with a narrower, derived tool set -- its scope is \
+not yours to choose or query. Delegate multi-step work; do simple things yourself. \
+`background: true` only for long work you do not need now: returns a task_id for check_task, \
+and is refused when the model runs on this device (one agent at a time).")]
     async fn delegate(
         &self,
         ctx: RequestContext<RoleServer>,
@@ -637,9 +635,8 @@ is refused, because there one agent can work at a time.")]
     }
 
     #[tool(description = "\
-Check on a delegated agent you started earlier with delegate and `background`. Give it the \
-`task_id` you were told. It answers with what that agent is doing, or with what it found if it \
-has finished. You can only check tasks started in this conversation.")]
+Check a background delegation by `task_id`: what the agent is doing, or its findings if \
+finished. Only tasks started in this conversation.")]
     async fn check_task(
         &self,
         ctx: RequestContext<RoleServer>,

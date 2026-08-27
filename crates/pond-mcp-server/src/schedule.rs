@@ -304,9 +304,8 @@ impl ScheduleMcpServer {
     }
 
     #[tool(description = "\
-Set a one-shot timer or reminder that fires ONCE after a delay, then deletes \
-itself. Use for \"in 10 minutes\", \"remind me in an hour\". For anything \
-repeating use create_schedule instead.")]
+One-shot timer or reminder: fires ONCE after a delay, then deletes itself \
+(\"in 10 minutes\"). Anything repeating: create_schedule.")]
     async fn set_timer(
         &self,
         _ctx: RequestContext<RoleServer>,

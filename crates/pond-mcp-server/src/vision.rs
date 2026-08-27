@@ -223,9 +223,9 @@ impl VisionMcpServer {
     }
 
     #[tool(description = "\
-Fixed home security cameras only, never an image attached to the message. Lists recent camera \
-events (motion, pet, package, person) as text, newest first - no frames. Never guess what a \
-camera saw.")]
+Fixed security cameras only, never an image attached to the message. Text list of recent \
+events (motion, pet, package, person), newest first, no frames. Never guess what a camera \
+saw.")]
     async fn get_recent_camera_events(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -297,9 +297,8 @@ camera saw.")]
     // match and the qualifier arrived too late. Scope, then guard, then what it
     // returns.
     #[tool(description = "\
-Fixed home security cameras ONLY (door, driveway, room). If the user attached an image to the \
-message, do NOT call this - you can already see that image, just look at it. Returns one real \
-camera frame; newest unless event_id is given.")]
+Fixed security cameras only. One real frame, newest unless event_id is given. If the user \
+attached an image, just look at it - do NOT call this.")]
     async fn look_at_camera_snapshot(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -357,9 +356,9 @@ camera frame; newest unless event_id is given.")]
     }
 
     #[tool(description = "\
-Fixed home security cameras ONLY. If the user attached an image to the message, do NOT call \
-this - you can already see that image. Returns up to 4 real camera frames spread across recent \
-events, to show what changed or which way someone moved.")]
+Fixed security cameras only. Up to 4 frames across recent events - shows what changed or \
+which way someone moved. If the user attached an image, just look at it - do NOT call \
+this.")]
     async fn look_at_camera_window(
         &self,
         _ctx: RequestContext<RoleServer>,

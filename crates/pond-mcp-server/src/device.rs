@@ -66,9 +66,9 @@ impl DeviceMcpServer {
     }
 
     #[tool(
-        description = "List registered devices with their online status and what each can \
-                       be told to do. For the specific values a device accepts (fan modes, \
-                       temperature limits, what a sensor measures), use describe_device."
+        description = "List registered devices, online status, and what each can be told to \
+                       do. For exact accepted values (modes, limits, sensor units): \
+                       describe_device."
     )]
     async fn list_registered_devices(
         &self,

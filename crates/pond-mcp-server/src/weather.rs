@@ -58,9 +58,8 @@ impl WeatherMcpServer {
     }
 
     #[tool(description = "\
-Get current weather. Omit location to use the user's configured home — call it \
-that way rather than asking which city. Never guess weather data or use shell \
-commands for it.")]
+Current weather. Omit location for the configured home rather than asking \
+which city. Never guess weather or shell out for it.")]
     async fn get_current_weather(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -123,9 +122,8 @@ commands for it.")]
     }
 
     #[tool(description = "\
-Multi-day forecast: highs/lows, rain chance, UV, sunrise/sunset. \
-days 1-7 (default 3). Omit location to use the user's configured home rather \
-than asking which city. Never guess data.")]
+Forecast, days 1-7 (default 3): highs/lows, rain chance, UV, sun times. Omit \
+location for the configured home. Never guess data.")]
     async fn get_weather_forecast(
         &self,
         _ctx: RequestContext<RoleServer>,
