@@ -21,12 +21,16 @@ impl SqliteUsageTally {
 
 #[async_trait]
 impl UsageTally for SqliteUsageTally {
-    async fn record_usage(&self, peer: PeerId, tokens: TokenCount) -> Result<(), UsageTallyError> {
+    async fn record_borrowed(
+        &self,
+        peer: PeerId,
+        tokens: TokenCount,
+    ) -> Result<(), UsageTallyError> {
         sqlx::query(
-            "INSERT INTO mesh_usage_tally (peer_id, pending_tokens, updated_at) \
+            "INSERT INTO mesh_usage_tally (peer_id, tokens_borrowed, updated_at) \
              VALUES (?, ?, datetime('now')) \
              ON CONFLICT(peer_id) DO UPDATE SET \
-                pending_tokens = pending_tokens + excluded.pending_tokens, \
+                tokens_borrowed = tokens_borrowed + excluded.tokens_borrowed, \
                 updated_at = datetime('now')",
         )
         .bind(peer.to_string())
@@ -37,9 +41,35 @@ impl UsageTally for SqliteUsageTally {
         Ok(())
     }
 
-    async fn pending_tally(&self, peer: PeerId) -> Result<TokenCount, UsageTallyError> {
+    async fn record_lent(&self, peer: PeerId, tokens: TokenCount) -> Result<(), UsageTallyError> {
+        sqlx::query(
+            "INSERT INTO mesh_usage_tally (peer_id, tokens_lent, updated_at) \
+             VALUES (?, ?, datetime('now')) \
+             ON CONFLICT(peer_id) DO UPDATE SET \
+                tokens_lent = tokens_lent + excluded.tokens_lent, \
+                updated_at = datetime('now')",
+        )
+        .bind(peer.to_string())
+        .bind(tokens.value() as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| UsageTallyError::General(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn pending_borrowed(&self, peer: PeerId) -> Result<TokenCount, UsageTallyError> {
         let row: Option<(i64,)> =
-            sqlx::query_as("SELECT pending_tokens FROM mesh_usage_tally WHERE peer_id = ?")
+            sqlx::query_as("SELECT tokens_borrowed FROM mesh_usage_tally WHERE peer_id = ?")
+                .bind(peer.to_string())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| UsageTallyError::General(e.to_string()))?;
+        Ok(TokenCount::new(row.map(|(t,)| t as u64).unwrap_or(0)))
+    }
+
+    async fn pending_lent(&self, peer: PeerId) -> Result<TokenCount, UsageTallyError> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT tokens_lent FROM mesh_usage_tally WHERE peer_id = ?")
                 .bind(peer.to_string())
                 .fetch_optional(&self.pool)
                 .await
@@ -50,10 +80,12 @@ impl UsageTally for SqliteUsageTally {
     async fn mark_settled(&self, peer: PeerId, up_to: TokenCount) -> Result<(), UsageTallyError> {
         // Atomic conditional decrement — see SqliteCreditLedger::debit for why
         // this is safe under concurrent callers without a transaction/lock.
+        // Only ever touches tokens_borrowed: settlement pays what we owe,
+        // never what we're owed.
         let result = sqlx::query(
             "UPDATE mesh_usage_tally \
-             SET pending_tokens = pending_tokens - ?, updated_at = datetime('now') \
-             WHERE peer_id = ? AND pending_tokens >= ?",
+             SET tokens_borrowed = tokens_borrowed - ?, updated_at = datetime('now') \
+             WHERE peer_id = ? AND tokens_borrowed >= ?",
         )
         .bind(up_to.value() as i64)
         .bind(peer.to_string())
@@ -91,31 +123,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn record_usage_accumulates() {
+    async fn record_borrowed_accumulates() {
         let (tally, _tmp) = make_tally().await;
         let peer = PeerId::from([1u8; 32]);
         tally
-            .record_usage(peer, TokenCount::new(100))
+            .record_borrowed(peer, TokenCount::new(100))
             .await
             .unwrap();
-        tally.record_usage(peer, TokenCount::new(50)).await.unwrap();
+        tally
+            .record_borrowed(peer, TokenCount::new(50))
+            .await
+            .unwrap();
         assert_eq!(
-            tally.pending_tally(peer).await.unwrap(),
+            tally.pending_borrowed(peer).await.unwrap(),
             TokenCount::new(150)
         );
     }
 
     #[tokio::test]
-    async fn mark_settled_reduces_pending() {
+    async fn mark_settled_reduces_borrowed() {
         let (tally, _tmp) = make_tally().await;
         let peer = PeerId::from([2u8; 32]);
         tally
-            .record_usage(peer, TokenCount::new(100))
+            .record_borrowed(peer, TokenCount::new(100))
             .await
             .unwrap();
         tally.mark_settled(peer, TokenCount::new(60)).await.unwrap();
         assert_eq!(
-            tally.pending_tally(peer).await.unwrap(),
+            tally.pending_borrowed(peer).await.unwrap(),
             TokenCount::new(40)
         );
     }
@@ -124,12 +159,15 @@ mod tests {
     async fn mark_settled_more_than_pending_errors() {
         let (tally, _tmp) = make_tally().await;
         let peer = PeerId::from([3u8; 32]);
-        tally.record_usage(peer, TokenCount::new(10)).await.unwrap();
+        tally
+            .record_borrowed(peer, TokenCount::new(10))
+            .await
+            .unwrap();
         let result = tally.mark_settled(peer, TokenCount::new(11)).await;
         assert!(result.is_err());
         // Pending is unchanged after a failed settle.
         assert_eq!(
-            tally.pending_tally(peer).await.unwrap(),
+            tally.pending_borrowed(peer).await.unwrap(),
             TokenCount::new(10)
         );
     }
@@ -138,6 +176,44 @@ mod tests {
     async fn unknown_peer_has_zero_pending() {
         let (tally, _tmp) = make_tally().await;
         let peer = PeerId::from([4u8; 32]);
-        assert_eq!(tally.pending_tally(peer).await.unwrap(), TokenCount::new(0));
+        assert_eq!(
+            tally.pending_borrowed(peer).await.unwrap(),
+            TokenCount::new(0)
+        );
+        assert_eq!(
+            tally.pending_lent(peer).await.unwrap(),
+            TokenCount::new(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn lent_and_borrowed_are_independent() {
+        let (tally, _tmp) = make_tally().await;
+        let peer = PeerId::from([5u8; 32]);
+        tally
+            .record_borrowed(peer, TokenCount::new(30))
+            .await
+            .unwrap();
+        tally.record_lent(peer, TokenCount::new(70)).await.unwrap();
+
+        assert_eq!(
+            tally.pending_borrowed(peer).await.unwrap(),
+            TokenCount::new(30)
+        );
+        assert_eq!(
+            tally.pending_lent(peer).await.unwrap(),
+            TokenCount::new(70)
+        );
+
+        // Settling the borrowed side must not touch what we're owed.
+        tally.mark_settled(peer, TokenCount::new(30)).await.unwrap();
+        assert_eq!(
+            tally.pending_borrowed(peer).await.unwrap(),
+            TokenCount::new(0)
+        );
+        assert_eq!(
+            tally.pending_lent(peer).await.unwrap(),
+            TokenCount::new(70)
+        );
     }
 }

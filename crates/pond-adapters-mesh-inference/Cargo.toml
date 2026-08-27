@@ -1,0 +1,30 @@
+[package]
+name = "pond-adapters-mesh-inference"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Ports + domain newtypes only — no dependency on the concrete
+# pond-adapters-mesh-libp2p transport. Wiring a real `Arc<dyn MeshTransport>`
+# into this crate happens at pond-server's composition root, same as every
+# other LlmProvider adapter.
+pond-core = { workspace = true }
+pond-mesh-protocol = { workspace = true }
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+prost = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pond-adapters-mesh-libp2p = { workspace = true }
+# `mesh::mocks` (MockPeerDirectory/MockCreditLedger/MockUsageTally) is
+# gated behind this feature — see pond-core/src/mesh/mod.rs.
+pond-core = { workspace = true, features = ["test-mocks"] }
+pond-mesh-protocol = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

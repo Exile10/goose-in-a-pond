@@ -85,7 +85,13 @@ vision-onnx = ["dep:pond-adapters-vision-onnx"]
 # — full-feature libp2p (kad+gossipsub+relay+dcutr) is a materially heavier
 # compile than the rest of the default build.
 # cargo run -p pond-server --features mesh -- serve
-mesh = ["dep:pond-adapters-mesh-libp2p", "dep:pond-mesh-protocol"]
+mesh = ["dep:pond-adapters-mesh-libp2p", "dep:pond-mesh-protocol", "dep:pond-adapters-mesh-inference"]
+# Enable Lightning settlement over Breez/Spark (#132 Milestone 5), gated
+# behind settings.lightning_enabled at runtime. Kept optional and separate
+# from `mesh` — mesh borrowing/lending works without ever settling a real
+# balance, and this pulls a heavier, git-pinned SDK dependency.
+# cargo run -p pond-server --features "mesh lightning" -- serve
+lightning = ["dep:pond-adapters-lightning"]
 # `legacy-subprocess` is gone (2026-08). It kept the whisper-server and piper
 # subprocess paths compilable as "a one-release escape valve while the
 # in-process backends bed in" — several releases ago. It was default-off, never
@@ -114,6 +120,8 @@ pond-adapters-vision-onnx     = { workspace = true, optional = true }
 # Optional: only compiled when --features mesh is passed.
 pond-adapters-mesh-libp2p     = { workspace = true, optional = true }
 pond-mesh-protocol            = { workspace = true, optional = true }
+pond-adapters-mesh-inference  = { workspace = true, optional = true }
+pond-adapters-lightning       = { workspace = true, optional = true }
 # `test-mocks` is required at the NORMAL dependency level (not dev-deps) because
 # `main.rs` falls back to `MockAgent` in non-test code paths (the `--agent mock`
 # fallback and the `cfg(not(feature = "goose-agent"))` voice-mode wiring).

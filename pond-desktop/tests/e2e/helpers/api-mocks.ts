@@ -188,8 +188,18 @@ export async function mockAllApiRoutes(page: Page): Promise<void> {
   await page.route("**/api/v1/mesh/peers/*", (route) =>
     route.fulfill({ status: 204, body: "" }),
   );
+  await page.route("**/api/v1/mesh/peers/*/capabilities", (route) =>
+    route.fulfill({
+      json: { peer_id: "", inference_available: false, lightning_available: false },
+    }),
+  );
   await page.route("**/api/v1/mesh/self", (route) =>
     route.fulfill({ json: { mesh_enabled: false } }),
+  );
+  await page.route("**/api/v1/mesh/settlement", (route) =>
+    route.fulfill({
+      json: { configured: false, millisats_per_token: 0, peers: [] },
+    }),
   );
 
   // Weather — no location configured in tests, dashboard falls back to mock data.

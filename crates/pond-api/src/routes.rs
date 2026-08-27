@@ -17,6 +17,7 @@ use axum::{
     Router,
 };
 use pond_core::mcp::ports::extension_manager::ExtensionInfo;
+use pond_core::mesh::domain::millisats::Millisats;
 use pond_core::mesh::domain::peer_id::PeerId as MeshPeerId;
 use pond_core::mesh::domain::trust_scope::TrustScope;
 use pond_core::models::domain::message::ChatMessage;
@@ -194,7 +195,13 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/mesh/peers/{peer_id}",
             axum::routing::delete(remove_mesh_peer),
         )
+        .route("/mesh/peers/{peer_id}/credit", post(credit_mesh_peer))
+        .route(
+            "/mesh/peers/{peer_id}/capabilities",
+            get(get_mesh_peer_capabilities),
+        )
         .route("/mesh/self", get(get_mesh_self))
+        .route("/mesh/settlement", get(get_mesh_settlement_status))
         .route("/settings", get(get_settings))
         .route("/weather", get(get_weather))
         .route("/models", get(list_models))
@@ -4023,6 +4030,11 @@ struct AddMeshPeerRequest {
     address: Option<String>,
 }
 
+#[derive(serde::Deserialize)]
+struct CreditMeshPeerRequest {
+    amount_millisats: u64,
+}
+
 fn trust_scope_from_str(s: &str) -> Result<TrustScope, (StatusCode, Json<Value>)> {
     match s {
         "self_owned" => Ok(TrustScope::SelfOwned),
@@ -4068,7 +4080,8 @@ async fn list_mesh_peers(
         .await
         .map_err(mesh_internal_error)?;
 
-    let connected: std::collections::HashSet<MeshPeerId> = match &state.mesh_transport {
+    let transport = state.mesh_transport.read().await.clone();
+    let connected: std::collections::HashSet<MeshPeerId> = match &transport {
         Some(transport) => transport
             .connected_peers()
             .await
@@ -4125,7 +4138,8 @@ async fn add_mesh_peer(
         .await
         .map_err(mesh_internal_error)?;
 
-    if let (Some(address), Some(transport)) = (&req.address, &state.mesh_transport) {
+    let transport = state.mesh_transport.read().await.clone();
+    if let (Some(address), Some(transport)) = (&req.address, &transport) {
         if let Err(err) = transport.connect(peer, address.clone()).await {
             tracing::warn!("mesh: connect to newly-trusted peer {peer} failed: {err}");
         }
@@ -4154,6 +4168,148 @@ async fn remove_mesh_peer(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /api/v1/mesh/peers/{peer_id}/credit` — manual top-up, standing in
+/// for real Lightning settlement (`pond-adapters-lightning`, not built yet).
+/// `CreditLedger` is peer-agnostic (keyed by raw `PeerId`, no relationship
+/// to `PeerDirectory`), so this checks trust itself — without that check the
+/// route would let you silently fund a balance for someone outside your
+/// circle.
+async fn credit_mesh_peer(
+    State(state): State<Arc<AppState>>,
+    Path(peer_id): Path<String>,
+    body: Result<Json<CreditMeshPeerRequest>, JsonRejection>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Json(req) = body.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid request: {e}")})),
+        )
+    })?;
+    if req.amount_millisats == 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "amount_millisats must be greater than zero"})),
+        ));
+    }
+    let peer = parse_mesh_peer_id(&peer_id)?;
+
+    let scope = state
+        .peer_directory
+        .trust_scope_of(peer)
+        .await
+        .map_err(mesh_internal_error)?;
+    if scope.is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "peer is not trusted — add them first"})),
+        ));
+    }
+
+    state
+        .credit_ledger
+        .credit(peer, Millisats::new(req.amount_millisats))
+        .await
+        .map_err(mesh_internal_error)?;
+    let balance = state
+        .credit_ledger
+        .balance(peer)
+        .await
+        .map_err(mesh_internal_error)?;
+
+    Ok(Json(json!({
+        "peer_id": peer.to_string(),
+        "credit_balance_millisats": balance.value(),
+    })))
+}
+
+/// `GET /api/v1/mesh/peers/{peer_id}/capabilities` — live "what does this
+/// peer offer right now", queried over the mesh (not cached — see
+/// `PeerCapabilityQuery`'s own docs on why this isn't `PeerDirectory` data).
+/// 503 when `peer_capability_query` isn't configured (mesh feature/setting
+/// off); trust is checked first, same discipline as `credit_mesh_peer`.
+async fn get_mesh_peer_capabilities(
+    State(state): State<Arc<AppState>>,
+    Path(peer_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let peer = parse_mesh_peer_id(&peer_id)?;
+
+    let scope = state
+        .peer_directory
+        .trust_scope_of(peer)
+        .await
+        .map_err(mesh_internal_error)?;
+    if scope.is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "peer is not trusted — add them first"})),
+        ));
+    }
+
+    let query = state.peer_capability_query.read().await.clone();
+    let Some(query) = query else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "mesh is not enabled on this Pond"})),
+        ));
+    };
+    let capabilities = query
+        .capabilities_of(peer)
+        .await
+        .map_err(mesh_internal_error)?;
+
+    Ok(Json(json!({
+        "peer_id": peer.to_string(),
+        "inference_available": capabilities.inference_available,
+        "lightning_available": capabilities.lightning_available,
+    })))
+}
+
+/// `GET /api/v1/mesh/settlement` — read-only status for the periodic
+/// settlement job (#132 Milestone 6): the dev-decided exchange rate, and
+/// each trusted peer's currently-pending usage. Deliberately read-only —
+/// the rate is `MESH_SETTLEMENT_MILLISATS_PER_TOKEN`, a fixed constant, not
+/// a per-Pond setting (see that constant's own docs on why).
+async fn get_mesh_settlement_status(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let rate = pond_core::mesh::domain::settlement::MESH_SETTLEMENT_MILLISATS_PER_TOKEN;
+
+    let peers = state
+        .peer_directory
+        .list_trusted_peers(None)
+        .await
+        .map_err(mesh_internal_error)?;
+
+    let mut peer_list = Vec::with_capacity(peers.len());
+    for peer in peers {
+        // Borrowed: what we owe (settlement pays this). Lent: what peer
+        // owes us (shown for transparency only — their job to collect).
+        let borrowed = state
+            .usage_tally
+            .pending_borrowed(peer)
+            .await
+            .map_err(mesh_internal_error)?;
+        let lent = state
+            .usage_tally
+            .pending_lent(peer)
+            .await
+            .map_err(mesh_internal_error)?;
+        peer_list.push(json!({
+            "peer_id": peer.to_string(),
+            "pending_tokens": borrowed.value(),
+            "pending_millisats": borrowed.value().saturating_mul(rate),
+            "owed_to_us_tokens": lent.value(),
+            "owed_to_us_millisats": lent.value().saturating_mul(rate),
+        }));
+    }
+
+    Ok(Json(json!({
+        "configured": rate > 0,
+        "millisats_per_token": rate,
+        "peers": peer_list,
+    })))
+}
+
 /// `GET /api/v1/mesh/self` — this Pond's own mesh identity + invite link.
 /// Soft-disabled like weather: 200 with `mesh_enabled: false` when
 /// `mesh_transport` isn't configured, not an error — the UI renders an
@@ -4161,16 +4317,19 @@ async fn remove_mesh_peer(
 async fn get_mesh_self(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Some(transport) = &state.mesh_transport else {
+    let transport = state.mesh_transport.read().await.clone();
+    let Some(transport) = transport else {
         return Ok(Json(json!({ "mesh_enabled": false })));
     };
     let peer_id = transport.local_peer_id();
-    let address = transport
-        .listen_addresses()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .next();
+    let addresses = transport.listen_addresses().await.unwrap_or_default();
+    // Prefer a routable address over loopback — an invite is only useful
+    // to a peer on a different machine.
+    let address = addresses
+        .iter()
+        .find(|a| !a.contains("127.0.0.1") && !a.contains("/ip6/::1/"))
+        .or_else(|| addresses.first())
+        .cloned();
     let invite_url = match &address {
         Some(address) => format!(
             "pond-mesh://invite?peer={peer_id}&addr={}",
@@ -4561,6 +4720,31 @@ async fn update_settings(
         }
     }
 
+    // Same reasoning as Matter directly above: mesh_enabled used to be read
+    // only at server startup, so flipping it on changed nothing until the
+    // Pond was restarted. `mesh_rebuild` (set by pond-server at startup)
+    // builds the real transport/provider on demand; it is always safe to
+    // call — it no-ops if the stack is already built, mesh is still
+    // disabled, or this binary lacks the `mesh` feature. Only when the
+    // caller actually touched mesh_enabled, same discipline as
+    // touches_matter: this endpoint takes a patch over the whole of
+    // Settings, so calling it unconditionally would pay a settings read on
+    // every unrelated save.
+    let touches_mesh = patch
+        .as_object()
+        .is_some_and(|o| o.contains_key("mesh_enabled"));
+    if touches_mesh && merged.mesh_enabled {
+        if let Some(rebuild) = &state.mesh_rebuild {
+            rebuild().await;
+            // Pick up a real mesh provider immediately if chat_provider was
+            // already "mesh" while mesh itself was still off — otherwise
+            // state.llm_provider stays pinned to the UnavailableProvider it
+            // cached back then, since only chat_provider/chat_model changes
+            // normally trigger this rebuild (see provider_keys below).
+            rebuild_llm_provider(&state, &merged).await;
+        }
+    }
+
     // Hot-reload the ModelRouter whenever any provider/model field changes.
     let provider_keys = [
         "chat_provider",
@@ -4583,7 +4767,16 @@ async fn update_settings(
                     ("tts", "", &merged.active_tts_model),
                 ];
                 for (role, provider, model_name) in role_map {
-                    if model_name.is_empty() {
+                    // "mesh" (#132) has no catalog category — it borrows a
+                    // trusted peer's compute, it isn't a file this Pond
+                    // downloaded. Without this, `for_chat_provider("mesh")`
+                    // falls into its catch-all ("llamafile") and this writes
+                    // a bogus `llamafile/{model}` assignment pointing at a
+                    // catalog row that doesn't exist — clearing it here is
+                    // the same treatment the empty-model_name case already
+                    // gets, for the same reason: no real catalog row to
+                    // assign.
+                    if model_name.is_empty() || (*role == "chat" && *provider == "mesh") {
                         let _ = repo.clear_assignment(role).await;
                         continue;
                     }
@@ -4718,6 +4911,8 @@ fn weather_short_weekday(date: &str) -> String {
         .unwrap_or_else(|_| date.to_string())
 }
 
+use pond_core::models::ports::provider::UnavailableProvider;
+
 /// Rebuild and hot-swap the ModelRouter using the new settings.
 /// Called whenever the user changes any provider/model assignment.
 async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
@@ -4733,6 +4928,12 @@ async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
 
     /// Build one `Arc<dyn LlmProvider>` for a given (provider, model) pair.
     ///
+    /// `"mesh"` → the singleton read live out of `state.mesh_provider`'s
+    ///   lock (never reconstructed here — see `pond-adapters-mesh-inference`'s
+    ///   docs for why more than one would break the mesh transport's single
+    ///   `recv()` consumer; `state.mesh_rebuild` is the only thing allowed
+    ///   to populate it, at startup or via `PUT /settings` hot-enabling), or
+    ///   a provider that fails loudly if mesh isn't actually available yet.
     /// `"local"` → `LocalInferenceLlmAdapter` (compiled in with the
     ///   `local-inference` feature; falls back to llamafile otherwise).
     /// `"ollama"` → `OllamaProvider`.
@@ -4744,8 +4945,19 @@ async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
         _data_dir: Option<std::path::PathBuf>,
         max_tokens: u32,
         temperature: f32,
+        mesh_provider: Option<Arc<dyn LlmProvider>>,
+        _model_repo: Option<
+            Arc<dyn pond_core::models::ports::model_repository::ModelRepository + Send + Sync>,
+        >,
     ) -> Arc<dyn LlmProvider> {
         match provider {
+            "mesh" => mesh_provider.unwrap_or_else(|| {
+                Arc::new(UnavailableProvider::new(
+                    "mesh inference is not enabled on this Pond (mesh_enabled is off, \
+                     or this build lacks the `mesh` feature)",
+                )) as Arc<dyn LlmProvider>
+            }),
+
             "ollama" => Arc::new(
                 OllamaProvider::new(None, Some(model))
                     .with_max_tokens(max_tokens)
@@ -4756,12 +4968,23 @@ async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
             "local" | "gguf" => {
                 use pond_adapters_local_inference::LocalInferenceLlmAdapter;
 
-                // `new_with_data_dir` handles both raw ".gguf" filenames and
-                // HuggingFace "repo:quant" IDs, registering the model in Goose's
-                // global registry so LocalInferenceProvider can locate the file.
+                // Resolve the catalog's real on-disk filename first — guessing
+                // `{model}.gguf` fails when it doesn't match the catalog alias
+                // (e.g. "llama-3.2-3b" vs "Llama-3.2-3B-Instruct-Q4_K_M.gguf").
+                let resolved_filename = match &_model_repo {
+                    Some(repo) => repo
+                        .get_by_id(&format!("gguf/{model}"))
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|record| record.filename),
+                    None => None,
+                };
+                let model_arg = resolved_filename.as_deref().unwrap_or(model);
+
                 let result = match &_data_dir {
-                    Some(dir) => LocalInferenceLlmAdapter::new_with_data_dir(model, dir).await,
-                    None => LocalInferenceLlmAdapter::new(model).await,
+                    Some(dir) => LocalInferenceLlmAdapter::new_with_data_dir(model_arg, dir).await,
+                    None => LocalInferenceLlmAdapter::new(model_arg).await,
                 };
                 match result {
                     Ok(adapter) => Arc::new(adapter) as Arc<dyn LlmProvider>,
@@ -4799,6 +5022,8 @@ async fn rebuild_llm_provider(state: &Arc<AppState>, settings: &Settings) {
         data_dir.clone(),
         max_tokens,
         temperature,
+        state.mesh_provider.read().await.clone(),
+        state.model_repo.clone(),
     )
     .await;
     // If chat uses llamafile, ensure the process is running before
@@ -11774,7 +11999,8 @@ async fn music_now_playing_handler(State(state): State<Arc<AppState>>) -> axum::
         // made a connection Spotify was actively refusing look like a paused
         // one, leaving the widget with nothing to tell the user.
         let (error, message) = spotify_error_hint(status);
-        tracing::warn!(status = %status, error, "Spotify now-playing request failed");
+        let body_preview = resp.text().await.unwrap_or_default();
+        tracing::warn!(status = %status, error, body = %body_preview, "Spotify now-playing request failed");
         return Json(json!({
             "connected": true,
             "playing": false,

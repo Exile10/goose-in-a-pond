@@ -133,6 +133,11 @@ jobs:
       - name: cargo check (production binary + its test targets — pond-server + goose adapter)
         run: cargo check -p pond-server -p pond-adapters-goose --all-targets
 
+      # The check above doesn't pass --features mesh, but the staged sidecar
+      # build always does — this catches a mesh-only break the other misses.
+      - name: cargo check (production binary with mesh feature — matches the staged sidecar build)
+        run: cargo check -p pond-server --features mesh --all-targets
+
       # The quarantined PondAgent stack (Q2-05). It is no longer in pond-server's
       # default features, so the gate above stops reaching it — and AGENTS.md's
       # promise is that the code "compiles and can be enabled when the engine is
@@ -170,6 +175,24 @@ jobs:
 
       - name: cargo test (mesh transport — pond-adapters-mesh-libp2p)
         run: cargo test -p pond-adapters-mesh-libp2p
+
+      # Isolated like mesh-libp2p above — dev-dependencies pull in the full
+      # libp2p stack. Previously only type-checked as a side effect of the
+      # goose-adapter check, never linted or tested.
+      - name: cargo clippy (mesh inference — pond-adapters-mesh-inference)
+        run: cargo clippy -p pond-adapters-mesh-inference --all-targets
+
+      - name: cargo test (mesh inference — pond-adapters-mesh-inference)
+        run: cargo test -p pond-adapters-mesh-inference
+
+      # Previously compiled by nothing in CI at all. Its one live-network
+      # test needs a real BREEZ_API_KEY and stays #[ignore]d, like the other
+      # live-hardware tests in the fast job.
+      - name: cargo clippy (lightning payment rail — pond-adapters-lightning)
+        run: cargo clippy -p pond-adapters-lightning --all-targets
+
+      - name: cargo test (lightning payment rail — pond-adapters-lightning)
+        run: cargo test -p pond-adapters-lightning
 
   # 2: Frontend ─────────────────────────────────────────────────────────
   # Runs Vitest unit tests and Playwright E2E tests.

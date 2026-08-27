@@ -13,6 +13,7 @@ use pond_core::models::ports::agent::{
 };
 use pond_core::models::ports::embedding::EmbeddingProvider;
 use pond_core::models::ports::model_repository::ModelRepository;
+use pond_core::models::ports::provider::LlmProvider;
 use pond_core::models::ports::token_counter::TokenCounter as PondTokenCounter;
 use pond_core::models::services::context::context_budget::CompactionProfile;
 use pond_core::models::services::context::context_governor::{
@@ -91,10 +92,38 @@ const GOOSE_EMPTY_TURN_MESSAGE: &str =
 /// How many times GIAP re-engages the model after a turn that produced no text
 /// and no tool call.
 ///
-/// Deliberately small: each attempt is a full turn, and on-device that is a real
-/// wait. Two buys the recovery without turning a bad turn into a minute of
+/// Deliberately small: each attempt is a real full turn, and on-device that is a
+/// real wait. Two buys the recovery without turning a bad turn into a minute of
 /// silence.
 const MAX_EMPTY_TURN_REENGAGEMENTS: usize = 2;
+
+/// GIAP's own tag names, injected into every turn's `<system-context>` (see
+/// `goose_agent.rs`'s `user_text` construction). None of them can ever be a
+/// legitimate answer — nobody asks a question shaped like
+/// `<answer-contract>...</answer-contract>` — so any of them surviving into
+/// the model's VISIBLE output means it echoed scaffolding instead of
+/// following it, not that it answered.
+const SCAFFOLD_TAGS: &[&str] = &[
+    "<system-context>",
+    "<user-message>",
+    "<answer-contract>",
+    "<memories>",
+    "<turn-context>",
+];
+
+/// Whether `text` — a turn's visible output, already checked non-empty — is
+/// GIAP's own prompt scaffolding leaking back out rather than an answer.
+///
+/// Observed in the wild over a mesh-borrowed model: asked "when is today?", it
+/// replied `<answer-contract> When is today? </answer-contract>` — the
+/// wrapper tag name from the prompt, with the user's own question stuffed
+/// inside instead of the worked example's answer shape. That is exactly as
+/// useless to the user as [`GOOSE_EMPTY_TURN_MESSAGE`], so it gets the same
+/// treatment: swallowed and re-engaged, not shown.
+fn looks_like_leaked_scaffold(text: &str) -> bool {
+    let trimmed = text.trim();
+    SCAFFOLD_TAGS.iter().any(|tag| trimmed.contains(tag))
+}
 
 /// Appended to the user message when re-engaging after an empty turn.
 ///
@@ -217,6 +246,16 @@ pub struct GooseAdapter {
     /// GIAP data directory — used to resolve GGUF model paths under
     /// `$data_dir/models/gguf/` for the in-process LocalInferenceProvider.
     data_dir: Option<PathBuf>,
+    /// Private mesh (#132 Milestone 4): the exact same lock `pond-server`
+    /// wires into `AppState.mesh_provider` (not a snapshot of it), so
+    /// `chat_provider = "mesh"` can drive real chat via `MeshProvider`
+    /// (`mesh_provider.rs`), not just the `GET /api/v1/test` diagnostic
+    /// probe. `None` inside the lock unless the mesh transport is actually
+    /// running. Reading it live (rather than caching an `Option` at
+    /// construction) is what lets `PUT /api/v1/settings` enabling mesh at
+    /// runtime take effect on this GooseAdapter's very next turn, with no
+    /// restart and no adapter rebuild.
+    mesh_provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,
     /// Shared manager for extensions.
     extension_manager: Arc<GiapGooseExtensionManager>,
     /// Tracks the last "chat_provider:chat_model" key we wired into Goose.
@@ -539,6 +578,7 @@ impl GooseAdapter {
             model_repo: None,
             llamafile_url,
             data_dir,
+            mesh_provider: Arc::new(tokio::sync::RwLock::new(None)),
             extension_manager,
             last_provider_key: Mutex::new(String::new()),
             current_provider: Mutex::new(None),
@@ -2057,6 +2097,33 @@ impl GooseAdapter {
 
         let provider: Option<(Arc<dyn Provider>, goose_providers::model::ModelConfig)> =
             match settings.chat_provider.as_str() {
+                // Private mesh (#132 Milestone 4): route to a trusted peer's
+                // compute via MeshProvider (mesh_provider.rs), reading the
+                // same lock AppState.mesh_provider also holds — live, on
+                // every turn, so enabling mesh from Settings takes effect
+                // here with no adapter rebuild. No MCP tool-calling over
+                // mesh yet — see that module's doc comment for why. `None`
+                // (keep whatever provider is already active) on
+                // unavailability matches this function's own established
+                // failure mode for every other arm below.
+                "mesh" => match self.mesh_provider.read().await.clone() {
+                    Some(provider) => {
+                        let cfg = goose_providers::model::ModelConfig::new("mesh");
+                        Some((
+                            Arc::new(crate::mesh_provider::MeshProvider::new(provider))
+                                as Arc<dyn Provider>,
+                            cfg,
+                        ))
+                    }
+                    None => {
+                        tracing::warn!(
+                            "[model-switch] chat_provider=mesh but no mesh_provider wired into \
+                             GooseAdapter — keeping current provider"
+                        );
+                        None
+                    }
+                },
+
                 // In-process GGUF inference via llama.cpp — no HTTP server needed.
                 // Registers the model in Goose's local_model_registry so
                 // LocalInferenceProvider can locate the .gguf file on disk.
@@ -2958,6 +3025,25 @@ impl GooseAdapter {
     /// anything it does not recognise.
     pub fn with_model_repo(mut self, repo: Arc<dyn ModelRepository>) -> Self {
         self.model_repo = Some(repo);
+        self
+    }
+
+    /// Attach the private-mesh (#132) borrowing provider so `chat_provider =
+    /// "mesh"` can drive real chat via `MeshProvider`. A builder, not a
+    /// `new()` argument, for the same reason as `with_model_repo`: without it
+    /// the "mesh" arm just warns and keeps whatever provider was already
+    /// active, rather than the whole adapter failing to construct.
+    ///
+    /// Takes the shared lock itself, not a resolved `Arc<dyn LlmProvider>` —
+    /// the caller hands over the exact same lock it stores elsewhere (e.g.
+    /// `AppState.mesh_provider`), so a later write into that lock (mesh
+    /// hot-enabling) is visible here immediately, with no re-call to this
+    /// builder and no adapter rebuild.
+    pub fn with_mesh_provider(
+        mut self,
+        provider: Arc<tokio::sync::RwLock<Option<Arc<dyn LlmProvider>>>>,
+    ) -> Self {
+        self.mesh_provider = provider;
         self
     }
 
@@ -4513,6 +4599,16 @@ impl GooseAdapter {
                                     tracing::warn!(
                                         session_id = %session_id,
                                         "goose reported an empty turn",
+                                    );
+                                } else if !raw_text.is_empty() && looks_like_leaked_scaffold(&raw_text) {
+                                    // The model echoed one of GIAP's own prompt tags
+                                    // instead of answering — as useless to the user as
+                                    // an empty turn, so it gets the same recovery path
+                                    // rather than being shown.
+                                    tracing::warn!(
+                                        session_id = %session_id,
+                                        leaked = %raw_text,
+                                        "model echoed internal scaffolding instead of answering",
                                     );
                                 } else if !raw_text.is_empty() {
                                     // Goose signals "budget exhausted" by streaming a
@@ -7868,6 +7964,38 @@ mod tests {
             "The model returned an empty response. Please resend your message to continue."
         );
         assert_ne!(GOOSE_EMPTY_TURN_MESSAGE, EMPTY_TURN_EXHAUSTED_MESSAGE);
+    }
+
+    /// The exact failure observed over a mesh-borrowed model: asked "when is
+    /// today?", it echoed the wrapper tag with the question stuffed inside
+    /// instead of answering. Reproduced verbatim so a fix can't quietly stop
+    /// catching the real case it was written for.
+    #[test]
+    fn a_leaked_answer_contract_tag_is_recognised() {
+        assert!(looks_like_leaked_scaffold(
+            "<answer-contract> When is today? </answer-contract>"
+        ));
+    }
+
+    /// Every scaffold tag GIAP injects is covered, not just the one observed —
+    /// a model that leaks a different one must not slip through.
+    #[test]
+    fn every_injected_scaffold_tag_is_recognised() {
+        for tag in SCAFFOLD_TAGS {
+            let leaked = format!("some preamble {tag} and more");
+            assert!(looks_like_leaked_scaffold(&leaked), "tag: {tag}");
+        }
+    }
+
+    /// A real answer that happens to mention something in prose must not be
+    /// mistaken for leaked scaffolding — only GIAP's own bracketed tag names
+    /// trip this, not ordinary words.
+    #[test]
+    fn an_ordinary_answer_is_not_mistaken_for_leaked_scaffolding() {
+        assert!(!looks_like_leaked_scaffold("The sky is blue on a clear day."));
+        assert!(!looks_like_leaked_scaffold(
+            "Today's context and your message history look fine."
+        ));
     }
 
     /// The knob set doubles as the change signature that gates `set_var`, so a
