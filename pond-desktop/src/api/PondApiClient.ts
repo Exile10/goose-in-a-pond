@@ -1136,6 +1136,17 @@ export class PondApiClient {
     });
   }
 
+  updateRecipe(
+    id: string,
+    patch: { description?: string; yaml?: string; active?: boolean },
+  ): Promise<AgentRecipe> {
+    return this.put(`/api/v1/recipes/${encodeURIComponent(id)}`, patch);
+  }
+
+  removeRecipe(id: string): Promise<void> {
+    return this.del(`/api/v1/recipes/${encodeURIComponent(id)}`);
+  }
+
   // ── Chat streaming ────────────────────────────────────────
   //
   // Returns an AsyncGenerator that yields ChatEvent objects.
@@ -1172,12 +1183,19 @@ export class PondApiClient {
    */
   async *runRecipe(
     name: string,
-    opts?: { sessionId?: string; voiceMode?: boolean; canvasMode?: boolean; token?: string },
+    opts?: {
+      sessionId?: string;
+      voiceMode?: boolean;
+      canvasMode?: boolean;
+      token?: string;
+      parameters?: Record<string, string>;
+    },
   ): AsyncGenerator<ChatEvent> {
     const reqBody = {
       session_id: opts?.sessionId,
       voice_mode: opts?.voiceMode ?? false,
       canvas_mode: opts?.canvasMode ?? false,
+      ...(opts?.parameters ? { parameters: opts.parameters } : {}),
     };
     yield* this.streamSse(
       `/api/v1/recipes/${encodeURIComponent(name)}/run`,

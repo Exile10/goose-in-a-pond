@@ -93,6 +93,7 @@ mod tests {
             canvas_mode: false,
             profile_scope: crate::user_data::domain::profile::ProfileScope::Household,
             profile_context: None,
+            tool_group_allowlist: None,
         };
         let response = agent.chat(request).await.unwrap();
         assert_eq!(response.text, "Echo: Hello, Pond!");
@@ -111,6 +112,7 @@ mod tests {
             canvas_mode: false,
             profile_scope: crate::user_data::domain::profile::ProfileScope::Household,
             profile_context: None,
+            tool_group_allowlist: None,
         };
         let mut stream = agent.chat_stream(request).await.unwrap();
 

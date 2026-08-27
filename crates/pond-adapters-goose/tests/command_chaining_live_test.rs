@@ -368,6 +368,7 @@ async fn run_utterance(session_id: &str, utterance: &str) -> ChainRun {
         // BUILD ever since. Household is what a test with no speaker means.
         profile_scope: ProfileScope::Household,
         profile_context: None,
+        tool_group_allowlist: None,
     };
 
     let started = Instant::now();

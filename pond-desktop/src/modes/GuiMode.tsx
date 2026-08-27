@@ -14,6 +14,7 @@ import { Pairing } from "../sections/Pairing";
 import { Schedules } from "../sections/Schedules";
 import { Memory } from "../sections/Memory";
 import { Skills } from "../sections/Skills";
+import { Recipes } from "../sections/Recipes";
 import { Models } from "../sections/Models";
 import { Prompts } from "../sections/Prompts";
 import { SettingsCatalogueView } from "../settings/SettingsCatalogue";
@@ -34,6 +35,7 @@ function SectionContent({ section }: { section: GuiSection }) {
     case "notifications": return <Notifications />;
     case "memory":     return <Memory />;
     case "skills":     return <Skills />;
+    case "recipes":    return <Recipes />;
     case "extensions": return <Extensions />;
     case "models":    return <Models />;
     case "prompts":   return <Prompts />;

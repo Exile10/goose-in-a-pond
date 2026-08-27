@@ -134,6 +134,7 @@ mod tests {
             canvas_mode: false,
             profile_scope: crate::user_data::domain::profile::ProfileScope::Household,
             profile_context: None,
+            tool_group_allowlist: None,
         }
     }
 

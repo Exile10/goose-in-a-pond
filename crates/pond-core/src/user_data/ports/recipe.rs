@@ -5,8 +5,9 @@ use async_trait::async_trait;
 /// Driven Port: agent recipe persistence.
 ///
 /// Recipes are Goose-compatible YAML automations stored in the DB.
-/// They can be executed on demand via the `giap__run_recipe` MCP tool or
-/// via `POST /api/v1/recipes/{name}/run`.
+/// They are executed via `POST /api/v1/recipes/{name}/run` — there is no
+/// MCP tool for self-invocation by the agent; a recipe run is always
+/// caller-initiated.
 #[async_trait]
 pub trait AgentRecipeRepository: Send + Sync {
     /// Return all recipes, ordered by name.
