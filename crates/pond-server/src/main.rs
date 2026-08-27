@@ -7597,7 +7597,14 @@ fn build_mesh_provider(
         usage_tally,
         settings_repo,
         backing_provider,
-        std::time::Duration::from_secs(30),
+        // Reset on every chunk received, not an overall stream deadline — so
+        // this bounds the GAP between chunks, not the total reply length.
+        // 30s was tuned for a fast LAN peer; a lender on modest hardware
+        // (observed as low as ~1.7 tokens/sec over a real mesh connection)
+        // can leave a longer gap between chunks on a long generation (e.g. a
+        // requested short story) without actually being stuck, and 30s
+        // turned that into a false "no reply from peer" failure.
+        std::time::Duration::from_secs(180),
         std::time::Duration::from_secs(15 * 60),
         payment_rail,
     );
