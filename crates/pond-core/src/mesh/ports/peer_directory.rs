@@ -34,4 +34,18 @@ pub trait PeerDirectory: Send + Sync {
     ) -> Result<Vec<PeerId>, PeerDirectoryError>;
 
     async fn trust_scope_of(&self, peer: PeerId) -> Result<Option<TrustScope>, PeerDirectoryError>;
+
+    /// Remember the last address a peer was successfully dialed at, so a
+    /// restart doesn't lose the ability to auto-reconnect to it. Best-effort
+    /// bookkeeping, not part of the trust model: a peer with no recorded
+    /// address is simply absent from `known_addresses`.
+    async fn record_peer_address(
+        &self,
+        peer: PeerId,
+        address: String,
+    ) -> Result<(), PeerDirectoryError>;
+
+    /// Every trusted peer for which an address has been recorded, for
+    /// seeding the mesh transport's reconnect loop at startup.
+    async fn known_addresses(&self) -> Result<Vec<(PeerId, String)>, PeerDirectoryError>;
 }

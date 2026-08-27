@@ -66,10 +66,16 @@ const PROVIDERS: Record<Exclude<OptionSource, "llm-providers">, (m: ModelEntry) 
 
 interface Option { value: string; label: string }
 
-function optionsFor(source: OptionSource, models: ModelEntry[]): Option[] {
+function optionsFor(source: OptionSource, models: ModelEntry[], meshEnabled?: boolean): Option[] {
   if (source === "llm-providers") {
     const seen = [...new Set(models.filter(PROVIDERS["llm-models"]).map((m) => m.provider))];
-    return seen.sort().map((p) => ({ value: p, label: p }));
+    // "mesh" (#132) has no catalog row — it is not a downloadable model, it is
+    // a trusted peer's compute — so it can never appear via the `models` scan
+    // above. Gated on `mesh_enabled`, same principle as the `downloaded`
+    // filter below: offering a provider that cannot actually serve a turn
+    // right now is offering a failure, not a choice.
+    const providers = meshEnabled ? [...seen, "mesh"] : seen;
+    return providers.sort().map((p) => ({ value: p, label: p }));
   }
   return models
     .filter(PROVIDERS[source])
@@ -981,7 +987,7 @@ export function SettingsCatalogueView({ onBack }: { onBack?: () => void } = {}) 
                         entry={e}
                         value={(settings as Record<string, unknown>)[e.key]}
                         error={errors[e.key] ?? null}
-                        options={e.control.kind === "lookup" && models ? optionsFor(e.control.source, models) : null}
+                        options={e.control.kind === "lookup" && models ? optionsFor(e.control.source, models, settings.mesh_enabled) : null}
                         onChange={patch}
                         extra={extraFor(e)}
                         dev={dev}

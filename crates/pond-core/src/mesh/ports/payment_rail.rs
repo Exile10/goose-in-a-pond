@@ -31,9 +31,17 @@ pub trait PaymentRail: Send + Sync {
         preimage: &str,
     ) -> Result<bool, PaymentRailError>;
 
+    /// Pay `peer` `amount` against `invoice` — *their* invoice, obtained by
+    /// the caller beforehand (e.g. via
+    /// `pond_adapters_mesh_inference::MeshInferenceService::request_invoice`,
+    /// the mesh-side half of invoice exchange; this port has no transport of
+    /// its own to ask for one). `amount` is passed separately from the
+    /// amount encoded in `invoice` so an adapter can cross-check the two
+    /// don't disagree before paying.
     async fn batch_settle(
         &self,
         peer: PeerId,
         amount: Millisats,
+        invoice: &str,
     ) -> Result<SettlementRecord, PaymentRailError>;
 }

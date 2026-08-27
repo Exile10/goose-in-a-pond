@@ -1,0 +1,30 @@
+[package]
+name = "pond-adapters-lightning"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Ports + domain newtypes only.
+pond-core = { workspace = true }
+# Already pulled in transitively by breez-sdk-spark — depended on directly
+# only for Mnemonic::generate() when no wallet seed exists yet. `rand`:
+# generate() needs it for secure entropy, off by default.
+bip39 = { version = "2", features = ["rand"] }
+# Not published on crates.io — consumed as a pinned git dependency, same
+# pattern this workspace already uses for the goose submodule. `sqlite`:
+# file-based local wallet-state storage, native-only — matches GIAP's own
+# SQLite-everywhere convention, no default feature set pulls it in.
+breez-sdk-spark = { git = "https://github.com/breez/spark-sdk", tag = "0.19.4", features = [
+    "sqlite",
+] }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
