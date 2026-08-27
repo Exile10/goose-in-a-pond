@@ -28,6 +28,9 @@ interface ChatMessage {
   text: string;
   card?: CardKind;
   streaming?: boolean;
+  /** Set when this bubble is showing an error, so later text starts a new one
+   *  instead of being appended onto the error sentence. */
+  error?: boolean;
   turnStats?: TurnStats;
   /** Set when the agent stopped on its turn budget — renders a Continue action. */
   turnLimit?: number;
@@ -264,6 +267,14 @@ export function ChatHubView() {
               setMsgs((prev) => {
                 const last = prev[prev.length - 1];
                 if (!last || last.who !== "goose") return prev;
+                // See Chat.tsx: the error arm overwrites `text`, this one appends,
+                // so text arriving after an error jammed onto the error sentence.
+                if (last.error) {
+                  return [
+                    ...prev,
+                    { id: nextMsgId(), who: "goose" as const, text: visible, streaming: true },
+                  ];
+                }
                 return [
                   ...prev.slice(0, -1),
                   { ...last, text: last.text + visible },
@@ -293,6 +304,7 @@ export function ChatHubView() {
                   ...last,
                   text: `Error: ${errMsg}`,
                   streaming: false,
+                  error: true,
                 },
               ];
             });

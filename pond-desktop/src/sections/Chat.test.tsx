@@ -176,6 +176,41 @@ describe("Chat section", () => {
     });
   });
 
+  it("does not run text after an error onto the end of the error sentence", async () => {
+    // The reported bug, exactly: a new chat rendered
+    //   "Error: Could not resolve model config: missing providerI could not produce…"
+    // The error arm overwrites `text` while the text arm appends to it, and the server
+    // deliberately keeps streaming after an error frame — so a following text frame ran
+    // straight onto the end of the error. The two are separate events and must render
+    // as separate messages.
+    vi.mocked(api.chatStream).mockReturnValue(
+      makeStream([
+        { type: "error", error: "Could not resolve model config: missing provider" },
+        { type: "text", content: "I could not produce a response to that." },
+      ]),
+    );
+
+    render(<Chat />);
+    await waitFor(() => expect(screen.getByLabelText("Message input")).toBeTruthy());
+
+    fireEvent.change(screen.getByLabelText("Message input"), { target: { value: "Hello" } });
+    fireEvent.click(screen.getByLabelText("Send message"));
+
+    await waitFor(() => {
+      expect(screen.getByText(/^i could not produce a response to that\.$/i)).toBeTruthy();
+    });
+
+    // Anchored at both ends: the error bubble's own text must END at "provider",
+    // which is precisely what appending broke. Asserted per element rather than
+    // against `document.body.textContent` — that flattens the whole tree, so two
+    // correctly separate bubbles still read as "providerI could not" there and the
+    // assertion would fail on a working fix.
+    const errorBubble = screen.getByText(
+      /^error: could not resolve model config: missing provider$/i,
+    );
+    expect(errorBubble.textContent).not.toMatch(/could not produce/i);
+  });
+
   it("New chat button clears messages", async () => {
     vi.mocked(api.chatStream).mockReturnValue(
       makeStream([
