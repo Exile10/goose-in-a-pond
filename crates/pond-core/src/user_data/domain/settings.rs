@@ -415,14 +415,12 @@ pub struct Settings {
     #[serde(default = "Settings::default_lightning_enabled")]
     pub lightning_enabled: bool,
 
-    /// Millisats owed per token of mesh usage — the exchange rate the
-    /// periodic settlement job (#132 Milestone 6) multiplies against each
-    /// trusted peer's pending `UsageTally` to get a real amount to invoice
-    /// and pay. Default `0` is not a placeholder value picked at random —
-    /// `SettlementService::run_once` treats `0` as "not configured yet" and
-    /// deliberately settles nothing rather than guess a rate nobody signed
-    /// off on. No UI yet; set via the settings API once a real rate is
-    /// decided.
+    /// Vestigial — no longer read by anything. The exchange rate is now
+    /// `pond_core::mesh::domain::settlement::MESH_SETTLEMENT_MILLISATS_PER_TOKEN`,
+    /// a fixed dev-decided constant, not a per-Pond setting (a borrower
+    /// reading its own number here could simply set it to pay less). Kept
+    /// on `Settings` only so old persisted rows/API payloads still
+    /// (de)serialize; setting it via the API does nothing.
     #[serde(default = "Settings::default_mesh_settlement_millisats_per_token")]
     pub mesh_settlement_millisats_per_token: u64,
 

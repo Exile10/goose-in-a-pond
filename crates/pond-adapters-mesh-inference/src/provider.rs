@@ -168,28 +168,22 @@ impl LlmProvider for MeshInferenceProvider {
                                 .usage_tally
                                 .record_borrowed(peer, TokenCount::new(usage.completion_tokens as u64))
                                 .await;
-                            // Spends down the balance select_peer checked.
-                            // Rate 0 = not configured yet, so this no-ops.
-                            let rate = self
+                            // Spends down the balance select_peer checked, at
+                            // the one dev-decided rate every Pond settles at
+                            // (not a local setting — a borrower reading its
+                            // own number could simply set it to pay less).
+                            let spent = usage.completion_tokens as u64
+                                * pond_core::mesh::domain::settlement::MESH_SETTLEMENT_MILLISATS_PER_TOKEN;
+                            if let Err(err) = self
                                 .service
-                                .settings_repo
-                                .get()
+                                .credit_ledger
+                                .debit(peer, Millisats::new(spent))
                                 .await
-                                .map(|s| s.mesh_settlement_millisats_per_token)
-                                .unwrap_or(0);
-                            if rate > 0 {
-                                let spent = usage.completion_tokens as u64 * rate;
-                                if let Err(err) = self
-                                    .service
-                                    .credit_ledger
-                                    .debit(peer, Millisats::new(spent))
-                                    .await
-                                {
-                                    // Log only — don't fail a response already streamed in full.
-                                    tracing::warn!(
-                                        "mesh: failed to debit {peer} {spent} msat: {err}"
-                                    );
-                                }
+                            {
+                                // Log only — don't fail a response already streamed in full.
+                                tracing::warn!(
+                                    "mesh: failed to debit {peer} {spent} msat: {err}"
+                                );
                             }
                             yield Ok(StreamToken::Usage(UsageStats {
                                 prompt_tokens: usage.prompt_tokens,

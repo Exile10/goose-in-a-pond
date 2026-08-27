@@ -4253,20 +4253,14 @@ async fn get_mesh_peer_capabilities(
 }
 
 /// `GET /api/v1/mesh/settlement` — read-only status for the periodic
-/// settlement job (#132 Milestone 6): whether a real exchange rate is set,
-/// and each trusted peer's currently-pending usage. Deliberately read-only —
-/// there is no route to set `mesh_settlement_millisats_per_token` here; that
-/// stays a settings-API-only knob until the rate itself is decided (see
-/// `Settings.mesh_settlement_millisats_per_token`'s own docs).
+/// settlement job (#132 Milestone 6): the dev-decided exchange rate, and
+/// each trusted peer's currently-pending usage. Deliberately read-only —
+/// the rate is `MESH_SETTLEMENT_MILLISATS_PER_TOKEN`, a fixed constant, not
+/// a per-Pond setting (see that constant's own docs on why).
 async fn get_mesh_settlement_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let rate = state
-        .settings_repo
-        .get()
-        .await
-        .map_err(mesh_internal_error)?
-        .mesh_settlement_millisats_per_token;
+    let rate = pond_core::mesh::domain::settlement::MESH_SETTLEMENT_MILLISATS_PER_TOKEN;
 
     let peers = state
         .peer_directory
