@@ -26,6 +26,7 @@ use pond_core::mesh::ports::mesh_transport::MeshTransport;
 use pond_core::mesh::ports::payment_rail::PaymentRail;
 use pond_core::mesh::ports::peer_capability_query::PeerCapabilityQuery;
 use pond_core::mesh::ports::peer_directory::PeerDirectory;
+use pond_core::mesh::ports::usage_tally::UsageTally;
 use pond_core::models::mocks::mock_provider::MockProvider;
 use pond_core::models::ports::provider::{LlmProvider, StreamToken};
 use pond_mesh_protocol::identity::MeshKeypair;
@@ -893,11 +894,12 @@ async fn a_lend_side_empty_completion_is_retried_and_the_real_answer_reaches_the
     connect(&b_transport, &b_dir, &a_transport, &a_dir).await;
 
     let backing = Arc::new(EmptyThenRealProvider::new(1));
+    let a_usage_tally = Arc::new(MockUsageTally::new());
     let _a_service = MeshInferenceService::spawn(
         a_transport.clone(),
         Arc::new(MockPeerDirectory::new()),
         Arc::new(MockCreditLedger::new()),
-        Arc::new(MockUsageTally::new()),
+        a_usage_tally.clone(),
         Arc::new(MockSettingsRepository::new()),
         backing.clone(),
         PRODUCTION_LIKE_TIMEOUT,
@@ -915,11 +917,12 @@ async fn a_lend_side_empty_completion_is_retried_and_the_real_answer_reaches_the
         .credit(a_transport.local_peer_id(), Millisats::new(1_000))
         .await
         .unwrap();
+    let b_usage_tally = Arc::new(MockUsageTally::new());
     let b_service = MeshInferenceService::spawn(
         b_transport.clone(),
         b_peer_directory,
         b_credit_ledger,
-        Arc::new(MockUsageTally::new()),
+        b_usage_tally.clone(),
         Arc::new(MockSettingsRepository::new()),
         Arc::new(MockProvider::new()),
         PRODUCTION_LIKE_TIMEOUT,
@@ -945,6 +948,27 @@ async fn a_lend_side_empty_completion_is_retried_and_the_real_answer_reaches_the
         backing.calls.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "expected exactly one retry: the first (empty) attempt plus the real one"
+    );
+
+    // The whole point of `charged_tokens`: the lender's bill (which includes
+    // the discarded empty attempt) and the borrower's own record of what it
+    // owes must be the exact same number — not the borrower silently
+    // under-counting because it only ever saw the real attempt's tokens.
+    let a_lent = a_usage_tally
+        .pending_lent(b_transport.local_peer_id())
+        .await
+        .unwrap();
+    let b_borrowed = b_usage_tally
+        .pending_borrowed(a_transport.local_peer_id())
+        .await
+        .unwrap();
+    assert_eq!(
+        a_lent, b_borrowed,
+        "lender and borrower must agree on tokens owed, including the discarded retry"
+    );
+    assert!(
+        a_lent.value() > 0,
+        "the discarded empty attempt must actually be charged for, not silently free"
     );
 }
 

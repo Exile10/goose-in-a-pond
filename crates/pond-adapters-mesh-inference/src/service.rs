@@ -477,6 +477,9 @@ impl MeshInferenceService {
                         attempt_usage = Some(pond_mesh_protocol::wire::UsageWire {
                             prompt_tokens: stats.prompt_tokens,
                             completion_tokens: stats.completion_tokens,
+                            // Set on `sent_usage` once this attempt is known
+                            // to be the one actually sent — see below.
+                            charged_tokens: 0,
                         });
                     }
                     Err(err) => {
@@ -509,10 +512,18 @@ impl MeshInferenceService {
             if seen_visible || is_last_attempt {
                 // Falls back to the estimate if the provider reported no
                 // usage, or max_tokens cut it short.
-                sent_usage = Some(attempt_usage.unwrap_or(pond_mesh_protocol::wire::UsageWire {
+                let mut usage = attempt_usage.unwrap_or(pond_mesh_protocol::wire::UsageWire {
                     prompt_tokens: 0,
                     completion_tokens: estimated_tokens,
-                }));
+                    charged_tokens: 0,
+                });
+                // The borrower needs to see the full bill — this attempt's
+                // tokens plus every discarded attempt before it — not just
+                // what it can see in `completion_tokens`, or its own ledger
+                // can never agree with what it's actually charged.
+                usage.charged_tokens =
+                    discarded_tokens_total.saturating_add(usage.completion_tokens);
+                sent_usage = Some(usage);
                 self.send_chunk(
                     peer,
                     InferenceChunk {
@@ -542,11 +553,10 @@ impl MeshInferenceService {
             );
         }
 
-        // Lend side: `peer` owes us, so record_lent — the attempt actually
-        // sent plus every discarded attempt before it, since compute spent
-        // producing nothing was still spent.
-        let sent_tokens = sent_usage.map(|u| u.completion_tokens).unwrap_or(0);
-        let charged_tokens = discarded_tokens_total.saturating_add(sent_tokens);
+        // Lend side: `peer` owes us, so record_lent at exactly what
+        // `charged_tokens` already told them they owe (see above) — the
+        // same number, not a second computation that could drift from it.
+        let charged_tokens = sent_usage.map(|u| u.charged_tokens).unwrap_or(0);
         let _ = self
             .usage_tally
             .record_lent(peer, TokenCount::new(charged_tokens as u64))
