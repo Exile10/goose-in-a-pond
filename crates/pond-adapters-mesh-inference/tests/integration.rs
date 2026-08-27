@@ -345,9 +345,11 @@ async fn lender_stops_at_max_tokens_instead_of_streaming_the_whole_response() {
     );
 }
 
-/// Borrowing must actually spend the credit balance down, once a rate is set.
+/// Borrowing must actually spend the credit balance down, at the fixed
+/// `MESH_SETTLEMENT_MILLISATS_PER_TOKEN` rate — always, not conditionally on
+/// a per-Pond setting (there is no such setting to turn it off any more).
 #[tokio::test]
-async fn borrowing_debits_the_credit_ledger_once_a_rate_is_set() {
+async fn borrowing_always_debits_the_credit_ledger_at_the_fixed_rate() {
     let (a_transport, a_dir) = spawn_transport().await; // the lender
     let (b_transport, b_dir) = spawn_transport().await; // the borrower
     connect(&b_transport, &b_dir, &a_transport, &a_dir).await;
@@ -374,17 +376,12 @@ async fn borrowing_debits_the_credit_ledger_once_a_rate_is_set() {
         .credit(a_transport.local_peer_id(), Millisats::new(1_000_000))
         .await
         .unwrap();
-    let b_settings = Arc::new(MockSettingsRepository::new());
-    b_settings
-        .set_key("mesh_settlement_millisats_per_token", "5".to_string())
-        .await
-        .unwrap();
     let b_service = MeshInferenceService::spawn(
         b_transport.clone(),
         b_peer_directory,
         b_credit_ledger.clone(),
         Arc::new(MockUsageTally::new()),
-        b_settings,
+        Arc::new(MockSettingsRepository::new()),
         Arc::new(MockProvider::new()),
         PRODUCTION_LIKE_TIMEOUT,
         Duration::from_secs(15 * 60),

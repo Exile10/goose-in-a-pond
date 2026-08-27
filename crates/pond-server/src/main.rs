@@ -2622,20 +2622,18 @@ async fn run_server(
         llm_provider.clone(),
         payment_rail.clone(),
     );
-    // Off by design until settings.mesh_settlement_millisats_per_token is
-    // set to something nonzero — see SettlementService's own docs on why
-    // it refuses to guess an exchange rate. Safe to always spawn: the loop
-    // just no-ops every tick until that setting is real. NOTE this closes
-    // over whatever `invoice_requester` was built above — if mesh gets
-    // hot-enabled later via `mesh_rebuild` below, this job does NOT pick up
-    // the fresh one. Settlement stays restart-only for now; only mesh
-    // borrowing/lending itself is made hot-reloadable here.
+    // Settles at MESH_SETTLEMENT_MILLISATS_PER_TOKEN, the one dev-decided
+    // rate every Pond uses (not a per-install setting — see that constant's
+    // own docs on why). NOTE this closes over whatever `invoice_requester`
+    // was built above — if mesh gets hot-enabled later via `mesh_rebuild`
+    // below, this job does NOT pick up the fresh one. Settlement stays
+    // restart-only for now; only mesh borrowing/lending itself is made
+    // hot-reloadable here.
     spawn_settlement_job(
         peer_directory.clone(),
         usage_tally.clone(),
         payment_rail.clone(),
         invoice_requester,
-        settings_repo.clone(),
     );
 
     // Wrapped in locks (not fixed values) so enabling mesh from
@@ -7639,19 +7637,17 @@ fn build_mesh_provider(
 
 /// Spawns the periodic Lightning settlement job (#132 Milestone 6): once per
 /// interval, pays down each trusted peer's pending usage tally via
-/// `SettlementService`. Always spawned — no `#[cfg(feature = "mesh")]` split
-/// needed, since it only touches `pond-core` port traits, always compiled —
-/// safe to, because the loop checks `payment_rail`/`invoice_requester`/the
-/// exchange-rate setting on every tick and simply does nothing until all
-/// three are real. Re-reads the rate from `settings_repo` each tick rather
-/// than freezing it at startup, so setting a real rate takes effect on the
-/// next tick, not a restart.
+/// `SettlementService`, at the fixed `MESH_SETTLEMENT_MILLISATS_PER_TOKEN`
+/// rate. Always spawned — no `#[cfg(feature = "mesh")]` split needed, since
+/// it only touches `pond-core` port traits, always compiled — safe to,
+/// because the loop checks `payment_rail`/`invoice_requester` on every tick
+/// and simply does nothing until both are real (i.e. mesh + lightning are
+/// enabled on this Pond).
 fn spawn_settlement_job(
     peer_directory: Arc<dyn pond_core::mesh::ports::peer_directory::PeerDirectory + Send + Sync>,
     usage_tally: Arc<dyn pond_core::mesh::ports::usage_tally::UsageTally + Send + Sync>,
     payment_rail: Option<Arc<dyn pond_core::mesh::ports::payment_rail::PaymentRail>>,
     invoice_requester: Option<Arc<dyn pond_core::mesh::ports::invoice_requester::InvoiceRequester>>,
-    settings_repo: Arc<dyn pond_core::user_data::ports::settings::SettingsRepository + Send + Sync>,
 ) {
     const SETTLEMENT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
     tokio::spawn(async move {
@@ -7664,18 +7660,7 @@ fn spawn_settlement_job(
             else {
                 continue; // mesh/lightning not enabled on this Pond — nothing to settle
             };
-            let rate = match settings_repo.get().await {
-                Ok(settings) => settings.mesh_settlement_millisats_per_token,
-                Err(err) => {
-                    tracing::warn!("settlement: failed to read settings: {err}");
-                    continue;
-                }
-            };
-            if rate == 0 {
-                // Not configured yet — see mesh_settlement_millisats_per_token's
-                // own doc comment on why this is a deliberate no-op.
-                continue;
-            }
+            let rate = pond_core::mesh::domain::settlement::MESH_SETTLEMENT_MILLISATS_PER_TOKEN;
 
             let service = pond_core::mesh::services::settlement::SettlementService::new(
                 peer_directory.clone(),
@@ -7718,10 +7703,7 @@ fn spawn_settlement_job(
             }
         }
     });
-    tracing::info!(
-        "settlement worker started — runs every 15 minutes \
-         (no-op until mesh_settlement_millisats_per_token is set)"
-    );
+    tracing::info!("settlement worker started — runs every 15 minutes");
 }
 
 // ── Goose agent backend ───────────────────────────────────────────────────────
