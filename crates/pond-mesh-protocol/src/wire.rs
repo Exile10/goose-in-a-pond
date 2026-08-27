@@ -131,8 +131,20 @@ pub struct InferenceRequest {
 pub struct UsageWire {
     #[prost(uint32, tag = "1")]
     pub prompt_tokens: u32,
+    /// The visible output the borrower actually received — what its own
+    /// context/token-budget accounting should use. Not necessarily what it
+    /// owes; see `charged_tokens`.
     #[prost(uint32, tag = "2")]
     pub completion_tokens: u32,
+    /// What the lender is actually billing for: `completion_tokens` plus
+    /// every discarded empty-completion attempt before it (compute spent
+    /// producing nothing was still spent). Can exceed `completion_tokens`.
+    /// The borrower's credit ledger must debit against this field, not
+    /// `completion_tokens` — otherwise it never sees the retries its own
+    /// balance is being charged for. `0` from an older peer that predates
+    /// this field means "use `completion_tokens`", not "nothing owed".
+    #[prost(uint32, tag = "3")]
+    pub charged_tokens: u32,
 }
 
 /// One piece of the lender's streamed reply. `usage` and `error` are both
@@ -369,6 +381,7 @@ mod tests {
             kind: Some(ChunkKind::Usage(UsageWire {
                 prompt_tokens: 12,
                 completion_tokens: 8,
+                charged_tokens: 8,
             })),
         });
         let bytes = frame.encode_to_vec();

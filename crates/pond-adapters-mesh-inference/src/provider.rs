@@ -162,17 +162,28 @@ impl LlmProvider for MeshInferenceProvider {
                             yield Ok(StreamToken::Text(text));
                         }
                         Some(ChunkKind::Usage(usage)) => {
+                            // What we're actually billed for — includes the
+                            // lender's discarded empty-completion retries,
+                            // which `completion_tokens` alone doesn't. `0`
+                            // means an older peer that predates this field:
+                            // fall back rather than record an owed amount of
+                            // zero for a real completion.
+                            let billed_tokens = if usage.charged_tokens > 0 {
+                                usage.charged_tokens
+                            } else {
+                                usage.completion_tokens
+                            };
                             // Borrow side: we owe `peer` — record_borrowed, not record_lent.
                             let _ = self
                                 .service
                                 .usage_tally
-                                .record_borrowed(peer, TokenCount::new(usage.completion_tokens as u64))
+                                .record_borrowed(peer, TokenCount::new(billed_tokens as u64))
                                 .await;
                             // Spends down the balance select_peer checked, at
                             // the one dev-decided rate every Pond settles at
                             // (not a local setting — a borrower reading its
                             // own number could simply set it to pay less).
-                            let spent = usage.completion_tokens as u64
+                            let spent = billed_tokens as u64
                                 * pond_core::mesh::domain::settlement::MESH_SETTLEMENT_MILLISATS_PER_TOKEN;
                             if let Err(err) = self
                                 .service
