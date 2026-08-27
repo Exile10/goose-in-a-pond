@@ -16,12 +16,46 @@
  */
 export type ClusterState = Record<string, Record<string, unknown>>;
 
+/**
+ * A manufacturer-specific cluster: seen, and that is the whole of it.
+ *
+ * An id and nothing else, because an id and nothing else is what exists. matter.js
+ * builds a behavior for a cluster its model cannot name, but discovers no shape for
+ * it — measured against a live commissioned device, the behavior's schema carries
+ * zero attributes. Matter publishes no attribute names either, so the words for these
+ * controls ("Flip-Flop", "Emoticon" on Google's Matter Virtual Device) exist only in
+ * that maker's app.
+ *
+ * Recorded anyway, because a description that lists power and brightness for a device
+ * showing three controls reads as a statement that the third does not exist.
+ */
+export interface VendorCluster {
+  /** The 32-bit Matter cluster id, e.g. 0xfff1fc01. */
+  id: number;
+}
+
 export interface EndpointSnapshot {
   /** The Matter endpoint number. Endpoint 0 is the root and never the application. */
   number: number;
   /** Device type ids from the Descriptor cluster's DeviceTypeList. */
   deviceTypes: number[];
   clusters: ClusterState;
+  /** Manufacturer-specific clusters here. Empty for all but a handful of devices. */
+  vendorClusters: VendorCluster[];
+}
+
+/**
+ * Manufacturer-specific rather than standard.
+ *
+ * A Matter cluster id is 32 bits with the vendor code in the upper 16, and a standard
+ * cluster's is zero. Keyed off the id rather than off "the snapshot has no name for
+ * it" on purpose: the snapshot also drops `identify`, `groups`, `powerSource`,
+ * `timeSynchronization` and a dozen more standard utility clusters, and reporting
+ * those as things the device can do would bury the one entry that is a real control
+ * the user can see in the maker's app.
+ */
+export function isVendorCluster(id: number): boolean {
+  return (id >>> 16) !== 0;
 }
 
 export interface NodeSnapshot {

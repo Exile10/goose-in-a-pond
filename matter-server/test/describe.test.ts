@@ -1,7 +1,24 @@
 import { describe, expect, it } from "vitest";
 
 import { describeNode } from "../src/mapping/describe.js";
-import { describedNode, endpoint, fanNode, lightNode, named, node } from "./fixtures.js";
+import {
+  airConditionerNode,
+  coOnlyAlarmNode,
+  bareLockNode,
+  customLightNode,
+  describedNode,
+  doorLockNode,
+  endpoint,
+  extendedColorLightNode,
+  fanNode,
+  lightNode,
+  mvdColorLightNode,
+  named,
+  node,
+  smokeCoAlarmNode,
+  videoPlayerNode,
+  tunableWhiteNode,
+} from "./fixtures.js";
 
 /** The capability for a verb, or undefined if the device does not offer it. */
 function capability(n: Parameters<typeof describeNode>[0], verb: string) {
@@ -77,7 +94,97 @@ describe("device description", () => {
     expect(capability(silent, "target_temp")?.value).toEqual({ kind: "number", unit: "C" });
   });
 
+  it("offers every colour control the device claims, not just hue", () => {
+    // The report this came from: asked what the Extended Color Light could do, GIAP
+    // answered power, brightness and hue/saturation -- for a device whose own Color mode
+    // dropdown offered hue/saturation, XY and colour temperature. Temperature was
+    // missing entirely, and it is the one a person actually asks for ("warmer").
+    const verbs = describeNode(extendedColorLightNode()).capabilities.map(c => c.verb);
+
+    expect(verbs).toContain("color");
+    expect(verbs).toContain("color_temp");
+  });
+
+  it("states the kelvin range the device says it can reach", () => {
+    // Mireds invert: the SMALLEST mired value is the HOTTEST colour, so 153..500 mireds
+    // is 2000..6536 K and not the other way round. Getting it backwards yields a range
+    // whose minimum exceeds its maximum, which reads as a broken device.
+    const temp = describeNode(extendedColorLightNode()).capabilities.find(
+      c => c.verb === "color_temp",
+    );
+
+    expect(temp?.value).toEqual({ kind: "number", unit: "K", min: 2000, max: 6536 });
+  });
+
+  it("believes the attributes when the capability bitmap claims nothing", () => {
+    // Google's Matter Virtual Device, exactly: three colour modes in its own Controller
+    // tab and a colorCapabilities bitmap claiming none of them. Trusting the bitmap
+    // outright described that light as having no colour at all -- strictly worse than
+    // the over-claiming it replaced, because the control is right there in the app.
+    const verbs = describeNode(mvdColorLightNode()).capabilities.map(c => c.verb);
+
+    expect(verbs).toContain("color");
+    expect(verbs).toContain("color_temp");
+  });
+
+  it("does not offer a hue to a bulb that only does white", () => {
+    // A tunable-white bulb has ColorControl and no hue whatsoever. Offering one is a
+    // command the device rejects -- the same failure as offering tilt to a roller blind.
+    const verbs = describeNode(tunableWhiteNode()).capabilities.map(c => c.verb);
+
+    expect(verbs).toContain("color_temp");
+    expect(verbs).not.toContain("color");
+  });
+
+  it("invents no kelvin range when the device states none", () => {
+    // The spec's own default for colorTempPhysicalMinMireds is 0, which converts to
+    // infinite kelvin. The capability stands; the range does not get made up.
+    const silent = node(53, [
+      named("Bulb"),
+      endpoint(1, { colorControl: { colorCapabilities: 0x10 } }, [0x010c]),
+    ]);
+    const temp = describeNode(silent).capabilities.find(c => c.verb === "color_temp");
+
+    expect(temp?.value).toEqual({ kind: "number", unit: "K" });
+  });
+
+  it("calls a speaker's level a volume, not a brightness", () => {
+    // The report this came from: a Basic Video Player described as accepting "power and
+    // brightness". Level Control was on its SPEAKER endpoint, so setting that brightness
+    // would have turned the sound down. Verified against a live device: the player is
+    // endpoint 1 type 0x28, the speaker endpoint 2 type 0x22.
+    const verbs = describeNode(videoPlayerNode()).capabilities.map(c => c.verb);
+
+    expect(verbs).toContain("volume");
+    expect(verbs).not.toContain("brightness");
+  });
+
+  it("offers a television its playback and its inputs", () => {
+    // Playback rides the existing `operation` verb -- play/pause/stop is what
+    // start/pause/stop already means -- and the input lists ride `mode`, whose whole
+    // design is a named setting whose values are labels the device published.
+    const described = describeNode(videoPlayerNode());
+    const operation = described.capabilities.find(c => c.verb === "operation");
+    const settings = described.capabilities.filter(c => c.verb === "mode");
+
+    expect(operation?.value).toEqual({ kind: "enum", values: ["play", "pause", "stop"] });
+    expect(settings.map(c => c.setting)).toEqual(["input", "audio output"]);
+    // The device's own words, not a list GIAP keeps.
+    expect(settings[0]?.value).toEqual({ kind: "enum", values: ["HDMI 1", "HDMI 2"] });
+    expect(settings[1]?.value).toEqual({ kind: "enum", values: ["TV Speaker", "Soundbar"] });
+  });
+
+  it("still calls a light's level a brightness", () => {
+    // The split is by endpoint device type, not by "has a speaker anywhere" -- a bulb has
+    // no speaker endpoint and must keep the control it has always had.
+    const verbs = describeNode(lightNode()).capabilities.map(c => c.verb);
+
+    expect(verbs).toContain("brightness");
+    expect(verbs).not.toContain("volume");
+  });
+
   it("describes only what the device has", () => {
+
     const description = describeNode(lightNode());
     const verbs = description.capabilities.map(c => c.verb);
 
@@ -85,6 +192,109 @@ describe("device description", () => {
     expect(verbs).not.toContain("fan_mode");
     expect(verbs).not.toContain("locked");
     expect(description.sensors).toEqual([]);
+    // The overwhelmingly common case, and the one a renderer must not print a line for.
+    expect(description.vendor_clusters).toEqual([]);
+    expect(description.states).toEqual([]);
+  });
+
+  it("says a device has a custom cluster rather than implying it has none", () => {
+    // Google's Matter Virtual Device shows a Flip-Flop toggle and an Emoticon field
+    // under Custom Clusters. Asked what this light could do, the agent answered "power
+    // and brightness" -- true of what GIAP could see, and read by the user as a claim
+    // that the two controls in front of them did not exist.
+    const description = describeNode(customLightNode());
+
+    expect(description.vendor_clusters).toEqual([{ cluster_id: 0xfff1fc01, endpoint: 1 }]);
+  });
+
+  it("keeps a custom cluster out of the verbs, since none of them can drive it", () => {
+    // Anything describable is callable, by construction. A vendor cluster has no verb,
+    // no name for its attributes, and no command matter.js can resolve -- so admitting
+    // one here would trade that property for a control the agent still cannot work.
+    const description = describeNode(customLightNode());
+
+    expect(description.capabilities.map(c => c.verb)).toEqual(["power", "brightness"]);
+  });
+
+  it("ignores a custom cluster on the root endpoint, which is not the device", () => {
+    // Endpoint 0 is the node's own plumbing. A vendor cluster there is not something
+    // the light does, and reporting it as such would send the user looking for a
+    // control their app does not show.
+    const rootOnly = node(31, [
+      endpoint(0, { basicInformation: { nodeLabel: "Custom Light" } }, [0x0016], [
+        { id: 0xfff1fc02 },
+      ]),
+      endpoint(1, { onOff: { onOff: false } }, [0x0100]),
+    ]);
+
+    expect(describeNode(rootOnly).vendor_clusters).toEqual([]);
+  });
+
+  it("names what a lock reports and cannot be told to be", () => {
+    // The report this came from: asked what the Door Lock could do, GIAP answered
+    // "locked or unlocked. It does not measure any data" -- for a device whose own app
+    // showed a door state and a PIN requirement beside the lock state. Both sat in the
+    // snapshot the whole time; there was no slot in the description to put them in.
+    const description = describeNode(doorLockNode());
+
+    expect(description.capabilities.map(c => c.verb)).toEqual(["locked"]);
+    expect(description.states).toEqual([
+      {
+        name: "door",
+        value: {
+          kind: "enum",
+          values: ["open", "closed", "jammed", "forced open", "unspecified error", "ajar"],
+        },
+      },
+      { name: "pin_required", value: { kind: "enum", values: ["required", "not required"] } },
+    ]);
+  });
+
+  it("keeps a lock's PIN requirement out of the verbs", () => {
+    // Read, never written. Every writable attribute on DoorLock is a security control,
+    // and a verb for one puts "turn off the pin requirement" a sentence away.
+    const verbs = describeNode(doorLockNode()).capabilities;
+
+    expect(verbs.map(c => c.verb)).not.toContain("mode");
+    expect(verbs.map(c => c.setting)).not.toContain("pin_required");
+  });
+
+  it("promises no door reading for a lock that has no position sensor", () => {
+    // DoorPositionSensor and PinCredential are both optional. Declaring either on a
+    // plain deadbolt would promise a reading that never arrives -- the same failure as
+    // offering tilt to a roller blind.
+    expect(describeNode(bareLockNode()).states).toEqual([]);
+  });
+
+  it("measures carbon monoxide as well as smoke", () => {
+    // The report this came from: an alarm expressing a CO alarm, described as measuring
+    // "the smoke alarm state" and nothing else. Two dangers with two different responses
+    // -- one says leave, the other says ventilate -- and only one was mapped.
+    const sensors = describeNode(smokeCoAlarmNode()).sensors.map(s => s.sensor_type);
+
+    expect(sensors).toContain("smoke_alarm");
+    expect(sensors).toContain("co_alarm");
+    expect(sensors).toContain("alarm_battery");
+  });
+
+  it("names which alarm is sounding, which neither reading says", () => {
+    // expressedState is the attribute the device's own screen shows, and the only one
+    // that answers "what is it doing". Categorical rather than a magnitude, so it is a
+    // state and not a sensor with an ordinal a threshold rule could compare.
+    const states = describeNode(smokeCoAlarmNode()).states;
+
+    expect(states.map(s => s.name)).toEqual(["alarm", "alarm_service", "alarm_fault"]);
+    expect(states[0]?.value).toMatchObject({ kind: "enum" });
+    expect((states[0]?.value as { values: string[] }).values).toContain("co alarm");
+  });
+
+  it("describes a CO-only alarm without inventing a smoke reading", () => {
+    // The smoke feature is absent, so the attribute has no value and the reading does
+    // not exist. Before this the device measured nothing GIAP could name at all.
+    const sensors = describeNode(coOnlyAlarmNode()).sensors.map(s => s.sensor_type);
+
+    expect(sensors).toContain("co_alarm");
+    expect(sensors).not.toContain("smoke_alarm");
   });
 
   it("lists what a sensor measures before it has reported anything", () => {
@@ -173,13 +383,51 @@ describe("device description", () => {
     });
   });
 
+  it("offers an air conditioner only the range it can cool to", () => {
+    // The report this came from: "you can set its target temperature between 7 and 32 C"
+    // for a cooling-only air conditioner. 7 is the floor of a HEATING setpoint the device
+    // does not implement, unioned in because presence was inferred from a key rather than
+    // a value -- and matter.js keys every attribute in the cluster model, unsupported
+    // ones included. Verified against a live device: controlSequenceOfOperation says
+    // CoolingOnly and occupiedHeatingSetpoint has no value at all.
+    expect(capability(airConditionerNode(), "target_temp")?.value).toEqual({
+      kind: "number",
+      unit: "C",
+      min: 16,
+      max: 32,
+      // Names which setpoint moved, and carries no "reaches ... across its modes" tail:
+      // there is no other mode, and the existing heat-only case settled that the label
+      // itself stays. What was wrong was the RANGE, not the qualifier.
+      when: "while cooling",
+    });
+  });
+
+  it("reads a system mode matter.js decoded to its enum name", () => {
+    // "Cool" compared against 3 is never equal, so the mode read as unsettled and the
+    // description fell back to the union of both setpoints' ranges.
+    const spec = capability(airConditionerNode(), "target_temp")?.value;
+
+    // Settled on the cooling setpoint, so the floor is the COOLING minimum (16) and not
+    // the heating one (7) that the union would have supplied.
+    expect(spec).toMatchObject({ min: 16 });
+  });
+
   it("keeps the setpoints from crossing when no deadband is stated", () => {
     // An absent deadband means zero, not "no rule": heating still may not pass
     // cooling.
     const noDeadband = node(92, [
       named("Thermostat"),
       endpoint(1, {
-        thermostat: { absMaxHeatSetpointLimit: 3000, occupiedCoolingSetpoint: 2400 },
+        // States that it both heats and cools (controlSequenceOfOperation 4), which is
+        // the premise the deadband rule needs: the cap exists to stop TWO setpoints
+        // crossing. Without it this fixture reads as cool-only -- it has a cooling
+        // setpoint and no heating one -- and a cool-only device has no heating ceiling
+        // to report.
+        thermostat: {
+          controlSequenceOfOperation: 4,
+          absMaxHeatSetpointLimit: 3000,
+          occupiedCoolingSetpoint: 2400,
+        },
       }),
     ]);
 

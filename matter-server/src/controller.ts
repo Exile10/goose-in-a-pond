@@ -11,15 +11,17 @@ import { Endpoint, Environment, Seconds, ServerNode, type ClientNode } from "@ma
 
 import { log, describeError, setupCodeKind } from "./log.js";
 import { nodeToDevice } from "./mapping/devices.js";
-import { planControl, type Verb } from "./mapping/control.js";
+import { observedFor, planControl, type Verb } from "./mapping/control.js";
 import { observedOperation } from "./mapping/settings.js";
 import { describeNode } from "./mapping/describe.js";
 import { stateOf } from "./mapping/state.js";
 import { readingFor, sensorClusters } from "./mapping/sensors.js";
 import {
+  isVendorCluster,
   type ClusterState,
   type EndpointSnapshot,
   type NodeSnapshot,
+  type VendorCluster,
 } from "./mapping/snapshot.js";
 import {
   OpError,
@@ -127,8 +129,8 @@ export class Controller {
     // DEVICES can be found on it. A controller squatting it means no Matter
     // device can start on the same machine: Google's Matter Virtual Device dies
     // with "OS Error 0x02000030: Address already in use ... UDP::Init
-    // bind&listen port=5540" and shows an empty Controller tab, and this repo's
-    // own virtual-device tool had to be moved off 5540 for the same reason.
+    // bind&listen port=5540" and shows an empty Controller tab, with nothing in
+    // either place pointing back at the controller that took the port.
     //
     // A controller has no need of a well-known port. It initiates the
     // connections; devices answer whatever source port it used. Verified by
@@ -398,6 +400,11 @@ export class Controller {
     }
 
     const plan = planControl(snapshotOf(peer, nodeId), deviceId, verb, value);
+    // Captured BEFORE the write, so the settle below can tell "the device has reported
+    // its new value" from "the report has not arrived yet". Without a baseline the two
+    // are indistinguishable and the first read wins, which is the state before the
+    // command.
+    const before = observedFor(snapshotOf(peer, nodeId), verb);
 
     for (const action of plan.actions) {
       const endpoint = peer.endpoints.for(action.endpoint);
@@ -439,6 +446,8 @@ export class Controller {
     if (verb === "operation") {
       const observed = await settledOperation(peer, nodeId, plan.applied.operation);
       if (observed !== undefined) plan.applied.operation = observed;
+    } else {
+      Object.assign(plan.applied, await settledObservation(peer, nodeId, verb, before, plan.applied));
     }
 
     return plan.applied;
@@ -565,13 +574,29 @@ export class Controller {
     const wired = this.#observed.get(peer.id);
     if (wired === undefined) return;
 
+    // Every cluster this pass declined to watch, reported once at the end rather than
+    // per cluster. Before this the allowlist was silent, so a device carrying a control
+    // GIAP cannot see left no trace anywhere -- the only way to find out was to read
+    // `SNAPSHOT_CLUSTERS` and compare by hand.
+    const skipped: string[] = [];
+
     for (const endpoint of peer.endpoints) {
       for (const cluster of Object.keys(endpoint.behaviors.supported)) {
-        if (!isSnapshotCluster(cluster)) continue;
+        if (!isSnapshotCluster(cluster)) {
+          skipped.push(`${endpoint.number}/${cluster}`);
+          continue;
+        }
         const key = `${endpoint.number}/${cluster}`;
         if (wired.has(key)) continue;
         if (this.#observeCluster(peer, endpoint, cluster) > 0) wired.add(key);
       }
+    }
+
+    if (skipped.length > 0) {
+      log.debug("clusters_skipped", "not watching clusters GIAP does not read", {
+        node: peer.id,
+        clusters: skipped.join(", "),
+      });
     }
   }
 
@@ -677,6 +702,7 @@ function snapshotOf(peer: ClientNode, nodeId: bigint): NodeSnapshot {
       number: Number(endpoint.number),
       deviceTypes: readDeviceTypes(endpoint),
       clusters: readClusters(endpoint),
+      vendorClusters: readVendorClusters(endpoint),
     });
   }
   return { nodeId, online: peer.lifecycle.isOnline, endpoints };
@@ -697,11 +723,20 @@ const OPERATION_SETTLE_MS = 2000;
 const OPERATION_POLL_MS = 100;
 
 /** The state each operation asks the device to reach. */
-const INTENDED_STATE: Record<string, string> = {
-  start: "running",
-  resume: "running",
-  stop: "stopped",
-  pause: "paused",
+/**
+ * The state each operation asks the device to reach, in every vocabulary that means it.
+ *
+ * Two clusters answer this verb and they do not share words: OperationalState says
+ * "stopped" where MediaPlayback says "not playing". Listing both is what lets one verb
+ * serve an appliance and a television without either waiting out the full window for a
+ * word the device is never going to say.
+ */
+const INTENDED_STATE: Record<string, readonly string[]> = {
+  start: ["running"],
+  resume: ["running"],
+  stop: ["stopped", "not playing"],
+  pause: ["paused"],
+  play: ["playing"],
 };
 
 /**
@@ -713,7 +748,7 @@ const INTENDED_STATE: Record<string, string> = {
  * took the command and did nothing.
  */
 export async function settleTo(
-  wanted: string | undefined,
+  wanted: string | readonly string[] | undefined,
   read: () => string | undefined,
   waitMs: number = OPERATION_SETTLE_MS,
   pollMs: number = OPERATION_POLL_MS,
@@ -722,8 +757,11 @@ export async function settleTo(
   // Nothing to wait for: a verb with no state of its own to reach.
   if (wanted === undefined) return seen;
 
+  // One target or several: the same idea can have a different word per cluster, and
+  // arriving at any of them is arriving.
+  const accepted = typeof wanted === "string" ? [wanted] : wanted;
   const deadline = Date.now() + waitMs;
-  while (seen !== wanted && Date.now() < deadline) {
+  while (!(seen !== undefined && accepted.includes(seen)) && Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, pollMs));
     seen = read();
   }
@@ -736,8 +774,48 @@ async function settledOperation(
   nodeId: bigint,
   requested: string | undefined,
 ): Promise<string | undefined> {
-  const wanted = requested === undefined ? undefined : INTENDED_STATE[requested.toLowerCase()];
+  const wanted: readonly string[] | undefined =
+    requested === undefined ? undefined : INTENDED_STATE[requested.toLowerCase()];
   return settleTo(wanted, () => observedOperation(snapshotOf(peer, nodeId)));
+}
+
+/**
+ * What the device reports for this verb once it has had a chance to report it.
+ *
+ * Returns as soon as the reading MOVES, so a device that obeys is not held up: measured
+ * against Google's Matter Virtual Device the command answers in ~13ms and the new state
+ * lands within ~500ms. A device already sitting at the requested value has nothing to
+ * report, so it is not waited on at all — otherwise every no-op command would cost the
+ * full window.
+ *
+ * Where the device reports nothing for the verb, the plan's own `applied` stands. That is
+ * the request echoed back, which is what this exists to replace — but an absent reading
+ * is not evidence of a different one, and inventing a value would be worse than echoing.
+ */
+async function settledObservation(
+  peer: ClientNode,
+  nodeId: bigint,
+  verb: Verb,
+  before: DeviceStatePatch,
+  requested: DeviceStatePatch,
+): Promise<DeviceStatePatch> {
+  const read = () => observedFor(snapshotOf(peer, nodeId), verb);
+  const keys = Object.keys(read()) as (keyof DeviceStatePatch)[];
+  if (keys.length === 0) return {};
+
+  // Already there: the device has nothing to move to, so there is nothing to wait for.
+  if (keys.every(k => before[k] !== undefined && before[k] === requested[k])) return before;
+
+  const deadline = Date.now() + OPERATION_SETTLE_MS;
+  let seen = before;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, OPERATION_POLL_MS));
+    seen = read();
+    if (keys.some(k => seen[k] !== before[k])) return seen;
+  }
+  // Never moved. Reporting what it still says is the honest answer for a device that
+  // took the command and did nothing -- the same choice `settleTo` makes.
+  return seen;
 }
 
 /**
@@ -970,6 +1048,31 @@ function readClusters(endpoint: Endpoint): ClusterState {
     }
   }
   return clusters;
+}
+
+/**
+ * The manufacturer-specific clusters this endpoint has.
+ *
+ * Free: matter.js already built a behavior for every entry in the Descriptor's
+ * ServerList, including the clusters its own model cannot name, so the id is in hand.
+ * Nothing is read from the device and nothing is subscribed — which is what lets this
+ * sit outside `SNAPSHOT_CLUSTERS` without paying the cost that bound exists to avoid.
+ *
+ * The id is all there is. Measured against a live commissioned device, such a
+ * behavior is named `cluster$fff1fc01` and its schema carries no attributes at all:
+ * matter.js discovers no shape for a cluster it does not know. So there is nothing to
+ * count, and reporting a count of zero for a device showing two controls would be the
+ * same silent falsehood this whole record exists to remove.
+ */
+function readVendorClusters(endpoint: Endpoint): VendorCluster[] {
+  const vendor: VendorCluster[] = [];
+  for (const behavior of Object.values(endpoint.behaviors.supported)) {
+    // `cluster` is on cluster behaviors; an endpoint also carries plain ones.
+    const id = (behavior as { cluster?: { id?: unknown } }).cluster?.id;
+    if (typeof id !== "number" || !isVendorCluster(id)) continue;
+    vendor.push({ id });
+  }
+  return vendor;
 }
 
 /**

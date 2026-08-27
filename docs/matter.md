@@ -133,32 +133,29 @@ carries the underlying error.
 
 ## Testing without hardware
 
-`matter-server/` can be a Matter *device* as well as drive one, so testing needs
-nothing external — no Google Matter Virtual Device, no bulb:
+Google's **Matter Virtual Device** is the device side. It advertises itself for
+commissioning like any bulb or lock, and its Controller tab both shows what the
+device currently is and lets you change what only the device can change — a door
+position, a custom cluster's attributes.
 
-```bash
-cd matter-server && npm run virtual-device
-```
-
-It prints a pairing code and waits. Pair it from the Devices tab, then drive it
-from chat ("turn off the light", "set the light to 40%") and watch the device
-process report what it was told:
-
-```
-  [device] power  -> on
-  [device] level  -> 102 (40%)
-```
+Pair it from the Devices tab with the code it shows, then drive it from chat
+("turn off the light", "set the light to 40%") and watch its Controller tab.
 
 Two lines, one from each side, is the check worth making: GIAP reporting success
-and the device reporting the same change are different claims, and only the
-second one means the command arrived.
+and the device reporting the same change are different claims, and only the second
+one means the command arrived.
 
-Its fabric is temporary, so stopping and restarting gives you a fresh, unpaired
-device. It binds Matter port 5541, leaving the standard 5540 for a real device
-app. Remove it from the Devices tab when finished, or it will show as offline
-once stopped.
+Remove the device from the Devices tab when finished, or it will show as offline
+once the app stops. MVD wants UDP 5540 — see below if it starts with an empty
+Controller tab.
 
-Google's Matter Virtual Device works too, and wants UDP 5540.
+There is no device-side test rig in this repo. The mappings are covered instead by
+recorded snapshots in `matter-server/test/fixtures.ts` — real devices as
+commissioned, carried forward so the cluster logic keeps its coverage without a
+fabric. What those cannot check is the wiring either side of them: that a
+description reaches chat, that a command leaves the socket, that an attribute a
+real device publishes arrives decoded the way a fixture says it does. That part is
+MVD and a person.
 
 ### Ports, and why a device app may refuse to start
 
@@ -207,8 +204,7 @@ avahi-browse -rt _matterc._udp              # Linux
 ```
 
 No result means nothing is in pairing mode. Restart the device and retry
-promptly — for the bundled virtual device, that is Ctrl-C and `npm run
-virtual-device` again.
+promptly — in MVD, Reboot on the device reopens the window.
 
 Setup codes are credentials, and are redacted out of every log line, error
 message and API response on both sides of the socket. If you ever find one in a

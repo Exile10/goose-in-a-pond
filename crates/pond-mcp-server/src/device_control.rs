@@ -58,6 +58,14 @@ pub struct SetDeviceStateParams {
     /// 0-100 percent.
     #[serde(default)]
     pub saturation: Option<u8>,
+    /// Speaker volume 0-100. A television's level is its VOLUME, not its brightness.
+    #[serde(default)]
+    pub volume: Option<u8>,
+    /// Colour temperature in kelvin — roughly 2000 (warm/amber) to 6500 (cool/daylight).
+    /// A device's own achievable range comes from describe_device; this is not the same
+    /// control as hue + saturation, and a white cannot be asked for as a hue.
+    #[serde(default)]
+    pub color_temp: Option<u32>,
     /// 0-100 percent.
     #[serde(default)]
     pub fan_speed: Option<u8>,
@@ -265,6 +273,44 @@ fn render_description(d: &DeviceDescription) -> String {
             out.push_str(&format!("\n    {} ({})", sensor.sensor_type, sensor.unit));
         }
     }
+
+    // Named separately from Accepts and Measures because it is neither, and the
+    // difference is the whole point: asked to shut the door, an agent that read these
+    // as settable would try, and a lock refusing a write it never offered is a worse
+    // answer than "I can see it and cannot change it".
+    if !d.states.is_empty() {
+        out.push_str("\n  Reports, and cannot be told to change:");
+        for state in &d.states {
+            out.push_str(&format!(
+                "\n    {} — {}",
+                state.name,
+                render_value(&state.value)
+            ));
+        }
+    }
+
+    // Printed only when there is one, which is nearly never. A "Manufacturer-specific:
+    // nothing." line on every description in the house would be paid for by every
+    // reader to inform none of them.
+    //
+    // The sentence has to carry both halves — that the control is there, and that
+    // nothing here can work it — because either half alone is a wrong answer. Silence
+    // told a user their light had no emoji setting while the maker's app showed one;
+    // naming it without the caveat would have the agent promise a control it cannot
+    // reach.
+    if !d.vendor_clusters.is_empty() {
+        out.push_str(
+            "\n  Has manufacturer-specific controls that cannot be named or driven from \
+             here — the maker's own app is the only thing that can set them:",
+        );
+        for vendor in &d.vendor_clusters {
+            out.push_str(&format!(
+                "\n    cluster 0x{:08x} on endpoint {}",
+                vendor.cluster_id, vendor.endpoint
+            ));
+        }
+    }
+
     out
 }
 
@@ -403,6 +449,8 @@ impl DeviceControlMcpServer {
             && p.locked.is_none()
             && p.hue.is_none()
             && p.saturation.is_none()
+            && p.color_temp.is_none()
+            && p.volume.is_none()
             && p.fan_speed.is_none()
             && p.fan_mode.is_none()
             && p.setting.is_none()
@@ -413,7 +461,9 @@ impl DeviceControlMcpServer {
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "No change requested for '{device_id}'. Specify one of: power (on/off), \
                  brightness (0-100), target_temp (°C), locked (true/false), hue (0-360) + \
-                 saturation (0-100), fan_speed (0-100), fan_mode (off/low/medium/high/on/auto/\
+                 saturation (0-100), color_temp (kelvin, e.g. 2700 for warm white), \
+                 volume (0-100, a speaker's level), \
+                 fan_speed (0-100), fan_mode (off/low/medium/high/on/auto/\
                  smart), setting + setting_value (appliance settings such as a wash \
                  cycle or spin speed — see describe_device), operation (start/stop/\
                  pause/resume), position (0-100 percent open), or tilt (0-100 percent \
@@ -504,6 +554,30 @@ impl DeviceControlMcpServer {
                 Err(e) => {
                     return Ok(guidance(format!(
                         "Couldn't set colour on '{device_id}': {e}"
+                    )))
+                }
+            }
+        }
+        // Its own action, not a variant of colour. A device may take one, both, or
+        // neither, and setting hue on a tunable-white bulb is a rejection rather than a
+        // near miss -- so the two are never substituted for one another here.
+        if let Some(level) = p.volume {
+            let pct = level.min(100);
+            match self.control.set_volume(device_id, pct).await {
+                Ok(_) => applied.push(format!("volume={pct}%")),
+                Err(e) => {
+                    return Ok(guidance(format!(
+                        "Couldn't set volume on '{device_id}': {e}"
+                    )))
+                }
+            }
+        }
+        if let Some(kelvin) = p.color_temp {
+            match self.control.set_color_temp(device_id, kelvin).await {
+                Ok(_) => applied.push(format!("color_temp={kelvin}K")),
+                Err(e) => {
+                    return Ok(guidance(format!(
+                        "Couldn't set colour temperature on '{device_id}': {e}"
                     )))
                 }
             }
@@ -742,7 +816,9 @@ mod tests {
     };
     use OperationNote::{Missed, Reached};
 
-    use pond_core::user_data::ports::device_control::{Capability, SensorSpec};
+    use pond_core::user_data::ports::device_control::{
+        Capability, SensorSpec, StateSpec, VendorCluster,
+    };
 
     fn spec(verb: &str, value: ValueSpec) -> Capability {
         Capability {
@@ -788,6 +864,8 @@ mod tests {
                 ),
             ],
             sensors: vec![],
+            vendor_clusters: vec![],
+            states: vec![],
         });
 
         // The name is what `set_device_state` is called with, so it has to be in the
@@ -822,6 +900,8 @@ mod tests {
                 ),
             ],
             sensors: vec![],
+            vendor_clusters: vec![],
+            states: vec![],
         });
 
         assert!(rendered.contains("matter-18 (fan)"), "{rendered}");
@@ -848,6 +928,8 @@ mod tests {
                 },
             )],
             sensors: vec![],
+            vendor_clusters: vec![],
+            states: vec![],
         });
         assert!(stated.contains("from 7 to 30 C"), "{stated}");
 
@@ -865,6 +947,8 @@ mod tests {
                 },
             )],
             sensors: vec![],
+            vendor_clusters: vec![],
+            states: vec![],
         });
         assert!(silent.contains("a number in C"), "{silent}");
         assert!(!silent.contains("from"), "no range is implied: {silent}");
@@ -888,6 +972,8 @@ mod tests {
                     unit: "ug/m3".into(),
                 },
             ],
+            vendor_clusters: vec![],
+            states: vec![],
         });
 
         assert!(rendered.contains("carbon_dioxide (ppm)"), "{rendered}");
@@ -919,6 +1005,8 @@ mod tests {
                 },
             }],
             sensors: vec![],
+            vendor_clusters: vec![],
+            states: vec![],
         });
 
         assert!(rendered.contains("a number from 7 to 23.5 C"), "{rendered}");
@@ -1180,6 +1268,165 @@ mod tests {
             resolve_device("the thermostat", &devices),
             DeviceResolution::NotFound
         );
+    }
+
+    /// The report this came from: asked what a light with a Flip-Flop toggle and an
+    /// Emoticon field could do, the agent answered "power and brightness". True of
+    /// what it had been given, and read by the user as a claim that the two controls
+    /// in front of them did not exist.
+    #[test]
+    fn a_control_that_cannot_be_driven_is_still_disclosed() {
+        let rendered = render_description(&DeviceDescription {
+            device_id: "matter-31".into(),
+            device_type: "light".into(),
+            capabilities: vec![
+                spec("power", ValueSpec::Boolean),
+                spec("brightness", ValueSpec::Percent),
+            ],
+            sensors: vec![],
+            vendor_clusters: vec![VendorCluster {
+                cluster_id: 0xfff1_fc01,
+                endpoint: 1,
+            }],
+            states: vec![],
+        });
+
+        // Both halves, because either alone is a wrong answer: naming it without the
+        // caveat has the agent promise a control it cannot reach.
+        assert!(
+            rendered.contains("cluster 0xfff1fc01 on endpoint 1"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("cannot be named or driven"), "{rendered}");
+        assert!(rendered.contains("the maker's own app"), "{rendered}");
+        // Disclosure is not a capability. The verbs are what `set_device_state` accepts.
+        assert!(rendered.contains("power — true or false"), "{rendered}");
+        assert!(!rendered.contains("0xfff1fc01 — "), "{rendered}");
+    }
+
+    /// Nearly every device, and the reason the block is conditional: a
+    /// "Manufacturer-specific: nothing." line on all of them would be paid for by
+    /// every reader to inform none of them.
+    #[test]
+    fn a_device_with_no_vendor_cluster_says_nothing_about_them() {
+        let rendered = render_description(&DeviceDescription {
+            device_id: "matter-2".into(),
+            device_type: "light".into(),
+            capabilities: vec![spec("power", ValueSpec::Boolean)],
+            sensors: vec![],
+            vendor_clusters: vec![],
+            states: vec![],
+        });
+
+        assert!(!rendered.contains("manufacturer-specific"), "{rendered}");
+        assert!(!rendered.contains("cluster"), "{rendered}");
+    }
+
+    /// The report this came from: asked what the Door Lock could do, GIAP answered
+    /// "locked or unlocked. It does not measure any data" — for a device whose own app
+    /// showed a door state and a PIN requirement beside the lock state.
+    #[test]
+    fn a_reading_that_cannot_be_set_is_named_as_one() {
+        let rendered = render_description(&DeviceDescription {
+            device_id: "matter-44".into(),
+            device_type: "lock".into(),
+            capabilities: vec![spec("locked", ValueSpec::Boolean)],
+            sensors: vec![],
+            vendor_clusters: vec![],
+            states: vec![
+                StateSpec {
+                    name: "door".into(),
+                    value: ValueSpec::Enum {
+                        values: vec!["open".into(), "closed".into(), "jammed".into()],
+                    },
+                },
+                StateSpec {
+                    name: "pin_required".into(),
+                    value: ValueSpec::Enum {
+                        values: vec!["required".into(), "not required".into()],
+                    },
+                },
+            ],
+        });
+
+        assert!(
+            rendered.contains("door — one of: open, closed, jammed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("pin_required — one of: required, not required"),
+            "{rendered}"
+        );
+        // The distinction the block exists for. Read as settable, an agent would try to
+        // shut the door, and the refusal is a worse answer than the honest one.
+        assert!(rendered.contains("cannot be told to change"), "{rendered}");
+        // And it is not in Accepts, which is what `set_device_state` reads.
+        let accepts = rendered.split("Reports").next().unwrap_or_default();
+        assert!(!accepts.contains("pin_required"), "{rendered}");
+    }
+
+    /// Nearly every device, and the reason the block is conditional.
+    #[test]
+    fn a_device_that_reports_nothing_read_only_says_nothing_about_it() {
+        let rendered = render_description(&DeviceDescription {
+            device_id: "matter-2".into(),
+            device_type: "light".into(),
+            capabilities: vec![spec("power", ValueSpec::Boolean)],
+            sensors: vec![],
+            vendor_clusters: vec![],
+            states: vec![],
+        });
+
+        assert!(!rendered.contains("Reports"), "{rendered}");
+    }
+
+    /// The report this came from: asked what the Extended Color Light could do, GIAP
+    /// answered power, brightness and hue/saturation — for a device whose own Color mode
+    /// dropdown offered hue/saturation, XY and colour temperature. Temperature is the
+    /// one a person actually asks for, and it was missing from every layer.
+    #[test]
+    fn a_colour_temperature_range_reads_in_kelvin() {
+        let rendered = render_description(&DeviceDescription {
+            device_id: "matter-51".into(),
+            device_type: "light".into(),
+            capabilities: vec![
+                spec("power", ValueSpec::Boolean),
+                spec("color", ValueSpec::Color),
+                spec(
+                    "color_temp",
+                    ValueSpec::Number {
+                        min: Some(2000.0),
+                        max: Some(6536.0),
+                        step: None,
+                        unit: Some("K".into()),
+                        when: None,
+                    },
+                ),
+            ],
+            sensors: vec![],
+            vendor_clusters: vec![],
+            states: vec![],
+        });
+
+        assert!(
+            rendered.contains("color_temp — a number from 2000 to 6536 K"),
+            "{rendered}"
+        );
+        // Both colour controls, named separately: a white cannot be asked for as a hue,
+        // so collapsing them would lose the one the user wanted.
+        assert!(
+            rendered.contains("color — hue 0-360 with saturation 0-100"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn colour_temperature_is_a_thing_the_tool_accepts() {
+        let p: SetDeviceStateParams =
+            serde_json::from_str(r#"{"device_id":"lamp","color_temp":2700}"#).unwrap();
+        assert_eq!(p.color_temp, Some(2700));
+        // And it is not confused with the hue/saturation pair beside it.
+        assert!(p.hue.is_none() && p.saturation.is_none());
     }
 
     #[test]

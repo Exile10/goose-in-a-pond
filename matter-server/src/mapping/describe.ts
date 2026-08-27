@@ -14,11 +14,22 @@
  * because it will be believed.
  */
 
-import type { Capability, DeviceDescription, SensorSpec, ValueSpec } from "../protocol.js";
+import type {
+  Capability,
+  DeviceDescription,
+  SensorSpec,
+  StateSpec,
+  ValueSpec,
+  VendorClusterSpec,
+} from "../protocol.js";
 import { deviceIdForNode } from "../protocol.js";
 import {
+  colorSupport,
+  levelIsBrightness,
+  speakerEndpoint,
   CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
+  CLUSTER_SMOKE_CO_ALARM,
   CLUSTER_FAN_CONTROL,
   CLUSTER_LEVEL_CONTROL,
   CLUSTER_ON_OFF,
@@ -26,10 +37,16 @@ import {
   CLUSTER_WINDOW_COVERING,
   nodeToDevice,
 } from "./devices.js";
-import { declaredUnitOf, SENSORS } from "./sensors.js";
-import { applianceSetpoint, reachableRange, targetSetpoint } from "./thermostat.js";
+import { miredsToKelvin } from "./control.js";
+import { clusterHasFeature, declaredUnitOf, SENSORS } from "./sensors.js";
+import {
+  applianceSetpoint,
+  reachableRange,
+  systemMode,
+  targetSetpoint,
+} from "./thermostat.js";
 import { operationsOf, settingsOf } from "./settings.js";
-import { endpointWith, type NodeSnapshot } from "./snapshot.js";
+import { applicationEndpoints, endpointWith, type NodeSnapshot } from "./snapshot.js";
 
 /**
  * FanControl's `fanModeSequence` says which modes a fan really has — Off/Low/Med/High
@@ -48,8 +65,77 @@ const FAN_MODE_SEQUENCES: ReadonlyMap<number, string[]> = new Map([
 /** Every mode GIAP can send, for a fan that does not narrow it down. */
 const ALL_FAN_MODES = ["off", "low", "medium", "high", "on", "auto", "smart"];
 
+/**
+ * DoorLock's `doorState`, in the order Matter numbers it.
+ *
+ * Three of these six are the reason the attribute is worth reading at all: a lock can
+ * say jammed, forced open, or ajar, and none of them is answerable from `lockState`.
+ * A bolt thrown into a frame that is standing open reports "locked" perfectly happily.
+ *
+ * Declared here rather than in `state.ts` because for a read-only value the list of
+ * words *is* the description — `state` imports it so the two cannot drift.
+ */
+export const DOOR_STATES = [
+  "open",
+  "closed",
+  "jammed",
+  "forced open",
+  "unspecified error",
+  "ajar",
+] as const;
+
+/** The same six by matter.js's enum name, which it may hand over instead of the number. */
+const DOOR_STATE_NAMES: ReadonlyMap<string, string> = new Map(
+  DOOR_STATES.map(word => [`door${word.replace(/ /g, "")}`, word]),
+);
+
+/** What PIN enforcement reads as. Both words, so `state` cannot invent a third. */
+export const PIN_REQUIREMENTS = ["required", "not required"] as const;
+
 function attribute(node: NodeSnapshot, cluster: string, name: string): unknown {
   return endpointWith(node, cluster)?.clusters[cluster]?.[name];
+}
+
+/**
+ * A lock's `doorState` as a word, or undefined if it does not have one.
+ *
+ * Both encodings, for the reason `fanModes` reads both: matter.js may decode an enum
+ * to its name rather than its number, and a door reported as "DoorJammed" must not
+ * come out the same as a door that said nothing.
+ */
+export function doorStateWord(raw: unknown): string | undefined {
+  const numeric = asNumber(raw);
+  if (numeric !== undefined) return DOOR_STATES[numeric];
+  if (typeof raw === "string") {
+    return DOOR_STATE_NAMES.get(raw.toLowerCase().replace(/[\s_-]/g, ""));
+  }
+  return undefined;
+}
+
+/**
+ * The colour temperatures this device can actually reach, in kelvin.
+ *
+ * Mireds are reciprocal megakelvin, so the conversion inverts the bounds: the SMALLEST
+ * mired value is the HOTTEST colour. Getting that backwards yields a range whose
+ * minimum exceeds its maximum, which reads as a broken device rather than a broken
+ * conversion.
+ *
+ * Zero is not a temperature. The spec's default for `colorTempPhysicalMinMireds` is 0,
+ * which converts to infinite kelvin — so a device that has not stated a real bound gets
+ * no bound stated for it, and the capability stands without an invented range.
+ */
+function colorTemperatureSpec(node: NodeSnapshot): ValueSpec {
+  const coolestMireds = asNumber(attribute(node, CLUSTER_COLOR_CONTROL, "colorTempPhysicalMinMireds"));
+  const warmestMireds = asNumber(attribute(node, CLUSTER_COLOR_CONTROL, "colorTempPhysicalMaxMireds"));
+
+  const spec: ValueSpec = { kind: "number", unit: "K" };
+  if (warmestMireds !== undefined && warmestMireds > 0) {
+    spec.min = miredsToKelvin(warmestMireds);
+  }
+  if (coolestMireds !== undefined && coolestMireds > 0) {
+    spec.max = miredsToKelvin(coolestMireds);
+  }
+  return spec;
 }
 
 function asNumber(value: unknown): number | undefined {
@@ -112,7 +198,11 @@ function temperatureSpec(node: NodeSnapshot): ValueSpec {
     };
   }
 
-  const mode = attribute(node, CLUSTER_THERMOSTAT, "systemMode");
+  // Through the tolerant reader: compared as a raw number this failed for every device
+  // that reported its mode as a NAME, and a cool-only air conditioner in Cool mode fell
+  // through to the union of both setpoints -- 7 to 32 C on a device that cannot reach 7.
+  const endpoint = endpointWith(node, CLUSTER_THERMOSTAT);
+  const mode = endpoint === undefined ? undefined : systemMode(endpoint);
   // Auto (1) and Off (0) do not name a setpoint; the requested value would.
   const settled = mode === MODE_COOL || mode === MODE_HEAT || mode === MODE_EMERGENCY_HEAT;
   const live = settled ? targetSetpoint(node) : undefined;
@@ -167,7 +257,11 @@ function capabilitiesOf(node: NodeSnapshot): Capability[] {
 
   // A fan need not implement On/Off at all; FanMode is its power switch.
   if (hasOnOff || hasFan) add("power", { kind: "boolean" });
-  if (has(CLUSTER_LEVEL_CONTROL)) add("brightness", { kind: "percent" });
+  // Whose level it is decides which control it is. A composed television carries Level
+  // Control on its SPEAKER endpoint, and describing that as brightness offered a control
+  // that would have turned the sound down instead.
+  if (speakerEndpoint(node) !== undefined) add("volume", { kind: "percent" });
+  if (levelIsBrightness(node)) add("brightness", { kind: "percent" });
   if (hasFan) {
     add("fan_speed", { kind: "percent" });
     add("fan_mode", { kind: "enum", values: fanModes(node) });
@@ -179,7 +273,15 @@ function capabilitiesOf(node: NodeSnapshot): Capability[] {
     add("target_temp", temperatureSpec(node));
   }
   if (has(CLUSTER_DOOR_LOCK)) add("locked", { kind: "boolean" });
-  if (has(CLUSTER_COLOR_CONTROL)) add("color", { kind: "color" });
+  // Gated on what the device claims, not on the cluster being present. A tunable-white
+  // bulb has ColorControl with no hue, and offering it one is the failure this whole
+  // area exists to stop — the same reason `tilt` is offered only to a covering that
+  // reports a tilt position.
+  if (has(CLUSTER_COLOR_CONTROL)) {
+    const colour = colorSupport(node);
+    if (colour.hueSaturation) add("color", { kind: "color" });
+    if (colour.temperature) add("color_temp", colorTemperatureSpec(node));
+  }
   if (has(CLUSTER_WINDOW_COVERING)) add("position", { kind: "percent" });
   // The second axis, offered only by a covering that has it. A roller blind has no
   // slats to turn, and offering a control the device will reject is the failure this
@@ -218,7 +320,15 @@ function sensorsOf(node: NodeSnapshot): SensorSpec[] {
   const sensors: SensorSpec[] = [];
 
   for (const mapping of SENSORS) {
-    if (endpointWith(node, mapping.cluster) === undefined) continue;
+    const endpoint = endpointWith(node, mapping.cluster);
+    if (endpoint === undefined) continue;
+    // Cluster presence is not sensor presence where the cluster's own features decide.
+    if (
+      mapping.feature !== undefined &&
+      !clusterHasFeature(endpoint.clusters[mapping.cluster], mapping.feature)
+    ) {
+      continue;
+    }
     if (seen.has(mapping.sensorType)) continue;
     seen.add(mapping.sensorType);
     sensors.push({
@@ -233,6 +343,126 @@ function sensorsOf(node: NodeSnapshot): SensorSpec[] {
   return sensors;
 }
 
+/**
+ * The manufacturer-specific clusters this device has, which is all that can be said
+ * about them.
+ *
+ * Deliberately not folded into `capabilities`: a capability is a verb `control`
+ * accepts, and there is no verb here. Naming one would break the property the whole
+ * type rests on -- that anything describable is callable -- to gain a control the
+ * agent still could not work.
+ *
+ * Application endpoints only, for the reason `applicationEndpoints` exists: endpoint 0
+ * is the node's own plumbing and never something the device does.
+ */
+function vendorClustersOf(node: NodeSnapshot): VendorClusterSpec[] {
+  const vendor: VendorClusterSpec[] = [];
+  for (const endpoint of applicationEndpoints(node)) {
+    for (const cluster of endpoint.vendorClusters) {
+      vendor.push({ cluster_id: cluster.id, endpoint: endpoint.number });
+    }
+  }
+  return vendor;
+}
+
+/** SmokeCoAlarm's ExpressedStateEnum: WHICH alarm the device is currently sounding. */
+export const EXPRESSED_STATES = [
+  "normal",
+  "smoke alarm",
+  "co alarm",
+  "battery alert",
+  "testing",
+  "hardware fault",
+  "end of service",
+  "interconnected smoke alarm",
+  "interconnected co alarm",
+] as const;
+
+/** The same nine by matter.js's enum name, which it may send instead of the number. */
+const EXPRESSED_STATE_NAMES: ReadonlyMap<string, string> = new Map([
+  ["normal", "normal"],
+  ["smokealarm", "smoke alarm"],
+  ["coalarm", "co alarm"],
+  ["batteryalert", "battery alert"],
+  ["testing", "testing"],
+  ["hardwarefault", "hardware fault"],
+  ["endofservice", "end of service"],
+  ["interconnectsmoke", "interconnected smoke alarm"],
+  ["interconnectco", "interconnected co alarm"],
+]);
+
+/** What the alarm says it is expressing, or undefined if it does not say. */
+export function expressedStateWord(raw: unknown): string | undefined {
+  const numeric = asNumber(raw);
+  if (numeric !== undefined) return EXPRESSED_STATES[numeric];
+  if (typeof raw === "string") {
+    return EXPRESSED_STATE_NAMES.get(raw.toLowerCase().replace(/[\s_-]/g, ""));
+  }
+  return undefined;
+}
+
+/** SmokeCoAlarm's EndOfServiceEnum. An expired alarm is a decoration. */
+export const SERVICE_STATES = ["normal", "expired"] as const;
+
+/**
+ * What the device reports and nothing can set.
+ *
+ * Both of these sat in the snapshot already — `doorLock` is read whole — and fell
+ * through every slot there was: not a verb, so not a capability, and not a number, so
+ * not a sensor. Asked what a door lock could do, GIAP answered "locked or unlocked"
+ * for a device whose own app showed a door position and a PIN requirement beside it.
+ *
+ * Each is gated on the attribute actually being there, because both belong to optional
+ * DoorLock features: a lock with no position sensor has no `doorState`, and declaring
+ * one would promise a reading that never arrives.
+ */
+function statesOf(node: NodeSnapshot): StateSpec[] {
+  const states: StateSpec[] = [];
+
+  // Read whether or not the value decodes: a lock with the DoorPositionSensor feature
+  // has the attribute, and an encoding this does not recognise is still a device that
+  // reports its door.
+  if (attribute(node, CLUSTER_DOOR_LOCK, "doorState") !== undefined) {
+    states.push({ name: "door", value: { kind: "enum", values: [...DOOR_STATES] } });
+  }
+
+  // Whether remote lock and unlock require a PIN. Reported, never written — and not a
+  // `mode` for that reason. Every writable attribute on this cluster is a security
+  // control (`sendPinOverTheAir`, `enableLocalProgramming`, `wrongCodeEntryLimit`), and
+  // a verb for one of them puts a lock's security configuration one sentence of natural
+  // language away from being turned off.
+  // Gated on CredentialOverTheAirAccess *and* PinCredential, not PIN alone -- measured
+  // against a live lock, matter.js refuses the attribute without both. So a PIN lock
+  // with no over-the-air credential access has no such setting to report.
+  if (typeof attribute(node, CLUSTER_DOOR_LOCK, "requirePinForRemoteOperation") === "boolean") {
+    states.push({ name: "pin_required", value: { kind: "enum", values: [...PIN_REQUIREMENTS] } });
+  }
+
+  // A smoke/CO alarm's summary of what it is doing, and whether it can still do it.
+  //
+  // `expressedState` is the one the device's own screen shows, and it is the only
+  // attribute that says WHICH alarm is sounding — smoke and CO have separate readings
+  // but a device expressing a CO alarm while its smoke reading sits at Critical is
+  // telling you something neither reading does. Categorical, not a magnitude:
+  // "interconnected CO alarm" is not eight times worse than "normal", so it is a state
+  // rather than a sensor with an ordinal a rule could compare.
+  if (attribute(node, CLUSTER_SMOKE_CO_ALARM, "expressedState") !== undefined) {
+    states.push({ name: "alarm", value: { kind: "enum", values: [...EXPRESSED_STATES] } });
+  }
+  // Whether the unit is past its service life. Not an ordinal either — expired is not a
+  // worse Normal, it is a different fact about the device.
+  if (attribute(node, CLUSTER_SMOKE_CO_ALARM, "endOfServiceAlert") !== undefined) {
+    states.push({ name: "alarm_service", value: { kind: "enum", values: [...SERVICE_STATES] } });
+  }
+  // A fault means the alarm may not sound at all, which is the one thing a smoke alarm
+  // exists to do.
+  if (typeof attribute(node, CLUSTER_SMOKE_CO_ALARM, "hardwareFaultAlert") === "boolean") {
+    states.push({ name: "alarm_fault", value: { kind: "enum", values: ["ok", "faulty"] } });
+  }
+
+  return states;
+}
+
 export function describeNode(node: NodeSnapshot): DeviceDescription {
   return {
     device_id: deviceIdForNode(node.nodeId),
@@ -241,5 +471,7 @@ export function describeNode(node: NodeSnapshot): DeviceDescription {
     device_type: nodeToDevice(node).device_type,
     capabilities: capabilitiesOf(node),
     sensors: sensorsOf(node),
+    vendor_clusters: vendorClustersOf(node),
+    states: statesOf(node),
   };
 }

@@ -105,6 +105,8 @@ Exactly GIAP's `DeviceControlPort` vocabulary:
 | `target_temp` | degrees Celsius | `target_temp` |
 | `locked` | `true` / `false` | `locked` |
 | `color` | `{hue: 0–360, saturation: 0–100}` | `hue`, `saturation` |
+| `color_temp` | kelvin | `color_temp` |
+| `volume` | 0–100 | `volume` |
 | `fan_speed` | 0–100 | `fan_speed`, `on` |
 | `fan_mode` | `off`/`low`/`medium`/`high`/`on`/`auto`/`smart` | `fan_mode`, `on` |
 | `position` | 0–100 percent **open** | `position` |
@@ -119,6 +121,21 @@ clamps to its own minimum reports that minimum. This is why the field exists: th
 old adapter built its outcome from the caller's request, so a device that did
 something else was still described to the user as having obeyed.
 
+That was true of `operation` alone for a while, and of nothing else — every other verb
+echoed the request straight back. A fan told to run at 85% reported 85% while the device
+had quantised it onto its High mode and was sitting at 90, and the number the user read
+was the number they typed. So the controller now reads the value back for every verb
+whose result can differ from the request: `fan_speed`, `brightness`, `color`,
+`color_temp`, `target_temp`, `position`, `tilt` — quantised onto a cluster's scale,
+clamped to a device's stated limits, or still travelling.
+
+It reads through the same inverses `state` reads with, so the number reported is one that
+would put the device back where it is. It returns as soon as the reading moves rather than
+waiting a fixed window, and a device already at the requested value is not waited on at
+all. `power`, `locked` and `fan_mode` are deliberately not read back: a value with nowhere
+else to land buys nothing for the latency. Where a device reports nothing for the verb the
+request stands, because an absent reading is not evidence of a different one.
+
 That holds only if the command's *response* is read. Matter commands do not merely
 succeed or throw: Operational State answers every Start/Stop/Pause/Resume with an
 `ErrorStateID`, and ModeBase answers `changeToMode` with a `status`, so a refusal
@@ -131,6 +148,21 @@ become `device_refused`, worded by the device where it says why.
 that was sent, and the operations offered are derived from `operationalStateList`
 rather than assumed: each of the four commands is optional, and the spec requires a
 device to expose the states matching the commands it supports.
+
+**Which setpoints a thermostat has comes from `controlSequenceOfOperation`**, the
+mandatory attribute that states whether the device cools, heats, or both. It was not read
+at all, and presence was inferred as `"occupiedCoolingSetpoint" in clusters` instead —
+a KEY check, where matter.js populates a key for every attribute in the cluster model and
+leaves the unsupported ones `undefined`. So every thermostat looked like it had both
+setpoints, and a cooling-only air conditioner advertised a range from 7 C: the floor of a
+heating setpoint it does not implement, unioned in. Claims first, evidence second, and
+neither strips a control on silence — a device stating nothing keeps both, because
+withholding a setpoint from an under-reporting thermostat would be the worse failure.
+
+`systemMode` is read through the same number-or-enum-name tolerance as FanControl's mode
+sequence. Compared as a raw number it never matched a device reporting `"Cool"`, so the
+mode read as unsettled and the description fell back to the union of both setpoints'
+ranges — which is the other half of how 7 to 32 reached the user.
 
 `target_temp` names whichever setpoint the thermostat currently runs on. A
 thermostat has two — one it heats up to, one it cools down to — and writing the
@@ -155,6 +187,27 @@ only by a covering that reports a tilt position, since a roller blind has nothin
 turn and a control a device will reject is the failure this area exists to stop.
 Zero is open on both axes: the spec has `GoToTiltPercentage` treat a zero percentage
 as `UpOrOpen`, so one conversion serves both.
+
+`color_temp` is a second colour control, not a second way to reach the first. 2700K white
+has no hue, so it cannot be asked for through hue and saturation at all — which is why it
+earns its own verb while XY, which addresses the same perceptual space hue and saturation
+already cover, does not get one.
+
+Both are offered strictly according to the device's own `colorCapabilities`. Presence of
+the ColorControl cluster used to imply hue and saturation outright, and that is wrong in a
+way that shows: a tunable-white bulb has the cluster and no hue whatsoever, and was
+offered a hue it rejects — the same failure as offering `tilt` to a roller blind.
+
+The wire carries **kelvin**; the cluster takes mireds. Mireds are reciprocal megakelvin,
+so the conversion inverts the bounds — the smallest mired value is the hottest colour —
+and a range built without inverting has a minimum above its maximum, which reads as a
+broken device rather than a broken conversion. The range itself comes from
+`colorTempPhysicalMinMireds`/`MaxMireds` where the device states them, and is absent where
+it does not: the spec's own default for those is 0, which converts to infinite kelvin.
+
+`applied` reports the kelvin the device will sit at rather than the kelvin requested,
+because the round trip through whole mireds is lossy — asked for 2700 a device lands on
+2703, and echoing the request would overstate the precision.
 
 `target_temp` also carries an appliance's own setpoint. Temperature Control has two
 shapes: a washer names levels, which are read as a `mode`, while a dishwasher states
@@ -235,7 +288,11 @@ DeviceDescription = {
   device_id, device_type,
   capabilities: Capability[],      // what it can be told to do
   sensors: SensorSpec[],           // what it measures, reported or not
+  vendor_clusters: VendorClusterSpec[],  // what it has and this cannot drive
+  states: StateSpec[],             // what it reports and nothing can set
 }
+VendorClusterSpec = { cluster_id, endpoint }
+StateSpec = { name, value: ValueSpec }
 Capability = { verb: Verb, setting?: string, value: ValueSpec }
 ValueSpec =
   | { kind: "boolean" }
@@ -273,6 +330,123 @@ way has to be added to it. Settings read by shape from a snapshot filtered by na
 is a contradiction worth knowing about: it is what made a paired washer report
 nothing but power while every unit test passed.
 
+That bound is still there, but `describe` no longer hides what it drops.
+
+### What a device reports and nothing can set
+
+`states` is the third kind of thing a device has. `capabilities` are verbs `control`
+accepts; `sensors` are numeric measurements, carried on the same feed as `Reading`. A
+door's position is neither — a word the lock reports, writable by nobody — so it fell
+through both, and a lock that can say **jammed**, **forced open** or **ajar** was
+described as a device with one boolean. Asked what a door lock could do, GIAP answered
+"locked or unlocked; it does not measure any data" for a device whose own app showed a
+door state beside the lock state. Both attributes were in the snapshot the entire time:
+`doorLock` is read whole, and there was simply nowhere in the description to put them.
+
+`value` declares the exact words `state` will use, so the two cannot drift — for a
+read-only value the list of words *is* the description, which is why the vocabulary
+lives in `describe.ts` and `state.ts` imports it.
+
+Each entry is gated on the attribute actually being present, because both belong to
+optional DoorLock features: `doorState` to DoorPositionSensor, and
+`requirePinForRemoteOperation` to CredentialOverTheAirAccess **and** PinCredential
+together — matter.js refuses the attribute without both. A plain deadbolt has neither,
+and declaring one would promise a reading that never arrives — the same failure as
+offering `tilt` to a roller blind.
+
+`doorState` is also nullable, so a lock with the sensor can have the attribute and no
+value in it. The description still declares the door, exactly as `sensors` declares
+what a sensor measures before it has reported; the reading stays absent rather than
+being filled in, because an invented "closed" cannot be told from a real one.
+
+**Read-only by construction, not by convention.** `requirePinForRemoteOperation` is a
+security control: off means remote lock and unlock stop requiring a PIN. The same
+cluster carries `sendPinOverTheAir`, `enableLocalProgramming`, `wrongCodeEntryLimit`,
+`autoRelockTime` and `operatingMode` in the same snapshot. A verb for any of them puts a
+lock's security configuration one sentence of natural language away from being turned
+off, so the whole class is closed here rather than guarded case by case. `control` has
+no verb that reaches them.
+
+### Media
+
+**Level Control means volume on a speaker and brightness on a light**, and the ENDPOINT's
+device type is what says which. A Basic Video Player is composed — the player on one
+endpoint, a Speaker (`0x0022`) on another — and Level Control lives on the speaker.
+Searching the node for the cluster found it and reported brightness, so a television
+advertised a brightness control that would have turned the sound down. Split by endpoint
+type, and a device can have both: a television with a backlight is not a contradiction.
+
+**Playback rides `operation`, and inputs ride `mode` — no new vocabulary for either.**
+Play, pause and stop are what start, pause and stop already mean, so `operationsOf` simply
+points the existing verb at MediaPlayback where there is no Operational State. And an
+input list is exactly what `mode` was built for: a named setting whose values are labels
+the DEVICE published, chosen by sending an index back. "HDMI 2" is offered because the
+television said so, the same way a washer's cycles are its own.
+
+The two clusters do not share words for the same idea — Operational State says "stopped"
+where MediaPlayback says "not playing" — so the settle target for an operation is a set of
+acceptable words rather than one. Without that a television's stop waited out the full
+window for a word it was never going to say.
+
+### Alarms
+
+A smoke/CO alarm carries two separate dangers with two separate responses — one says
+leave, the other says ventilate — so `smoke_alarm` and `co_alarm` are separate readings,
+each gated on the cluster's own feature map. Only smoke was read for a while, which meant
+an alarm sounding for carbon monoxide reported nothing about it and a CO-only alarm looked
+like a device that measures nothing at all. `alarm_battery` rides alongside them: a
+life-safety device with a flat battery is the failure everyone knows about and nobody was
+told about.
+
+`expressedState` is a `states` entry rather than a sensor, and the distinction is the one
+`states` exists for. It is the attribute a device's own screen shows and the only one that
+says WHICH alarm is sounding — a unit expressing a CO alarm while its smoke level reads
+Critical is stating something neither reading does. It is categorical, not a magnitude:
+"interconnected CO alarm" is not eight times worse than "normal", so an ordinal a
+threshold rule could compare would be actively misleading. `alarm_service` and
+`alarm_fault` join it, because an expired or faulty alarm is a decoration.
+
+**A cluster's presence is not a sensor's presence** where features decide. `describe`
+lists a sensor whether or not it has reported yet, which is right — a device that has not
+spoken still measures the thing — but that let cluster presence stand in for attribute
+presence. Value presence cannot separate the two cases either: an unsupported attribute
+and one that has not reported are both absent. The feature map is the only thing that can,
+so a reading naming a `feature` is listed only where the cluster claims it.
+
+### Manufacturer-specific clusters
+
+`vendor_clusters` is what a device has that this cannot drive. A cluster id is 32 bits
+with the vendor code in the upper 16, and a non-zero one is the maker's own — outside
+the snapshot's bound, unreachable by the shape rule, and **unnameable**: Matter
+publishes no attribute names, so the words for these controls ("Flip-Flop",
+"Emoticon" on Google's Matter Virtual Device) exist only in that maker's app.
+
+An id and an endpoint is the whole of what is carried, because it is the whole of what
+exists. matter.js builds a behavior for a cluster its model cannot name but discovers
+no shape for it: measured against a live commissioned device, `cluster$fff1fc01`
+carries zero attributes and a `clusterRevision` of 0. So there is not even a count to
+report, and reporting a count of zero for a device showing two controls would be the
+same silent falsehood this record exists to remove.
+
+It is carried at all because the alternative reads worse than silence. Asked what a
+custom light could do, GIAP answered "power and brightness" — true of everything it
+could see, and taken by the user as a statement that the two controls their app was
+showing did not exist. This is the invented constraint from the other direction: an
+absent capability reads as a fact about the device just as readily as a wrong range
+does.
+
+Not `Capability` entries, deliberately. A capability is a `control` verb, and there is
+no verb here; naming one would break the property the type rests on — anything
+describable is callable — to gain a control nothing could actually work. `control`
+still answers `capability_unsupported`, `state` still says nothing about them, and
+reading or writing a vendor attribute by numeric address is **not** offered: an
+unnamed vendor attribute can be a calibration or factory-reset control, and the caller
+would be writing it on a guess.
+
+Costs nothing to collect. matter.js builds a behavior for every cluster in the
+Descriptor's ServerList, including ones its model cannot name, so the id is already in
+hand — no read, no subscription, and nothing added to what the snapshot bound pays for.
+
 It is answered live rather than cached. A description is derived from what the
 device currently reports, and a stored copy goes stale exactly when a device is
 upgraded or reconfigured — the moment its description matters most.
@@ -289,10 +463,15 @@ StateValue  = { name, value }        // both as the device words them
 ```
 
 Every `name` is one `describe` also uses — a control verb for a scalar, a setting
-name for a selectable — so a reading names the thing that changes it: "spin speed
-is Low" leads straight to the call that makes it High. That correspondence is the
-point of the type being this plain, and it is asserted in the controller's tests
-rather than left as an intention.
+name for a selectable, a `states` entry for something only reported — so a reading
+names the thing that changes it: "spin speed is Low" leads straight to the call that
+makes it High, and "door is jammed" names something with no such call by design.
+That correspondence is the point of the type being this plain, and it is asserted in
+the controller's tests rather than left as an intention.
+
+A colour reading names the mode the device is IN, not every attribute it holds: a bulb
+sitting at 2700K still carries whatever hue it was last set to, and reporting both makes
+the reading contradict itself.
 
 Values are read through the inverses of the conversions `control` writes with, so a
 covering reported at 40% open is the same 40% that would put it there — not
