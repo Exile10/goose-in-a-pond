@@ -20,6 +20,7 @@ use pond_core::mesh::ports::peer_capability_query::{
 use pond_core::mesh::ports::peer_directory::PeerDirectory;
 use pond_core::mesh::ports::usage_tally::UsageTally;
 use pond_core::models::ports::provider::{LlmProvider, StreamToken};
+use pond_core::models::services::thought_filter::ThoughtFilter;
 use pond_core::user_data::ports::settings::SettingsRepository;
 use pond_mesh_protocol::wire::{
     CapabilityRequest, CapabilityResponse, ChunkKind, InferenceChunk, InferenceRequest,
@@ -366,6 +367,19 @@ impl MeshInferenceService {
         result
     }
 
+    /// How many times a completion producing no visible text (pure
+    /// reasoning, or genuinely empty) is retried locally before the lender
+    /// gives up and reports it anyway.
+    ///
+    /// `backing_provider` is a bare completion call with none of Goose's own
+    /// harness on this side — no empty-turn detection, no re-engagement, no
+    /// thinking/content split. Every one of those had to happen on the
+    /// BORROWER instead, and each retry there is a full mesh round trip on
+    /// top of whatever this lender's hardware takes to generate nothing.
+    /// Retrying here first is strictly cheaper: one extra local completion
+    /// beats a wire round trip plus the borrower's own re-engagement.
+    const MAX_EMPTY_COMPLETION_ATTEMPTS: u32 = 2;
+
     /// Server role: run `backing_provider` against the borrower's request and
     /// stream the reply back as a sequence of `InferenceChunk`s, terminated
     /// by exactly one `usage` or `error` chunk.
@@ -394,78 +408,150 @@ impl MeshInferenceService {
             return;
         }
 
-        let messages = request.messages.iter().map(from_wire_message).collect();
-        let mut stream = self
-            .backing_provider
-            .stream_complete(&request.system_prompt, messages);
+        let messages: Vec<_> = request.messages.iter().map(from_wire_message).collect();
 
-        let mut seq = 0u32;
-        let mut usage = None;
-        // No per-chunk token count on the wire, so max_tokens is enforced
-        // against an estimate (chars/4) until real usage is reported below.
-        let mut estimated_tokens: u32 = 0;
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(StreamToken::Text(text)) => {
-                    estimated_tokens =
-                        estimated_tokens.saturating_add((text.chars().count() / 4) as u32);
-                    self.send_chunk(
-                        peer,
-                        InferenceChunk {
+        // Tokens spent on attempts discarded for producing no visible text —
+        // still real local compute, so still charged against the lend
+        // window, even though nothing from them reached the wire. The FINAL
+        // (sent) attempt's tokens are added separately below, from whichever
+        // figure actually gets reported in its usage chunk — the accurate
+        // provider-reported count when available, not this same estimate.
+        let mut discarded_tokens_total: u32 = 0;
+        let mut sent_usage: Option<pond_mesh_protocol::wire::UsageWire> = None;
+
+        for attempt in 0..Self::MAX_EMPTY_COMPLETION_ATTEMPTS {
+            let is_last_attempt = attempt + 1 == Self::MAX_EMPTY_COMPLETION_ATTEMPTS;
+            let mut stream = self
+                .backing_provider
+                .stream_complete(&request.system_prompt, messages.clone());
+
+            // Buffered, not sent, until this attempt proves it has visible
+            // content — a chunk already on the wire can't be un-sent, and
+            // "was this attempt empty" isn't knowable from the first chunk
+            // alone (a `<think>` block can still be followed by a real
+            // answer). Once `seen_visible` flips, buffering stops and the
+            // rest of this attempt streams through normally: real content
+            // still reaches the borrower incrementally, not all at once at
+            // the end.
+            let mut pending: Vec<InferenceChunk> = Vec::new();
+            let mut filter = ThoughtFilter::new();
+            let mut seen_visible = false;
+            let mut seq = 0u32;
+            // No per-chunk token count on the wire, so max_tokens is enforced
+            // against an estimate (chars/4) until real usage is reported.
+            let mut estimated_tokens: u32 = 0;
+            let mut attempt_usage = None;
+
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(StreamToken::Text(text)) => {
+                        let visible = filter.push(&text);
+                        estimated_tokens =
+                            estimated_tokens.saturating_add((text.chars().count() / 4) as u32);
+                        let chunk = InferenceChunk {
                             request_id: request.request_id,
                             seq,
                             kind: Some(ChunkKind::Text(text)),
-                        },
-                    )
-                    .await;
-                    seq += 1;
-                    if estimated_tokens >= request.max_tokens {
-                        // Borrower's own cap, not an error — end with a
-                        // usage chunk below, same as a normal completion.
-                        break;
+                        };
+                        seq += 1;
+
+                        if seen_visible {
+                            self.send_chunk(peer, chunk).await;
+                        } else if !visible.trim().is_empty() {
+                            seen_visible = true;
+                            for buffered in pending.drain(..) {
+                                self.send_chunk(peer, buffered).await;
+                            }
+                            self.send_chunk(peer, chunk).await;
+                        } else {
+                            pending.push(chunk);
+                        }
+
+                        if estimated_tokens >= request.max_tokens {
+                            // Borrower's own cap, not an error — end with a
+                            // usage chunk below, same as a normal completion.
+                            break;
+                        }
+                    }
+                    Ok(StreamToken::Usage(stats)) => {
+                        attempt_usage = Some(pond_mesh_protocol::wire::UsageWire {
+                            prompt_tokens: stats.prompt_tokens,
+                            completion_tokens: stats.completion_tokens,
+                        });
+                    }
+                    Err(err) => {
+                        // An attempt that errors outright isn't the empty-turn
+                        // case this retry exists for — surface it immediately
+                        // rather than mask a real failure behind a retry.
+                        for buffered in pending.drain(..) {
+                            self.send_chunk(peer, buffered).await;
+                        }
+                        self.send_chunk(
+                            peer,
+                            InferenceChunk {
+                                request_id: request.request_id,
+                                seq,
+                                kind: Some(ChunkKind::Error(err.to_string())),
+                            },
+                        )
+                        .await;
+                        return; // error chunk is terminal — don't also send usage
                     }
                 }
-                Ok(StreamToken::Usage(stats)) => {
-                    usage = Some(pond_mesh_protocol::wire::UsageWire {
-                        prompt_tokens: stats.prompt_tokens,
-                        completion_tokens: stats.completion_tokens,
-                    });
-                }
-                Err(err) => {
-                    self.send_chunk(
-                        peer,
-                        InferenceChunk {
-                            request_id: request.request_id,
-                            seq,
-                            kind: Some(ChunkKind::Error(err.to_string())),
-                        },
-                    )
-                    .await;
-                    return; // error chunk is terminal — don't also send usage
+            }
+            if !seen_visible && !filter.flush().trim().is_empty() {
+                seen_visible = true;
+                for buffered in pending.drain(..) {
+                    self.send_chunk(peer, buffered).await;
                 }
             }
+
+            if seen_visible || is_last_attempt {
+                // Falls back to the estimate if the provider reported no
+                // usage, or max_tokens cut it short.
+                sent_usage = Some(attempt_usage.unwrap_or(pond_mesh_protocol::wire::UsageWire {
+                    prompt_tokens: 0,
+                    completion_tokens: estimated_tokens,
+                }));
+                self.send_chunk(
+                    peer,
+                    InferenceChunk {
+                        request_id: request.request_id,
+                        seq,
+                        kind: Some(ChunkKind::Usage(sent_usage.clone().unwrap())),
+                    },
+                )
+                .await;
+                break;
+            }
+
+            // This attempt is being discarded — its tokens still cost local
+            // compute, so charge them now (the accurate reported count when
+            // the provider gave one, else the same char/4 estimate used
+            // above).
+            discarded_tokens_total = discarded_tokens_total.saturating_add(
+                attempt_usage
+                    .map(|u| u.completion_tokens)
+                    .unwrap_or(estimated_tokens),
+            );
+            tracing::warn!(
+                peer = %peer,
+                attempt = attempt + 1,
+                max = Self::MAX_EMPTY_COMPLETION_ATTEMPTS,
+                "mesh: lend-side completion produced no visible text — retrying before replying"
+            );
         }
 
-        // Falls back to the estimate if the provider reported no usage, or
-        // max_tokens cut it short. Lend side: `peer` owes us, so record_lent.
-        let usage = usage.unwrap_or(pond_mesh_protocol::wire::UsageWire {
-            prompt_tokens: 0,
-            completion_tokens: estimated_tokens,
-        });
+        // Lend side: `peer` owes us, so record_lent — the attempt actually
+        // sent plus every discarded attempt before it, since compute spent
+        // producing nothing was still spent.
+        let sent_tokens = sent_usage.map(|u| u.completion_tokens).unwrap_or(0);
+        let charged_tokens = discarded_tokens_total.saturating_add(sent_tokens);
         let _ = self
             .usage_tally
-            .record_lent(peer, TokenCount::new(usage.completion_tokens as u64))
+            .record_lent(peer, TokenCount::new(charged_tokens as u64))
             .await;
-        self.lend_window_record(peer, usage.completion_tokens as u64);
-        self.send_chunk(
-            peer,
-            InferenceChunk {
-                request_id: request.request_id,
-                seq,
-                kind: Some(ChunkKind::Usage(usage)),
-            },
-        )
-        .await;
+        self.lend_window_record(peer, charged_tokens as u64);
     }
 
     async fn send_chunk(&self, peer: PeerId, chunk: InferenceChunk) {

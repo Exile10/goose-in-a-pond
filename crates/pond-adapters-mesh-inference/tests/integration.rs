@@ -831,3 +831,199 @@ async fn querying_capabilities_reflects_the_peers_real_payment_rail_state() {
     assert!(capabilities.inference_available);
     assert!(capabilities.lightning_available);
 }
+
+/// Yields pure `<think>...</think>` (no visible text at all) on its first
+/// `fail_first_n` calls, then a real answer — standing in for a bare local
+/// model that sometimes produces only reasoning with nothing after it.
+/// `calls` counts every `stream_complete` invocation, so a test can assert
+/// the lender actually retried locally rather than shipping the empty
+/// attempt to the wire.
+struct EmptyThenRealProvider {
+    fail_first_n: usize,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl EmptyThenRealProvider {
+    fn new(fail_first_n: usize) -> Self {
+        Self {
+            fail_first_n,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for EmptyThenRealProvider {
+    async fn complete(
+        &self,
+        _system_prompt: &str,
+        _messages: Vec<pond_core::models::domain::message::ChatMessage>,
+    ) -> anyhow::Result<pond_core::models::domain::message::ChatMessage> {
+        unreachable!("only stream_complete is exercised by this test")
+    }
+
+    fn model_name(&self) -> String {
+        "empty-then-real-test-provider".to_string()
+    }
+
+    fn stream_complete<'a>(
+        &'a self,
+        _system_prompt: &'a str,
+        _messages: Vec<pond_core::models::domain::message::ChatMessage>,
+    ) -> pond_core::models::ports::provider::TokenStream<'a> {
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let chunks: Vec<anyhow::Result<StreamToken>> = if call < self.fail_first_n {
+            vec![Ok(StreamToken::Text(
+                "<think>reasoning, no answer follows</think>".to_string(),
+            ))]
+        } else {
+            vec![Ok(StreamToken::Text("Real answer.".to_string()))]
+        };
+        Box::pin(futures::stream::iter(chunks))
+    }
+}
+
+/// The exact case #2 exists for: a lender whose bare completion produces
+/// only reasoning on its first attempt must retry locally and ship the
+/// borrower the real answer once it gets one — never the empty attempt, and
+/// never surfacing the retry as a failure.
+#[tokio::test]
+async fn a_lend_side_empty_completion_is_retried_and_the_real_answer_reaches_the_borrower() {
+    let (a_transport, a_dir) = spawn_transport().await; // the lender
+    let (b_transport, b_dir) = spawn_transport().await; // the borrower
+    connect(&b_transport, &b_dir, &a_transport, &a_dir).await;
+
+    let backing = Arc::new(EmptyThenRealProvider::new(1));
+    let _a_service = MeshInferenceService::spawn(
+        a_transport.clone(),
+        Arc::new(MockPeerDirectory::new()),
+        Arc::new(MockCreditLedger::new()),
+        Arc::new(MockUsageTally::new()),
+        Arc::new(MockSettingsRepository::new()),
+        backing.clone(),
+        PRODUCTION_LIKE_TIMEOUT,
+        Duration::from_secs(15 * 60),
+        None,
+    );
+
+    let b_peer_directory = Arc::new(MockPeerDirectory::new());
+    let b_credit_ledger = Arc::new(MockCreditLedger::new());
+    b_peer_directory
+        .add_trusted_peer(a_transport.local_peer_id(), TrustScope::Circle)
+        .await
+        .unwrap();
+    b_credit_ledger
+        .credit(a_transport.local_peer_id(), Millisats::new(1_000))
+        .await
+        .unwrap();
+    let b_service = MeshInferenceService::spawn(
+        b_transport.clone(),
+        b_peer_directory,
+        b_credit_ledger,
+        Arc::new(MockUsageTally::new()),
+        Arc::new(MockSettingsRepository::new()),
+        Arc::new(MockProvider::new()),
+        PRODUCTION_LIKE_TIMEOUT,
+        Duration::from_secs(15 * 60),
+        None,
+    );
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        b_service
+            .provider()
+            .complete("sys", vec![pond_core::models::domain::message::ChatMessage::user("hi")]),
+    )
+    .await
+    .expect("request timed out")
+    .expect("request failed");
+
+    assert_eq!(
+        response.content, "Real answer.",
+        "the borrower must see only the retried attempt's real content"
+    );
+    assert_eq!(
+        backing.calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "expected exactly one retry: the first (empty) attempt plus the real one"
+    );
+}
+
+/// A lender that never produces visible text — not even on the last
+/// attempt — must still terminate with a usage chunk rather than hang or
+/// error, bounded at `MAX_EMPTY_COMPLETION_ATTEMPTS` calls, so a permanently
+/// unproductive backing provider can't turn into runaway local compute
+/// spend or a stuck borrower.
+#[tokio::test]
+async fn a_lend_side_completion_that_never_produces_visible_text_still_terminates() {
+    let (a_transport, a_dir) = spawn_transport().await; // the lender
+    let (b_transport, b_dir) = spawn_transport().await; // the borrower
+    connect(&b_transport, &b_dir, &a_transport, &a_dir).await;
+
+    // fail_first_n larger than the retry budget — every attempt is empty.
+    let backing = Arc::new(EmptyThenRealProvider::new(usize::MAX));
+    let _a_service = MeshInferenceService::spawn(
+        a_transport.clone(),
+        Arc::new(MockPeerDirectory::new()),
+        Arc::new(MockCreditLedger::new()),
+        Arc::new(MockUsageTally::new()),
+        Arc::new(MockSettingsRepository::new()),
+        backing.clone(),
+        PRODUCTION_LIKE_TIMEOUT,
+        Duration::from_secs(15 * 60),
+        None,
+    );
+
+    let b_peer_directory = Arc::new(MockPeerDirectory::new());
+    let b_credit_ledger = Arc::new(MockCreditLedger::new());
+    b_peer_directory
+        .add_trusted_peer(a_transport.local_peer_id(), TrustScope::Circle)
+        .await
+        .unwrap();
+    b_credit_ledger
+        .credit(a_transport.local_peer_id(), Millisats::new(1_000))
+        .await
+        .unwrap();
+    let b_service = MeshInferenceService::spawn(
+        b_transport.clone(),
+        b_peer_directory,
+        b_credit_ledger,
+        Arc::new(MockUsageTally::new()),
+        Arc::new(MockSettingsRepository::new()),
+        Arc::new(MockProvider::new()),
+        PRODUCTION_LIKE_TIMEOUT,
+        Duration::from_secs(15 * 60),
+        None,
+    );
+
+    let provider = b_service.provider();
+    let mut stream = provider.stream_complete(
+        "sys",
+        vec![pond_core::models::domain::message::ChatMessage::user("hi")],
+    );
+
+    let mut saw_text = false;
+    let mut saw_usage = false;
+    while let Some(item) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .expect("stream stalled — never terminated")
+    {
+        match item.expect("must not surface as an error") {
+            StreamToken::Text(_) => saw_text = true,
+            StreamToken::Usage(_) => saw_usage = true,
+        }
+    }
+
+    assert!(
+        !saw_text,
+        "an all-empty completion must never forward the empty attempts' text"
+    );
+    assert!(saw_usage, "must still terminate with a usage chunk");
+    assert_eq!(
+        backing.calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "retries must be bounded, not unbounded, when nothing ever comes back"
+    );
+}
