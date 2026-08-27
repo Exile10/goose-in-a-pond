@@ -206,9 +206,9 @@ or listing options; for factual questions prefer get_wikipedia_article.")]
     }
 
     #[tool(description = "\
-Look up a topic on Wikipedia (auto-searches if the title is not exact). First \
-choice for any factual question. Answer concisely in your own words; never \
-repeat the extract verbatim.")]
+Look up a topic on Wikipedia (auto-searches inexact titles). First choice for \
+factual questions. Answer in your own words; never repeat the extract \
+verbatim.")]
     async fn get_wikipedia_article(
         &self,
         _ctx: RequestContext<RoleServer>,
