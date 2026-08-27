@@ -721,9 +721,16 @@ pub fn init_device_control_deps(
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_device_control_server(reader: DuplexStream, writer: DuplexStream) {
-    let deps = DEVICE_CONTROL_DEPS
-        .get()
-        .expect("init_device_control_deps() not called");
+    // Missing deps = this path never initialised this extension (the voice/CLI
+    // binary vs `serve` install different families). A skipped extension is a
+    // logged, contained failure; a panic here took down every builtin server's
+    // startup at once (2026-08-27, giap-context in the voice child).
+    let Some(deps) = DEVICE_CONTROL_DEPS.get() else {
+        tracing::error!(
+            "spawn_device_control_server called before init_device_control_deps — extension will not start"
+        );
+        return;
+    };
     let server = DeviceControlMcpServer::new(deps.control.clone(), deps.registry.clone());
     crate::serve_builtin("giap-device-control", server, reader, writer);
 }

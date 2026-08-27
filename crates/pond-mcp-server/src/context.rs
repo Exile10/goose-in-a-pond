@@ -420,7 +420,16 @@ pub fn init_context_authority(authority: Option<Arc<dyn DraftAuthority>>) {
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_context_server(reader: DuplexStream, writer: DuplexStream) {
-    let deps = CONTEXT_DEPS.get().expect("init_context_deps() not called");
+    // Missing deps = this path never initialised this extension (the voice/CLI
+    // binary vs `serve` install different families). A skipped extension is a
+    // logged, contained failure; a panic here took down every builtin server's
+    // startup at once (2026-08-27, giap-context in the voice child).
+    let Some(deps) = CONTEXT_DEPS.get() else {
+        tracing::error!(
+            "spawn_context_server called before init_context_deps — extension will not start"
+        );
+        return;
+    };
     let server = ContextMcpServer::new(deps.repo.clone())
         .with_embedder(deps.embedder.clone())
         // Without this the `recall` tool is registered, offered to the model and
