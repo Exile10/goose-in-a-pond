@@ -95,6 +95,24 @@ export function Mesh() {
     load();
   }, [load]);
 
+  // `connected` is a live snapshot of this Pond's own swarm state (see
+  // list_mesh_peers), not a cached DB flag — it goes stale the instant the
+  // underlying connection changes, and `load()` only ever ran once, on
+  // mount. Poll quietly (no `loading`/`error` toggle, so the screen doesn't
+  // flicker to a spinner every tick) so a peer flipping online/offline
+  // between visits to this screen actually shows up.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      Promise.all([api.listMeshPeers(), api.getMeshSelf()])
+        .then(([p, s]) => {
+          setPeers(p);
+          setSelf(s);
+        })
+        .catch(() => {});
+    }, 10_000);
+    return () => clearInterval(interval);
+  }, []);
+
   useEffect(() => {
     if (!self?.invite_url || !canvasRef.current) return;
     QRCode.toCanvas(canvasRef.current, self.invite_url, {
