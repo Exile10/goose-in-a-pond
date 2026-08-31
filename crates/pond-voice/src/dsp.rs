@@ -326,11 +326,85 @@ pub enum VadEvent {
     Confirmed,
 }
 
+/// Whether one frame of audio is speech.
+///
+/// [`SpeculativeVad`] is the *policy* — when to fire a speculative
+/// transcription, when to call the endpoint, how long a pause has to last. This
+/// is the *evidence* that policy runs on, and the two are separated because
+/// they change for different reasons and at different rates.
+///
+/// Before this split the policy took an RMS reading and a threshold, which
+/// meant "speech" was permanently defined as "louder than 0.005". That is the
+/// oldest detector there is and it fails in both directions daily: a sentence
+/// trailing off drops below the line and gets clipped, and a fan or a fridge
+/// sits above it forever so the utterance never ends. Neither is fixable by
+/// moving the number — a value tuned in a quiet room is wrong in a loud one,
+/// and nothing in the design notices.
+///
+/// Taking `&[f32]` rather than a level is what makes a model implementable
+/// here: a neural detector needs the samples, not a summary of them. The frame
+/// is whatever the caller polls at; a detector that needs a specific size
+/// buffers internally.
+pub trait SpeechDetector {
+    /// Is this frame speech? `&mut self` because a real detector carries state
+    /// between frames — Silero runs an LSTM, and feeding it windows
+    /// independently would reset that every frame and quietly measure a worse
+    /// model than the one you installed.
+    fn is_speech(&mut self, frame: &[f32]) -> bool;
+
+    /// Forget everything. Called between utterances, so one turn's trailing
+    /// state cannot bias the start of the next.
+    fn reset(&mut self) {}
+}
+
+/// Speech is anything louder than a threshold. The incumbent.
+///
+/// Kept, and kept honest, for three reasons: it is what ships today so it is
+/// the baseline any replacement has to beat; it costs about half a microsecond
+/// per frame, which no model will match; and it is the only detector that
+/// works with no model file present, which matters on first run.
+#[derive(Debug, Clone, Copy)]
+pub struct RmsDetector {
+    threshold: f32,
+}
+
+impl RmsDetector {
+    pub fn new(threshold: f32) -> Self {
+        Self { threshold }
+    }
+}
+
+impl SpeechDetector for RmsDetector {
+    fn is_speech(&mut self, frame: &[f32]) -> bool {
+        // `>=`, not `>`: the caller this replaced treated `rms < threshold` as
+        // silence, so a frame exactly at the threshold counted as speech.
+        //
+        // This is `rms >= t` rather than `!(rms < t)`, and the difference is
+        // NaN — the one input on which this is not a pure refactor. The old
+        // `rms < t` was false for NaN, so a NaN frame counted as *speech* and
+        // held the endpoint open forever; a microphone that started emitting
+        // NaN mid-utterance would record to the hard cap and hand whisper a
+        // buffer of it. Here NaN is silence, so the utterance ends.
+        //
+        // That is the better answer, and it is also the consistent one: the
+        // onset gate this loop sits downstream of already asks `rms >=
+        // SPEECH_RMS` (`pond-adapters-whisper` `record_mono_f32_vad`), so NaN
+        // has always failed to *start* a recording. Writing `!(rms < t)` here
+        // to make the refactor bit-exact would reinstate the hang and leave the
+        // two gates disagreeing about the same sample.
+        //
+        // Nothing manufactures a NaN today — the i16 and u16 capture paths
+        // cannot, and the f32 path passes driver samples through unaltered —
+        // so this is a disposition, not a fix for an observed bug.
+        rms(frame) >= self.threshold
+    }
+}
+
 /// Debounced end-of-speech detector that also drives speculative inference.
 ///
-/// Feed it one RMS reading per `poll_ms`. It reports the start of each silence
-/// run exactly once (not on every poll), which is what makes the speculative
-/// transcription fire once per pause rather than continuously.
+/// Feed it one speech/not-speech decision per `poll_ms`. It reports the start
+/// of each silence run exactly once (not on every poll), which is what makes
+/// the speculative transcription fire once per pause rather than continuously.
 #[derive(Debug, Clone)]
 pub struct SpeculativeVad {
     silent_for_ms: u64,
@@ -347,8 +421,12 @@ impl SpeculativeVad {
         }
     }
 
-    pub fn on_rms(&mut self, rms: f32, silence_threshold: f32) -> VadEvent {
-        if rms < silence_threshold {
+    /// Advance one poll.
+    ///
+    /// Takes a decision, not a level. What counted as speech is the detector's
+    /// business; this only cares how long the answer has been "no".
+    pub fn on_speech(&mut self, is_speech: bool) -> VadEvent {
+        if !is_speech {
             let was_speaking = self.silent_for_ms == 0;
             self.silent_for_ms += self.poll_ms;
             if self.silent_for_ms >= self.silence_ms {
@@ -668,6 +746,101 @@ mod tests {
         assert_eq!(resample_to_16k(&s, 32_000).len(), 50);
     }
 
+    /// The old signature, kept alive as an oracle.
+    ///
+    /// The state machine's tests were rewritten in the same commit as the state
+    /// machine, which is the exact situation where a refactor drifts and drags
+    /// its tests along with it. This is the pre-refactor logic, transcribed
+    /// from the deleted `on_rms`, so the new implementation is checked against
+    /// what the old one *did* rather than against what its new tests say.
+    fn oracle(state: &mut (u64, u64, u64), rms: f32, threshold: f32) -> VadEvent {
+        let (silent_for_ms, silence_ms, poll_ms) = (&mut state.0, state.1, state.2);
+        if rms < threshold {
+            let was_speaking = *silent_for_ms == 0;
+            *silent_for_ms += poll_ms;
+            if *silent_for_ms >= silence_ms {
+                VadEvent::Confirmed
+            } else if was_speaking {
+                VadEvent::SpawnSpeculative
+            } else {
+                VadEvent::None
+            }
+        } else {
+            let was_silent = *silent_for_ms != 0;
+            *silent_for_ms = 0;
+            if was_silent {
+                VadEvent::DiscardSpeculative
+            } else {
+                VadEvent::None
+            }
+        }
+    }
+
+    #[test]
+    fn the_split_changed_no_behaviour() {
+        const THRESHOLD: f32 = 0.01;
+        // Levels chosen to straddle the threshold, including landing exactly on
+        // it — the boundary is where an inverted comparison hides.
+        let levels = [0.5, 0.001, 0.01, 0.0099, 0.0101, 0.0, 0.2, 0.005, 0.5, 0.0];
+
+        for &(silence_ms, poll_ms) in &[(300u64, 100u64), (90, 30), (1_000, 100), (30, 30)] {
+            let mut vad = SpeculativeVad::new(silence_ms, poll_ms);
+            let mut oracle_state = (0u64, silence_ms, poll_ms);
+            let mut detector = RmsDetector::new(THRESHOLD);
+
+            // Repeat the pattern so multi-run sequences are covered, not just
+            // the first pause.
+            for round in 0..4 {
+                for (i, &level) in levels.iter().enumerate() {
+                    // A constant frame whose RMS is exactly `level`.
+                    let frame = [level; 8];
+                    let got = vad.on_speech(detector.is_speech(&frame));
+                    let want = oracle(&mut oracle_state, level, THRESHOLD);
+                    assert_eq!(
+                        got, want,
+                        "round {round}, step {i}, level {level}, \
+                         silence_ms {silence_ms}, poll_ms {poll_ms}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_nan_frame_counts_as_silence() {
+        // The one input where this is not a pure refactor, pinned so the choice
+        // is visible rather than incidental. The old comparison (`rms < t`,
+        // false for NaN) called a NaN frame speech and never ended the
+        // utterance; this calls it silence. See the note on `is_speech`.
+        let mut d = RmsDetector::new(0.01);
+        assert!(!d.is_speech(&[f32::NAN; 4]), "NaN is silence, deliberately");
+        // An empty frame has an RMS of 0.0, which both versions call silence.
+        assert!(!d.is_speech(&[]));
+    }
+
+    #[test]
+    fn the_detector_matches_the_comparison_it_replaced() {
+        let mut d = RmsDetector::new(0.01);
+        assert!(d.is_speech(&[0.5; 4]));
+        assert!(!d.is_speech(&[0.001; 4]));
+        // Exactly at the threshold is speech: the code this replaced treated
+        // `rms < threshold` as silence, so equality fell on the speech side.
+        assert!(d.is_speech(&[0.01; 4]), "the boundary belongs to speech");
+        assert!(!d.is_speech(&[0.0099; 4]));
+    }
+
+    #[test]
+    fn a_detector_can_be_swapped_at_runtime() {
+        // Step 3 selects the detector from a settings row, so the trait has to
+        // survive being put behind a pointer. Object safety is easy to lose by
+        // accident (a generic method, `Self: Sized`) and annoying to discover
+        // one crate away.
+        let mut boxed: Box<dyn SpeechDetector> = Box::new(RmsDetector::new(0.01));
+        assert!(boxed.is_speech(&[0.5; 4]));
+        boxed.reset();
+        assert!(!boxed.is_speech(&[0.0; 4]));
+    }
+
     #[test]
     fn the_vad_reports_a_silence_run_once_then_confirms() {
         const SILENCE: f32 = 0.001;
@@ -675,10 +848,14 @@ mod tests {
         const T: f32 = 0.01;
         let mut vad = SpeculativeVad::new(300, 100);
 
-        assert_eq!(vad.on_rms(SPEECH, T), VadEvent::None);
-        assert_eq!(vad.on_rms(SILENCE, T), VadEvent::SpawnSpeculative);
-        assert_eq!(vad.on_rms(SILENCE, T), VadEvent::None, "only once per run");
-        assert_eq!(vad.on_rms(SILENCE, T), VadEvent::Confirmed);
+        assert_eq!(vad.on_speech(SPEECH >= T), VadEvent::None);
+        assert_eq!(vad.on_speech(SILENCE >= T), VadEvent::SpawnSpeculative);
+        assert_eq!(
+            vad.on_speech(SILENCE >= T),
+            VadEvent::None,
+            "only once per run"
+        );
+        assert_eq!(vad.on_speech(SILENCE >= T), VadEvent::Confirmed);
     }
 
     #[test]
@@ -687,10 +864,10 @@ mod tests {
         const SPEECH: f32 = 0.5;
         const T: f32 = 0.01;
         let mut vad = SpeculativeVad::new(1_000, 100);
-        assert_eq!(vad.on_rms(SILENCE, T), VadEvent::SpawnSpeculative);
-        assert_eq!(vad.on_rms(SPEECH, T), VadEvent::DiscardSpeculative);
-        assert_eq!(vad.on_rms(SPEECH, T), VadEvent::None);
-        assert_eq!(vad.on_rms(SILENCE, T), VadEvent::SpawnSpeculative);
+        assert_eq!(vad.on_speech(SILENCE >= T), VadEvent::SpawnSpeculative);
+        assert_eq!(vad.on_speech(SPEECH >= T), VadEvent::DiscardSpeculative);
+        assert_eq!(vad.on_speech(SPEECH >= T), VadEvent::None);
+        assert_eq!(vad.on_speech(SILENCE >= T), VadEvent::SpawnSpeculative);
     }
 
     /// Regression against a real file, not a synthetic one.

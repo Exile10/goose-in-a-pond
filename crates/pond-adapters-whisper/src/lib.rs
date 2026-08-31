@@ -151,6 +151,12 @@ pub(crate) fn record_mono_f32_until_silence(
     let max_ms = max_record_secs as u64 * 1000;
     let mut elapsed_ms: u64 = 0;
     let mut silent_for: u64 = 0;
+    // The same detector the other end-of-speech path uses. This loop keeps its
+    // own countdown rather than a `SpeculativeVad` because it fires no
+    // speculative transcription — but "is this speech" has to be answered the
+    // same way in both, or a detector chosen in settings would govern only the
+    // half of the turns that did not start with a wake word.
+    let mut detector = RmsDetector::new(SILENCE_RMS);
 
     while elapsed_ms < max_ms {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
@@ -159,9 +165,8 @@ pub(crate) fn record_mono_f32_until_silence(
 
         let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
         let start = samples.len().saturating_sub(recent);
-        let rms = rms_energy(&samples[start..]);
 
-        if rms < SILENCE_RMS {
+        if !detector.is_speech(&samples[start..]) {
             silent_for += POLL_MS;
             if silent_for >= silence_ms {
                 tracing::debug!(
@@ -182,7 +187,7 @@ pub(crate) fn record_mono_f32_until_silence(
 
 use pond_voice::dsp::VadEvent;
 
-use pond_voice::dsp::SpeculativeVad;
+use pond_voice::dsp::{RmsDetector, SpeculativeVad, SpeechDetector};
 
 /// Spawns a background transcription of `samples` at `sample_rate`, returning
 /// a handle the caller can join once end-of-speech is confirmed.
@@ -267,6 +272,11 @@ pub(crate) fn record_mono_f32_vad(
     let max_record_ms = max_record_secs as u64 * 1000;
     let mut recorded_ms: u64 = 0;
     let mut vad = SpeculativeVad::new(silence_ms, POLL_MS);
+    // The detector is constructed here rather than passed in, for now: this
+    // change is a seam, not a swap. `SILENCE_RMS` is the same constant the loop
+    // compared against inline, so the decision reaching the state machine is
+    // bit-for-bit what it was.
+    let mut detector = RmsDetector::new(SILENCE_RMS);
     let mut speculative: Option<std::thread::JoinHandle<Result<String>>> = None;
     // Set once the in-flight speculative job has been joined and the caller
     // notified via `Ready` — retained so a later `Confirmed` can reuse it
@@ -282,12 +292,15 @@ pub(crate) fn record_mono_f32_vad(
 
         let recent = (sample_rate as u64 * POLL_MS / 1000) as usize;
         let start = samples.len().saturating_sub(recent);
-        let rms = rms_energy(&samples[start..]);
+        let frame = &samples[start..];
+        // The level meter wants a number and the detector wants the samples, so
+        // this frame is walked twice. At 30 ms that is ~480 floats per poll —
+        // far below the cost of the branch that decides whether to say so.
         if let Some(sink) = audio_level_sink {
-            sink.maybe_emit(rms);
+            sink.maybe_emit(rms_energy(frame));
         }
 
-        match vad.on_rms(rms, SILENCE_RMS) {
+        match vad.on_speech(detector.is_speech(frame)) {
             VadEvent::SpawnSpeculative => {
                 if let Some(spawn) = speculative_spawn {
                     let snapshot = samples.clone();
@@ -1087,56 +1100,77 @@ mod tests {
     fn vad_does_nothing_while_speech_continues() {
         let mut vad = SpeculativeVad::new(360, 30);
         for _ in 0..10 {
-            assert_eq!(vad.on_rms(SPEECH, THRESHOLD), VadEvent::None);
+            assert_eq!(vad.on_speech(SPEECH >= THRESHOLD), VadEvent::None);
         }
     }
 
     #[test]
     fn vad_spawns_once_on_first_silent_poll_then_goes_quiet() {
         let mut vad = SpeculativeVad::new(360, 30);
-        vad.on_rms(SPEECH, THRESHOLD);
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::SpawnSpeculative);
+        vad.on_speech(SPEECH >= THRESHOLD);
+        assert_eq!(
+            vad.on_speech(QUIET >= THRESHOLD),
+            VadEvent::SpawnSpeculative
+        );
         // Subsequent silent polls before confirmation: no repeat spawn.
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::None);
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::None);
+        assert_eq!(vad.on_speech(QUIET >= THRESHOLD), VadEvent::None);
+        assert_eq!(vad.on_speech(QUIET >= THRESHOLD), VadEvent::None);
     }
 
     #[test]
     fn vad_confirms_after_silence_ms_elapses() {
         let mut vad = SpeculativeVad::new(90, 30); // 3 polls to confirm
-        vad.on_rms(SPEECH, THRESHOLD);
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::SpawnSpeculative); // 30ms
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::None); // 60ms
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::Confirmed); // 90ms
+        vad.on_speech(SPEECH >= THRESHOLD);
+        assert_eq!(
+            vad.on_speech(QUIET >= THRESHOLD),
+            VadEvent::SpawnSpeculative
+        ); // 30ms
+        assert_eq!(vad.on_speech(QUIET >= THRESHOLD), VadEvent::None); // 60ms
+        assert_eq!(vad.on_speech(QUIET >= THRESHOLD), VadEvent::Confirmed); // 90ms
     }
 
     #[test]
     fn vad_discards_speculative_on_resumed_speech() {
         let mut vad = SpeculativeVad::new(360, 30);
-        vad.on_rms(SPEECH, THRESHOLD);
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::SpawnSpeculative);
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::None);
+        vad.on_speech(SPEECH >= THRESHOLD);
+        assert_eq!(
+            vad.on_speech(QUIET >= THRESHOLD),
+            VadEvent::SpawnSpeculative
+        );
+        assert_eq!(vad.on_speech(QUIET >= THRESHOLD), VadEvent::None);
         // False pause — speech resumes before confirmation.
-        assert_eq!(vad.on_rms(SPEECH, THRESHOLD), VadEvent::DiscardSpeculative);
-        assert_eq!(vad.on_rms(SPEECH, THRESHOLD), VadEvent::None);
+        assert_eq!(
+            vad.on_speech(SPEECH >= THRESHOLD),
+            VadEvent::DiscardSpeculative
+        );
+        assert_eq!(vad.on_speech(SPEECH >= THRESHOLD), VadEvent::None);
     }
 
     #[test]
     fn vad_spawns_a_fresh_job_for_each_new_silence_run() {
         let mut vad = SpeculativeVad::new(360, 30);
-        vad.on_rms(SPEECH, THRESHOLD);
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::SpawnSpeculative);
-        assert_eq!(vad.on_rms(SPEECH, THRESHOLD), VadEvent::DiscardSpeculative);
+        vad.on_speech(SPEECH >= THRESHOLD);
+        assert_eq!(
+            vad.on_speech(QUIET >= THRESHOLD),
+            VadEvent::SpawnSpeculative
+        );
+        assert_eq!(
+            vad.on_speech(SPEECH >= THRESHOLD),
+            VadEvent::DiscardSpeculative
+        );
         // New silence run after the false pause — spawns again, independent
         // of the discarded one.
-        assert_eq!(vad.on_rms(QUIET, THRESHOLD), VadEvent::SpawnSpeculative);
+        assert_eq!(
+            vad.on_speech(QUIET >= THRESHOLD),
+            VadEvent::SpawnSpeculative
+        );
     }
 
     #[test]
     fn vad_repeated_speech_after_speech_is_a_noop() {
         let mut vad = SpeculativeVad::new(360, 30);
-        assert_eq!(vad.on_rms(SPEECH, THRESHOLD), VadEvent::None);
-        assert_eq!(vad.on_rms(SPEECH, THRESHOLD), VadEvent::None);
+        assert_eq!(vad.on_speech(SPEECH >= THRESHOLD), VadEvent::None);
+        assert_eq!(vad.on_speech(SPEECH >= THRESHOLD), VadEvent::None);
     }
 
     // ── wake-word cancellation ───────────────────────────────────────────
