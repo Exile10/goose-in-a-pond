@@ -330,7 +330,18 @@ way has to be added to it. Settings read by shape from a snapshot filtered by na
 is a contradiction worth knowing about: it is what made a paired washer report
 nothing but power while every unit test passed.
 
-That bound is still there, but `describe` no longer hides what it drops.
+That bound is still there, but `describe` no longer hides what it drops — and the set is
+now **derived from the mappings** rather than written beside them. Each module declares the
+clusters it reads (`deviceClusters()`, `settingClusters()`, `sensorClusters()`), so a
+cluster's name lives in the file that uses it and there is no second place to remember.
+
+That second place is not hypothetical. Media control shipped complete and dead:
+`mediaPlayback`, `mediaInput` and `audioOutput` were declared inside `settings.ts` as
+module-private constants, the allowlist was not updated, and `readClusters` dropped all
+three — so a television described nothing but power and volume while every unit test
+passed. The fixtures build snapshots by hand and never cross the filter, which is the
+identical reason a paired washer once reported nothing but power. The `*Mode` rule remains
+the escape hatch that needs no list at all.
 
 ### What a device reports and nothing can set
 

@@ -33,6 +33,30 @@ export const CLUSTER_TEMPERATURE = "temperatureMeasurement";
 export const CLUSTER_HUMIDITY = "relativeHumidityMeasurement";
 export const CLUSTER_SMOKE_CO_ALARM = "smokeCoAlarm";
 
+/**
+ * Every cluster this module names, for the snapshot allowlist.
+ *
+ * The same contract as `sensorClusters()` and `settingClusters()`: a cluster named here
+ * is a cluster the snapshot admits, so the two cannot drift apart.
+ */
+export function deviceClusters(): ReadonlySet<string> {
+  return new Set([
+    CLUSTER_ON_OFF,
+    CLUSTER_LEVEL_CONTROL,
+    CLUSTER_COLOR_CONTROL,
+    CLUSTER_THERMOSTAT,
+    CLUSTER_DOOR_LOCK,
+    CLUSTER_FAN_CONTROL,
+    CLUSTER_WINDOW_COVERING,
+    CLUSTER_BASIC_INFORMATION,
+    CLUSTER_OCCUPANCY,
+    CLUSTER_BOOLEAN_STATE,
+    CLUSTER_TEMPERATURE,
+    CLUSTER_HUMIDITY,
+    CLUSTER_SMOKE_CO_ALARM,
+  ]);
+}
+
 /** Matter's Speaker device type. Its Level Control is volume, not brightness. */
 export const SPEAKER_DEVICE_TYPE = 0x0022;
 
