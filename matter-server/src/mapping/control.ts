@@ -390,17 +390,26 @@ export function planControl(
           `Matter device '${deviceId}' has no speaker to set a volume on`,
         );
       }
-      // The speaker's own Level Control, on the speaker's own endpoint. Written the same
-      // way brightness is because it is the same cluster and the same 0-254 scale -- what
-      // differs is whose level it is, and that is settled by the endpoint.
+      // A COMMAND, not an attribute write. `currentLevel` is read-only in Matter -- the
+      // device answers a write to it with "Unsupported write" -- and `moveToLevel` is how
+      // the level is actually set. Brightness three cases below has always done this; the
+      // volume case was written as a write and the device refused every one.
+      //
+      // `moveToLevel`, not `moveToLevelWithOnOff`: a light asked for 0% means off, but a
+      // television asked for silence still wants to be on.
       return {
         actions: [
           {
-            kind: "write",
+            kind: "command",
             endpoint: speaker.number,
             cluster: CLUSTER_LEVEL_CONTROL,
-            attribute: "currentLevel",
-            value: brightnessToLevel(pct),
+            command: "moveToLevel",
+            payload: {
+              level: brightnessToLevel(pct),
+              transitionTime: 0,
+              optionsMask: {},
+              optionsOverride: {},
+            },
           },
         ],
         applied: { volume: pct },

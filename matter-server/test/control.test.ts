@@ -352,8 +352,17 @@ describe("media control", () => {
   it("writes the volume to the speaker's endpoint, not the player's", () => {
     const plan = planControl(videoPlayerNode(), "matter-81", "volume", 50);
 
+    // A command. This test asserted a WRITE and passed, because it checked what the plan
+    // said rather than what Matter accepts -- `currentLevel` is read-only and the device
+    // refused every volume it was ever sent.
     expect(plan.actions).toEqual([
-      { kind: "write", endpoint: 2, cluster: "levelControl", attribute: "currentLevel", value: 127 },
+      {
+        kind: "command",
+        endpoint: 2,
+        cluster: "levelControl",
+        command: "moveToLevel",
+        payload: { level: 127, transitionTime: 0, optionsMask: {}, optionsOverride: {} },
+      },
     ]);
     expect(plan.applied).toEqual({ volume: 50 });
   });
@@ -395,5 +404,71 @@ describe("media control", () => {
     expect(observedFor(videoPlayerNode(), "brightness")).toEqual({});
     // A bulb is unaffected -- its level is still a brightness.
     expect(observedFor(lightNode(), "brightness")).toEqual({ brightness: 50 });
+  });
+});
+
+/**
+ * Matter attributes a controller may READ but never WRITE.
+ *
+ * Every one of these has a command that sets it instead — `moveToLevel` for a level,
+ * `moveToHueAndSaturation` for a colour, `lockDoor` for a bolt. Writing them is answered
+ * with "Unsupported write", which is exactly what a television did to every volume it was
+ * ever sent: the `volume` case was written as an attribute write while `brightness`, three
+ * cases away in the same file, had always used the command.
+ *
+ * Not exhaustive over Matter — it is the set this repo's verbs could plausibly reach.
+ */
+const READ_ONLY: ReadonlySet<string> = new Set([
+  "levelControl.currentLevel",
+  "onOff.onOff",
+  "colorControl.currentHue",
+  "colorControl.currentSaturation",
+  "colorControl.currentX",
+  "colorControl.currentY",
+  "colorControl.colorTemperatureMireds",
+  "colorControl.colorMode",
+  "doorLock.lockState",
+  "doorLock.doorState",
+  "fanControl.percentCurrent",
+  "fanControl.speedCurrent",
+  "windowCovering.currentPositionLiftPercent100ths",
+  "windowCovering.currentPositionTiltPercent100ths",
+  "mediaPlayback.currentState",
+  "mediaInput.currentInput",
+  "audioOutput.currentOutput",
+  "operationalState.operationalState",
+  "thermostat.localTemperature",
+]);
+
+describe("no plan writes an attribute the device will refuse", () => {
+  it("sets every verb through a command where the attribute is read-only", () => {
+    // A unit test can assert what a plan SAYS; it cannot assert that Matter accepts it.
+    // This is the gap that let a broken volume ship green -- the test asserted the write
+    // it was given. Naming the read-only attributes is the cheap half of the check the
+    // device would otherwise have to make for us.
+    const cases: [ReturnType<typeof lightNode>, string, unknown][] = [
+      [lightNode(), "power", true],
+      [lightNode(), "brightness", 60],
+      [extendedColorLightNode(), "color", { hue: 120, saturation: 80 }],
+      [extendedColorLightNode(), "color_temp", 2700],
+      [fanNode(), "fan_speed", 40],
+      [fanNode(), "fan_mode", "high"],
+      [videoPlayerNode(), "volume", 50],
+      [videoPlayerNode(), "operation", "pause"],
+      [videoPlayerNode(), "mode", { setting: "input", value: "HDMI 2" }],
+      [tunableWhiteNode(), "color_temp", 3000],
+    ];
+
+    for (const [node, verb, value] of cases) {
+      const plan = planControl(node, "matter-1", verb as never, value);
+      for (const action of plan.actions) {
+        if (action.kind !== "write") continue;
+        const path = `${action.cluster}.${action.attribute}`;
+        expect(
+          READ_ONLY.has(path),
+          `'${verb}' writes ${path}, which Matter refuses — use its command instead`,
+        ).toBe(false);
+      }
+    }
   });
 });
