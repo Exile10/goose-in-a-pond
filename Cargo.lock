@@ -9549,6 +9549,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pond-adapters-silero"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ndarray",
+ "ort",
+ "pond-voice",
+ "tracing",
+]
+
+[[package]]
 name = "pond-adapters-vision"
 version = "0.1.0"
 dependencies = [
@@ -9871,6 +9882,7 @@ dependencies = [
  "pond-adapters-mcp-memory",
  "pond-adapters-mesh-libp2p",
  "pond-adapters-ollama",
+ "pond-adapters-silero",
  "pond-adapters-vision",
  "pond-adapters-vision-onnx",
  "pond-adapters-weather",
@@ -9885,6 +9897,7 @@ dependencies = [
  "pond-infra-scheduler",
  "pond-mcp-server",
  "pond-mesh-protocol",
+ "pond-voice",
  "predicates",
  "qrcode",
  "reqwest 0.13.3",

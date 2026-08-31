@@ -133,8 +133,8 @@ pub(crate) fn record_mono_f32_until_silence(
     mic: &MicHandle,
     max_record_secs: u32,
     silence_ms: u64,
+    detector: &mut dyn SpeechDetector,
 ) -> Result<(Vec<f32>, u32)> {
-    const SILENCE_RMS: f32 = 0.005;
     const POLL_MS: u64 = 30;
 
     // Privacy gate: refuse to OPEN the device, so the OS microphone indicator
@@ -151,12 +151,6 @@ pub(crate) fn record_mono_f32_until_silence(
     let max_ms = max_record_secs as u64 * 1000;
     let mut elapsed_ms: u64 = 0;
     let mut silent_for: u64 = 0;
-    // The same detector the other end-of-speech path uses. This loop keeps its
-    // own countdown rather than a `SpeculativeVad` because it fires no
-    // speculative transcription — but "is this speech" has to be answered the
-    // same way in both, or a detector chosen in settings would govern only the
-    // half of the turns that did not start with a wake word.
-    let mut detector = RmsDetector::new(SILENCE_RMS);
 
     while elapsed_ms < max_ms {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
@@ -187,7 +181,7 @@ pub(crate) fn record_mono_f32_until_silence(
 
 use pond_voice::dsp::VadEvent;
 
-use pond_voice::dsp::{RmsDetector, SpeculativeVad, SpeechDetector};
+use pond_voice::dsp::{SpeculativeVad, SpeechDetector};
 
 /// Spawns a background transcription of `samples` at `sample_rate`, returning
 /// a handle the caller can join once end-of-speech is confirmed.
@@ -225,9 +219,14 @@ pub(crate) fn record_mono_f32_vad(
     speculative_spawn: Option<&SpeculativeSpawn>,
     on_speculative_event: Option<&(dyn Fn(SpeculativeSignal) + Send + Sync)>,
     audio_level_sink: Option<&ThrottledAudioLevelSink>,
+    detector: &mut dyn SpeechDetector,
 ) -> Result<(Vec<f32>, u32, Option<String>)> {
+    // Onset only. The end-of-speech threshold moved into `detector`, which is
+    // why these are no longer a matched pair: onset stays an energy question on
+    // purpose. A model detector needs a window or two of context before it is
+    // trustworthy, so it under-reports at exactly the moment onset is decided
+    // and would clip the first word.
     const SPEECH_RMS: f32 = 0.010; // onset threshold — lowered for better sensitivity
-    const SILENCE_RMS: f32 = 0.005; // end-of-speech threshold (hysteresis)
     const POLL_MS: u64 = 30;
 
     // Privacy gate: refuse to OPEN the device, so the OS microphone indicator
@@ -272,11 +271,6 @@ pub(crate) fn record_mono_f32_vad(
     let max_record_ms = max_record_secs as u64 * 1000;
     let mut recorded_ms: u64 = 0;
     let mut vad = SpeculativeVad::new(silence_ms, POLL_MS);
-    // The detector is constructed here rather than passed in, for now: this
-    // change is a seam, not a swap. `SILENCE_RMS` is the same constant the loop
-    // compared against inline, so the decision reaching the state machine is
-    // bit-for-bit what it was.
-    let mut detector = RmsDetector::new(SILENCE_RMS);
     let mut speculative: Option<std::thread::JoinHandle<Result<String>>> = None;
     // Set once the in-flight speculative job has been joined and the caller
     // notified via `Ready` — retained so a later `Confirmed` can reuse it
@@ -851,6 +845,7 @@ fn detection_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pond_voice::dsp::RmsDetector;
 
     // ── Detection tuning ──────────────────────────────────────────────────
     //
@@ -1287,7 +1282,8 @@ mod tests {
         // The detector's `mic.close()` and this follow-up `mic.open()` race
         // exactly the way `run_loop` races them between turns.
         let result = tokio::task::spawn_blocking(move || {
-            record_mono_f32_vad(&mic, 1, 1, 200, None, None, None)
+            let mut detector = RmsDetector::new(0.005);
+            record_mono_f32_vad(&mic, 1, 1, 200, None, None, None, &mut detector)
         })
         .await
         .expect("capture thread must not panic");

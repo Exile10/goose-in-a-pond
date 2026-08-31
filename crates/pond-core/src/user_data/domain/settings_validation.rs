@@ -41,7 +41,7 @@ use serde_json::Value;
 use crate::user_data::domain::settings::{
     Settings, AGENT_BACKENDS, CONSOLIDATION_MODES, EMBEDDING_PROVIDERS, NETWORK_MODES,
     PROMPT_STYLES, QUARANTINED_AGENT_BACKENDS, REASONING_EFFORTS, REVIEW_MODES,
-    SECURITY_POLICY_MODES, THINKING_MODES, TOOL_SELECTION_MODES, TTS_QUALITIES,
+    SECURITY_POLICY_MODES, THINKING_MODES, TOOL_SELECTION_MODES, TTS_QUALITIES, VAD_BACKENDS,
 };
 use crate::user_data::services::location::normalize_zone;
 
@@ -169,6 +169,11 @@ pub const FIELD_RULES: &[FieldRule] = &[
     FieldRule {
         key: "voice_tts_quality",
         check: Check::OneOf(TTS_QUALITIES),
+        blank_ok: false,
+    },
+    FieldRule {
+        key: "vad_backend",
+        check: Check::OneOf(VAD_BACKENDS),
         blank_ok: false,
     },
     // ── Time ───────────────────────────────────────────────────────────────

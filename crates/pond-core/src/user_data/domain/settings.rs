@@ -129,6 +129,14 @@ pub const EMBEDDING_PROVIDERS: &[&str] = &["fastembed", "gguf", "none"];
 /// Kokoro quality tiers, smallest first.
 pub const TTS_QUALITIES: &[&str] = &["q4", "q4f16", "q8", "q8f16", "fp16", "fp32"];
 
+/// Which detector decides that a frame is speech.
+///
+/// `rms` is the energy gate that has always shipped: cheap, and unable to tell
+/// a fridge from a voice. `silero` runs a 2 MB ONNX model that can — measured,
+/// steady noise at twice the energy threshold scores 0.08 where speech averages
+/// 0.945 — at about 1.6% of one core on a Jetson.
+pub const VAD_BACKENDS: &[&str] = &["rms", "silero"];
+
 /// One factory default that CHANGED after installs already existed.
 ///
 /// Settings are a flat key-value table and a default only applies when the key
@@ -352,6 +360,21 @@ pub struct Settings {
     /// a mistyped tier must not leave the pond unable to speak.
     #[serde(default = "Settings::default_tts_quality")]
     pub voice_tts_quality: String,
+
+    /// Which detector decides that a frame is speech (`rms` | `silero`).
+    ///
+    /// Only the *endpoint* — deciding the user has stopped talking — goes
+    /// through this. Speech onset stays on the energy gate, deliberately: a
+    /// freshly reset Silero scores 0.27 on a window of unambiguous speech
+    /// because its recurrent state needs a window or two of context, which is
+    /// harmless when looking for silence and would clip the first word when
+    /// looking for the start of one.
+    ///
+    /// Defaults to `rms`, and falls back to it when the model is missing or the
+    /// ONNX runtime will not load. An unknown value resolves to the default
+    /// rather than failing — a mistyped backend must not leave the pond deaf.
+    #[serde(default = "Settings::default_vad_backend")]
+    pub vad_backend: String,
 
     /// Whether the soft ambient tone plays while the model is working.
     ///
@@ -1178,6 +1201,7 @@ impl Default for Settings {
             voice_tts_voice: Self::default_tts_voice(),
             voice_tts_speed: Self::default_tts_speed(),
             voice_tts_quality: Self::default_tts_quality(),
+            vad_backend: Self::default_vad_backend(),
             voice_thinking_tone_enabled: Self::default_voice_thinking_tone_enabled(),
             voice_recording_duration_secs: Self::default_recording_duration(),
             voice_whisper_url: Self::default_whisper_url(),
@@ -1353,6 +1377,11 @@ impl Settings {
     /// `q8`. See the field docs: the tier that fits beside the language model.
     fn default_tts_quality() -> String {
         "q8".to_string()
+    }
+    /// `rms`. See the field docs: the model is opt-in because it is a download,
+    /// and the gate that needs no file has to keep working without one.
+    fn default_vad_backend() -> String {
+        "rms".to_string()
     }
     /// ON. See the field docs: a household that dislikes the tone can switch it
     /// off, but one that never hears it has nothing to go looking for.
@@ -2407,6 +2436,11 @@ mod tests {
             // Vision classifier model file (#130 follow-up): an operator knob
             // that also requires a `vision-onnx` build; UI wiring comes with
             // the Models-tab vision section, not before.
+            // No control yet: the model is a download and the backend is opt-in,
+            // so this ships headless and moves to UI_WIRED in the same change
+            // that adds the switch. Claiming a control that does not exist is
+            // how twenty-two switches came to render without being operable.
+            "vad_backend",
             "vision_classifier_model",
             // PAI-8's on-pond producer, headless for the same reason and owing
             // a UI for a sharper one: this switch decides whether what the

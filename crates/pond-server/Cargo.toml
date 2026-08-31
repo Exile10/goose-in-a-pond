@@ -67,6 +67,14 @@ face-onnx = ["dep:pond-adapters-face-onnx"]
 # face-onnx (ORT_DYLIB_PATH). Off = events stay plain "motion".
 # cargo run -p pond-server --features vision-onnx -- serve
 vision-onnx = ["dep:pond-adapters-vision-onnx"]
+# Silero VAD: replaces the energy gate that decides the user has stopped
+# talking with a 2 MB ONNX model that can tell a fridge from a voice.
+# Off by default for the same reason as the other two — it needs a system ONNX
+# Runtime at run time (ORT_DYLIB_PATH), and a default build must not depend on
+# one. With the feature off, `vad_backend = "silero"` degrades to the energy
+# gate and says so.
+#   cargo run -p pond-server --features silero-vad -- serve
+silero-vad = ["dep:pond-adapters-silero"]
 # There is deliberately no `system-ort` feature here to dlopen the ONNX Runtime
 # rather than link it. One was written and reverted: this binary depends on
 # pond-infra, pond-infra depends on fastembed, and the root Cargo.toml gives
@@ -111,6 +119,8 @@ pond-adapters-local-inference = { workspace = true, optional = true }
 pond-adapters-face-onnx       = { workspace = true, optional = true }
 # Optional: only compiled when --features vision-onnx is passed.
 pond-adapters-vision-onnx     = { workspace = true, optional = true }
+# Optional: only compiled when --features silero-vad is passed.
+pond-adapters-silero      = { workspace = true, optional = true }
 # Optional: only compiled when --features mesh is passed.
 pond-adapters-mesh-libp2p     = { workspace = true, optional = true }
 pond-mesh-protocol            = { workspace = true, optional = true }
@@ -131,6 +141,8 @@ pond-adapters-weather      = { workspace = true }
 pond-adapters-llamafile = { path = "../../crates/pond-adapters-llamafile" }
 pond-adapters-ollama = { path = "../../crates/pond-adapters-ollama" }
 pond-adapters-whisper = { path = "../../crates/pond-adapters-whisper" }
+# The SpeechDetector trait the composition root hands to the whisper adapter.
+pond-voice            = { path = "../../crates/pond-voice" }
 pond-adapters-kokoro = { path = "../../crates/pond-adapters-kokoro" }
 pond-audio = { path = "../pond-audio" }
 cpal = "0.15"
