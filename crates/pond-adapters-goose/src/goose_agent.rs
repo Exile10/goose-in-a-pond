@@ -848,6 +848,12 @@ impl GooseAdapter {
             .get(giap_sid)
             .cloned()
         {
+            tracing::info!(
+                giap_sid = %giap_sid,
+                goose_sid = %gid,
+                branch = "map",
+                "resolved the engine session"
+            );
             return gid;
         }
         // Persisted pairing from a previous run. Re-validated against Goose:
@@ -873,6 +879,12 @@ impl GooseAdapter {
                         tracing::debug!(
                             "Restored persisted goose session pairing {giap_sid} -> {gid}"
                         );
+                        tracing::info!(
+                            giap_sid = %giap_sid,
+                            goose_sid = %gid,
+                            branch = "persisted",
+                            "resolved the engine session"
+                        );
                         return gid;
                     }
                     Ok(_) => {
@@ -897,6 +909,12 @@ impl GooseAdapter {
             .is_ok()
         {
             self.remember_goose_session(giap_sid, giap_sid).await;
+            tracing::info!(
+                giap_sid = %giap_sid,
+                goose_sid = %giap_sid,
+                branch = "id-as-is",
+                "resolved the engine session"
+            );
             return giap_sid.to_string();
         }
         // Create a brand-new Goose session; use the GIAP id as the human name.
@@ -912,6 +930,15 @@ impl GooseAdapter {
         {
             Ok(session) => {
                 let gid = session.id.clone();
+                // The id goose just minted. It is `MAX(today's ids) + 1`, so deleting the
+                // highest one frees it for reuse -- which is how a brand-new chat can be
+                // handed an id another session already used, and why this line matters.
+                tracing::info!(
+                    giap_sid = %giap_sid,
+                    goose_sid = %gid,
+                    branch = "created",
+                    "resolved the engine session"
+                );
                 self.remember_goose_session(giap_sid, &gid).await;
                 // A brand-new engine session for an EXISTING conversation must
                 // not start empty. The trimmer cannot cover this: it returns
@@ -2050,7 +2077,16 @@ impl GooseAdapter {
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(session_id);
             if session_configured {
-                tracing::debug!("[model-switch] provider already current: {}", key);
+                // INFO, not DEBUG. This is the branch a failing turn takes, and at DEBUG
+                // it was invisible under the filter this deployment runs -- the same
+                // filtering that buried the previous instance of this bug. The claim it
+                // makes is about an in-memory set, and the row it refers to may since
+                // have been deleted and its id reissued to a different session.
+                tracing::info!(
+                    session_id = %session_id,
+                    provider_key = %key,
+                    "skipping provider setup: this session is believed already configured"
+                );
                 return Ok(());
             }
             let cached = self
@@ -2325,6 +2361,15 @@ impl GooseAdapter {
             // the model named here. A backstop, not the mechanism: the fix that matters
             // is that the row is always written above.
             std::env::set_var("GOOSE_PROVIDER", &settings.chat_provider);
+            // Read back, because the evidence says these are not doing what the code says
+            // they do: a turn failed with "no global one is set either" hours after this
+            // line ran, in this same process. Logging the write is worth nothing; logging
+            // what the variable actually holds afterwards is the whole question.
+            tracing::info!(
+                goose_provider = ?std::env::var("GOOSE_PROVIDER").ok(),
+                goose_model = ?std::env::var("GOOSE_MODEL").ok(),
+                "exported the global goose provider fallback"
+            );
 
             // Update model capabilities from the new model name
             let mut caps =
@@ -4279,6 +4324,12 @@ impl GooseAdapter {
                 target: "giap::trace",
                 kind = "turn_start",
                 session_id = %session_id,
+                // The ENGINE's session id, which every provider decision is keyed on and
+                // which appeared in no INFO line on a normal turn. Goose names this id in
+                // its own errors, so without it here a failure could not be tied back to
+                // the turn that caused it -- which is precisely why "no stored provider
+                // for session '20260831_1'" was undiagnosable from the logs.
+                goose_sid = %turn_goose_sid,
                 model = %settings.chat_model,
                 provider = %settings.chat_provider,
                 message_len = user_msg_len,
@@ -7992,7 +8043,9 @@ mod tests {
     /// trip this, not ordinary words.
     #[test]
     fn an_ordinary_answer_is_not_mistaken_for_leaked_scaffolding() {
-        assert!(!looks_like_leaked_scaffold("The sky is blue on a clear day."));
+        assert!(!looks_like_leaked_scaffold(
+            "The sky is blue on a clear day."
+        ));
         assert!(!looks_like_leaked_scaffold(
             "Today's context and your message history look fine."
         ));
