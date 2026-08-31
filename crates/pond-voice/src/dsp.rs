@@ -357,6 +357,65 @@ pub trait SpeechDetector {
     fn reset(&mut self) {}
 }
 
+/// Re-frames a stream of variable-length reads into fixed-size windows.
+///
+/// A model detector needs an exact window — Silero wants 512 samples at 16 kHz
+/// and nothing else — while a capture loop hands over whatever arrived since it
+/// last looked. At a 30 ms poll that is *about* 480 samples, but only about:
+/// scheduling jitter makes each read a different length, and a detector that
+/// assumed otherwise would silently see overlapping or skipped audio.
+///
+/// Overlap and skip are the failure to care about, because neither is visible.
+/// An LSTM fed a window that repeats 40 ms it already saw does not error; it
+/// just carries a slightly wrong state forward, forever, and the detector is
+/// merely a bit worse than the one you benchmarked.
+///
+/// This keeps the leftover between calls so the windows it emits are exactly
+/// consecutive, with no sample seen twice and none dropped.
+#[derive(Debug, Clone)]
+pub struct Windower {
+    size: usize,
+    buf: Vec<f32>,
+}
+
+impl Windower {
+    pub fn new(size: usize) -> Self {
+        Self {
+            size,
+            buf: Vec::with_capacity(size * 2),
+        }
+    }
+
+    /// Append `samples` and hand each complete window to `on_window`.
+    ///
+    /// Called with zero windows when a read was short, and with several when a
+    /// read was long or a poll was late. A caller that needs one answer per
+    /// call keeps the last one.
+    pub fn push(&mut self, samples: &[f32], mut on_window: impl FnMut(&[f32])) {
+        self.buf.extend_from_slice(samples);
+        let mut consumed = 0;
+        while self.buf.len() - consumed >= self.size {
+            on_window(&self.buf[consumed..consumed + self.size]);
+            consumed += self.size;
+        }
+        if consumed > 0 {
+            // Drain from the front rather than reallocating: the leftover is
+            // always smaller than one window, so this copies at most 511 floats.
+            self.buf.drain(..consumed);
+        }
+    }
+
+    /// Drop the leftover. The next window starts clean.
+    pub fn reset(&mut self) {
+        self.buf.clear();
+    }
+
+    /// Samples held back, waiting for a full window.
+    pub fn pending(&self) -> usize {
+        self.buf.len()
+    }
+}
+
 /// Speech is anything louder than a threshold. The incumbent.
 ///
 /// Kept, and kept honest, for three reasons: it is what ships today so it is
@@ -804,6 +863,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── Windower ──────────────────────────────────────────────────────────
+
+    /// Collect every window a sequence of reads produces.
+    fn windows_of(size: usize, reads: &[usize]) -> Vec<Vec<f32>> {
+        let mut w = Windower::new(size);
+        let mut out = Vec::new();
+        let mut next = 0.0f32;
+        for &n in reads {
+            // Each sample is its own index, so a dropped or repeated sample is
+            // visible in the output rather than hidden in a sea of zeros.
+            let read: Vec<f32> = (0..n)
+                .map(|_| {
+                    next += 1.0;
+                    next
+                })
+                .collect();
+            w.push(&read, |win| out.push(win.to_vec()));
+        }
+        out
+    }
+
+    #[test]
+    fn windows_are_exactly_consecutive_under_jitter() {
+        // The realistic case: a 30 ms poll at 16 kHz is ~480 samples, but never
+        // exactly, and a 512-sample model needs exact windows regardless.
+        let reads = [480, 512, 470, 490, 300, 700, 480, 480, 1, 999];
+        let got = windows_of(512, &reads);
+
+        assert!(!got.is_empty());
+        let flat: Vec<f32> = got.concat();
+        // No sample seen twice, none skipped: the concatenation must be
+        // 1, 2, 3, ... with no gap. This is the assertion that would fail if
+        // the leftover were dropped or re-emitted.
+        let expected: Vec<f32> = (1..=flat.len()).map(|i| i as f32).collect();
+        assert_eq!(flat, expected, "windows are not contiguous");
+        for w in &got {
+            assert_eq!(w.len(), 512, "a window came out the wrong size");
+        }
+    }
+
+    #[test]
+    fn a_short_read_emits_nothing_and_is_not_lost() {
+        let mut w = Windower::new(512);
+        let mut seen = 0;
+        w.push(&[1.0; 100], |_| seen += 1);
+        assert_eq!(seen, 0, "not enough for a window yet");
+        assert_eq!(w.pending(), 100, "and the samples are held, not dropped");
+        w.push(&[2.0; 412], |win| {
+            seen += 1;
+            assert_eq!(win.len(), 512);
+        });
+        assert_eq!(seen, 1, "the two reads together make one window");
+        assert_eq!(w.pending(), 0);
+    }
+
+    #[test]
+    fn one_long_read_emits_every_window_it_contains() {
+        let mut w = Windower::new(512);
+        let mut count = 0;
+        // A late poll delivers a backlog. All of it must be processed, or the
+        // detector silently falls behind real time and never catches up.
+        w.push(&[0.5; 512 * 3 + 7], |_| count += 1);
+        assert_eq!(count, 3);
+        assert_eq!(w.pending(), 7);
+    }
+
+    #[test]
+    fn reset_drops_the_leftover() {
+        let mut w = Windower::new(512);
+        w.push(&[1.0; 300], |_| unreachable!());
+        w.reset();
+        assert_eq!(w.pending(), 0);
+        let mut seen = 0;
+        // If the 300 had survived, 300 + 300 would have emitted a window.
+        w.push(&[2.0; 300], |_| seen += 1);
+        assert_eq!(seen, 0, "the pre-reset samples must not count");
     }
 
     #[test]

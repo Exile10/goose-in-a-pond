@@ -4344,6 +4344,91 @@ fn write_ndjson_line(ev: &pond_core::shared::domain::agent::WorkflowEvent) {
     }
 }
 
+/// Build the speech detector the capture loops should use, or `None` to keep
+/// the energy gate.
+///
+/// Diagnostics go to stderr rather than through `out!`: that macro is a no-op
+/// under `--json-events`, which is the only mode the desktop shell uses, so a
+/// warning printed with it would reach nobody in the case that matters most.
+///
+/// The composition root owns this choice because `pond-adapters-whisper` is in
+/// CI's fast-crate set and must stay buildable without an ONNX Runtime; it
+/// knows the trait and nothing else.
+///
+/// Every failure degrades to `None` rather than propagating. A pond that cannot
+/// load its VAD model should be a pond with a worse VAD, not a deaf one — and
+/// the setting is opt-in, so the fallback is the behaviour the user had before
+/// they changed it.
+#[allow(unused_variables)]
+async fn build_speech_detector(
+    vad_backend: &str,
+    data_dir: &std::path::Path,
+) -> Option<Box<dyn pond_voice::dsp::SpeechDetector + Send>> {
+    if !vad_backend.eq_ignore_ascii_case("silero") {
+        return None;
+    }
+
+    #[cfg(not(feature = "silero-vad"))]
+    {
+        eprintln!("  Listen   vad_backend=silero but this build has no silero-vad feature.");
+        eprintln!("           Using the energy gate. Rebuild with --features silero-vad.");
+        None
+    }
+
+    #[cfg(feature = "silero-vad")]
+    {
+        let path = data_dir
+            .join("models")
+            .join("silero")
+            .join("silero_vad.onnx");
+        if !path.exists() {
+            eprintln!(
+                "  Listen   silero VAD model not found at {}",
+                path.display()
+            );
+            eprintln!("           Using the energy gate.");
+            return None;
+        }
+
+        // Bounded, because a broken ONNX Runtime does not fail — it HANGS.
+        // `load-dynamic` with no dylib to open blocks forever inside ort's
+        // init, and an unbounded wait here is a permanently silent startup with
+        // nothing in the log. Kokoro's engine load is guarded the same way, for
+        // the same reason.
+        const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+        let loading = tokio::time::timeout(
+            LOAD_TIMEOUT,
+            tokio::task::spawn_blocking(move || pond_adapters_silero::SileroDetector::new(&path)),
+        )
+        .await;
+
+        match loading {
+            Ok(Ok(Ok(detector))) => {
+                tracing::info!("silero VAD active");
+                Some(Box::new(detector) as Box<dyn pond_voice::dsp::SpeechDetector + Send>)
+            }
+            Ok(Ok(Err(e))) => {
+                eprintln!("  Listen   silero VAD failed to load: {e}");
+                eprintln!("           Using the energy gate.");
+                None
+            }
+            Ok(Err(e)) => {
+                eprintln!("  Listen   silero VAD load panicked: {e}");
+                None
+            }
+            Err(_) => {
+                eprintln!(
+                    "  Listen   silero VAD load timed out after {}s — the ONNX Runtime is \
+                     probably missing or version-incompatible.",
+                    LOAD_TIMEOUT.as_secs()
+                );
+                eprintln!("           Using the energy gate.");
+                None
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_chat(
     provider: Option<&str>,
@@ -5017,6 +5102,16 @@ async fn run_chat(
     } else {
         None
     };
+
+    // Swap in the configured detector, if there is one and it loads. Done after
+    // construction rather than passed to `new` because both the VoiceInput
+    // adapter and the wake-word detector share this one instance, and the
+    // choice is a setting rather than a property of the model file.
+    if let Some(backend) = &whisper_backend {
+        if let Some(detector) = build_speech_detector(&settings.vad_backend, &data_dir).await {
+            backend.set_speech_detector(detector);
+        }
+    }
 
     let voice: Arc<dyn VoiceInput> = match (input, &whisper_backend) {
         ("whisper", Some(backend)) => {

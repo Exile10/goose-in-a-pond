@@ -25,6 +25,7 @@ members = [
     "crates/pond-adapters-matter",
     "crates/pond-adapters-vision",
     "crates/pond-adapters-vision-onnx",
+    "crates/pond-adapters-silero",
     "crates/pond-adapters-weather",
     "crates/pond-adapters-mcp-memory",
     "crates/pond-mesh-protocol",
@@ -241,6 +242,7 @@ pond-adapters-llamafile = { path = "crates/pond-adapters-llamafile" }
 pond-adapters-matter           = { path = "crates/pond-adapters-matter" }
 pond-adapters-vision           = { path = "crates/pond-adapters-vision" }
 pond-adapters-vision-onnx      = { path = "crates/pond-adapters-vision-onnx" }
+pond-adapters-silero           = { path = "crates/pond-adapters-silero" }
 pond-adapters-caldav           = { path = "crates/pond-adapters-caldav" }
 pond-adapters-imap             = { path = "crates/pond-adapters-imap" }
 pond-adapters-weather          = { path = "crates/pond-adapters-weather" }
