@@ -10,7 +10,14 @@ import {
 } from "../src/controller.js";
 import { planControl } from "../src/mapping/control.js";
 import { describeNode } from "../src/mapping/describe.js";
-import { observedOperation, operationsOf, settingsOf } from "../src/mapping/settings.js";
+import {
+  observedOperation,
+  operationsOf,
+  settingClusters,
+  settingsOf,
+} from "../src/mapping/settings.js";
+import { deviceClusters } from "../src/mapping/devices.js";
+import { sensorClusters } from "../src/mapping/sensors.js";
 import { endpoint, laundryWasherNode, named, node } from "./fixtures.js";
 
 /** The capabilities of one verb, in the order the device offered them. */
@@ -150,6 +157,13 @@ describe("appliance settings", () => {
     expect(isSnapshotCluster("laundryWasherControls")).toBe(true);
     expect(isSnapshotCluster("operationalState")).toBe(true);
 
+    // The same bug, a year and a device class later: these three were declared in
+    // settings.ts as module-private constants and never reached the allowlist, so every
+    // television described nothing but power and volume while all 158 tests passed.
+    expect(isSnapshotCluster("mediaPlayback")).toBe(true);
+    expect(isSnapshotCluster("mediaInput")).toBe(true);
+    expect(isSnapshotCluster("audioOutput")).toBe(true);
+
     // The `*Mode` rule is what keeps the promise for devices nobody has coded for.
     expect(isSnapshotCluster("dishwasherMode")).toBe(true);
     expect(isSnapshotCluster("rvcRunMode")).toBe(true);
@@ -158,6 +172,18 @@ describe("appliance settings", () => {
     // And it stays bounded: a snapshot is rebuilt on every node event.
     expect(isSnapshotCluster("timeSynchronization")).toBe(false);
     expect(isSnapshotCluster("diagnosticLogs")).toBe(false);
+  });
+
+  it("admits every cluster the mappings say they read", () => {
+    // Tautological while the allowlist is DERIVED from these three helpers, and that is
+    // the point: it is what fails the moment someone goes back to hand-listing a cluster
+    // in controller.ts, which is how the media clusters came to be dropped. The check
+    // costs nothing and the failure it guards cost a whole feature.
+    for (const cluster of [...deviceClusters(), ...settingClusters(), ...sensorClusters()]) {
+      expect(isSnapshotCluster(cluster), `'${cluster}' is read but never snapshotted`).toBe(
+        true,
+      );
+    }
   });
 
   it("finds a mode cluster it has never heard of, by its shape", () => {

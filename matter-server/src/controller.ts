@@ -10,9 +10,9 @@
 import { Endpoint, Environment, Seconds, ServerNode, type ClientNode } from "@matter/main";
 
 import { log, describeError, setupCodeKind } from "./log.js";
-import { nodeToDevice } from "./mapping/devices.js";
+import { deviceClusters, nodeToDevice } from "./mapping/devices.js";
 import { observedFor, planControl, type Verb } from "./mapping/control.js";
-import { observedOperation } from "./mapping/settings.js";
+import { observedOperation, settingClusters } from "./mapping/settings.js";
 import { describeNode } from "./mapping/describe.js";
 import { stateOf } from "./mapping/state.js";
 import { readingFor, sensorClusters } from "./mapping/sensors.js";
@@ -52,29 +52,28 @@ const DISCOVER_TIMEOUT = Seconds(8);
  * event, and reading all the clusters a composed device may expose would make a busy
  * fabric expensive for data nothing consumes.
  *
- * The named set is the fixed vocabulary -- lighting, closures, climate, sensors. The
- * `*Mode` rule is what keeps appliances working without a list: Matter's ModeBase
- * derivatives are consistently named that way, and `settingsOf` reads them by shape,
- * so a washer, a dishwasher, an oven and whatever ships next all arrive without a
- * code change. Without that rule the promise was empty -- the snapshot dropped those
- * clusters by name before anything could look at their shape.
+ * The named set is DERIVED from the mappings rather than written here: each module
+ * declares the clusters it reads, so a cluster's name lives in the file that uses it and
+ * there is no second place to remember. The `*Mode` rule is what keeps appliances working
+ * without any list at all: Matter's ModeBase derivatives are consistently named that way,
+ * and `settingsOf` reads them by shape, so a washer, a dishwasher, an oven and whatever
+ * ships next all arrive without a code change. Without that rule the promise was empty --
+ * the snapshot dropped those clusters by name before anything could look at their shape.
  */
 const SNAPSHOT_CLUSTERS: ReadonlySet<string> = new Set([
+  // Endpoint 0's own plumbing, and the only entry not owned by a mapping: `deviceTypes`
+  // is read straight off the endpoint rather than out of the snapshot's cluster map.
   "descriptor",
-  "basicInformation",
-  "onOff",
-  "levelControl",
-  "colorControl",
-  "thermostat",
-  "doorLock",
-  "fanControl",
-  "windowCovering",
-  // Selectable settings whose shape is not ModeBase, so the rule below cannot match
-  // them and they are named here instead -- as they already are in settings.ts.
-  "temperatureControl",
-  "laundryWasherControls",
-  // Start / stop / pause / resume, shared by every appliance that runs a cycle.
-  "operationalState",
+  // Derived, not listed. Each mapping module names the clusters it reads, because the
+  // hand-written version of this list was a second place to remember and it was
+  // forgotten: `mediaPlayback`, `mediaInput` and `audioOutput` were declared in
+  // settings.ts as module-private constants, so `readClusters` dropped all three and
+  // every television reported nothing but power and volume -- while 158 tests passed,
+  // because the fixtures build snapshots by hand and never cross this filter. That is
+  // the same failure, in the same file, that once made a paired washer report nothing
+  // but power.
+  ...deviceClusters(),
+  ...settingClusters(),
   ...sensorClusters(),
 ]);
 
