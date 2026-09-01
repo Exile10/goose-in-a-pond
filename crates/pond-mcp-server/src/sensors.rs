@@ -4,6 +4,8 @@
 
 use std::sync::{Arc, OnceLock};
 
+use chrono::Utc;
+use pond_core::user_data::ports::device_control::DeviceControlPort;
 use pond_core::user_data::ports::device_registry::DeviceRegistry;
 use pond_core::user_data::ports::sensor_storage::SensorStorage;
 use rmcp::{
@@ -150,15 +152,41 @@ mod reading_words {
     }
 }
 
+/// How long ago, in the coarsest unit that is still true.
+///
+/// The reply used to carry an absolute timestamp and nothing else, and a model
+/// reading "recorded at 10:50:59 UTC" has no way to know whether that is a minute or
+/// a day ago -- so it relayed the number as current. An age cannot be misread that
+/// way.
+fn describe_age(elapsed: chrono::Duration) -> String {
+    let seconds = elapsed.num_seconds().max(0);
+    match seconds {
+        0..=90 => format!("{seconds}s"),
+        91..=5399 => format!("{}min", seconds / 60),
+        5400..=172_799 => format!("{}h", seconds / 3600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
 // ── MCP server ─────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct SensorsMcpServer {
     sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
-    /// Read only to answer for sensors that have never reported. Readings
-    /// alone cannot distinguish "no such device" from "that device is here and
-    /// has said nothing yet", and the two need opposite replies.
+    /// Read to answer for sensors that have never reported — readings alone cannot
+    /// distinguish "no such device" from "that device is here and has said nothing
+    /// yet", and the two need opposite replies — and to tell whether a device is
+    /// reachable, which decides whether a stored reading may be called current.
     device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
+    /// Asked what a reachable device reads NOW.
+    ///
+    /// This server held storage and a registry and so could not reach a device at
+    /// all, which made every answer a stored one. Worse than it sounds: the Matter
+    /// controller publishes only CHANGED values and the bridge dedupes again, so a
+    /// steady sensor is written once and never again. A flow sensor reporting 197.8
+    /// had exactly one row, hours old, for a device that had since been removed from
+    /// the fabric — and "what is the CURRENT reading" was answered with it.
+    device_control: Arc<dyn DeviceControlPort>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
@@ -196,12 +224,54 @@ impl SensorsMcpServer {
     pub fn new(
         sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
         device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
+        device_control: Arc<dyn DeviceControlPort>,
     ) -> Self {
         Self {
             sensor_storage,
             device_registry,
+            device_control,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// What the device reads now, if it can be asked and it answers for this sensor.
+    ///
+    /// `None` for every other case, and the caller falls back to the store: no such
+    /// device, a device the registry calls unreachable, a backend that cannot read
+    /// state at all (the port's default `state` bails, which is what every
+    /// non-Matter source does), or a device that answered without this sensor among
+    /// its values.
+    ///
+    /// Gated on reachability BEFORE the call, not on the call failing, because an
+    /// unreachable Matter device costs a fabric timeout to discover. `is_online` is
+    /// derived from `last_seen` freshness, so it is exactly the question "would this
+    /// answer".
+    ///
+    /// `state` names sensor values with the same words `list_sensors` uses -- both
+    /// come from the controller's one `SENSORS` table -- so matching `sensor_type`
+    /// against a `StateValue.name` is the protocol's own guarantee rather than a
+    /// convention this function hopes holds.
+    async fn live_reading(&self, device_id: &str, sensor_type: &str) -> Option<String> {
+        match self.device_registry.get_device(device_id).await {
+            Ok(Some(device)) if device.is_online => {}
+            _ => return None,
+        }
+
+        let state = match self.device_control.state(device_id).await {
+            Ok(state) => state,
+            Err(e) => {
+                // Debug: a backend that cannot read state reaches here on every
+                // call, and that is a normal configuration rather than a fault.
+                tracing::debug!(error = %e, device_id, "sensors: live read unavailable");
+                return None;
+            }
+        };
+
+        state
+            .values
+            .into_iter()
+            .find(|v| v.name == sensor_type)
+            .map(|v| v.value)
     }
 
     /// Registered sensing devices that have no stored reading.
@@ -222,7 +292,10 @@ impl SensorsMcpServer {
     }
 
     #[tool(
-        description = "Get the latest reading for a device. Requires device_id and sensor_type. Never guess values."
+        description = "What a sensor reads NOW. Reads the device directly when it is \
+                       reachable; otherwise returns the last stored reading, labelled \
+                       STORED with its age — say so rather than presenting it as \
+                       current. Requires device_id and sensor_type. Never guess values."
     )]
     async fn get_sensor_reading(
         &self,
@@ -250,17 +323,35 @@ impl SensorsMcpServer {
 
         let device_id = self.resolved_device(&device_id).await;
 
+        // Ask the device first, when the device is there to ask. See `live_reading`:
+        // a stored row can be arbitrarily old through no fault of anything, because
+        // only CHANGES are ever written.
+        if let Some(value) = self.live_reading(&device_id, &sensor_type).await {
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "Current {sensor_type} reading from '{device_id}': {value} (read from the \
+                 device just now)"
+            ))]));
+        }
+
         match self
             .sensor_storage
             .get_latest(&device_id, &sensor_type)
             .await
         {
             Ok(Some(r)) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Latest {} reading from '{}': {} (recorded at {})",
+                // Says it is STORED, and how old. The old wording was "Latest {type}
+                // reading from '{id}': {value} (recorded at {time})", and a model
+                // relayed that as the current reading -- correctly, since nothing in
+                // the sentence suggested otherwise. One flow reading was passed off
+                // as current more than five hours after the device had been removed
+                // from the fabric.
+                "Last STORED {} reading from '{}': {} — recorded {}, {} ago. The device \
+                 could not be read just now, so this may no longer be true.",
                 r.sensor_type,
                 r.device_id,
                 render_reading(&r.sensor_type, r.value, &r.unit),
                 r.recorded_at.format("%Y-%m-%d %H:%M:%S UTC"),
+                describe_age(Utc::now() - r.recorded_at),
             ))])),
             Ok(None) => Ok(CallToolResult::success(vec![Content::text(
                 crate::format::format_no_results(
@@ -506,6 +597,7 @@ use tokio::io::DuplexStream;
 struct SensorDeps {
     sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
     device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
+    device_control: Arc<dyn DeviceControlPort>,
 }
 
 static SENSOR_DEPS: OnceLock<SensorDeps> = OnceLock::new();
@@ -515,10 +607,12 @@ static SENSOR_DEPS: OnceLock<SensorDeps> = OnceLock::new();
 pub fn init_sensor_deps(
     sensor_storage: Arc<dyn SensorStorage + Send + Sync>,
     device_registry: Arc<dyn DeviceRegistry + Send + Sync>,
+    device_control: Arc<dyn DeviceControlPort>,
 ) {
     let _ = SENSOR_DEPS.set(SensorDeps {
         sensor_storage,
         device_registry,
+        device_control,
     });
 }
 
@@ -530,7 +624,11 @@ pub fn spawn_sensor_server(reader: DuplexStream, writer: DuplexStream) {
         );
         return;
     };
-    let server = SensorsMcpServer::new(deps.sensor_storage.clone(), deps.device_registry.clone());
+    let server = SensorsMcpServer::new(
+        deps.sensor_storage.clone(),
+        deps.device_registry.clone(),
+        deps.device_control.clone(),
+    );
     crate::serve_builtin("giap-sensors", server, reader, writer);
 }
 
@@ -543,6 +641,9 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{DateTime, Utc};
     use pond_core::user_data::domain::sensor::SensorReading;
+    use pond_core::user_data::ports::device_control::{
+        DeviceControlOutcome, DeviceState, StateValue,
+    };
     use pond_core::user_data::ports::device_registry::DeviceRegistry;
     use pond_core::user_data::ports::sensor_storage::SensorStorage;
     use rmcp::model::RequestId;
@@ -580,6 +681,63 @@ mod tests {
 
     fn empty_registry() -> Arc<dyn DeviceRegistry + Send + Sync> {
         Arc::new(StubRegistry(Vec::new()))
+    }
+
+    /// A control port that cannot read state, which is every non-Matter backend:
+    /// `DeviceControlPort::state` has a default that bails, and that is the case the
+    /// stored fallback exists for.
+    struct MuteControl;
+
+    #[async_trait]
+    impl DeviceControlPort for MuteControl {
+        async fn set_power(&self, _: &str, _: bool) -> Result<DeviceControlOutcome> {
+            unimplemented!("not exercised by the sensor tools")
+        }
+        async fn set_brightness(&self, _: &str, _: u8) -> Result<DeviceControlOutcome> {
+            unimplemented!("not exercised by the sensor tools")
+        }
+        async fn set_target_temp(&self, _: &str, _: f32) -> Result<DeviceControlOutcome> {
+            unimplemented!("not exercised by the sensor tools")
+        }
+        async fn set_locked(&self, _: &str, _: bool) -> Result<DeviceControlOutcome> {
+            unimplemented!("not exercised by the sensor tools")
+        }
+    }
+
+    fn no_live_control() -> Arc<dyn DeviceControlPort> {
+        Arc::new(MuteControl)
+    }
+
+    /// A control port that answers `state` with the values it was given.
+    struct SpeakingControl(Vec<(String, String)>);
+
+    #[async_trait]
+    impl DeviceControlPort for SpeakingControl {
+        async fn set_power(&self, _: &str, _: bool) -> Result<DeviceControlOutcome> {
+            unimplemented!("not exercised by the sensor tools")
+        }
+        async fn set_brightness(&self, _: &str, _: u8) -> Result<DeviceControlOutcome> {
+            unimplemented!("not exercised by the sensor tools")
+        }
+        async fn set_target_temp(&self, _: &str, _: f32) -> Result<DeviceControlOutcome> {
+            unimplemented!("not exercised by the sensor tools")
+        }
+        async fn set_locked(&self, _: &str, _: bool) -> Result<DeviceControlOutcome> {
+            unimplemented!("not exercised by the sensor tools")
+        }
+        async fn state(&self, device_id: &str) -> Result<DeviceState> {
+            Ok(DeviceState {
+                device_id: device_id.to_string(),
+                values: self
+                    .0
+                    .iter()
+                    .map(|(name, value)| StateValue {
+                        name: name.clone(),
+                        value: value.clone(),
+                    })
+                    .collect(),
+            })
+        }
     }
 
     fn sensor_device(id: &str, name: &str) -> Device {
@@ -681,7 +839,11 @@ mod tests {
     fn make_ctx() -> RequestContext<RoleServer> {
         let (_client, stream) = tokio::io::duplex(64);
         let running = serve_directly(
-            SensorsMcpServer::new(Arc::new(StubStorage::new()), empty_registry()),
+            SensorsMcpServer::new(
+                Arc::new(StubStorage::new()),
+                empty_registry(),
+                no_live_control(),
+            ),
             stream,
             None,
         );
@@ -709,6 +871,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reachable_device_is_read_now_rather_than_recalled() {
+        // The report this came from: "what is the CURRENT reading on the Flow
+        // Sensor?" answered 197.8 m3/h from a single stored row -- for a device that
+        // had been removed from the fabric five hours earlier. One row, because the
+        // controller publishes only CHANGED values and the bridge dedupes again, so a
+        // steady sensor is written once and never again.
+        let storage = Arc::new(StubStorage::new());
+        storage
+            .record(reading("matter-5", "flow", 197.8))
+            .await
+            .unwrap();
+
+        let registry: Arc<dyn DeviceRegistry + Send + Sync> =
+            Arc::new(StubRegistry(vec![sensor_device("matter-5", "Flow Sensor")]));
+        let live: Arc<dyn DeviceControlPort> = Arc::new(SpeakingControl(vec![(
+            "flow".to_string(),
+            "12.4 m3/h".to_string(),
+        )]));
+
+        let server = SensorsMcpServer::new(storage, registry, live);
+        let params = Parameters(GetSensorReadingParams {
+            device_id: Some("matter-5".to_string()),
+            sensor_type: Some("flow".to_string()),
+            extra: Default::default(),
+        });
+        let text = text_of(server.get_sensor_reading(make_ctx(), params).await.unwrap());
+
+        assert!(text.contains("12.4"), "the device was not asked: {text}");
+        assert!(
+            !text.contains("197.8"),
+            "served the stored row anyway: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_device_falls_back_to_the_store_and_says_so() {
+        // The stored reading is still the best answer available -- it just must not
+        // be passed off as current. The old wording was "Latest {type} reading from
+        // '{id}': {value} (recorded at {time})", and a model relayed that as the
+        // present state, correctly, because nothing in the sentence said otherwise.
+        let storage = Arc::new(StubStorage::new());
+        storage
+            .record(reading("matter-5", "flow", 197.8))
+            .await
+            .unwrap();
+
+        let mut absent = sensor_device("matter-5", "Flow Sensor");
+        absent.is_online = false;
+        let registry: Arc<dyn DeviceRegistry + Send + Sync> = Arc::new(StubRegistry(vec![absent]));
+        // A control port that WOULD answer, to prove reachability is what gates the
+        // read rather than the call failing. An unreachable Matter device costs a
+        // fabric timeout to discover, and the registry already knows.
+        let live: Arc<dyn DeviceControlPort> = Arc::new(SpeakingControl(vec![(
+            "flow".to_string(),
+            "12.4 m3/h".to_string(),
+        )]));
+
+        let server = SensorsMcpServer::new(storage, registry, live);
+        let params = Parameters(GetSensorReadingParams {
+            device_id: Some("matter-5".to_string()),
+            sensor_type: Some("flow".to_string()),
+            extra: Default::default(),
+        });
+        let text = text_of(server.get_sensor_reading(make_ctx(), params).await.unwrap());
+
+        assert!(text.contains("197.8"), "lost the stored reading: {text}");
+        assert!(text.contains("STORED"), "did not say it was stored: {text}");
+        assert!(
+            text.contains("ago"),
+            "did not say how old it was, which is the part a model can act on: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_that_does_not_report_this_sensor_falls_back_too() {
+        // A reachable device that answers about other things. Matching `sensor_type`
+        // against a `StateValue.name` is the protocol's own guarantee -- both come
+        // from the controller's single SENSORS table -- but a device with a flow
+        // sensor and no thermometer must not silently produce a temperature.
+        let storage = Arc::new(StubStorage::new());
+        storage
+            .record(reading("matter-5", "temperature", 20.0))
+            .await
+            .unwrap();
+
+        let registry: Arc<dyn DeviceRegistry + Send + Sync> =
+            Arc::new(StubRegistry(vec![sensor_device("matter-5", "Flow Sensor")]));
+        let live: Arc<dyn DeviceControlPort> = Arc::new(SpeakingControl(vec![(
+            "flow".to_string(),
+            "12.4 m3/h".to_string(),
+        )]));
+
+        let server = SensorsMcpServer::new(storage, registry, live);
+        let params = Parameters(GetSensorReadingParams {
+            device_id: Some("matter-5".to_string()),
+            sensor_type: Some("temperature".to_string()),
+            extra: Default::default(),
+        });
+        let text = text_of(server.get_sensor_reading(make_ctx(), params).await.unwrap());
+
+        assert!(text.contains("20"), "lost the stored reading: {text}");
+        assert!(text.contains("STORED"), "did not say it was stored: {text}");
+        assert!(!text.contains("12.4"), "reported the wrong sensor: {text}");
+    }
+
+    #[test]
+    fn an_age_is_stated_in_the_coarsest_unit_that_is_still_true() {
+        assert_eq!(describe_age(chrono::Duration::seconds(12)), "12s");
+        assert_eq!(describe_age(chrono::Duration::minutes(14)), "14min");
+        assert_eq!(describe_age(chrono::Duration::hours(5)), "5h");
+        assert_eq!(describe_age(chrono::Duration::days(3)), "3d");
+        // A clock that went backwards must not read as a reading from the future.
+        assert_eq!(describe_age(chrono::Duration::seconds(-30)), "0s");
+    }
+
+    #[tokio::test]
     async fn get_sensor_reading_returns_latest() {
         let storage = Arc::new(StubStorage::new());
         storage
@@ -720,7 +998,7 @@ mod tests {
             .await
             .unwrap();
 
-        let server = SensorsMcpServer::new(storage, empty_registry());
+        let server = SensorsMcpServer::new(storage, empty_registry(), no_live_control());
         let params = Parameters(GetSensorReadingParams {
             device_id: Some("bedroom".to_string()),
             sensor_type: Some("temperature".to_string()),
@@ -736,7 +1014,11 @@ mod tests {
 
     #[tokio::test]
     async fn get_sensor_reading_missing_params_returns_guidance() {
-        let server = SensorsMcpServer::new(Arc::new(StubStorage::new()), empty_registry());
+        let server = SensorsMcpServer::new(
+            Arc::new(StubStorage::new()),
+            empty_registry(),
+            no_live_control(),
+        );
         let params = Parameters(GetSensorReadingParams::default());
         let text = text_of(server.get_sensor_reading(make_ctx(), params).await.unwrap());
         assert!(
@@ -757,7 +1039,7 @@ mod tests {
             .await
             .unwrap();
 
-        let server = SensorsMcpServer::new(storage, empty_registry());
+        let server = SensorsMcpServer::new(storage, empty_registry(), no_live_control());
         let text = text_of(
             server
                 .list_sensors(make_ctx(), Parameters(ListSensorsParams::default()))
@@ -778,7 +1060,8 @@ mod tests {
             "matter-18",
             "Air Quality Sensor",
         )]));
-        let server = SensorsMcpServer::new(Arc::new(StubStorage::new()), registry);
+        let server =
+            SensorsMcpServer::new(Arc::new(StubStorage::new()), registry, no_live_control());
 
         let text = text_of(
             server
@@ -807,7 +1090,7 @@ mod tests {
         )]));
 
         let text = text_of(
-            SensorsMcpServer::new(storage, registry)
+            SensorsMcpServer::new(storage, registry, no_live_control())
                 .list_sensors(make_ctx(), Parameters(ListSensorsParams::default()))
                 .await
                 .unwrap(),
@@ -832,7 +1115,7 @@ mod tests {
             .await
             .unwrap();
 
-        let server = SensorsMcpServer::new(storage, empty_registry());
+        let server = SensorsMcpServer::new(storage, empty_registry(), no_live_control());
         let params = Parameters(GetSensorHistoryParams {
             device_id: Some("living-room".to_string()),
             sensor_type: Some("temperature".to_string()),
@@ -847,7 +1130,11 @@ mod tests {
 
     #[test]
     fn server_constructs() {
-        let _server = SensorsMcpServer::new(Arc::new(StubStorage::new()), empty_registry());
+        let _server = SensorsMcpServer::new(
+            Arc::new(StubStorage::new()),
+            empty_registry(),
+            no_live_control(),
+        );
     }
 
     #[test]

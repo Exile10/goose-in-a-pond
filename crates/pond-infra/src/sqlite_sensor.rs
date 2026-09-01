@@ -40,10 +40,18 @@ fn format_bound(dt: DateTime<Utc>) -> String {
     dt.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// A stored `created_at`, or the epoch if it cannot be read.
+///
+/// The epoch, NOT `Utc::now()`, and the difference matters now that a reading's age
+/// decides whether it may be reported as current. `now` makes an unreadable timestamp
+/// the freshest row in the table — a reading of unknown vintage presented as this
+/// second's. The epoch fails the other way: unreadable reads as ancient, so a caller
+/// checking staleness treats it as stale, which is the safe direction for a value
+/// nobody can date.
 fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
     chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
         .map(|ndt| ndt.and_utc())
-        .unwrap_or_else(|_| Utc::now())
+        .unwrap_or(DateTime::UNIX_EPOCH)
 }
 
 fn sensor_row_to_reading(row: SensorRow) -> SensorReading {
@@ -60,13 +68,25 @@ fn sensor_row_to_reading(row: SensorRow) -> SensorReading {
 impl SensorStorage for SqliteSensorStorage {
     async fn record(&self, reading: SensorReading) -> Result<()> {
         sqlx::query(
+            // The reading's own timestamp, not `datetime('now')`.
+            //
+            // `recorded_at` was accepted and thrown away, so what came back out was
+            // the INSERT time — close enough while nothing measured the gap, and
+            // wrong the moment something did. The Matter controller stamps a reading
+            // with its own clock, and there is a queue and an event bus between that
+            // and this line.
+            //
+            // Same text format `format_bound` and `parse_dt` use, because the column
+            // is TEXT and the range queries compare it as text. Byte-compatible with
+            // what `datetime('now')` wrote, so existing rows still order correctly.
             "INSERT INTO sensor_readings (device_id, sensor_type, value, unit, created_at) \
-             VALUES (?, ?, ?, ?, datetime('now'))",
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&reading.device_id)
         .bind(&reading.sensor_type)
         .bind(reading.value)
         .bind(&reading.unit)
+        .bind(format_bound(reading.recorded_at))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -334,8 +354,9 @@ mod tests {
         }
     }
 
-    /// Seed a reading at a chosen time. `record` always stamps `datetime('now')`,
-    /// so the time-range behaviour cannot be exercised through the port.
+    /// Seed a reading at a chosen time, bypassing the port. Kept for the rows this
+    /// suite wants dated years apart, which is quicker to write directly than to
+    /// build a `SensorReading` for.
     async fn insert_at(pool: &Pool<Sqlite>, device_id: &str, t: &str, v: f64, created_at: &str) {
         sqlx::query(
             "INSERT INTO sensor_readings (device_id, sensor_type, value, unit, created_at) \
@@ -367,6 +388,44 @@ mod tests {
             acknowledged: false,
             created_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_readings_own_timestamp_survives_the_round_trip() {
+        // It did not. `record` bound four fields and wrote `datetime('now')` for the
+        // fifth, so `recorded_at` was accepted and discarded and what came back out
+        // was the INSERT time. Close enough while nothing measured the gap -- and
+        // wrong the moment `get_sensor_reading` started reporting a reading's age to
+        // decide whether it may be called current. There is a controller clock, a
+        // queue and an event bus upstream of this line.
+        let (pool, _tmp) = make_logs_pool().await;
+        let store = SqliteSensorStorage::new(pool);
+
+        let when = at("2026-08-30 14:05:09");
+        store
+            .record(SensorReading {
+                device_id: "matter-5".to_string(),
+                sensor_type: "flow".to_string(),
+                value: 197.8,
+                unit: "m3/h".to_string(),
+                recorded_at: when,
+            })
+            .await
+            .unwrap();
+
+        let stored = store.get_latest("matter-5", "flow").await.unwrap().unwrap();
+        assert_eq!(stored.recorded_at, when);
+    }
+
+    #[test]
+    fn a_timestamp_nobody_can_read_is_ancient_rather_than_now() {
+        // The direction matters. `Utc::now()` made an unreadable timestamp the
+        // freshest row in the table -- a reading of unknown vintage presented as this
+        // second's, which is the worst possible input to a staleness check. The epoch
+        // fails the other way, so such a row reads as stale.
+        assert_eq!(parse_dt("not a timestamp"), DateTime::UNIX_EPOCH);
+        assert_eq!(parse_dt(""), DateTime::UNIX_EPOCH);
+        assert_eq!(parse_dt("2026-08-30 14:05:09"), at("2026-08-30 14:05:09"));
     }
 
     #[tokio::test]
