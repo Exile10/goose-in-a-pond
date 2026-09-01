@@ -8,8 +8,10 @@
  */
 
 import { Endpoint, Environment, Seconds, ServerNode, type ClientNode } from "@matter/main";
+// Not re-exported by `@matter/main`, which forwards only `@matter/types/datatype`.
+import { QrPairingCodeCodec } from "@matter/types";
 
-import { log, describeError, setupCodeKind } from "./log.js";
+import { log, describeError, setupCodeKind, type SetupCodeKind } from "./log.js";
 import { deviceClusters, nodeToDevice } from "./mapping/devices.js";
 import { observedFor, planControl, type Verb } from "./mapping/control.js";
 import { observedOperation, settingClusters } from "./mapping/settings.js";
@@ -262,21 +264,18 @@ export class Controller {
   /**
    * Pair a device by its setup code.
    *
-   * Both forms find the device over mDNS. A pairing code or QR payload carries the
-   * discriminator so matter.js can narrow the browse; a bare passcode cannot, so that
-   * form pairs with whatever is in commissioning mode — which is how development
-   * devices such as Google's Matter Virtual Device are paired, since they show only a
-   * passcode.
+   * All three forms find the device over mDNS. A manual pairing code or a QR payload
+   * carries a discriminator so matter.js can narrow the browse; a bare passcode cannot,
+   * so that form pairs with whatever is in commissioning mode — which is how
+   * development devices such as Google's Matter Virtual Device are paired when they
+   * show only a passcode.
    */
   async commission(code: string, name?: string): Promise<Device> {
     const trimmed = code.trim();
     const kind = setupCodeKind(trimmed);
     log.info("commission_started", "commissioning a device", { code_kind: kind });
 
-    const options =
-      kind === "passcode"
-        ? { passcode: Number(trimmed.replace(/[\s-]/g, "")) }
-        : { pairingCode: trimmed.replace(/\s/g, "") };
+    const options = commissioningOptions(trimmed, kind);
 
     let peer: ClientNode;
     try {
@@ -654,6 +653,57 @@ export class Controller {
     if (nodeId === undefined) return;
     this.#events.availabilityChanged(deviceIdForNode(nodeId), online);
   }
+}
+
+/**
+ * What to hand matter.js for a code of this kind.
+ *
+ * A QR payload has to be decoded HERE, and that is the whole of this function's
+ * reason to exist. matter.js's `commission({pairingCode})` runs
+ * `ManualPairingCodeCodec.decode` unconditionally, and that codec strips every
+ * non-digit before it checks the length — so `MT:` + base-38 collapses to a dozen
+ * stray digits and dies with "Invalid pairing code" in two milliseconds, before
+ * anything reaches the network. The QR form therefore never worked, while GIAP's
+ * validator accepted it, this controller logged it as a pairing code, and the
+ * Register-device dialog offered one as an example.
+ *
+ * Uppercasing is lossless: Matter's base-38 alphabet is `0-9 A-Z - .`, and the QR
+ * codec matches its `MT:` prefix case-sensitively.
+ */
+export function commissioningOptions(
+  code: string,
+  kind: SetupCodeKind,
+): { passcode: number } | { passcode: number; discriminator: number } | { pairingCode: string } {
+  if (kind === "qr_payload") {
+    let payloads;
+    try {
+      payloads = QrPairingCodeCodec.decode(code.replace(/\s/g, "").toUpperCase());
+    } catch (error) {
+      // Nothing was attempted, so this is not a failure to commission. Saying
+      // `commission_failed` for a code that never left the process is what put
+      // "Invalid pairing code: commission_failed" in front of the user.
+      throw new OpError("invalid_setup_code", describeError(error));
+    }
+    const [payload] = payloads;
+    if (payloads.length !== 1 || payload === undefined) {
+      throw new OpError(
+        "invalid_setup_code",
+        `that QR payload carries ${payloads.length} devices; commission them one at a time`,
+      );
+    }
+    // The QR form carries the LONG discriminator, so the browse narrows to one
+    // device. The manual form carries only a short one, which is why matter.js
+    // takes that route itself and this one does not.
+    return { passcode: payload.passcode, discriminator: payload.discriminator };
+  }
+
+  if (kind === "passcode") {
+    return { passcode: Number(code.replace(/[\s-]/g, "")) };
+  }
+
+  // A manual pairing code, or something GIAP could not classify: matter.js's own
+  // decoder gets the last word rather than this one guessing.
+  return { pairingCode: code.replace(/\s/g, "") };
 }
 
 /**

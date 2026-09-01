@@ -3855,6 +3855,12 @@ async fn commission_device(
         // context, so every failure reached the user as a bare "commissioning
         // failed" while the reason it was wrapped around — the controller's own
         // error — was dropped on the floor.
+        //
+        // The commissioner is what keeps this from being the opposite problem.
+        // It renders the sentence a user can act on and returns that alone, so
+        // there is no bookkeeping frame here for `{:#}` to print as if it were
+        // prose. This endpoint names the operation; the message says what went
+        // wrong with it.
         .map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
