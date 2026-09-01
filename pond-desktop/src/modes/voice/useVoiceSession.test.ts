@@ -101,13 +101,19 @@ const _dispatch = vi.fn((action: { type: string; payload?: unknown }) => {
   _dispatched.push(action);
 });
 
+// The conversation the chat view is on. `startSession` passes it to the child
+// so voice continues that conversation instead of starting a new one.
+let _appSessionId: string | null = null;
+
 vi.mock("../../state/AppContext", () => ({
   useAppDispatch: () => _dispatch,
   useAppState: () => ({
     serverOnline: true,
     serverUrl: "http://127.0.0.1:4000",
     sessionToken: "tok",
-    sessionId: null,
+    get sessionId() {
+      return _appSessionId;
+    },
     voiceState: "idle",
     voiceError: null,
     transcript: [],
@@ -231,11 +237,40 @@ describe("useVoiceSession — start/stop lifecycle", () => {
       sessionId = await result.current.startSession();
     });
 
-    expect(_invoke).toHaveBeenCalledWith("start_voice_session");
+    // No chat has happened, so there is nothing to continue — the child mints
+    // its own id and returns it.
+    expect(_invoke).toHaveBeenCalledWith("start_voice_session", {
+      sessionId: null,
+    });
     expect(sessionId).toBe("abc-123");
     const sessionIdActions = dispatchedOfType("SET_SESSION_ID");
     expect(sessionIdActions.length).toBeGreaterThan(0);
     expect(sessionIdActions[0].payload).toBe("abc-123");
+  });
+
+  it("startSession continues the conversation the chat view is on", async () => {
+    // The whole point of the change: speaking after typing must reach the same
+    // agent mid-conversation, not a stranger. The child resolves this GIAP
+    // session to its Goose session and hydrates it with the history.
+    const useVoiceSession = await getHook();
+    _appSessionId = "chat-session-7";
+    // The child echoes back whichever id it used, which is this one.
+    _invoke = vi.fn().mockResolvedValue("chat-session-7");
+
+    const { result } = renderHook(() => useVoiceSession(), { wrapper });
+    await act(async () => { await Promise.resolve(); });
+
+    clearDispatched();
+    let sessionId: string | null = null;
+    await act(async () => {
+      sessionId = await result.current.startSession();
+    });
+
+    expect(_invoke).toHaveBeenCalledWith("start_voice_session", {
+      sessionId: "chat-session-7",
+    });
+    expect(sessionId).toBe("chat-session-7");
+    _appSessionId = null;
   });
 
   it("stopSession invokes stop_voice_session and resets state", async () => {
