@@ -204,12 +204,23 @@ select:focus {
  * set `outline: none` on custom buttons/inputs without a replacement ring.
  * Rather than auditing every one individually, guarantee a visible indicator
  * everywhere via !important so no interactive element can end up with zero
- * focus feedback, regardless of what a more specific/later rule does. */
+ * focus feedback, regardless of what a more specific/later rule does.
+ *
+ * Text fields are deliberately NOT in this list. They already have a focus
+ * treatment of their own directly above -- an accent border plus a 3px halo --
+ * and stacking an outline at `outline-offset: 2px` on top of it drew a SECOND
+ * accent ring 2px outside the first. The Register-device dialog is where it
+ * showed worst, because `autoFocus` means the field is focused on open: two
+ * concentric rounded borders around one input, which reads as a rendering bug.
+ *
+ * The safety net's purpose survives: the rule above is unconditional for
+ * `input`, `textarea` and `select`, so no text field can end up with zero focus
+ * feedback either -- it just gets one indicator instead of two. Anything that
+ * sets `outline: none` on a text field (`.sched-modal__input` does) still shows
+ * the border and halo, which is why the `!important` was not what was protecting
+ * them. */
 button:focus-visible,
 a:focus-visible,
-input:focus-visible,
-textarea:focus-visible,
-select:focus-visible,
 [role="button"]:focus-visible,
 [tabindex]:focus-visible {
   outline: 2px solid var(--focus-ring) !important;
