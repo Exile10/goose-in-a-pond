@@ -230,3 +230,142 @@ fn ordinary_text_loses_no_phonemes() {
         "espeak emitted phonemes outside Kokoro's vocab — words will sound wrong"
     );
 }
+
+/// Every mark this crate preserves has to be in the model's alphabet.
+///
+/// `PROSODY_PUNCT` is asserted to be a subset of `tokenizer.json`, and this is
+/// the only place that claim can be checked: the unit tests build their vocab
+/// by adding `PROSODY_PUNCT` to it, so asking them the question answers itself.
+///
+/// If a mark is not in the table, `encode` drops it silently and the drop-count
+/// canary — which exists to mean "espeak emitted something this model was never
+/// trained to read" — starts firing on ordinary punctuated English instead.
+#[test]
+#[ignore = "needs Kokoro weights; set KOKORO_DIR"]
+fn every_preserved_mark_is_in_the_real_vocab() {
+    let Some(dir) = model_dir() else {
+        panic!("set KOKORO_DIR to a directory holding tokenizer.json + model + voices/")
+    };
+    let vocab = Vocab::load(&dir.join("tokenizer.json")).expect("vocab");
+
+    // Deliberately spelled out rather than read from `PROSODY_PUNCT`. The point
+    // is to pin the nine marks against the real table; importing the list would
+    // make a future edit to it silently redefine what is being checked.
+    for c in ['.', ',', '!', '?', ';', ':', '"', '(', ')'] {
+        assert!(
+            vocab.contains(c),
+            "{c:?} is preserved by the tokenizer but is not in the model's vocab"
+        );
+    }
+
+    // And the one deliberately left out: currency is spelled to words by
+    // `normalize_for_speech` long before this point, so `$` being in the vocab
+    // is not a reason to preserve it. If this ever fails, that reasoning moved.
+    let (_, _, dropped) = vocab.encode(",.!?;:\"()");
+    assert_eq!(dropped, 0, "a preserved mark was dropped by the real vocab");
+}
+
+/// Punctuation has to reach the model and change the sound, or the marks are
+/// decorative and the fix that kept them did nothing.
+///
+/// The measurable claim is duration. Kokoro's vocab carries `,`, `.`, `?` and
+/// the rest because it was trained to read them as prosody, and prosody is
+/// mostly pause: the same words with punctuation should take *longer* to say
+/// than without. If they take the same time, the marks never arrived.
+#[test]
+#[ignore = "needs Kokoro weights; set KOKORO_DIR"]
+fn punctuation_changes_the_audio() {
+    let Some(dir) = model_dir() else {
+        panic!("set KOKORO_DIR to a directory holding tokenizer.json + model + voices/");
+    };
+
+    let vocab = Vocab::load(&dir.join("tokenizer.json")).expect("vocab");
+    let style = StyleTable::load(&dir.join("voices"), "af_heart").expect("voice");
+    let mut engine = Engine::load(&dir.join(model_file()), intra_threads()).expect("engine");
+
+    // Same words, same order. Only the marks differ.
+    const BARE: &str = "Hello world Are you sure Yes really";
+    const MARKED: &str = "Hello, world! Are you sure? Yes; really.";
+
+    let mut say = |text: &str| -> (Vec<f32>, String, usize) {
+        let (chunks, dropped) = tokenizer::chunk(text, &vocab).expect("chunk");
+        let phonemes = chunks
+            .iter()
+            .map(|c| c.phonemes.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        let mut samples = Vec::new();
+        for c in &chunks {
+            samples.extend(
+                engine
+                    .synthesize(c, style.style_for(c.tokens.len()), 1.0)
+                    .expect("synthesis"),
+            );
+        }
+        (samples, phonemes, dropped)
+    };
+
+    let (bare, bare_ipa, bare_dropped) = say(BARE);
+    let (marked, marked_ipa, marked_dropped) = say(MARKED);
+
+    println!("bare    {bare_ipa:?}");
+    println!("marked  {marked_ipa:?}");
+
+    assert_eq!(bare_dropped, 0, "unpunctuated text lost phonemes");
+    assert_eq!(
+        marked_dropped, 0,
+        "punctuated text lost phonemes — a mark is outside the vocab"
+    );
+
+    for mark in ['.', ',', '!', '?', ';'] {
+        assert!(
+            marked_ipa.contains(mark),
+            "{mark:?} never reached the model: {marked_ipa:?}"
+        );
+    }
+    assert!(
+        !bare_ipa.contains(','),
+        "unpunctuated text somehow grew a comma: {bare_ipa:?}"
+    );
+
+    let bare_secs = duration_secs(&bare);
+    let marked_secs = duration_secs(&marked);
+    println!("bare {bare_secs:.2}s   marked {marked_secs:.2}s");
+
+    assert!(
+        marked_secs > bare_secs,
+        "punctuation did not lengthen the audio ({marked_secs:.2}s vs {bare_secs:.2}s) — \
+         the marks are reaching the tokenizer but not changing the voice"
+    );
+
+    // Write both so the difference can be heard, not just measured.
+    if let Ok(out) = std::env::var("KOKORO_OUT") {
+        write_wav(&format!("{out}/bare.wav"), &bare);
+        write_wav(&format!("{out}/marked.wav"), &marked);
+        println!("wrote {out}/bare.wav and {out}/marked.wav");
+    }
+}
+
+/// Minimal 16-bit mono WAV, so a listener does not need the rest of the stack.
+fn write_wav(path: &str, samples: &[f32]) {
+    const RATE: u32 = 24_000;
+    let bytes: Vec<u8> = samples
+        .iter()
+        .flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())
+        .collect();
+    let mut wav = Vec::with_capacity(44 + bytes.len());
+    wav.extend(b"RIFF");
+    wav.extend(((36 + bytes.len()) as u32).to_le_bytes());
+    wav.extend(b"WAVEfmt ");
+    wav.extend(16u32.to_le_bytes());
+    wav.extend(1u16.to_le_bytes());
+    wav.extend(1u16.to_le_bytes());
+    wav.extend(RATE.to_le_bytes());
+    wav.extend((RATE * 2).to_le_bytes());
+    wav.extend(2u16.to_le_bytes());
+    wav.extend(16u16.to_le_bytes());
+    wav.extend(b"data");
+    wav.extend((bytes.len() as u32).to_le_bytes());
+    wav.extend(bytes);
+    std::fs::write(path, wav).expect("write wav");
+}

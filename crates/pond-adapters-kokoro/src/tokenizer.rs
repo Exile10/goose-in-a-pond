@@ -22,6 +22,20 @@
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
+
+/// espeak-ng is one global C library, and it is not thread-safe.
+///
+/// `espeak_SetVoiceByName` mutates process-wide state and `espeak_TextToPhonemes`
+/// walks a cursor through it, so two threads phonemizing at once corrupt each
+/// other. It shows up as a SIGSEGV with `N_VOICES_LIST` warnings before it,
+/// which reads like a bad build rather than a data race — the reason it is
+/// worth a comment this long.
+///
+/// The lock is here, at the only place this crate touches espeak, rather than
+/// in a caller: a caller that forgets is a crash, and there is no type that
+/// would remind it.
+static ESPEAK: Mutex<()> = Mutex::new(());
 
 /// Kokoro's hard context limit, including the pad token at each end.
 pub const MAX_CONTEXT: usize = 512;
@@ -113,6 +127,10 @@ impl Vocab {
     /// were dropped. The drop count is the R2 canary: on English it should be
     /// zero, and a non-zero count means espeak has started emitting something
     /// this model was never trained to read.
+    ///
+    /// It is also what keeps [`PROSODY_PUNCT`] honest. Every mark in that list
+    /// is in the vocab, so preserving them adds nothing to this count; a mark
+    /// that is not would show up here rather than going quietly missing.
     pub fn encode(&self, phonemes: &str) -> (Vec<i64>, String, usize) {
         let mut ids = Vec::with_capacity(phonemes.len());
         let mut kept = String::with_capacity(phonemes.len());
@@ -130,14 +148,129 @@ impl Vocab {
     }
 }
 
-/// Phonemize `text` into one IPA string per sentence.
+/// The punctuation Kokoro was trained to read.
 ///
-/// espeak advances clause by clause and terminates a sentence on `.`/`?`/`!`,
-/// so this is already the sentence split the streaming path wants — no
-/// separate sentence splitter, and no risk of the two disagreeing.
-pub fn phonemize(text: &str) -> Result<Vec<String>> {
-    espeak_rs::text_to_phonemes(text, "en-us", None)
-        .map_err(|e| anyhow!("espeak phonemization failed: {e}"))
+/// Exactly the intersection of "is punctuation" and "is in the model's vocab"
+/// (`tokenizer.json`), which is not an accident: Kokoro's reference G2P is
+/// misaki, and misaki leaves these in the phoneme string. They are prosody —
+/// a comma is a short pause, a question mark bends the pitch up at the end of
+/// the clause. Feeding the model none of them is why synthesis reads flat and
+/// runs sentences together.
+///
+/// `$` is in the vocab too and is deliberately not here: currency is spelled
+/// out long before this point, by `normalize_for_speech`.
+const PROSODY_PUNCT: &[char] = &['.', ',', '!', '?', ';', ':', '"', '(', ')'];
+
+/// Phonemize `text`, keeping the punctuation espeak throws away.
+///
+/// ## What espeak actually does
+///
+/// `espeak_rs::text_to_phonemes` returns **one** string with every clause
+/// concatenated, no punctuation and — the part that matters more — no
+/// separator at all:
+///
+/// ```text
+/// "Hello, world! Are you sure?"  ->  ["həlˈoʊwˈɜːldɑːɹ juː ʃˈʊɹ"]
+/// ```
+///
+/// `həlˈoʊwˈɜːld` is "hello" and "world" fused into one word. So the old code
+/// was not merely losing prosody, it was handing Kokoro a different sentence
+/// from the one it was given, at every clause boundary in every utterance.
+///
+/// (The docstring this replaces claimed espeak returned one string per
+/// sentence and that the streaming path could rely on it as a sentence split.
+/// It returns one element regardless of input. Nothing downstream depended on
+/// the claim — `split_sentences` in `pond-voice` had already done the real
+/// split — but it is worth naming, because it is the reason nobody looked
+/// here.)
+///
+/// ## What this does instead
+///
+/// Cut the source into runs of speech and runs of punctuation, phonemize the
+/// speech runs one at a time, and put the punctuation back between them.
+/// espeak never sees a clause boundary, so it has nothing to swallow.
+pub fn phonemize(text: &str) -> Result<String> {
+    let mut out = String::with_capacity(text.len() * 2);
+
+    for segment in segments(text) {
+        match segment {
+            Segment::Speech {
+                text: run,
+                leading_space,
+            } => {
+                let spoken = {
+                    // Poisoning is not meaningful here: espeak holds no state
+                    // of ours, so a panicking sibling leaves nothing to repair.
+                    let _guard = ESPEAK.lock().unwrap_or_else(|e| e.into_inner());
+                    espeak_rs::text_to_phonemes(run, "en-us", None)
+                        .map_err(|e| anyhow!("espeak phonemization failed: {e}"))?
+                }
+                .join(" ");
+                let spoken = spoken.trim();
+                if spoken.is_empty() {
+                    continue;
+                }
+                // espeak trims, so a space between two runs has to be restored
+                // from the source or the words either side fuse — which is the
+                // bug this function exists to fix, and it would come straight
+                // back one layer up.
+                if leading_space && !out.is_empty() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                out.push_str(spoken);
+            }
+            Segment::Punct(c) => out.push(c),
+        }
+    }
+
+    Ok(out)
+}
+
+/// One run of the source: speech to be phonemized, or a mark to be kept.
+enum Segment<'a> {
+    Speech { text: &'a str, leading_space: bool },
+    Punct(char),
+}
+
+/// Cut `text` into alternating speech and punctuation runs.
+///
+/// Only [`PROSODY_PUNCT`] breaks a run. Everything else — apostrophes inside
+/// contractions, hyphens inside compounds — stays in the speech run, because
+/// espeak pronounces those as part of the word and the vocab has no token for
+/// them anyway.
+fn segments(text: &str) -> Vec<Segment<'_>> {
+    let mut out = Vec::new();
+    let mut run_start: Option<usize> = None;
+    let mut leading_space = false;
+
+    for (i, c) in text.char_indices() {
+        if PROSODY_PUNCT.contains(&c) {
+            if let Some(start) = run_start.take() {
+                out.push(Segment::Speech {
+                    text: &text[start..i],
+                    leading_space,
+                });
+            }
+            out.push(Segment::Punct(c));
+            // The next speech run is separated from this mark by whatever
+            // whitespace follows it, which the loop below will record.
+            leading_space = false;
+        } else if run_start.is_none() {
+            if c.is_whitespace() {
+                leading_space = true;
+            } else {
+                run_start = Some(i);
+            }
+        }
+    }
+
+    if let Some(start) = run_start {
+        out.push(Segment::Speech {
+            text: &text[start..],
+            leading_space,
+        });
+    }
+    out
 }
 
 /// Phonemize and tokenize `text` into forward-pass-sized chunks.
@@ -147,23 +280,33 @@ pub fn phonemize(text: &str) -> Result<Vec<String>> {
 /// this is the one piece of chunking logic Kokoro genuinely adds.
 pub fn chunk(text: &str, vocab: &Vocab) -> Result<(Vec<Chunk>, usize)> {
     let mut out = Vec::new();
-    let mut dropped_total = 0usize;
 
-    for sentence in phonemize(text)? {
-        let (ids, kept, dropped) = vocab.encode(&sentence);
-        dropped_total += dropped;
-        if ids.is_empty() {
-            continue;
-        }
-        for (tokens, phonemes) in split_to_limit(&ids, &kept) {
-            out.push(Chunk {
-                text: sentence.clone(),
-                phonemes,
-                tokens,
-            });
-        }
+    let phonemized = phonemize(text)?;
+    let (ids, kept, dropped) = vocab.encode(&phonemized);
+    if ids.is_empty() {
+        return Ok((out, dropped));
     }
-    Ok((out, dropped_total))
+
+    for (tokens, phonemes) in split_to_limit(&ids, &kept) {
+        out.push(Chunk {
+            // The source, not the phonemes. The field is documented as being
+            // for logging and UI, and it was being handed the IPA — nothing
+            // has noticed because nothing reads it yet, which is exactly how
+            // long a field can hold the wrong thing when the only check is
+            // that it compiles.
+            //
+            // Every chunk of one input carries that whole input. The split
+            // below is by token count, not at a sentence boundary, so there is
+            // no substring of the source that corresponds to a chunk. In the
+            // streaming path this is moot: `chat.rs` calls `split_sentences`
+            // first and hands over one sentence at a time, so a second chunk
+            // only exists for a single sentence past the phoneme limit.
+            text: text.to_string(),
+            phonemes,
+            tokens,
+        });
+    }
+    Ok((out, dropped))
 }
 
 /// Split an over-long token run at the last space before the limit.
@@ -299,5 +442,147 @@ mod tests {
         assert_eq!(out.len(), 3);
         assert!(out.iter().all(|(t, _)| t.len() <= MAX_PHONEME_TOKENS));
         assert_eq!(out.iter().map(|(t, _)| t.len()).sum::<usize>(), ids.len());
+    }
+
+    // ── Punctuation ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn punctuation_reaches_the_model() {
+        // Kokoro's vocab has these tokens because it was trained to read them.
+        // Sending none of them is what made every utterance flat.
+        let out = phonemize("Hello, world! Are you sure? Yes; really.").unwrap();
+        for mark in ['.', ',', '!', '?', ';'] {
+            assert!(out.contains(mark), "{mark:?} missing from {out:?}");
+        }
+    }
+
+    #[test]
+    fn words_either_side_of_a_mark_stay_separate() {
+        // The bug underneath the missing prosody: espeak returns every clause
+        // concatenated with no separator, so "Hello, world" arrived as one
+        // fused word. This is the regression test for that, and it would fail
+        // even if punctuation were dropped again but spacing kept.
+        let out = phonemize("Hello, world!").unwrap();
+        let (before, after) = out.split_once(',').expect("comma survived");
+        assert!(!before.is_empty(), "nothing before the comma in {out:?}");
+        assert!(
+            after.starts_with(' '),
+            "no space after the comma, words will fuse: {out:?}"
+        );
+    }
+
+    #[test]
+    fn quotes_and_parens_survive_without_fusing_their_neighbours() {
+        // These are in the vocab and in PROSODY_PUNCT, so they have to behave
+        // like the other marks: kept, and not gluing the words either side.
+        let quoted = phonemize("She said \"stop\" and left.").unwrap();
+        assert_eq!(quoted.matches('"').count(), 2, "{quoted:?}");
+        assert!(quoted.ends_with('.'));
+
+        let parens = phonemize("One (two) three.").unwrap();
+        assert!(parens.contains('(') && parens.contains(')'), "{parens:?}");
+        // "one" and "two" must not have fused across the bracket.
+        let inner = parens
+            .split_once('(')
+            .and_then(|(_, r)| r.split_once(')'))
+            .map(|(inner, _)| inner.to_string())
+            .expect("bracketed run");
+        assert!(!inner.trim().is_empty(), "bracket swallowed its contents");
+    }
+
+    #[test]
+    fn leading_and_repeated_marks_do_not_produce_stray_spaces() {
+        // "Wait... what?" is three dots in a row and a mark at position zero
+        // once the first run is consumed — the two shapes most likely to emit a
+        // leading space or an empty run.
+        let out = phonemize("Wait... what?").unwrap();
+        assert!(!out.starts_with(' '), "leading space in {out:?}");
+        assert!(out.contains("..."), "ellipsis collapsed: {out:?}");
+        assert!(out.ends_with('?'));
+        assert!(!out.contains("  "), "double space in {out:?}");
+    }
+
+    // The claim "every mark in PROSODY_PUNCT is in the model's alphabet" is
+    // NOT tested here, and cannot be: `vocab_for` builds its table by adding
+    // PROSODY_PUNCT, so asking it whether it contains those marks answers
+    // itself. A tautology in the shape of a guarantee is worse than no test —
+    // it is the one somebody points at when the canary starts firing.
+    //
+    // It lives in `tests/live_synthesis.rs`
+    // (`every_preserved_mark_is_in_the_real_vocab`), against the real
+    // `tokenizer.json`, which is the only table that can answer it.
+
+    #[test]
+    fn preserved_punctuation_is_not_counted_as_dropped() {
+        let sample = "hˈɛloʊ, wˈɜːld!";
+        let v = vocab_for(&[sample]);
+        let (_, kept, dropped) = v.encode(sample);
+        assert_eq!(dropped, 0, "kept {kept:?}");
+        assert!(kept.contains(','));
+        assert!(kept.ends_with('!'));
+    }
+
+    #[test]
+    fn a_contraction_keeps_its_apostrophe_inside_the_word() {
+        // The apostrophe is not in PROSODY_PUNCT on purpose: espeak pronounces
+        // it as part of the word, and splitting there would phonemize "don" and
+        // "t" separately.
+        let out = phonemize("Don't stop.").unwrap();
+        assert!(
+            !out.contains('\''),
+            "apostrophe leaked into phonemes: {out:?}"
+        );
+        assert!(out.ends_with('.'));
+        // One word, not two runs fused or split: "doʊnt" stays whole.
+        assert!(out.split(' ').count() >= 2, "{out:?}");
+    }
+
+    #[test]
+    fn text_with_no_punctuation_is_unchanged_in_shape() {
+        let out = phonemize("no punctuation here").unwrap();
+        assert!(!out.is_empty());
+        assert!(out.split(' ').count() >= 3, "words ran together: {out:?}");
+    }
+
+    #[test]
+    fn a_chunk_carries_the_source_text_not_its_phonemes() {
+        let v = vocab_for(&[&phonemize("Hello, world!").unwrap()]);
+        let (chunks, _) = chunk("Hello, world!", &v).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "Hello, world!");
+        assert_ne!(chunks[0].text, chunks[0].phonemes);
+    }
+
+    /// A vocab holding exactly the symbols a test uses, plus every mark.
+    ///
+    /// Built from the input rather than hand-listed: a hand-listed phoneme
+    /// vocab is how you write a test that passes because the character it
+    /// meant to check was never in the table.
+    ///
+    /// It adds `PROSODY_PUNCT` unconditionally, so nothing built on it can be
+    /// used to ask whether those marks are in the *model's* vocab — see the
+    /// note above `preserved_punctuation_is_not_counted_as_dropped`.
+    fn vocab_for(samples: &[&str]) -> Vocab {
+        let mut symbols: Vec<char> = samples.iter().flat_map(|s| s.chars()).collect();
+        symbols.extend_from_slice(PROSODY_PUNCT);
+        symbols.sort_unstable();
+        symbols.dedup();
+
+        let entries: Vec<String> = symbols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                format!(
+                    "{}: {}",
+                    serde_json::to_string(&c.to_string()).unwrap(),
+                    i + 1
+                )
+            })
+            .collect();
+        Vocab::from_json(&format!(
+            "{{\"model\":{{\"vocab\":{{{}}}}}}}",
+            entries.join(",")
+        ))
+        .expect("test vocab")
     }
 }
