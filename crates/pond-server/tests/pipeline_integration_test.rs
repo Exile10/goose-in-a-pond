@@ -206,8 +206,10 @@ async fn multi_turn_history_preserved_across_chat_once_calls() {
 /// `WhisperInput::transcribe_wav()`, then passes the transcript to
 /// `ChatService::chat_once()`.
 ///
-/// Gated on `legacy-subprocess` because the test exercises the HTTP backend.
-/// The in-process backend has its own coverage in `pond-adapters-whisper`.
+/// The `WhisperInput` half of that description is historical: the HTTP backend
+/// was deleted in 2026-08 and the test below no longer builds one. What remains
+/// is the Think half — Ollama through `ChatService` — plus the role assignment.
+/// The in-process recogniser has its own coverage in `pond-adapters-whisper`.
 
 /// Verify correct role assignment across all pipeline steps:
 /// user messages must be Role::User and LLM responses Role::Assistant.

@@ -453,7 +453,7 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
   `AgentStreamEvent::Thinking`'s own doc comment already claimed. **Consequence: `routes.rs` needed
   no change at all**, which is also why this landed without touching a held file.
 
-  `voice` is `voice_instance || request.voice_mode` — the CLI `--input whisper` flag OR the
+  `voice` is `voice_instance || request.voice_mode` — the CLI `--voice` flag OR the
   per-request desktop flag, unlike `vision_section_applies` which reads only the instance flag. It
   can be the OR here precisely because this value never reaches `PromptState`: it is resolved after
   the prompt is built, so it cannot move the static prefix between turn 1 and turn 2. No prompt text

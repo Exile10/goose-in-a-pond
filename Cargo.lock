@@ -9621,7 +9621,6 @@ dependencies = [
  "tokio",
  "tracing",
  "whisper-rs",
- "wiremock",
 ]
 
 [[package]]

@@ -213,6 +213,15 @@ pub const DEFAULT_ADOPTIONS: &[DefaultAdoption] = &[
         new_default: "true",
         migration: "0035",
     },
+    // The energy gate cannot tell a fridge from a voice, so it holds the
+    // microphone open on room noise until the hard cap. Opt-in, it was never
+    // going to be on anywhere it mattered.
+    DefaultAdoption {
+        key: "vad_backend",
+        old_default: "rms",
+        new_default: "silero",
+        migration: "0052",
+    },
 ];
 
 /// All configurable settings for GIAP.
@@ -370,9 +379,11 @@ pub struct Settings {
     /// harmless when looking for silence and would clip the first word when
     /// looking for the start of one.
     ///
-    /// Defaults to `rms`, and falls back to it when the model is missing or the
-    /// ONNX runtime will not load. An unknown value resolves to the default
-    /// rather than failing — a mistyped backend must not leave the pond deaf.
+    /// Defaults to `silero`, which fetches its 2 MB model on first use, and
+    /// falls back to `rms` whenever that cannot be had — no network, no ONNX
+    /// runtime, a load that times out. `rms` remains selectable as the escape
+    /// hatch for a board whose runtime is broken. An unknown value falls back
+    /// too, and says so: a mistyped backend must not leave the pond deaf.
     #[serde(default = "Settings::default_vad_backend")]
     pub vad_backend: String,
 
@@ -1378,10 +1389,12 @@ impl Settings {
     fn default_tts_quality() -> String {
         "q8".to_string()
     }
-    /// `rms`. See the field docs: the model is opt-in because it is a download,
-    /// and the gate that needs no file has to keep working without one.
+    /// `silero`. See the field docs. It was `rms` for exactly one commit, on
+    /// the theory that a download should be opt-in; but the download is 2 MB
+    /// and happens once, and leaving it opt-in meant every pond shipped with
+    /// the detector that cannot tell a fridge from a voice.
     fn default_vad_backend() -> String {
-        "rms".to_string()
+        "silero".to_string()
     }
     /// ON. See the field docs: a household that dislikes the tone can switch it
     /// off, but one that never hears it has nothing to go looking for.
