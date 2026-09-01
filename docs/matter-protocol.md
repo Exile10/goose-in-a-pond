@@ -246,6 +246,30 @@ exactly as it was told.
 | `reading` | a `Reading` |
 | `log` | `{level, kind, message, fields?}` |
 
+`device_availability` is a **level report, repeated**, not an edge. Every thirty
+seconds the controller names every peer it has and says whether that peer is
+reachable, whether or not the answer changed. Both branches on the receiving side
+are idempotent — insert into a set and heartbeat a row, or remove from a set — so
+repetition costs a set operation.
+
+That is not tidiness, it is the fix for a device that read offline while it was
+working. It used to be an edge, sent only from matter.js's `lifecycle.online` /
+`.offline`, which fire on a transition and only on a transition — and, per
+`#retryWiring`'s own comment, *a node already online when the controller connects
+never fires `online` again*. So the bridge's set of devices it vouches for was seeded
+once, from a `subscribe` snapshot that reads `peer.lifecycle.isOnline`, which means
+"is there a live CASE session right now" and is false until one exists. A snapshot
+taken inside that window recorded a working device as offline; nothing ever said
+otherwise; `last_seen` aged past the registry's five-minute threshold; and the card
+went offline while readings kept arriving from matter.js's own cache. A level report
+recovers from a missed, mistimed or lost transition within one tick, whichever it was.
+
+The bridge logs the **changes** at info (`matter_availability_changed`), not the
+reports. It logged them at debug before, and the tracing filter admits debug from
+`pond_server` only — so a state change the user sees on a card, and gets an OS
+notification for, left no trace in any log file. That absence is most of why this took
+three passes to find.
+
 `log` is the controller's own structured record, relayed into `tracing` at the
 level it names. The Rust side also pipes the child's stderr, so a controller GIAP
 started is audible twice over; the event is what makes a controller the operator

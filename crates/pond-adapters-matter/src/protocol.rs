@@ -181,7 +181,11 @@ pub struct WireDevice {
     pub device_type: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
-    #[serde(default)]
+    /// Required, unlike `capabilities`. `bool::default()` is `false`, so a
+    /// defaulted `online` means "offline" — and a field the controller stopped
+    /// sending, or renamed, would mark every device on the fabric unreachable
+    /// with no error raised anywhere. An absent capability list is a device with
+    /// nothing to drive, which is a real thing; an absent reachability is not.
     pub online: bool,
 }
 
@@ -337,7 +341,9 @@ impl WireLog {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AvailabilityEvent {
     pub device_id: String,
-    #[serde(default)]
+    /// Required, for the reason on [`WireDevice::online`]: the whole payload of
+    /// this event is one boolean, and defaulting it to `false` turns a malformed
+    /// frame into a confident claim that the device is gone.
     pub online: bool,
 }
 
