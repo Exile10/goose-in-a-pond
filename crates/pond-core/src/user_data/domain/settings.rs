@@ -222,6 +222,15 @@ pub const DEFAULT_ADOPTIONS: &[DefaultAdoption] = &[
         new_default: "silero",
         migration: "0052",
     },
+    // Voice held the tightest turn budget in the pond while text was raised to
+    // 50 for exactly the requests a household speaks rather than types. The
+    // same ask finished when typed and gave up six turns in when spoken.
+    DefaultAdoption {
+        key: "voice_max_turns",
+        old_default: "8",
+        new_default: "0",
+        migration: "0053",
+    },
 ];
 
 /// All configurable settings for GIAP.
@@ -694,12 +703,13 @@ pub struct Settings {
     #[serde(default = "Settings::default_agent_max_turns")]
     pub agent_max_turns: u32,
 
-    /// Maximum agentic loop turns for VOICE requests (#105). Voice trades
-    /// completeness for latency: every extra turn is another full LLM round
-    /// the user waits through in silence before hearing anything. The default
-    /// (8) still fits a chained command — two or three tool rounds plus the
-    /// spoken summary — while capping the worst case well below the text-chat
-    /// limit. Never raised above `agent_max_turns`; 0 = no voice-specific cap.
+    /// Maximum agentic loop turns for VOICE requests (#105).
+    ///
+    /// Defaults to `0` — no voice-specific cap, so a spoken request gets the
+    /// same `agent_max_turns` budget a typed one does. See
+    /// `default_voice_max_turns` for why the 8 it used to be was making voice
+    /// look unreliable. A non-zero value restores the trade — completeness for
+    /// latency — and is never raised above `agent_max_turns`.
     #[serde(default = "Settings::default_voice_max_turns")]
     pub voice_max_turns: u32,
 
@@ -1537,12 +1547,28 @@ impl Settings {
     fn default_agent_max_turns() -> u32 {
         50
     }
-    // 8 turns ≈ 2-3 chained tool rounds + the spoken summary. Chosen against
-    // the #105 harness (command_chaining_live_test.rs): chained two-action
-    // utterances complete in 3-5 turns, so 8 leaves headroom for a retry
-    // without letting a runaway loop keep the speaker silent for 20 rounds.
+    /// `0` — no voice-specific cap. Voice gets the same budget as text.
+    ///
+    /// It was 8, chosen against the #105 harness on the reasoning that chained
+    /// two-action utterances complete in 3-5 turns and a runaway loop must not
+    /// keep the speaker silent for 20 rounds. Both halves were true; the
+    /// conclusion stopped being. `agent_max_turns` moved 20 -> 50 in migration
+    /// 0035 precisely because "the 20-turn cap stranded multi-step research and
+    /// home-automation requests mid-task" — and voice, where the household
+    /// actually asks for those, kept the tightest budget in the pond. The same
+    /// request that finishes when typed gives up six times sooner when spoken,
+    /// which reads as the assistant being unreliable rather than as a setting.
+    ///
+    /// The latency worry is now covered by things that bound the wait directly
+    /// rather than by proxy: `agent_timeout_secs` stops a stalled turn, the
+    /// thinking tone means the wait is not silent, and a spoken barge-in stops
+    /// a turn that has gone wrong. Capping *steps* to bound *time* also priced
+    /// a cheap tool round the same as an expensive one.
+    ///
+    /// Still settable: a household that would rather be cut off than wait can
+    /// put a number back, and it is still clamped to `agent_max_turns`.
     fn default_voice_max_turns() -> u32 {
-        8
+        0
     }
 
     /// The agent-loop turn cap for a request, honouring the voice-specific
@@ -2123,16 +2149,40 @@ mod tests {
         assert!(s.searxng_url.is_none());
     }
 
-    /// #105: voice requests get the tighter turn cap; text keeps the full budget.
+    /// Out of the box, a spoken request gets the same budget as a typed one.
+    ///
+    /// This asserted `8` for voice against `50` for text — #105's trade of
+    /// completeness for latency. The trade is still available (see the test
+    /// below) but is no longer the default: the same multi-step request
+    /// completing when typed and stopping six turns in when spoken is
+    /// indistinguishable, from the room, from the assistant being unreliable.
     #[test]
-    fn effective_max_turns_prefers_voice_cap_for_voice_requests() {
+    fn a_spoken_request_gets_the_same_budget_as_a_typed_one() {
         let s = Settings::default();
         assert_eq!(
             s.effective_max_turns(false),
             50,
             "text uses agent_max_turns"
         );
-        assert_eq!(s.effective_max_turns(true), 8, "voice uses voice_max_turns");
+        assert_eq!(
+            s.effective_max_turns(true),
+            s.effective_max_turns(false),
+            "voice must not be quietly given a smaller budget than text"
+        );
+    }
+
+    /// The voice cap still works — it is defaulted off, not removed.
+    ///
+    /// A household that would rather be cut off than wait can set one, and it
+    /// must still bind. Without this, defaulting the value to 0 could silently
+    /// become "the voice cap is ignored" and nobody would notice until someone
+    /// set it and nothing changed.
+    #[test]
+    fn a_configured_voice_cap_still_binds() {
+        let mut s = Settings::default();
+        s.voice_max_turns = 8;
+        assert_eq!(s.effective_max_turns(true), 8);
+        assert_eq!(s.effective_max_turns(false), 50, "text is unaffected");
     }
 
     /// B1: `agent_max_turns = 0` means uncapped reasoning — the engine gets the
