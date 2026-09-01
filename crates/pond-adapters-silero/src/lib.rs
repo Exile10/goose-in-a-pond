@@ -220,9 +220,14 @@ mod tests {
         assert!(err.to_string().contains("not found"), "{err}");
     }
 
+    /// Named for what it actually does. It was
+    /// `speech_scores_high_and_steady_noise_does_not`, which promised half a
+    /// thing it never checked: both assertions below are negative, so an
+    /// `is_speech` hard-coded to `false` passed it. The speech half lives in
+    /// `tests/against_real_audio.rs`, which plays it real utterances.
     #[test]
     #[ignore = "needs the model; set SILERO_MODEL"]
-    fn speech_scores_high_and_steady_noise_does_not() {
+    fn steady_noise_and_silence_both_read_as_silence() {
         let Some(path) = model_path() else {
             panic!("set SILERO_MODEL to onnx/model.onnx from onnx-community/silero-vad")
         };
