@@ -9,6 +9,7 @@ import {
   doorLockNode,
   endpoint,
   extendedColorLightNode,
+  genericSwitchNode,
   laundryWasherNode,
   named,
   node,
@@ -67,6 +68,35 @@ describe("device state", () => {
         `'${name}' is reported but the description neither sets, measures nor reports it`,
       ).toBe(true);
     }
+  });
+
+  it("reports which way a switch is thrown, naming it as the description does", () => {
+    // A Generic Switch reports and takes no orders, so `states` is the only slot it
+    // has -- and before this it had none at all: it arrived typed `matter` with no
+    // capabilities and `state` had nothing to say about it either.
+    const reported = stateOf(genericSwitchNode()).values;
+    expect(reported).toContainEqual({ name: "switch_position", value: "1" });
+
+    // The same invariant the purifier checks, applied to a device that is ALL states:
+    // every name reported is a name the description declares.
+    const declared = new Set(describeNode(genericSwitchNode()).states.map(s => s.name));
+    for (const value of reported) {
+      expect(declared.has(value.name), `'${value.name}' is reported but not declared`).toBe(true);
+    }
+  });
+
+  it("says nothing about a switch kind the device did not claim", () => {
+    // An unstated feature map means the device has not said which kind of switch it
+    // is. `clusterHasFeature` reads an unstated map as a yes, which is right when the
+    // question is "may this reading exist"; here it would put a word in the device's
+    // mouth.
+    const unstated = node(8, [
+      named("Switch"),
+      endpoint(1, { switch: { currentPosition: 0 } }, [0x000f]),
+    ]);
+
+    expect(stateOf(unstated).values.map(v => v.name)).not.toContain("switch_kind");
+    expect(describeNode(unstated).states.map(s => s.name)).toEqual(["switch_position"]);
   });
 
   it("says where the door is, which the lock state cannot", () => {

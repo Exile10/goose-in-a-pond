@@ -3,7 +3,7 @@ import { Button, Separator, Switch } from "@heroui/react";
 import {
   Monitor, Cpu, Activity, Power, Settings, Plus, X, Radio, Smartphone,
   Lightbulb, Lock, Thermometer, Fan, Blinds, RefreshCw,
-  PlugZap, WashingMachine, Waves, Wind, MonitorPlay, Bot, BellRing,
+  PlugZap, WashingMachine, Waves, Wind, MonitorPlay, Bot, BellRing, ToggleLeft,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { ApiError, type Device, type MatterStatus } from "../api/types";
@@ -49,6 +49,10 @@ function DeviceIcon({ kind }: { kind: string | undefined }) {
   if (kind === "media")      return <MonitorPlay size={22} />;
   if (kind === "vacuum")     return <Bot size={22} />;
   if (kind === "alarm")      return <BellRing size={22} />;
+  // A Generic Switch reports which way it is thrown and takes no orders, so it is
+  // its own type rather than a light with the controls missing. Until it had one it
+  // fell to the fallback below and arrived wearing a monitor.
+  if (kind === "switch")     return <ToggleLeft size={22} />;
   return <Monitor size={22} />;
 }
 

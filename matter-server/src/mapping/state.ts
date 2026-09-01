@@ -40,13 +40,14 @@ import {
   CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
   CLUSTER_SMOKE_CO_ALARM,
+  CLUSTER_SWITCH,
   CLUSTER_FAN_CONTROL,
   CLUSTER_LEVEL_CONTROL,
   CLUSTER_ON_OFF,
   CLUSTER_THERMOSTAT,
   CLUSTER_WINDOW_COVERING,
 } from "./devices.js";
-import { doorStateWord, expressedStateWord } from "./describe.js";
+import { doorStateWord, expressedStateWord, switchKindOf } from "./describe.js";
 import { SENSORS } from "./sensors.js";
 import { observedOperation, settingsOf } from "./settings.js";
 import { applianceSetpoint, targetSetpoint } from "./thermostat.js";
@@ -114,6 +115,13 @@ export function stateOf(node: NodeSnapshot): DeviceState {
   // Reported so it can be checked, never set. See `statesOf` in describe.ts.
   const pin = valueAt(node, CLUSTER_DOOR_LOCK, "requirePinForRemoteOperation");
   if (typeof pin === "boolean") add("pin_required", pin ? "required" : "not required");
+
+  // Which way a switch is thrown, and which kind of switch it is. Named exactly as
+  // `statesOf` names them, and the kind comes from the same reader, so a description
+  // and a reading cannot disagree about either.
+  const position = numberAt(node, CLUSTER_SWITCH, "currentPosition");
+  if (position !== undefined) add("switch_position", `${position}`);
+  add("switch_kind", switchKindOf(node));
   // What colour it is, which had no answer at all before: `state` never touched
   // ColorControl, so "what colour is the light?" could only be answered by changing it.
   //

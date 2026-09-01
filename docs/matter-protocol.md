@@ -370,6 +370,32 @@ value in it. The description still declares the door, exactly as `sensors` decla
 what a sensor measures before it has reported; the reading stays absent rather than
 being filled in, because an invented "closed" cannot be told from a real one.
 
+**A device that is nothing but states.** A Generic Switch (device type `0x000f`,
+cluster `switch`) reports which way it is thrown and takes no orders at all, so
+`states` is not one slot among three for it — it is the only slot it has. Before it
+existed the switch had none: `0x000f` was not a device type GIAP mapped and `switch`
+was not a cluster the snapshot admitted, so a commissioned switch arrived typed
+`matter` with no capabilities and answered "cannot be controlled, and it does not
+measure any data" — while the maker's app showed its position plainly.
+
+It reports `switch_position`, bounded by `numberOfPositions` **only when the device
+states one**; the spec's default is 2, and a default is not a statement. It also
+reports `switch_kind`, latching or momentary, when the feature map claims one — and
+that is worth saying out loud rather than inferring, because the position means
+different things in the two cases. A latching switch stays where it is put. A
+momentary switch is a pushbutton whose `currentPosition` returns to rest on release,
+and everything interesting about it — the press, the release, the double-press —
+arrives as a Matter **event**. `#observeCluster` wires attribute-change observables
+only (`*$Changed`), so those presses are not observed here at all. "Reports a
+position, 0 to 1" describes a latching switch well and misleads about a button; a
+reader told which kind they have can tell the two apart. Subscribing to Matter events
+is the work that would close that gap, and it is not done.
+
+Note the strictness. `switchKindOf` treats an unstated feature map as "the device did
+not say", where `clusterHasFeature` treats one as a yes. Both are right for their own
+question: withholding a reading that works is the worse mistake, and putting a word in
+a device's mouth is the worse mistake.
+
 **Read-only by construction, not by convention.** `requirePinForRemoteOperation` is a
 security control: off means remote lock and unlock stop requiring a PIN. The same
 cluster carries `sendPinOverTheAir`, `enableLocalProgramming`, `wrongCodeEntryLimit`,

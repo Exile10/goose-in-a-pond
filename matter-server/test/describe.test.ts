@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { describeNode } from "../src/mapping/describe.js";
+import { stateOf } from "../src/mapping/state.js";
 import {
   airConditionerNode,
   coOnlyAlarmNode,
@@ -11,7 +12,9 @@ import {
   endpoint,
   extendedColorLightNode,
   fanNode,
+  genericSwitchNode,
   lightNode,
+  momentarySwitchNode,
   mvdColorLightNode,
   named,
   node,
@@ -248,6 +251,47 @@ describe("device description", () => {
       },
       { name: "pin_required", value: { kind: "enum", values: ["required", "not required"] } },
     ]);
+  });
+
+  it("describes a Generic Switch, which described itself as nothing", () => {
+    // The report this came from: a commissioned Generic Switch answered "cannot be
+    // controlled, and it does not measure any data". True of the mapping and false of
+    // the device -- MVD's own screen showed its position the whole time. 0x000f was
+    // not a device type GIAP mapped and `switch` was not a cluster it read, so the
+    // node arrived typed `matter` with nothing to say about it.
+    const description = describeNode(genericSwitchNode());
+
+    expect(description.device_type).toBe("switch");
+    // Nothing to set. A switch is a thing a person moves.
+    expect(description.capabilities).toEqual([]);
+    expect(description.states).toEqual([
+      { name: "switch_position", value: { kind: "number", min: 0, max: 1 } },
+      { name: "switch_kind", value: { kind: "enum", values: ["latching", "momentary"] } },
+    ]);
+  });
+
+  it("bounds a switch's position only when the device stated how many it has", () => {
+    // The spec's default is 2, and a default is not a statement. An invented bound is
+    // worse than an absent one, because a reader believes it -- the same rule that
+    // leaves a colour bulb with no kelvin range when it declares none.
+    const [position] = describeNode(momentarySwitchNode()).states;
+
+    expect(position).toEqual({ name: "switch_position", value: { kind: "number", min: 0 } });
+  });
+
+  it("says which kind of switch it is, because the position means different things", () => {
+    // A latching switch stays where it is put; a momentary one springs back and does
+    // its talking through Matter EVENTS, which this controller does not subscribe to.
+    // "Reports a position, 0 to 1" describes the first well and misleads about the
+    // second, so the reader is told which they have.
+    expect(stateOf(genericSwitchNode()).values).toContainEqual({
+      name: "switch_kind",
+      value: "latching",
+    });
+    expect(stateOf(momentarySwitchNode()).values).toContainEqual({
+      name: "switch_kind",
+      value: "momentary",
+    });
   });
 
   it("keeps a lock's PIN requirement out of the verbs", () => {

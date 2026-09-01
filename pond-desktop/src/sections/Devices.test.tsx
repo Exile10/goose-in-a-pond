@@ -77,6 +77,21 @@ describe("Devices section — Matter devices", () => {
     expect(container.querySelector(".lucide-lock")).toBeTruthy();
   });
 
+  it("shows a switch icon for a Generic Switch, not the monitor fallback", async () => {
+    // A commissioned Generic Switch arrived typed `matter`, which the table above has
+    // no entry for, so it rendered the generic monitor. The backend now types it
+    // `switch`; this is the half of that fix the user can see.
+    (api.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: "matter-6", name: "Generic Switch", device_type: "switch", is_online: true },
+    ]);
+
+    const { container } = render(<Devices />);
+    await screen.findByText("Generic Switch");
+
+    expect(container.querySelector(".lucide-toggle-left")).toBeTruthy();
+    expect(container.querySelector(".lucide-monitor")).toBeNull();
+  });
+
   it("shows a phone icon for the GOTG mobile companion, not a computer", async () => {
     (api.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([
       { id: "phone-1", name: "Emmanuel's Phone", device_type: "gotg", is_online: true },
