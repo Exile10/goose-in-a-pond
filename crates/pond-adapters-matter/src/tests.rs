@@ -756,6 +756,37 @@ async fn commissioning_with_nothing_in_pairing_mode_says_so_and_says_it_early() 
 }
 
 #[tokio::test]
+async fn a_rejected_setup_code_reaches_the_user_as_one_sentence() {
+    // What the user actually read: "commissioning failed: Invalid pairing code:
+    // commission_failed". Three fragments, and only the middle one says anything
+    // — the first restates the endpoint they were already looking at, and the
+    // third is the wire code, which is bookkeeping this crate consumes itself.
+    let answer: Answer = Arc::new(|frame: &Value| match frame["op"].as_str() {
+        Some("discover") => json!({"ok": true, "result": {"commissionable": 1}}),
+        Some("commission") => json!({
+            "ok": false,
+            "error": {"code": "invalid_setup_code", "message": "Invalid pairing code"}
+        }),
+        _ => json!({"ok": true, "result": {}}),
+    });
+    let (url, _received) = mock_controller(snapshot(vec![], vec![]), vec![], Some(answer)).await;
+    let (client, _events) = MatterClient::connect(&url).await.unwrap();
+    let commissioner = MatterCommissioner::new(client, MatterNotifier::disabled());
+
+    let error = commissioner
+        .commission(
+            SetupCode::PairingCode("MT:Y.K9042C00KA0648G00".to_string()),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    // Rendered the way the HTTP route renders it.
+    let shown = format!("{error:#}");
+    assert_eq!(shown, "Invalid pairing code", "got: {shown}");
+}
+
+#[tokio::test]
 async fn an_unusable_probe_answer_does_not_block_commissioning() {
     // A probe that itself fails proves nothing, so it never blocks the attempt.
     let answer: Answer = Arc::new(|frame: &Value| match frame["op"].as_str() {

@@ -514,7 +514,37 @@ failed" the only diagnosis GIAP could offer.
 | `internal` | anything else |
 
 The code is preserved into the Rust error chain (`code_of`) rather than flattened
-into prose.
+into prose — and it is **not rendered as part of the message**. It sits at the
+bottom of the chain so `code_of` can downcast to it, which means `{:#}` would print
+it as if it were a sentence: `commissioning failed: Invalid pairing code:
+commission_failed` is what the user actually read, and only the middle fragment
+said anything. `describe` skips that frame, and the commissioner consumes the code
+where it branches on it and returns prose alone across the port.
+
+---
+
+## The three forms of a setup code
+
+| form | example | how the controller pairs with it |
+|---|---|---|
+| QR payload | `MT:Y.K9042C00KA0648G00` | decoded here with `QrPairingCodeCodec`, then `{passcode, discriminator}` |
+| manual pairing code | `34970112332` (11 or 21 digits) | `{pairingCode}`; matter.js decodes it |
+| passcode | `20202021` (8 digits) | `{passcode}`; pairs with whatever is in commissioning mode |
+
+The QR payload has to be decoded **by the controller**, and that is not a stylistic
+choice. matter.js's `commission({pairingCode})` runs `ManualPairingCodeCodec.decode`
+unconditionally, and that codec strips every non-digit before it checks the length —
+so `MT:` plus base-38 collapses to a dozen stray digits and is rejected as an
+"Invalid pairing code" in about two milliseconds, before anything reaches the
+network. Handing a QR payload through as a `pairingCode` therefore cannot work,
+which is what `commissioningOptions` exists to prevent recurring.
+
+A payload that will not decode is `invalid_setup_code`, not `commission_failed`:
+nothing was attempted, and the two codes lead to different advice.
+
+Only the QR form carries the **long** discriminator, so it is the only one that
+narrows the mDNS browse to a single device. The manual form carries a short
+discriminator and a bare passcode carries none.
 
 ---
 
