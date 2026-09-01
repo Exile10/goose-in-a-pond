@@ -618,7 +618,16 @@ impl GooseAdapter {
         let mut state = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
         let served = state.turns_served;
         state.invalidate(reason);
-        tracing::debug!(
+        // INFO, not DEBUG. The production filter is `info,{GIAP_VERBOSE},…`
+        // and `giap::trace` is not one of the verbose targets, so at DEBUG this
+        // event — the one built to answer "why did the KV prefix go cold" —
+        // has never been recorded on any pond. Its sibling `prefix_prewarm` is
+        // INFO and does appear, which is what made the gap findable at all.
+        //
+        // One line per invalidation is not chatty: a prefix that is working
+        // invalidates rarely, and a prefix that is not is the thing being
+        // diagnosed.
+        tracing::info!(
             target: "giap::trace",
             kind = "prefix_cache_invalidated",
             reason = reason.as_str(),
@@ -661,10 +670,27 @@ impl GooseAdapter {
 
     /// Record that this turn is being served off the existing prefix.
     fn note_prefix_served(&self) {
-        self.prefix_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .serve_turn();
+        let (hash, turns_served) = {
+            let mut state = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+            state.serve_turn();
+            (state.hash, state.turns_served)
+        };
+        // The counterpart to `prefix_cache_invalidated`, and it did not exist:
+        // a miss traced at a level the filter dropped, and a hit traced
+        // nothing at all. Between them the KV hit rate was unobservable in
+        // production — which is how a cache that misses most turns goes
+        // unnoticed for as long as it takes somebody to read a database of
+        // prefill timings and work backwards.
+        //
+        // `turns_served` is the number that matters: 1 means the prefix took
+        // for one turn, a rising count means it is actually being reused.
+        tracing::info!(
+            target: "giap::trace",
+            kind = "prefix_cache_served",
+            hash = %hash,
+            turns_served,
+            "KV prefix reused"
+        );
     }
 
     /// Returns an `GiapGooseExtensionManager` for managing Goose extensions on a session.
