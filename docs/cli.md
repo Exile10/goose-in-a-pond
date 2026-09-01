@@ -102,7 +102,7 @@ pond-server chat [OPTIONS]
 |---|---|---|---|
 | `--provider` | `-P` | from Settings | LLM backend: `mock`, `llamafile`, `ollama`, or `local` (requires `--features local-inference`) |
 | `--model` | `-M` | from Settings | Model name for `--provider ollama` (e.g. `llama3.2`, `gemma2`) |
-| `--input` | `-I` | `stdin` | Input source: `stdin` (keyboard) or `whisper` (microphone → ASR) |
+| `--voice` | | off | Listen on the microphone: wake word, VAD, ASR, spoken reply. Fetches whatever is missing. Without it, chat reads the keyboard |
 | `--wake-word` | | from Settings | Custom wake word phrase |
 | `--no-wake-word` | | off | Skip wake-word detection; activate immediately on each turn |
 | `--tts` | | from Settings | TTS engine: `piper` or `none` (text only) |
@@ -119,7 +119,7 @@ pond-server chat --provider ollama --model llama3.2 --no-wake-word --tts none
 printf 'What is the weather today?\n' | pond-server chat --provider mock --no-wake-word --tts none
 
 # Full voice loop (requires Whisper + Piper)
-pond-server chat --provider llamafile --input whisper --tts piper
+pond-server chat --voice --provider llamafile
 
 # Use settings from DB (provider, model, wake word all come from onboarding)
 pond-server chat

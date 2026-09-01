@@ -291,7 +291,7 @@ pub struct GooseAdapter {
     /// These are preserved across turns (not stripped in the extension cleanup loop).
     user_extensions: Arc<tokio::sync::RwLock<HashSet<String>>>,
     /// When true, prompt templates include voice-mode instructions (keep responses
-    /// short, conversational, no formatting). Set by the CLI when `--input whisper`.
+    /// short, conversational, no formatting). Set by the CLI when `--voice` is passed.
     voice_mode: std::sync::atomic::AtomicBool,
     /// Runtime capabilities of the currently loaded model.
     model_capabilities: Mutex<pond_core::models::domain::model_capabilities::ModelCapabilities>,
@@ -1655,7 +1655,7 @@ impl GooseAdapter {
     /// the section is pure prompt cost there — the same trade `thinking` already
     /// makes in voice mode.
     ///
-    /// `voice` is the INSTANCE-level flag (CLI `--input whisper`), not the
+    /// `voice` is the INSTANCE-level flag (CLI `--voice`), not the
     /// per-request one, for two reasons. It is the only signal `capabilities()`
     /// can see, so keying off it is what makes the two agree on every input. And
     /// it is fixed for the life of the process, so it cannot flip the static
@@ -1726,7 +1726,7 @@ impl GooseAdapter {
     /// `AgentStreamEvent::Thinking`'s own doc comment already claims ("only
     /// emitted when `show_thinking` is enabled").
     ///
-    /// `voice` is the OR of the instance flag (CLI `--input whisper`) and the
+    /// `voice` is the OR of the instance flag (CLI `--voice`) and the
     /// per-request one (the desktop voice pipeline), unlike
     /// `vision_section_applies` — this value never reaches `PromptState`, so it
     /// cannot move the static prefix between turns, and the per-request flag is
@@ -3304,7 +3304,7 @@ impl GooseAdapter {
 
         // Voice detection is shared by prompt construction (disables thinking)
         // and the session turn cap (#105 — voice_max_turns). Check both the
-        // instance-level flag (CLI --input whisper) and the per-request flag
+        // instance-level flag (CLI --voice) and the per-request flag
         // (desktop voice pipeline sends voice_mode: true).
         let voice_instance = self.voice_mode.load(std::sync::atomic::Ordering::Relaxed);
         let is_voice = Self::voice_turn(voice_instance, request.voice_mode);
@@ -6077,7 +6077,7 @@ mod tests {
         );
         assert!(
             GooseAdapter::voice_turn(true, false),
-            "the CLI `--input whisper` instance flag must still count on its own"
+            "the CLI `--voice` instance flag must still count on its own"
         );
         assert!(GooseAdapter::voice_turn(true, true));
         assert!(

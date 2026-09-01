@@ -1,7 +1,7 @@
 //! Manager for the terminal-voice child process.
 //!
 //! Architecture A of the terminal-voice-in-desktop contract: the Tauri shell
-//! spawns and owns a `pond-server chat --input whisper --json-events
+//! spawns and owns a `pond-server chat --voice --json-events
 //! --session-id <uuid>` child that exclusively owns the microphone and speaker
 //! (wake word, VAD, ASR, TTS, barge-in all in-child). The shell parses the
 //! child's stdout NDJSON stream and re-emits it as Tauri events.
@@ -330,15 +330,20 @@ impl VoiceChatProcess {
         let session_id = uuid::Uuid::new_v4().to_string();
 
         tracing::info!(
-            "Spawning voice child: {} chat --input whisper --json-events --session-id {}",
+            "Spawning voice child: {} chat --voice --json-events --session-id {}",
             binary_path.display(),
             session_id
         );
 
+        // `--voice` replaced `--input whisper`. A staged sidecar older than
+        // that rename dies on clap's "unexpected argument" before it emits a
+        // single NDJSON line — the same symptom as a sidecar older than the
+        // database's migrations, and the same fix: re-run
+        // `scripts/stage-server-sidecar.sh`. The stderr tail attached to
+        // `voice-session-ended` carries clap's message, which names the flag.
         let mut cmd = Command::new(&binary_path);
         cmd.arg("chat")
-            .arg("--input")
-            .arg("whisper")
+            .arg("--voice")
             .arg("--json-events")
             .arg("--session-id")
             .arg(&session_id)
@@ -1154,11 +1159,18 @@ mod tests {
     fn cmdline_matches_only_a_pond_server_chat_process() {
         // The exact production invocation must match.
         assert!(cmdline_is_voice_child(
-            "/opt/app/pond-server chat --input whisper --json-events --session-id abc"
+            "/opt/app/pond-server chat --voice --json-events --session-id abc"
         ));
         // A bare macOS bundle sidecar path with the chat subcommand matches.
         assert!(cmdline_is_voice_child(
-            "/Applications/Goose In A Pond.app/Contents/MacOS/pond-server chat --input whisper"
+            "/Applications/Goose In A Pond.app/Contents/MacOS/pond-server chat --voice"
+        ));
+        // And the pre-rename invocation still matches, because orphan recovery
+        // has to reap a child spawned by the shell that was running before an
+        // upgrade. The matcher keys on the binary and the subcommand, never on
+        // the flags, which is what makes that survivable.
+        assert!(cmdline_is_voice_child(
+            "/opt/app/pond-server chat --input whisper --json-events --session-id abc"
         ));
     }
 

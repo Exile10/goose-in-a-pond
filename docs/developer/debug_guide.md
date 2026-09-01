@@ -227,7 +227,7 @@ Errors:
 
 ```bash
 # List audio devices
-RUST_LOG=debug cargo run -p pond-server -- chat --input whisper 2>&1 | grep -i audio
+RUST_LOG=debug cargo run -p pond-server -- chat --voice 2>&1 | grep -i audio
 ```
 
 Common causes:
@@ -417,7 +417,7 @@ Verifies:
 | `connection refused 127.0.0.1:9000` | whisper.cpp not running | Start whisper server |
 | `403 Forbidden` on `/api/v1/chat` | Onboarding incomplete | Run `pond-server onboard` |
 | `400 Bad Request` on `/api/v1/chat` | Missing or invalid JSON body | Add `Content-Type: application/json` header |
-| `No audio input device found` | No microphone / headless server | Use `--input stdin` instead |
+| `No audio input device found` | No microphone / headless server | Drop `--voice` and type instead |
 | `whisper returned empty text` | Silence / too-short recording | Speak louder, check mic, or increase `--duration` |
 | `could not compile pctx_code_execution_runtime` | goose dep added to pond-server | Remove `pond-adapters-goose` from pond-server deps |
 | `migration file not found` at compile time | SQL file created after last compile | Create `.sql` file, then `cargo build` |
@@ -477,9 +477,9 @@ sqlite3 "$DATA_DIR/pond_system.db" "SELECT id, downloaded FROM models ORDER BY i
 | Foundation + Infrastructure | Done | `cargo test -p pond-core -p pond-infra` |
 | Think (llamafile / ollama / gguf) | Done | `cargo run -- chat --provider llamafile` |
 | Session persistence | Done | `cargo test -p pond-infra -- sqlite_session` |
-| Listen (Whisper ASR) | Done | `cargo run -- chat --input whisper` |
+| Listen (Whisper ASR) | Done | `cargo run -- chat --voice` |
 | Data pipeline (P1–P4) | Done | `cargo test -p pond-core -- context_budget` |
-| Wait (Wake word) | Done | `cargo run -- chat --input whisper` (says "goose") |
+| Wait (Wake word) | Done | `cargo run -- chat --voice` (says "goose") |
 | Speak (TTS — Piper) | Done | `cargo run -- chat --tts piper` |
 | Model catalog + roles (DB-driven) | Done | `cargo test -p pond-api --test model_integration_test` |
 | Goose agent + MCP extensions | Done | `cargo run -- serve` + trigger agent |

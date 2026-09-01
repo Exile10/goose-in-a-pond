@@ -5,12 +5,21 @@
 //! - `WhisperKeywordDetector` — `WakeWordDetector` port: poll mic until trigger phrase heard
 //! - `WhisperBackend`         — backend trait the detector uses to transcribe windows
 //!
-//! ## Default — in-process (`WhisperRsInput`)
+//! ## In-process (`WhisperRsInput`)
 //!
 //! Loads a ggml `.bin` model directly via the whisper.cpp bindings. No port,
 //! no subprocess, no multipart HTTP. Shares the ggml CUDA primary context with
 //! `llama-cpp-2` on Jetson. The HTTP `WhisperInput` this replaced was deleted
-//! in 2026-08.
+//! in 2026-08; nothing here is selectable any more, so there is no default to
+//! name.
+//!
+//! ## Where the speech/silence decision comes from
+//!
+//! Not from here. Both capture paths take a `&mut dyn SpeechDetector` and the
+//! composition root decides which one — Silero by default, the energy gate
+//! when its model or the ONNX Runtime cannot be had. This crate is in CI's
+//! fast-crate set and must stay buildable without an ONNX Runtime, so it knows
+//! the trait and nothing else.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -60,10 +69,11 @@ fn play_wake_ping() {
 
 /// Synchronous transcription backend.
 ///
-/// Both the in-process `WhisperRsInput` and the legacy HTTP `WhisperInput`
-/// implement this trait. The `WhisperKeywordDetector` holds an
-/// `Arc<dyn WhisperBackend>` and calls `transcribe_pcm_blocking` on each window
-/// during the wake-word detection loop.
+/// The `WhisperKeywordDetector` holds an `Arc<dyn WhisperBackend>` and calls
+/// `transcribe_pcm_blocking` on each window during the wake-word detection
+/// loop. `WhisperRsInput` is the only implementor in the tree; the trait earns
+/// its keep by letting the detector's tests run against a canned transcript,
+/// and by being the seam a different recogniser would arrive through.
 ///
 /// Called from inside `tokio::task::spawn_blocking`, so a blocking call is fine.
 pub trait WhisperBackend: Send + Sync {

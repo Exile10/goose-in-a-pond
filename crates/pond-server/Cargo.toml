@@ -67,14 +67,14 @@ face-onnx = ["dep:pond-adapters-face-onnx"]
 # face-onnx (ORT_DYLIB_PATH). Off = events stay plain "motion".
 # cargo run -p pond-server --features vision-onnx -- serve
 vision-onnx = ["dep:pond-adapters-vision-onnx"]
-# Silero VAD: replaces the energy gate that decides the user has stopped
-# talking with a 2 MB ONNX model that can tell a fridge from a voice.
-# Off by default for the same reason as the other two — it needs a system ONNX
-# Runtime at run time (ORT_DYLIB_PATH), and a default build must not depend on
-# one. With the feature off, `vad_backend = "silero"` degrades to the energy
-# gate and says so.
-#   cargo run -p pond-server --features silero-vad -- serve
-silero-vad = ["dep:pond-adapters-silero"]
+# Silero VAD used to be a feature here, off by default, on the grounds that it
+# needs a system ONNX Runtime and a default build must not depend on one. That
+# reasoning applied to `face-onnx` and `vision-onnx` and was carried over
+# without checking: those two link ort at its default features, this one asks
+# for `load-dynamic` in its own manifest, so it never links a runtime it cannot
+# find — and `ensure_onnx_runtime()` already resolves or downloads the dylib
+# before voice starts. The feature only ever gated a build that would have
+# worked. Silero is now an ordinary dependency and `chat --voice` uses it.
 # There is deliberately no `system-ort` feature here to dlopen the ONNX Runtime
 # rather than link it. One was written and reverted: this binary depends on
 # pond-infra, pond-infra depends on fastembed, and the root Cargo.toml gives
@@ -119,8 +119,8 @@ pond-adapters-local-inference = { workspace = true, optional = true }
 pond-adapters-face-onnx       = { workspace = true, optional = true }
 # Optional: only compiled when --features vision-onnx is passed.
 pond-adapters-vision-onnx     = { workspace = true, optional = true }
-# Optional: only compiled when --features silero-vad is passed.
-pond-adapters-silero      = { workspace = true, optional = true }
+# Speech/silence decision for the voice loop; see the note above the features.
+pond-adapters-silero          = { workspace = true }
 # Optional: only compiled when --features mesh is passed.
 pond-adapters-mesh-libp2p     = { workspace = true, optional = true }
 pond-mesh-protocol            = { workspace = true, optional = true }
