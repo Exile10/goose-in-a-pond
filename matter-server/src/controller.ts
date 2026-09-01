@@ -48,6 +48,27 @@ import {
 const DISCOVER_TIMEOUT = Seconds(8);
 
 /**
+ * How often to say, again, which devices are reachable.
+ *
+ * `device_availability` is a LEVEL report, not an edge. matter.js's
+ * `lifecycle.online` fires on a transition and only on a transition — the comment on
+ * `#retryWiring` records the trap: a node already online when the controller connects
+ * never fires it at all. So the Rust bridge's set of devices it vouches for was seeded
+ * once, from a `subscribe` snapshot that reads `peer.lifecycle.isOnline`, which is
+ * false until a CASE session exists. A snapshot taken inside that window recorded a
+ * working device as offline, nothing ever said otherwise, its `last_seen` aged past the
+ * five-minute threshold, and the card went offline while readings kept arriving from
+ * matter.js's cache. Four bridge reconnects in one test session are four chances to
+ * land in that window.
+ *
+ * Repeating the level fixes it whatever the cause: a missed, mistimed or lost
+ * transition self-heals within one tick. Thirty seconds is well inside both the
+ * bridge's sixty-second heartbeat and the five-minute freshness threshold, and costs
+ * one boolean read per peer.
+ */
+const AVAILABILITY_TICK_MS = 30_000;
+
+/**
  * Which clusters a snapshot reads.
  *
  * Bounded rather than "every supported cluster": a snapshot is rebuilt on every node
@@ -155,6 +176,12 @@ export class Controller {
     const sweep = setInterval(() => guard("sweep_readings", () => controller.#sweepReadings()), 5_000);
     sweep.unref?.();
 
+    const availability = setInterval(
+      () => guard("report_availability", () => controller.#reportAvailability()),
+      AVAILABILITY_TICK_MS,
+    );
+    availability.unref?.();
+
     return controller;
   }
 
@@ -251,6 +278,23 @@ export class Controller {
       if (this.#lastRead.get(key) === reading.value) continue;
       this.#lastRead.set(key, reading.value);
       this.#events.reading(reading);
+    }
+  }
+
+  /**
+   * Say which devices are reachable, whether or not that changed.
+   *
+   * Unconditional, and that is the point — see `AVAILABILITY_TICK_MS`. The transition
+   * handlers in `#observe` stay because they are prompt, but they are the only thing
+   * that ever spoke, and matter.js fires them on a transition it may never make. A
+   * device recorded offline by one badly-timed snapshot had no route back.
+   *
+   * Both branches on the receiving side are idempotent: the bridge inserts into a set
+   * and heartbeats a row, or removes from a set. Repetition costs a set operation.
+   */
+  #reportAvailability(): void {
+    for (const { deviceId, online } of availabilityReports(this.#node.peers)) {
+      this.#events.availabilityChanged(deviceId, online);
     }
   }
 
@@ -704,6 +748,29 @@ export function commissioningOptions(
   // A manual pairing code, or something GIAP could not classify: matter.js's own
   // decoder gets the last word rather than this one guessing.
   return { pairingCode: code.replace(/\s/g, "") };
+}
+
+/**
+ * Every peer's reachability, as the `device_availability` event carries it.
+ *
+ * Every peer, unconditionally — the level, not the change. Pulled out of the class
+ * so the property that matters is a test rather than a claim: a device the last
+ * report called offline is named again in the next one, which is the whole of what
+ * makes a missed transition recoverable.
+ *
+ * Peers with no node id are dropped. Discovery adds merely-commissionable nodes to
+ * the same collection, and those are not devices on this fabric.
+ */
+export function availabilityReports(
+  peers: Iterable<ClientNode>,
+): { deviceId: string; online: boolean }[] {
+  const reports: { deviceId: string; online: boolean }[] = [];
+  for (const peer of peers) {
+    const nodeId = peerNodeId(peer);
+    if (nodeId === undefined) continue;
+    reports.push({ deviceId: deviceIdForNode(nodeId), online: peer.lifecycle.isOnline });
+  }
+  return reports;
 }
 
 /**
