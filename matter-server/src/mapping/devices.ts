@@ -32,6 +32,7 @@ export const CLUSTER_BOOLEAN_STATE = "booleanState";
 export const CLUSTER_TEMPERATURE = "temperatureMeasurement";
 export const CLUSTER_HUMIDITY = "relativeHumidityMeasurement";
 export const CLUSTER_SMOKE_CO_ALARM = "smokeCoAlarm";
+export const CLUSTER_SWITCH = "switch";
 
 /**
  * Every cluster this module names, for the snapshot allowlist.
@@ -54,6 +55,7 @@ export function deviceClusters(): ReadonlySet<string> {
     CLUSTER_TEMPERATURE,
     CLUSTER_HUMIDITY,
     CLUSTER_SMOKE_CO_ALARM,
+    CLUSTER_SWITCH,
   ]);
 }
 
@@ -110,6 +112,12 @@ const DEVICE_TYPES: ReadonlyMap<number, string> = new Map([
   [0x0307, "sensor"], // Humidity Sensor
   // An alarm is not a sensor to a user: it is the thing that wakes them.
   [0x0076, "alarm"], // Smoke/CO Alarm
+  // A switch reports which way it is thrown and takes no orders, so it is its own
+  // type rather than a light with the controls missing. Deliberately NOT the switch
+  // CLIENT types (0x0103 On/Off Light Switch, 0x0104 Dimmer Switch, 0x0105 Colour
+  // Dimmer Switch): those drive other devices, and claiming a mapping nobody has
+  // held a device against is how a plug arrived wearing a lightbulb.
+  [0x000f, "switch"], // Generic Switch
   // Appliances
   [0x0073, "appliance"], // Laundry Washer
   [0x0075, "appliance"], // Dishwasher
@@ -287,6 +295,7 @@ function typeOf(node: NodeSnapshot): string {
   ) {
     return "sensor";
   }
+  if (hasCluster(node, CLUSTER_SWITCH)) return "switch";
   // A cluster GIAP does not map leaves the device typed `matter` with no
   // capabilities: it appears in the device list, but the model has nothing it can do
   // with it. That is the signal a mapping is missing, not that the device is broken.
