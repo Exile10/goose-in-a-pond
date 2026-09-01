@@ -10108,6 +10108,12 @@ fn qualify_tool_name(server: &str, tool: &str) -> String {
 /// approves, executes shell, writes files, or reads household memory.
 const DIRECT_DISPATCH_ALLOWLIST: &[&str] = &[
     "giap-device-control__set_device_state",
+    // Read-only, and the counterpart to the line above. The desktop could
+    // actuate a device but not ask it anything, so the Devices card labelled its
+    // power button from `is_online` -- reachability, a different fact -- and
+    // offered "Turn on" to a contact sensor. See `powerStateOf` in
+    // `pond-desktop/src/sections/Devices.tsx`.
+    "giap-device-control__get_device_state",
     "giap-weather__get_current_weather",
     "giap-weather__get_weather_forecast",
 ];
