@@ -90,6 +90,34 @@ function lastSeen(device: Pick<Device, "is_online" | "last_seen">): string {
   return device.is_online ? "now" : timeSince(device.last_seen);
 }
 
+/** Can this device be told to turn on and off at all? */
+function canPower(d: Device): boolean {
+  return d.capabilities?.includes("power") ?? false;
+}
+
+/**
+ * Whether the device says it is on, from `get_device_state`'s text.
+ *
+ * `undefined` means it did not say — a device that is unreachable, or one whose
+ * reply this cannot read. That is deliberately different from `false`: labelling a
+ * button "Turn on" because a read failed is the mistake this whole change exists to
+ * undo, only with a different wrong input.
+ *
+ * The format is a declared contract, not a guess: `state_line` in
+ * `crates/pond-mcp-server/src/device_control.rs` writes these lines, and a test
+ * there fails if their shape drifts. A dispatched MCP tool answers with text and
+ * nothing else — `ToolCallResult` is `{content, success}` — so text is the channel
+ * there is.
+ */
+export function powerStateOf(content: string): boolean | undefined {
+  const line = content.split("\n").find((l) => /^\s*power:/.test(l));
+  if (line === undefined) return undefined;
+  const value = line.slice(line.indexOf(":") + 1).trim().toLowerCase();
+  if (value === "on") return true;
+  if (value === "off") return false;
+  return undefined;
+}
+
 export function Devices() {
   const [devices, setDevices]     = useState<Device[]>([]);
   const [loading, setLoading]     = useState(true);
@@ -111,6 +139,11 @@ export function Devices() {
   const [busyId, setBusyId]           = useState<string | null>(null);
   const [detail, setDetail]           = useState<Device | null>(null);
 
+  // What each power-capable device says it is: on, off, or (absent) it did not say.
+  // Read from the device rather than inferred from reachability, which is a different
+  // fact and was labelling the button before.
+  const [powerOn, setPowerOn]         = useState<Record<string, boolean>>({});
+
   // Configure-modal edit state
   const [editName, setEditName]         = useState("");
   const [editHostname, setEditHostname] = useState("");
@@ -121,9 +154,43 @@ export function Devices() {
   function load() {
     setLoading(true);
     api.listDevices()
-      .then(setDevices)
+      .then((list) => {
+        setDevices(list);
+        void loadPowerStates(list);
+      })
       .catch((e) => setError(errorText(e)))
       .finally(() => setLoading(false));
+  }
+
+  /**
+   * Ask each device that can be switched what it currently is.
+   *
+   * Only those: a sensor has no power state to read, and asking would be a fabric
+   * round-trip for a device that has nothing to answer. A read that fails leaves the
+   * device absent from the map, and the button says so rather than guessing.
+   */
+  async function loadPowerStates(list: Device[]) {
+    const switchable = list.filter(canPower);
+    if (switchable.length === 0) return;
+    const readings = await Promise.all(
+      switchable.map(async (d) => {
+        try {
+          const result = await api.invokeTool({
+            server: "giap-device-control",
+            tool: "get_device_state",
+            args: { device_id: d.id },
+          });
+          return [d.id, powerStateOf(result.content)] as const;
+        } catch {
+          return [d.id, undefined] as const;
+        }
+      }),
+    );
+    setPowerOn(
+      Object.fromEntries(
+        readings.filter((r): r is readonly [string, boolean] => r[1] !== undefined),
+      ),
+    );
   }
 
   /** Read the Matter runtime's actual state — what it is doing, not what was
@@ -194,13 +261,46 @@ export function Devices() {
     }
   }
 
-  // Toggle registry connectivity directly (heartbeat / offline), not the
-  // giap-device-control MCP tool — that tool actuates a smart device's own
-  // power state (a light/plug), a different concept from whether the device
-  // itself is reachable. There is no "wake"/"restart" primitive in the
-  // backend, so this is an honest on/off toggle: turn on when offline, off
-  // when online.
+  /**
+   * Turn the device on or off — the device's own power, not GIAP's opinion of it.
+   *
+   * This used to call `markDeviceOffline` / `markDeviceOnline`, which write the
+   * registry's `last_seen` and nothing else, and took its label from `is_online`. So
+   * the card offered "Turn on" to a contact sensor, and "Turn off" on a lamp made
+   * GIAP forget the lamp rather than switching it off. Reachability is a real thing
+   * worth being able to set by hand, and it moved to the Configure modal where it is
+   * named as what it is.
+   *
+   * Read back afterwards rather than assumed: a device that refused, or took a moment,
+   * should not leave the card claiming otherwise.
+   */
   async function handlePower(d: Device) {
+    const next = !(powerOn[d.id] ?? false);
+    setBusyId(d.id);
+    try {
+      await api.invokeTool({
+        server: "giap-device-control",
+        tool: "set_device_state",
+        args: { device_id: d.id, power: next },
+      });
+      await loadPowerStates([d]);
+      void refreshHomeData();
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  /**
+   * Mark the device reachable or unreachable in the registry.
+   *
+   * A different question from whether it is switched on, which is why it is here and
+   * not on the card. `is_online` is derived from `last_seen` being fresher than five
+   * minutes, so "go offline" means backdating that -- there is no wake or restart
+   * primitive to offer instead.
+   */
+  async function handleReachability(d: Device) {
     setBusyId(d.id);
     try {
       if (d.is_online) {
@@ -211,7 +311,7 @@ export function Devices() {
       load();
       void refreshHomeData();
     } catch (e) {
-      setError(errorText(e));
+      setEditError(errorText(e));
     } finally {
       setBusyId(null);
     }
@@ -338,7 +438,10 @@ export function Devices() {
                 <div className="device-card__info">
                   <div className="device-card__name">{d.name}</div>
                   <code className="device-card__ip">
-                    {d.metadata?.ip != null ? String(d.metadata.ip) : "—"}
+                    {/* `ip_address` is the field the server sends. This read
+                        `metadata.ip`, which `list_devices` has never set, so the
+                        line rendered an em dash for every device on the fabric. */}
+                    {d.ip_address ?? "—"}
                   </code>
                 </div>
               </div>
@@ -357,14 +460,18 @@ export function Devices() {
 
               {/* Actions */}
               <div className="device-card__actions">
-                <button
-                  className="device-card__action-btn"
-                  onClick={() => handlePower(d)}
-                  disabled={busyId === d.id}
-                  type="button"
-                >
-                  <Power size={12} /> {d.is_online ? "Turn off" : "Turn on"}
-                </button>
+                {/* Only a device that can be switched. A contact sensor's
+                    capability list is empty, and it was being offered "Turn on". */}
+                {canPower(d) && (
+                  <button
+                    className="device-card__action-btn"
+                    onClick={() => handlePower(d)}
+                    disabled={busyId === d.id || !d.is_online}
+                    type="button"
+                  >
+                    <Power size={12} /> {powerOn[d.id] ? "Turn off" : "Turn on"}
+                  </button>
+                )}
                 <button
                   className="device-card__action-btn"
                   onClick={() => openDetail(d)}
@@ -507,11 +614,27 @@ export function Devices() {
                 <div className="muted-12">
                   {detail.is_online ? "online" : "offline"} · last seen {lastSeen(detail)}
                 </div>
+                {/* Reachability, which is not the device's power. It lived on the
+                    card labelled "Turn on"/"Turn off" and wrote nothing but
+                    `last_seen`, so switching a lamp "off" made GIAP forget the lamp.
+                    Still worth being able to set by hand -- named for what it is. */}
+                <button
+                  className="device-card__action-btn"
+                  onClick={() => handleReachability(detail)}
+                  disabled={busyId === detail.id}
+                  type="button"
+                >
+                  <Radio size={12} /> {detail.is_online ? "Mark offline" : "Mark online"}
+                </button>
+                <p className="sched-modal__cron-hint">
+                  Whether GIAP believes it can reach the device, not whether the
+                  device is switched on.
+                </p>
               </div>
               <div className="sched-modal__field">
                 <label className="sched-modal__label">Address</label>
                 <code className="device-card__ip">
-                  {detail.metadata?.ip != null ? String(detail.metadata.ip) : "—"}
+                  {detail.ip_address ?? "—"}
                 </code>
               </div>
               {editError && (
