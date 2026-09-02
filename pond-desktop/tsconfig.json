@@ -13,7 +13,9 @@
     "jsx": "react-jsx",
     "strict": true,
     "paths": {
-      "@web/*": ["../web/src/*"]
+      "@web/*": ["../web/src/*"],
+      "@jarida/ink": ["../../jarida-ink/src/index.ts"],
+      "@jarida/ink/*": ["../../jarida-ink/src/*"]
     }
   },
   "include": ["src"]
