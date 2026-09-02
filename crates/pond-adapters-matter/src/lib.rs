@@ -51,7 +51,8 @@ pub use commissioning::MatterCommissioner;
 pub use control::{MatterDeviceControl, SharedMatterClient};
 pub use notify::MatterNotifier;
 pub use protocol::{
-    device_id_for_node, node_id_from_device_id, redact_setup_code, WireDevice, WireReading,
+    is_matter_device_id, matter_bridged_endpoint, matter_device_id, matter_node_id,
+    redact_setup_code, WireDevice, WireReading,
 };
 pub use runtime::{MatterRuntime, SwitchableDeviceControl};
 pub use server_setup::{

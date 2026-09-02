@@ -1224,6 +1224,35 @@ async fn a_matter_device_is_refused_while_matter_is_off_but_others_fall_back() {
 }
 
 #[tokio::test]
+async fn a_matter_id_never_falls_back_to_the_stub_however_malformed() {
+    // The property, stated so it cannot quietly change. Routing used to ask "does
+    // this id parse as a node id", which answers `false` for any Matter id the
+    // grammar cannot read — and `false` means the stub, which reports success for
+    // every verb. So a malformed Matter id produced a confident lie rather than an
+    // error, which is the exact failure the test above exists to prevent, reached by
+    // a different route.
+    //
+    // It matters now because the grammar is about to grow an endpoint component for
+    // bridged devices, and every id shape it has not learned yet lands here.
+    let fallback = Arc::new(RecordingControl::default());
+    let runtime = runtime_for();
+    let control = runtime.device_control(fallback.clone());
+
+    for device_id in ["matter-90-2", "matter-01", "matter-", "matter-nonsense"] {
+        let error = control.set_power(device_id, true).await.unwrap_err();
+        assert!(
+            error.to_string().contains("Matter is off"),
+            "'{device_id}' was not treated as a Matter device: {error}"
+        );
+    }
+    assert!(
+        fallback.calls().is_empty(),
+        "no Matter id may reach the stub: {:?}",
+        fallback.calls()
+    );
+}
+
+#[tokio::test]
 async fn control_switches_to_matter_once_connected() {
     let (url, received) = mock_controller(snapshot(vec![light()], vec![]), vec![], None).await;
     let fallback = Arc::new(RecordingControl::default());
