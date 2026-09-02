@@ -2,6 +2,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { resolve } from "path";
+import { inkAlias } from "../../jarida-ink/vite-alias";
 
 // https://vitejs.dev/config/
 export default defineConfig(async () => ({
@@ -12,6 +13,7 @@ export default defineConfig(async () => ({
   // The @web alias is intentionally removed — pond-desktop is now standalone.
   resolve: {
     alias: [
+      ...inkAlias(resolve(__dirname, "../../jarida-ink")),
       { find: "react/jsx-runtime",     replacement: resolve(__dirname, "node_modules/react/jsx-runtime.js") },
       { find: "react/jsx-dev-runtime", replacement: resolve(__dirname, "node_modules/react/jsx-dev-runtime.js") },
       { find: "react-dom/client",      replacement: resolve(__dirname, "node_modules/react-dom/client.js") },
