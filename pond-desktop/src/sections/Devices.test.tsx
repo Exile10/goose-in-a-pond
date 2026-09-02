@@ -122,6 +122,20 @@ describe("Devices section — Matter devices", () => {
     expect(container.querySelector(".lucide-monitor")).toBeNull();
   });
 
+  it("shows a droplet for a water valve, not the monitor fallback", async () => {
+    // A valve has no On/Off cluster, so it arrived typed `matter` with nothing it
+    // could do — and wearing a monitor.
+    (api.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: "matter-60", name: "Garden Valve", device_type: "valve", is_online: true },
+    ]);
+
+    const { container } = render(<Devices />);
+    await screen.findByText("Garden Valve");
+
+    expect(container.querySelector(".lucide-droplet")).toBeTruthy();
+    expect(container.querySelector(".lucide-monitor")).toBeNull();
+  });
+
   it("shows a phone icon for the GOTG mobile companion, not a computer", async () => {
     (api.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([
       { id: "phone-1", name: "Emmanuel's Phone", device_type: "gotg", is_online: true },

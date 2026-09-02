@@ -27,6 +27,7 @@ import {
   colorSupport,
   levelIsBrightness,
   speakerEndpoint,
+  valveHasLevel,
   CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
   CLUSTER_SMOKE_CO_ALARM,
@@ -35,6 +36,7 @@ import {
   CLUSTER_LEVEL_CONTROL,
   CLUSTER_ON_OFF,
   CLUSTER_THERMOSTAT,
+  CLUSTER_VALVE,
   CLUSTER_WINDOW_COVERING,
   nodeToDevice,
 } from "./devices.js";
@@ -89,6 +91,29 @@ export const DOOR_STATES = [
 const DOOR_STATE_NAMES: ReadonlyMap<string, string> = new Map(
   DOOR_STATES.map(word => [`door${word.replace(/ /g, "")}`, word]),
 );
+
+/**
+ * Where a valve is, in its own three words.
+ *
+ * "Transitioning" is not padding: a motorised valve takes seconds to travel, and a
+ * caller that has just asked for it to open needs to be able to tell "moving" from
+ * "refused". Declared here for the same reason `DOOR_STATES` is -- `state` imports
+ * it, so a description and a reading cannot use different words.
+ */
+export const VALVE_STATES = ["closed", "open", "transitioning"] as const;
+
+/** The same three by matter.js's enum name, which it may hand over instead. */
+const VALVE_STATE_NAMES: ReadonlyMap<string, string> = new Map(
+  VALVE_STATES.map(word => [word, word]),
+);
+
+/** Both encodings, for the reason `doorStateWord` reads both. */
+export function valveStateWord(raw: unknown): string | undefined {
+  const numeric = asNumber(raw);
+  if (numeric !== undefined) return VALVE_STATES[numeric];
+  if (typeof raw === "string") return VALVE_STATE_NAMES.get(raw.toLowerCase().trim());
+  return undefined;
+}
 
 /** What PIN enforcement reads as. Both words, so `state` cannot invent a third. */
 export const PIN_REQUIREMENTS = ["required", "not required"] as const;
@@ -318,6 +343,12 @@ function capabilitiesOf(node: NodeSnapshot): Capability[] {
     if (colour.hueSaturation) add("color", { kind: "color" });
     if (colour.temperature) add("color_temp", colorTemperatureSpec(node));
   }
+  if (has(CLUSTER_VALVE)) {
+    add("valve", { kind: "boolean" });
+    // Only a valve that says it has a level. A plain solenoid is open or shut with
+    // nothing in between, and offering it a percentage is a control it would reject.
+    if (valveHasLevel(node)) add("position", { kind: "percent" });
+  }
   if (has(CLUSTER_WINDOW_COVERING)) add("position", { kind: "percent" });
   // The second axis, offered only by a covering that has it. A roller blind has no
   // slats to turn, and offering a control the device will reject is the failure this
@@ -476,6 +507,17 @@ function statesOf(node: NodeSnapshot): StateSpec[] {
   // with no over-the-air credential access has no such setting to report.
   if (typeof attribute(node, CLUSTER_DOOR_LOCK, "requirePinForRemoteOperation") === "boolean") {
     states.push({ name: "pin_required", value: { kind: "enum", values: [...PIN_REQUIREMENTS] } });
+  }
+
+  // Whether a valve is shut, open, or moving between the two, and whether it has
+  // faulted. Reported rather than driven: `valve` and `position` ask for a state,
+  // and this is the device saying where it actually is -- which for a motorised
+  // valve is a third thing for several seconds, and a fourth if it jams.
+  if (attribute(node, CLUSTER_VALVE, "currentState") !== undefined) {
+    states.push({ name: "valve_state", value: { kind: "enum", values: [...VALVE_STATES] } });
+  }
+  if (attribute(node, CLUSTER_VALVE, "valveFault") !== undefined) {
+    states.push({ name: "valve_fault", value: { kind: "boolean" } });
   }
 
   // A smoke/CO alarm's summary of what it is doing, and whether it can still do it.

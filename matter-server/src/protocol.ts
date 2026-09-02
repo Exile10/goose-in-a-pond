@@ -74,6 +74,8 @@ export interface DeviceStatePatch {
   position?: number;
   /** Slat angle as a 0-100 percentage OPEN, the covering's second axis. */
   tilt?: number;
+  /** A valve, open or shut. */
+  valve?: boolean;
 }
 
 /**
@@ -161,6 +163,17 @@ export type Verb =
   | "fan_mode"
   | "position"
   | "tilt"
+  /**
+   * Open or shut a valve.
+   *
+   * Its own verb rather than `power`, because a valve has no On/Off cluster to send
+   * one to -- Valve Configuration and Control takes `open` and `close` commands --
+   * and rather than `position`, because a valve need not have a level at all: the
+   * LVL feature is optional, and a plain solenoid is open or shut with nothing in
+   * between. Where a valve DOES claim a level, `position` addresses it, on the same
+   * "0-100 percentage open" scale a covering uses.
+   */
+  | "valve"
   /** Choose a named setting: `{setting, value}`, both in the device's own words. */
   | "mode"
   /** start / stop / pause / resume, for a device that runs cycles. */

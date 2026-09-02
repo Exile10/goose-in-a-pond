@@ -57,6 +57,9 @@ pub struct DeviceStatePatch {
     /// Slat angle as a 0–100 percentage **open**, a covering's second axis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tilt: Option<u8>,
+    /// A valve, open (`true`) or shut (`false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valve: Option<bool>,
     /// The named setting that changed, and what it became.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<ModeChange>,
@@ -347,14 +350,29 @@ pub trait DeviceControlPort: Send + Sync {
         anyhow::bail!("device '{device_id}' does not support tilt")
     }
 
-    /// Set a covering (blind/curtain/shade) position, as a 0–100 percentage
-    /// **open** — 100 is fully open, 0 fully closed.
+    /// Set a covering (blind/curtain/shade) position, or a valve's level, as a
+    /// 0–100 percentage **open** — 100 is fully open, 0 fully closed.
+    ///
+    /// One verb for both because it is one axis: how far open the thing is. A valve
+    /// that has no level says so and only [`Self::set_valve`] reaches it.
     async fn set_position(
         &self,
         device_id: &str,
         _percent_open: u8,
     ) -> Result<DeviceControlOutcome> {
         anyhow::bail!("device '{device_id}' does not support position control")
+    }
+
+    /// Open or shut a valve.
+    ///
+    /// Separate from [`Self::set_power`] because a valve has no on/off switch to
+    /// throw: Matter's Valve Configuration and Control takes `open` and `close`
+    /// commands, and a device with only that cluster would answer a power request
+    /// with "not supported" while sitting there perfectly openable. Separate from
+    /// [`Self::set_position`] because a valve's level is optional — a plain solenoid
+    /// is open or shut with nothing in between.
+    async fn set_valve(&self, device_id: &str, _open: bool) -> Result<DeviceControlOutcome> {
+        anyhow::bail!("device '{device_id}' has no valve to open or shut")
     }
 }
 
@@ -394,5 +412,80 @@ mod tests {
 
         let l = dc.set_locked("door", true).await.unwrap();
         assert_eq!(l.applied.locked, Some(true));
+    }
+
+    /// A valve is not a plug with water in it.
+    ///
+    /// It has no on/off switch to throw -- Matter's Valve Configuration and Control
+    /// takes `open` and `close` -- so a device with only that cluster answered every
+    /// power request "not supported" while sitting there perfectly openable.
+    #[tokio::test]
+    async fn set_valve_records_and_echoes() {
+        let dc = RecordingDeviceControl::default();
+
+        let opened = dc.set_valve("garden-valve", true).await.unwrap();
+        assert_eq!(opened.applied.valve, Some(true));
+        assert_eq!(
+            dc.last_call().as_deref(),
+            Some("set_valve(garden-valve, open=true)")
+        );
+
+        let shut = dc.set_valve("garden-valve", false).await.unwrap();
+        assert_eq!(shut.applied.valve, Some(false));
+        // Not reported as a power change: nothing was switched.
+        assert_eq!(shut.applied.on, None);
+    }
+
+    /// The opt-in default, so a backend that cannot open a valve says which device
+    /// and why rather than reporting a success it did not perform.
+    #[tokio::test]
+    async fn a_backend_without_valves_says_so() {
+        struct PowerOnly;
+
+        #[async_trait]
+        impl DeviceControlPort for PowerOnly {
+            async fn set_power(&self, device_id: &str, _on: bool) -> Result<DeviceControlOutcome> {
+                Ok(DeviceControlOutcome::new(
+                    device_id,
+                    DeviceStatePatch::default(),
+                ))
+            }
+            async fn set_brightness(
+                &self,
+                device_id: &str,
+                _percent: u8,
+            ) -> Result<DeviceControlOutcome> {
+                Ok(DeviceControlOutcome::new(
+                    device_id,
+                    DeviceStatePatch::default(),
+                ))
+            }
+            async fn set_target_temp(
+                &self,
+                device_id: &str,
+                _celsius: f32,
+            ) -> Result<DeviceControlOutcome> {
+                Ok(DeviceControlOutcome::new(
+                    device_id,
+                    DeviceStatePatch::default(),
+                ))
+            }
+            async fn set_locked(
+                &self,
+                device_id: &str,
+                _locked: bool,
+            ) -> Result<DeviceControlOutcome> {
+                Ok(DeviceControlOutcome::new(
+                    device_id,
+                    DeviceStatePatch::default(),
+                ))
+            }
+        }
+
+        let error = PowerOnly.set_valve("lamp-1", true).await.unwrap_err();
+        assert!(
+            error.to_string().contains("lamp-1") && error.to_string().contains("valve"),
+            "{error}"
+        );
     }
 }

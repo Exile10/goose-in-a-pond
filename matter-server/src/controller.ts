@@ -1114,6 +1114,17 @@ const REFUSALS: ReadonlyMap<string, string> = new Map([
   ["invalid in state", "it will not do that in its current state"],
   ["needs timed interaction", "it requires a timed interaction"],
   ["write ignored", "it ignored the write"],
+  // Last, so every specific meaning above wins over it.
+  //
+  // Matter's generic Failure (0x01), which matter.js also returns for a command a
+  // device declares and has not implemented. It says nothing about WHY -- but it is
+  // a status the device sent, over a session that was up, and a device that answers
+  // is a device that can be reached. Measured against a valve whose firmware has no
+  // handler for `open`: the command was addressed correctly, delivered, and answered
+  // "not implemented", and GIAP reported the valve as UNREACHABLE -- sending the
+  // reader to look at the network for a device sitting there responding in
+  // milliseconds. That is the exact failure this table's own note describes.
+  ["received error status", "it answered with an error of its own rather than acting"],
 ]);
 
 /**
