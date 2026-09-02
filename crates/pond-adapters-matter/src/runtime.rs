@@ -47,7 +47,7 @@ use crate::client::{MatterClient, MatterEvent};
 use crate::commissioning::MatterCommissioner;
 use crate::control::MatterDeviceControl;
 use crate::notify::MatterNotifier;
-use crate::protocol::{describe, node_id_from_device_id};
+use crate::protocol::{describe, is_matter_device_id};
 use crate::server_setup::{ensure_running, local_port_from_ws_url, SharedServerChild};
 
 /// How long to wait for a freshly installed controller to start listening.
@@ -522,13 +522,21 @@ impl SwitchableDeviceControl {
     /// told the user so, truthfully relaying a lie it had been handed. A device
     /// on some other transport still falls back, which is what the stub is for.
     ///
+    /// The test is `is_matter_device_id` — a PREFIX check — and not "does this id
+    /// parse as a node id". The two differ for any Matter id this grammar cannot
+    /// read, and the difference is which way the mistake falls: a parse test sends
+    /// such an id to the stub, which is the exact lie above. A prefix test sends it
+    /// to the error below, which names a real state the user can act on. It also
+    /// keeps working when the id grammar grows, as it is about to for bridged
+    /// devices.
+    ///
     /// The backend is cloned so the lock is released before any await on the
     /// network.
     async fn backend_for(&self, device_id: &str) -> Result<Arc<dyn DeviceControlPort>> {
         if let Some(matter) = self.matter.read().await.clone() {
             return Ok(matter);
         }
-        if node_id_from_device_id(device_id).is_none() {
+        if !is_matter_device_id(device_id) {
             return Ok(self.fallback.clone());
         }
         // Name the actual state: "off" and "the controller is unreachable" need

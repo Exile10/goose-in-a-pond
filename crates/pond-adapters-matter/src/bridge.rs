@@ -350,9 +350,12 @@ pub(crate) async fn run_matter_bridge_with_cache(
                     // Only news if GIAP still thinks it has this device: a user
                     // deleting one goes through the same removal, and telling
                     // them about the thing they just did is noise.
+                    //
+                    // The lookup already had the name; the alert used to be given
+                    // the id and print it, so it named the device `"matter-18"`.
                     present.remove(&device_id);
-                    if matches!(registry.get_device(&device_id).await, Ok(Some(_))) {
-                        notifier.device_dropped(&device_id).await;
+                    if let Ok(Some(device)) = registry.get_device(&device_id).await {
+                        notifier.device_dropped(&device_id, &device.name).await;
                     }
                 }
             }

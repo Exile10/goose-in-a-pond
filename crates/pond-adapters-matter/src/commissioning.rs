@@ -21,8 +21,8 @@ use serde_json::json;
 use crate::client::{code_of, MatterClient};
 use crate::notify::MatterNotifier;
 use crate::protocol::{
-    describe, device_id_for_node, node_id_from_device_id, setup_code_kind, CommissionResult,
-    DiscoverResult, CODE_NOTHING_PAIRABLE,
+    describe, matter_device_id, matter_node_id, setup_code_kind, CommissionResult, DiscoverResult,
+    CODE_NOTHING_PAIRABLE,
 };
 
 /// Commissioning is slow: discovery, attestation, and fabric join, often over a
@@ -155,7 +155,7 @@ impl DeviceCommissioningPort for MatterCommissioner {
 
         let CommissionResult { device } = serde_json::from_value(result)
             .context("the controller did not return a commissioned device")?;
-        let node_id = node_id_from_device_id(&device.id).with_context(|| {
+        let node_id = matter_node_id(&device.id).with_context(|| {
             format!(
                 "the controller returned '{}', which is not a Matter device id",
                 device.id
@@ -183,7 +183,7 @@ impl DeviceCommissioningPort for MatterCommissioner {
     }
 
     async fn decommission(&self, node_id: u64) -> Result<()> {
-        let device_id = device_id_for_node(node_id);
+        let device_id = matter_device_id(node_id, None);
         // Before the op, not after: the controller's `device_removed` event can
         // reach the bridge while this call is still returning.
         self.notifier.expect_removal(&device_id).await;
