@@ -313,7 +313,7 @@ async function main(): Promise<void> {
   // directory lock; stop leaves it held, and matter.js then warns on process exit
   // that it is removing an orphaned lock.
   let closing = false;
-  const shutdown = async (): Promise<never> => {
+  const shutdown: () => Promise<never> = async () => {
     if (!closing) {
       closing = true;
       await node.close();
@@ -323,6 +323,19 @@ async function main(): Promise<void> {
   process.once("SIGINT", () => void shutdown());
   process.once("SIGTERM", () => void shutdown());
 
+  // Read commands if there are any, but never exit because there are none. Piping
+  // or backgrounding the tool closes stdin immediately, and exiting on that end-of
+  // -input took the device down the moment it was launched with `&` -- which is how
+  // anything driving it from a script would launch it. A device's job is to stay up
+  // until it is told otherwise.
+  void readCommands(endpoints, shutdown);
+  await new Promise<never>(() => {});
+}
+
+async function readCommands(
+  endpoints: Map<string, Endpoint>,
+  shutdown: () => Promise<never>,
+): Promise<void> {
   process.stdin.setEncoding("utf8");
   for await (const chunk of process.stdin) {
     const lines = String(chunk)
@@ -341,7 +354,6 @@ async function main(): Promise<void> {
       }
     }
   }
-  await shutdown();
 }
 
 await main();

@@ -119,6 +119,18 @@ describe("virtual device arguments", () => {
     expect(one.storage).not.toBe(two.storage);
   });
 
+  it("takes the storage directory as --storage-dir, and knows no --storage", () => {
+    // The flag is not spelt `--storage` on purpose: matter.js parses OUR argv into
+    // its own variables, so `--storage /path` defines the scalar `storage` and the
+    // tool then dies setting `storage.path` — "segment storage is not a map". The
+    // rename is only worth anything if `--storage` stays an error rather than
+    // quietly becoming a matter.js variable again.
+    expect(parseArgs(["--device", "on-off-light", "--storage-dir", "/tmp/one"]).storage)
+      .toBe("/tmp/one");
+    expect(() => parseArgs(["--device", "on-off-light", "--storage", "/tmp/one"]))
+      .toThrow(/unknown option '--storage'/);
+  });
+
   it("refuses a device with nothing to be", () => {
     expect(() => parseArgs([])).toThrow(/give --device/);
   });
