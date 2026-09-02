@@ -1973,10 +1973,6 @@ async fn run_server(
     // deal — `spawn_vision_server` only fires at chat time.
     pond_mcp_server::init_vision_deps(camera_storage.clone());
 
-    // Install the sensor MCP server's storage handle — `spawn_sensor_server`
-    // only fires at chat time.
-    pond_mcp_server::init_sensor_deps(sensor_storage.clone(), device_registry.clone());
-
     // Spawn background memory decay/cleanup task
     if settings.memory_cleanup_enabled {
         let cleanup_repo = memory_repo.clone();
@@ -3029,6 +3025,21 @@ async fn run_server(
     let (matter_runtime, device_control): (MatterRuntimeHandle, DeviceControl) = (
         None,
         Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
+    );
+
+    // Install the sensor MCP server's handles — `spawn_sensor_server` only fires at
+    // chat time, so anywhere before the server serves is early enough.
+    //
+    // Down here, beside its siblings' call sites rather than with them, because it
+    // needs `device_control`, which does not exist until the Matter runtime above is
+    // built. That handle is what lets `get_sensor_reading` ask a reachable device what
+    // it reads NOW instead of serving the newest row in the log — and the newest row
+    // can be hours old, because the controller publishes only CHANGES, so a steady
+    // sensor is written once and never again.
+    pond_mcp_server::init_sensor_deps(
+        sensor_storage.clone(),
+        device_registry.clone(),
+        device_control.clone(),
     );
 
     let (agent, extension_manager, _tool_caller, tool_registry) = if pond_agent_active {
@@ -4471,6 +4482,11 @@ async fn run_chat(
     pond_mcp_server::init_sensor_deps(
         Arc::new(SqliteSensorStorage::new(db.logs.clone())),
         Arc::new(SqliteDeviceRegistry::new(db.system.clone())),
+        // No Matter runtime on this path, so no device to read live. The port's
+        // default `state` bails, which is exactly the case the stored fallback
+        // exists for -- and the reply says the reading is stored and how old it is
+        // rather than passing it off as current.
+        Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
     );
 
     // Load settings and model registry early — drives provider, model, TTS, and wake word.
