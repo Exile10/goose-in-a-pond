@@ -25,6 +25,12 @@ on:
     - cron: "17 6 * * 1"
   workflow_dispatch:
 
+# Superseded runs are not worth finishing: a second push to the same branch
+# makes the first scan's answer about a tree nobody will merge.
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
