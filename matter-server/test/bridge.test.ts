@@ -82,6 +82,19 @@ describe("a bridge", () => {
     expect(read(hall!, "brightness")).toBe("4%");
   });
 
+  it("answers under the id it was asked about, not its hub's", () => {
+    // Found by running a real bridge, not by a unit test: `describe` and `state` both
+    // stamped their reply with `deviceIdForNode(nodeId)` and no endpoint, so all
+    // twelve children answered as the hub. Anything correlating a reply with the
+    // device it asked about would have matched the wrong one.
+    const [hub, kitchen, hall, front] = deviceSlices(bridgeNode());
+
+    expect(stateOf(kitchen!).device_id).toBe("matter-90-3");
+    expect(stateOf(hall!).device_id).toBe("matter-90-4");
+    expect(describeNode(front!).device_id).toBe("matter-90-5");
+    expect(stateOf(hub!).device_id).toBe("matter-90");
+  });
+
   it("drives the child that was asked for", () => {
     // The failure this whole change exists for. `planControl` chose "the lowest
     // endpoint carrying onOff", so every command on this hub went to endpoint 3 —
