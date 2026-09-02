@@ -280,6 +280,9 @@ export class Controller {
                 value,
                 new Date(),
                 attributes["measurementUnit"],
+                // Boolean State's meaning is the endpoint's device type, not the
+                // cluster's -- see `deviceType` on `SensorMapping`.
+                endpoint.deviceTypes,
               );
               if (reading !== undefined) out.push(reading);
             }
@@ -784,6 +787,7 @@ export class Controller {
             value,
             new Date(),
             declaredUnit,
+            readDeviceTypes(endpoint),
           );
           if (reading !== undefined) {
             this.#events.reading(reading);

@@ -113,6 +113,13 @@ pub const DISCRETE_SENSOR_TYPES: &[&str] = &[
     "smoke",
     "leak",
     "button",
+    // Water freezing in a pipe, and rain falling. The same one bit as `leak`, off
+    // the same Matter cluster, and separated from it only by the endpoint's device
+    // type -- reported as `contact` until the bridge learned to tell them apart.
+    // Transitions by construction: a household cares that it started, and "the pipe
+    // sensor went to freezing at 04:20" is the sentence this corpus exists to say.
+    "freeze",
+    "rain",
     // The Matter `SmokeCoAlarm` cluster's own name for the same thing (#195).
     // Its state is Normal/Warning/Critical rather than a boolean, but it is an
     // ALARM: it changes rarely, every change is an event a household needs, and
