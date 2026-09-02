@@ -163,25 +163,34 @@ describe("SubagentTree", () => {
  * that ships the tree invisible for exactly the minutes it exists to cover, a
  * turn parked inside a `delegate` tool call. `PAI-6` is in the same breath in
  * both files so the gate cannot be re-added without reading why.
+ *
+ * Folding the frame and rendering the tree are checked separately, because
+ * they live separately: the fold moved to `state/chatRunStore.ts` when the turn
+ * was hoisted out of the components so it could survive leaving the section,
+ * and the `!streaming` mutation this guard exists for is a render-side one.
  */
 describe("subagent_progress has a consumer", () => {
+  it("the shared turn driver folds the frame through the one reducer", () => {
+    const src = readFileSync(join(SRC_DIR, "state/chatRunStore.ts"), "utf8");
+    expect(
+      src.includes('ev.type === "subagent_progress"'),
+      "the frame has no consumer in the turn driver - a delegating turn is " +
+        "then a spinner for the whole of its child's run, on every surface",
+    ).toBe(true);
+    expect(
+      src.includes("applySubagentProgress("),
+      "the driver folds progress frames some other way than through the one " +
+        "shared reducer",
+    ).toBe(true);
+  });
+
   for (const surface of ["hub/views/ChatHub.tsx", "sections/Chat.tsx"]) {
-    it(`${surface} folds the frame and renders the tree while streaming`, () => {
+    it(`${surface} renders the tree while the turn is still streaming`, () => {
       const src = readFileSync(join(SRC_DIR, surface), "utf8");
-      expect(
-        src.includes('ev.type === "subagent_progress"'),
-        `the frame has no consumer in ${surface} - a delegating turn there is ` +
-          "a spinner for the whole of its child's run",
-      ).toBe(true);
-      expect(
-        src.includes("applySubagentProgress("),
-        `${surface} folds progress frames some other way than through the one ` +
-          "shared reducer, so the two surfaces can disagree about what a frame means",
-      ).toBe(true);
       const render = src.slice(src.indexOf("<SubagentTree"));
       expect(
         render.startsWith("<SubagentTree"),
-        `${surface} reads subagent_progress but renders nothing for it`,
+        `${surface} is handed delegations on the message but renders nothing`,
       ).toBe(true);
       const guard = src.slice(
         src.lastIndexOf("{", src.indexOf("<SubagentTree")),

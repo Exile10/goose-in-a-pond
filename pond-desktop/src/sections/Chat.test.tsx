@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, act } from "@testing-library/react";
 import { Chat } from "./Chat";
 import { api } from "../api/PondApiClient";
+import { __resetChatRunForTests, setChatRunBridge } from "../state/chatRunStore";
 import type { ChatEvent } from "../api/types";
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
@@ -62,6 +63,18 @@ beforeEach(() => {
   appState.sessionId = null;
   vi.mocked(api.listSessions).mockResolvedValue([]);
   vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+  // The turn lives in a module singleton so it can outlive an unmount, which
+  // means it also outlives `cleanup()` — without this, one test's transcript is
+  // the next test's starting state. This file also mocks AppContext wholesale,
+  // so the provider that normally installs the bridge never runs here.
+  __resetChatRunForTests();
+  setChatRunBridge({
+    sessionToken: "test-token",
+    serverOnline: true,
+    onSessionId: vi.fn(),
+    onResponseMeta: vi.fn(),
+    onContextCard: vi.fn(),
+  });
 });
 
 afterEach(() => {
@@ -413,6 +426,15 @@ describe("Chat history — persisted reasoning (PAI-5 P6)", () => {
       }),
       useAppDispatch: () => vi.fn(),
     }));
+    // Same hazard as the api mock above, one layer down: the turn store is a
+    // module singleton, so the instance the FRESH `Chat` binds to is whichever
+    // one this reset registry hands out — not the one `beforeEach` reset. Left
+    // stale, its `sessionId` still reads "sess-1" from the previous test in
+    // this block, the external-session effect sees nothing to follow, and the
+    // thread renders empty. Importing it from the same registry, right here,
+    // is what guarantees we reset the instance `Chat` is about to use.
+    const store = await import("../state/chatRunStore");
+    store.__resetChatRunForTests();
     const { Chat: FreshChat } = await import("./Chat");
     const { rerender } = render(<FreshChat />);
     // The sidebar-click path: the session id arrives from outside, the effect
@@ -483,6 +505,111 @@ describe("Chat history — persisted reasoning (PAI-5 P6)", () => {
 
     await waitFor(() => expect(screen.getByText("The porch light is on.")).toBeTruthy());
     expect(document.querySelector(".think")).toBeNull();
+  });
+});
+
+// ── Leaving the section and coming back ───────────────────────────────────────
+
+/**
+ * The reported bug, driven end to end.
+ *
+ * `GuiMode` renders sections with a `switch`, so a sidebar press really does
+ * unmount this component -- `unmount()` here is that press, not an
+ * approximation of it. Before the turn was hoisted into `chatRunStore`, coming
+ * back showed the "All chats" wall and the answer was nowhere, even though the
+ * server had finished writing it.
+ */
+describe("navigating away mid-turn", () => {
+  /** A stream held open, so "while Goose is still answering" is a real state. */
+  function heldStream(events: ChatEvent[]) {
+    let release!: () => void;
+    const held = new Promise<void>((r) => { release = r; });
+    const gen = (async function* () {
+      for (const ev of events) yield ev;
+      await held;
+      yield { type: "text", content: " and back." } as ChatEvent;
+      yield { done: true, session_id: "sess-nav", type: "done" } as ChatEvent;
+    })();
+    return { gen, release: () => release() };
+  }
+
+  async function sendAndLeave() {
+    // A pond that already has conversations, so the wall is what this section
+    // would otherwise open on -- otherwise "landed in the thread" would be
+    // satisfied by the empty-pond case and prove nothing.
+    vi.mocked(api.listSessions).mockResolvedValue([
+      { id: "s-1", title: "an older chat", created_at: "", updated_at: "" },
+    ] as never);
+    const stream = heldStream([{ type: "text", content: "Still going" }]);
+    vi.mocked(api.chatStream).mockReturnValueOnce(stream.gen);
+
+    const mounted = render(<Chat />);
+    fireEvent.click(await screen.findByRole("button", { name: "New chat" }));
+    await waitFor(() => expect(screen.getByLabelText("Message input")).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Message input"), { target: { value: "a long one" } });
+    fireEvent.click(screen.getByLabelText(/send message|queue message/i));
+    await waitFor(() => expect(screen.getByText(/Still going/)).toBeTruthy());
+
+    mounted.unmount();
+    return stream;
+  }
+
+  it("comes back to the answer that finished while it was away", async () => {
+    const stream = await sendAndLeave();
+
+    await act(async () => {
+      stream.release();
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    render(<Chat />);
+    // The thread, not the wall, and the whole answer -- including the half that
+    // arrived with nothing mounted to receive it.
+    await waitFor(() => expect(screen.getByText(/Still going and back\./)).toBeTruthy());
+    expect(screen.getByLabelText("Message input")).toBeTruthy();
+  });
+
+  it("comes back to a turn that is still running", async () => {
+    await sendAndLeave();
+
+    render(<Chat />);
+    await waitFor(() => expect(screen.getByText(/Still going/)).toBeTruthy());
+    // Still working: the composer says so, and it queues rather than sends.
+    expect(
+      (screen.getByLabelText("Message input") as HTMLTextAreaElement).placeholder,
+    ).toMatch(/Queue a message/);
+  });
+
+  it("still opens on the wall when nothing was left running", async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([
+      { id: "s-1", title: "an older chat", created_at: "", updated_at: "" },
+    ] as never);
+
+    render(<Chat />);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Open conversation/ })).toBeTruthy());
+    expect(screen.queryByLabelText("Message input")).toBeNull();
+  });
+
+  it("goes back to the wall once the finished turn has been read", async () => {
+    const stream = await sendAndLeave();
+    await act(async () => {
+      stream.release();
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    // First return shows it...
+    const first = render(<Chat />);
+    await waitFor(() => expect(screen.getByText(/Still going and back\./)).toBeTruthy());
+    first.unmount();
+
+    // ...and the visit after that is the wall again, as the section intends.
+    vi.mocked(api.listSessions).mockResolvedValue([
+      { id: "s-1", title: "an older chat", created_at: "", updated_at: "" },
+    ] as never);
+    render(<Chat />);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /Open conversation/ })).toBeTruthy());
   });
 });
 
