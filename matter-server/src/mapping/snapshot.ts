@@ -42,6 +42,23 @@ export interface EndpointSnapshot {
   clusters: ClusterState;
   /** Manufacturer-specific clusters here. Empty for all but a handful of devices. */
   vendorClusters: VendorCluster[];
+  /**
+   * This endpoint's child endpoints, from matter.js's own resolved structure.
+   *
+   * NOT the Descriptor cluster's `partsList`, which is also in the snapshot and
+   * looks like the same thing. Three reasons matter.js's version is the one to
+   * trust. The spec gives an Aggregator's PartsList *full-family* semantics — every
+   * descendant — and a composed device's *tree* semantics, so the raw attribute
+   * cannot say whether a grandchild is a child. A PartsList may name endpoint 0, or
+   * name endpoints cyclically, and a recursive walk over one that does either
+   * either inherits the node's own name or does not terminate. matter.js has
+   * already resolved all of that into a real parent-child tree to build its
+   * endpoint index, so reading `endpoint.parts` gets the answer rather than the
+   * evidence.
+   *
+   * Empty until the structure is read, like every other field here.
+   */
+  parts: number[];
 }
 
 /**
@@ -62,12 +79,49 @@ export interface NodeSnapshot {
   nodeId: bigint;
   online: boolean;
   endpoints: EndpointSnapshot[];
+  /**
+   * The endpoint this snapshot is *about*, when it is about one device of several.
+   *
+   * A Matter bridge is one node carrying an Aggregator whose children are separate
+   * logical devices, so one node has to become several GIAP devices. Rather than
+   * teach forty mapping call sites what an endpoint is, `deviceSlices` cuts the node
+   * into one snapshot per device and every existing mapping runs over a slice
+   * unchanged — a slice IS a `NodeSnapshot`, just a narrower one.
+   *
+   * Absent for an ordinary node, which is then its own single slice and keeps the
+   * device id it has always had.
+   */
+  rootEndpoint?: number;
 }
 
-/** Application endpoints, lowest number first. Endpoint 0 carries utility clusters
- *  (Basic Information, Descriptor for the root node) and never says what the device is. */
+/**
+ * Application endpoints: this slice's own endpoint first, then ascending. Endpoint 0
+ * carries utility clusters (Basic Information, Descriptor for the root node) and
+ * never says what the device is.
+ *
+ * Root-first, not simply ascending, and that ordering is load-bearing for bridges.
+ * Everything downstream — `endpointWith`, `hasCluster`, `deviceTypeFromDescriptor`,
+ * `settingsOf` — resolves ties by taking the lowest endpoint, and the comment on
+ * `deviceTypeFromDescriptor` justifies that with "a composed device is reported as
+ * whatever its first endpoint claims, which is what its own UI calls it". True of an
+ * air purifier with a fan inside it. False behind a bridge, where the endpoint
+ * numbers are allocated by the HUB in its own discovery order: a bridged air
+ * purifier at endpoint 9 whose Fan part landed at endpoint 2 would be typed a fan.
+ * Putting the device's own endpoint first replaces an accident of numbering with a
+ * fact about the device.
+ *
+ * A no-op while `rootEndpoint` is absent, which it always is until `deviceSlices`
+ * starts producing slices.
+ */
 export function applicationEndpoints(node: NodeSnapshot): EndpointSnapshot[] {
-  return node.endpoints.filter(e => e.number !== 0).sort((a, b) => a.number - b.number);
+  const application = node.endpoints
+    .filter(e => e.number !== 0)
+    .sort((a, b) => a.number - b.number);
+  if (node.rootEndpoint === undefined) return application;
+
+  const own = application.findIndex(e => e.number === node.rootEndpoint);
+  if (own <= 0) return application;
+  return [application[own]!, ...application.slice(0, own), ...application.slice(own + 1)];
 }
 
 /** The lowest-numbered application endpoint carrying `behaviorId`, if any. */

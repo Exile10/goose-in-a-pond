@@ -304,14 +304,51 @@ export function event(name: EventName, payload: unknown): Event {
   return { event: name, payload };
 }
 
-/** `matter-<node_id>`, matching what the Rust side parses back out. */
-export function deviceIdForNode(nodeId: bigint | number): string {
-  return `matter-${nodeId.toString()}`;
+/**
+ * `matter-<node_id>`, or `matter-<node_id>-<endpoint>` for one bridged device of a
+ * hub. Matches what the Rust side parses back out (`matter_node_id` and
+ * `matter_bridged_endpoint` in `pond-core`).
+ *
+ * An ordinary node keeps the id it has always had — no endpoint component — so
+ * existing registry rows and fabric state survive this becoming possible.
+ */
+export function deviceIdForNode(nodeId: bigint | number, rootEndpoint?: number): string {
+  const node = nodeId.toString();
+  return rootEndpoint === undefined ? `matter-${node}` : `matter-${node}-${rootEndpoint}`;
 }
 
+/** The FABRIC node behind a device id: `matter-90-2` is node 90, because a bridged
+ *  device is not separately commissioned and every fabric operation acts on its hub. */
 export function nodeIdFromDeviceId(deviceId: string): bigint | undefined {
+  return partsOfDeviceId(deviceId)?.nodeId;
+}
+
+/**
+ * Both components of a device id, or undefined if it is not one.
+ *
+ * Canonical spellings only. `BigInt("01")` is `1n`, so without the round-trip check
+ * `matter-01` and `matter-1` would be two ids for one device — and the registry keys
+ * its rows on the string. The Rust side refuses the same spellings for the same
+ * reason.
+ */
+export function partsOfDeviceId(
+  deviceId: string,
+): { nodeId: bigint; rootEndpoint?: number } | undefined {
   if (!deviceId.startsWith("matter-")) return undefined;
   const rest = deviceId.slice("matter-".length);
-  if (!/^\d+$/.test(rest)) return undefined;
-  return BigInt(rest);
+  const dash = rest.indexOf("-");
+  const nodeText = dash === -1 ? rest : rest.slice(0, dash);
+  const endpointText = dash === -1 ? undefined : rest.slice(dash + 1);
+
+  if (!/^\d+$/.test(nodeText)) return undefined;
+  const nodeId = BigInt(nodeText);
+  if (nodeId.toString() !== nodeText) return undefined;
+
+  if (endpointText === undefined) return { nodeId };
+
+  if (!/^\d+$/.test(endpointText)) return undefined;
+  const rootEndpoint = Number(endpointText);
+  // A Matter endpoint is a u16, and only its canonical spelling counts.
+  if (rootEndpoint > 0xffff || rootEndpoint.toString() !== endpointText) return undefined;
+  return { nodeId, rootEndpoint };
 }

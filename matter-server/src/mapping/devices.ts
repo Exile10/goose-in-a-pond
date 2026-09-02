@@ -33,6 +33,13 @@ export const CLUSTER_TEMPERATURE = "temperatureMeasurement";
 export const CLUSTER_HUMIDITY = "relativeHumidityMeasurement";
 export const CLUSTER_SMOKE_CO_ALARM = "smokeCoAlarm";
 export const CLUSTER_SWITCH = "switch";
+/**
+ * A bridged device's own identity and its own reachability, as its hub reports them.
+ *
+ * Dropped from the snapshot until now, which is why a hub's children would have been
+ * nameless and the hub's own liveness the only liveness there was.
+ */
+export const CLUSTER_BRIDGED_DEVICE_INFO = "bridgedDeviceBasicInformation";
 
 /**
  * Every cluster this module names, for the snapshot allowlist.
@@ -56,6 +63,7 @@ export function deviceClusters(): ReadonlySet<string> {
     CLUSTER_HUMIDITY,
     CLUSTER_SMOKE_CO_ALARM,
     CLUSTER_SWITCH,
+    CLUSTER_BRIDGED_DEVICE_INFO,
   ]);
 }
 
