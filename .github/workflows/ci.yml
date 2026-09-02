@@ -1,10 +1,33 @@
 name: CI
 
+# `paths-ignore` belongs to each EVENT, not to `on:` itself — at the top level
+# GitHub reads it as the name of an event that does not exist and the filter
+# silently does nothing.
 on:
   push:
-    branches: [main, hardening, "feat/**", "fix/**"]
+    # Trunk only. A PR branch used to match here AND on `pull_request`, so every
+    # push to an open PR ran the entire matrix twice for one change. The PR event
+    # is the gate that actually blocks a merge, so it is the one worth paying for.
+    branches: [main, hardening]
+    paths-ignore: &docs-only
+      - "**/*.md"
+      - "docs/**"
+      - ".ai/**"
+      - "LICENSE"
   pull_request:
     branches: [main, hardening]
+    # Documentation cannot break a build, and this repo's guides are long and
+    # edited often — each edit was spending a full Rust + frontend matrix to
+    # prove that markdown still parses.
+    paths-ignore: *docs-only
+
+# One run per branch. Without this every push started a fresh full matrix and
+# left the previous one running to completion against a commit nobody would
+# merge; a burst of three pushes billed three complete builds to answer a
+# question only the last one asked.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -87,7 +110,6 @@ jobs:
             -p pond-adapters-ollama \
             -p pond-adapters-whisper \
             -p pond-adapters-matter \
-            -p pond-adapters-piper \
             -p pond-adapters-vision \
             -p pond-adapters-weather \
             -p pond-adapters-caldav \
@@ -110,7 +132,6 @@ jobs:
             -p pond-adapters-ollama \
             -p pond-adapters-whisper \
             -p pond-adapters-matter \
-            -p pond-adapters-piper \
             -p pond-adapters-vision \
             -p pond-adapters-weather \
             -p pond-adapters-caldav \
