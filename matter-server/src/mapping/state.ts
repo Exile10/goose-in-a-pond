@@ -48,7 +48,7 @@ import {
   CLUSTER_WINDOW_COVERING,
 } from "./devices.js";
 import { doorStateWord, expressedStateWord, switchKindOf } from "./describe.js";
-import { SENSORS } from "./sensors.js";
+import { sensorApplies, SENSORS } from "./sensors.js";
 import { observedOperation, settingsOf } from "./settings.js";
 import { applianceSetpoint, targetSetpoint } from "./thermostat.js";
 import { endpointWith, type NodeSnapshot } from "./snapshot.js";
@@ -220,7 +220,11 @@ export function stateOf(node: NodeSnapshot): DeviceState {
   // Read through the same table `describe` lists its sensors from, so a device
   // cannot be described as measuring something its state then omits.
   for (const sensor of SENSORS) {
-    const raw = endpointWith(node, sensor.cluster)?.clusters[sensor.cluster]?.[sensor.attribute];
+    const endpoint = endpointWith(node, sensor.cluster);
+    // The same precedence `describe` applies, from the same function: one bit on
+    // Boolean State is four different facts and the device type says which.
+    if (!sensorApplies(sensor, endpoint?.deviceTypes ?? [])) continue;
+    const raw = endpoint?.clusters[sensor.cluster]?.[sensor.attribute];
     const reading = sensor.read(raw);
     if (reading === undefined) continue;
 

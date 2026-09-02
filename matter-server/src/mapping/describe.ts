@@ -39,7 +39,7 @@ import {
   nodeToDevice,
 } from "./devices.js";
 import { miredsToKelvin } from "./control.js";
-import { clusterHasFeature, declaredUnitOf, SENSORS } from "./sensors.js";
+import { clusterHasFeature, declaredUnitOf, sensorApplies, SENSORS } from "./sensors.js";
 import {
   applianceSetpoint,
   reachableRange,
@@ -358,6 +358,10 @@ function sensorsOf(node: NodeSnapshot): SensorSpec[] {
   for (const mapping of SENSORS) {
     const endpoint = endpointWith(node, mapping.cluster);
     if (endpoint === undefined) continue;
+    // Boolean State is one bit whose meaning is the endpoint's device type, so only
+    // one of its four mappings describes any given device. Without this a leak
+    // detector was described as having a `leak` AND a `contact`.
+    if (!sensorApplies(mapping, endpoint.deviceTypes)) continue;
     // Cluster presence is not sensor presence where the cluster's own features decide.
     if (
       mapping.feature !== undefined &&

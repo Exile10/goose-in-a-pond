@@ -87,10 +87,46 @@ describe("sensor readings", () => {
     }
   });
 
-  it("has no duplicate cluster/attribute pairs", () => {
-    // A duplicate would be silently shadowed by whichever entry the map built last.
-    const paths = SENSORS.map(s => `${s.cluster}.${s.attribute}`);
-    expect(new Set(paths).size).toBe(paths.length);
+  it("shares a cluster attribute only between device types, and once generally", () => {
+    // The invariant that replaced "no duplicate paths at all". Boolean State is one
+    // bit whose meaning is the endpoint's device type, so four mappings share its
+    // path on purpose -- but a SECOND entry with no device type would be shadowed by
+    // whichever the picker found first, silently, exactly as before.
+    const byPath = new Map<string, typeof SENSORS[number][]>();
+    for (const sensor of SENSORS) {
+      const path = `${sensor.cluster}.${sensor.attribute}`;
+      byPath.set(path, [...(byPath.get(path) ?? []), sensor]);
+    }
+
+    for (const [path, entries] of byPath) {
+      const general = entries.filter(e => e.deviceType === undefined);
+      expect(general.length, `'${path}' has ${general.length} mappings for any device`)
+        .toBeLessThanOrEqual(1);
+      const types = entries.filter(e => e.deviceType !== undefined).map(e => e.deviceType);
+      expect(new Set(types).size, `'${path}' names a device type twice`).toBe(types.length);
+    }
+  });
+
+  it("names one bit by the device holding it", () => {
+    // A leak detector, a freeze detector, a rain sensor and a contact sensor all
+    // publish Boolean State's `stateValue` and nothing else. Reported as `contact`,
+    // as they all were, a household was told its leak detector had a door.
+    const bit = (deviceType: number) =>
+      readingFor(DEVICE, "booleanState", "stateValue", true, new Date(), undefined, [deviceType]);
+
+    expect(bit(0x0043)?.sensor_type).toBe("leak");
+    expect(bit(0x0041)?.sensor_type).toBe("freeze");
+    expect(bit(0x0044)?.sensor_type).toBe("rain");
+    expect(bit(0x0015)?.sensor_type).toBe("contact");
+  });
+
+  it("still reports the bit from a detector it has no name for", () => {
+    // Fails OPEN, like every other unstated case in this file: an endpoint that
+    // states no device type, or one GIAP has no specific mapping for, gets the
+    // general `contact` rather than no reading at all.
+    expect(readingFor(DEVICE, "booleanState", "stateValue", true)?.sensor_type).toBe("contact");
+    const unknown = readingFor(DEVICE, "booleanState", "stateValue", true, new Date(), undefined, [0xbeef]);
+    expect(unknown?.sensor_type).toBe("contact");
   });
   it("reports a reading in the unit the device declared, not the substance's default", () => {
     // The Matter Virtual Device's air quality sensor declares ozone in ppm, where

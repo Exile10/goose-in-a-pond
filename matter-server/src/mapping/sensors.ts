@@ -39,6 +39,20 @@ export interface SensorMapping {
    */
   words?: Record<number, string>;
   /**
+   * The Matter device type this reading belongs to, for a cluster whose meaning is
+   * not in the cluster.
+   *
+   * Boolean State is one bit and says nothing about what the bit is: the same
+   * cluster, the same attribute, is a door being shut on a contact sensor, water on
+   * the floor under a leak detector, ice in a pipe on a freeze detector, and weather
+   * on a rain sensor. Only the endpoint's device type distinguishes them, and
+   * reporting all four as `contact` told a household its leak detector had a door.
+   *
+   * A mapping without one is the general case and matches any device, so the
+   * specific entry wins where it applies and nothing is lost where it does not.
+   */
+  deviceType?: number;
+  /**
    * A featureMap flag the cluster must claim for this reading to exist at all.
    *
    * `describe` lists a sensor whether or not it has reported yet, which is right — a
@@ -159,12 +173,33 @@ const AIR_QUALITY: Record<number, string> = {
   6: "Extremely poor",
 };
 
+/**
+ * What one bit means, per detector.
+ *
+ * `stateValue` true is the thing having happened -- contact made, water found, ice
+ * found, rain falling -- so the words are not interchangeable and neither is the
+ * direction. Without them GIAP answered "contact = 0 bool", which is the reading
+ * with the meaning removed, and for these devices the meaning is all there is: a
+ * leak detector has exactly one thing to say.
+ */
+const CONTACT_STATE: Record<number, string> = { 0: "open", 1: "closed" };
+const LEAK_STATE: Record<number, string> = { 0: "dry", 1: "leak detected" };
+const FREEZE_STATE: Record<number, string> = { 0: "above freezing", 1: "freezing" };
+const RAIN_STATE: Record<number, string> = { 0: "dry", 1: "raining" };
+const OCCUPANCY_STATE: Record<number, string> = { 0: "clear", 1: "occupied" };
+
 // ── The table ────────────────────────────────────────────────────────────────
 
 export const SENSORS: readonly SensorMapping[] = [
   // Presence and contact. Both are transitions: a household cares when they change.
-  { cluster: "occupancySensing", attribute: "occupancy", sensorType: "occupancy", unit: "bool", read: occupied },
-  { cluster: "booleanState", attribute: "stateValue", sensorType: "contact", unit: "bool", read: asBool },
+  { cluster: "occupancySensing", attribute: "occupancy", sensorType: "occupancy", unit: "bool", read: occupied, words: OCCUPANCY_STATE },
+  // Boolean State, four ways. The device type decides which, and the general
+  // `contact` entry is last so a detector GIAP has no specific name for still
+  // reports its bit rather than nothing.
+  { cluster: "booleanState", attribute: "stateValue", sensorType: "leak", unit: "bool", read: asBool, deviceType: 0x0043, words: LEAK_STATE },
+  { cluster: "booleanState", attribute: "stateValue", sensorType: "freeze", unit: "bool", read: asBool, deviceType: 0x0041, words: FREEZE_STATE },
+  { cluster: "booleanState", attribute: "stateValue", sensorType: "rain", unit: "bool", read: asBool, deviceType: 0x0044, words: RAIN_STATE },
+  { cluster: "booleanState", attribute: "stateValue", sensorType: "contact", unit: "bool", read: asBool, words: CONTACT_STATE },
 
   // Ambient measurements.
   { cluster: "temperatureMeasurement", attribute: "measuredValue", sensorType: "temperature", unit: "C", read: hundredths },
@@ -225,9 +260,51 @@ export const SENSORS: readonly SensorMapping[] = [
   { cluster: "activatedCarbonFilterMonitoring", attribute: "changeIndication", sensorType: "carbon_filter_change", unit: "state", read: asNumber, words: CHANGE_INDICATION },
 ];
 
-const BY_PATH: ReadonlyMap<string, SensorMapping> = new Map(
-  SENSORS.map(mapping => [`${mapping.cluster}.${mapping.attribute}`, mapping]),
-);
+const BY_PATH: ReadonlyMap<string, readonly SensorMapping[]> = (() => {
+  const paths = new Map<string, SensorMapping[]>();
+  for (const mapping of SENSORS) {
+    const path = `${mapping.cluster}.${mapping.attribute}`;
+    const at = paths.get(path);
+    if (at === undefined) paths.set(path, [mapping]);
+    else at.push(mapping);
+  }
+  return paths;
+})();
+
+/**
+ * Which of the mappings on one cluster attribute this endpoint's reading is.
+ *
+ * A device-type-specific mapping wins where the endpoint claims that type; the
+ * general one answers otherwise. Declaration order settles a device claiming two
+ * of them, which no real device does and the spec does not allow.
+ */
+export function sensorMappingFor(
+  cluster: string,
+  attribute: string,
+  deviceTypes: readonly number[] = [],
+): SensorMapping | undefined {
+  const candidates = BY_PATH.get(`${cluster}.${attribute}`);
+  if (candidates === undefined) return undefined;
+  return (
+    candidates.find(m => m.deviceType !== undefined && deviceTypes.includes(m.deviceType)) ??
+    candidates.find(m => m.deviceType === undefined)
+  );
+}
+
+/**
+ * Is this the mapping an endpoint with these device types reads through?
+ *
+ * The one place precedence is decided, so `describe`, `state` and the reading stream
+ * cannot disagree. Asking only "does this mapping name a type this endpoint has"
+ * left the GENERAL entry applying too, and a leak detector was described as having
+ * both a `leak` and a `contact` -- one device, two names, one bit.
+ */
+export function sensorApplies(
+  mapping: SensorMapping,
+  deviceTypes: readonly number[] = [],
+): boolean {
+  return sensorMappingFor(mapping.cluster, mapping.attribute, deviceTypes) === mapping;
+}
 
 /**
  * The reading a cluster attribute carries, or `undefined` when it is not one GIAP
@@ -249,8 +326,12 @@ export function readingFor(
   // readings did not, so the same substance was described in one unit and reported
   // in another -- ozone declared ppm and reported ppb, from one device, at once.
   declaredUnit?: unknown,
+  // The endpoint's own device types, for a cluster whose meaning is not in the
+  // cluster -- see `deviceType` on `SensorMapping`. Empty means "not stated", which
+  // resolves to the general mapping rather than to none.
+  deviceTypes: readonly number[] = [],
 ): Reading | undefined {
-  const mapping = BY_PATH.get(`${cluster}.${attribute}`);
+  const mapping = sensorMappingFor(cluster, attribute, deviceTypes);
   if (mapping === undefined) return undefined;
 
   const reading = mapping.read(value);
