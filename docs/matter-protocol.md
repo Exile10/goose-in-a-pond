@@ -280,7 +280,7 @@ runs themselves — where there is no pipe to read — just as legible.
 ## Types
 
 ```ts
-Device  = { id: "matter-<node_id>", name, device_type, capabilities: string[], online }
+Device  = { id: "matter-<node_id>"[-<endpoint>], name, device_type, capabilities: string[], online }
 Reading = { device_id, sensor_type, value, unit, at }        // at is RFC 3339
 ```
 
@@ -289,6 +289,93 @@ Rust side deserialises them without a mapping step. `Device` is deliberately
 smaller than GIAP's: the controller knows nothing about rooms, hostnames or when
 a device was first registered, and inventing values for those would make a Matter
 device look different from every other kind.
+
+---
+
+## One node is not always one device
+
+A Matter **bridge** — a Hue, Aqara or Tuya hub — is a single commissioned node whose
+Aggregator endpoint (device type `0x000e`) carries a Bridged Node child (`0x0013`)
+per real device. So one node is a dozen devices, and GIAP mapped one device per node:
+such a hub arrived as a single thing that was simultaneously a light and a lock,
+whose state was whichever child held the lowest endpoint number, and which could only
+ever be driven at that one child. "Turn off the hall lamp" turned off the kitchen lamp
+and reported success.
+
+`deviceSlices` cuts the node into one **slice** per device, and a slice is a
+`NodeSnapshot` whose endpoints are just that device's subtree — so every mapping runs
+over one unchanged. Nothing in `describe.ts`, `state.ts` or `control.ts` learned what
+an endpoint is.
+
+| | |
+|---|---|
+| id | `matter-<node>` for the hub, `matter-<node>-<endpoint>` for each child. An ordinary node keeps the id it always had, so existing rows and fabric state survive. |
+| sliced on | **Bridged Node**, not Aggregator. The Bridged Node is what defines a device; the Aggregator only says a bridge exists, and the two descriptors arrive in independent subscription reports. |
+| the hub | **always** a device, typed `bridge`, driving nothing. |
+| names | `bridgedDeviceBasicInformation` `nodeLabel` → `productName` → `vendorName`, then the hub's own Basic Information, then `"<Type> <node>-<endpoint>"`. |
+| `online` | the node's reachability AND `bridgedDeviceBasicInformation.reachable`, which fails **open** when unstated. |
+| endpoint order | `applicationEndpoints` returns the slice's own endpoint FIRST, then ascending. |
+| deletion | `matter-<node>-<endpoint>` cannot be decommissioned — Matter commissions nodes. The API refuses it and names the hub. |
+
+Four of those are less obvious than they look.
+
+**The hub is a device on purpose.** Clusters populate late — that is what
+`#retryWiring` exists for — so the first snapshot after commissioning has no device
+types and yields one slice for the whole node. If that slice were not the hub it
+would register as a device and then never be removed: the peer still exists, so
+`peers.deleted` never fires. The user would be left with a permanently-offline row
+they could not delete without decommissioning the hub. Emitting it deliberately also
+gives an empty hub something to be, gives `commission` something to return, and gives
+deletion a handle.
+
+**Endpoint order is root-first, not ascending.** Every lookup downstream resolves ties
+by taking the first endpoint, and `deviceTypeFromDescriptor` justifies that with "a
+composed device is reported as whatever its first endpoint claims, which is what its
+own UI calls it". True of an air purifier with a fan inside it. False behind a bridge,
+where the numbers are the **hub's** to allocate in its own discovery order — a bridged
+video player at endpoint 7 whose Speaker part landed at 3 would be typed a speaker.
+
+**The child tree comes from matter.js, not from `partsList`.** The Descriptor
+attribute is in the snapshot and looks like the same thing. The spec gives an
+Aggregator's PartsList *full-family* semantics — every descendant — and a composed
+device's *tree* semantics, so it cannot say whether a grandchild is a child. It may
+name endpoint 0, and a walk over one that does gives every child the hub's identity.
+It may be cyclic, and a recursive walk over one that is does not terminate — inside
+`subscribe`, so one bad firmware would put the bridge in a permanent reconnect loop.
+matter.js has already resolved all of it into a real tree to build its endpoint index,
+so `endpoint.parts` is the answer rather than the evidence.
+
+**Endpoint numbers stay absolute.** `VendorClusterSpec.endpoint` and a control
+action's endpoint are the node's own numbering, not slice-relative, so they share one
+namespace with `peer.endpoints.for(...)`.
+
+**No `PROTOCOL_VERSION` bump.** `commission` still returns one device — the hub — and
+it can only ever honestly return that, because the children's descriptors have not
+populated at the moment it answers. They arrive seconds later as `device_added`,
+which the Rust side already handles. An un-updated client therefore reads the
+greeting, registers the hub and receives the children exactly as it does for any
+node, so the rule ("bump only if an un-updated client would break") is not met.
+
+**Churn is the vendor app's, not the fabric's.** A bridged child unpaired in the
+hub's own app disappears from the node's structure without anything touching the
+fabric, so `peers.deleted` never fires and the row would outlive the device. The
+controller diffs each peer's device set on the reading sweep and emits
+`device_removed` for what has gone — but only while the node still shows an
+Aggregator. A snapshot whose descriptors are momentarily unreadable collapses to one
+slice, which by device count alone is indistinguishable from a hub whose every child
+was just removed; requiring the Aggregator to still be visible makes an empty child
+list a fact rather than a gap, so a blink cannot announce a dozen devices as gone.
+
+**One hub is one notification.** A hub arrives with everything it speaks for, and
+each child registers separately, so the pairing alert fired once per bulb. It is
+silent for a bridged child now, and the hub's own alert says the devices it provides
+will appear as it reports them — deliberately without a count, because the children's
+descriptors have not populated at the moment the hub registers, which is exactly why
+they arrive as separate events seconds later.
+
+**Not done.** Nothing coalesces a hub that re-enumerates its children after a
+firmware update: the removals and the additions cancel out, but each is still
+reported.
 
 ---
 

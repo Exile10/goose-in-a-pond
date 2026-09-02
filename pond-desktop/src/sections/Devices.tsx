@@ -4,6 +4,7 @@ import {
   Monitor, Cpu, Activity, Power, Settings, Plus, X, Radio, Smartphone,
   Lightbulb, Lock, Thermometer, Fan, Blinds, RefreshCw,
   PlugZap, WashingMachine, Waves, Wind, MonitorPlay, Bot, BellRing, ToggleLeft,
+  Router,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { ApiError, type Device, type MatterStatus } from "../api/types";
@@ -53,6 +54,9 @@ function DeviceIcon({ kind }: { kind: string | undefined }) {
   // its own type rather than a light with the controls missing. Until it had one it
   // fell to the fallback below and arrived wearing a monitor.
   if (kind === "switch")     return <ToggleLeft size={22} />;
+  // A hub that speaks for other devices — a Hue, Aqara or Tuya bridge. It appears
+  // beside the devices behind it and drives nothing itself.
+  if (kind === "bridge")     return <Router size={22} />;
   return <Monitor size={22} />;
 }
 

@@ -20,8 +20,9 @@ export function endpoint(
   clusters: ClusterState,
   deviceTypes: number[] = [],
   vendorClusters: VendorCluster[] = [],
+  parts: number[] = [],
 ): EndpointSnapshot {
-  return { number, deviceTypes, clusters, vendorClusters };
+  return { number, deviceTypes, clusters, vendorClusters, parts };
 }
 
 export function node(nodeId: number, endpoints: EndpointSnapshot[], online = true): NodeSnapshot {
@@ -369,3 +370,69 @@ export function laundryWasherNode(): NodeSnapshot {
     ),
   ]);
 }
+
+/**
+ * A Hue-shaped hub: an Aggregator with three bridged devices behind it.
+ *
+ * One commissioned node, four GIAP devices — the hub plus its children. The endpoint
+ * numbers are the hub's to allocate, which is why they are not tidy.
+ */
+export function bridgeNode(): NodeSnapshot {
+  return node(90, [
+    endpoint(0, { basicInformation: { nodeLabel: "Living Room Hub" } }, [0x0016]),
+    endpoint(1, {}, [0x000e], [], [3, 4, 5]),
+    endpoint(
+      3,
+      {
+        onOff: { onOff: true },
+        levelControl: { currentLevel: 254 },
+        bridgedDeviceBasicInformation: { nodeLabel: "Kitchen Lamp", reachable: true },
+      },
+      [0x0013, 0x0101],
+    ),
+    endpoint(
+      4,
+      {
+        onOff: { onOff: false },
+        levelControl: { currentLevel: 10 },
+        bridgedDeviceBasicInformation: { nodeLabel: "Hall Lamp", reachable: true },
+      },
+      [0x0013, 0x0101],
+    ),
+    endpoint(
+      5,
+      {
+        doorLock: { lockState: 1, doorState: 0 },
+        bridgedDeviceBasicInformation: { nodeLabel: "Front Door", reachable: true },
+      },
+      [0x0013, 0x000a],
+    ),
+  ]);
+}
+
+/**
+ * A composed device BEHIND a bridge: a video player at endpoint 7 whose Speaker part
+ * the hub happened to put at endpoint 3.
+ *
+ * The case that breaks "the lowest endpoint carrying this cluster wins". Built and
+ * run for real against the virtual-device rig, which is where the numbering came
+ * from.
+ */
+export function bridgedComposedNode(): NodeSnapshot {
+  return node(91, [
+    named("Media Hub"),
+    endpoint(1, {}, [0x000e], [], [7]),
+    endpoint(
+      7,
+      {
+        mediaPlayback: { currentState: 0 },
+        bridgedDeviceBasicInformation: { nodeLabel: "Telly", reachable: true },
+      },
+      [0x0013, 0x0028],
+      [],
+      [3],
+    ),
+    endpoint(3, { levelControl: { currentLevel: 60 } }, [0x0022]),
+  ]);
+}
+
