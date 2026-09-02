@@ -356,9 +356,26 @@ which the Rust side already handles. An un-updated client therefore reads the
 greeting, registers the hub and receives the children exactly as it does for any
 node, so the rule ("bump only if an un-updated client would break") is not met.
 
-**Not done.** A bridged child unpaired in the vendor's own app leaves the slice set
-silently; nothing yet emits `device_removed` for it. And a hub commissioned with a
-dozen children still sends a dozen pairing notifications.
+**Churn is the vendor app's, not the fabric's.** A bridged child unpaired in the
+hub's own app disappears from the node's structure without anything touching the
+fabric, so `peers.deleted` never fires and the row would outlive the device. The
+controller diffs each peer's device set on the reading sweep and emits
+`device_removed` for what has gone — but only while the node still shows an
+Aggregator. A snapshot whose descriptors are momentarily unreadable collapses to one
+slice, which by device count alone is indistinguishable from a hub whose every child
+was just removed; requiring the Aggregator to still be visible makes an empty child
+list a fact rather than a gap, so a blink cannot announce a dozen devices as gone.
+
+**One hub is one notification.** A hub arrives with everything it speaks for, and
+each child registers separately, so the pairing alert fired once per bulb. It is
+silent for a bridged child now, and the hub's own alert says the devices it provides
+will appear as it reports them — deliberately without a count, because the children's
+descriptors have not populated at the moment the hub registers, which is exactly why
+they arrive as separate events seconds later.
+
+**Not done.** Nothing coalesces a hub that re-enumerates its children after a
+firmware update: the removals and the additions cancel out, but each is still
+reported.
 
 ---
 
