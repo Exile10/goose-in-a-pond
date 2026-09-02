@@ -149,13 +149,76 @@ Remove the device from the Devices tab when finished, or it will show as offline
 once the app stops. MVD wants UDP 5540 — see below if it starts with an empty
 Controller tab.
 
-There is no device-side test rig in this repo. The mappings are covered instead by
-recorded snapshots in `matter-server/test/fixtures.ts` — real devices as
-commissioned, carried forward so the cluster logic keeps its coverage without a
-fabric. What those cannot check is the wiring either side of them: that a
-description reaches chat, that a command leaves the socket, that an attribute a
-real device publishes arrives decoded the way a fixture says it does. That part is
-MVD and a person.
+MVD is the **independent** check and worth preferring wherever it can express the
+case: it is Google's own CHIP stack, so it catches anything GIAP has quietly learned
+to assume about matter.js. Its form lets you set the device type, name,
+discriminator, Matter port, vendor id and product id, and because the port is
+editable it coexists with the rig below rather than competing for 5540.
+
+### The virtual device
+
+`matter-server/tools/virtual-device.ts` is the device side, built on the matter.js
+already here for the controller. It needs no extra dependency and it can build two
+things MVD cannot:
+
+```bash
+cd matter-server
+
+# an ordinary device
+node --import tsx tools/virtual-device.ts --device dimmable-light
+
+# a COMPOSED device: one device whose function lives in child endpoints
+node --import tsx tools/virtual-device.ts --device oven \
+  --part temperature-controlled-cabinet --part cook-surface
+
+# a BRIDGE: one node, an Aggregator, and a separate device per child
+node --import tsx tools/virtual-device.ts --name "Virtual Hub" \
+  --bridged dimmable-light=Kitchen --bridged dimmable-light=Hall
+```
+
+It prints both pairing codes; paste either into the Devices tab. Once running,
+stdin provokes a subscription report rather than waiting for one:
+
+```
+set kitchen.onOff.onOff = true
+list
+quit
+```
+
+`--port` defaults to 5541 and should never be 5540 (see below). `--storage` is
+per-instance by default, so several can run at once. `@<number>` after a device
+forces its endpoint number — `--bridged basic-video-player=Telly@7 --part speaker@3`
+builds a bridged device sitting *above* its own part, which is what a real hub does
+and what breaks anything reading "the lowest endpoint carrying this cluster".
+
+**Some device types will not start bare, and that is matter.js being right.** It
+enforces Matter conformance on the device side, so a Door Lock with no `lockType`
+is refused rather than advertised. The tool reports exactly which attribute matter.js
+wanted, and `--attr` supplies it:
+
+```bash
+node --import tsx tools/virtual-device.ts --bridged door-lock=Front \
+  --attr front.doorLock.lockType=0 --attr front.doorLock.lockState=1 \
+  --attr front.doorLock.actuatorEnabled=true --attr front.doorLock.operatingMode=0 \
+  --attr front.doorLock.wrongCodeEntryLimit=5 --attr front.doorLock.userCodeTemporaryDisableTime=10
+```
+
+There is deliberately no built-in table of mandatory defaults for 81 device types:
+matter.js already knows, its message names the attribute, and a table would drift
+from the spec.
+
+**What this cannot tell you.** Both sides are matter.js, so it exercises GIAP's
+mappings rather than matter.js's conformance — which is the right target, since the
+mappings are what is in doubt, but it is not independent evidence the way MVD is.
+It uses test certificates, so attestation goes untested. And a virtual device is
+spec-perfect; real hardware ships wrong feature maps and absent optional attributes
+in ways nothing here will reproduce.
+
+The recorded snapshots in `matter-server/test/fixtures.ts` still carry the cluster
+logic's coverage without a fabric. What they cannot check is the wiring either side
+of them — that a description reaches chat, that a command leaves the socket, that an
+attribute a device publishes arrives decoded the way a fixture says it does. That is
+what MVD and the rig above are for.
 
 ### Ports, and why a device app may refuse to start
 
