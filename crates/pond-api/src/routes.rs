@@ -1690,546 +1690,845 @@ impl TurnAccumulator {
 /// outranks every other identification the pond can make. Passing it beside the
 /// body keeps the two provenances apart in the type signature, so a future
 /// author cannot reach for `req.device_id` because there is nothing to reach
+/// Shared SSE pipeline used by both `chat_stream` and `run_recipe`.
+///
+/// Callers handle activity touching, body parsing, and semaphore acquisition;
+/// this helper owns the full agent turn — session creation, system-prompt
+/// build, llamafile startup wait, ThoughtFilter, telemetry, memory extraction —
+/// and emits the same SSE event shape regardless of entry point.
+///
+/// `device` is separate from `req` on purpose (PAI-1 P9): `ChatRequest` is
+/// deserialised from a client-controlled body, and the paired-device rung
+/// outranks every other identification the pond can make. Passing it beside the
+/// body keeps the two provenances apart in the type signature, so a future
+/// author cannot reach for `req.device_id` because there is nothing to reach
 /// for.
+///
+/// The turn no longer *is* this response body. It is a task driving a
+/// [`crate::runs::RunHandle`], and what is returned here is a subscriber to it
+/// — see [`spawn_run`]. For this entry point the policy is
+/// [`RunPolicy::Ephemeral`], which reproduces the previous contract exactly:
+/// when the last subscriber leaves, the turn is cancelled.
 fn chat_stream_inner(
     state: Arc<AppState>,
     permit: tokio::sync::OwnedSemaphorePermit,
     req: ChatRequest,
     device: ProvenDevice,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let run = new_run(&req, &device, crate::runs::RunPolicy::Ephemeral);
+    spawn_run(state, permit, run, None, req, device)
+}
+
+/// Build a handle for a turn that has not started yet.
+///
+/// The session id is minted HERE rather than inside the turn, because the
+/// registry indexes runs by session and a client that restarted knows its
+/// session id and nothing else.
+fn new_run(
+    req: &ChatRequest,
+    device: &ProvenDevice,
+    policy: crate::runs::RunPolicy,
+) -> Arc<crate::runs::RunHandle> {
+    let session_id = req
+        .session_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let owner = match device.id() {
+        Some(id) => crate::runs::RunOwner::Device(id.to_string()),
+        None => crate::runs::RunOwner::Unattributed,
+    };
+    crate::runs::RunHandle::new(session_id, owner, policy)
+}
+
+/// Start the turn as an owned task and return an SSE body attached to it.
+///
+/// `run_permit` is the detached-run cap, held for the life of the TASK rather
+/// than the life of the response body. `permit` is the interactive
+/// `sse_semaphore` one and is held only while somebody is reading, which is
+/// what that semaphore's own documentation says it is counting.
+fn spawn_run(
+    state: Arc<AppState>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    run: Arc<crate::runs::RunHandle>,
+    run_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    req: ChatRequest,
+    device: ProvenDevice,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    tracing::info!(
+        target: "giap::runs",
+        run_id = %run.run_id,
+        session_id = %run.session_id,
+        policy = ?run.policy,
+        "agent run spawned"
+    );
+    tokio::spawn(run_turn(state.clone(), run.clone(), run_permit, req, device));
+    attach_sse(state, permit, run, 0, AttachKind::Original)
+}
+
+/// One agent turn, start to finish, whether or not anybody is listening.
+///
+/// This is the whole of what `chat_stream_inner`'s generator used to be, moved
+/// rather than copied — `stream_handler_parity.rs` forbids a second `match` on
+/// `AgentStreamEvent`, and the ordering it guards (scope before `ChatService`,
+/// persistence before the `done` frame) is preserved here unchanged. The only
+/// mechanical difference is that every `yield` is now a push onto the run.
+async fn run_turn(
+    state: Arc<AppState>,
+    run: Arc<crate::runs::RunHandle>,
+    run_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    req: ChatRequest,
+    device: ProvenDevice,
+) {
+    // Released when the task ends, not when a reader goes away.
+    let _run_permit = run_permit;
+    drive_turn(&state, &run, req, device).await;
+    // `finish` keeps the first terminal state, so a cancel that landed while
+    // the tail was still running is not relabelled as an ordinary finish.
+    run.finish(crate::runs::RunState::Finished);
+    tracing::info!(
+        target: "giap::runs",
+        run_id = %run.run_id,
+        state = ?run.state(),
+        last_seq = run.last_seq(),
+        "agent run finished"
+    );
+}
+
+async fn drive_turn(
+    state: &Arc<AppState>,
+    run: &Arc<crate::runs::RunHandle>,
+    req: ChatRequest,
+    device: ProvenDevice,
+) {
     use futures::StreamExt;
 
-    let stream = async_stream::stream! {
-        let _permit = permit;
-        let turn_start = std::time::Instant::now();
-        let session_id = req.session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-        let storage = &state.session_storage;
+    let turn_start = std::time::Instant::now();
+    let session_id = run.session_id.clone();
+    let storage = &state.session_storage;
 
-        // Ensure session exists
-        if storage.get_session(&session_id).await.is_err() {
-            if let Err(e) = storage.create_session(session_id.clone()).await {
-                let data = json!({"error": format!("Failed to create session: {}", e)}).to_string();
-                yield Ok(Event::default().data(data));
-                return;
+    // Ensure session exists
+    if storage.get_session(&session_id).await.is_err() {
+        if let Err(e) = storage.create_session(session_id.clone()).await {
+            let data = json!({"error": format!("Failed to create session: {}", e)}).to_string();
+            run.push(data, true);
+            run.finish(crate::runs::RunState::Failed);
+            return;
+        }
+    }
+
+    let settings = state.settings_repo.get().await.unwrap_or_default();
+
+    // No system prompt is built here. It used to be, into a `_system_prompt`
+    // that nothing read: `AgentRequest` has no system-prompt field, and the
+    // adapter builds the real one from `build_prompt_partition`. The block cost
+    // a disk read of `<data_dir>/prompts/system.md`, a Tera render of the 8 KB
+    // balanced template, an `Agent::list_tools` round trip and a tool-guidance
+    // format -- every turn, and on every recipe run -- and then dropped all of
+    // it. Editing that file to change behaviour changed nothing, which is the
+    // worse cost: it read as a working override.
+    //
+    // Two things rode on it and are therefore inert until deliberately rewired:
+    // `AppState::prompt_template_dir` (the file override above, superseded by
+    // the template repo the adapter reads) and `AppState::mcp_memory`, whose
+    // instructions were appended here and nowhere else.
+
+    let model_role = "chat";
+
+    // The same verdict the AgentRequest carries, so a turn's memory is
+    // WRITTEN under the identity it was READ under. Extraction stamps
+    // `profile_id` from this; before it, every fragment was unattributed
+    // and `Owner(id)` reads matched exactly what `Household` did.
+    let turn_scope = resolve_turn_scope(&state, &session_id, &device).await;
+
+    let mut chat_service = pond_core::shared::services::chat::ChatService::new(
+        state.agent.clone(),
+        session_id.clone(),
+        storage.clone(),
+    )
+    .with_profile_scope(turn_scope.clone())
+    // PAI-5 P6. The user's own choice, off by default. The `Thinking` arm
+    // below calls `record_thinking` unconditionally; this is what decides
+    // whether anything comes of it.
+    .with_thinking(settings.persist_thinking);
+    if let (Some(ext), Some(svc)) =
+        (state.memory_extractor.clone(), state.memory_extraction_service.clone())
+    {
+        chat_service = chat_service.with_memory_extraction(
+            ext,
+            svc,
+            state.memory_repo.clone(),
+        );
+    }
+    if let Some(event_log) = state.event_log.clone() {
+        chat_service = chat_service.with_event_log(event_log);
+    }
+
+    // ── Persist user message ────────────────────────────────────────────
+    // Phase F2: the images go in with the message so a follow-up turn can
+    // still see them after a trim, a compaction rebuild, or a restart.
+    if let Err(e) = chat_service
+        .persist_user_message_with_images(&req.message, req.images.clone())
+        .await
+    {
+        let data = json!({"error": format!("Failed to persist user message: {}", e)}).to_string();
+        run.push(data, true);
+        run.finish(crate::runs::RunState::Failed);
+        return;
+    }
+
+    // ── On-demand llamafile startup ─────────────────────────────────────
+    // If any role uses llamafile and the process is not responding, emit a
+    // status event and wait up to 90 s before attempting to stream.
+    {
+        let is_llamafile_role = settings.chat_provider == "llamafile";
+
+        if is_llamafile_role {
+            if let Some(manager) = &state.llamafile_manager {
+                if !manager.is_running().await {
+                    let status = json!({"type": "status", "content": "Model starting…"})
+                        .to_string();
+                    run.push(status, false);
+
+                    let model_hint = if settings.chat_provider == "llamafile" {
+                        Some(settings.chat_model.as_str())
+                    } else {
+                        None
+                    };
+
+                    let (_url, ready) = manager
+                        .ensure_started_and_wait(model_hint, 90)
+                        .await;
+
+                    if !ready {
+                        let data = json!({"error":
+                            "llamafile did not start within 90 s — \
+                             check that a model file is installed"
+                        }).to_string();
+                        run.push(data, true);
+                        run.finish(crate::runs::RunState::Failed);
+                        return;
+                    }
+                }
             }
         }
+    }
 
-        let settings = state.settings_repo.get().await.unwrap_or_default();
+    let mut usage_prompt_tokens: u32 = 0;
+    let mut usage_completion_tokens: u32 = 0;
+    let mut turn_stats: Option<pond_core::shared::domain::turn_stats::TurnStats> = None;
 
-        // No system prompt is built here. It used to be, into a `_system_prompt`
-        // that nothing read: `AgentRequest` has no system-prompt field, and the
-        // adapter builds the real one from `build_prompt_partition`. The block cost
-        // a disk read of `<data_dir>/prompts/system.md`, a Tera render of the 8 KB
-        // balanced template, an `Agent::list_tools` round trip and a tool-guidance
-        // format -- every turn, and on every recipe run -- and then dropped all of
-        // it. Editing that file to change behaviour changed nothing, which is the
-        // worse cost: it read as a working override.
-        //
-        // Two things rode on it and are therefore inert until deliberately rewired:
-        // `AppState::prompt_template_dir` (the file override above, superseded by
-        // the template repo the adapter reads) and `AppState::mcp_memory`, whose
-        // instructions were appended here and nowhere else.
+    let model_name_for_done = settings.chat_model.clone();
 
-        let model_role = "chat";
+    use pond_core::shared::domain::agent::AgentRequest;
 
-        // The same verdict the AgentRequest carries, so a turn's memory is
-        // WRITTEN under the identity it was READ under. Extraction stamps
-        // `profile_id` from this; before it, every fragment was unattributed
-        // and `Owner(id)` reads matched exactly what `Household` did.
-        let turn_scope = resolve_turn_scope(&state, &session_id, &device).await;
+    let agent_req = AgentRequest {
+        message: req.message.clone(),
+        session_id: session_id.clone(),
+        model_role: model_role.to_string(),
+        images: req.images.clone(),
+        voice_mode: req.voice_mode,
+        canvas_mode: req.canvas_mode,
+        profile_scope: turn_scope.clone(),
+        profile_context: profile_context_for(&state, &turn_scope).await,
+        tool_group_allowlist: req.tool_group_allowlist.clone(),
+    };
 
-        let mut chat_service = pond_core::shared::services::chat::ChatService::new(
-            state.agent.clone(),
-            session_id.clone(),
-            storage.clone(),
+    // The turn's own state: the visible answer, the tool results that go
+    // with it, and the per-tool timing this route reports as TurnMetrics.
+    // The filter strips Harmony-style `<|channel>thought ... <channel|>`
+    // preambles and `<think>…</think>` blocks out of the per-token stream;
+    // when show_thinking is enabled it captures them as SSE events instead.
+    // Voice mode always disables thinking capture.
+    let mut turn = TurnAccumulator::new(if settings.show_thinking && !req.voice_mode {
+        crate::thought_filter::ThoughtFilter::new().with_thinking_capture()
+    } else {
+        crate::thought_filter::ThoughtFilter::new()
+    });
+    let mut agent_stream = match state.agent.chat_stream(agent_req).await {
+        Ok(s) => s,
+        Err(e) => {
+            let data = json!({"error": e.to_string()}).to_string();
+            run.push(data, true);
+            run.finish(crate::runs::RunState::Failed);
+            return;
+        }
+    };
+
+    // ── Agent turn idle timeout ────────────────────────────────────
+    // Bound the SILENCE between stream events, not total generation.
+    // A slow reasoning model that streams continuously must never be
+    // killed; only a genuinely stalled stream (no event for
+    // `agent_timeout_secs`) trips the deadline. The deadline is reset
+    // after every event received below. When agent_timeout_secs is 0
+    // the timeout is disabled (24h sentinel keeps the path uniform).
+    let timeout_secs = settings.agent_timeout_secs;
+    let idle_budget = if timeout_secs == 0 {
+        std::time::Duration::from_secs(86_400) // effectively disabled
+    } else {
+        std::time::Duration::from_secs(timeout_secs)
+    };
+    let mut deadline = tokio::time::Instant::now() + idle_budget;
+    let mut timed_out = false;
+    let mut cancelled = false;
+
+    loop {
+        // Cancellation used to be the response body being dropped: the generator
+        // went with it, taking `agent_stream` and firing the adapter's own
+        // `DropGuard`. The turn is a task now, so that no longer happens by
+        // itself and has to be observed. `biased` so a cancel that arrives with
+        // events already queued still wins -- a voice barge-in that kept
+        // generating for another two sentences would be no barge-in at all.
+        let next = tokio::select! {
+            biased;
+            _ = run.cancel.cancelled() => {
+                cancelled = true;
+                tracing::info!(
+                    target: "giap::runs",
+                    run_id = %run.run_id,
+                    session_id = %session_id,
+                    "agent run cancelled; stopping the turn"
+                );
+                break;
+            }
+            next = tokio::time::timeout_at(deadline, agent_stream.next()) => next,
+        };
+        match next {
+            Ok(Some(event_result)) => {
+                // Progress observed — extend the idle window.
+                deadline = tokio::time::Instant::now() + idle_budget;
+                match event_result {
+                    Ok(event) => {
+                        match turn.absorb(event) {
+                            StreamStep::Nothing => {}
+                            StreamStep::Frame(data) => {
+                                run.push(data, false);
+                            }
+                            StreamStep::Reasoning { frame, block } => {
+                                // PAI-5 P6. Offer it to the persistence
+                                // owner; `record_thinking` drops it unless
+                                // the user turned `persist_thinking` on.
+                                // The SSE frame is unchanged either way --
+                                // showing it live and keeping it are
+                                // different consents.
+                                chat_service.record_thinking(block);
+                                run.push(frame, false);
+                            }
+                            StreamStep::TurnComplete { usage, stats } => {
+                                if let Some(u) = usage {
+                                    usage_prompt_tokens = u.prompt_tokens;
+                                    usage_completion_tokens = u.completion_tokens;
+                                }
+                                if let Some(s) = stats {
+                                    let payload = turn_stats_frame(&s);
+                                    turn_stats = Some(s);
+                                    run.push(payload, false);
+                                }
+                                // The `done` frame for this route is emitted
+                                // at the very end, after persistence and
+                                // telemetry, and carries the usage totals.
+                                continue;
+                            }
+                        }
+                        // Emit captured thinking blocks as SSE events (when show_thinking is on)
+                        for thinking_content in turn.thought.take_thinking() {
+                            let data = json!({"type": "thinking", "content": thinking_content}).to_string();
+                            run.push(data, false);
+                        }
+                        // After every push the filter may have captured a complete
+                        // tool-call envelope (`<|tool_call> ... <tool_call|>`).
+                        // The model emitted tool calls as Harmony text markup instead of
+                        // the structured protocol. Execute them directly as a fallback.
+                        for body in turn.thought.take_tool_calls() {
+                            if let Some((name, args)) = crate::thought_filter::parse_tool_envelope(&body) {
+                                tracing::info!(tool = %name, "Executing text-based tool call (model used Harmony format)");
+                                let call_id = uuid::Uuid::new_v4().to_string();
+                                let args_val: serde_json::Value = serde_json::from_str(&args).unwrap_or(json!({}));
+                                run.push(
+                                    json!({"type": "tool_call", "tool": name.clone(), "id": call_id.clone(), "input": args_val}).to_string(),
+                                    false,
+                                );
+                                let call_start = std::time::Instant::now();
+                                let call_result = state.agent.call_tool(&session_id, &name, &args).await;
+                                turn.note_fallback_tool(&name, call_start.elapsed());
+                                match call_result {
+                                    Ok(result_text) => {
+                                        let (clean, ui_hint) = extract_ui_hint(&result_text);
+                                        run.push(
+                                            tool_result_frame(&name, &call_id, &clean, ui_hint),
+                                            false,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        run.push(
+                                            tool_result_frame(&name, &call_id, &format!("Tool error: {e}"), None),
+                                            false,
+                                        );
+                                    }
+                                }
+                            } else {
+                                tracing::warn!("Unrecognised tool-call envelope: {body}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        let data = json!({"error": err_msg}).to_string();
+                        run.push(data, true);
+                        run.finish(crate::runs::RunState::Failed);
+                        return;
+                    }
+                }
+            }
+            Ok(None) => {
+                // Stream ended normally
+                break;
+            }
+            Err(_elapsed) => {
+                // Deadline exceeded — emit timeout error
+                timed_out = true;
+                tracing::warn!(
+                    session_id = %session_id,
+                    timeout_secs = timeout_secs,
+                    "Agent turn timed out"
+                );
+                let data = json!({"error": "Agent timed out. Try a shorter message or start a new session."}).to_string();
+                run.push(data, false);
+                break;
+            }
+        }
+    }
+
+    // Explicit, and this line is the cancellation. Dropping the agent stream
+    // fires the `DropGuard` the adapter holds inside it, which cancels the token
+    // handed to the agent loop and releases the authority lease and the device
+    // claim beside it. Letting scope do it would run everything below -- the
+    // review's second model call included -- while still holding that claim.
+    drop(agent_stream);
+
+    // Flush any tail buffered by the thought filter (e.g. text after the
+    // last `<channel|>` that had not yet exceeded the safe-emit threshold).
+    if !timed_out && !cancelled {
+        let tail = turn.thought.flush();
+        if !tail.is_empty() {
+            turn.full_text.push_str(&tail);
+            let data = json!({"type": "text", "content": tail, "token": tail}).to_string();
+            run.push(data, false);
+        }
+    }
+
+    // ── Adversarial answer review (post-inference) ───────────────
+    // When review_mode is "on", evaluate the answer before persisting.
+    // If the reviewer rejects it, revise and emit a review_revision
+    // event that the frontend uses to replace the text.
+    // Skipped when the agent timed out — no point reviewing a partial answer.
+    {
+        let should_review = !timed_out && !cancelled && match settings.review_mode.as_str() {
+            "on" => true,
+            "auto" => {
+                let msg = req.message.to_lowercase();
+                msg.contains('?')
+                    || msg.starts_with("what ")
+                    || msg.starts_with("how ")
+                    || msg.starts_with("why ")
+                    || msg.starts_with("explain ")
+                    || msg.starts_with("compare ")
+                    || msg.starts_with("analyze ")
+            }
+            _ => false,
+        };
+
+        if should_review {
+            if let Some(ref reviewer) = state.answer_reviewer {
+                let status = json!({"type": "review_status", "content": "Reviewing answer..."}).to_string();
+                run.push(status, false);
+
+                match reviewer.review(&req.message, &turn.full_text, None).await {
+                    Ok(result) if result.was_revised => {
+                        turn.full_text = result.final_answer.clone();
+                        let data = json!({
+                            "type": "review_revision",
+                            "content": result.final_answer,
+                            "score": result.verdict.score,
+                            "rounds": result.rounds,
+                        }).to_string();
+                        run.push(data, false);
+                    }
+                    Ok(result) => {
+                        let status = json!({
+                            "type": "review_status",
+                            "content": format!("Answer verified (score: {}/5)", result.verdict.score),
+                        }).to_string();
+                        run.push(status, false);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Answer review failed (non-fatal): {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Persist assistant turn + memory extraction ────────────────────
+    // `persist_assistant_turn_with_extraction` owns both concerns: it
+    // writes tool results / assistant text / usage to session_messages,
+    // then spawns memory extraction in the background. The handler cannot
+    // accidentally omit extraction by refactoring this block.
+    let _ = chat_service
+        .persist_assistant_turn_with_extraction(
+            std::mem::take(&mut turn.tool_results),
+            &turn.full_text,
+            Some((usage_prompt_tokens, usage_completion_tokens)),
+            Some(&model_name_for_done),
+            &req.message,
         )
-        .with_profile_scope(turn_scope.clone())
-        // PAI-5 P6. The user's own choice, off by default. The `Thinking` arm
-        // below calls `record_thinking` unconditionally; this is what decides
-        // whether anything comes of it.
-        .with_thinking(settings.persist_thinking);
-        if let (Some(ext), Some(svc)) =
-            (state.memory_extractor.clone(), state.memory_extraction_service.clone())
-        {
-            chat_service = chat_service.with_memory_extraction(
-                ext,
-                svc,
-                state.memory_repo.clone(),
+        .await;
+
+    // The turn's context window, resolved ONCE.
+    //
+    // Two consumers follow — per-turn telemetry and the context-growth
+    // monitor — and they used to resolve it independently. Telemetry went
+    // through `ContextGovernor`, whose documented precedence is
+    // EngineReported > Registry > CatalogRecord > Override > Heuristic. The
+    // monitor forty lines below took `context_window_override` when set and
+    // `capabilities().context_window_tokens` otherwise, which inverts that
+    // order and never consults the registry pin at all. On a Jetson pinned to
+    // 4096 with capabilities reporting 32768, the monitor read utilisation at
+    // roughly an eighth of the truth, so `context_warning` could not fire
+    // before the trimmer started dropping turns. Resolving once is the only
+    // way the two can be guaranteed to agree.
+    // Rung 3's input: the catalog row for the active chat model. Reached
+    // through `state.model_repo`, which is the same catalog the Models tab
+    // lists — so telemetry, the growth monitor and the UI are all quoting
+    // one number. Absent repo or absent row falls through to the rungs
+    // below, which is what happened for every turn before PAI-3 P3b.
+    let catalog_context_length = match &state.model_repo {
+        Some(repo) => {
+            let id = ModelRecord::id_for(
+                &ModelCategory::for_chat_provider(&settings.chat_provider),
+                &settings.chat_model,
             );
+            repo.get_by_id(&id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|m| m.context_length)
         }
-        if let Some(event_log) = state.event_log.clone() {
-            chat_service = chat_service.with_event_log(event_log);
+        None => None,
+    };
+
+    let turn_context_limit = ContextGovernor::resolve(&ContextInputs {
+        provider: &settings.chat_provider,
+        model: &settings.chat_model,
+        override_tokens: settings.context_window_override,
+        // Not reachable from the API layer; the adapter owns the registry
+        // lookup and reports the result via TurnStats.
+        registry_pinned: None,
+        catalog_context_length,
+        engine_reported: turn_stats
+            .as_ref()
+            .and_then(|s| s.context_limit_tokens)
+            .map(|t| EngineWindow::new(settings.chat_model.clone(), t)),
+        capability_window: Some(state.agent.capabilities().context_window_tokens),
+    })
+    .tokens as u32;
+
+    // ── Per-turn telemetry ──────────────────────────────────────────
+    if settings.telemetry_enabled {
+        if let Some(ref telemetry) = state.telemetry {
+            let total_latency_ms = turn_start.elapsed().as_millis() as u64;
+            // Prefer the engine's own TTFT; fall back to first-SSE-text time.
+            let ttft_ms = turn_stats
+                .as_ref()
+                .and_then(|s| s.ttft_ms)
+                .or_else(|| {
+                    turn.ttft.map(|t| t.duration_since(turn_start).as_millis() as u64)
+                })
+                .unwrap_or(total_latency_ms);
+
+            // Estimate turn number from existing telemetry for this session.
+            let existing_turns = telemetry
+                .get_turns(&session_id)
+                .await
+                .map(|v| v.len() as u32)
+                .unwrap_or(0);
+
+            let context_limit = turn_context_limit;
+            let context_used = turn_stats
+                .as_ref()
+                .and_then(|s| s.context_used_tokens)
+                .unwrap_or(usage_prompt_tokens + usage_completion_tokens);
+            let context_utilization_pct = if context_limit > 0 {
+                (context_used as f32 / context_limit as f32) * 100.0
+            } else {
+                0.0
+            };
+
+            let metrics = pond_core::security::domain::turn_metrics::TurnMetrics {
+                session_id: session_id.clone(),
+                turn_number: existing_turns + 1,
+                prompt_tokens: usage_prompt_tokens,
+                completion_tokens: usage_completion_tokens,
+                ttft_ms,
+                total_latency_ms,
+                // PAI-3 / PAI-4 read this. The accumulator gathers it from
+                // the `ToolCall` / `ToolResult` pair and from the Harmony
+                // fallback above; losing it is a silent regression in a
+                // different workstream, not a cosmetic one.
+                tool_name: turn.last_tool_name.clone(),
+                tool_latency_ms: turn.last_tool_latency_ms,
+                tool_cache_hit: None,
+                context_utilization_pct,
+                model_name: model_name_for_done.clone(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                prefill_ms: turn_stats.as_ref().and_then(|s| s.prefill_ms),
+                model_load_ms: turn_stats.as_ref().and_then(|s| s.model_load_ms),
+                decode_tok_per_sec: turn_stats.as_ref().and_then(|s| s.decode_tok_per_sec),
+                prefill_tok_per_sec: turn_stats.as_ref().and_then(|s| s.prefill_tok_per_sec),
+                context_limit_tokens: turn_stats.as_ref().and_then(|s| s.context_limit_tokens),
+                inference_count: turn_stats.as_ref().map(|s| s.inference_count),
+                // What thinking cost, and what it cost when it went wrong.
+                // `reasoning_tokens` stays Option all the way down: a turn
+                // from a provider that reports no stats has not been
+                // measured, and that is a different fact from a turn that
+                // did no thinking. `reengagements` is a plain count on
+                // `TurnStats`, so the only Nones here are turns with no
+                // stats at all.
+                reasoning_tokens: turn_stats.as_ref().and_then(|s| s.reasoning_tokens),
+                reengagements: turn_stats.as_ref().map(|s| s.reengagements),
+            };
+
+            if let Err(e) = telemetry.record_turn(metrics).await {
+                tracing::debug!(target: "giap::telemetry", "failed to record turn metrics: {e}");
+            }
+        }
+    }
+
+    // ── Context growth monitoring ─────────────────────────────────
+    if settings.context_monitor_enabled {
+        let estimated_tokens = usage_prompt_tokens + usage_completion_tokens;
+        let context_limit = turn_context_limit;
+
+        if estimated_tokens > 0 && context_limit > 0 {
+            state.context_monitor.record_turn(
+                &session_id,
+                estimated_tokens,
+                context_limit,
+            );
+
+            let health = state.context_monitor.check_context_health(&session_id);
+
+            if let Some(ref warning) = health.warning {
+                tracing::warn!(
+                    session_id = %session_id,
+                    utilization_pct = health.utilization_pct,
+                    turns_remaining = health.estimated_turns_remaining,
+                    "{}",
+                    warning,
+                );
+            }
+
+            if health.should_compact {
+                let data = json!({
+                    "type": "context_warning",
+                    "utilization_pct": health.utilization_pct,
+                    "turns_remaining": health.estimated_turns_remaining,
+                    "avg_growth_rate": health.avg_growth_rate,
+                    "warning": health.warning,
+                }).to_string();
+                run.push(data, false);
+
+                // PAI-4 P6: and then actually do something about it. Until
+                // this phase the frame above was the entire response to a
+                // filling context window — the server warned the client and
+                // took no action itself.
+                //
+                // This call spawns and returns; it must stay that way. We
+                // are inside the SSE generator, the `done` frame below is
+                // still unsent, and invariant 1 is that compaction never
+                // blocks a turn, ever. Doing the work here — the obvious
+                // reading of "act on should_compact" — would put a
+                // summarisation model call between the user's last token and
+                // the end of their stream, on the tier that can least afford
+                // it. Everything real happens in the detached task.
+                spawn_pressure_compaction(&state, &session_id);
+            }
+        }
+    }
+
+    // Record how the turn actually ended BEFORE the terminal frame goes out, so
+    // a client that reads `state` from the discovery route and a client reading
+    // the frame cannot disagree. `finish` keeps the first terminal state, so the
+    // cancel path below does not overwrite a state an explicit stop already set.
+    if cancelled {
+        run.finish(crate::runs::RunState::Cancelled);
+        let data = json!({
+            "type": "cancelled",
+            "run_id": run.run_id,
+            "at_seq": run.last_seq(),
+        }).to_string();
+        run.push(data, false);
+    } else if timed_out {
+        run.finish(crate::runs::RunState::Failed);
+    }
+
+    // Done event
+    let data = json!({
+        "done": true,
+        "interrupted": cancelled || timed_out,
+        "run_id": run.run_id,
+        "session_id": session_id,
+        "model_role": model_role,
+        "model_name": model_name_for_done,
+        "usage": {
+            "prompt_tokens": usage_prompt_tokens,
+            "completion_tokens": usage_completion_tokens,
+        }
+    }).to_string();
+    run.push(data, true);
+}
+
+/// Whether this subscriber started the turn or came back to it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AttachKind {
+    Original,
+    Reattach,
+}
+
+/// One subscriber: replay what it missed, then follow the live tail.
+///
+/// The same shape `notifications_stream` uses, and for the same reason. The
+/// ordering of the two lines that open it is load-bearing: subscribing BEFORE
+/// reading the snapshot is what stops a frame produced between the two from
+/// being missed by both paths.
+fn attach_sse(
+    state: Arc<AppState>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    run: Arc<crate::runs::RunHandle>,
+    after_seq: u64,
+    kind: AttachKind,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let guard = run.attach();
+    let mut rx = run.subscribe();
+    let snapshot = run.snapshot(after_seq);
+    let epoch = state.runs.epoch.clone();
+
+    tracing::info!(
+        target: "giap::runs",
+        run_id = %run.run_id,
+        kind = ?kind,
+        from_seq = after_seq,
+        replay_depth = snapshot.frames.len(),
+        gap = ?snapshot.gap,
+        state = ?snapshot.state,
+        "client attached to run"
+    );
+
+    let stream = async_stream::stream! {
+        // Held only while somebody is reading. The turn does not care.
+        let _permit = permit;
+        let _guard = guard;
+
+        if kind == AttachKind::Reattach {
+            let data = json!({
+                "type": "reattached",
+                "run_id": run.run_id,
+                "session_id": run.session_id,
+                "from_seq": after_seq,
+                "replay_depth": snapshot.frames.len(),
+                "state": snapshot.state,
+                "epoch": epoch,
+            }).to_string();
+            yield Ok(Event::default().data(data));
         }
 
-        // ── Persist user message ────────────────────────────────────────────
-        // Phase F2: the images go in with the message so a follow-up turn can
-        // still see them after a trim, a compaction rebuild, or a restart.
-        if let Err(e) = chat_service
-            .persist_user_message_with_images(&req.message, req.images.clone())
-            .await
-        {
-            let data = json!({"error": format!("Failed to persist user message: {}", e)}).to_string();
+        // The ring rolled past where this client was. Say so: it has genuinely
+        // lost frames, and reloading the session is the only honest recovery.
+        if let Some(first_available) = snapshot.gap {
+            let data = json!({
+                "type": "replay_gap",
+                "requested_after_seq": after_seq,
+                "first_available_seq": first_available,
+                "advice": "reload_session_messages",
+            }).to_string();
             yield Ok(Event::default().data(data));
+        }
+
+        let mut sent = after_seq;
+        let saw_terminal = snapshot.saw_terminal;
+        for frame in snapshot.frames {
+            sent = frame.seq;
+            yield Ok(Event::default().id(frame.seq.to_string()).data(frame.payload.to_string()));
+        }
+        if saw_terminal {
             return;
         }
 
-        // ── On-demand llamafile startup ─────────────────────────────────────
-        // If any role uses llamafile and the process is not responding, emit a
-        // status event and wait up to 90 s before attempting to stream.
-        {
-            let is_llamafile_role = settings.chat_provider == "llamafile";
-
-            if is_llamafile_role {
-                if let Some(manager) = &state.llamafile_manager {
-                    if !manager.is_running().await {
-                        let status = json!({"type": "status", "content": "Model starting…"})
-                            .to_string();
-                        yield Ok(Event::default().data(status));
-
-                        let model_hint = if settings.chat_provider == "llamafile" {
-                            Some(settings.chat_model.as_str())
-                        } else {
-                            None
-                        };
-
-                        let (_url, ready) = manager
-                            .ensure_started_and_wait(model_hint, 90)
-                            .await;
-
-                        if !ready {
-                            let data = json!({"error":
-                                "llamafile did not start within 90 s — \
-                                 check that a model file is installed"
-                            }).to_string();
-                            yield Ok(Event::default().data(data));
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut usage_prompt_tokens: u32 = 0;
-        let mut usage_completion_tokens: u32 = 0;
-        let mut turn_stats: Option<pond_core::shared::domain::turn_stats::TurnStats> = None;
-
-        let model_name_for_done = settings.chat_model.clone();
-
-        use pond_core::shared::domain::agent::AgentRequest;
-
-        let agent_req = AgentRequest {
-            message: req.message.clone(),
-            session_id: session_id.clone(),
-            model_role: model_role.to_string(),
-            images: req.images.clone(),
-            voice_mode: req.voice_mode,
-            canvas_mode: req.canvas_mode,
-            profile_scope: turn_scope.clone(),
-            profile_context: profile_context_for(&state, &turn_scope).await,
-            tool_group_allowlist: req.tool_group_allowlist.clone(),
-        };
-
-        // The turn's own state: the visible answer, the tool results that go
-        // with it, and the per-tool timing this route reports as TurnMetrics.
-        // The filter strips Harmony-style `<|channel>thought ... <channel|>`
-        // preambles and `<think>…</think>` blocks out of the per-token stream;
-        // when show_thinking is enabled it captures them as SSE events instead.
-        // Voice mode always disables thinking capture.
-        let mut turn = TurnAccumulator::new(if settings.show_thinking && !req.voice_mode {
-            crate::thought_filter::ThoughtFilter::new().with_thinking_capture()
-        } else {
-            crate::thought_filter::ThoughtFilter::new()
-        });
-        let mut agent_stream = match state.agent.chat_stream(agent_req).await {
-            Ok(s) => s,
-            Err(e) => {
-                let data = json!({"error": e.to_string()}).to_string();
-                yield Ok(Event::default().data(data));
-                return;
-            }
-        };
-
-        // ── Agent turn idle timeout ────────────────────────────────────
-        // Bound the SILENCE between stream events, not total generation.
-        // A slow reasoning model that streams continuously must never be
-        // killed; only a genuinely stalled stream (no event for
-        // `agent_timeout_secs`) trips the deadline. The deadline is reset
-        // after every event received below. When agent_timeout_secs is 0
-        // the timeout is disabled (24h sentinel keeps the path uniform).
-        let timeout_secs = settings.agent_timeout_secs;
-        let idle_budget = if timeout_secs == 0 {
-            std::time::Duration::from_secs(86_400) // effectively disabled
-        } else {
-            std::time::Duration::from_secs(timeout_secs)
-        };
-        let mut deadline = tokio::time::Instant::now() + idle_budget;
-        let mut timed_out = false;
-
         loop {
-            match tokio::time::timeout_at(deadline, agent_stream.next()).await {
-                Ok(Some(event_result)) => {
-                    // Progress observed — extend the idle window.
-                    deadline = tokio::time::Instant::now() + idle_budget;
-                    match event_result {
-                        Ok(event) => {
-                            match turn.absorb(event) {
-                                StreamStep::Nothing => {}
-                                StreamStep::Frame(data) => {
-                                    yield Ok(Event::default().data(data));
-                                }
-                                StreamStep::Reasoning { frame, block } => {
-                                    // PAI-5 P6. Offer it to the persistence
-                                    // owner; `record_thinking` drops it unless
-                                    // the user turned `persist_thinking` on.
-                                    // The SSE frame is unchanged either way --
-                                    // showing it live and keeping it are
-                                    // different consents.
-                                    chat_service.record_thinking(block);
-                                    yield Ok(Event::default().data(frame));
-                                }
-                                StreamStep::TurnComplete { usage, stats } => {
-                                    if let Some(u) = usage {
-                                        usage_prompt_tokens = u.prompt_tokens;
-                                        usage_completion_tokens = u.completion_tokens;
-                                    }
-                                    if let Some(s) = stats {
-                                        let payload = turn_stats_frame(&s);
-                                        turn_stats = Some(s);
-                                        yield Ok(Event::default().data(payload));
-                                    }
-                                    // The `done` frame for this route is emitted
-                                    // at the very end, after persistence and
-                                    // telemetry, and carries the usage totals.
-                                    continue;
-                                }
-                            }
-                            // Emit captured thinking blocks as SSE events (when show_thinking is on)
-                            for thinking_content in turn.thought.take_thinking() {
-                                let data = json!({"type": "thinking", "content": thinking_content}).to_string();
-                                yield Ok(Event::default().data(data));
-                            }
-                            // After every push the filter may have captured a complete
-                            // tool-call envelope (`<|tool_call> ... <tool_call|>`).
-                            // The model emitted tool calls as Harmony text markup instead of
-                            // the structured protocol. Execute them directly as a fallback.
-                            for body in turn.thought.take_tool_calls() {
-                                if let Some((name, args)) = crate::thought_filter::parse_tool_envelope(&body) {
-                                    tracing::info!(tool = %name, "Executing text-based tool call (model used Harmony format)");
-                                    let call_id = uuid::Uuid::new_v4().to_string();
-                                    let args_val: serde_json::Value = serde_json::from_str(&args).unwrap_or(json!({}));
-                                    yield Ok(Event::default().data(
-                                        json!({"type": "tool_call", "tool": name.clone(), "id": call_id.clone(), "input": args_val}).to_string()
-                                    ));
-                                    let call_start = std::time::Instant::now();
-                                    let call_result = state.agent.call_tool(&session_id, &name, &args).await;
-                                    turn.note_fallback_tool(&name, call_start.elapsed());
-                                    match call_result {
-                                        Ok(result_text) => {
-                                            let (clean, ui_hint) = extract_ui_hint(&result_text);
-                                            yield Ok(Event::default().data(
-                                                tool_result_frame(&name, &call_id, &clean, ui_hint)
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            yield Ok(Event::default().data(
-                                                tool_result_frame(&name, &call_id, &format!("Tool error: {e}"), None)
-                                            ));
-                                        }
-                                    }
-                                } else {
-                                    tracing::warn!("Unrecognised tool-call envelope: {body}");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let err_msg = e.to_string();
-                            let data = json!({"error": err_msg}).to_string();
-                            yield Ok(Event::default().data(data));
-                            return;
-                        }
+            match rx.recv().await {
+                // Already replayed from the snapshot.
+                Ok(frame) if frame.seq <= sent => continue,
+                Ok(frame) => {
+                    let terminal = frame.terminal;
+                    sent = frame.seq;
+                    yield Ok(Event::default().id(frame.seq.to_string()).data(frame.payload.to_string()));
+                    if terminal {
+                        break;
                     }
                 }
-                Ok(None) => {
-                    // Stream ended normally
-                    break;
-                }
-                Err(_elapsed) => {
-                    // Deadline exceeded — emit timeout error
-                    timed_out = true;
+                // Not an error on the wire, and this is what the ring is for:
+                // it holds strictly more than the broadcast queue can drop, so
+                // everything this subscriber missed is still there to re-read.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     tracing::warn!(
-                        session_id = %session_id,
-                        timeout_secs = timeout_secs,
-                        "Agent turn timed out"
+                        target: "giap::runs",
+                        run_id = %run.run_id,
+                        lagged = n,
+                        from_seq = sent,
+                        "attached client lagged; recovering from the replay buffer"
                     );
-                    let data = json!({"error": "Agent timed out. Try a shorter message or start a new session."}).to_string();
-                    yield Ok(Event::default().data(data));
-                    break;
-                }
-            }
-        }
-
-        // Flush any tail buffered by the thought filter (e.g. text after the
-        // last `<channel|>` that had not yet exceeded the safe-emit threshold).
-        if !timed_out {
-            let tail = turn.thought.flush();
-            if !tail.is_empty() {
-                turn.full_text.push_str(&tail);
-                let data = json!({"type": "text", "content": tail, "token": tail}).to_string();
-                yield Ok(Event::default().data(data));
-            }
-        }
-
-        // ── Adversarial answer review (post-inference) ───────────────
-        // When review_mode is "on", evaluate the answer before persisting.
-        // If the reviewer rejects it, revise and emit a review_revision
-        // event that the frontend uses to replace the text.
-        // Skipped when the agent timed out — no point reviewing a partial answer.
-        {
-            let should_review = !timed_out && match settings.review_mode.as_str() {
-                "on" => true,
-                "auto" => {
-                    let msg = req.message.to_lowercase();
-                    msg.contains('?')
-                        || msg.starts_with("what ")
-                        || msg.starts_with("how ")
-                        || msg.starts_with("why ")
-                        || msg.starts_with("explain ")
-                        || msg.starts_with("compare ")
-                        || msg.starts_with("analyze ")
-                }
-                _ => false,
-            };
-
-            if should_review {
-                if let Some(ref reviewer) = state.answer_reviewer {
-                    let status = json!({"type": "review_status", "content": "Reviewing answer..."}).to_string();
-                    yield Ok(Event::default().data(status));
-
-                    match reviewer.review(&req.message, &turn.full_text, None).await {
-                        Ok(result) if result.was_revised => {
-                            turn.full_text = result.final_answer.clone();
-                            let data = json!({
-                                "type": "review_revision",
-                                "content": result.final_answer,
-                                "score": result.verdict.score,
-                                "rounds": result.rounds,
-                            }).to_string();
-                            yield Ok(Event::default().data(data));
-                        }
-                        Ok(result) => {
-                            let status = json!({
-                                "type": "review_status",
-                                "content": format!("Answer verified (score: {}/5)", result.verdict.score),
-                            }).to_string();
-                            yield Ok(Event::default().data(status));
-                        }
-                        Err(e) => {
-                            tracing::warn!("Answer review failed (non-fatal): {}", e);
+                    let recovered = run.snapshot(sent);
+                    if let Some(first_available) = recovered.gap {
+                        let data = json!({
+                            "type": "replay_gap",
+                            "requested_after_seq": sent,
+                            "first_available_seq": first_available,
+                            "advice": "reload_session_messages",
+                        }).to_string();
+                        yield Ok(Event::default().data(data));
+                    }
+                    let mut done = false;
+                    for frame in recovered.frames {
+                        sent = frame.seq;
+                        done = frame.terminal;
+                        yield Ok(Event::default().id(frame.seq.to_string()).data(frame.payload.to_string()));
+                        if done {
+                            break;
                         }
                     }
+                    if done {
+                        break;
+                    }
                 }
-            }
-        }
-
-        // ── Persist assistant turn + memory extraction ────────────────────
-        // `persist_assistant_turn_with_extraction` owns both concerns: it
-        // writes tool results / assistant text / usage to session_messages,
-        // then spawns memory extraction in the background. The handler cannot
-        // accidentally omit extraction by refactoring this block.
-        let _ = chat_service
-            .persist_assistant_turn_with_extraction(
-                std::mem::take(&mut turn.tool_results),
-                &turn.full_text,
-                Some((usage_prompt_tokens, usage_completion_tokens)),
-                Some(&model_name_for_done),
-                &req.message,
-            )
-            .await;
-
-        // The turn's context window, resolved ONCE.
-        //
-        // Two consumers follow — per-turn telemetry and the context-growth
-        // monitor — and they used to resolve it independently. Telemetry went
-        // through `ContextGovernor`, whose documented precedence is
-        // EngineReported > Registry > CatalogRecord > Override > Heuristic. The
-        // monitor forty lines below took `context_window_override` when set and
-        // `capabilities().context_window_tokens` otherwise, which inverts that
-        // order and never consults the registry pin at all. On a Jetson pinned to
-        // 4096 with capabilities reporting 32768, the monitor read utilisation at
-        // roughly an eighth of the truth, so `context_warning` could not fire
-        // before the trimmer started dropping turns. Resolving once is the only
-        // way the two can be guaranteed to agree.
-        // Rung 3's input: the catalog row for the active chat model. Reached
-        // through `state.model_repo`, which is the same catalog the Models tab
-        // lists — so telemetry, the growth monitor and the UI are all quoting
-        // one number. Absent repo or absent row falls through to the rungs
-        // below, which is what happened for every turn before PAI-3 P3b.
-        let catalog_context_length = match &state.model_repo {
-            Some(repo) => {
-                let id = ModelRecord::id_for(
-                    &ModelCategory::for_chat_provider(&settings.chat_provider),
-                    &settings.chat_model,
-                );
-                repo.get_by_id(&id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|m| m.context_length)
-            }
-            None => None,
-        };
-
-        let turn_context_limit = ContextGovernor::resolve(&ContextInputs {
-            provider: &settings.chat_provider,
-            model: &settings.chat_model,
-            override_tokens: settings.context_window_override,
-            // Not reachable from the API layer; the adapter owns the registry
-            // lookup and reports the result via TurnStats.
-            registry_pinned: None,
-            catalog_context_length,
-            engine_reported: turn_stats
-                .as_ref()
-                .and_then(|s| s.context_limit_tokens)
-                .map(|t| EngineWindow::new(settings.chat_model.clone(), t)),
-            capability_window: Some(state.agent.capabilities().context_window_tokens),
-        })
-        .tokens as u32;
-
-        // ── Per-turn telemetry ──────────────────────────────────────────
-        if settings.telemetry_enabled {
-            if let Some(ref telemetry) = state.telemetry {
-                let total_latency_ms = turn_start.elapsed().as_millis() as u64;
-                // Prefer the engine's own TTFT; fall back to first-SSE-text time.
-                let ttft_ms = turn_stats
-                    .as_ref()
-                    .and_then(|s| s.ttft_ms)
-                    .or_else(|| {
-                        turn.ttft.map(|t| t.duration_since(turn_start).as_millis() as u64)
-                    })
-                    .unwrap_or(total_latency_ms);
-
-                // Estimate turn number from existing telemetry for this session.
-                let existing_turns = telemetry
-                    .get_turns(&session_id)
-                    .await
-                    .map(|v| v.len() as u32)
-                    .unwrap_or(0);
-
-                let context_limit = turn_context_limit;
-                let context_used = turn_stats
-                    .as_ref()
-                    .and_then(|s| s.context_used_tokens)
-                    .unwrap_or(usage_prompt_tokens + usage_completion_tokens);
-                let context_utilization_pct = if context_limit > 0 {
-                    (context_used as f32 / context_limit as f32) * 100.0
-                } else {
-                    0.0
-                };
-
-                let metrics = pond_core::security::domain::turn_metrics::TurnMetrics {
-                    session_id: session_id.clone(),
-                    turn_number: existing_turns + 1,
-                    prompt_tokens: usage_prompt_tokens,
-                    completion_tokens: usage_completion_tokens,
-                    ttft_ms,
-                    total_latency_ms,
-                    // PAI-3 / PAI-4 read this. The accumulator gathers it from
-                    // the `ToolCall` / `ToolResult` pair and from the Harmony
-                    // fallback above; losing it is a silent regression in a
-                    // different workstream, not a cosmetic one.
-                    tool_name: turn.last_tool_name.clone(),
-                    tool_latency_ms: turn.last_tool_latency_ms,
-                    tool_cache_hit: None,
-                    context_utilization_pct,
-                    model_name: model_name_for_done.clone(),
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    prefill_ms: turn_stats.as_ref().and_then(|s| s.prefill_ms),
-                    model_load_ms: turn_stats.as_ref().and_then(|s| s.model_load_ms),
-                    decode_tok_per_sec: turn_stats.as_ref().and_then(|s| s.decode_tok_per_sec),
-                    prefill_tok_per_sec: turn_stats.as_ref().and_then(|s| s.prefill_tok_per_sec),
-                    context_limit_tokens: turn_stats.as_ref().and_then(|s| s.context_limit_tokens),
-                    inference_count: turn_stats.as_ref().map(|s| s.inference_count),
-                    // What thinking cost, and what it cost when it went wrong.
-                    // `reasoning_tokens` stays Option all the way down: a turn
-                    // from a provider that reports no stats has not been
-                    // measured, and that is a different fact from a turn that
-                    // did no thinking. `reengagements` is a plain count on
-                    // `TurnStats`, so the only Nones here are turns with no
-                    // stats at all.
-                    reasoning_tokens: turn_stats.as_ref().and_then(|s| s.reasoning_tokens),
-                    reengagements: turn_stats.as_ref().map(|s| s.reengagements),
-                };
-
-                if let Err(e) = telemetry.record_turn(metrics).await {
-                    tracing::debug!(target: "giap::telemetry", "failed to record turn metrics: {e}");
-                }
-            }
-        }
-
-        // ── Context growth monitoring ─────────────────────────────────
-        if settings.context_monitor_enabled {
-            let estimated_tokens = usage_prompt_tokens + usage_completion_tokens;
-            let context_limit = turn_context_limit;
-
-            if estimated_tokens > 0 && context_limit > 0 {
-                state.context_monitor.record_turn(
-                    &session_id,
-                    estimated_tokens,
-                    context_limit,
-                );
-
-                let health = state.context_monitor.check_context_health(&session_id);
-
-                if let Some(ref warning) = health.warning {
+                // The sender lives on the handle in the registry, so this means
+                // the handle went away underneath an attached client. Never go
+                // silent about it.
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     tracing::warn!(
-                        session_id = %session_id,
-                        utilization_pct = health.utilization_pct,
-                        turns_remaining = health.estimated_turns_remaining,
-                        "{}",
-                        warning,
+                        target: "giap::runs",
+                        run_id = %run.run_id,
+                        at_seq = sent,
+                        "run dropped while a client was attached"
                     );
-                }
-
-                if health.should_compact {
                     let data = json!({
-                        "type": "context_warning",
-                        "utilization_pct": health.utilization_pct,
-                        "turns_remaining": health.estimated_turns_remaining,
-                        "avg_growth_rate": health.avg_growth_rate,
-                        "warning": health.warning,
+                        "type": "run_evicted",
+                        "run_id": run.run_id,
+                        "advice": "reload_session_messages",
                     }).to_string();
                     yield Ok(Event::default().data(data));
-
-                    // PAI-4 P6: and then actually do something about it. Until
-                    // this phase the frame above was the entire response to a
-                    // filling context window — the server warned the client and
-                    // took no action itself.
-                    //
-                    // This call spawns and returns; it must stay that way. We
-                    // are inside the SSE generator, the `done` frame below is
-                    // still unsent, and invariant 1 is that compaction never
-                    // blocks a turn, ever. Doing the work here — the obvious
-                    // reading of "act on should_compact" — would put a
-                    // summarisation model call between the user's last token and
-                    // the end of their stream, on the tier that can least afford
-                    // it. Everything real happens in the detached task.
-                    spawn_pressure_compaction(&state, &session_id);
+                    break;
                 }
             }
         }
-
-        // Done event
-        let data = json!({
-            "done": true,
-            "session_id": session_id,
-            "model_role": model_role,
-            "model_name": model_name_for_done,
-            "usage": {
-                "prompt_tokens": usage_prompt_tokens,
-                "completion_tokens": usage_completion_tokens,
-            }
-        }).to_string();
-        yield Ok(Event::default().data(data));
     };
 
     Sse::new(stream).keep_alive(KeepAlive::default())
