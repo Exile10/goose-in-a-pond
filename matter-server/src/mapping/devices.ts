@@ -126,6 +126,10 @@ const DEVICE_TYPES: ReadonlyMap<number, string> = new Map([
   // Dimmer Switch): those drive other devices, and claiming a mapping nobody has
   // held a device against is how a plug arrived wearing a lightbulb.
   [0x000f, "switch"], // Generic Switch
+  // A hub that speaks for other devices. Not drivable itself, and deliberately a
+  // device anyway: it is the physical thing on the shelf, it owns the fabric
+  // membership, and it is the only thing `decommission` can act on.
+  [0x000e, "bridge"], // Aggregator
   // Appliances
   [0x0073, "appliance"], // Laundry Washer
   [0x0075, "appliance"], // Dishwasher
@@ -310,32 +314,75 @@ function typeOf(node: NodeSnapshot): string {
   return "matter";
 }
 
-function basicInfo(node: NodeSnapshot, attribute: string): string | undefined {
-  const value = rootAttribute(node, CLUSTER_BASIC_INFORMATION, attribute);
+function nonEmpty(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+function basicInfo(node: NodeSnapshot, attribute: string): string | undefined {
+  return nonEmpty(rootAttribute(node, CLUSTER_BASIC_INFORMATION, attribute));
+}
+
+/** What a bridged device says about itself, which its hub relays on its behalf. */
+function bridgedInfo(node: NodeSnapshot, attribute: string): string | undefined {
+  if (node.rootEndpoint === undefined) return undefined;
+  const own = node.endpoints.find(e => e.number === node.rootEndpoint);
+  return nonEmpty(own?.clusters[CLUSTER_BRIDGED_DEVICE_INFO]?.[attribute]);
+}
+
+/**
+ * Is this bridged device reachable, as its hub reports it?
+ *
+ * Fails OPEN: an unstated `reachable` means yes. `bridgedDeviceBasicInformation`
+ * populates from a subscription report like everything else, so treating "not said
+ * yet" as unreachable would show a dozen offline devices behind a perfectly healthy
+ * hub for the first seconds of its life. Same rule, and the same reason, as
+ * `clusterHasFeature`: keep the answer that works rather than withholding it.
+ */
+function bridgedReachable(node: NodeSnapshot): boolean {
+  if (node.rootEndpoint === undefined) return true;
+  const own = node.endpoints.find(e => e.number === node.rootEndpoint);
+  return own?.clusters[CLUSTER_BRIDGED_DEVICE_INFO]?.["reachable"] !== false;
+}
+
 /**
  * Naming follows what production controllers do — take the device's own identity,
- * best source first:
- *   1. Basic Information `nodeLabel` — the user-assigned name;
- *   2. Basic Information `productName` — the vendor's ("Hue color lamp");
- *   3. `"<Type> <node_id>"` (e.g. "Light 2") — a clean, speakable fallback.
+ * best source first. For a bridged device that identity is on its own endpoint,
+ * relayed by the hub, and only then does the hub's own name apply:
+ *   1. `bridgedDeviceBasicInformation` `nodeLabel`, `productName`, `vendorName`;
+ *   2. Basic Information `nodeLabel` — the user-assigned name;
+ *   3. Basic Information `productName` — the vendor's ("Hue color lamp");
+ *   4. `"<Type> <node_id>"`, plus the endpoint for a bridged device.
+ *
+ * The fallback must be UNIQUE, which is why it carries the endpoint. Hubs that
+ * report nothing about their children are ordinary, and twelve devices all named
+ * "Light 90" would make `resolve_device` answer `Ambiguous` for every one of them —
+ * and because its last tier matches on device type, "the light" would stop resolving
+ * for standalone lights on entirely different nodes. A bridge would break devices it
+ * has nothing to do with.
  */
 export function nodeToDevice(node: NodeSnapshot): Device {
   const device_type = typeOf(node);
+  const suffix =
+    node.rootEndpoint === undefined
+      ? node.nodeId.toString()
+      : `${node.nodeId.toString()}-${node.rootEndpoint}`;
   const name =
+    bridgedInfo(node, "nodeLabel") ??
+    bridgedInfo(node, "productName") ??
+    bridgedInfo(node, "vendorName") ??
     basicInfo(node, "nodeLabel") ??
     basicInfo(node, "productName") ??
-    `${device_type.charAt(0).toUpperCase()}${device_type.slice(1)} ${node.nodeId.toString()}`;
+    `${device_type.charAt(0).toUpperCase()}${device_type.slice(1)} ${suffix}`;
 
   return {
-    id: deviceIdForNode(node.nodeId),
+    id: deviceIdForNode(node.nodeId, node.rootEndpoint),
     name,
     device_type,
     capabilities: capabilitiesOf(node),
-    online: node.online,
+    // A bridged device is only as reachable as its hub, and its hub may know it is
+    // not: a Zigbee bulb whose battery died is still behind a healthy bridge.
+    online: node.online && bridgedReachable(node),
   };
 }

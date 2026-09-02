@@ -19,7 +19,10 @@ import { describeNode } from "./mapping/describe.js";
 import { stateOf } from "./mapping/state.js";
 import { readingFor, sensorClusters } from "./mapping/sensors.js";
 import {
+  applicationEndpoints,
+  deviceSlices,
   isVendorCluster,
+  sliceForEndpoint,
   type ClusterState,
   type EndpointSnapshot,
   type NodeSnapshot,
@@ -29,6 +32,7 @@ import {
   OpError,
   deviceIdForNode,
   nodeIdFromDeviceId,
+  partsOfDeviceId,
   type Device,
   type DeviceDescription,
   type DeviceState,
@@ -220,7 +224,9 @@ export class Controller {
 
   /** Every commissioned node, as GIAP devices. */
   devices(): Device[] {
-    return this.#peerSnapshots().map(([, snapshot]) => nodeToDevice(snapshot));
+    return this.#peerSnapshots().flatMap(([, snapshot]) =>
+      deviceSlices(snapshot).map(nodeToDevice),
+    );
   }
 
   /**
@@ -233,19 +239,30 @@ export class Controller {
   readings(): Reading[] {
     const out: Reading[] = [];
     for (const [, snapshot] of this.#peerSnapshots()) {
-      for (const endpoint of snapshot.endpoints) {
-        for (const [cluster, attributes] of Object.entries(endpoint.clusters)) {
-          for (const [attribute, value] of Object.entries(attributes)) {
-            // The cluster's own declared unit travels with its value.
-            const reading = readingFor(
-              deviceIdForNode(snapshot.nodeId, snapshot.rootEndpoint),
-              cluster,
-              attribute,
-              value,
-              new Date(),
-              attributes["measurementUnit"],
-            );
-            if (reading !== undefined) out.push(reading);
+      // Per slice, not per node: two bridged thermometers reporting under one node
+      // id are indistinguishable downstream, and they collide in the dedupe caches
+      // on both sides of the socket -- each sweep then sees the other's value as a
+      // change and republishes, forever, on a house where nothing is moving.
+      for (const slice of deviceSlices(snapshot)) {
+        const deviceId = deviceIdForNode(slice.nodeId, slice.rootEndpoint);
+        // Application endpoints only. Endpoint 0 is on every slice and belongs to
+        // the hub, so walking it per slice would report the same reading once per
+        // bridged device -- true of nothing today, since endpoint 0 carries no
+        // sensor cluster, and a trap for the first one that lands there.
+        for (const endpoint of applicationEndpoints(slice)) {
+          for (const [cluster, attributes] of Object.entries(endpoint.clusters)) {
+            for (const [attribute, value] of Object.entries(attributes)) {
+              // The cluster's own declared unit travels with its value.
+              const reading = readingFor(
+                deviceId,
+                cluster,
+                attribute,
+                value,
+                new Date(),
+                attributes["measurementUnit"],
+              );
+              if (reading !== undefined) out.push(reading);
+            }
           }
         }
       }
@@ -399,15 +416,8 @@ export class Controller {
    * upgraded or reconfigured — the moment its description matters most.
    */
   describe(deviceId: string): DeviceDescription {
-    const peer = this.#peerFor(deviceId);
-    const nodeId = peer === undefined ? undefined : peerNodeId(peer);
-    if (peer === undefined || nodeId === undefined) {
-      throw new OpError(
-        "device_unknown",
-        `Matter device '${deviceId}' is not commissioned on this fabric`,
-      );
-    }
-    return describeNode(snapshotOf(peer, nodeId));
+    const [, slice] = this.#sliceFor(deviceId);
+    return describeNode(slice);
   }
 
   /**
@@ -419,34 +429,26 @@ export class Controller {
    * traffic and reflects the last thing the device said about itself.
    */
   state(deviceId: string): DeviceState {
-    const peer = this.#peerFor(deviceId);
-    const nodeId = peer === undefined ? undefined : peerNodeId(peer);
-    if (peer === undefined || nodeId === undefined) {
-      throw new OpError(
-        "device_unknown",
-        `Matter device '${deviceId}' is not commissioned on this fabric`,
-      );
-    }
-    return stateOf(snapshotOf(peer, nodeId));
+    const [, slice] = this.#sliceFor(deviceId);
+    return stateOf(slice);
   }
 
   /** Drive a device. Returns what the device state became. */
   async control(deviceId: string, verb: Verb, value: unknown): Promise<DeviceStatePatch> {
-    const peer = this.#peerFor(deviceId);
-    const nodeId = peer === undefined ? undefined : peerNodeId(peer);
-    if (peer === undefined || nodeId === undefined) {
-      throw new OpError(
-        "device_unknown",
-        `Matter device '${deviceId}' is not commissioned on this fabric`,
-      );
-    }
+    const [peer, slice] = this.#sliceFor(deviceId);
+    const nodeId = slice.nodeId;
+    const rootEndpoint = slice.rootEndpoint;
 
-    const plan = planControl(snapshotOf(peer, nodeId), deviceId, verb, value);
+    // Planned from the SLICE, so the endpoint chosen is this device's. The dispatch
+    // below was already endpoint-addressed (`Action.endpoint`, `endpoints.for`) --
+    // only the choice of endpoint was node-wide, which is why a bridge could be
+    // driven at all but only ever its lowest-numbered child.
+    const plan = planControl(slice, deviceId, verb, value);
     // Captured BEFORE the write, so the settle below can tell "the device has reported
     // its new value" from "the report has not arrived yet". Without a baseline the two
     // are indistinguishable and the first read wins, which is the state before the
     // command.
-    const before = observedFor(snapshotOf(peer, nodeId), verb);
+    const before = observedFor(slice, verb);
 
     for (const action of plan.actions) {
       const endpoint = peer.endpoints.for(action.endpoint);
@@ -479,17 +481,20 @@ export class Controller {
         }
       } catch (error) {
         if (error instanceof OpError) throw error;
-        throw refusalOrFault(deviceId, error, acceptedFor(snapshotOf(peer, nodeId), verb, value));
+        throw refusalOrFault(deviceId, error, acceptedFor(slice, verb, value));
       }
     }
 
     // What the device is now, not what it was asked to be. The command response
     // above proves it accepted the command; this is how it describes the result.
     if (verb === "operation") {
-      const observed = await settledOperation(peer, nodeId, plan.applied.operation);
+      const observed = await settledOperation(peer, nodeId, rootEndpoint, plan.applied.operation);
       if (observed !== undefined) plan.applied.operation = observed;
     } else {
-      Object.assign(plan.applied, await settledObservation(peer, nodeId, verb, before, plan.applied));
+      Object.assign(
+        plan.applied,
+        await settledObservation(peer, nodeId, rootEndpoint, verb, before, plan.applied),
+      );
     }
 
     return plan.applied;
@@ -507,6 +512,40 @@ export class Controller {
       out.push([peer, snapshotOf(peer, nodeId)]);
     }
     return out;
+  }
+
+  /**
+   * The peer and the slice a device id names, or the reason there is none.
+   *
+   * `describe`, `state` and `control` all want a DEVICE — one bridged child of a
+   * hub, not the whole node — because every mapping they call reads "the first
+   * endpoint carrying this cluster" and would otherwise answer for whichever child
+   * the hub numbered lowest. `decommission` is the exception and keeps resolving to
+   * the peer: Matter commissions nodes, so there is nothing else it could act on.
+   */
+  #sliceFor(deviceId: string): [ClientNode, NodeSnapshot] {
+    const peer = this.#peerFor(deviceId);
+    const nodeId = peer === undefined ? undefined : peerNodeId(peer);
+    if (peer === undefined || nodeId === undefined) {
+      throw new OpError(
+        "device_unknown",
+        `Matter device '${deviceId}' is not commissioned on this fabric`,
+      );
+    }
+
+    const wanted = partsOfDeviceId(deviceId)?.rootEndpoint;
+    const slices = deviceSlices(snapshotOf(peer, nodeId));
+    const slice = slices.find(candidate => candidate.rootEndpoint === wanted);
+    if (slice === undefined) {
+      // The node is here and this endpoint is not one of its devices — a bridged
+      // child that has been unpaired from the hub in the vendor's own app, which is
+      // an ordinary thing for a user to do and not the same as an unknown node.
+      throw new OpError(
+        "device_unknown",
+        `Matter device '${deviceId}' is no longer one of the devices on node ${nodeId}`,
+      );
+    }
+    return [peer, slice];
   }
 
   #peerFor(deviceId: string): ClientNode | undefined {
@@ -674,8 +713,15 @@ export class Controller {
             declaredUnit = undefined;
           }
 
+          // Which DEVICE published this. The endpoint was already in scope and
+          // thrown away, so on a bridge every child's reading arrived stamped with
+          // the hub's id — indistinguishable downstream, and colliding in the
+          // dedupe cache so each one republished the other's value forever.
+          const slices = deviceSlices(snapshotOf(peer, nodeId));
+          const owner = sliceForEndpoint(slices, Number(endpoint.number));
+
           const reading = readingFor(
-            deviceIdForNode(nodeId),
+            deviceIdForNode(nodeId, owner?.rootEndpoint),
             cluster,
             attribute,
             value,
@@ -690,8 +736,23 @@ export class Controller {
           // device IS — a name, a device type, a newly reported cluster. The
           // device is republished so the registry's typing and capabilities
           // stay true.
-          if (cluster === "basicInformation" || cluster === "descriptor") {
-            this.#events.deviceUpdated(nodeToDevice(snapshotOf(peer, nodeId)));
+          //
+          // `bridgedDeviceBasicInformation` joins them: it carries a bridged
+          // device's name and its reachability, so without it a child coming back
+          // after a battery change would never be republished as present.
+          //
+          // Republished for every device on the node, because a descriptor change is
+          // how a bridge announces a child it has just acquired — and `device_added`
+          // and `device_updated` are the same arm on the Rust side, so a new child
+          // registers through this path for free.
+          if (
+            cluster === "basicInformation" ||
+            cluster === "descriptor" ||
+            cluster === "bridgedDeviceBasicInformation"
+          ) {
+            for (const slice of deviceSlices(snapshotOf(peer, nodeId))) {
+              this.#events.deviceUpdated(nodeToDevice(slice));
+            }
           }
         }),
       );
@@ -699,10 +760,26 @@ export class Controller {
     return attached;
   }
 
+  /**
+   * Report reachability for every device on a peer, not for the peer.
+   *
+   * A hub unplugged is a dozen devices gone. One event naming the node would leave
+   * the children being vouched for by the Rust side's liveness tick, so the UI would
+   * show twelve online bulbs behind a dead hub.
+   *
+   * A child can also be unreachable while its hub is fine — a Zigbee bulb whose
+   * battery died — which is what `bridgedDeviceBasicInformation.reachable` says and
+   * `nodeToDevice` already folds into `online`.
+   */
   #announceAvailability(peer: ClientNode, online: boolean): void {
     const nodeId = peerNodeId(peer);
     if (nodeId === undefined) return;
-    this.#events.availabilityChanged(deviceIdForNode(nodeId), online);
+    for (const slice of deviceSlices(snapshotOf(peer, nodeId))) {
+      this.#events.availabilityChanged(
+        deviceIdForNode(nodeId, slice.rootEndpoint),
+        online && nodeToDevice(slice).online,
+      );
+    }
   }
 }
 
@@ -893,14 +970,29 @@ export async function settleTo(
 }
 
 /** The device's state once it has had a chance to report the command's effect. */
+/**
+ * The current snapshot of one device on a peer.
+ *
+ * The settle loops below have to re-read as the device reports, and each read has to
+ * be narrowed to the same device the command went to — on a bridge, the whole node's
+ * snapshot would settle against whichever child holds the lowest endpoint, so a
+ * command to the second lamp would wait two seconds and then report the first lamp's
+ * unchanged value as the result. Which is worse than the echo the settle replaced.
+ */
+function sliceOf(peer: ClientNode, nodeId: bigint, rootEndpoint: number | undefined): NodeSnapshot {
+  const slices = deviceSlices(snapshotOf(peer, nodeId));
+  return slices.find(slice => slice.rootEndpoint === rootEndpoint) ?? slices[0]!;
+}
+
 async function settledOperation(
   peer: ClientNode,
   nodeId: bigint,
+  rootEndpoint: number | undefined,
   requested: string | undefined,
 ): Promise<string | undefined> {
   const wanted: readonly string[] | undefined =
     requested === undefined ? undefined : INTENDED_STATE[requested.toLowerCase()];
-  return settleTo(wanted, () => observedOperation(snapshotOf(peer, nodeId)));
+  return settleTo(wanted, () => observedOperation(sliceOf(peer, nodeId, rootEndpoint)));
 }
 
 /**
@@ -919,11 +1011,12 @@ async function settledOperation(
 async function settledObservation(
   peer: ClientNode,
   nodeId: bigint,
+  rootEndpoint: number | undefined,
   verb: Verb,
   before: DeviceStatePatch,
   requested: DeviceStatePatch,
 ): Promise<DeviceStatePatch> {
-  const read = () => observedFor(snapshotOf(peer, nodeId), verb);
+  const read = () => observedFor(sliceOf(peer, nodeId, rootEndpoint), verb);
   const keys = Object.keys(read()) as (keyof DeviceStatePatch)[];
   if (keys.length === 0) return {};
 
