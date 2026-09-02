@@ -16,7 +16,6 @@
  */
 
 import type { Reading } from "../protocol.js";
-import { deviceIdForNode } from "../protocol.js";
 
 /** How a decoded attribute value becomes a number. `undefined` skips the reading. */
 type Read = (value: unknown) => number | undefined;
@@ -236,7 +235,12 @@ const BY_PATH: ReadonlyMap<string, SensorMapping> = new Map(
  * whose decoded value is not the shape the mapping expects.
  */
 export function readingFor(
-  nodeId: bigint,
+  // The DEVICE this reading belongs to, not the node it arrived from. A bridge is
+  // one node and many devices, and two bridged thermometers reporting under one
+  // node id are indistinguishable to everything downstream -- worse, they collide
+  // in the dedupe caches on both sides of the socket, so each sweep sees the other
+  // one's value as a change and republishes forever.
+  deviceId: string,
   cluster: string,
   attribute: string,
   value: unknown,
@@ -253,7 +257,7 @@ export function readingFor(
   if (reading === undefined) return undefined;
 
   return {
-    device_id: deviceIdForNode(nodeId),
+    device_id: deviceId,
     sensor_type: mapping.sensorType,
     value: reading,
     unit: declaredUnitOf(declaredUnit) ?? mapping.unit,

@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pond_core::mcp::ports::notification::{Notification, NotificationSender};
+use pond_core::user_data::ports::device_commissioning::matter_bridged_endpoint;
 use tokio::sync::{Mutex, RwLock};
 
 /// How long an alert of a given kind suppresses the next one of that kind.
@@ -144,13 +145,35 @@ impl MatterNotifier {
         *self.sender.write().await = Some(sender);
     }
 
-    pub async fn device_paired(&self, name: &str, device_type: &str) {
-        self.push(
-            "info",
-            "Matter device added".to_string(),
-            format!("\"{name}\" joined this Pond's Matter network as a {device_type}."),
-        )
-        .await;
+    /// A device joined the fabric.
+    ///
+    /// Silent for a device behind a bridge. A hub arrives with everything it speaks
+    /// for -- a dozen bulbs is normal -- and each one registers separately, so this
+    /// fired a dozen times for one thing the user did.
+    ///
+    /// `pairing_success_is_not_debounced` is still right for its stated reason:
+    /// "adding several devices in one sitting is a normal thing to do, and each one
+    /// is a distinct fact". Twelve devices out of one setup code is ONE fact, and the
+    /// hub's own alert below is where it is reported.
+    ///
+    /// The hub's alert does not claim a count. It cannot know one: the children's
+    /// descriptors have not populated at the moment the hub registers, which is why
+    /// they arrive as separate events seconds later. Promising a number here would
+    /// mean promising the wrong one.
+    pub async fn device_paired(&self, device_id: &str, name: &str, device_type: &str) {
+        if matter_bridged_endpoint(device_id).is_some() {
+            return;
+        }
+        let body = if device_type == "bridge" {
+            format!(
+                "\"{name}\" joined this Pond's Matter network. The devices it provides will \
+                 appear as it reports them."
+            )
+        } else {
+            format!("\"{name}\" joined this Pond's Matter network as a {device_type}.")
+        };
+        self.push("info", "Matter device added".to_string(), body)
+            .await;
     }
 
     pub async fn pairing_failed(&self, reason: &str) {
@@ -478,6 +501,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hub_arriving_with_a_dozen_devices_is_one_alert() {
+        // One thing the user did. A hub arrives with everything it speaks for and
+        // each child registers separately, so this fired once per bulb.
+        let (notifier, recorder) = notifier().await;
+
+        notifier
+            .device_paired("matter-90", "Living Room Hub", "bridge")
+            .await;
+        for child in ["matter-90-3", "matter-90-4", "matter-90-5"] {
+            notifier.device_paired(child, "a bulb", "light").await;
+        }
+
+        assert_eq!(recorder.titles(), vec!["Matter device added"]);
+        // And it does not claim a count it cannot know: the children's descriptors
+        // have not populated when the hub registers, which is why they arrive as
+        // separate events seconds later.
+        let body = recorder.bodies().join(" ");
+        assert!(body.contains("Living Room Hub"), "{body}");
+        assert!(body.contains("as it reports them"), "{body}");
+    }
+
+    #[tokio::test]
     async fn removing_a_hub_silences_its_children_too() {
         // A Matter hub's children leave the fabric with it, and the controller emits
         // one `device_removed` per child. The adapter never held the hub's child
@@ -542,8 +587,12 @@ mod tests {
         // Adding several devices in one sitting is a normal thing to do, and each
         // one is a distinct fact the user wants confirmed.
         let (notifier, recorder) = notifier().await;
-        notifier.device_paired("Hall light", "light").await;
-        notifier.device_paired("Porch lock", "lock").await;
+        notifier
+            .device_paired("matter-2", "Hall light", "light")
+            .await;
+        notifier
+            .device_paired("matter-3", "Porch lock", "lock")
+            .await;
         assert_eq!(recorder.titles().len(), 2);
     }
 
@@ -552,7 +601,9 @@ mod tests {
         // Every notifier starts this way, and stays this way on a build without
         // the notification stack, so no caller may have to branch on it.
         let notifier = MatterNotifier::disabled();
-        notifier.device_paired("Hall light", "light").await;
+        notifier
+            .device_paired("matter-2", "Hall light", "light")
+            .await;
         notifier.controller_unreachable("ws://x").await;
     }
 }

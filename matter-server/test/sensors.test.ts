@@ -2,10 +2,10 @@ import { describe, expect, it } from "vitest";
 
 import { SENSORS, readingFor } from "../src/mapping/sensors.js";
 
-const NODE = 4n;
+const DEVICE = "matter-4";
 
 function value(cluster: string, attribute: string, raw: unknown): number | undefined {
-  return readingFor(NODE, cluster, attribute, raw)?.value;
+  return readingFor(DEVICE, cluster, attribute, raw)?.value;
 }
 
 describe("sensor readings", () => {
@@ -40,7 +40,7 @@ describe("sensor readings", () => {
   });
 
   it("names the reading against the device it came from", () => {
-    const reading = readingFor(NODE, "temperatureMeasurement", "measuredValue", 2000);
+    const reading = readingFor(DEVICE, "temperatureMeasurement", "measuredValue", 2000);
     expect(reading).toMatchObject({
       device_id: "matter-4",
       sensor_type: "temperature",
@@ -52,15 +52,15 @@ describe("sensor readings", () => {
 
   it("ignores clusters and attributes it does not map", () => {
     // A light confirming its own state is not a sensor reading.
-    expect(readingFor(NODE, "onOff", "onOff", true)).toBeUndefined();
-    expect(readingFor(NODE, "temperatureMeasurement", "minMeasuredValue", 100)).toBeUndefined();
+    expect(readingFor(DEVICE, "onOff", "onOff", true)).toBeUndefined();
+    expect(readingFor(DEVICE, "temperatureMeasurement", "minMeasuredValue", 100)).toBeUndefined();
   });
 
   it("drops a value whose shape is not what the mapping expects", () => {
     // A null measured value is how Matter says "I do not know", and it must not
     // become a reading of zero.
-    expect(readingFor(NODE, "temperatureMeasurement", "measuredValue", null)).toBeUndefined();
-    expect(readingFor(NODE, "booleanState", "stateValue", 1)).toBeUndefined();
+    expect(readingFor(DEVICE, "temperatureMeasurement", "measuredValue", null)).toBeUndefined();
+    expect(readingFor(DEVICE, "booleanState", "stateValue", 1)).toBeUndefined();
   });
 
   it("mints a sensor type from one cluster, save where a quantity has two sources", () => {
@@ -97,19 +97,19 @@ describe("sensor readings", () => {
     // the conventional default is ppb, and pm1 in ppm where the default is ug/m3.
     // describe read the declaration and readings did not, so one device described
     // ozone in ppm and reported it in ppb at the same moment.
-    const ozone = readingFor(NODE, "ozoneConcentrationMeasurement", "measuredValue", 60, new Date(), 0);
+    const ozone = readingFor(DEVICE, "ozoneConcentrationMeasurement", "measuredValue", 60, new Date(), 0);
     expect(ozone?.unit).toBe("ppm");
 
-    const pm1 = readingFor(NODE, "pm1ConcentrationMeasurement", "measuredValue", 200, new Date(), 0);
+    const pm1 = readingFor(DEVICE, "pm1ConcentrationMeasurement", "measuredValue", 200, new Date(), 0);
     expect(pm1?.unit).toBe("ppm");
 
     // matter.js may hand the enum over decoded.
-    const named = readingFor(NODE, "ozoneConcentrationMeasurement", "measuredValue", 60, new Date(), "ugm3");
+    const named = readingFor(DEVICE, "ozoneConcentrationMeasurement", "measuredValue", 60, new Date(), "ugm3");
     expect(named?.unit).toBe("ug/m3");
 
     // A device that declares nothing keeps the substance's conventional unit,
     // rather than a unit invented for it.
-    const silent = readingFor(NODE, "ozoneConcentrationMeasurement", "measuredValue", 60);
+    const silent = readingFor(DEVICE, "ozoneConcentrationMeasurement", "measuredValue", 60);
     expect(silent?.unit).toBe("ppb");
   });
 });

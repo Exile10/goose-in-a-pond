@@ -240,7 +240,10 @@ export function stateOf(node: NodeSnapshot): DeviceState {
     add(sensor.sensorType, sensor.unit === "%" ? `${reading}%` : `${reading} ${sensor.unit}`);
   }
 
-  return { device_id: deviceIdForNode(node.nodeId), values };
+  // The device this state is OF, endpoint included. Without the endpoint every
+  // bridged child reported its hub's id back, so a caller correlating a reply with
+  // the device it asked about got the hub for all twelve.
+  return { device_id: deviceIdForNode(node.nodeId, node.rootEndpoint), values };
 }
 
 /** The label a setting is currently on, as the device words it. */

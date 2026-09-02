@@ -203,7 +203,7 @@ async fn sync_device(
                         "matter: device registered"
                     );
                     notifier
-                        .device_paired(&device.name, &device.device_type)
+                        .device_paired(&device.id, &device.name, &device.device_type)
                         .await;
                 }
                 Err(e) => {

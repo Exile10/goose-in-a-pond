@@ -526,7 +526,8 @@ function statesOf(node: NodeSnapshot): StateSpec[] {
 
 export function describeNode(node: NodeSnapshot): DeviceDescription {
   return {
-    device_id: deviceIdForNode(node.nodeId),
+    // Endpoint included, or every bridged child describes itself under its hub's id.
+    device_id: deviceIdForNode(node.nodeId, node.rootEndpoint),
     // The same projection the device list uses, so a description and a listing
     // can never disagree about what a device is.
     device_type: nodeToDevice(node).device_type,

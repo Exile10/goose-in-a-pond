@@ -108,6 +108,20 @@ describe("Devices section — Matter devices", () => {
     expect(container.querySelector(".lucide-monitor")).toBeNull();
   });
 
+  it("shows a hub icon for a Matter bridge, not the monitor fallback", async () => {
+    // A bridge appears beside the dozen devices behind it, so it has to be
+    // distinguishable from them at a glance.
+    (api.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: "matter-90", name: "Living Room Hub", device_type: "bridge", is_online: true },
+    ]);
+
+    const { container } = render(<Devices />);
+    await screen.findByText("Living Room Hub");
+
+    expect(container.querySelector(".lucide-router")).toBeTruthy();
+    expect(container.querySelector(".lucide-monitor")).toBeNull();
+  });
+
   it("shows a phone icon for the GOTG mobile companion, not a computer", async () => {
     (api.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([
       { id: "phone-1", name: "Emmanuel's Phone", device_type: "gotg", is_online: true },
