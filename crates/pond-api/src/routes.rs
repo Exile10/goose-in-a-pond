@@ -140,6 +140,18 @@ pub fn api_routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         // limit exceeded" and `image_limit_response` — which knows how to
         // explain the problem — never runs. Scoped to this route rather than the
         // router: no other endpoint has any business accepting 12 MiB.
+        // Following a turn already in flight, and stopping one on purpose. Both
+        // sit on the protected router, so `require_auth` and the onboarding gate
+        // apply exactly as they do to the turn itself.
+        .route("/chat/runs/{run_id}/events", get(reattach_run_events))
+        .route("/chat/runs/{run_id}/cancel", post(cancel_run))
+        // Discovery by session, because a client that restarted knows its
+        // session id and nothing else. `delete` for "stop it", matching how the
+        // other session-scoped routes here spell that.
+        .route(
+            "/sessions/{session_id}/active-run",
+            get(session_active_run).delete(cancel_session_run),
+        )
         .route(
             "/chat/stream",
             post(chat_stream).layer(axum::extract::DefaultBodyLimit::max(
@@ -1084,6 +1096,19 @@ struct ChatRequest {
     /// its own turn.
     #[serde(default)]
     tool_group_allowlist: Option<Vec<String>>,
+    /// Detach this turn from the response body: it keeps running when the
+    /// client disconnects, and can be re-attached through
+    /// `/chat/runs/{run_id}/events`.
+    ///
+    /// **Defaults to false, and that default is load-bearing rather than
+    /// cautious.** `WebVoiceBackend` fires a speculative `/chat/stream` the
+    /// moment trailing silence begins — before the pause is confirmed — and
+    /// aborts it when speech resumes. A detached speculative turn would run to
+    /// completion and persist a question-and-answer pair for a half-sentence
+    /// nobody finished saying. The voice path stays ephemeral until it cancels
+    /// through the endpoint instead of by dropping its socket.
+    #[serde(default)]
+    resumable: bool,
 }
 
 /// Send a message and get a response.
@@ -1385,7 +1410,69 @@ async fn chat_stream(
     // event mid-conversation. Nothing has been decoded at this point.
     image_limit_response(&req.images)?;
 
-    Ok(chat_stream_inner(state, permit, req, device))
+    if !req.resumable {
+        // Today's contract, unchanged: the turn ends when the last reader does.
+        // Not registered either — an ephemeral run has nothing to discover or
+        // reattach to, and registering it would let ordinary chat consume the
+        // detached-run cap.
+        let run = new_run(&req, &device, crate::runs::RunPolicy::Ephemeral);
+        return Ok(spawn_run(state, permit, run, None, req, device));
+    }
+
+    // A detached run needs its own permit, taken here rather than inside the
+    // stream for the same reason `image_limit_response` is: a client can show a
+    // 503 and can do nothing sensible with an SSE error mid-conversation. It is
+    // NOT `sse_semaphore` — that one counts clients reading, and a detached run
+    // outlives its reader, so sharing the pool would let a handful of abandoned
+    // runs starve interactive chat.
+    let run_permit = state
+        .runs
+        .permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            tracing::warn!(
+                target: "giap::runs",
+                active = state.runs.registry.len(),
+                "refused a resumable turn: the detached-run cap is full"
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "Too many agent runs in flight",
+                    "kind": "run_cap",
+                })),
+            )
+        })?;
+
+    let run = new_run(&req, &device, crate::runs::RunPolicy::Detached);
+    state.runs.registry.insert(run.clone()).map_err(|e| {
+        let crate::runs::RegistryFull::AtCap { active, max } = e;
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": format!("Too many agent runs in flight ({active}/{max})"),
+                "kind": "run_cap",
+            })),
+        )
+    })?;
+
+    // First frame of a resumable run, so a client that has to reconnect knows
+    // what to reconnect TO. The epoch rides along because a run id minted under
+    // a different one names a run that died with the last process.
+    run.push(
+        json!({
+            "type": "run_started",
+            "run_id": run.run_id,
+            "session_id": run.session_id,
+            "epoch": state.runs.epoch,
+            "resumable": true,
+        })
+        .to_string(),
+        false,
+    );
+
+    Ok(spawn_run(state, permit, run, Some(run_permit), req, device))
 }
 
 /// Map an image-limit violation onto an HTTP status, or pass a legal set through.
@@ -1761,7 +1848,13 @@ fn spawn_run(
         policy = ?run.policy,
         "agent run spawned"
     );
-    tokio::spawn(run_turn(state.clone(), run.clone(), run_permit, req, device));
+    tokio::spawn(run_turn(
+        state.clone(),
+        run.clone(),
+        run_permit,
+        req,
+        device,
+    ));
     attach_sse(state, permit, run, 0, AttachKind::Original)
 }
 
@@ -1838,7 +1931,7 @@ async fn drive_turn(
     // WRITTEN under the identity it was READ under. Extraction stamps
     // `profile_id` from this; before it, every fragment was unattributed
     // and `Owner(id)` reads matched exactly what `Household` did.
-    let turn_scope = resolve_turn_scope(&state, &session_id, &device).await;
+    let turn_scope = resolve_turn_scope(state, &session_id, &device).await;
 
     let mut chat_service = pond_core::shared::services::chat::ChatService::new(
         state.agent.clone(),
@@ -1850,14 +1943,11 @@ async fn drive_turn(
     // below calls `record_thinking` unconditionally; this is what decides
     // whether anything comes of it.
     .with_thinking(settings.persist_thinking);
-    if let (Some(ext), Some(svc)) =
-        (state.memory_extractor.clone(), state.memory_extraction_service.clone())
-    {
-        chat_service = chat_service.with_memory_extraction(
-            ext,
-            svc,
-            state.memory_repo.clone(),
-        );
+    if let (Some(ext), Some(svc)) = (
+        state.memory_extractor.clone(),
+        state.memory_extraction_service.clone(),
+    ) {
+        chat_service = chat_service.with_memory_extraction(ext, svc, state.memory_repo.clone());
     }
     if let Some(event_log) = state.event_log.clone() {
         chat_service = chat_service.with_event_log(event_log);
@@ -1866,15 +1956,22 @@ async fn drive_turn(
     // ── Persist user message ────────────────────────────────────────────
     // Phase F2: the images go in with the message so a follow-up turn can
     // still see them after a trim, a compaction rebuild, or a restart.
-    if let Err(e) = chat_service
+    // The id is kept because this row lands BEFORE inference starts. A turn
+    // cancelled before it says anything would otherwise leave a question with no
+    // answer under it — see the repair below.
+    let user_message_id = match chat_service
         .persist_user_message_with_images(&req.message, req.images.clone())
         .await
     {
-        let data = json!({"error": format!("Failed to persist user message: {}", e)}).to_string();
-        run.push(data, true);
-        run.finish(crate::runs::RunState::Failed);
-        return;
-    }
+        Ok(id) => id,
+        Err(e) => {
+            let data =
+                json!({"error": format!("Failed to persist user message: {}", e)}).to_string();
+            run.push(data, true);
+            run.finish(crate::runs::RunState::Failed);
+            return;
+        }
+    };
 
     // ── On-demand llamafile startup ─────────────────────────────────────
     // If any role uses llamafile and the process is not responding, emit a
@@ -1885,8 +1982,8 @@ async fn drive_turn(
         if is_llamafile_role {
             if let Some(manager) = &state.llamafile_manager {
                 if !manager.is_running().await {
-                    let status = json!({"type": "status", "content": "Model starting…"})
-                        .to_string();
+                    let status =
+                        json!({"type": "status", "content": "Model starting…"}).to_string();
                     run.push(status, false);
 
                     let model_hint = if settings.chat_provider == "llamafile" {
@@ -1895,15 +1992,14 @@ async fn drive_turn(
                         None
                     };
 
-                    let (_url, ready) = manager
-                        .ensure_started_and_wait(model_hint, 90)
-                        .await;
+                    let (_url, ready) = manager.ensure_started_and_wait(model_hint, 90).await;
 
                     if !ready {
                         let data = json!({"error":
                             "llamafile did not start within 90 s — \
                              check that a model file is installed"
-                        }).to_string();
+                        })
+                        .to_string();
                         run.push(data, true);
                         run.finish(crate::runs::RunState::Failed);
                         return;
@@ -1929,7 +2025,7 @@ async fn drive_turn(
         voice_mode: req.voice_mode,
         canvas_mode: req.canvas_mode,
         profile_scope: turn_scope.clone(),
-        profile_context: profile_context_for(&state, &turn_scope).await,
+        profile_context: profile_context_for(state, &turn_scope).await,
         tool_group_allowlist: req.tool_group_allowlist.clone(),
     };
 
@@ -2031,7 +2127,8 @@ async fn drive_turn(
                         }
                         // Emit captured thinking blocks as SSE events (when show_thinking is on)
                         for thinking_content in turn.thought.take_thinking() {
-                            let data = json!({"type": "thinking", "content": thinking_content}).to_string();
+                            let data = json!({"type": "thinking", "content": thinking_content})
+                                .to_string();
                             run.push(data, false);
                         }
                         // After every push the filter may have captured a complete
@@ -2039,16 +2136,20 @@ async fn drive_turn(
                         // The model emitted tool calls as Harmony text markup instead of
                         // the structured protocol. Execute them directly as a fallback.
                         for body in turn.thought.take_tool_calls() {
-                            if let Some((name, args)) = crate::thought_filter::parse_tool_envelope(&body) {
+                            if let Some((name, args)) =
+                                crate::thought_filter::parse_tool_envelope(&body)
+                            {
                                 tracing::info!(tool = %name, "Executing text-based tool call (model used Harmony format)");
                                 let call_id = uuid::Uuid::new_v4().to_string();
-                                let args_val: serde_json::Value = serde_json::from_str(&args).unwrap_or(json!({}));
+                                let args_val: serde_json::Value =
+                                    serde_json::from_str(&args).unwrap_or(json!({}));
                                 run.push(
                                     json!({"type": "tool_call", "tool": name.clone(), "id": call_id.clone(), "input": args_val}).to_string(),
                                     false,
                                 );
                                 let call_start = std::time::Instant::now();
-                                let call_result = state.agent.call_tool(&session_id, &name, &args).await;
+                                let call_result =
+                                    state.agent.call_tool(&session_id, &name, &args).await;
                                 turn.note_fallback_tool(&name, call_start.elapsed());
                                 match call_result {
                                     Ok(result_text) => {
@@ -2060,7 +2161,12 @@ async fn drive_turn(
                                     }
                                     Err(e) => {
                                         run.push(
-                                            tool_result_frame(&name, &call_id, &format!("Tool error: {e}"), None),
+                                            tool_result_frame(
+                                                &name,
+                                                &call_id,
+                                                &format!("Tool error: {e}"),
+                                                None,
+                                            ),
                                             false,
                                         );
                                     }
@@ -2122,24 +2228,27 @@ async fn drive_turn(
     // event that the frontend uses to replace the text.
     // Skipped when the agent timed out — no point reviewing a partial answer.
     {
-        let should_review = !timed_out && !cancelled && match settings.review_mode.as_str() {
-            "on" => true,
-            "auto" => {
-                let msg = req.message.to_lowercase();
-                msg.contains('?')
-                    || msg.starts_with("what ")
-                    || msg.starts_with("how ")
-                    || msg.starts_with("why ")
-                    || msg.starts_with("explain ")
-                    || msg.starts_with("compare ")
-                    || msg.starts_with("analyze ")
-            }
-            _ => false,
-        };
+        let should_review = !timed_out
+            && !cancelled
+            && match settings.review_mode.as_str() {
+                "on" => true,
+                "auto" => {
+                    let msg = req.message.to_lowercase();
+                    msg.contains('?')
+                        || msg.starts_with("what ")
+                        || msg.starts_with("how ")
+                        || msg.starts_with("why ")
+                        || msg.starts_with("explain ")
+                        || msg.starts_with("compare ")
+                        || msg.starts_with("analyze ")
+                }
+                _ => false,
+            };
 
         if should_review {
             if let Some(ref reviewer) = state.answer_reviewer {
-                let status = json!({"type": "review_status", "content": "Reviewing answer..."}).to_string();
+                let status =
+                    json!({"type": "review_status", "content": "Reviewing answer..."}).to_string();
                 run.push(status, false);
 
                 match reviewer.review(&req.message, &turn.full_text, None).await {
@@ -2150,7 +2259,8 @@ async fn drive_turn(
                             "content": result.final_answer,
                             "score": result.verdict.score,
                             "rounds": result.rounds,
-                        }).to_string();
+                        })
+                        .to_string();
                         run.push(data, false);
                     }
                     Ok(result) => {
@@ -2173,15 +2283,50 @@ async fn drive_turn(
     // writes tool results / assistant text / usage to session_messages,
     // then spawns memory extraction in the background. The handler cannot
     // accidentally omit extraction by refactoring this block.
-    let _ = chat_service
-        .persist_assistant_turn_with_extraction(
-            std::mem::take(&mut turn.tool_results),
-            &turn.full_text,
-            Some((usage_prompt_tokens, usage_completion_tokens)),
-            Some(&model_name_for_done),
-            &req.message,
-        )
-        .await;
+    // Nothing was said, and nothing is coming.
+    //
+    // The user's message was committed before inference began. Leaving it shows
+    // a question the pond visibly never answered, and hands the NEXT turn a
+    // prompt ending on a user line nothing replied to. `delete_messages_from`
+    // is the same primitive the edit-and-resend path uses.
+    //
+    // Deliberately narrow. A turn that produced ANY text or tool result keeps
+    // both halves — a barge-in should not erase the sentence the user heard.
+    // A TIMEOUT keeps them too: the same words are worth retrying, and the
+    // error frame already said what happened.
+    let said_nothing = turn.full_text.trim().is_empty() && turn.tool_results.is_empty();
+    if cancelled && said_nothing {
+        match state
+            .session_storage
+            .delete_messages_from(&session_id, &user_message_id)
+            .await
+        {
+            Ok(()) => tracing::info!(
+                target: "giap::runs",
+                run_id = %run.run_id,
+                session_id = %session_id,
+                user_message_id = %user_message_id,
+                "run ended before it said anything; removed the orphaned user message"
+            ),
+            Err(e) => tracing::warn!(
+                target: "giap::runs",
+                run_id = %run.run_id,
+                session_id = %session_id,
+                error = %e,
+                "could not remove the orphaned user message"
+            ),
+        }
+    } else {
+        let _ = chat_service
+            .persist_assistant_turn_with_extraction(
+                std::mem::take(&mut turn.tool_results),
+                &turn.full_text,
+                Some((usage_prompt_tokens, usage_completion_tokens)),
+                Some(&model_name_for_done),
+                &req.message,
+            )
+            .await;
+    }
 
     // The turn's context window, resolved ONCE.
     //
@@ -2241,7 +2386,8 @@ async fn drive_turn(
                 .as_ref()
                 .and_then(|s| s.ttft_ms)
                 .or_else(|| {
-                    turn.ttft.map(|t| t.duration_since(turn_start).as_millis() as u64)
+                    turn.ttft
+                        .map(|t| t.duration_since(turn_start).as_millis() as u64)
                 })
                 .unwrap_or(total_latency_ms);
 
@@ -2309,11 +2455,9 @@ async fn drive_turn(
         let context_limit = turn_context_limit;
 
         if estimated_tokens > 0 && context_limit > 0 {
-            state.context_monitor.record_turn(
-                &session_id,
-                estimated_tokens,
-                context_limit,
-            );
+            state
+                .context_monitor
+                .record_turn(&session_id, estimated_tokens, context_limit);
 
             let health = state.context_monitor.check_context_health(&session_id);
 
@@ -2334,7 +2478,8 @@ async fn drive_turn(
                     "turns_remaining": health.estimated_turns_remaining,
                     "avg_growth_rate": health.avg_growth_rate,
                     "warning": health.warning,
-                }).to_string();
+                })
+                .to_string();
                 run.push(data, false);
 
                 // PAI-4 P6: and then actually do something about it. Until
@@ -2350,7 +2495,7 @@ async fn drive_turn(
                 // summarisation model call between the user's last token and
                 // the end of their stream, on the tier that can least afford
                 // it. Everything real happens in the detached task.
-                spawn_pressure_compaction(&state, &session_id);
+                spawn_pressure_compaction(state, &session_id);
             }
         }
     }
@@ -2365,7 +2510,8 @@ async fn drive_turn(
             "type": "cancelled",
             "run_id": run.run_id,
             "at_seq": run.last_seq(),
-        }).to_string();
+        })
+        .to_string();
         run.push(data, false);
     } else if timed_out {
         run.finish(crate::runs::RunState::Failed);
@@ -2383,7 +2529,8 @@ async fn drive_turn(
             "prompt_tokens": usage_prompt_tokens,
             "completion_tokens": usage_completion_tokens,
         }
-    }).to_string();
+    })
+    .to_string();
     run.push(data, true);
 }
 
@@ -2457,7 +2604,7 @@ fn attach_sse(
         let saw_terminal = snapshot.saw_terminal;
         for frame in snapshot.frames {
             sent = frame.seq;
-            yield Ok(Event::default().id(frame.seq.to_string()).data(frame.payload.to_string()));
+            yield Ok(Event::default().id(frame.seq.to_string()).data(&*frame.payload));
         }
         if saw_terminal {
             return;
@@ -2470,7 +2617,7 @@ fn attach_sse(
                 Ok(frame) => {
                     let terminal = frame.terminal;
                     sent = frame.seq;
-                    yield Ok(Event::default().id(frame.seq.to_string()).data(frame.payload.to_string()));
+                    yield Ok(Event::default().id(frame.seq.to_string()).data(&*frame.payload));
                     if terminal {
                         break;
                     }
@@ -2500,7 +2647,7 @@ fn attach_sse(
                     for frame in recovered.frames {
                         sent = frame.seq;
                         done = frame.terminal;
-                        yield Ok(Event::default().id(frame.seq.to_string()).data(frame.payload.to_string()));
+                        yield Ok(Event::default().id(frame.seq.to_string()).data(&*frame.payload));
                         if done {
                             break;
                         }
@@ -2532,6 +2679,209 @@ fn attach_sse(
     };
 
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+// ── Reattaching to a run in flight ────────────────────────────────────────────
+
+/// May this caller follow this run?
+///
+/// Checked against the owner captured when the turn STARTED, not against
+/// whoever happens to be asking. A run's frames can carry a household member's
+/// private content, so the paired-device rung is not relaxed here — see
+/// `RunOwner` for why an unattributed run is not a widening.
+fn may_reattach(run: &crate::runs::RunHandle, device: &ProvenDevice) -> bool {
+    match &run.owner {
+        crate::runs::RunOwner::Device(owner) => device.id() == Some(owner.as_str()),
+        crate::runs::RunOwner::Unattributed => true,
+    }
+}
+
+/// Find the run, or say why not.
+///
+/// An unknown run and a run belonging to somebody else answer the same 404, so
+/// the endpoint is not an oracle for which run ids exist. The distinction is
+/// logged, not returned.
+fn lookup_run(
+    state: &AppState,
+    run_id: &str,
+    device: &ProvenDevice,
+) -> Result<Arc<crate::runs::RunHandle>, (StatusCode, Json<Value>)> {
+    let not_found = || (StatusCode::NOT_FOUND, Json(json!({"error": "unknown run"})));
+    let run = state.runs.registry.get(run_id).ok_or_else(not_found)?;
+    if !may_reattach(&run, device) {
+        tracing::warn!(
+            target: "giap::runs",
+            run_id = %run_id,
+            asking_device = ?device.id(),
+            "refused a reattach: the run belongs to another device"
+        );
+        return Err(not_found());
+    }
+    Ok(run)
+}
+
+#[derive(serde::Deserialize)]
+struct ReattachQuery {
+    /// Exclusive. Absent means "from the beginning".
+    #[serde(default)]
+    after_seq: Option<u64>,
+    /// The epoch the client was told when the run started.
+    #[serde(default)]
+    epoch: Option<String>,
+}
+
+/// What a client that only knows its session id needs to find its way back.
+async fn session_active_run(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let device = proven_device(principal.as_ref());
+    let run = state
+        .runs
+        .registry
+        .for_session(&session_id)
+        .filter(|r| may_reattach(r, &device))
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "no active run for this session"})),
+            )
+        })?;
+    Ok(Json(json!({
+        "run_id": run.run_id,
+        "session_id": run.session_id,
+        "state": run.state(),
+        "started_at": run.started_at.to_rfc3339(),
+        "first_seq": run.first_seq(),
+        "last_seq": run.last_seq(),
+        "epoch": state.runs.epoch,
+    })))
+}
+
+/// Follow a run that is already in flight, or replay one that just finished.
+async fn reattach_run_events(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Path(run_id): Path<String>,
+    Query(q): Query<ReattachQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)>
+{
+    let device = proven_device(principal.as_ref());
+
+    // A run id minted under another epoch names a run that died with the last
+    // process. Saying so is the difference between an honest "reload the
+    // session" and a 404 the client cannot tell apart from "it aged out".
+    if let Some(epoch) = q.epoch.as_deref() {
+        if epoch != state.runs.epoch {
+            return Err((
+                StatusCode::GONE,
+                Json(json!({
+                    "error": "run_lost",
+                    "reason": "server_restarted",
+                    "epoch": state.runs.epoch,
+                    "advice": "reload_session_messages",
+                })),
+            ));
+        }
+    }
+
+    let run = lookup_run(&state, &run_id, &device)?;
+
+    // `Last-Event-ID` is what a browser resends on its own; `after_seq` is what
+    // survives a process restart, where nothing browser-managed does. Both are
+    // honoured and the further-along one wins, because replaying a frame the
+    // client already has is the harmless direction to be wrong in.
+    let from_header = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let after_seq = q.after_seq.unwrap_or(0).max(from_header.unwrap_or(0));
+
+    let permit = state
+        .sse_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Too many concurrent streams"})),
+            )
+        })?;
+
+    Ok(attach_sse(
+        state,
+        permit,
+        run,
+        after_seq,
+        AttachKind::Reattach,
+    ))
+}
+
+/// Stop a run on purpose.
+///
+/// Necessary because dropping the connection no longer means "stop" for a
+/// detached run. Idempotent: asking twice, or asking for one that already
+/// ended, reports the state rather than failing.
+async fn cancel_run(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let device = proven_device(principal.as_ref());
+    let run = lookup_run(&state, &run_id, &device)?;
+    cancel_handle(&run, device.id());
+    Ok(Json(json!({
+        "run_id": run.run_id,
+        "state": run.state(),
+        "at_seq": run.last_seq(),
+    })))
+}
+
+/// The same stop, for a caller that knows the session rather than the run.
+async fn cancel_session_run(
+    State(state): State<Arc<AppState>>,
+    principal: Option<axum::Extension<pond_core::security::ports::policy::Principal>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let device = proven_device(principal.as_ref());
+    let run = state
+        .runs
+        .registry
+        .for_session(&session_id)
+        .filter(|r| may_reattach(r, &device))
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "no active run for this session"})),
+            )
+        })?;
+    cancel_handle(&run, device.id());
+    Ok(Json(json!({
+        "run_id": run.run_id,
+        "state": run.state(),
+        "at_seq": run.last_seq(),
+    })))
+}
+
+/// Fire the token, and never `JoinHandle::abort()`.
+///
+/// An abort at an arbitrary await point skips the persistence tail, which is
+/// the whole reason a detached turn is worth having: a cancelled turn must
+/// still write down what it already said. Cooperative cancellation only.
+fn cancel_handle(run: &crate::runs::RunHandle, requested_by: Option<&str>) {
+    if run.state().is_terminal() {
+        return;
+    }
+    tracing::info!(
+        target: "giap::runs",
+        run_id = %run.run_id,
+        at_seq = run.last_seq(),
+        requested_by = ?requested_by,
+        "run cancelled on request"
+    );
+    run.cancel.cancel();
 }
 
 /// List all sessions, ordered by most recently updated first.
@@ -13702,6 +14052,9 @@ async fn run_recipe(
         })?;
 
     let chat_req = ChatRequest {
+        // A recipe run is driven by the schedule, not by a client that might
+        // come back for it.
+        resumable: false,
         session_id: body.session_id,
         message: prompt,
         images: Vec::new(),
