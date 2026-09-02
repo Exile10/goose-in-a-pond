@@ -4051,6 +4051,7 @@ async fn run_server(
         event_log: Some(event_log.clone()),
         push_token_repo: Some(push_token_repo.clone()),
         face_recognition,
+        runs: Arc::new(pond_api::runs::RunSupervisor::default()),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         // Long-lived per-device notification streams get their own, larger pool
         // so connected phones never starve interactive chat SSE (#99 audit).
