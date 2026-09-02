@@ -233,7 +233,11 @@ impl RunHandle {
             let mut buf = self.buf.lock().expect("run buffer poisoned");
             let seq = buf.next_seq;
             buf.next_seq += 1;
-            let frame = RunFrame { seq, payload, terminal };
+            let frame = RunFrame {
+                seq,
+                payload,
+                terminal,
+            };
             buf.bytes += frame.payload.len();
             buf.frames.push_back(frame.clone());
             while buf.frames.len() > MAX_FRAMES || (buf.bytes > MAX_BYTES && buf.frames.len() > 1) {
