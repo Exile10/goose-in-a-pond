@@ -403,6 +403,30 @@ describe("resuming a run this window never started", () => {
   it("does nothing at all on an ordinary cold start", async () => {
     expect(await resumeActiveRun()).toBe(false);
     expect(api.getActiveRun).not.toHaveBeenCalled();
+    expect(hasLiveThread()).toBe(false);
+  });
+
+  it("sends the surface to the thread before the server has even answered", async () => {
+    // A surface decides which screen to open while it mounts, and the round
+    // trip below has not happened yet. Landing on the wall and having the turn
+    // appear behind it a second later is the failure this change exists to
+    // remove, so the pointer alone has to be enough.
+    leaveAPointer();
+    expect(hasLiveThread()).toBe(true);
+  });
+
+  it("still opens the conversation when the run turns out to be gone", async () => {
+    leaveAPointer();
+    vi.mocked(api.getActiveRun).mockResolvedValue(null);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([
+      { id: "m1", session_id: "sess-live", role: "user", content: "still here", created_at: "" },
+    ] as never);
+
+    await resumeActiveRun();
+
+    // `hasLiveThread` already sent the surface to the thread on the strength of
+    // the pointer, so leaving it empty would be worse than the wall it skipped.
+    expect(getChatRun().messages[0].text).toBe("still here");
   });
 
   it("picks up a turn that is still being written", async () => {
