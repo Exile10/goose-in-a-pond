@@ -20,8 +20,9 @@ export function endpoint(
   clusters: ClusterState,
   deviceTypes: number[] = [],
   vendorClusters: VendorCluster[] = [],
+  parts: number[] = [],
 ): EndpointSnapshot {
-  return { number, deviceTypes, clusters, vendorClusters };
+  return { number, deviceTypes, clusters, vendorClusters, parts };
 }
 
 export function node(nodeId: number, endpoints: EndpointSnapshot[], online = true): NodeSnapshot {

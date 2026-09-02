@@ -238,7 +238,7 @@ export class Controller {
           for (const [attribute, value] of Object.entries(attributes)) {
             // The cluster's own declared unit travels with its value.
             const reading = readingFor(
-              snapshot.nodeId,
+              deviceIdForNode(snapshot.nodeId, snapshot.rootEndpoint),
               cluster,
               attribute,
               value,
@@ -674,7 +674,14 @@ export class Controller {
             declaredUnit = undefined;
           }
 
-          const reading = readingFor(nodeId, cluster, attribute, value, new Date(), declaredUnit);
+          const reading = readingFor(
+            deviceIdForNode(nodeId),
+            cluster,
+            attribute,
+            value,
+            new Date(),
+            declaredUnit,
+          );
           if (reading !== undefined) {
             this.#events.reading(reading);
             return;
@@ -819,6 +826,7 @@ function snapshotOf(peer: ClientNode, nodeId: bigint): NodeSnapshot {
       deviceTypes: readDeviceTypes(endpoint),
       clusters: readClusters(endpoint),
       vendorClusters: readVendorClusters(endpoint),
+      parts: readParts(endpoint),
     });
   }
   return { nodeId, online: peer.lifecycle.isOnline, endpoints };
@@ -1196,6 +1204,22 @@ function readVendorClusters(endpoint: Endpoint): VendorCluster[] {
  * DeviceTypeList. Empty when the endpoint has no Descriptor or has not been read yet,
  * in which case the cluster-based fallback decides the type.
  */
+/**
+ * This endpoint's children, from matter.js's resolved tree.
+ *
+ * `endpoint.parts` and not `descriptor.partsList` — see `EndpointSnapshot.parts`
+ * for why the raw attribute is the wrong source. Guarded like `peerNodeId`: reading
+ * the structure of an endpoint matter.js has not finished building can throw, and
+ * this runs inside `snapshotOf`, which every op calls.
+ */
+function readParts(endpoint: Endpoint): number[] {
+  try {
+    return [...endpoint.parts].map(part => Number(part.number));
+  } catch {
+    return [];
+  }
+}
+
 function readDeviceTypes(endpoint: Endpoint): number[] {
   const descriptor = endpoint.maybeStateOf("descriptor");
   const list = descriptor?.deviceTypeList;
