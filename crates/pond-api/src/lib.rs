@@ -40,6 +40,7 @@ pub mod cleanup;
 pub mod middleware;
 pub mod oauth_callback;
 pub mod routes;
+pub mod runs;
 pub mod thought_filter;
 pub mod tool_context;
 
@@ -300,6 +301,10 @@ pub struct AppState {
     /// stalled or abandoned clients. Acquired at the start of `chat_stream`
     /// and `agent_chat_stream`; dropped when the stream ends or disconnects.
     pub sse_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Detached agent runs: the registry, the cap that bounds them, and this
+    /// process's epoch. A turn that outlives its connection is owned here rather
+    /// than by the response body — see `crate::runs`.
+    pub runs: Arc<crate::runs::RunSupervisor>,
     /// Bounds concurrent `/notifications/stream` connections (#99). Kept
     /// SEPARATE from `sse_semaphore`: a phone holds its notification stream
     /// open indefinitely, so sharing the small interactive-chat pool would let

@@ -153,6 +153,7 @@ async fn make_app() -> Harness {
         recipe_repo: None,
         llamafile_manager: None,
         operational_log: None,
+        runs: Arc::new(pond_api::runs::RunSupervisor::default()),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
