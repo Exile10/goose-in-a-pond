@@ -404,9 +404,32 @@ impl RunRegistry {
     pub fn insert(&self, handle: Arc<RunHandle>) -> Result<(), RegistryFull> {
         let mut inner = self.inner.lock().expect("run registry poisoned");
         Self::sweep_locked(&mut inner, self.retention);
-        if inner.runs.len() >= self.max_runs {
+
+        // A session has one turn at a time, so a new one supersedes whatever
+        // that session left behind. Without this, every finished turn holds its
+        // slot for the whole retention window and an ordinary conversation --
+        // nine messages inside two minutes -- starts being refused.
+        if let Some(previous) = inner.by_session.get(&handle.session_id).cloned() {
+            if inner
+                .runs
+                .get(&previous)
+                .is_some_and(|h| h.state().is_terminal())
+            {
+                inner.runs.remove(&previous);
+            }
+        }
+
+        // The cap is about work in flight, not about history kept for a
+        // reconnecting client. Counting retained runs would make the ceiling
+        // drift down as a pond is used and back up again as it idles.
+        let active = inner
+            .runs
+            .values()
+            .filter(|h| !h.state().is_terminal())
+            .count();
+        if active >= self.max_runs {
             return Err(RegistryFull::AtCap {
-                active: inner.runs.len(),
+                active,
                 max: self.max_runs,
             });
         }
@@ -653,9 +676,48 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_run_does_not_hold_a_slot_against_the_cap() {
+        // The cap is about turns in flight. A ten-message conversation inside
+        // the retention window must not start being refused halfway through,
+        // which is exactly what counting retained runs would do.
+        let reg = RunRegistry::new(2, Duration::from_secs(300));
+        for i in 0..10 {
+            let run = RunHandle::new(
+                format!("sess-{i}"),
+                RunOwner::Unattributed,
+                RunPolicy::Detached,
+            );
+            reg.insert(run.clone())
+                .unwrap_or_else(|e| panic!("refused turn {i}: {e:?}"));
+            run.finish(RunState::Finished);
+        }
+    }
+
+    #[test]
+    fn a_new_turn_supersedes_the_finished_one_on_the_same_session() {
+        let reg = RunRegistry::new(4, Duration::from_secs(300));
+        let first = handle(RunPolicy::Detached);
+        reg.insert(first.clone()).unwrap();
+        first.finish(RunState::Finished);
+
+        let second = handle(RunPolicy::Detached);
+        reg.insert(second.clone()).unwrap();
+
+        assert!(
+            reg.get(&first.run_id).is_none(),
+            "the previous turn on this session is superseded, not accumulated"
+        );
+        assert_eq!(
+            reg.for_session("sess-1").map(|h| h.run_id.clone()),
+            Some(second.run_id.clone())
+        );
+    }
+
+    #[test]
     fn the_registry_refuses_past_its_cap() {
         let reg = RunRegistry::new(1, DEFAULT_RETENTION);
-        reg.insert(handle(RunPolicy::Detached)).unwrap();
+        let running = handle(RunPolicy::Detached);
+        reg.insert(running).unwrap();
         let err = reg
             .insert(RunHandle::new(
                 "sess-2".into(),
