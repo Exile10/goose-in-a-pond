@@ -80,6 +80,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -133,5 +134,35 @@ mod tests {
         let tmp = tempdir().unwrap();
         Database::init(tmp.path()).await.unwrap();
         Database::init(tmp.path()).await.unwrap(); // second run must not fail
+    }
+
+    /// Two migrations sharing a version number is a merge hazard, not a
+    /// theoretical one: `_sqlx_migrations.version` is the primary key, so the
+    /// second of a colliding pair fails its bookkeeping insert and every
+    /// startup against a fresh database dies with a bare UNIQUE-constraint
+    /// error. Nothing catches it on either contributing branch — the collision
+    /// only exists once both are merged — so it is asserted here, where the
+    /// failure names the culprits instead of taking the whole suite down with
+    /// it.
+    #[test]
+    fn migration_versions_are_unique_within_each_database() {
+        for (name, migrator) in [
+            ("system", sqlx::migrate!("migrations/system")),
+            ("logs", sqlx::migrate!("migrations/logs")),
+            ("vectors", sqlx::migrate!("migrations/vectors")),
+        ] {
+            let mut seen: HashMap<i64, &str> = HashMap::new();
+            for migration in migrator.iter() {
+                if let Some(previous) =
+                    seen.insert(migration.version, migration.description.as_ref())
+                {
+                    panic!(
+                        "{name} migrations {previous:?} and {:?} both claim version {}; \
+                         renumber the one that merged last to the next free version",
+                        migration.description, migration.version
+                    );
+                }
+            }
+        }
     }
 }
