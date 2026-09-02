@@ -208,7 +208,13 @@ export function parseArgs(argv: string[]): Spec {
         id = slug(value(i, flag));
         i++;
         break;
-      case "--storage":
+      // `--storage-dir`, NOT `--storage`. matter.js's `Environment` parses OUR argv
+      // into its own variables, so `--storage /path` defines the scalar variable
+      // `storage` -- and `vars.set("storage.path", ...)` then fails with "segment
+      // storage is not a map". `server.ts` records the same trap from the other
+      // side: "`--storage-path` is NOT left to matter.js's own argv parser, which
+      // reads it as a boolean".
+      case "--storage-dir":
         storage = value(i, flag);
         i++;
         break;
