@@ -308,7 +308,15 @@ export function getChatRun(): ChatRunSnapshot {
  */
 export function hasLiveThread(): boolean {
   if (state.busy) return true;
-  return state.completedTurns > state.acknowledgedTurns;
+  if (state.completedTurns > state.acknowledgedTurns) return true;
+  // A pointer left behind by the last window, read synchronously.
+  //
+  // The timing is load-bearing: a surface decides which screen to open on while
+  // it is mounting, and `resumeActiveRun` cannot answer by then — it has a
+  // round trip to make. Without this the app lands on the wall and the turn it
+  // is about to resume into appears a second later behind it, which is the
+  // exact failure this whole change exists to remove.
+  return readRunPointer() !== null;
 }
 
 /** A surface has shown the finished turn; stop resuming into it. */
@@ -761,9 +769,15 @@ export async function resumeActiveRun(): Promise<boolean> {
   }
 
   // Gone, or gone with the process that owned it. Either way the pointer is
-  // stale and the persisted messages are the whole truth.
+  // stale and the persisted messages are the whole truth — but the conversation
+  // still opens, because the person was just in it and `hasLiveThread` has
+  // already sent the surface to the thread on the strength of that pointer.
+  // Landing them in an empty one would be worse than the wall they were spared.
   if (!active || active.run_id !== pointer.runId || active.epoch !== pointer.epoch) {
     forgetRun();
+    await openSession(pointer.sessionId);
+    state.completedTurns += 1;
+    commit();
     return false;
   }
   if (active.state !== "running") {
