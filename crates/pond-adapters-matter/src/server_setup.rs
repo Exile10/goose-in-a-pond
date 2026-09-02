@@ -103,16 +103,8 @@ fn node_version_objection(version: (u32, u32)) -> String {
     let (from, until) = EXCLUDED_NODE;
     if version >= from && version < until {
         format!(
-            "Node {}.{} is on PATH, and matter.js does not support {}.{} to {}.{} — the range \
-             is 20.19 or newer, EXCEPT 22.0 through 22.12. Upgrade to {}.{} or newer",
-            version.0,
-            version.1,
-            from.0,
-            from.1,
-            until.0,
-            until.1 - 1,
-            until.0,
-            until.1
+            "Node {}.{} is on PATH, and matter.js does not support {}.{} to {}.{} — the range              is 20.19 or newer, EXCEPT 22.0 through 22.12. Upgrade to {}.{} or newer",
+            version.0, version.1, from.0, from.1, until.0, until.1 - 1, until.0, until.1
         )
     } else {
         format!(
@@ -728,17 +720,22 @@ type StderrTail = Arc<Mutex<VecDeque<String>>>;
 
 /// Spawn the controller. The child is `kill_on_drop`, so holding the handle ties
 /// its lifetime to pond-server: drop it and the controller goes away too.
-fn spawn_server(data_dir: &Path, port: u16) -> Result<(Child, StderrTail)> {
+fn spawn_server(data_dir: &Path, port: u16, ble: bool) -> Result<(Child, StderrTail)> {
     let storage = storage_dir(data_dir);
     std::fs::create_dir_all(&storage).with_context(|| format!("creating {}", storage.display()))?;
 
-    let mut child = Command::new("node")
+    let mut command = Command::new("node");
+    command
         .arg("--import")
         .arg("tsx")
         .arg(entrypoint(data_dir))
         .args(["--port", &port.to_string()])
         .arg("--storage-path")
-        .arg(&storage)
+        .arg(&storage);
+    if ble {
+        command.arg("--ble");
+    }
+    let mut child = command
         .current_dir(app_dir(data_dir))
         // Piped rather than sent to a file nobody reads. The controller writes
         // structured NDJSON here, so the relay below can re-emit each record at
@@ -898,6 +895,7 @@ pub async fn ensure_running(
     ready_timeout: Duration,
     notifier: &MatterNotifier,
     url: &str,
+    ble: bool,
 ) -> Result<Option<Child>> {
     // Before the probe, or an orphan would be found healthy and adopted.
     reap_orphan(data_dir).await;
@@ -929,12 +927,62 @@ pub async fn ensure_running(
 
     tracing::info!(port, "matter: no controller found; setting one up");
     ensure_installed(data_dir, notifier).await?;
-    let (child, stderr_tail) = spawn_server(data_dir, port)?;
+
+    match start_and_wait(data_dir, port, ready_timeout, ble).await {
+        Ok(child) => Ok(Some(child)),
+        // BLE is optional, and asking for it must never cost the controller.
+        //
+        // On macOS the OS KILLS a process that touches CoreBluetooth without an
+        // `NSBluetoothAlwaysUsageDescription` in its bundle's Info.plist -- SIGKILL,
+        // from TCC, with the reason only in a crash report. The controller cannot
+        // catch that, so `ble.ts`'s try/catch does not help: the process is simply
+        // gone. Left alone, the supervisor would respawn it and it would be killed
+        // again, forever, and Matter would be unusable BECAUSE a transport was
+        // switched on.
+        //
+        // So the second attempt drops it. IP-only is the behaviour every install had
+        // before BLE existed, and it is strictly better than a crash loop.
+        Err(first) if ble => {
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "matter_ble_start_failed",
+                port,
+                error = %format!("{first:#}"),
+                "matter: the controller would not start with BLE; retrying over IP only"
+            );
+            let child = start_and_wait(data_dir, port, ready_timeout, false)
+                .await
+                .map_err(|second| ble_and_ip_both_failed(&first, &second))?;
+            tracing::warn!(
+                target: "giap::trace",
+                kind = "matter_ble_disabled",
+                port,
+                "matter: BLE is off for this controller; a device that has never been on \
+                 the network cannot be paired until the cause above is fixed"
+            );
+            Ok(Some(child))
+        }
+        Err(only) => Err(only),
+    }
+}
+
+/// Spawn a controller and wait for it to accept connections.
+///
+/// Split out of [`ensure_running`] so the BLE fallback can run it twice without
+/// repeating the readiness loop or the stderr reporting.
+async fn start_and_wait(
+    data_dir: &Path,
+    port: u16,
+    ready_timeout: Duration,
+    ble: bool,
+) -> Result<Child> {
+    let (child, stderr_tail) = spawn_server(data_dir, port, ble)?;
     tracing::info!(
         target: "giap::trace",
         kind = "matter_controller_spawned",
         port,
         pid = child.id(),
+        ble,
         "matter: controller started"
     );
 
@@ -946,9 +994,10 @@ pub async fn ensure_running(
                 target: "giap::trace",
                 kind = "matter_controller_ready",
                 port,
+                ble,
                 "matter: controller ready"
             );
-            return Ok(Some(child));
+            return Ok(child);
         }
     }
 
@@ -963,6 +1012,7 @@ pub async fn ensure_running(
         target: "giap::trace",
         kind = "matter_controller_exited",
         port,
+        ble,
         stderr_tail = %reason,
         "matter: controller did not become ready"
     );
@@ -971,6 +1021,16 @@ pub async fn ensure_running(
         ready_timeout,
         explain_startup_failure(&reason, &app_dir(data_dir))
     ))
+}
+
+/// Both attempts failed, so BLE was not the problem. Carries both reasons: the
+/// second is the real fault, and the first is what a reader would otherwise be
+/// left blaming.
+fn ble_and_ip_both_failed(with_ble: &anyhow::Error, without: &anyhow::Error) -> anyhow::Error {
+    anyhow!(
+        "{without} (it also failed with BLE enabled, which is therefore not the cause: \
+         {with_ble})"
+    )
 }
 
 /// What a revival attempt actually did, so the caller can tell "the controller
@@ -1000,6 +1060,7 @@ pub async fn revive_local_controller(
     url: &str,
     child: &SharedServerChild,
     ready_timeout: Duration,
+    ble: bool,
 ) -> Result<Revival> {
     let Some(port) = local_port_from_ws_url(url) else {
         return Ok(Revival::NotLocal);
@@ -1013,6 +1074,7 @@ pub async fn revive_local_controller(
         ready_timeout,
         &MatterNotifier::disabled(),
         url,
+        ble,
     )
     .await?
     {
@@ -1047,6 +1109,7 @@ mod tests {
             "ws://192.168.1.50:5580/giap",
             &child,
             Duration::from_millis(1),
+            false,
         )
         .await
         .unwrap();
@@ -1092,6 +1155,7 @@ mod tests {
             &format!("ws://127.0.0.1:{port}/giap"),
             &child,
             Duration::from_millis(1),
+            false,
         )
         .await
         .unwrap();
@@ -1291,6 +1355,7 @@ mod tests {
             Duration::from_millis(1),
             &MatterNotifier::disabled(),
             &url,
+            false,
         )
         .await
         .expect_err("adopting it would leave Matter permanently broken");
