@@ -10,6 +10,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { api } from "../api/PondApiClient";
 import { refreshHomeData } from "../hub/state/hubDataStore";
+import { setChatRunBridge } from "./chatRunStore";
 import {
   reducer,
   buildInitialState,
@@ -129,6 +130,21 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
     if (!state.serverOnline) return;
     void refreshHomeData();
   }, [state.serverOnline]);
+
+  // The chat turn driver is a module singleton, so a turn keeps streaming when
+  // you leave the Chat section -- see `chatRunStore`. Being at module scope, it
+  // has no way to read app state or to dispatch, so this provider hands it
+  // both. Installed here rather than in Chat for the same reason the schedule
+  // listener above is: a turn started in Chat is still arriving while you are
+  // looking at Devices, and its `done` frame still has to reach the reducer.
+  // `dispatch` from `useReducer` is stable, hence its absence below.
+  useEffect(() => setChatRunBridge({
+    sessionToken:   state.sessionToken,
+    serverOnline:   state.serverOnline,
+    onSessionId:    (id)   => dispatch({ type: "SET_SESSION_ID", payload: id }),
+    onResponseMeta: (meta) => dispatch({ type: "SET_LAST_RESPONSE_META", payload: meta }),
+    onContextCard:  (card) => dispatch({ type: "PUSH_CONTEXT_CARD", payload: card }),
+  }), [state.sessionToken, state.serverOnline]);
 
   useEffect(() => {
     const unlisten: Array<() => void> = [];

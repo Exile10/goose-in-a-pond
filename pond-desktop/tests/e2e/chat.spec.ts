@@ -249,6 +249,95 @@ test.describe("Chat section — response rendering", () => {
   });
 });
 
+// ── Leaving the section mid-turn ──────────────────────────────────────────────
+
+/**
+ * The one test that exercises the REAL unmount.
+ *
+ * `GuiMode` renders sections through a `switch`, so pressing Devices in the
+ * sidebar destroys `<Chat />` and everything it holds. Every other test of this
+ * behaviour mounts the component directly; only here is the section swap the
+ * thing actually being driven.
+ */
+test.describe("Chat section — a turn survives leaving the section", () => {
+  test.beforeEach(async ({ page }) => {
+    await mockAllApiRoutes(page);
+  });
+
+  async function goToSection(page: Parameters<typeof mockAllApiRoutes>[0], name: RegExp) {
+    await page.getByRole("button", { name }).or(page.locator(`[title="${name.source}"]`)).first().click();
+  }
+
+  test("the answer that lands while you are on another section is there when you return", async ({ page }) => {
+    // Held open until the test lets it go, so "still answering" is a real state
+    // rather than a race against an instant mock.
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => { release = r; });
+    await page.route("**/api/v1/chat/stream", async (route) => {
+      await held;
+      await route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+        body: sseStream("Geese fly in a V to save energy."),
+      });
+    });
+
+    await goToChat(page);
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("why do geese fly in a V");
+    await textarea.press("Meta+Enter");
+
+    // Leave while it is still working.
+    await goToSection(page, /devices/i);
+    await expect(page.locator("textarea")).toHaveCount(0);
+
+    // It finishes with nothing mounted to receive it.
+    release();
+    await page.waitForTimeout(500);
+
+    await goToSection(page, /chat/i);
+    // The thread, not the wall, and the answer is in it.
+    await expect(page.getByText("Geese fly in a V to save energy.")).toBeVisible({
+      timeout: 10_000,
+    });
+  });
+
+  test("a turn still running is still running when you come back", async ({ page }) => {
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => { release = r; });
+    await page.route("**/api/v1/chat/stream", async (route) => {
+      await held;
+      await route.fulfill({
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+        body: sseStream("Finished after all."),
+      });
+    });
+
+    await goToChat(page);
+    const textarea = page.locator("textarea").first();
+    await textarea.fill("take your time");
+    await textarea.press("Meta+Enter");
+    await expect(page.getByText("take your time")).toBeVisible();
+
+    await goToSection(page, /devices/i);
+    await goToSection(page, /chat/i);
+
+    // Back in the thread with the question still showing, and the composer
+    // still saying the model has not stopped.
+    await expect(page.getByText("take your time")).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator("textarea").first()).toHaveAttribute(
+      "placeholder",
+      /Queue a message/,
+    );
+
+    // And it lands into the thread we came back to.
+    release();
+    await expect(page.getByText("Finished after all.")).toBeVisible({ timeout: 10_000 });
+  });
+});
+
+
 // ── Live E2E tests (require running pond-server) ───────────────────────────────
 
 const LIVE = !!process.env.GIAP_SERVER_URL;

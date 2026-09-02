@@ -2,9 +2,10 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { Paperclip } from "lucide-react";
 import { api } from "../../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../../state/AppContext";
-import { filterThinking } from "../../lib/thinkFilter";
+import { useChatRun, sendTurn } from "../../state/chatRunStore";
+import type { Message } from "../../state/chatRunStore";
 import { CONTINUE_TURN_MESSAGE } from "../../api/types";
-import type { ChatEvent, ContextWarning, ImageAttachment, TurnStats } from "../../api/types";
+import type { ContextWarning, TurnStats } from "../../api/types";
 import { HubIco, micEl } from "../primitives/HubIco";
 import { HP_PATHS } from "../primitives/icons";
 import { GooseAvatar } from "./chat/GooseAvatar";
@@ -13,7 +14,7 @@ import { ResultCard } from "./chat/ResultCard";
 import type { CardKind } from "./chat/ResultCard";
 import { TurnStatsFooter } from "../../components/TurnStatsFooter";
 import { ContextPressureNote } from "../../components/ContextPressureNote";
-import { SubagentTree, applySubagentProgress } from "../../components/SubagentTree";
+import { SubagentTree } from "../../components/SubagentTree";
 import type { SubagentRun } from "../../components/SubagentTree";
 import { AttachmentTray } from "../../components/AttachmentTray";
 import { prepareImage, validateAttachmentSet } from "../../lib/imageAttach";
@@ -22,31 +23,37 @@ import "./chat.css";
 
 // ── Types ─────────────────────────────────────────────────────
 
-interface ChatMessage {
+/**
+ * One rendered row.
+ *
+ * The Hub shows fewer things about a turn than the Chat section does -- no
+ * thinking disclosure, no per-message actions, one inline card rather than a
+ * list of tool chips -- so it renders a PROJECTION of the shared `Message`
+ * rather than keeping a parallel model. Keeping two models was how the two
+ * surfaces came to disagree about what a frame means.
+ *
+ * The seed rows below are the other reason this type exists: they are
+ * presentation, not conversation, so they never enter the store.
+ */
+interface Row {
   id: string;
   who: "user" | "goose";
   text: string;
   card?: CardKind;
   streaming?: boolean;
-  /** Set when this bubble is showing an error, so later text starts a new one
-   *  instead of being appended onto the error sentence. */
-  error?: boolean;
   turnStats?: TurnStats;
   /** Set when the agent stopped on its turn budget — renders a Continue action. */
   turnLimit?: number;
-  /** Set when the server said the context window is filling — renders the
-   *  pressure note and the manual compaction control (PAI-4 P7b). */
+  /** Set when the server said the context window is filling (PAI-4 P7b). */
   contextWarning?: ContextWarning;
-  /** PAI-6 P6. Delegations this turn started, folded from `subagent_progress`
-   *  frames through the shared reducer. */
+  /** PAI-6 P6. Delegations this turn started. */
   delegations?: SubagentRun[];
-  /** Local preview URLs for images attached to a live-sent message. */
   images?: string[];
 }
 
 // ── Constants ─────────────────────────────────────────────────
 
-function makeSeed(userName: string): ChatMessage[] {
+function makeSeed(userName: string): Row[] {
   const greeting = userName
     ? `Morning, ${userName}. The house is set to Good Morning — lights are easing up and coffee’s brewing. Anything you need?`
     : "Morning! The house is set to Good Morning — lights are easing up and coffee’s brewing. Anything you need?";
@@ -77,10 +84,24 @@ const CHIPS = [
   "New sticky note",
 ];
 
-// Simple incrementing ID for messages
-let _msgId = 0;
-function nextMsgId() {
-  return String(++_msgId);
+/** Project a stored message into what this surface renders. */
+function toRow(m: Message): Row {
+  // The Hub shows ONE inline card, and the last tool a turn called is the one
+  // its answer is about -- an answer that checked the weather and then the
+  // locks is about the locks.
+  const lastTool = m.cards?.[m.cards.length - 1]?.tool;
+  return {
+    id: String(m.id),
+    who: m.role === "user" ? "user" : "goose",
+    text: m.text,
+    card: lastTool ? toolToCard(lastTool) : undefined,
+    streaming: m.streaming,
+    turnStats: m.turnStats,
+    turnLimit: m.turnLimit,
+    contextWarning: m.contextWarning,
+    delegations: m.delegations,
+    images: m.images,
+  };
 }
 
 // Resolve tool call to an inline card kind
@@ -99,23 +120,28 @@ export function ChatHubView() {
   const state = useAppState();
   const dispatch = useAppDispatch();
 
-  // Use seed as initial messages; cleared when user sends first real message
-  const [msgs, setMsgs] = useState<ChatMessage[]>(() => makeSeed(""));
-  const [seeded, setSeeded] = useState(true); // true = currently showing seed
+  // The conversation lives in the shared store, so a turn started here keeps
+  // running when the Hub changes route -- which remounts this whole subtree --
+  // and the Chat section shows the same conversation rather than a second one.
+  const run = useChatRun();
+  const { messages, busy } = run;
+
+  // Presentation, not conversation: an empty pond opens on something to read
+  // rather than a blank pane. The seed is replaced by the first real message
+  // and never enters the store.
+  const [seed, setSeed] = useState<Row[]>(() => makeSeed(""));
 
   // Populate the greeting with the real user name once settings are loaded
   useEffect(() => {
     if (!state.serverOnline) return;
     api.getSettings()
       .then((s) => {
-        const name = s.user_name?.trim() ?? "";
-        setMsgs(makeSeed(name));
+        setSeed(makeSeed(s.user_name?.trim() ?? ""));
         setShowTurnStats(s.show_turn_stats ?? false);
       })
       .catch(() => {});
   }, [state.serverOnline]);
   const [text, setText] = useState("");
-  const [busy, setBusy] = useState(false);
   const [showTurnStats, setShowTurnStats] = useState(false);
   const [attachments, setAttachments] = useState<PreparedImage[]>([]);
   const [attachError, setAttachError] = useState<string | null>(null);
@@ -191,186 +217,50 @@ export function ChatHubView() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
-  const sessionIdRef = useRef<string | undefined>(
-    state.sessionId ?? undefined,
-  );
-  const inThinkBlockRef = useRef(false);
-
-  // Keep sessionIdRef in sync with global state
-  useEffect(() => {
-    if (state.sessionId) sessionIdRef.current = state.sessionId;
-  }, [state.sessionId]);
-
   // Auto-scroll to bottom on new messages
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [msgs, busy]);
+  }, [messages, busy]);
 
+  /**
+   * Hand a turn to the store, keeping only what belongs to the composer.
+   *
+   * The stream loop that used to live here is gone: it was a second copy of
+   * the Chat section's, and two copies is how one surface came to handle
+   * frames the other did not. Both now fold the same stream in `chatRunStore`,
+   * and this file decides only what to draw.
+   */
   const sendMessage = useCallback(
-    async (raw?: string) => {
+    (raw?: string) => {
       const t = (raw ?? text).trim();
       if ((!t && attachments.length === 0) || busy) return;
 
-      // Clear seed on first real send
-      if (seeded) {
-        setSeeded(false);
-      }
-
-      const pendingAttachments = attachments;
-      const imagePayload: ImageAttachment[] = pendingAttachments.map((a) => ({ data: a.data, mime_type: a.mime_type }));
-
       setText("");
-      setBusy(true);
-      inThinkBlockRef.current = false;
 
-      const userMsg: ChatMessage = {
-        id: nextMsgId(),
-        who: "user",
+      // The bubble keeps its own copy of each previewUrl and the store owns
+      // revoking them, so clear the tray WITHOUT revoking -- doing so would
+      // blank the thumbnail on the message just sent.
+      sendTurn({
         text: t,
-        images: pendingAttachments.length > 0 ? pendingAttachments.map((a) => a.previewUrl) : undefined,
-      };
-      const agentMsg: ChatMessage = {
-        id: nextMsgId(),
-        who: "goose",
-        text: "",
-        streaming: true,
-      };
-
-      setMsgs((prev) => {
-        const base = seeded ? [] : prev;
-        return [...base, userMsg, agentMsg];
+        images: attachments.map((a) => ({ data: a.data, mime_type: a.mime_type })),
+        previewUrls: attachments.map((a) => a.previewUrl),
       });
-      // Bubble now holds its own copy of previewUrl — don't revoke on send.
       setAttachments([]);
       setAttachError(null);
-
-      try {
-        api.setToken(state.sessionToken);
-        for await (const event of api.chatStream(
-          t,
-          sessionIdRef.current,
-          state.sessionToken ?? undefined,
-          undefined,
-          imagePayload,
-        )) {
-          const ev = event as ChatEvent;
-
-          if (ev.type === "text" && (ev.content ?? ev.token)) {
-            const raw = ev.content ?? ev.token ?? "";
-            const [visible, newInBlock] = filterThinking(
-              raw,
-              inThinkBlockRef.current,
-            );
-            inThinkBlockRef.current = newInBlock;
-            if (visible) {
-              setMsgs((prev) => {
-                const last = prev[prev.length - 1];
-                if (!last || last.who !== "goose") return prev;
-                // See Chat.tsx: the error arm overwrites `text`, this one appends,
-                // so text arriving after an error jammed onto the error sentence.
-                if (last.error) {
-                  return [
-                    ...prev,
-                    { id: nextMsgId(), who: "goose" as const, text: visible, streaming: true },
-                  ];
-                }
-                return [
-                  ...prev.slice(0, -1),
-                  { ...last, text: last.text + visible },
-                ];
-              });
-            }
-          } else if (ev.type === "tool_call" && ev.tool) {
-            const card = toolToCard(ev.tool);
-            if (card) {
-              setMsgs((prev) => {
-                const last = prev[prev.length - 1];
-                if (!last || last.who !== "goose") return prev;
-                return [
-                  ...prev.slice(0, -1),
-                  { ...last, card },
-                ];
-              });
-            }
-          } else if (ev.type === "error" || ev.error) {
-            const errMsg = ev.error ?? "Something went wrong";
-            setMsgs((prev) => {
-              const last = prev[prev.length - 1];
-              if (!last || last.who !== "goose") return prev;
-              return [
-                ...prev.slice(0, -1),
-                {
-                  ...last,
-                  text: `Error: ${errMsg}`,
-                  streaming: false,
-                  error: true,
-                },
-              ];
-            });
-          } else if (ev.type === "turn_stats") {
-            // Attach by id, not array position, so a message-list refresh
-            // mid-stream can never misdirect the stats.
-            const stats = ev as unknown as TurnStats;
-            setMsgs((prev) =>
-              prev.map((m) => (m.id === agentMsg.id ? { ...m, turnStats: stats } : m)),
-            );
-          } else if (ev.type === "turn_limit_reached") {
-            // The agent ran out of turns rather than finishing — mark the
-            // message (by id, same reasoning as turn_stats) so it offers a
-            // Continue action.
-            const limit = ev.max_turns ?? 0;
-            setMsgs((prev) =>
-              prev.map((m) => (m.id === agentMsg.id ? { ...m, turnLimit: limit } : m)),
-            );
-          } else if (ev.type === "subagent_progress") {
-            // PAI-6 P6. Attach by id — same reasoning as turn_stats — and fold
-            // through the shared reducer rather than a second copy of it.
-            setMsgs((prev) =>
-              prev.map((m) =>
-                m.id === agentMsg.id
-                  ? { ...m, delegations: applySubagentProgress(m.delegations ?? [], ev) }
-                  : m,
-              ),
-            );
-          } else if (ev.type === "context_warning") {
-            // PAI-4 P7b. The window is filling. Attach by id — same reasoning
-            // as turn_stats — so the note lands on this turn and not on
-            // whatever message a mid-stream history refresh left last.
-            const cw = ev as unknown as ContextWarning;
-            setMsgs((prev) =>
-              prev.map((m) => (m.id === agentMsg.id ? { ...m, contextWarning: cw } : m)),
-            );
-          } else if (ev.done && ev.session_id) {
-            sessionIdRef.current = ev.session_id;
-            dispatch({ type: "SET_SESSION_ID", payload: ev.session_id });
-          }
-        }
-      } catch (e) {
-        setMsgs((prev) => {
-          const last = prev[prev.length - 1];
-          if (!last || last.who !== "goose") return prev;
-          return [
-            ...prev.slice(0, -1),
-            {
-              ...last,
-              text: `Error: ${String(e)}`,
-              streaming: false,
-            },
-          ];
-        });
-      } finally {
-        setMsgs((prev) => {
-          const last = prev[prev.length - 1];
-          if (!last || last.who !== "goose") return prev;
-          return [...prev.slice(0, -1), { ...last, streaming: false }];
-        });
-        setBusy(false);
-        inputRef.current?.focus();
-      }
     },
-    [text, attachments, busy, seeded, state.sessionToken], // state.sessionId intentionally via ref
+    [text, attachments, busy],
   );
+
+  // Take focus back when the model stops -- what the old stream loop's
+  // `finally` did, and the only part of it that belonged to this component.
+  const prevBusyRef = useRef(busy);
+  useEffect(() => {
+    const wasBusy = prevBusyRef.current;
+    prevBusyRef.current = busy;
+    if (!busy && wasBusy) inputRef.current?.focus();
+  }, [busy]);
+
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -384,6 +274,9 @@ export function ChatHubView() {
   }
 
   const canSend = (text.trim().length > 0 || attachments.length > 0) && !busy;
+
+  // The seed stands in only until there is a real conversation to show.
+  const rows: Row[] = messages.length > 0 ? messages.map(toRow) : seed;
 
   return (
     <div className="chat2">
@@ -417,7 +310,7 @@ export function ChatHubView() {
         aria-label="Chat conversation"
         aria-live="polite"
       >
-        {msgs.map((m) => (
+        {rows.map((m) => (
           <div key={m.id} className={`ch-row ch-row--${m.who}`}>
             {m.who === "goose" && <GooseAvatar />}
             <div className="ch-bubble-wrap">
@@ -459,7 +352,7 @@ export function ChatHubView() {
               {m.who === "goose" && !m.streaming && m.contextWarning && (
                 <ContextPressureNote
                   warning={m.contextWarning}
-                  sessionId={sessionIdRef.current ?? null}
+                  sessionId={run.sessionId ?? null}
                 />
               )}
               {m.who === "goose" && !m.streaming && showTurnStats && m.turnStats && (
@@ -468,7 +361,7 @@ export function ChatHubView() {
             </div>
           </div>
         ))}
-        {busy && msgs[msgs.length - 1]?.text === "" && (
+        {busy && rows[rows.length - 1]?.text === "" && (
           <TypingIndicator />
         )}
       </div>
