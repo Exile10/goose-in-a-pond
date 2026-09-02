@@ -141,3 +141,137 @@ export function rootAttribute(
 ): unknown {
   return node.endpoints.find(e => e.number === 0)?.clusters[behaviorId]?.[attribute];
 }
+
+// ── Bridges ──────────────────────────────────────────────────────────────────
+
+/** Matter's Aggregator: the endpoint that says "this node speaks for others". */
+export const DEVICE_TYPE_AGGREGATOR = 0x000e;
+/** Matter's Bridged Node: the endpoint that IS one of those others. */
+export const DEVICE_TYPE_BRIDGED_NODE = 0x0013;
+
+/**
+ * One snapshot per GIAP device on this node.
+ *
+ * A Matter bridge — a Hue, Aqara or Tuya hub — is a single commissioned node whose
+ * Aggregator endpoint has a Bridged Node child per real device. GIAP has always
+ * mapped one device per node, so such a hub collapsed into one nonsense device that
+ * was simultaneously a light and a lock and could only ever drive whichever child
+ * held the lowest endpoint number.
+ *
+ * Rather than teach every mapping what an endpoint is, this cuts the node into one
+ * narrower `NodeSnapshot` each and the mappings run over those unchanged.
+ *
+ * Sliced on **Bridged Node**, not on Aggregator. The Bridged Node is what defines a
+ * device; the Aggregator only says a bridge exists, and the two descriptors populate
+ * from independent subscription reports — so keying on the Aggregator would give a
+ * different answer depending on which arrived first.
+ *
+ * The node itself is **always** a device too, typed `bridge` and driving nothing.
+ * That is not tidiness. Clusters populate late (see `#retryWiring`), so the first
+ * snapshot after commissioning has no device types at all and yields exactly one
+ * slice for the whole node; if that slice were not the hub, it would be registered
+ * as a device and then never removed — the peer still exists, so `peers.deleted`
+ * never fires — leaving a permanently-offline row the user cannot delete without
+ * decommissioning the hub. Emitting the hub deliberately also gives an empty hub
+ * something to be, gives `commission` something to return, and gives deletion a
+ * handle.
+ */
+export function deviceSlices(node: NodeSnapshot): NodeSnapshot[] {
+  const application = applicationEndpoints(node);
+  const bridged = application.filter(e => e.deviceTypes.includes(DEVICE_TYPE_BRIDGED_NODE));
+  // Not a bridge, or not yet known to be one: the node is its own single device and
+  // keeps the id it has always had.
+  if (bridged.length === 0) return [node];
+
+  const byNumber = new Map(node.endpoints.map(e => [e.number, e]));
+  const root = node.endpoints.find(e => e.number === 0);
+  const claimed = new Set<number>();
+
+  const children = bridged.map(child => ({
+    nodeId: node.nodeId,
+    online: node.online,
+    endpoints: withRoot(root, subtreeOf(child, byNumber, claimed)),
+    rootEndpoint: child.number,
+  }));
+
+  // The hub: endpoint 0, its Aggregator, and anything else it exposes for itself.
+  // A node can carry an Aggregator AND its own application endpoints — a thermostat
+  // hub that bridges valves — and those endpoints belong to the hub, not to a child.
+  const hub: NodeSnapshot = {
+    nodeId: node.nodeId,
+    online: node.online,
+    endpoints: withRoot(
+      root,
+      application.filter(e => !claimed.has(e.number)),
+    ),
+  };
+
+  return [hub, ...children];
+}
+
+/**
+ * Endpoint 0 stays on every slice.
+ *
+ * It carries the hub's Basic Information, which is the right fallback when a bridged
+ * child says nothing about itself — better a hub's name than `Matter 90`.
+ */
+function withRoot(
+  root: EndpointSnapshot | undefined,
+  endpoints: EndpointSnapshot[],
+): EndpointSnapshot[] {
+  return root === undefined ? endpoints : [root, ...endpoints];
+}
+
+/**
+ * A bridged device and its own parts, claiming each endpoint as it goes.
+ *
+ * Breadth-first over `parts` with a claimed set, so a `parts` list that is cyclic or
+ * that names an endpoint twice terminates instead of recursing until the stack goes
+ * — which, since this runs inside `subscribe`, would have put the bridge into a
+ * permanent reconnect loop on one bad firmware.
+ *
+ * Descent stops at any endpoint that is itself a Bridged Node. A hub reporting
+ * full-family parts (every descendant, which is what the spec says an Aggregator's
+ * PartsList is) would otherwise have child A swallow child B while B is also a
+ * device in its own right — and B's readings would then arrive under two device ids.
+ */
+function subtreeOf(
+  start: EndpointSnapshot,
+  byNumber: ReadonlyMap<number, EndpointSnapshot>,
+  claimed: Set<number>,
+): EndpointSnapshot[] {
+  const subtree: EndpointSnapshot[] = [];
+  const queue: EndpointSnapshot[] = [start];
+
+  while (queue.length > 0) {
+    const endpoint = queue.shift()!;
+    // Endpoint 0 is the hub's, never a child's, however a `parts` list names it.
+    if (endpoint.number === 0 || claimed.has(endpoint.number)) continue;
+    claimed.add(endpoint.number);
+    subtree.push(endpoint);
+
+    for (const part of endpoint.parts) {
+      const child = byNumber.get(part);
+      if (child === undefined || child.number === 0) continue;
+      if (child.deviceTypes.includes(DEVICE_TYPE_BRIDGED_NODE)) continue;
+      queue.push(child);
+    }
+  }
+  return subtree;
+}
+
+/**
+ * The slice an endpoint belongs to, for attributing something the device published.
+ *
+ * Endpoint 0 is on every slice and belongs to none of them, so it resolves to the
+ * hub — which is whose Basic Information it is.
+ */
+export function sliceForEndpoint(
+  slices: readonly NodeSnapshot[],
+  endpointNumber: number,
+): NodeSnapshot | undefined {
+  if (endpointNumber === 0) return slices.find(slice => slice.rootEndpoint === undefined);
+  return slices.find(slice =>
+    slice.endpoints.some(e => e.number !== 0 && e.number === endpointNumber),
+  );
+}
