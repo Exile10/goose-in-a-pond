@@ -261,6 +261,19 @@ function subtreeOf(
 }
 
 /**
+ * Does this node carry an Aggregator?
+ *
+ * Distinct from "does it have bridged children": a hub whose children have all been
+ * unpaired still has one, and a hub whose descriptors are momentarily unreadable
+ * looks like it has neither. That difference is what tells "the user removed every
+ * bulb" from "we cannot see anything right now", which matters before announcing a
+ * dozen devices as gone.
+ */
+export function hasAggregator(node: NodeSnapshot): boolean {
+  return applicationEndpoints(node).some(e => e.deviceTypes.includes(DEVICE_TYPE_AGGREGATOR));
+}
+
+/**
  * The slice an endpoint belongs to, for attributing something the device published.
  *
  * Endpoint 0 is on every slice and belongs to none of them, so it resolves to the

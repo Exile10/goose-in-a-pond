@@ -21,6 +21,7 @@ import { readingFor, sensorClusters } from "./mapping/sensors.js";
 import {
   applicationEndpoints,
   deviceSlices,
+  hasAggregator,
   isVendorCluster,
   sliceForEndpoint,
   type ClusterState,
@@ -122,6 +123,16 @@ export interface ControllerEvents {
 export class Controller {
   #node: ServerNode;
   #events: ControllerEvents;
+  /**
+   * The devices each peer last held, so one that goes can be reported.
+   *
+   * Node-level churn was rare enough that `peers.deleted` covered it. Bridged-child
+   * churn is not: users add and remove bulbs in the vendor's own app constantly, and
+   * nothing about that touches the fabric — the node stays, so `peers.deleted` never
+   * fires and the row would live forever.
+   */
+  #lastDevices = new Map<string, Set<string>>();
+
   /** Peers already wired for events, so a re-sync does not double-subscribe. */
   #observed = new Map<string, Set<string>>();
   /** The last value published per device and sensor, so a sweep only says what changed. */
@@ -177,7 +188,16 @@ export class Controller {
     // Five seconds: fast enough that a person changing something on the device and
     // then asking about it gets the new value, slow enough to be a handful of
     // comparisons over an idle house.
-    const sweep = setInterval(() => guard("sweep_readings", () => controller.#sweepReadings()), 5_000);
+    const sweep = setInterval(
+      () =>
+        guard("sweep_readings", () => {
+          controller.#sweepReadings();
+          // Same tick: a bridge's child list changes when the user changes it in the
+          // vendor's app, which GIAP hears about only as a structure change.
+          controller.#reconcileDevices();
+        }),
+      5_000,
+    );
     sweep.unref?.();
 
     const availability = setInterval(
@@ -289,6 +309,42 @@ export class Controller {
    * Should the event path start working, this sweep finds nothing left to say and
    * becomes a cheap backstop rather than a second source of truth.
    */
+  /**
+   * Report devices a peer no longer holds.
+   *
+   * A bridged child unpaired in the vendor's own app disappears from the node's
+   * structure without anything touching the fabric, so `peers.deleted` never fires
+   * and the registry row would outlive the device forever.
+   *
+   * Only for a node that still shows an Aggregator, which is the guard that matters.
+   * A snapshot whose descriptors are momentarily unreadable collapses to one slice —
+   * indistinguishable, by device count alone, from a hub whose every child was just
+   * removed. Requiring the Aggregator to still be visible means an empty child list
+   * is a fact rather than a gap, so a blink cannot announce a dozen devices as gone.
+   */
+  #reconcileDevices(): void {
+    for (const [peer, snapshot] of this.#peerSnapshots()) {
+      const current = new Set(
+        deviceSlices(snapshot).map(slice => deviceIdForNode(slice.nodeId, slice.rootEndpoint)),
+      );
+      const previous = this.#lastDevices.get(peer.id);
+      this.#lastDevices.set(peer.id, current);
+
+      // First sight: `subscribe` and `device_added` have already said what is here.
+      if (previous === undefined) continue;
+      if (!hasAggregator(snapshot)) continue;
+
+      for (const gone of previous) {
+        if (!current.has(gone)) {
+          log.info("bridged_device_gone", "a device behind a bridge is no longer there", {
+            device_id: gone,
+          });
+          this.#events.deviceRemoved(gone);
+        }
+      }
+    }
+  }
+
   #sweepReadings(): void {
     for (const reading of this.readings()) {
       const key = `${reading.device_id}/${reading.sensor_type}`;
@@ -580,6 +636,7 @@ export class Controller {
         const nodeId = peerNodeId(peer);
         if (nodeId === undefined) return;
         this.#observed.delete(peer.id);
+        this.#lastDevices.delete(peer.id);
         this.#events.deviceRemoved(deviceIdForNode(nodeId));
       }),
     );
