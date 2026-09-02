@@ -1954,27 +1954,20 @@
   gap: var(--space-4);
 }
 
+/* The edge itself comes from `.ink-edge .ink-card` in @jarida/ink. What is left
+   here is what is true of THIS card and no other. */
 .skill-card {
-  --ink-lift: 4px;
-
   position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-4);
-
-  background: var(--color-surface);
-  border: 2px solid var(--color-text);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--ink-lift) var(--ink-lift) 0 var(--border-ink);
-
-  transform: translate(calc(4px - var(--ink-lift)), calc(4px - var(--ink-lift)));
-  transition: transform 160ms cubic-bezier(0.22, 1, 0.36, 1),
-              box-shadow 160ms cubic-bezier(0.22, 1, 0.36, 1),
-              border-color 160ms ease, opacity 160ms ease;
+  /* CSS transitions do not compose: naming `opacity` here replaces the
+     library's three rather than adding to it, so all four are restated. The
+     numbers still come from one place. */
+  transition: transform var(--dur-lift) var(--ink-ease),
+              box-shadow var(--dur-lift) var(--ink-ease),
+              border-color var(--dur-base) ease,
+              opacity var(--dur-lift) var(--ink-ease);
 }
 
-.skill-card:hover { --ink-lift: 7px; border-color: var(--color-accent); }
+.skill-card:hover { --ink-lift: var(--ink-raised); border-color: var(--color-accent-line); }
 
 .skill-card--inactive { opacity: 0.55; }
 

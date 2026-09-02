@@ -173,42 +173,18 @@
   align-content: start;
 }
 
+/* The edge itself comes from `.ink-edge .ink-card` in @jarida/ink. What is left
+   here is what is true of THIS card and no other. */
 .chist__card {
-  --ink-lift: 4px;
-
   position: relative;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-4);
+  /* A conversation title long enough to wrap twice would otherwise push past
+     the card it was measured for. */
   overflow: hidden;
-
-  background: var(--color-surface);
-  border: 2px solid var(--color-text);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--ink-lift) var(--ink-lift) 0 var(--border-ink);
-
-  cursor: pointer;
-  text-align: left;
-  /* The card moves by exactly what the shadow loses, so pressing lands it in
-     the space the shadow was occupying. */
-  transform: translate(calc(4px - var(--ink-lift)), calc(4px - var(--ink-lift)));
-  transition: transform 160ms cubic-bezier(0.22, 1, 0.36, 1),
-              box-shadow 160ms cubic-bezier(0.22, 1, 0.36, 1),
-              border-color 160ms ease;
 }
 
 .chist__card[data-weight="tile"]   { grid-row: span 3; }
 .chist__card[data-weight="card"]   { grid-row: span 4; }
 .chist__card[data-weight="column"] { grid-row: span 5; }
-
-.chist__card:hover  { --ink-lift: 7px; border-color: var(--color-accent); }
-.chist__card:active { --ink-lift: 0px; }
-
-.chist__card:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 3px;
-}
 
 /* Loading placeholders: the wall's shape before its contents, so the layout
    does not jump when the real cards arrive. */
@@ -352,8 +328,5 @@
   .chist__grid { grid-template-columns: 1fr; }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  /* The lift is the whole affordance, so it stays — instantly rather than
-     eased. Removing it outright would leave a card with no pressed state. */
-  .chist__card { transition-duration: 1ms; }
-}
+/* Reduced motion is handled by the library, which collapses the transition
+   rather than removing the lift — the lift is the whole pressed affordance. */

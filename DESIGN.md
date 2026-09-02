@@ -8,6 +8,12 @@ The designer-facing edition of this document is
 [`docs/design/Jarida_GIAP_DesignEthos_v1.0_20260816.pdf`](docs/design/Jarida_GIAP_DesignEthos_v1.0_20260816.pdf).
 Same rules, longer form, printable, with the ethos stated at the end.
 
+The executable edition is [`packages/ink`](packages/ink/README.md) — the tokens, the edge geometry
+and the components, for React and React Native/Expo. Three of the rules below are held there rather
+than described: there is no `color` prop on any component, `InkBudget` counts raised surfaces against
+a budget, and the contrast values that depend on a runtime accent are derived instead of written
+down. Its test suite parses `design-tokens.css` and fails if the two have drifted.
+
 ---
 
 ## 1. Precedence — read this before resolving any conflict
