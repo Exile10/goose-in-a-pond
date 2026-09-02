@@ -86,12 +86,24 @@ const ROUTES: &str = include_str!("../src/routes.rs");
 /// The two functions that actually hold the streaming bodies.
 ///
 /// **They are not symmetrical, and that asymmetry is part of what P7 is about.**
-/// `chat_stream` is a thin wrapper that takes an SSE permit and delegates to
-/// `chat_stream_inner`; `agent_chat_stream` carries its body inline with no
-/// inner. Pointing this guard at `chat_stream` finds thirty lines of preamble and
-/// none of the persistence, which is exactly the false pass the vacuity control
-/// below exists to catch -- it caught it while this file was being written.
-const CHAT: &str = "chat_stream_inner";
+/// `chat_stream` is a thin wrapper that takes an SSE permit and delegates
+/// onwards; `agent_chat_stream` carries its body inline with no inner. Pointing
+/// this guard at `chat_stream` finds thirty lines of preamble and none of the
+/// persistence, which is exactly the false pass the vacuity control below exists
+/// to catch -- it caught it while this file was being written, and it caught the
+/// move described next.
+///
+/// # Why this is `drive_turn` and no longer `chat_stream_inner`
+///
+/// The turn stopped being a response body. It is now a task driving a
+/// `RunHandle`, so that a reload no longer kills the answer mid-sentence, and
+/// `chat_stream_inner` shrank to the wrapper that starts it. The guard followed
+/// the code rather than the name: pointed at the wrapper it found 560 bytes and
+/// went vacuous, which is precisely what the control below is for.
+///
+/// The wrapper's NAME is still asserted to exist, in `production()` -- both this
+/// file's slicer and `run_recipe` depend on it.
+const CHAT: &str = "drive_turn";
 const AGENT: &str = "agent_chat_stream";
 
 /// The one function that turns an engine event into an SSE frame.
@@ -117,6 +129,7 @@ fn production() -> &'static str {
     // below would pass for the wrong reason.
     for needle in [
         "fn chat_stream_inner(",
+        "async fn drive_turn(",
         "async fn agent_chat_stream(",
         "fn absorb(",
     ] {
