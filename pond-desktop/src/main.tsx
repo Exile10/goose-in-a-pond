@@ -6,6 +6,10 @@ import React, { useState } from "react";
 import ReactDOM from "react-dom/client";
 
 import "./styles/design-tokens.css";
+// The Ink component styles. Structure only — every value in it reads a custom
+// property that `themeStore` has already written to <html>, so it agrees with
+// the stylesheets below by construction rather than by luck.
+import "@jarida/ink/css";
 import "./styles/base.css";
 import "./styles/sections.css";
 import "./hub/hub.css";

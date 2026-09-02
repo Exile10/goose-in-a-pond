@@ -151,7 +151,7 @@ export function ChatHistory({ sessions, loading, onOpen, onNewChat, onDelete }: 
       {loading && (
         <div className="chist__grid" aria-busy="true" aria-label="Loading conversations">
           {(["card", "tile", "column", "tile", "card", "tile"] as const).map((w, i) => (
-            <div key={i} className="chist__card chist__card--ghost" data-weight={w} />
+            <div key={i} className="ink-edge ink-card chist__card chist__card--ghost" data-weight={w} />
           ))}
         </div>
       )}
@@ -180,7 +180,7 @@ export function ChatHistory({ sessions, loading, onOpen, onNewChat, onDelete }: 
             return (
               <article
                 key={session.id}
-                className="chist__card"
+                className="ink-edge ink-card ink-pressable chist__card"
                 data-weight={cardWeight(session)}
                 onClick={(e) => open(session, e)}
                 onKeyDown={(e) => {

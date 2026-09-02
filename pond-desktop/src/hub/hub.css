@@ -2330,7 +2330,7 @@ body,
   box-shadow: var(--shadow-ink);
 }
 .dtile:hover { border-color: var(--color-text) !important; }
-.dtile[data-active="true"]:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 var(--border-ink); }
+.dtile[data-active="true"]:active { transform: translate(calc(var(--ink-rest) - var(--ink-press-compact)), calc(var(--ink-rest) - var(--ink-press-compact))); box-shadow: var(--ink-press-compact) var(--ink-press-compact) 0 var(--border-ink); }
 .dtile__name, .dtile__temp { color: var(--color-text) !important; }
 
 /* The weather card joins the same material. This overrides its four

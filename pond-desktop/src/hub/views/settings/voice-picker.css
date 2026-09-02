@@ -3,6 +3,11 @@
    slider — rebuilt in the house material. Paper, a 2px ink outline, and the
    hard offset in --border-ink.
 
+   The ladder is @jarida/ink's: a chip presses to --ink-press-compact rather
+   than to zero, because a 30px control travelling the full 4px reads as
+   falling over rather than being pressed. The offset it loses is the distance
+   it moves, which is what keeps the plate still.
+
    The rule the device tiles set holds here: STATE IS ELEVATION, not hue. A
    selected voice is raised on its offset; the rest lie flat with a hairline.
    That leaves the page's one real colour to the control that actually asks a
@@ -129,7 +134,7 @@
   color: var(--color-text, #171616);
   box-shadow: var(--shadow-ink);
 }
-.vpick__tab[data-on="true"]:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 var(--border-ink); }
+.vpick__tab[data-on="true"]:active { transform: translate(calc(var(--ink-rest) - var(--ink-press-compact)), calc(var(--ink-rest) - var(--ink-press-compact))); box-shadow: var(--ink-press-compact) var(--ink-press-compact) 0 var(--border-ink); }
 .vpick__tab:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ── Voices ──
@@ -161,7 +166,7 @@
   border-color: var(--color-text, #171616);
   box-shadow: var(--shadow-ink);
 }
-.vpick__voice[data-on="true"]:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 var(--border-ink); }
+.vpick__voice[data-on="true"]:active { transform: translate(calc(var(--ink-rest) - var(--ink-press-compact)), calc(var(--ink-rest) - var(--ink-press-compact))); box-shadow: var(--ink-press-compact) var(--ink-press-compact) 0 var(--border-ink); }
 .vpick__voice:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .vpick__vname {
@@ -245,7 +250,7 @@
   transition: transform 0.12s, box-shadow 0.12s, filter 0.16s;
 }
 .vpick__play:hover:not(:disabled) { filter: brightness(1.06); }
-.vpick__play:active:not(:disabled) { transform: translate(2px, 2px); box-shadow: 2px 2px 0 var(--border-ink); }
+.vpick__play:active:not(:disabled) { transform: translate(calc(var(--ink-rest) - var(--ink-press-compact)), calc(var(--ink-rest) - var(--ink-press-compact))); box-shadow: var(--ink-press-compact) var(--ink-press-compact) 0 var(--border-ink); }
 .vpick__play:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .vpick__spin { animation: vpick-spin 1s linear infinite; }
@@ -301,7 +306,7 @@
   border-color: var(--color-text, #171616);
   box-shadow: var(--shadow-ink);
 }
-.vpick__tier[data-on="true"]:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 var(--border-ink); }
+.vpick__tier[data-on="true"]:active { transform: translate(calc(var(--ink-rest) - var(--ink-press-compact)), calc(var(--ink-rest) - var(--ink-press-compact))); box-shadow: var(--ink-press-compact) var(--ink-press-compact) 0 var(--border-ink); }
 .vpick__tier:disabled { opacity: 0.5; cursor: not-allowed; }
 .vpick__tier:focus-visible { outline: 2px solid var(--border-ink, #5D23C2); outline-offset: 3px; }
 

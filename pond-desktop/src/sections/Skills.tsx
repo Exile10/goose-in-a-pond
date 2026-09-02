@@ -261,7 +261,7 @@ export function Skills() {
       ) : skills.length > 0 ? (
         <div className="skills-grid">
           {skills.map((s) => (
-            <div key={s.id} className={`skill-card${!s.active ? " skill-card--inactive" : ""}`}>
+            <div key={s.id} className={`ink-edge ink-card skill-card${!s.active ? " skill-card--inactive" : ""}`}>
               <div className="skill-card__top">
                 <span className="skill-card__icon">
                   <SkillIcon icon={s.icon} name={s.name} />

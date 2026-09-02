@@ -353,6 +353,15 @@
   --color-destructive-soft: rgba(255,  59,  48, 0.15);
   --color-info-soft:        rgba(  0, 114, 245, 0.12);
 
+  /* The FOREGROUND has to move with the background it sits on, and it was not
+     moving. `--color-destructive-fg` is `#B91C1C` in the light block, chosen
+     there because #DC2626 measured 4.0:1 on a light-red surface — a dark red
+     for dark text on a pale ground. Dark mode overrode the surface just above
+     and inherited that same dark red, so destructive text was rendering nearly
+     invisibly against it. Caught by `ink-adoption.test.ts`, which compares this
+     block against `@jarida/ink` and named the exact token. */
+  --color-destructive-fg:   #F87171;
+
   /* Shadows — lighter base for dark surfaces */
   --shadow-xs:     0 1px 1px rgba(0, 0, 0, 0.25);
   --shadow-sm:     0 1px 3px rgba(0, 0, 0, 0.30);
