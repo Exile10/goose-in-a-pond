@@ -185,9 +185,12 @@ list
 quit
 ```
 
-`--port` defaults to 5541 and should never be 5540 (see below). `--storage` is
-per-instance by default, so several can run at once. `@<number>` after a device
-forces its endpoint number — `--bridged basic-video-player=Telly@7 --part speaker@3`
+`--port` defaults to 5541 and should never be 5540 (see below). `--storage-dir` is
+per-instance by default, so several can run at once. It is spelt `--storage-dir`
+rather than `--storage` because matter.js parses the tool's own argv into its own
+variables: a `--storage` flag would define `storage` as a scalar, and setting
+`storage.path` then fails with *"segment storage is not a map"*. `@<number>` after
+a device forces its endpoint number — `--bridged basic-video-player=Telly@7 --part speaker@3`
 builds a bridged device sitting *above* its own part, which is what a real hub does
 and what breaks anything reading "the lowest endpoint carrying this cluster".
 
