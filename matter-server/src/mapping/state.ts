@@ -45,9 +45,10 @@ import {
   CLUSTER_LEVEL_CONTROL,
   CLUSTER_ON_OFF,
   CLUSTER_THERMOSTAT,
+  CLUSTER_VALVE,
   CLUSTER_WINDOW_COVERING,
 } from "./devices.js";
-import { doorStateWord, expressedStateWord, switchKindOf } from "./describe.js";
+import { doorStateWord, expressedStateWord, switchKindOf, valveStateWord } from "./describe.js";
 import { sensorApplies, SENSORS } from "./sensors.js";
 import { observedOperation, settingsOf } from "./settings.js";
 import { applianceSetpoint, targetSetpoint } from "./thermostat.js";
@@ -70,6 +71,23 @@ function numberAt(node: NodeSnapshot, cluster: string, attribute: string): numbe
 }
 
 /** Everything this device currently reports, in the order a person would ask. */
+/**
+ * Is a valve reporting any fault at all?
+ *
+ * `valveFault` is a bitmap, and matter.js may hand it over decoded into named flags
+ * or as the raw number -- the same tolerance `colorSupport` and `fanModes` apply.
+ * Which fault it is stays out of this: the words are the spec's ("general fault",
+ * "blocked", "leaking"), a device may report several at once, and "the valve has
+ * faulted" is the fact a caller acts on.
+ */
+function faultsPresent(raw: unknown): boolean {
+  if (typeof raw === "number") return raw !== 0;
+  if (typeof raw === "object" && raw !== null) {
+    return Object.values(raw as Record<string, unknown>).some(flag => flag === true);
+  }
+  return false;
+}
+
 export function stateOf(node: NodeSnapshot): DeviceState {
   const values: StateValue[] = [];
   const add = (name: string, value: string | undefined) => {
@@ -111,6 +129,16 @@ export function stateOf(node: NodeSnapshot): DeviceState {
   // frame reports "locked" quite happily, and jammed and forced open have no reading
   // here at all otherwise.
   add("door", doorStateWord(valueAt(node, CLUSTER_DOOR_LOCK, "doorState")));
+
+  // Where the valve is, in the same three words `describe` lists -- from the same
+  // reader, so "transitioning" cannot come out as something else here. Its level,
+  // where it has one, is reported as `position`: the thing reported is the thing
+  // `position` sets, which is the rule the covering above follows.
+  add("valve_state", valveStateWord(valueAt(node, CLUSTER_VALVE, "currentState")));
+  const valveLevel = numberAt(node, CLUSTER_VALVE, "currentLevel");
+  if (valveLevel !== undefined) add("position", `${Math.round(valveLevel)}%`);
+  const valveFault = valueAt(node, CLUSTER_VALVE, "valveFault");
+  if (valveFault !== undefined) add("valve_fault", faultsPresent(valveFault) ? "yes" : "no");
 
   // Reported so it can be checked, never set. See `statesOf` in describe.ts.
   const pin = valueAt(node, CLUSTER_DOOR_LOCK, "requirePinForRemoteOperation");

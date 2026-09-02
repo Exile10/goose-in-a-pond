@@ -665,6 +665,13 @@ impl DeviceControlPort for SwitchableDeviceControl {
             .await
     }
 
+    async fn set_valve(&self, device_id: &str, open: bool) -> Result<DeviceControlOutcome> {
+        self.backend_for(device_id)
+            .await?
+            .set_valve(device_id, open)
+            .await
+    }
+
     async fn set_position(
         &self,
         device_id: &str,

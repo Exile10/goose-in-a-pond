@@ -16,6 +16,7 @@ import {
   type EndpointSnapshot,
   type NodeSnapshot,
 } from "./snapshot.js";
+import { clusterHasFeature } from "./sensors.js";
 import { operationsOf, settingsOf } from "./settings.js";
 import { applianceSetpoint } from "./thermostat.js";
 
@@ -40,6 +41,8 @@ export const CLUSTER_SWITCH = "switch";
  * nameless and the hub's own liveness the only liveness there was.
  */
 export const CLUSTER_BRIDGED_DEVICE_INFO = "bridgedDeviceBasicInformation";
+/** A valve: open, shut, and -- where it says so -- how far. */
+export const CLUSTER_VALVE = "valveConfigurationAndControl";
 
 /**
  * Every cluster this module names, for the snapshot allowlist.
@@ -64,6 +67,7 @@ export function deviceClusters(): ReadonlySet<string> {
     CLUSTER_SMOKE_CO_ALARM,
     CLUSTER_SWITCH,
     CLUSTER_BRIDGED_DEVICE_INFO,
+    CLUSTER_VALVE,
   ]);
 }
 
@@ -173,6 +177,10 @@ const DEVICE_TYPES: ReadonlyMap<number, string> = new Map([
   [0x007a, "fan"], // Extractor Hood
   [0x0074, "vacuum"], // Robotic Vacuum Cleaner
   [0x0303, "pump"], // Pump
+  // A valve is not a plug with water in it: it takes `open` and `close` rather than
+  // On/Off, and an irrigation system is one or several of them.
+  [0x0042, "valve"], // Water Valve
+  [0x0040, "valve"], // Irrigation System
   // Media
   [0x0023, "media"], // Casting Video Player
   [0x0028, "media"], // Basic Video Player
@@ -273,6 +281,20 @@ export function levelIsBrightness(node: NodeSnapshot): boolean {
   );
 }
 
+/**
+ * Does this valve say it has a level, rather than only open and shut?
+ *
+ * Valve Configuration and Control's LVL feature is optional. Claims first, evidence
+ * second -- the same order `colorSupport` uses: the feature map is believed where it
+ * speaks, and a device that publishes a `currentLevel` has one whatever it claims.
+ */
+export function valveHasLevel(node: NodeSnapshot): boolean {
+  const state = endpointWith(node, CLUSTER_VALVE)?.clusters[CLUSTER_VALVE];
+  if (state === undefined) return false;
+  if (clusterHasFeature(state, "level")) return true;
+  return state["currentLevel"] !== undefined || state["targetLevel"] !== undefined;
+}
+
 function capabilitiesOf(node: NodeSnapshot): string[] {
   const capabilities: string[] = [];
   const hasOnOff = hasCluster(node, CLUSTER_ON_OFF);
@@ -297,6 +319,13 @@ function capabilitiesOf(node: NodeSnapshot): string[] {
     capabilities.push("temperature");
   }
   if (hasCluster(node, CLUSTER_DOOR_LOCK)) capabilities.push("lock");
+  if (hasCluster(node, CLUSTER_VALVE)) {
+    capabilities.push("valve");
+    // Only a valve that says it has a level. The LVL feature is optional and a plain
+    // solenoid has none, so offering one is a control the device would reject -- the
+    // same rule `tilt` follows for a roller blind with no slats.
+    if (valveHasLevel(node)) capabilities.push("position");
+  }
   // A covering was listed with no capabilities at all while `describe` offered it a
   // position, so the short answer said a controllable device could not be driven.
   if (hasCluster(node, CLUSTER_WINDOW_COVERING)) {

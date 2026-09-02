@@ -113,6 +113,7 @@ Exactly GIAP's `DeviceControlPort` vocabulary:
 | `tilt` | 0–100 percent **open** | `tilt` |
 | `mode` | `{setting, value}`, both as the device words them | `mode` |
 | `operation` | one of the operations the device offers | `operation` |
+| `valve` | `true` (open) / `false` (shut) | `valve` |
 
 Values are in GIAP's units. The controller converts.
 
@@ -187,6 +188,25 @@ only by a covering that reports a tilt position, since a roller blind has nothin
 turn and a control a device will reject is the failure this area exists to stop.
 Zero is open on both axes: the spec has `GoToTiltPercentage` treat a zero percentage
 as `UpOrOpen`, so one conversion serves both.
+
+`valve` is not `power`, and a valve's level is `position`. Valve Configuration and
+Control takes `open` and `close` commands and has no On/Off cluster at all, so a
+valve answered every power request "not supported" while sitting there perfectly
+openable. Its level, where it has one, is the same axis a covering's `position` is —
+percentage **open** — so it is the same verb rather than a third name for it.
+
+That level is optional: the cluster's LVL feature is, and a plain solenoid is open
+or shut with nothing in between. `position` is therefore offered only to a valve
+that claims the feature or publishes a level, on the same claims-first-evidence-second
+order `colorCapabilities` uses, and refused by name on one that has neither — the
+same rule that keeps `tilt` off a roller blind. Asking for 0% sends `close` rather
+than `open` with a zero target, because the spec constrains `targetLevel` to 1–100
+and 0% means shut.
+
+`valve_state` is reported and never written: closed, open, or **transitioning**. The
+third is a real answer — a motorised valve takes seconds to travel — and a caller
+that has just asked for it to open needs to tell "moving" from "refused", so the
+settle read withholds an answer while it travels rather than guessing a direction.
 
 `color_temp` is a second colour control, not a second way to reach the first. 2700K white
 has no hue, so it cannot be asked for through hue and saturation at all — which is why it

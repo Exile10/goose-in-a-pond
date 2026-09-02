@@ -436,3 +436,47 @@ export function bridgedComposedNode(): NodeSnapshot {
   ]);
 }
 
+
+/**
+ * A water valve with a level: open, shut, and how far.
+ *
+ * Valve Configuration and Control's LVL feature is optional, so this and
+ * `plainValveNode` are the two shapes that behave differently — one takes a
+ * percentage and the other has nothing to take it with.
+ */
+export function levelValveNode(): NodeSnapshot {
+  return node(60, [
+    named("Garden Valve"),
+    endpoint(
+      1,
+      {
+        valveConfigurationAndControl: {
+          featureMap: { level: true, timeSync: false },
+          currentState: 1,
+          targetState: 1,
+          currentLevel: 40,
+          valveFault: {},
+        },
+      },
+      [0x0042],
+    ),
+  ]);
+}
+
+/** A plain solenoid: open or shut, with nothing in between and no level to set. */
+export function plainValveNode(): NodeSnapshot {
+  return node(61, [
+    named("Mains Shutoff"),
+    endpoint(
+      1,
+      {
+        valveConfigurationAndControl: {
+          featureMap: { level: false, timeSync: false },
+          currentState: 0,
+          targetState: 0,
+        },
+      },
+      [0x0042],
+    ),
+  ]);
+}

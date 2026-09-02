@@ -11,16 +11,18 @@ import { OpError, type DeviceStatePatch, type Verb } from "../protocol.js";
 import {
   levelIsBrightness,
   speakerEndpoint,
+  valveHasLevel,
   CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
   CLUSTER_FAN_CONTROL,
   CLUSTER_LEVEL_CONTROL,
   CLUSTER_ON_OFF,
   CLUSTER_THERMOSTAT,
+  CLUSTER_VALVE,
   CLUSTER_WINDOW_COVERING,
 } from "./devices.js";
 import { operationsOf, settingNamed, settingsOf } from "./settings.js";
-import { endpointWith, type NodeSnapshot } from "./snapshot.js";
+import { endpointWith, hasCluster, type NodeSnapshot } from "./snapshot.js";
 import { applianceSetpoint, targetSetpoint } from "./thermostat.js";
 
 // `Verb` is protocol vocabulary — it names what a `control` op may ask for — so it
@@ -52,6 +54,7 @@ const ALL_VERBS: Record<Verb, true> = {
   tilt: true,
   mode: true,
   operation: true,
+  valve: true,
 };
 
 export const VERBS: ReadonlySet<string> = new Set(Object.keys(ALL_VERBS));
@@ -137,7 +140,18 @@ export function observedFor(node: NodeSnapshot, verb: Verb): DeviceStatePatch {
     }
     case "position": {
       const lift = at(CLUSTER_WINDOW_COVERING, "currentPositionLiftPercent100ths");
-      return lift === undefined ? {} : { position: lift100thsToPositionOpen(lift) };
+      if (lift !== undefined) return { position: lift100thsToPositionOpen(lift) };
+      // A valve's level is already a plain percentage, so there is nothing to convert.
+      const level = at(CLUSTER_VALVE, "currentLevel");
+      return typeof level === "number" ? { position: clampPercent(level) } : {};
+    }
+    case "valve": {
+      const state = at(CLUSTER_VALVE, "currentState");
+      // Transitioning is not an answer to "is it open" -- it is the device saying it
+      // does not know yet -- so nothing is reported rather than guessing a direction.
+      if (state === VALVE_OPEN) return { valve: true };
+      if (state === VALVE_CLOSED) return { valve: false };
+      return {};
     }
     case "tilt": {
       const tilt = at(CLUSTER_WINDOW_COVERING, "currentPositionTiltPercent100ths");
@@ -149,6 +163,16 @@ export function observedFor(node: NodeSnapshot, verb: Verb): DeviceStatePatch {
       return {};
   }
 }
+
+/**
+ * Valve Configuration and Control's `currentState`: shut, open, or on its way.
+ *
+ * Transitioning is a real third answer -- a motorised ball valve takes seconds --
+ * and reading it as either of the other two reports a valve as settled when it is
+ * not, which is the failure the settle loop exists to avoid.
+ */
+const VALVE_CLOSED = 0;
+const VALVE_OPEN = 1;
 
 // ── Unit conversions ─────────────────────────────────────────────────────────
 
@@ -498,6 +522,21 @@ export function planControl(
       };
     }
 
+    case "valve": {
+      const open = asBoolean(value, "valve");
+      const endpoint = endpointFor(node, CLUSTER_VALVE, deviceId);
+      return {
+        actions: [
+          // No payload on `open`: its two fields are an auto-close duration and a
+          // target level, and neither was asked for. Sending a level here would set
+          // one on a valve that may not have the feature at all -- `position` is the
+          // verb for that, and it is offered only where the device claims a level.
+          { kind: "command", endpoint, cluster: CLUSTER_VALVE, command: open ? "open" : "close", payload: {} },
+        ],
+        applied: { valve: open },
+      };
+    }
+
     case "locked": {
       const locked = asBoolean(value, "locked");
       const endpoint = endpointFor(node, CLUSTER_DOOR_LOCK, deviceId);
@@ -599,6 +638,33 @@ export function planControl(
 
     case "position": {
       const pct = asPercent(value, "position");
+      // A valve's level is the same axis by a different route: percentage OPEN, sent
+      // as `open`'s target level rather than as a covering's lift. Checked second so
+      // a device with both -- which does not exist today -- keeps the behaviour it
+      // has rather than silently changing which cluster it drives.
+      if (!hasCluster(node, CLUSTER_WINDOW_COVERING) && hasCluster(node, CLUSTER_VALVE)) {
+        if (!valveHasLevel(node)) {
+          throw new OpError(
+            "capability_unsupported",
+            `Matter device '${deviceId}' is a valve with no level -- it can only be opened or shut, with the 'valve' verb`,
+          );
+        }
+        return {
+          actions: [
+            {
+              kind: "command",
+              endpoint: endpointFor(node, CLUSTER_VALVE, deviceId),
+              cluster: CLUSTER_VALVE,
+              // Asking for 0% is asking for it shut, and `open` with a target level
+              // of zero is not that -- the spec's own constraint on targetLevel is
+              // 1 to 100.
+              command: pct === 0 ? "close" : "open",
+              payload: pct === 0 ? {} : { targetLevel: pct },
+            },
+          ],
+          applied: pct === 0 ? { position: 0, valve: false } : { position: pct, valve: true },
+        };
+      }
       const endpoint = endpointFor(node, CLUSTER_WINDOW_COVERING, deviceId);
       return {
         actions: [
