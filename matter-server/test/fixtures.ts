@@ -215,6 +215,50 @@ export function smokeCoAlarmNode(): NodeSnapshot {
   ]);
 }
 
+/**
+ * Google's Matter Virtual Device Generic Switch: a latching switch whose whole screen
+ * is a "Current position" dropdown reading "Position #1".
+ *
+ * The device that arrived typed `matter` with no capabilities and answered "cannot be
+ * controlled, and does not measure any data" -- because 0x000f was not a device type
+ * GIAP mapped, `switch` was not a cluster the snapshot admitted, and nothing described
+ * it. Two positions, so a bound of 0..1 is a real statement rather than the spec's
+ * default repeated back.
+ */
+export function genericSwitchNode(): NodeSnapshot {
+  return node(6, [
+    named("Generic Switch"),
+    endpoint(1, {
+      switch: {
+        featureMap: { latchingSwitch: true, momentarySwitch: false },
+        numberOfPositions: 2,
+        currentPosition: 1,
+      },
+    }, [0x000f]),
+  ]);
+}
+
+/**
+ * A momentary switch -- a pushbutton -- which says nothing about how many positions
+ * it has.
+ *
+ * Two things this pins. No `numberOfPositions`, so no bound is stated rather than the
+ * spec's default of 2 being invented for it. And `momentarySwitch`, so a reader is
+ * told the position is fleeting: the presses themselves are Matter events, which the
+ * controller does not subscribe to.
+ */
+export function momentarySwitchNode(): NodeSnapshot {
+  return node(7, [
+    named("Button"),
+    endpoint(1, {
+      switch: {
+        featureMap: { latchingSwitch: false, momentarySwitch: true },
+        currentPosition: 0,
+      },
+    }, [0x000f]),
+  ]);
+}
+
 /** A CO-only alarm: no smoke feature, so no smoke reading exists at all. */
 export function coOnlyAlarmNode(): NodeSnapshot {
   return node(72, [

@@ -3855,6 +3855,12 @@ async fn commission_device(
         // context, so every failure reached the user as a bare "commissioning
         // failed" while the reason it was wrapped around — the controller's own
         // error — was dropped on the floor.
+        //
+        // The commissioner is what keeps this from being the opposite problem.
+        // It renders the sentence a user can act on and returns that alone, so
+        // there is no bookkeeping frame here for `{:#}` to print as if it were
+        // prose. This endpoint names the operation; the message says what went
+        // wrong with it.
         .map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
@@ -10102,6 +10108,12 @@ fn qualify_tool_name(server: &str, tool: &str) -> String {
 /// approves, executes shell, writes files, or reads household memory.
 const DIRECT_DISPATCH_ALLOWLIST: &[&str] = &[
     "giap-device-control__set_device_state",
+    // Read-only, and the counterpart to the line above. The desktop could
+    // actuate a device but not ask it anything, so the Devices card labelled its
+    // power button from `is_online` -- reachability, a different fact -- and
+    // offered "Turn on" to a contact sensor. See `powerStateOf` in
+    // `pond-desktop/src/sections/Devices.tsx`.
+    "giap-device-control__get_device_state",
     "giap-weather__get_current_weather",
     "giap-weather__get_weather_forecast",
 ];

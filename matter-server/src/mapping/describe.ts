@@ -30,6 +30,7 @@ import {
   CLUSTER_COLOR_CONTROL,
   CLUSTER_DOOR_LOCK,
   CLUSTER_SMOKE_CO_ALARM,
+  CLUSTER_SWITCH,
   CLUSTER_FAN_CONTROL,
   CLUSTER_LEVEL_CONTROL,
   CLUSTER_ON_OFF,
@@ -91,6 +92,41 @@ const DOOR_STATE_NAMES: ReadonlyMap<string, string> = new Map(
 
 /** What PIN enforcement reads as. Both words, so `state` cannot invent a third. */
 export const PIN_REQUIREMENTS = ["required", "not required"] as const;
+
+/**
+ * The two kinds of Generic Switch, and the reason the distinction is reported.
+ *
+ * A latching switch stays where it is put, so its position is a lasting fact about
+ * the device — MVD's Generic Switch is one, and its own screen shows nothing but
+ * "Current position". A momentary switch is a pushbutton: `currentPosition` returns
+ * to rest the instant it is released, and everything interesting about it — the
+ * press, the release, the double-press — arrives as a Matter EVENT rather than an
+ * attribute. The controller subscribes to attribute changes only, so those presses
+ * are not observed here at all.
+ *
+ * Which is exactly why the kind is worth saying out loud. "Reports a position, 0 to
+ * 1" is a true and useful description of a latching switch and a misleading one of a
+ * button, and a reader who is told which kind it is can tell the difference.
+ */
+export const SWITCH_KINDS = ["latching", "momentary"] as const;
+
+/**
+ * Which kind of switch this is, or undefined if the device did not say.
+ *
+ * Stricter than `clusterHasFeature`, on purpose. That helper answers "may this
+ * reading exist" and treats an unstated feature map as a yes, which is right when
+ * withholding a working reading is the worse mistake. Here an unstated feature map
+ * means the device has not told us which kind of switch it is, and inventing an
+ * answer would put a word in its mouth.
+ */
+export function switchKindOf(node: NodeSnapshot): (typeof SWITCH_KINDS)[number] | undefined {
+  const features = attribute(node, CLUSTER_SWITCH, "featureMap");
+  if (typeof features !== "object" || features === null) return undefined;
+  const claimed = features as Record<string, unknown>;
+  if (claimed["latchingSwitch"] === true) return "latching";
+  if (claimed["momentarySwitch"] === true) return "momentary";
+  return undefined;
+}
 
 function attribute(node: NodeSnapshot, cluster: string, name: string): unknown {
   return endpointWith(node, cluster)?.clusters[cluster]?.[name];
@@ -458,6 +494,31 @@ function statesOf(node: NodeSnapshot): StateSpec[] {
   // exists to do.
   if (typeof attribute(node, CLUSTER_SMOKE_CO_ALARM, "hardwareFaultAlert") === "boolean") {
     states.push({ name: "alarm_fault", value: { kind: "enum", values: ["ok", "faulty"] } });
+  }
+
+  // Which way a Generic Switch is thrown. Reported, and settable by nobody -- a
+  // switch is a thing a person moves, which is the whole of what it is for.
+  //
+  // Described as nothing at all until now: 0x000f is not a device type GIAP mapped
+  // and `switch` is not a cluster it read, so a commissioned Generic Switch arrived
+  // typed `matter` with no capabilities and answered "cannot be controlled, and does
+  // not measure any data" -- while the maker's app showed its position plainly.
+  if (attribute(node, CLUSTER_SWITCH, "currentPosition") !== undefined) {
+    // `numberOfPositions` is what the device says it has. Bounded only when it said
+    // so: the spec's default is 2, but a default is not a statement, and an invented
+    // bound is worse than an absent one because it will be believed.
+    const positions = asNumber(attribute(node, CLUSTER_SWITCH, "numberOfPositions"));
+    const value: ValueSpec =
+      positions !== undefined && positions > 1
+        ? { kind: "number", min: 0, max: positions - 1 }
+        : { kind: "number", min: 0 };
+    states.push({ name: "switch_position", value });
+  }
+  // Latching or momentary, when the device claimed one. See `SWITCH_KINDS`: a
+  // position is a lasting fact about a latching switch and a fleeting one about a
+  // button, whose presses are Matter events this controller does not subscribe to.
+  if (switchKindOf(node) !== undefined) {
+    states.push({ name: "switch_kind", value: { kind: "enum", values: [...SWITCH_KINDS] } });
   }
 
   return states;

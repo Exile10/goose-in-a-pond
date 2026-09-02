@@ -8,11 +8,13 @@
  */
 
 import { Endpoint, Environment, Seconds, ServerNode, type ClientNode } from "@matter/main";
+// Not re-exported by `@matter/main`, which forwards only `@matter/types/datatype`.
+import { QrPairingCodeCodec } from "@matter/types";
 
-import { log, describeError, setupCodeKind } from "./log.js";
-import { nodeToDevice } from "./mapping/devices.js";
+import { log, describeError, setupCodeKind, type SetupCodeKind } from "./log.js";
+import { deviceClusters, nodeToDevice } from "./mapping/devices.js";
 import { observedFor, planControl, type Verb } from "./mapping/control.js";
-import { observedOperation } from "./mapping/settings.js";
+import { observedOperation, settingClusters } from "./mapping/settings.js";
 import { describeNode } from "./mapping/describe.js";
 import { stateOf } from "./mapping/state.js";
 import { readingFor, sensorClusters } from "./mapping/sensors.js";
@@ -46,35 +48,55 @@ import {
 const DISCOVER_TIMEOUT = Seconds(8);
 
 /**
+ * How often to say, again, which devices are reachable.
+ *
+ * `device_availability` is a LEVEL report, not an edge. matter.js's
+ * `lifecycle.online` fires on a transition and only on a transition — the comment on
+ * `#retryWiring` records the trap: a node already online when the controller connects
+ * never fires it at all. So the Rust bridge's set of devices it vouches for was seeded
+ * once, from a `subscribe` snapshot that reads `peer.lifecycle.isOnline`, which is
+ * false until a CASE session exists. A snapshot taken inside that window recorded a
+ * working device as offline, nothing ever said otherwise, its `last_seen` aged past the
+ * five-minute threshold, and the card went offline while readings kept arriving from
+ * matter.js's cache. Four bridge reconnects in one test session are four chances to
+ * land in that window.
+ *
+ * Repeating the level fixes it whatever the cause: a missed, mistimed or lost
+ * transition self-heals within one tick. Thirty seconds is well inside both the
+ * bridge's sixty-second heartbeat and the five-minute freshness threshold, and costs
+ * one boolean read per peer.
+ */
+const AVAILABILITY_TICK_MS = 30_000;
+
+/**
  * Which clusters a snapshot reads.
  *
  * Bounded rather than "every supported cluster": a snapshot is rebuilt on every node
  * event, and reading all the clusters a composed device may expose would make a busy
  * fabric expensive for data nothing consumes.
  *
- * The named set is the fixed vocabulary -- lighting, closures, climate, sensors. The
- * `*Mode` rule is what keeps appliances working without a list: Matter's ModeBase
- * derivatives are consistently named that way, and `settingsOf` reads them by shape,
- * so a washer, a dishwasher, an oven and whatever ships next all arrive without a
- * code change. Without that rule the promise was empty -- the snapshot dropped those
- * clusters by name before anything could look at their shape.
+ * The named set is DERIVED from the mappings rather than written here: each module
+ * declares the clusters it reads, so a cluster's name lives in the file that uses it and
+ * there is no second place to remember. The `*Mode` rule is what keeps appliances working
+ * without any list at all: Matter's ModeBase derivatives are consistently named that way,
+ * and `settingsOf` reads them by shape, so a washer, a dishwasher, an oven and whatever
+ * ships next all arrive without a code change. Without that rule the promise was empty --
+ * the snapshot dropped those clusters by name before anything could look at their shape.
  */
 const SNAPSHOT_CLUSTERS: ReadonlySet<string> = new Set([
+  // Endpoint 0's own plumbing, and the only entry not owned by a mapping: `deviceTypes`
+  // is read straight off the endpoint rather than out of the snapshot's cluster map.
   "descriptor",
-  "basicInformation",
-  "onOff",
-  "levelControl",
-  "colorControl",
-  "thermostat",
-  "doorLock",
-  "fanControl",
-  "windowCovering",
-  // Selectable settings whose shape is not ModeBase, so the rule below cannot match
-  // them and they are named here instead -- as they already are in settings.ts.
-  "temperatureControl",
-  "laundryWasherControls",
-  // Start / stop / pause / resume, shared by every appliance that runs a cycle.
-  "operationalState",
+  // Derived, not listed. Each mapping module names the clusters it reads, because the
+  // hand-written version of this list was a second place to remember and it was
+  // forgotten: `mediaPlayback`, `mediaInput` and `audioOutput` were declared in
+  // settings.ts as module-private constants, so `readClusters` dropped all three and
+  // every television reported nothing but power and volume -- while 158 tests passed,
+  // because the fixtures build snapshots by hand and never cross this filter. That is
+  // the same failure, in the same file, that once made a paired washer report nothing
+  // but power.
+  ...deviceClusters(),
+  ...settingClusters(),
   ...sensorClusters(),
 ]);
 
@@ -153,6 +175,12 @@ export class Controller {
     // comparisons over an idle house.
     const sweep = setInterval(() => guard("sweep_readings", () => controller.#sweepReadings()), 5_000);
     sweep.unref?.();
+
+    const availability = setInterval(
+      () => guard("report_availability", () => controller.#reportAvailability()),
+      AVAILABILITY_TICK_MS,
+    );
+    availability.unref?.();
 
     return controller;
   }
@@ -253,6 +281,23 @@ export class Controller {
     }
   }
 
+  /**
+   * Say which devices are reachable, whether or not that changed.
+   *
+   * Unconditional, and that is the point — see `AVAILABILITY_TICK_MS`. The transition
+   * handlers in `#observe` stay because they are prompt, but they are the only thing
+   * that ever spoke, and matter.js fires them on a transition it may never make. A
+   * device recorded offline by one badly-timed snapshot had no route back.
+   *
+   * Both branches on the receiving side are idempotent: the bridge inserts into a set
+   * and heartbeats a row, or removes from a set. Repetition costs a set operation.
+   */
+  #reportAvailability(): void {
+    for (const { deviceId, online } of availabilityReports(this.#node.peers)) {
+      this.#events.availabilityChanged(deviceId, online);
+    }
+  }
+
   /** How many devices are advertising themselves for commissioning right now. */
   async discover(): Promise<number> {
     const discovery = this.#node.peers.discover({ timeout: DISCOVER_TIMEOUT });
@@ -263,21 +308,18 @@ export class Controller {
   /**
    * Pair a device by its setup code.
    *
-   * Both forms find the device over mDNS. A pairing code or QR payload carries the
-   * discriminator so matter.js can narrow the browse; a bare passcode cannot, so that
-   * form pairs with whatever is in commissioning mode — which is how development
-   * devices such as Google's Matter Virtual Device are paired, since they show only a
-   * passcode.
+   * All three forms find the device over mDNS. A manual pairing code or a QR payload
+   * carries a discriminator so matter.js can narrow the browse; a bare passcode cannot,
+   * so that form pairs with whatever is in commissioning mode — which is how
+   * development devices such as Google's Matter Virtual Device are paired when they
+   * show only a passcode.
    */
   async commission(code: string, name?: string): Promise<Device> {
     const trimmed = code.trim();
     const kind = setupCodeKind(trimmed);
     log.info("commission_started", "commissioning a device", { code_kind: kind });
 
-    const options =
-      kind === "passcode"
-        ? { passcode: Number(trimmed.replace(/[\s-]/g, "")) }
-        : { pairingCode: trimmed.replace(/\s/g, "") };
+    const options = commissioningOptions(trimmed, kind);
 
     let peer: ClientNode;
     try {
@@ -655,6 +697,80 @@ export class Controller {
     if (nodeId === undefined) return;
     this.#events.availabilityChanged(deviceIdForNode(nodeId), online);
   }
+}
+
+/**
+ * What to hand matter.js for a code of this kind.
+ *
+ * A QR payload has to be decoded HERE, and that is the whole of this function's
+ * reason to exist. matter.js's `commission({pairingCode})` runs
+ * `ManualPairingCodeCodec.decode` unconditionally, and that codec strips every
+ * non-digit before it checks the length — so `MT:` + base-38 collapses to a dozen
+ * stray digits and dies with "Invalid pairing code" in two milliseconds, before
+ * anything reaches the network. The QR form therefore never worked, while GIAP's
+ * validator accepted it, this controller logged it as a pairing code, and the
+ * Register-device dialog offered one as an example.
+ *
+ * Uppercasing is lossless: Matter's base-38 alphabet is `0-9 A-Z - .`, and the QR
+ * codec matches its `MT:` prefix case-sensitively.
+ */
+export function commissioningOptions(
+  code: string,
+  kind: SetupCodeKind,
+): { passcode: number } | { passcode: number; discriminator: number } | { pairingCode: string } {
+  if (kind === "qr_payload") {
+    let payloads;
+    try {
+      payloads = QrPairingCodeCodec.decode(code.replace(/\s/g, "").toUpperCase());
+    } catch (error) {
+      // Nothing was attempted, so this is not a failure to commission. Saying
+      // `commission_failed` for a code that never left the process is what put
+      // "Invalid pairing code: commission_failed" in front of the user.
+      throw new OpError("invalid_setup_code", describeError(error));
+    }
+    const [payload] = payloads;
+    if (payloads.length !== 1 || payload === undefined) {
+      throw new OpError(
+        "invalid_setup_code",
+        `that QR payload carries ${payloads.length} devices; commission them one at a time`,
+      );
+    }
+    // The QR form carries the LONG discriminator, so the browse narrows to one
+    // device. The manual form carries only a short one, which is why matter.js
+    // takes that route itself and this one does not.
+    return { passcode: payload.passcode, discriminator: payload.discriminator };
+  }
+
+  if (kind === "passcode") {
+    return { passcode: Number(code.replace(/[\s-]/g, "")) };
+  }
+
+  // A manual pairing code, or something GIAP could not classify: matter.js's own
+  // decoder gets the last word rather than this one guessing.
+  return { pairingCode: code.replace(/\s/g, "") };
+}
+
+/**
+ * Every peer's reachability, as the `device_availability` event carries it.
+ *
+ * Every peer, unconditionally — the level, not the change. Pulled out of the class
+ * so the property that matters is a test rather than a claim: a device the last
+ * report called offline is named again in the next one, which is the whole of what
+ * makes a missed transition recoverable.
+ *
+ * Peers with no node id are dropped. Discovery adds merely-commissionable nodes to
+ * the same collection, and those are not devices on this fabric.
+ */
+export function availabilityReports(
+  peers: Iterable<ClientNode>,
+): { deviceId: string; online: boolean }[] {
+  const reports: { deviceId: string; online: boolean }[] = [];
+  for (const peer of peers) {
+    const nodeId = peerNodeId(peer);
+    if (nodeId === undefined) continue;
+    reports.push({ deviceId: deviceIdForNode(nodeId), online: peer.lifecycle.isOnline });
+  }
+  return reports;
 }
 
 /**

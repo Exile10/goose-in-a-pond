@@ -144,8 +144,15 @@ async fn sync_device(
 
     match registry.get_device(&device.id).await {
         Ok(Some(existing)) => {
-            if let Err(e) = registry.heartbeat(&device.id).await {
-                tracing::warn!(device = %device.id, error = %e, "matter: heartbeat failed");
+            // Only for a device the controller can actually see. This runs for every
+            // device in the snapshot, including the ones it reports as offline, so an
+            // unconditional heartbeat handed each of those a fresh five minutes of
+            // looking present at every connect and reconnect — a second mechanism
+            // vouching for a device the first one had already given up on.
+            if device.is_online {
+                if let Err(e) = registry.heartbeat(&device.id).await {
+                    tracing::warn!(device = %device.id, error = %e, "matter: heartbeat failed");
+                }
             }
             // Re-derived typing has to reach a device that already exists, or it
             // only ever applies to devices commissioned after the improvement
@@ -360,7 +367,25 @@ pub(crate) async fn run_matter_bridge_with_cache(
                 if let Ok(AvailabilityEvent { device_id, online }) =
                     serde_json::from_value::<AvailabilityEvent>(payload)
                 {
-                    tracing::debug!(device = %device_id, online, "matter: availability changed");
+                    // A LEVEL report, repeated on the controller's tick, so most of
+                    // these say what the last one said. Log the CHANGES, at info.
+                    //
+                    // It was `debug!`, and the tracing filter admits debug from
+                    // `pond_server` only — so across every log file on the machine
+                    // where a working device kept going offline, the string
+                    // "availability changed" did not appear once. A state change the
+                    // user sees on a card, and gets an OS notification for, left no
+                    // trace anywhere. That is most of why this took three passes to
+                    // find.
+                    if online != present.contains(&device_id) {
+                        tracing::info!(
+                            target: "giap::trace",
+                            kind = "matter_availability_changed",
+                            device = %device_id,
+                            online,
+                            "matter: a device's reachability changed"
+                        );
+                    }
                     if online {
                         present.insert(device_id.clone());
                         if let Err(e) = registry.heartbeat(&device_id).await {

@@ -45,10 +45,23 @@ export function redactSetupCode(text: string): string {
   );
 }
 
-/** Which kind of code this is, for logging in place of the value itself. */
-export function setupCodeKind(code: string): "pairing_code" | "passcode" | "unknown" {
+/**
+ * Which of the three forms a setup code is in.
+ *
+ * A QR payload is its own kind rather than a species of pairing code, because the
+ * three take three different routes into matter.js -- see `commissioningOptions` in
+ * `controller.ts`. Collapsing the first two is what made the QR path fail: a payload
+ * classified as a pairing code was handed to a decoder that only reads the manual
+ * form, and nothing in either implementation noticed.
+ *
+ * Also used for logging in place of the value itself, which is why the kind names are
+ * safe to print and the code is not.
+ */
+export type SetupCodeKind = "qr_payload" | "pairing_code" | "passcode" | "unknown";
+
+export function setupCodeKind(code: string): SetupCodeKind {
   const trimmed = code.trim();
-  if (/^MT:/i.test(trimmed)) return "pairing_code";
+  if (/^MT:/i.test(trimmed)) return "qr_payload";
   const digits = trimmed.replace(/[\s-]/g, "");
   if (/^\d{11}$/.test(digits) || /^\d{21}$/.test(digits)) return "pairing_code";
   if (/^\d{8}$/.test(digits)) return "passcode";

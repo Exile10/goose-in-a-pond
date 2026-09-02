@@ -122,6 +122,31 @@ const TEMPERATURE_CONTROL = "temperatureControl";
 const THERMOSTAT = "thermostat";
 const LAUNDRY_WASHER_CONTROLS = "laundryWasherControls";
 
+/**
+ * Every cluster this module reads BY NAME, for the snapshot allowlist.
+ *
+ * Mirrors `sensorClusters()`, and for the reason that helper exists: the allowlist in
+ * `controller.ts` drops any cluster it does not name, so a mapping added here and not
+ * added there is invisible at runtime while every unit test passes — the fixtures build
+ * snapshots by hand and never cross the filter. That is exactly how the three media
+ * clusters below shipped dead: they were declared here as module-private constants that
+ * `controller.ts` could not have referenced even if someone had thought to.
+ *
+ * The ModeBase derivatives are deliberately absent — `settingsOf` finds those by shape,
+ * and the `*Mode` suffix rule is what admits them without anyone writing a list.
+ */
+export function settingClusters(): ReadonlySet<string> {
+  return new Set([
+    OPERATIONAL_STATE,
+    TEMPERATURE_CONTROL,
+    THERMOSTAT,
+    LAUNDRY_WASHER_CONTROLS,
+    MEDIA_PLAYBACK,
+    MEDIA_INPUT,
+    AUDIO_OUTPUT,
+  ]);
+}
+
 /** `laundryWasherMode` → `laundry washer mode`. The device's own word, made speakable. */
 function spokenName(clusterId: string): string {
   return clusterId
