@@ -55,6 +55,46 @@ struct State {
     /// Removals GIAP asked for, so the event they cause is not reported as a
     /// device leaving on its own.
     expected_removals: HashMap<String, Instant>,
+    /// Which device ids an expectation has already answered for.
+    ///
+    /// Separate from `expected_removals` because one expectation answers for many
+    /// events — a hub and every device behind it — while still answering for each of
+    /// them only ONCE. Consuming the expectation on its first match silenced the hub
+    /// and then alerted for all of its children; not consuming anything would
+    /// silence a genuine later departure of a device that reused the id.
+    satisfied_removals: HashMap<String, Instant>,
+}
+
+impl State {
+    /// Was this removal one GIAP asked for?
+    ///
+    /// Matches the id exactly, or as a bridged child of an expected hub. Removing a
+    /// Matter hub takes its children off the fabric with it, so ONE expectation has
+    /// to answer for N events — which is why a prefix match is not consumed, unlike
+    /// an exact one. The entries still age out through the sweep in
+    /// `expect_removal`, so a hub removal cannot silence a real alert later.
+    ///
+    /// The trailing dash matters: `matter-9-` must not match `matter-90`.
+    fn take_expected_removal(&mut self, device_id: &str) -> bool {
+        // Already answered for. A second departure of the same device is news, or the
+        // first deliberate removal would silence every genuine one after it.
+        if let Some(at) = self.satisfied_removals.get(device_id) {
+            if at.elapsed() < REMOVAL_GRACE {
+                return false;
+            }
+        }
+
+        let covered = self.expected_removals.iter().any(|(expected, at)| {
+            at.elapsed() < REMOVAL_GRACE
+                && (expected == device_id || device_id.starts_with(&format!("{expected}-")))
+        });
+
+        if covered {
+            self.satisfied_removals
+                .insert(device_id.to_string(), Instant::now());
+        }
+        covered
+    }
 }
 
 /// Builds and pushes the Matter notifications, holding the debounce state.
@@ -189,6 +229,13 @@ impl MatterNotifier {
     /// registered, and "is it still in the registry?" cannot by itself tell a
     /// user's deletion from a device that left on its own. This can: the adapter
     /// knows which removals it caused.
+    ///
+    /// One expectation covers a hub AND everything behind it, because removing a
+    /// Matter hub from the fabric removes its children too — the controller then
+    /// emits one `device_removed` per child, and the adapter cannot enumerate them
+    /// (it never held the hub's child list). Without prefix matching, a hub removal
+    /// the user performed produced one silent event and a dozen "it may have been
+    /// factory reset" alarms. See `take_expected_removal`.
     pub async fn expect_removal(&self, device_id: &str) {
         let mut state = self.state.lock().await;
         // Opportunistic sweep: entries are only ever consumed by the matching
@@ -198,25 +245,31 @@ impl MatterNotifier {
             .expected_removals
             .retain(|_, at| at.elapsed() < REMOVAL_GRACE);
         state
+            .satisfied_removals
+            .retain(|_, at| at.elapsed() < REMOVAL_GRACE);
+        state
             .expected_removals
             .insert(device_id.to_string(), Instant::now());
     }
 
     /// A device left the fabric. Silent when GIAP is the one that removed it.
-    pub async fn device_dropped(&self, device_id: &str) {
+    ///
+    /// `name` is what the user calls the device; the id is not for reading. This
+    /// alert used to interpolate the raw id, so it said `"matter-18" is no longer on
+    /// this Pond's Matter network` — and a bridged child would have made that
+    /// `"matter-90-7"`, which names nothing a person recognises.
+    pub async fn device_dropped(&self, device_id: &str, name: &str) {
         {
             let mut state = self.state.lock().await;
-            if let Some(at) = state.expected_removals.remove(device_id) {
-                if at.elapsed() < REMOVAL_GRACE {
-                    return; // we asked for this
-                }
+            if state.take_expected_removal(device_id) {
+                return; // we asked for this
             }
         }
         self.push(
             "alert",
             "A Matter device left the network".to_string(),
             format!(
-                "\"{device_id}\" is no longer on this Pond's Matter network. If it was not \
+                "\"{name}\" is no longer on this Pond's Matter network. If it was not \
                  removed deliberately, it may have been factory reset."
             ),
         )
@@ -295,6 +348,16 @@ mod tests {
                 .unwrap()
                 .iter()
                 .map(|n| n.title.clone())
+                .collect()
+        }
+
+        /// The body text, which is where a device is named to the user.
+        fn bodies(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|n| n.body.clone())
                 .collect()
         }
     }
@@ -390,14 +453,14 @@ mod tests {
         let (notifier, recorder) = notifier().await;
 
         notifier.expect_removal("matter-18").await;
-        notifier.device_dropped("matter-18").await;
+        notifier.device_dropped("matter-18", "Porch Light").await;
         assert!(
             recorder.titles().is_empty(),
             "alerted on a deliberate removal"
         );
 
         // A different device leaving at the same time is still news.
-        notifier.device_dropped("matter-4").await;
+        notifier.device_dropped("matter-4", "Hall Sensor").await;
         assert_eq!(recorder.titles(), vec!["A Matter device left the network"]);
     }
 
@@ -408,10 +471,70 @@ mod tests {
         let (notifier, recorder) = notifier().await;
 
         notifier.expect_removal("matter-18").await;
-        notifier.device_dropped("matter-18").await;
-        notifier.device_dropped("matter-18").await;
+        notifier.device_dropped("matter-18", "Porch Light").await;
+        notifier.device_dropped("matter-18", "Porch Light").await;
 
         assert_eq!(recorder.titles().len(), 1, "the expectation was permanent");
+    }
+
+    #[tokio::test]
+    async fn removing_a_hub_silences_its_children_too() {
+        // A Matter hub's children leave the fabric with it, and the controller emits
+        // one `device_removed` per child. The adapter never held the hub's child
+        // list, so it registers ONE expectation — which used to mean a hub the user
+        // deleted produced one silent event and a dozen "it may have been factory
+        // reset" alarms for a removal they had just performed.
+        let (notifier, recorder) = notifier().await;
+
+        notifier.expect_removal("matter-90").await;
+        notifier
+            .device_dropped("matter-90", "Living room hub")
+            .await;
+        for child in ["matter-90-2", "matter-90-3", "matter-90-11"] {
+            notifier.device_dropped(child, "a bulb").await;
+        }
+
+        assert!(
+            recorder.titles().is_empty(),
+            "alerted on a hub removal the user asked for: {:?}",
+            recorder.titles()
+        );
+    }
+
+    #[tokio::test]
+    async fn one_hubs_removal_does_not_silence_another() {
+        // The trailing dash in the prefix test. Without it `matter-9-` also matches
+        // `matter-90`, so deleting one hub would silence an unrelated one's children
+        // leaving for real.
+        let (notifier, recorder) = notifier().await;
+
+        notifier.expect_removal("matter-9").await;
+        notifier
+            .device_dropped("matter-90-2", "someone else's bulb")
+            .await;
+
+        assert_eq!(
+            recorder.titles(),
+            vec!["A Matter device left the network"],
+            "a different hub's child was silenced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_departure_names_the_device_not_its_id() {
+        // The alert interpolated the raw device id, so it read `"matter-18" is no
+        // longer on this Pond's Matter network`. A bridged child would have made
+        // that `"matter-90-7"` — an id names nothing a person recognises.
+        let (notifier, recorder) = notifier().await;
+
+        notifier.device_dropped("matter-18", "Porch Light").await;
+
+        let body = recorder.bodies().join(" ");
+        assert!(
+            body.contains("Porch Light"),
+            "did not name the device: {body}"
+        );
+        assert!(!body.contains("matter-18"), "leaked the id: {body}");
     }
 
     #[tokio::test]

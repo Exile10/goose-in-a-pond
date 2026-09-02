@@ -388,6 +388,44 @@ async fn deleting_a_matter_device_while_off_refuses_with_the_honest_reason() {
     assert!(!error.contains("Devices tab"), "{error}");
 }
 
+/// Deleting a device behind a Matter hub is refused, and the refusal is the whole
+/// feature.
+///
+/// A bridged device is one endpoint of a node that speaks for several. Matter
+/// commissions NODES, so there is no fabric operation that removes one endpoint —
+/// and both alternatives are worse than saying so. Decommissioning acts on the node,
+/// so it would silently take every sibling and the hub with it. Dropping the row
+/// alone leaves the controller to re-announce the device on its next subscribe,
+/// which is the zombie the endpoint already guards against for whole nodes.
+///
+/// Checked before the Matter-state gate on purpose: the answer does not depend on
+/// whether the controller is reachable, so a disabled runtime must not turn a
+/// permanent "this is not a thing you can do" into a temporary "try later".
+#[tokio::test]
+async fn deleting_a_device_behind_a_hub_is_refused_and_names_the_hub() {
+    let (app, _, _tmp) = make_app(Some(Arc::new(StubMatterRuntime::disabled()))).await;
+
+    let response = app
+        .oneshot(authed(Method::DELETE, "/api/v1/devices/matter-90-2", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let body = json_body(response).await;
+    let error = body["error"].as_str().unwrap().to_string();
+    assert!(
+        error.contains("provided by"),
+        "the refusal must say where the device comes from: {error}"
+    );
+    assert!(
+        error.contains("hub's own app"),
+        "and where the user can actually remove it: {error}"
+    );
+    // The hub's id, so a client can offer to delete it instead of making the user
+    // work out what `matter-90-2` is a child of.
+    assert_eq!(body["hub_id"], "matter-90");
+}
+
 /// This endpoint takes a patch over the whole of Settings, so the Matter check
 /// must not turn a bad stored controller address into a wall that blocks every
 /// unrelated save.

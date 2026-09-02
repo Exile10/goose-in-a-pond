@@ -3902,15 +3902,76 @@ async fn commission_device(
     ))
 }
 
+/// The devices a Matter hub speaks for, by id, plus the hub itself.
+///
+/// The trailing dash is load-bearing: without it `matter-9-` would also match
+/// `matter-90`, and deleting one hub would take an unrelated one's children with it.
+fn bridged_children_of(
+    hub_id: &str,
+    devices: &[pond_core::user_data::ports::device_registry::Device],
+) -> Vec<String> {
+    let prefix = format!("{hub_id}-");
+    devices
+        .iter()
+        .filter(|d| d.id.starts_with(&prefix))
+        .map(|d| d.id.clone())
+        .collect()
+}
+
 async fn unregister_device(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    use pond_core::user_data::ports::device_commissioning::{
+        matter_bridged_endpoint, matter_node_id,
+    };
+
+    // A bridged device is one endpoint of a hub that speaks for several. Matter
+    // commissions NODES, so there is no fabric operation that removes one endpoint —
+    // and GIAP does not own the hub's child list either; the hub's own app does.
+    //
+    // So there are only three things this could mean, and two of them are wrong.
+    // Decommissioning acts on the node, so it would silently remove every sibling
+    // and the hub. Dropping the row alone leaves the controller to re-announce the
+    // device on its next subscribe — the zombie this endpoint's own comment below
+    // warns about. Refusing and saying why is the honest one.
+    if matter_bridged_endpoint(&id).is_some() {
+        let hub_id = matter_node_id(&id)
+            .map(|node| format!("matter-{node}"))
+            .unwrap_or_default();
+        // Name the hub as the user knows it, not by its id.
+        let hub_name = state
+            .device_registry
+            .get_device(&hub_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|d| d.name)
+            .unwrap_or_else(|| hub_id.clone());
+        let siblings = state
+            .device_registry
+            .list_devices()
+            .await
+            .map(|devices| bridged_children_of(&hub_id, &devices).len())
+            .unwrap_or(0);
+
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "This device is provided by '{hub_name}'. Remove it in that hub's own app, \
+                     or delete '{hub_name}' to remove all {siblings} devices behind it."
+                ),
+                "hub_id": hub_id,
+            })),
+        ));
+    }
+
     // A Matter device must leave the fabric before its row is removed, or the
     // controller re-announces it on the next start_listening and it reappears.
     // If we cannot reach the controller to do so, the delete is refused rather
     // than half-applied.
-    if let Some(node_id) = pond_core::user_data::ports::device_commissioning::matter_node_id(&id) {
+    if let Some(node_id) = matter_node_id(&id) {
         let commissioner = matter_commissioner(&state).await?;
         commissioner.decommission(node_id).await.map_err(|e| {
             (
@@ -3920,6 +3981,35 @@ async fn unregister_device(
                 })),
             )
         })?;
+    }
+
+    // Removing a hub from the fabric removes everything behind it, so its children's
+    // rows have to go too or they linger as devices that will never heartbeat again
+    // and can never be deleted (the branch above refuses them, correctly, and their
+    // hub no longer exists to delete instead).
+    //
+    // Children first, hub last: a failure part-way then leaves the hub visible and
+    // re-deletable rather than orphaning its children.
+    let children = match state.device_registry.list_devices().await {
+        Ok(devices) => bridged_children_of(&id, &devices),
+        Err(e) => {
+            tracing::warn!(device = %id, error = %e, "devices: could not list to cascade a hub delete");
+            Vec::new()
+        }
+    };
+    for child in &children {
+        if let Err(e) = state.device_registry.unregister(child).await {
+            tracing::warn!(device = %child, error = %e, "devices: could not remove a bridged child");
+        }
+    }
+    if !children.is_empty() {
+        tracing::info!(
+            target: "giap::trace",
+            kind = "devices_hub_removed",
+            device = %id,
+            children = children.len(),
+            "devices: removed a hub and the devices behind it"
+        );
     }
 
     state.device_registry.unregister(&id).await.map_err(|e| {
@@ -13164,7 +13254,10 @@ struct RunRecipeRequest {
 /// Plain string replacement, matching goose's own `{{key}}` recipe syntax —
 /// there is no conditional/loop logic in a recipe prompt, so a templating
 /// engine would be pulling in machinery to do what `str::replace` already does.
-fn substitute_recipe_params(text: &str, values: &std::collections::HashMap<String, String>) -> String {
+fn substitute_recipe_params(
+    text: &str,
+    values: &std::collections::HashMap<String, String>,
+) -> String {
     let mut out = text.to_string();
     for (key, value) in values {
         out = out.replace(&format!("{{{{{key}}}}}"), value);

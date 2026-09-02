@@ -354,15 +354,18 @@ pub struct DeviceRemovedEvent {
 
 // ── Ids ──────────────────────────────────────────────────────────────────────
 
-/// GIAP device id for a Matter node (`"matter-<node_id>"`).
-pub fn device_id_for_node(node_id: u64) -> String {
-    format!("matter-{node_id}")
-}
-
-/// Inverse of [`device_id_for_node`]; `None` for non-Matter ids.
-pub fn node_id_from_device_id(device_id: &str) -> Option<u64> {
-    device_id.strip_prefix("matter-")?.parse().ok()
-}
+// One grammar, one definition. This crate had its own copy of
+// `matter-<node_id>` parsing and `pond-core` had another, in a different crate,
+// with nothing tying them together and separate tests for each. Two
+// implementations of one string format is a defect waiting for the format to
+// change — and it is about to, since a bridged device needs an endpoint in its id.
+//
+// `pond-core` keeps the definition because the generic delete path in `pond-api`
+// needs it and must not depend on this adapter. This crate already depends on
+// `pond-core`, so the duplicate goes and the names stay where callers expect them.
+pub use pond_core::user_data::ports::device_commissioning::{
+    is_matter_device_id, matter_bridged_endpoint, matter_device_id, matter_node_id,
+};
 
 // ── Redaction ────────────────────────────────────────────────────────────────
 
@@ -468,10 +471,13 @@ mod tests {
 
     #[test]
     fn device_ids_round_trip() {
-        assert_eq!(device_id_for_node(18), "matter-18");
-        assert_eq!(node_id_from_device_id("matter-18"), Some(18));
-        assert_eq!(node_id_from_device_id("mqtt-lamp"), None);
-        assert_eq!(node_id_from_device_id("matter-not-a-number"), None);
+        // The grammar itself is tested where it is defined, in `pond-core`. This
+        // asserts the re-export reaches this crate, since every call site here
+        // imports it from `protocol`.
+        assert_eq!(matter_device_id(18, None), "matter-18");
+        assert_eq!(matter_node_id("matter-18"), Some(18));
+        assert_eq!(matter_node_id("mqtt-lamp"), None);
+        assert_eq!(matter_node_id("matter-not-a-number"), None);
     }
 
     /// The one wire contract nothing checked. `DescribeResult` deserialises straight
