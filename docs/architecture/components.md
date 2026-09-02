@@ -184,6 +184,47 @@ A [Tauri 2.0](https://tauri.app) application providing a native UI for macOS and
 
 The desktop app starts `pond-server` automatically via the `ensure_server_running` Tauri command, polls `server_health`, and displays a branded startup screen while the server comes online.
 
+### Detached runs — a turn that outlives its connection
+
+`crates/pond-api/src/runs.rs`. A turn used to *be* the SSE response body, which
+made dropping the connection its cancellation — deliberately, via the
+`DropGuard` inside `pond-adapters-goose`'s chat stream. It also meant a reload
+killed the answer mid-sentence: the user's message is persisted before inference
+starts and the assistant's only after the token loop drains, so the question was
+stored and the answer nowhere.
+
+A turn is now a task driving a `RunHandle`, and every SSE body — the original
+POST and every reattach — is a *subscriber*: replay the handle's ring buffer,
+then tail its broadcast. The same shape `notifications_stream` uses.
+
+| Route | For |
+|---|---|
+| `GET /sessions/{id}/active-run` | Discovery. A restarted client knows its session id and nothing else, so this is the only way back in |
+| `GET /chat/runs/{run_id}/events?after_seq=&epoch=` | Replay, then tail |
+| `POST /chat/runs/{run_id}/cancel`, `DELETE /sessions/{id}/active-run` | Stopping on purpose |
+
+Three things to know before changing any of it:
+
+**`resumable` defaults to false, and that default is load-bearing.** A run is
+`Ephemeral` unless asked otherwise, meaning the last subscriber leaving cancels
+it — today's exact contract. `WebVoiceBackend` fires a *speculative*
+`/chat/stream` the moment trailing silence begins, before the pause is
+confirmed, and aborts it when speech resumes. Detaching unconditionally would
+let that speculative turn finish and persist a question-and-answer pair for a
+half-sentence nobody finished saying. **The voice path must call the cancel
+endpoint before that default can change.** It has not been rewired yet; until it
+is, barge-in works because voice turns are still ephemeral.
+
+**A cancelled turn keeps what it streamed, not what it was about to.** The
+thought filter holds short text back until a turn ends, so a very short answer
+cancelled early has said nothing — and a turn that said nothing has its
+now-unanswerable user message removed rather than left dangling.
+
+**The cap counts turns in flight, not history.** Finished runs stay reattachable
+for a retention window, and a new turn supersedes the finished one on its own
+session. Counting retained runs would make an ordinary ten-message conversation
+start refusing turns halfway through.
+
 ### The chat turn is owned by the module, not the view
 
 `GuiMode` picks a section with a `switch`, not a router, so pressing anything in
@@ -218,8 +259,17 @@ Returning to Chat lands on the "All chats" wall as it always has, with one
 carve-out: a turn still running, or one that finished while nothing was mounted
 to show it, opens straight into its thread and is marked read once shown.
 
-**Boundary.** This survives navigation, not a reload. Reloading or restarting the
-app drops the HTTP body, and the server treats that as cancel-on-purpose (see
-`goose_agent.rs`'s cancellation drop-guard), so the run dies mid-turn and the
-assistant message is never written. Surviving that needs the run detached from
-its connection server-side, which is separate work.
+**Across a reload, too.** A chat turn is sent with `resumable: true`, asking the
+server to keep driving it when the connection drops — see *Detached runs* below.
+The store writes a small pointer to `localStorage` (session, run, server epoch,
+and how far it had read) the moment the turn names itself, and `resumeActiveRun`
+uses it on the next start: ask the server what it is still driving, load the
+session's persisted messages for the transcript, then reattach to the run and
+tail the rest. No conversation content is kept in the browser — only enough to
+ask the question.
+
+**Boundary.** A *server* restart still loses the run. Everything a turn needs
+lives in memory — the agent's state, its cancellation token, its authority
+lease, its device claim — so the epoch in the pointer will not match, the client
+is told `410 run_lost`, and it falls back to the persisted messages. That is the
+honest answer rather than a recoverable one.
