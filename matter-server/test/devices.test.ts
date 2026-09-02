@@ -62,6 +62,58 @@ describe("device typing", () => {
     }
   });
 
+  it("types the rest of the Matter device library, not just the ones MVD offers", () => {
+    // Every id here was read off matter.js's own device definitions rather than
+    // transcribed from the spec, and every one arrived as the monitor fallback before
+    // this — "unknown device", with whatever it can do listed underneath.
+    const cases: [number, string][] = [
+      [0x010f, "plug"], // Mounted On/Off Control
+      [0x0110, "plug"], // Mounted Dimmable Load Control
+      [0x0309, "thermostat"], // Heat Pump
+      [0x050f, "thermostat"], // Water Heater
+      [0x0041, "sensor"], // Water Freeze Detector
+      [0x0043, "sensor"], // Water Leak Detector
+      [0x0044, "sensor"], // Rain Sensor
+      [0x007c, "appliance"], // Laundry Dryer
+      [0x0079, "appliance"], // Microwave Oven
+      [0x0078, "appliance"], // Cooktop
+      [0x007b, "appliance"], // Oven
+      [0x0070, "appliance"], // Refrigerator
+      [0x0071, "appliance"], // Temperature Controlled Cabinet
+      [0x0077, "appliance"], // Cook Surface
+      [0x007a, "fan"], // Extractor Hood
+      [0x0022, "media"], // Speaker
+    ];
+    for (const [id, want] of cases) {
+      expect(nodeToDevice(describedNode(44, id)).device_type, `device type 0x${id.toString(16)}`)
+        .toBe(want);
+    }
+  });
+
+  it("leaves the client device types untyped, deliberately", () => {
+    // A remote holds no server cluster GIAP could read or drive, so typing one would
+    // put a row on the wall that answers "cannot be controlled" for every verb. The
+    // omission is the whole family, and this is the test that says so out loud —
+    // otherwise the next person filling gaps from the spec adds them all.
+    const remotes = [
+      0x0103, // On/Off Light Switch
+      0x0104, // Dimmer Switch
+      0x0105, // Colour Dimmer Switch
+      0x000b, // Door Lock Controller
+      0x0203, // Window Covering Controller
+      0x0304, // Pump Controller
+      0x030a, // Thermostat Controller
+      0x0840, // Control Bridge
+      0x0850, // On/Off Sensor
+      0x0029, // Casting Video Client
+      0x002a, // Video Remote Control
+    ];
+    for (const id of remotes) {
+      expect(deviceTypeFromDescriptor(describedNode(45, id)), `device type 0x${id.toString(16)}`)
+        .toBeUndefined();
+    }
+  });
+
   it("does not mistake the root endpoint for the device", () => {
     // Endpoint 0 is the Root Node (0x0016) on every device. Reading it would type the
     // whole fabric as one thing.
