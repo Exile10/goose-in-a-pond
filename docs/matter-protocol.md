@@ -246,6 +246,30 @@ exactly as it was told.
 | `reading` | a `Reading` |
 | `log` | `{level, kind, message, fields?}` |
 
+`device_availability` is a **level report, repeated**, not an edge. Every thirty
+seconds the controller names every peer it has and says whether that peer is
+reachable, whether or not the answer changed. Both branches on the receiving side
+are idempotent — insert into a set and heartbeat a row, or remove from a set — so
+repetition costs a set operation.
+
+That is not tidiness, it is the fix for a device that read offline while it was
+working. It used to be an edge, sent only from matter.js's `lifecycle.online` /
+`.offline`, which fire on a transition and only on a transition — and, per
+`#retryWiring`'s own comment, *a node already online when the controller connects
+never fires `online` again*. So the bridge's set of devices it vouches for was seeded
+once, from a `subscribe` snapshot that reads `peer.lifecycle.isOnline`, which means
+"is there a live CASE session right now" and is false until one exists. A snapshot
+taken inside that window recorded a working device as offline; nothing ever said
+otherwise; `last_seen` aged past the registry's five-minute threshold; and the card
+went offline while readings kept arriving from matter.js's own cache. A level report
+recovers from a missed, mistimed or lost transition within one tick, whichever it was.
+
+The bridge logs the **changes** at info (`matter_availability_changed`), not the
+reports. It logged them at debug before, and the tracing filter admits debug from
+`pond_server` only — so a state change the user sees on a card, and gets an OS
+notification for, left no trace in any log file. That absence is most of why this took
+three passes to find.
+
 `log` is the controller's own structured record, relayed into `tracing` at the
 level it names. The Rust side also pipes the child's stderr, so a controller GIAP
 started is audible twice over; the event is what makes a controller the operator
@@ -330,7 +354,18 @@ way has to be added to it. Settings read by shape from a snapshot filtered by na
 is a contradiction worth knowing about: it is what made a paired washer report
 nothing but power while every unit test passed.
 
-That bound is still there, but `describe` no longer hides what it drops.
+That bound is still there, but `describe` no longer hides what it drops — and the set is
+now **derived from the mappings** rather than written beside them. Each module declares the
+clusters it reads (`deviceClusters()`, `settingClusters()`, `sensorClusters()`), so a
+cluster's name lives in the file that uses it and there is no second place to remember.
+
+That second place is not hypothetical. Media control shipped complete and dead:
+`mediaPlayback`, `mediaInput` and `audioOutput` were declared inside `settings.ts` as
+module-private constants, the allowlist was not updated, and `readClusters` dropped all
+three — so a television described nothing but power and volume while every unit test
+passed. The fixtures build snapshots by hand and never cross the filter, which is the
+identical reason a paired washer once reported nothing but power. The `*Mode` rule remains
+the escape hatch that needs no list at all.
 
 ### What a device reports and nothing can set
 
@@ -358,6 +393,32 @@ offering `tilt` to a roller blind.
 value in it. The description still declares the door, exactly as `sensors` declares
 what a sensor measures before it has reported; the reading stays absent rather than
 being filled in, because an invented "closed" cannot be told from a real one.
+
+**A device that is nothing but states.** A Generic Switch (device type `0x000f`,
+cluster `switch`) reports which way it is thrown and takes no orders at all, so
+`states` is not one slot among three for it — it is the only slot it has. Before it
+existed the switch had none: `0x000f` was not a device type GIAP mapped and `switch`
+was not a cluster the snapshot admitted, so a commissioned switch arrived typed
+`matter` with no capabilities and answered "cannot be controlled, and it does not
+measure any data" — while the maker's app showed its position plainly.
+
+It reports `switch_position`, bounded by `numberOfPositions` **only when the device
+states one**; the spec's default is 2, and a default is not a statement. It also
+reports `switch_kind`, latching or momentary, when the feature map claims one — and
+that is worth saying out loud rather than inferring, because the position means
+different things in the two cases. A latching switch stays where it is put. A
+momentary switch is a pushbutton whose `currentPosition` returns to rest on release,
+and everything interesting about it — the press, the release, the double-press —
+arrives as a Matter **event**. `#observeCluster` wires attribute-change observables
+only (`*$Changed`), so those presses are not observed here at all. "Reports a
+position, 0 to 1" describes a latching switch well and misleads about a button; a
+reader told which kind they have can tell the two apart. Subscribing to Matter events
+is the work that would close that gap, and it is not done.
+
+Note the strictness. `switchKindOf` treats an unstated feature map as "the device did
+not say", where `clusterHasFeature` treats one as a yes. Both are right for their own
+question: withholding a reading that works is the worse mistake, and putting a word in
+a device's mouth is the worse mistake.
 
 **Read-only by construction, not by convention.** `requirePinForRemoteOperation` is a
 security control: off means remote lock and unlock stop requiring a PIN. The same
@@ -503,7 +564,37 @@ failed" the only diagnosis GIAP could offer.
 | `internal` | anything else |
 
 The code is preserved into the Rust error chain (`code_of`) rather than flattened
-into prose.
+into prose — and it is **not rendered as part of the message**. It sits at the
+bottom of the chain so `code_of` can downcast to it, which means `{:#}` would print
+it as if it were a sentence: `commissioning failed: Invalid pairing code:
+commission_failed` is what the user actually read, and only the middle fragment
+said anything. `describe` skips that frame, and the commissioner consumes the code
+where it branches on it and returns prose alone across the port.
+
+---
+
+## The three forms of a setup code
+
+| form | example | how the controller pairs with it |
+|---|---|---|
+| QR payload | `MT:Y.K9042C00KA0648G00` | decoded here with `QrPairingCodeCodec`, then `{passcode, discriminator}` |
+| manual pairing code | `34970112332` (11 or 21 digits) | `{pairingCode}`; matter.js decodes it |
+| passcode | `20202021` (8 digits) | `{passcode}`; pairs with whatever is in commissioning mode |
+
+The QR payload has to be decoded **by the controller**, and that is not a stylistic
+choice. matter.js's `commission({pairingCode})` runs `ManualPairingCodeCodec.decode`
+unconditionally, and that codec strips every non-digit before it checks the length —
+so `MT:` plus base-38 collapses to a dozen stray digits and is rejected as an
+"Invalid pairing code" in about two milliseconds, before anything reaches the
+network. Handing a QR payload through as a `pairingCode` therefore cannot work,
+which is what `commissioningOptions` exists to prevent recurring.
+
+A payload that will not decode is `invalid_setup_code`, not `commission_failed`:
+nothing was attempted, and the two codes lead to different advice.
+
+Only the QR form carries the **long** discriminator, so it is the only one that
+narrows the mDNS browse to a single device. The manual form carries a short
+discriminator and a bare passcode carries none.
 
 ---
 

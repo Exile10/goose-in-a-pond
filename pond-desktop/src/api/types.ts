@@ -410,6 +410,18 @@ export interface Device {
   room?: string;
   is_online: boolean;
   last_seen?: string;
+  /**
+   * What the device can be told to do, in `set_device_state`'s verbs — `power`,
+   * `brightness`, `fan_speed`, and the rest.
+   *
+   * `GET /api/v1/devices` has always sent this and this type dropped it, so the
+   * Devices card had nothing to gate on and offered every device a power button.
+   * A contact sensor's list is empty, which is the fact that stops it being asked
+   * to turn on.
+   */
+  capabilities?: string[];
+  /** The address the server knows, when it knows one. */
+  ip_address?: string;
   metadata?: Record<string, unknown>;
 }
 

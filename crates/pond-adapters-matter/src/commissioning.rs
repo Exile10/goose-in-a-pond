@@ -1,9 +1,10 @@
 //! [`MatterCommissioner`] — the [`DeviceCommissioningPort`] over a live
 //! controller connection.
 //!
-//! Both setup-code forms go to one `commission` op: the controller decodes the
-//! payload and decides how to find the device, which is knowledge that belongs
-//! next to matter.js rather than here.
+//! All three setup-code forms — a QR payload, a manual pairing code, a bare
+//! passcode — go to one `commission` op: the controller decodes the payload and
+//! decides how to find the device, which is knowledge that belongs next to
+//! matter.js rather than here.
 //!
 //! `decommission` removes the node from the fabric, which the delete path uses
 //! so a removed device does not re-announce itself on the next `subscribe`.
@@ -149,7 +150,21 @@ impl DeviceCommissioningPort for MatterCommissioner {
                     describe(&e)
                 };
                 self.notifier.pairing_failed(&told).await;
-                return Err(e).context("commissioning failed");
+                // Cross the port boundary as the sentence the user should read,
+                // and nothing else.
+                //
+                // Two frames used to ride along: a `.context("commissioning
+                // failed")` here, and — because `pond-api` renders `{e:#}` and
+                // cannot depend on this crate to ask for it — the wire code
+                // sitting at the bottom of the chain. So a rejected setup code
+                // arrived as "commissioning failed: Invalid pairing code:
+                // commission_failed". The code is consumed HERE, which is the
+                // only place that branches on it; past this point it is
+                // bookkeeping, and bookkeeping does not belong in a sentence.
+                //
+                // `told`, not `describe(&e)`: the better advice was already
+                // reaching the notification and not the dialog that asked.
+                return Err(anyhow::anyhow!("{told}"));
             }
         };
 

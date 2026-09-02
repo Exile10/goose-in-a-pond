@@ -292,8 +292,22 @@ async fn start_adapter(
     Arc<dyn EventBus>,
     BusStream,
 ) {
+    start_adapter_with(url, Arc::new(MockRegistry::default())).await
+}
+
+/// The same, over a registry the test has already put rows in — which is the only
+/// way to reach `sync_device`'s KNOWN-device branch, since a device the registry has
+/// never heard of takes the `register` path instead.
+async fn start_adapter_with(
+    url: &str,
+    registry: Arc<MockRegistry>,
+) -> (
+    Arc<MatterDeviceControl>,
+    Arc<MockRegistry>,
+    Arc<dyn EventBus>,
+    BusStream,
+) {
     let (client, events) = MatterClient::connect(url).await.unwrap();
-    let registry = Arc::new(MockRegistry::default());
     let bus: Arc<dyn EventBus> = Arc::new(InProcessEventBus::new());
     let received = bus.subscribe();
     let control = Arc::new(MatterDeviceControl::new(client.clone()));
@@ -381,10 +395,14 @@ async fn a_device_nobody_touches_keeps_reading_as_present() {
 }
 
 #[tokio::test]
-async fn a_device_the_controller_has_lost_stops_being_vouched_for() {
+async fn a_device_the_controller_has_lost_stops_being_vouched_for_until_it_says_otherwise() {
     // The other half: once the controller says a device is gone, the bridge must
     // stop saying it is here, or `last_seen` never ages and the card never turns
     // offline. Letting it age out is what makes one mechanism decide this.
+    //
+    // "Until it says otherwise" is the part that was missing, and it is covered by
+    // the test below: this used to be a latch, and a device recorded offline once had
+    // no route back short of a full reconnect.
     let (url, _) = mock_controller(
         snapshot(vec![light()], vec![]),
         vec![json!({
@@ -404,6 +422,81 @@ async fn a_device_the_controller_has_lost_stops_being_vouched_for() {
         beats.len(),
         after_loss,
         "a device the controller cannot see must not be vouched for: {beats:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_device_the_controller_can_see_again_is_vouched_for_again() {
+    // The bug this exists for. `present.remove` was a latch: a single `online:
+    // false` -- from a subscription lapse, or from a `subscribe` snapshot taken
+    // before matter.js had a CASE session -- dropped the device for good.
+    // `lifecycle.online` fires on a TRANSITION matter.js may never make again, so
+    // nothing said otherwise, `last_seen` aged past five minutes, and the card went
+    // offline while readings kept arriving from the controller's cache.
+    //
+    // The controller now reports availability as a repeated LEVEL rather than an
+    // edge, which only helps if the bridge treats a later `true` as a recovery.
+    let (url, _) = mock_controller(
+        snapshot(vec![light()], vec![]),
+        vec![
+            json!({
+                "event": "device_availability",
+                "payload": { "device_id": "matter-2", "online": false }
+            }),
+            json!({
+                "event": "device_availability",
+                "payload": { "device_id": "matter-2", "online": true }
+            }),
+        ],
+        None,
+    )
+    .await;
+    let (_control, registry, _bus, _rx) = start_adapter(&url).await;
+
+    let after_recovery = registry.heartbeats.lock().unwrap().len();
+    tokio::time::sleep(Duration::from_millis(180)).await;
+
+    let beats = registry.heartbeats.lock().unwrap();
+    assert!(
+        beats.len() > after_recovery,
+        "a device the controller can see again must be vouched for again: {beats:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_device_the_snapshot_reports_offline_is_not_given_a_reprieve() {
+    // `sync_device` heartbeated every device in the snapshot, including the ones the
+    // controller reported as offline -- so each connect and reconnect handed an
+    // absent device a fresh five minutes of looking present. A second mechanism
+    // vouching for what the first had already given up on.
+    //
+    // Registered first, because that spurious heartbeat is on the known-device
+    // branch: a device the registry has never seen is registered instead, and
+    // registration writes a fresh `last_seen` of its own by design.
+    let mut absent = light();
+    absent["online"] = json!(false);
+    let (url, _) = mock_controller(snapshot(vec![absent], vec![]), vec![], None).await;
+
+    let registry = Arc::new(MockRegistry::default());
+    registry
+        .register(RegisterDeviceRequest {
+            id: Some("matter-2".to_string()),
+            name: "Kitchen Light".to_string(),
+            device_type: "light".to_string(),
+            hostname: None,
+            capabilities: vec!["power".to_string(), "brightness".to_string()],
+            room: None,
+        })
+        .await
+        .unwrap();
+
+    let (_control, registry, _bus, _rx) = start_adapter_with(&url, registry).await;
+    tokio::time::sleep(Duration::from_millis(180)).await;
+
+    let beats = registry.heartbeats.lock().unwrap();
+    assert!(
+        beats.is_empty(),
+        "an offline device must not be vouched for at all: {beats:?}"
     );
 }
 
@@ -753,6 +846,37 @@ async fn commissioning_with_nothing_in_pairing_mode_says_so_and_says_it_early() 
         !ops.iter().any(|op| op == "commission"),
         "the wait must be skipped, not paid and then explained"
     );
+}
+
+#[tokio::test]
+async fn a_rejected_setup_code_reaches_the_user_as_one_sentence() {
+    // What the user actually read: "commissioning failed: Invalid pairing code:
+    // commission_failed". Three fragments, and only the middle one says anything
+    // — the first restates the endpoint they were already looking at, and the
+    // third is the wire code, which is bookkeeping this crate consumes itself.
+    let answer: Answer = Arc::new(|frame: &Value| match frame["op"].as_str() {
+        Some("discover") => json!({"ok": true, "result": {"commissionable": 1}}),
+        Some("commission") => json!({
+            "ok": false,
+            "error": {"code": "invalid_setup_code", "message": "Invalid pairing code"}
+        }),
+        _ => json!({"ok": true, "result": {}}),
+    });
+    let (url, _received) = mock_controller(snapshot(vec![], vec![]), vec![], Some(answer)).await;
+    let (client, _events) = MatterClient::connect(&url).await.unwrap();
+    let commissioner = MatterCommissioner::new(client, MatterNotifier::disabled());
+
+    let error = commissioner
+        .commission(
+            SetupCode::PairingCode("MT:Y.K9042C00KA0648G00".to_string()),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    // Rendered the way the HTTP route renders it.
+    let shown = format!("{error:#}");
+    assert_eq!(shown, "Invalid pairing code", "got: {shown}");
 }
 
 #[tokio::test]

@@ -15,6 +15,7 @@
 //! ← {"event": "reading", "payload": {…}}
 //! ```
 
+use crate::client::ControllerCode;
 use chrono::{DateTime, Utc};
 use pond_core::user_data::domain::sensor::SensorReading;
 use pond_core::user_data::ports::device_control::{
@@ -180,7 +181,11 @@ pub struct WireDevice {
     pub device_type: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
-    #[serde(default)]
+    /// Required, unlike `capabilities`. `bool::default()` is `false`, so a
+    /// defaulted `online` means "offline" — and a field the controller stopped
+    /// sending, or renamed, would mark every device on the fabric unreachable
+    /// with no error raised anywhere. An absent capability list is a device with
+    /// nothing to drive, which is a real thing; an absent reachability is not.
     pub online: bool,
 }
 
@@ -336,7 +341,9 @@ impl WireLog {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AvailabilityEvent {
     pub device_id: String,
-    #[serde(default)]
+    /// Required, for the reason on [`WireDevice::online`]: the whole payload of
+    /// this event is one boolean, and defaulting it to `false` turns a malformed
+    /// frame into a confident claim that the device is gone.
     pub online: bool,
 }
 
@@ -433,16 +440,34 @@ fn is_qr_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '$' | '%' | '*' | '+' | '-' | '/' | ':')
 }
 
-/// Render an error for a human: the whole cause chain, redacted.
+/// Render an error for a human: the whole cause chain, redacted, prose only.
 ///
 /// `anyhow::Error`'s plain `Display` prints only the OUTERMOST context, so
 /// `error = %e` on a failure like "connecting to the controller at ws://…"
 /// showed the attempt and threw away the reason — which is the one thing the
-/// reader needs. `{:#}` walks the chain ("context: cause: cause"), and this is
-/// the only way any error in this crate should reach a log, an API response, or
-/// the model.
+/// reader needs. Walking the chain fixes that, and this is the only way any
+/// error in this crate should reach a log, an API response, or the model.
+///
+/// The [`ControllerCode`] frame is skipped, because it is not prose. It sits at
+/// the bottom of the chain deliberately — the code is the SOURCE and the message
+/// the context, so [`code_of`](crate::code_of) can still reach it — but `{:#}`
+/// renders every frame, which is how a rejected setup code reached the user as
+/// "commissioning failed: Invalid pairing code: commission_failed". Two of those
+/// three fragments were bookkeeping. Callers that want the code ask for it by
+/// name and put it in a field of its own.
 pub fn describe(error: &anyhow::Error) -> String {
-    redact_setup_code(&format!("{error:#}"))
+    let prose: Vec<String> = error
+        .chain()
+        .filter(|frame| frame.downcast_ref::<ControllerCode>().is_none())
+        .map(ToString::to_string)
+        .collect();
+
+    // A code with no message at all: say which code rather than saying nothing.
+    // `WireError`'s own `Display` makes the same choice for the same reason.
+    if prose.is_empty() {
+        return format!("{error:#}");
+    }
+    redact_setup_code(&prose.join(": "))
 }
 
 /// Which kind of setup code this is, for logging in place of the value.

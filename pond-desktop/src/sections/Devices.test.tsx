@@ -28,6 +28,16 @@ const matterLight: Device = {
   device_type: "light",
   is_online: true,
   last_seen: new Date().toISOString(),
+  capabilities: ["power", "brightness"],
+};
+
+/** A contact sensor: nothing to drive, which is what the power button gates on. */
+const contactSensor: Device = {
+  id: "matter-5",
+  name: "Contact Sensor",
+  device_type: "sensor",
+  is_online: true,
+  capabilities: [],
 };
 
 const matterLock: Device = {
@@ -35,7 +45,13 @@ const matterLock: Device = {
   name: "Front Door",
   device_type: "lock",
   is_online: true,
+  capabilities: ["locked"],
 };
+
+/** `get_device_state`'s answer, in the shape `state_line` writes it. */
+function stateSaying(deviceId: string, power: "on" | "off") {
+  return { tool: "get_device_state", success: true, content: `${deviceId} is:\n    power: ${power}` };
+}
 
 const mocked = (fn: unknown) => fn as ReturnType<typeof vi.fn>;
 
@@ -77,6 +93,21 @@ describe("Devices section — Matter devices", () => {
     expect(container.querySelector(".lucide-lock")).toBeTruthy();
   });
 
+  it("shows a switch icon for a Generic Switch, not the monitor fallback", async () => {
+    // A commissioned Generic Switch arrived typed `matter`, which the table above has
+    // no entry for, so it rendered the generic monitor. The backend now types it
+    // `switch`; this is the half of that fix the user can see.
+    (api.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: "matter-6", name: "Generic Switch", device_type: "switch", is_online: true },
+    ]);
+
+    const { container } = render(<Devices />);
+    await screen.findByText("Generic Switch");
+
+    expect(container.querySelector(".lucide-toggle-left")).toBeTruthy();
+    expect(container.querySelector(".lucide-monitor")).toBeNull();
+  });
+
   it("shows a phone icon for the GOTG mobile companion, not a computer", async () => {
     (api.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([
       { id: "phone-1", name: "Emmanuel's Phone", device_type: "gotg", is_online: true },
@@ -90,32 +121,92 @@ describe("Devices section — Matter devices", () => {
   });
 });
 
-describe("Devices section — power toggle", () => {
-  it("turning off an online device calls markDeviceOffline, not the MCP tool", async () => {
-    (api.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([matterLight]);
-    (api.markDeviceOffline as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+describe("Devices section — power button", () => {
+  it("labels the button from what the device is, not from whether it is reachable", async () => {
+    // The bug. The label read `is_online`, so a lamp that was reachable and switched
+    // OFF said "Turn off" -- and pressing it wrote the registry's `last_seen` rather
+    // than touching the lamp, which made GIAP forget the lamp instead.
+    mocked(api.listDevices).mockResolvedValue([matterLight]);
+    mocked(api.invokeTool).mockResolvedValue(stateSaying("matter-2", "off"));
 
     render(<Devices />);
     await screen.findByText("Living Room Light");
 
+    // Reachable, and off. The button offers the thing that is possible.
+    await waitFor(() => expect(screen.getByText("Turn on")).toBeTruthy());
+  });
+
+  it("switches the device, and reads back rather than assuming", async () => {
+    mocked(api.listDevices).mockResolvedValue([matterLight]);
+    mocked(api.invokeTool).mockResolvedValue(stateSaying("matter-2", "on"));
+
+    render(<Devices />);
+    await screen.findByText("Living Room Light");
+    await waitFor(() => expect(screen.getByText("Turn off")).toBeTruthy());
+
+    mocked(api.invokeTool).mockClear();
     fireEvent.click(screen.getByText("Turn off"));
 
-    await waitFor(() => expect(api.markDeviceOffline).toHaveBeenCalledWith("matter-2"));
+    await waitFor(() =>
+      expect(api.invokeTool).toHaveBeenCalledWith({
+        server: "giap-device-control",
+        tool: "set_device_state",
+        args: { device_id: "matter-2", power: false },
+      }),
+    );
+    // And the state is read again, because a device that refused should not leave
+    // the card claiming otherwise.
+    await waitFor(() =>
+      expect(mocked(api.invokeTool).mock.calls.some((c) => c[0].tool === "get_device_state")).toBe(
+        true,
+      ),
+    );
+    // Never the registry's reachability, which is what this button used to write.
+    expect(api.markDeviceOffline).not.toHaveBeenCalled();
+  });
+
+  it("offers no power button to a device that cannot be switched", async () => {
+    // A Contact Sensor and a Humidity Sensor were both showing "Turn on". The card
+    // had nothing to gate on: `capabilities` is on the wire and the client type
+    // dropped it.
+    mocked(api.listDevices).mockResolvedValue([contactSensor]);
+
+    render(<Devices />);
+    await screen.findByText("Contact Sensor");
+
+    expect(screen.queryByText("Turn on")).toBeNull();
+    expect(screen.queryByText("Turn off")).toBeNull();
+    // And nothing is asked of a device with nothing to answer.
     expect(api.invokeTool).not.toHaveBeenCalled();
   });
 
-  it("turning on an offline device calls markDeviceOnline, not the MCP tool", async () => {
+  it("moves reachability into Configure, named as what it is", async () => {
+    // Worth keeping -- there is no wake or restart primitive, so marking a device
+    // absent by hand is the only way to age one out. It just is not the device's
+    // power, and sharing a button with it made both illegible.
     const offlineLight: Device = { ...matterLight, is_online: false };
-    (api.listDevices as ReturnType<typeof vi.fn>).mockResolvedValue([offlineLight]);
-    (api.markDeviceOnline as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+    mocked(api.listDevices).mockResolvedValue([offlineLight]);
+    mocked(api.markDeviceOnline).mockResolvedValue(undefined);
 
     render(<Devices />);
     await screen.findByText("Living Room Light");
+    fireEvent.click(screen.getByText("Configure"));
 
-    fireEvent.click(screen.getByText("Turn on"));
-
+    fireEvent.click(await screen.findByText("Mark online"));
     await waitFor(() => expect(api.markDeviceOnline).toHaveBeenCalledWith("matter-2"));
-    expect(api.invokeTool).not.toHaveBeenCalled();
+  });
+});
+
+describe("power state parsing", () => {
+  it("reads the line shape `state_line` writes, and nothing else", async () => {
+    const { powerStateOf } = await import("./Devices");
+
+    expect(powerStateOf("matter-2 is:\n    power: on\n    brightness: 50%")).toBe(true);
+    expect(powerStateOf("matter-2 is:\n    power: off")).toBe(false);
+    // A device that reported nothing is not a device that is off. Guessing `false`
+    // here would relabel every unreachable device "Turn on".
+    expect(powerStateOf("matter-2 reports nothing about its state.")).toBeUndefined();
+    expect(powerStateOf("matter-2 is:\n    brightness: 50%")).toBeUndefined();
   });
 });
 

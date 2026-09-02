@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 
+import { isSnapshotCluster } from "../src/controller.js";
 import { deviceTypeFromDescriptor, nodeToDevice } from "../src/mapping/devices.js";
 import {
   describedNode,
   endpoint,
   extendedColorLightNode,
   fanNode,
+  genericSwitchNode,
   lightNode,
   named,
   node,
@@ -101,6 +103,26 @@ describe("device typing", () => {
       endpoint(1, { onOff: { onOff: false } }),
     ]);
     expect(nodeToDevice(blank).name).toBe("Acme Plug");
+  });
+
+  it("types a Generic Switch as a switch, so it stops wearing a monitor", () => {
+    // A Generic Switch fell through to the `matter` sentinel, and the desktop's icon
+    // table has no entry for that -- so it rendered the generic Monitor fallback on
+    // the catch-all gradient. The type is what fixes the icon; the description is a
+    // separate fix in the same session.
+    const device = nodeToDevice(genericSwitchNode());
+
+    expect(device.device_type).toBe("switch");
+    // Still nothing to drive. A switch reports; it does not take orders.
+    expect(device.capabilities).toEqual([]);
+  });
+
+  it("admits the switch cluster into the snapshot", () => {
+    // Without this the fix above is invisible: `readClusters` skips any cluster
+    // outside the allowlist, so `switch` never reached a snapshot and no mapping over
+    // it could have run. The allowlist derives from `deviceClusters()` for exactly
+    // this reason -- naming a cluster in one place and not the other is the failure.
+    expect(isSnapshotCluster("switch")).toBe(true);
   });
 
   it("leaves an unmappable device typed matter with no capabilities", () => {

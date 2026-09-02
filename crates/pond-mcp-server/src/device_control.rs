@@ -153,6 +153,20 @@ impl DeviceControlMcpServer {
 }
 
 /// A device's current state, as the model reads it.
+/// One reading, as `render_state` writes it.
+///
+/// Its own constant because the desktop parses these lines. `get_device_state` is on
+/// the direct-dispatch allowlist so the Devices card can label its power button from
+/// what the device IS rather than from whether it is reachable, and the only channel
+/// a dispatched tool has is text -- `ToolCallResult` carries `{content, success}` and
+/// nothing structured. So the format is a contract with `powerStateOf` in
+/// `pond-desktop/src/sections/Devices.tsx`, and `a_state_line_is_the_shape_the_desktop_parses`
+/// fails if it drifts. Same discipline as the sensor-vocabulary tripwire: an
+/// undeclared coupling is the one that breaks silently.
+fn state_line(name: &str, value: &str) -> String {
+    format!("\n    {name}: {value}")
+}
+
 fn render_state(state: &DeviceState) -> String {
     if state.values.is_empty() {
         // Distinct from "it is off": the device reported nothing at all, and saying
@@ -162,7 +176,7 @@ fn render_state(state: &DeviceState) -> String {
 
     let mut out = format!("{} is:", state.device_id);
     for value in &state.values {
-        out.push_str(&format!("\n    {}: {}", value.name, value.value));
+        out.push_str(&state_line(&value.name, &value.value));
     }
     out
 }
@@ -819,6 +833,36 @@ mod tests {
     use pond_core::user_data::ports::device_control::{
         Capability, SensorSpec, StateSpec, VendorCluster,
     };
+
+    #[test]
+    fn a_state_line_is_the_shape_the_desktop_parses() {
+        // A declared coupling, not an accidental one. `get_device_state` is on the
+        // direct-dispatch allowlist so the Devices card can label its power button
+        // from what the device IS -- it used to read `is_online`, which is
+        // reachability, and offered "Turn on" to a contact sensor. A dispatched tool
+        // has only text to answer with (`ToolCallResult` is `{content, success}`), so
+        // `powerStateOf` in `pond-desktop/src/sections/Devices.tsx` reads these lines.
+        //
+        // Four newline-separated spaces, the name, a colon, a space, the value. If
+        // this changes, that parser has to change with it -- which is the whole
+        // reason this assertion is here rather than left to be discovered.
+        assert_eq!(state_line("power", "on"), "\n    power: on");
+
+        let rendered = render_state(&DeviceState {
+            device_id: "matter-2".to_string(),
+            values: vec![
+                StateValue {
+                    name: "power".to_string(),
+                    value: "on".to_string(),
+                },
+                StateValue {
+                    name: "brightness".to_string(),
+                    value: "50%".to_string(),
+                },
+            ],
+        });
+        assert_eq!(rendered, "matter-2 is:\n    power: on\n    brightness: 50%");
+    }
 
     fn spec(verb: &str, value: ValueSpec) -> Capability {
         Capability {

@@ -43,7 +43,7 @@ describe("setup code redaction", () => {
   });
 
   it("classifies a code without revealing it", () => {
-    expect(setupCodeKind("MT:Y.K9042C00KA0648G00")).toBe("pairing_code");
+    expect(setupCodeKind("MT:Y.K9042C00KA0648G00")).toBe("qr_payload");
     expect(setupCodeKind("3497-011-2332")).toBe("pairing_code");
     expect(setupCodeKind("20202021")).toBe("passcode");
     expect(setupCodeKind("nonsense")).toBe("unknown");
