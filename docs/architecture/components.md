@@ -170,7 +170,7 @@ A [Tauri 2.0](https://tauri.app) application providing a native UI for macOS and
 | `src-tauri/` | Rust backend — window management, hotkeys, system tray, audio recording, TTS playback, server lifecycle |
 | `src/` | React 19 + TypeScript frontend |
 | `src/styles/` | Jarida design tokens and base CSS (offline fonts via fontsource) |
-| `src/state/` | `AppState` reducer + `AppContext` (all Tauri event listeners) |
+| `src/state/` | `AppState` reducer + `AppContext` (all Tauri event listeners), and `chatRunStore` — the live chat turn (see below) |
 | `src/api/` | `PondApiClient` — single class for all REST calls |
 | `src/modes/` | `GuiMode` (sidebar app), `VoiceMode` (full-window orb) |
 | `src/sections/` | 10 GUI sections: Dashboard, Chat, Devices, Schedules, Memory, Skills, Models, Prompts, Settings, Agent |
@@ -183,3 +183,43 @@ A [Tauri 2.0](https://tauri.app) application providing a native UI for macOS and
 - **Canvas mode** — always-on-top translucent overlay for ambient display
 
 The desktop app starts `pond-server` automatically via the `ensure_server_running` Tauri command, polls `server_health`, and displays a branded startup screen while the server comes online.
+
+### The chat turn is owned by the module, not the view
+
+`GuiMode` picks a section with a `switch`, not a router, so pressing anything in
+the sidebar **unmounts the section that was showing**. A chat turn cannot live in
+that component: leaving Chat mid-answer would throw away the transcript, the
+queued follow-ups and the streaming bubble, while the stream itself kept running
+and decoded its tokens into state updates on a dead component, which React drops
+silently. The answer arrived, was persisted, and was invisible to whoever asked.
+
+So the turn lives in `src/state/chatRunStore.ts` — a module singleton read through
+`useSyncExternalStore`, the same shape `hub/state/hubDataStore.ts` uses for
+anything that must outlive a view. It owns the transcript, the busy flag, the
+queue and its draining, and the loop that folds the `/chat/stream` frames.
+
+| Concern | Owner |
+|---|---|
+| Transcript, streaming bubble, busy, queue, active session id | `chatRunStore` |
+| Composer draft, attachment tray, which screen the section is on | The section |
+| `sessionId`, `sessionToken`, `serverOnline`, context cards | `AppContext` |
+
+Two surfaces subscribe — `sections/Chat.tsx` and `hub/views/ChatHub.tsx` — and
+they render **one** conversation rather than keeping one each; the Hub draws a
+projection of the shared message, which is what stops the two drifting over what
+a frame means. Being at module scope, the driver cannot read app state or
+dispatch, so `AppContextProvider` installs a small typed bridge
+(`setChatRunBridge`) carrying the auth token and the three callbacks the turn
+needs on the way back. It is installed there for the same reason the schedule
+SSE listener is: a turn started in Chat is still arriving while you are looking
+at Devices.
+
+Returning to Chat lands on the "All chats" wall as it always has, with one
+carve-out: a turn still running, or one that finished while nothing was mounted
+to show it, opens straight into its thread and is marked read once shown.
+
+**Boundary.** This survives navigation, not a reload. Reloading or restarting the
+app drops the HTTP body, and the server treats that as cancel-on-purpose (see
+`goose_agent.rs`'s cancellation drop-guard), so the run dies mid-turn and the
+assistant message is never written. Surviving that needs the run detached from
+its connection server-side, which is separate work.

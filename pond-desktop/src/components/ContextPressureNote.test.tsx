@@ -155,19 +155,36 @@ describe("ContextPressureNote", () => {
  * because it is free and it does catch a deletion, and because `ChatHub.tsx`
  * still has no mount harness of its own — for that surface a grep is all there
  * is, and saying so is better than implying otherwise.
+ *
+ * The two halves are now checked in two places, because they live in two.
+ * Reading the frame moved to `state/chatRunStore.ts` when the turn was hoisted
+ * out of the components so it could survive leaving the section; rendering the
+ * note is still each surface's own. Asserting them together against a surface
+ * file would only prove the two had been copied back into it, which is the
+ * arrangement that let the surfaces drift in the first place.
  */
 describe("context_warning has a consumer", () => {
+  it("the shared turn driver reads the frame", () => {
+    const src = readFileSync(join(SRC_DIR, "state/chatRunStore.ts"), "utf8");
+    expect(
+      src.includes('ev.type === "context_warning"'),
+      "the frame has no consumer in the turn driver - the server emits " +
+        "context_warning under a default-true setting and every surface drops it",
+    ).toBe(true);
+  });
+
   for (const surface of ["hub/views/ChatHub.tsx", "sections/Chat.tsx"]) {
-    it(`${surface} reads the frame and renders the note`, () => {
+    it(`${surface} renders the note`, () => {
       const src = readFileSync(join(SRC_DIR, surface), "utf8");
       expect(
-        src.includes('ev.type === "context_warning"'),
-        `the frame has no consumer in ${surface} - the server emits ` +
-          "context_warning under a default-true setting and this surface drops it",
+        src.includes("<ContextPressureNote"),
+        `${surface} is handed context_warning on the message but renders ` +
+          "nothing for it",
       ).toBe(true);
       expect(
-        src.includes("<ContextPressureNote"),
-        `${surface} reads context_warning but renders nothing for it`,
+        src.includes("contextWarning"),
+        `${surface} never reads the warning off the message, so the note it ` +
+          "renders cannot be this turn's",
       ).toBe(true);
     });
   }

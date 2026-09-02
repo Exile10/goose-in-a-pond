@@ -2,8 +2,19 @@ import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { ArrowLeft, ArrowUp, Brain, Check, ChevronDown, Copy, Cpu, Loader2, Paperclip, Pencil, PenSquare, PlayCircle, RefreshCw, ThumbsDown, ThumbsUp, Wand2, Wrench, X } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { useAppState, useAppDispatch } from "../state/AppContext";
-import { nextCardId } from "../state/reducer";
-import type { ContextCard as ContextCardType } from "../state/reducer";
+import {
+  useChatRun,
+  getChatRun,
+  hasLiveThread,
+  acknowledgeCompletion,
+  sendTurn,
+  openSession,
+  followExternalSession,
+  resetConversation,
+  truncateFrom,
+  patchMessage,
+} from "../state/chatRunStore";
+import type { Message } from "../state/chatRunStore";
 import { ToolCallChip } from "../components/ToolCallChip";
 import { ChatHistory, type OpenOrigin } from "./ChatHistory";
 import { ThinkingPlaceholder } from "../components/ThinkingPlaceholder";
@@ -14,17 +25,12 @@ import { Goose } from "../components/Goose";
 import { greeting, subtitle } from "../components/quips";
 import { HubIco, micEl } from "../hub/primitives/HubIco";
 import { CONTINUE_TURN_MESSAGE } from "../api/types";
-import type { ChatEvent, ContextWarning, ImageAttachment, ModelEntry, SessionMessage, SessionSummary, TurnStats } from "../api/types";
+import type { ModelEntry, SessionSummary } from "../api/types";
 import { TurnStatsFooter } from "../components/TurnStatsFooter";
 import { ContextPressureNote } from "../components/ContextPressureNote";
-import { SubagentTree, applySubagentProgress } from "../components/SubagentTree";
-import type { SubagentRun } from "../components/SubagentTree";
-import { filterThinking } from "../lib/thinkFilter";
+import { SubagentTree } from "../components/SubagentTree";
 import { prepareImage, validateAttachmentSet } from "../lib/imageAttach";
 import type { PreparedImage } from "../lib/imageAttach";
-
-// Module-level counter — shared across session loads and live sends
-let _msgId = 0;
 
 const CHIPS = [
   "What can you help me with?",
@@ -34,115 +40,18 @@ const CHIPS = [
   "Manage my models",
 ];
 
-function friendlyToolStatus(rawName: string): string {
-  const bare = rawName.includes("__") ? rawName.split("__").pop()! : rawName;
-  const map: Record<string, string> = {
-    get_current_weather:      "Checking the weather…",
-    list_registered_devices:  "Looking up your devices…",
-    recall_memories:          "Recalling what I know…",
-    save_memory:              "Saving that for later…",
-    list_schedules:           "Looking up your schedules…",
-    get_recipe:               "Finding that recipe…",
-    get_user_profile:         "Looking up your profile…",
-    list_skills:              "Checking my skills…",
-  };
-  if (map[bare]) return map[bare];
-  return `Working on: ${bare.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())}…`;
-}
-
-interface Message {
-  id: number;
-  role: "user" | "agent";
-  text: string;
-  streaming?: boolean;
-  status?: string;
-  cards?: ContextCardType[];
-  thinkingBlocks?: string[];
-  /** Wall clock around the reasoning stream, so the disclosure can say how
-   *  long it took rather than showing an open-ended "Thinking…". */
-  thinkingStartedAt?: number;
-  thinkingEndedAt?: number;
-  modelRole?: string;
-  tokenUsage?: { prompt_tokens: number; completion_tokens: number };
-  turnStats?: TurnStats;
-  error?: boolean;
-  historyToolNames?: string[];
-  /** Set when the agent stopped on its turn budget — renders a Continue action. */
-  turnLimit?: number;
-  /** PAI-4 P7b. Set when the turn's `context_warning` frame said the window is
-   *  filling — renders the pressure line and the "Compact now" control. */
-  contextWarning?: ContextWarning;
-  /** PAI-6 P6. Delegations this turn started, folded from `subagent_progress`
-   *  frames. Rendered WHILE streaming, unlike every other note here: a tree
-   *  nobody sees until the turn ends is the spinner it replaces. */
-  delegations?: SubagentRun[];
-  /** Image preview URLs — either a live send's local previewUrl, or a
-   *  built `${apiBase}${url}` for images replayed from session history. */
-  images?: string[];
-  /** The persisted session_messages.id this bubble corresponds to. Absent
-   *  for a just-sent live turn until the "done" event backfills it (see
-   *  sendMessage) — copy/edit/refresh/like/dislike are disabled until then,
-   *  since they all act against this id. */
-  backendId?: string;
-  /** Agent messages only: current like/dislike vote, mirrors the backend's
-   *  `liked` column. `null`/absent = no vote. */
-  liked?: boolean | null;
-}
-
-function sessionMessagesToMessages(raw: SessionMessage[]): Message[] {
-  const out: Message[] = [];
-  for (const m of raw) {
-    if (m.role === "tool") continue;
-    const images = m.images?.length
-      ? m.images.map((img) => api.sessionAttachmentUrl(m.session_id, img.id))
-      : undefined;
-    if (m.role === "assistant") {
-      const hasContent = m.content.trim().length > 0;
-      const hasToolCalls = (m.tool_calls?.length ?? 0) > 0;
-      if (!hasContent && hasToolCalls) continue;
-      const historyToolNames = hasToolCalls
-        ? m.tool_calls!.map((tc) => {
-            const bare = tc.name.includes("__") ? tc.name.split("__").pop()! : tc.name;
-            return bare;
-          })
-        : undefined;
-      // PAI-5 P6. The panel below already renders `thinkingBlocks` and is
-      // already gated on `!streaming`, which is exactly right for replayed
-      // history. All that was missing was the refill: before this, reasoning
-      // existed only for the lifetime of the SSE connection that produced it,
-      // so reloading a conversation showed every answer with the thinking that
-      // led to it silently gone.
-      const thinkingBlocks = m.thinking?.length ? m.thinking : undefined;
-      out.push({
-        id: ++_msgId,
-        role: "agent",
-        text: m.content,
-        historyToolNames,
-        images,
-        thinkingBlocks,
-        // The persisted id and the vote ride the SAME row as the reasoning.
-        // Pushing them as a second entry renders every assistant turn twice on
-        // reload, which is what a keep-both merge of these two changes does if
-        // nobody looks — `Chat.test.tsx`'s PAI-5 replay tests caught it as
-        // "found multiple elements with the text".
-        backendId: m.id,
-        liked: m.liked ?? null,
-      });
-    } else {
-      out.push({ id: ++_msgId, role: "user", text: m.content, images, backendId: m.id });
-    }
-  }
-  return out;
-}
-
 export function Chat() {
   const state    = useAppState();
   const dispatch = useAppDispatch();
 
-  const [messages, setMessages]             = useState<Message[]>([]);
+  // The transcript, the turn in flight and the queue behind it belong to the
+  // store, not to this component: pressing anything in the sidebar unmounts
+  // Chat, and a turn is not a property of whichever screen happens to be
+  // showing. See `state/chatRunStore`.
+  const run = useChatRun();
+  const { messages, busy, queued, turnSeed, loadingSession } = run;
+
   const [input, setInput]                   = useState("");
-  const [busy, setBusy]                     = useState(false);
-  const [loadingSession, setLoadingSession] = useState(false);
   const [sessions, setSessions]             = useState<SessionSummary[]>([]);
   const [retitling, setRetitling]           = useState(false);
   const [editingTitle, setEditingTitle]     = useState(false);
@@ -153,8 +62,15 @@ export function Chat() {
   const chatTitleRef                        = useRef("");
   const titleDraftRef                       = useRef("");
   const renameSessionRef                    = useRef<(id: string, title: string) => void>(() => {});
-  /** `null` until the session list says which screen this should be. */
-  const [view, setView]                     = useState<"history" | "thread" | null>(null);
+  /**
+   * `null` until the session list says which screen this should be — unless a
+   * turn is live or finished-but-unseen, in which case the answer is already
+   * known and resolving it lazily avoids a frame of wall skeleton in front of a
+   * conversation that is mid-sentence.
+   */
+  const [view, setView]                     = useState<"history" | "thread" | null>(
+    () => (hasLiveThread() ? "thread" : null),
+  );
   /** Where in the pane the opened card was, so the chat grows out of it. */
   const [openOrigin, setOpenOrigin]         = useState<OpenOrigin | null>(null);
   const [showModelSelector, setShowModelSelector] = useState(false);
@@ -170,9 +86,6 @@ export function Chat() {
   // it only disables once we've SUCCESSFULLY confirmed the model lacks vision.
   const [visionCapable, setVisionCapable]         = useState(true);
   const [capabilitiesKnown, setCapabilitiesKnown] = useState(false);
-  // Messages typed while a reply was still streaming. Drained in order once
-  // the turn finishes — see the effect below.
-  const [queued, setQueued]                       = useState<string[]>([]);
   // `thinking_mode` is a server setting ("auto" | "on" | "off") the agent reads
   // each turn, so this toggle changes real behaviour rather than just a label.
   const [thinkingMode, setThinkingMode]           = useState<string>("auto");
@@ -198,13 +111,27 @@ export function Chat() {
   const textareaRef      = useRef<HTMLTextAreaElement>(null);
   const modelSelectorRef = useRef<HTMLDivElement>(null);
   const fileInputRef     = useRef<HTMLInputElement>(null);
-  const sessionIdRef     = useRef<string | undefined>(state.sessionId ?? undefined);
-  const inThinkBlockRef  = useRef(false);
 
   const attachDisabled = capabilitiesKnown && !visionCapable;
   const attachTitle = attachDisabled
     ? "The active model cannot read images. Switch to a vision-capable model such as gemma-4-E2B-it."
     : "Attach image";
+
+  /**
+   * Revoke previews still sitting in the tray when this component goes away.
+   *
+   * The tray is the one piece of chat state that genuinely dies with the view:
+   * a sent image's preview is owned by the store from `sendTurn` onward, but an
+   * unsent one has no owner left once Chat unmounts, and before the store
+   * existed those object URLs simply leaked. Reads a ref rather than
+   * `attachments`, because a cleanup with the array as a dependency would
+   * revoke a live thumbnail every time another image was added.
+   */
+  const attachmentsRef = useRef<PreparedImage[]>([]);
+  attachmentsRef.current = attachments;
+  useEffect(() => () => {
+    attachmentsRef.current.forEach((a) => URL.revokeObjectURL(a.previewUrl));
+  }, []);
 
   const clearAttachments = useCallback(() => {
     setAttachments((prev) => {
@@ -273,18 +200,30 @@ export function Chat() {
       .catch(() => { setCapabilitiesKnown(false); });
   }, [state.serverOnline]);
 
-  // Sync session ref; load history when session changes externally
+  /**
+   * Follow a session id set from OUTSIDE — a deep link, or the
+   * `session-created` event AppContext listens for.
+   *
+   * Keyed on app state actually changing, not on it disagreeing with the store.
+   * Those are different questions: opening a conversation from the wall sets
+   * the store first and dispatches second, so a disagreement is usually just
+   * this component's own change on its way round, and treating it as external
+   * would reload the history we already have — or, when the dispatch does not
+   * come back at all, quietly drop the open conversation.
+   *
+   * A cleared id records and stops. Somebody else clearing app state is not an
+   * instruction to throw away the transcript; "New chat" is, and it says so
+   * through `resetConversation`.
+   */
+  const lastExternalIdRef = useRef<string | undefined>(state.sessionId ?? undefined);
   useEffect(() => {
     const newId = state.sessionId ?? undefined;
-    if (newId === sessionIdRef.current) return;
-    const wasExternal = !!newId;
-    sessionIdRef.current = newId;
+    if (newId === lastExternalIdRef.current) return;
+    lastExternalIdRef.current = newId;
+    if (!newId || newId === run.sessionId) return;
     clearAttachments();
-    if (!wasExternal) return;
-    api.getSessionMessages(newId!)
-      .then((msgs) => setMessages(sessionMessagesToMessages(msgs ?? [])))
-      .catch((err) => console.warn("Could not load session history (non-fatal):", err));
-  }, [state.sessionId, clearAttachments]);
+    void followExternalSession(newId);
+  }, [state.sessionId, run.sessionId, clearAttachments]);
 
   const refreshSessions = useCallback(() => {
     api.listSessions().then(setSessions).catch(() => {});
@@ -420,10 +359,15 @@ export function Chat() {
    * open one is one press away. That costs a click when you were only passing
    * through another section, and it buys a section that always opens somewhere
    * you can steer from.
+   *
+   * The one thing that DOES override it is a turn still running, or one that
+   * finished while nothing was mounted to show it — `hasLiveThread`, resolved
+   * in `view`'s initialiser above, so this effect's early return covers it.
+   * Arriving to find your own answer already written and never seen is not a
+   * choice about where to steer; it is the thing you came back for.
    */
   useEffect(() => {
     if (!state.serverOnline || view !== null) return;
-    setLoadingSession(true);
     api.listSessions()
       .then((list) => {
         setSessions(list);
@@ -432,30 +376,42 @@ export function Chat() {
       .catch((err) => {
         console.warn("Could not list conversations (non-fatal):", err);
         setView("thread");
-      })
-      .finally(() => setLoadingSession(false));
+      });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.serverOnline]);
+
+  // The resume path above skips the list, but "All chats" still has to have
+  // something behind it, so fetch it whichever screen we opened on.
+  useEffect(() => {
+    if (!state.serverOnline) return;
+    refreshSessions();
+  }, [state.serverOnline, refreshSessions]);
+
+  /**
+   * Stop resuming into a turn this surface has now shown.
+   *
+   * Without it, `hasLiveThread` would stay true forever and every later visit
+   * would reopen the same finished thread — which is the deliberate wall
+   * behaviour above, undone.
+   */
+  useEffect(() => {
+    if (view !== "thread" || busy) return;
+    acknowledgeCompletion();
+  }, [view, busy, run.completedTurns]);
 
   /** Open one conversation from the wall, growing it out of the card pressed. */
   const openConversation = useCallback((id: string, origin: OpenOrigin) => {
     setOpenOrigin(origin);
     setView("thread");
-    setMessages([]);
-    setQueued([]);
-    sessionIdRef.current = id;
+    acknowledgeCompletion();
     dispatch({ type: "SET_SESSION_ID", payload: id });
     dispatch({ type: "CLEAR_CONTEXT_CARDS" });
-    setLoadingSession(true);
-    api.getSessionMessages(id)
-      .then((msgs) => setMessages(sessionMessagesToMessages(msgs ?? [])))
-      .catch((err) => console.warn("Could not open conversation (non-fatal):", err))
-      .finally(() => setLoadingSession(false));
+    void openSession(id);
   }, [dispatch]);
 
   /** Start typing a name for this conversation. */
   const beginTitleEdit = useCallback(() => {
-    if (!sessionIdRef.current) return;
+    if (!getChatRun().sessionId) return;
     setTitleDraft(chatTitleRef.current);
     setEditingTitle(true);
   }, []);
@@ -468,17 +424,18 @@ export function Chat() {
    * instruction, and there is no undo for the name it would replace.
    */
   const commitTitle = useCallback(() => {
-    const id = sessionIdRef.current;
+    const id = getChatRun().sessionId;
     setEditingTitle(false);
     const next = titleDraftRef.current.trim();
     if (!id || !next || next === chatTitleRef.current) return;
     renameSessionRef.current(id, next);
   }, []);
 
-  /** Back to the wall. */
+  /** Back to the wall. Also an explicit "I am done with that turn". */
   const showHistory = useCallback(() => {
     setOpenOrigin(null);
     setView("history");
+    acknowledgeCompletion();
     refreshSessions();
   }, [refreshSessions]);
 
@@ -496,9 +453,8 @@ export function Chat() {
   }, [editingTitle]);
 
   function newConversation() {
-    setMessages([]);
-    sessionIdRef.current = undefined;
-    setQueued([]);
+    resetConversation();
+    acknowledgeCompletion();
     setQuipSeed(Date.now());
     // A new chat is not opened from a card, so it has no point to grow out of.
     setOpenOrigin(null);
@@ -521,7 +477,7 @@ export function Chat() {
    * list both read from `sessions`, so both catch up in one go.
    */
   const retitleCurrent = useCallback(async () => {
-    const id = sessionIdRef.current;
+    const id = getChatRun().sessionId;
     if (!id || retitling) return;
     setRetitling(true);
     try {
@@ -558,7 +514,7 @@ export function Chat() {
       console.warn("Delete failed (non-fatal):", err);
     }
     // If the deleted conversation was the active one, drop back to a blank chat.
-    if (sessionIdRef.current === id) {
+    if (getChatRun().sessionId === id) {
       newConversation();
     }
     refreshSessions();
@@ -566,246 +522,59 @@ export function Chat() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshSessions]);
 
-  const sendMessage = useCallback(async (directText?: string) => {
+  /**
+   * Hand a turn to the store, keeping only what belongs to the composer.
+   *
+   * The turn itself, the queue behind it and every frame it produces live in
+   * `chatRunStore` so they survive this component being unmounted. What stays
+   * here is the box you typed into: the draft, the attachment tray, and the
+   * textarea's height.
+   */
+  const sendMessage = useCallback((directText?: string) => {
     const text = (directText ?? input).trim();
     if ((!text && attachments.length === 0) || !state.serverOnline) return;
 
-    // A reply is still streaming: hold this one rather than dropping it. The
-    // composer stays live throughout, so a thought does not have to wait for
-    // the model. Attachments are NOT queued — they belong to the turn they
-    // were attached to, and silently re-binding them to a later message would
-    // send an image with the wrong question.
-    if (busy) {
-      if (!text) return;
-      setQueued((q) => [...q, text]);
-      setInput("");
-      if (textareaRef.current) textareaRef.current.style.height = "auto";
-      return;
-    }
-
-    const pendingAttachments = attachments;
-    const imagePayload: ImageAttachment[] = pendingAttachments.map((a) => ({ data: a.data, mime_type: a.mime_type }));
+    // A reply is still streaming: the store holds this one rather than dropping
+    // it, so the composer never has to wait for the model. Attachments are NOT
+    // queued -- they belong to the turn they were attached to, and silently
+    // re-binding them to a later message would send an image with the wrong
+    // question -- so a busy send with an empty box is a no-op rather than a
+    // silent discard of the tray.
+    if (busy && !text) return;
 
     setInput("");
     if (textareaRef.current) textareaRef.current.style.height = "auto";
-    setTurnSeed(Date.now());
-    setBusy(true);
-    inThinkBlockRef.current = false;
 
-    const userMsg:  Message = {
-      id: ++_msgId,
-      role: "user",
+    if (busy) {
+      sendTurn({ text });
+      return;
+    }
+
+    // The bubble keeps its own copy of each previewUrl and the store now owns
+    // revoking them, so the tray is cleared here WITHOUT revoking -- doing so
+    // would blank the thumbnail on the message just sent.
+    sendTurn({
       text,
-      images: pendingAttachments.length > 0 ? pendingAttachments.map((a) => a.previewUrl) : undefined,
-    };
-    const agentMsg: Message = { id: ++_msgId, role: "agent", text: "", streaming: true };
-    setMessages((prev) => [...prev, userMsg, agentMsg]);
-    // Clear the pending tray now that the images have been captured into
-    // userMsg above — the bubble keeps its own copy of the previewUrl, so we
-    // deliberately don't revoke it here (that would blank the just-sent
-    // thumbnail); only a later manual removal or new-conversation revokes it.
+      images: attachments.map((a) => ({ data: a.data, mime_type: a.mime_type })),
+      previewUrls: attachments.map((a) => a.previewUrl),
+    });
     setAttachments([]);
     setAttachError(null);
+  }, [input, attachments, busy, state.serverOnline]);
 
-    try {
-      api.setToken(state.sessionToken);
-      for await (const event of api.chatStream(text, sessionIdRef.current, state.sessionToken ?? undefined, undefined, imagePayload)) {
-        const ev = event as ChatEvent;
-
-        if (ev.type === "text" && (ev.content ?? ev.token)) {
-          const raw = ev.content ?? ev.token ?? "";
-          const [visible, newInBlock] = filterThinking(raw, inThinkBlockRef.current);
-          inThinkBlockRef.current = newInBlock;
-          if (visible) {
-            setMessages((prev) => {
-              const last = prev[prev.length - 1];
-              if (!last || last.role !== "agent") return prev;
-              // A bubble already showing an error is finished. The error arm
-              // OVERWRITES `text` while this one APPENDS to it, so text arriving
-              // after an error ran straight onto the end of the error sentence --
-              // "…missing providerI could not produce a response". The server sends
-              // these as two separate frames and deliberately keeps streaming past an
-              // error, so the honest rendering is two messages, not one string.
-              if (last.error) {
-                return [...prev, { id: ++_msgId, role: "agent", text: visible, streaming: true }];
-              }
-              return [...prev.slice(0, -1), { ...last, text: last.text + visible, status: undefined }];
-            });
-          }
-        } else if (ev.type === "thinking" && ev.content) {
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (!last || last.role !== "agent") return prev;
-            const now = Date.now();
-            return [...prev.slice(0, -1), {
-              ...last,
-              thinkingBlocks: [...(last.thinkingBlocks ?? []), ev.content as string],
-              // First chunk opens the span; every chunk moves the close, so the
-              // duration is how long reasoning actually streamed rather than
-              // how long the whole turn took.
-              thinkingStartedAt: last.thinkingStartedAt ?? now,
-              thinkingEndedAt: now,
-            }];
-          });
-        } else if (ev.type === "status" && ev.content) {
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (!last || last.role !== "agent") return prev;
-            return [...prev.slice(0, -1), { ...last, status: ev.content }];
-          });
-        } else if (ev.type === "tool_call" && ev.tool) {
-          const card: ContextCardType = {
-            id: nextCardId(),
-            tool: ev.tool,
-            callId: ev.id as string | undefined,
-            data: (ev.result as Record<string, unknown>) ?? {},
-            timestamp_ms: Date.now(),
-          };
-          dispatch({ type: "PUSH_CONTEXT_CARD", payload: card });
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (!last || last.role !== "agent") return prev;
-            return [...prev.slice(0, -1), { ...last, cards: [...(last.cards ?? []), card], status: friendlyToolStatus(ev.tool ?? "") }];
-          });
-        } else if (ev.type === "tool_result" && ev.id) {
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (!last || last.role !== "agent" || !last.cards) return prev;
-            const cardData   = ev.ui?.data ?? { result: ev.content };
-            const renderHint = ev.ui?.card_type;
-            const evId   = ev.id as string;
-            const evTool = ev.tool as string | undefined;
-            const newCards = last.cards.map((c) =>
-              (c.callId && c.callId === evId) || (evTool && c.tool === evTool)
-                ? { ...c, data: cardData, ...(renderHint ? { renderHint } : {}) }
-                : c,
-            );
-            return [...prev.slice(0, -1), { ...last, cards: newCards, status: undefined }];
-          });
-        } else if (ev.type === "review_status" && ev.content) {
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (!last || last.role !== "agent") return prev;
-            return [...prev.slice(0, -1), { ...last, status: ev.content }];
-          });
-        } else if ((ev.type === "review_revision" || ev.type === "tool_revision") && ev.content) {
-          inThinkBlockRef.current = false;
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (!last || last.role !== "agent") return prev;
-            return [...prev.slice(0, -1), { ...last, text: ev.content!, status: undefined }];
-          });
-        } else if (ev.type === "error" || ev.error) {
-          const errMsg = ev.error ?? "Unknown error from agent";
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (!last || last.role !== "agent") return prev;
-            return [...prev.slice(0, -1), { ...last, text: `Error: ${errMsg}`, streaming: false, error: true }];
-          });
-        } else if (ev.done && ev.session_id) {
-          sessionIdRef.current = ev.session_id;
-          dispatch({ type: "SET_SESSION_ID", payload: ev.session_id });
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (!last || last.role !== "agent") return prev;
-            return [...prev.slice(0, -1), {
-              ...last,
-              ...(ev.model_role ? { modelRole: ev.model_role } : {}),
-              ...(ev.usage && ev.usage.completion_tokens > 0 ? { tokenUsage: ev.usage } : {}),
-            }];
-          });
-          if (ev.model_name && ev.model_role) {
-            dispatch({ type: "SET_LAST_RESPONSE_META", payload: { modelName: ev.model_name, modelRole: ev.model_role, completionTokens: ev.usage?.completion_tokens ?? 0 } });
-          }
-          // The stream never carries the persisted message ids, so copy/edit/
-          // refresh/like/dislike (which all act on a real backend id) have
-          // nothing to target yet. Fetch the small tail of the session and
-          // match by id, not array position — same reasoning as turn_stats
-          // below, a session switch mid-fetch must not misattribute this.
-          const doneSessionId = ev.session_id;
-          const forUser = userMsg.id;
-          const forAgent = agentMsg.id;
-          void (async () => {
-            try {
-              const recent = await api.getSessionMessages(doneSessionId, 10);
-              const nonTool = recent.filter((m) => m.role !== "tool");
-              const lastUser = [...nonTool].reverse().find((m) => m.role === "user");
-              const lastAgent = [...nonTool].reverse().find((m) => m.role === "assistant");
-              setMessages((prev) => prev.map((m) => {
-                if (m.id === forAgent && lastAgent) return { ...m, backendId: lastAgent.id, liked: lastAgent.liked ?? null };
-                if (m.id === forUser && lastUser) return { ...m, backendId: lastUser.id };
-                return m;
-              }));
-            } catch {
-              // Non-fatal: the turn already rendered; only the action icons
-              // stay disabled until the next successful history load.
-            }
-          })();
-        } else if (ev.type === "turn_stats") {
-          // Attach by id, not array position — a mid-stream session switch
-          // replaces `messages` with another conversation's history, and the
-          // stats must never land on one of those messages.
-          const stats = ev as unknown as TurnStats;
-          setMessages((prev) =>
-            prev.map((m) => (m.id === agentMsg.id ? { ...m, turnStats: stats } : m)),
-          );
-        } else if (ev.type === "turn_limit_reached") {
-          // The agent ran out of turns rather than finishing. Mark the message
-          // (by id, same reasoning as turn_stats) so it offers a Continue action
-          // instead of leaving the backend's "would you like me to continue?"
-          // as a question nothing can answer.
-          const limit = ev.max_turns ?? 0;
-          setMessages((prev) =>
-            prev.map((m) => (m.id === agentMsg.id ? { ...m, turnLimit: limit } : m)),
-          );
-        } else if (ev.type === "subagent_progress") {
-          // PAI-6 P6. Attach by id — same reasoning as turn_stats — and fold
-          // through the one shared reducer, so this surface and the hub cannot
-          // disagree about what a frame means.
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === agentMsg.id
-                ? { ...m, delegations: applySubagentProgress(m.delegations ?? [], ev) }
-                : m,
-            ),
-          );
-        } else if (ev.type === "context_warning") {
-          // PAI-4 P7b. The window is filling. Attach by id — same reasoning as
-          // turn_stats and turn_limit_reached — so the note lands on this turn
-          // and not on whatever message a mid-stream session switch left last.
-          const cw = ev as unknown as ContextWarning;
-          setMessages((prev) =>
-            prev.map((m) => (m.id === agentMsg.id ? { ...m, contextWarning: cw } : m)),
-          );
-        }
-      }
-    } catch (e) {
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (!last || last.role !== "agent") return prev;
-        return [...prev.slice(0, -1), { ...last, text: `Error: ${String(e)}`, streaming: false, error: true }];
-      });
-    } finally {
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (!last || last.role !== "agent" || !last.streaming) return prev;
-        return [...prev.slice(0, -1), { ...last, streaming: false }];
-      });
-      setBusy(false);
-      textareaRef.current?.focus();
-      refreshSessions();
-    }
-  }, [input, attachments, busy, state.serverOnline, state.sessionToken, dispatch, refreshSessions]);
-
-  // Drain the queue one message at a time. Keyed on `busy` going false rather
-  // than draining inside `sendMessage`'s `finally`, which would capture a stale
-  // queue in its closure.
+  // Two things `sendMessage`'s old `finally` did that belong to the view rather
+  // than to the turn: the session list carries the title the server derives
+  // from the first exchange, and the composer takes focus back when the model
+  // stops. Keyed on the store's completed-turn counter, so they fire once per
+  // turn even when the turn finished while this component was unmounted.
+  const prevBusyRef = useRef(busy);
   useEffect(() => {
-    if (busy || queued.length === 0 || !state.serverOnline) return;
-    const [next, ...rest] = queued;
-    setQueued(rest);
-    void sendMessage(next);
-  }, [busy, queued, state.serverOnline, sendMessage]);
+    const wasBusy = prevBusyRef.current;
+    prevBusyRef.current = busy;
+    if (busy || !wasBusy) return;
+    refreshSessions();
+    textareaRef.current?.focus();
+  }, [busy, refreshSessions]);
 
   const copyMessageText = useCallback((text: string) => {
     void navigator.clipboard.writeText(text).catch(() => {});
@@ -815,10 +584,7 @@ export function Chat() {
   // and refresh right before resending, so the stale pair never briefly shows
   // next to the fresh one.
   const truncateLocalFrom = useCallback((msgId: number) => {
-    setMessages((prev) => {
-      const idx = prev.findIndex((m) => m.id === msgId);
-      return idx === -1 ? prev : prev.slice(0, idx);
-    });
+    truncateFrom(msgId);
   }, []);
 
   // Shared by refresh (same text) and edit-submit (new text): truncate the
@@ -826,9 +592,10 @@ export function Chat() {
   // normal send path — no separate regenerate endpoint, `/chat/stream`
   // already knows how to append a fresh turn.
   const truncateAndResend = useCallback(async (msg: Message, text: string) => {
-    if (!msg.backendId || !sessionIdRef.current || busy) return;
+    const sessionId = getChatRun().sessionId;
+    if (!msg.backendId || !sessionId || busy) return;
     try {
-      await api.deleteMessagesFrom(sessionIdRef.current, msg.backendId);
+      await api.deleteMessagesFrom(sessionId, msg.backendId);
     } catch (e) {
       console.error("Failed to truncate session before resend:", e);
       return;
@@ -871,24 +638,21 @@ export function Chat() {
   // `null` clears a vote — clicking the already-active thumb toggles it off.
   // Optimistic: flips locally first, reverts only if the PUT fails.
   const setFeedback = useCallback((msg: Message, liked: boolean) => {
-    if (!msg.backendId || !sessionIdRef.current) return;
-    const sessionId = sessionIdRef.current;
+    const sessionId = getChatRun().sessionId;
+    if (!msg.backendId || !sessionId) return;
     const backendId = msg.backendId;
     const prevLiked = msg.liked ?? null;
     const next = prevLiked === liked ? null : liked;
-    setMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, liked: next } : m)));
+    patchMessage(msg.id, { liked: next });
     api.setMessageFeedback(sessionId, backendId, next).catch((e) => {
       console.error("Failed to save feedback:", e);
-      setMessages((prev) => prev.map((m) => (m.id === msg.id ? { ...m, liked: prevLiked } : m)));
+      patchMessage(msg.id, { liked: prevLiked });
     });
   }, []);
 
   // Held in state so the greeting is chosen once per conversation: recomputing
   // it on render would reshuffle the line while someone was reading it.
   const [quipSeed, setQuipSeed] = useState(() => Date.now());
-  // Reseeded when a turn starts, so the working quip differs between turns but
-  // holds still while one is running.
-  const [turnSeed, setTurnSeed] = useState(() => Date.now());
   const greetingLine = useMemo(() => greeting(userName, quipSeed), [userName, quipSeed]);
   const subtitleLine = useMemo(() => subtitle(quipSeed), [quipSeed]);
 
@@ -959,7 +723,7 @@ export function Chat() {
     view !== "thread" ? (
       <ChatHistory
         sessions={sessions}
-        loading={view === null || loadingSession}
+        loading={view === null}
         onOpen={openConversation}
         onNewChat={newConversation}
         onDelete={deleteSession}
@@ -1272,7 +1036,7 @@ export function Chat() {
                 {msg.role === "agent" && !msg.streaming && msg.contextWarning && (
                   <ContextPressureNote
                     warning={msg.contextWarning}
-                    sessionId={sessionIdRef.current ?? null}
+                    sessionId={run.sessionId ?? null}
                   />
                 )}
                 {/* Inference stats footer */}
