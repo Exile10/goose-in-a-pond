@@ -2333,20 +2333,22 @@ body,
 .dtile[data-active="true"]:active { transform: translate(calc(var(--ink-rest) - var(--ink-press-compact)), calc(var(--ink-rest) - var(--ink-press-compact))); box-shadow: var(--ink-press-compact) var(--ink-press-compact) 0 var(--border-ink); }
 .dtile__name, .dtile__temp { color: var(--color-text) !important; }
 
-/* The weather card joins the same material. This overrides its four
-   time-of-day skies — dawn, day, dusk, night, derived from real sunrise and
-   sunset. That was a genuine signal, not decoration, and it is the one thing
-   lost here: the card no longer says roughly what time it is by its colour.
-   The date line under the greeting says so in words. Delete this rule and the
-   sky comes back exactly. */
-.wx,
-.wx--hero,
-.wx--dawn,
-.wx--dusk,
-.wx--night {
-  background: var(--color-surface, #fff);
-  color: var(--color-text);
-  border: 2px solid var(--color-text);
+/* The sky is back, on the invitation the rule that flattened it left behind:
+   "That was a genuine signal, not decoration, and it is the one thing lost
+   here... Delete this rule and the sky comes back exactly."
+
+   It is a signal, and it is the one card on this screen whose subject is not a
+   thing in the house. Everything else — devices, music, scenes — is something
+   the household owns and can press, and those keep the shared material. The
+   weather is the world outside, it is the only card that cannot be actuated,
+   and looking different is the honest way to say so.
+
+   It still wears the ink edge, so it belongs to the same system; what it does
+   not do is pretend its subject is a control. See `wx--sky-*` in
+   `dashboard-grid.css` for what the sky is made of and how its contrast is
+   held. */
+.wx {
+  border: 2px solid var(--border-ink, var(--color-accent));
   border-radius: var(--radius-lg, 16px);
   box-shadow: var(--shadow-ink);
 }
