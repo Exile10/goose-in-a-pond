@@ -13,9 +13,18 @@
 //! thinking preamble — and now their inline tool-call gibberish — straight
 //! to the user.
 //!
-//! This filter buffers the minimum lookahead needed to detect partial open/close
-//! tags spanning chunk boundaries, suppresses everything between the tags, and
-//! flushes whatever remains (post-close-tag) on stream end.
+//! This filter withholds only the bytes that could still turn out to be the
+//! start of a marker -- the longest suffix of its buffer that is a proper
+//! prefix of some open tag or sentinel. Ordinary prose matches nothing, so it
+//! is forwarded the instant it arrives; a marker split across chunks is still
+//! caught on the next push. Everything between a matched pair is suppressed,
+//! and whatever remains (post-close-tag) is flushed on stream end.
+//!
+//! The holdback being *conditional* is the whole point. An earlier version
+//! withheld a fixed 16 bytes on every push regardless of content, which made
+//! the visible answer permanently trail generation by that much and froze the
+//! chat mid-word whenever generation slowed. `plain_text_is_emitted_with_no_holdback`
+//! is the guard.
 
 /// Paired tags whose entire contents (and the tags themselves) are dropped.
 /// Each pair = (open marker, close marker). The first pair encountered wins
@@ -24,6 +33,12 @@ const PAIRED_TAGS: &[(&str, &str)] = &[
     ("<|channel>thought", "<channel|>"),
     ("<|tool_call>", "<tool_call|>"),
     ("<think>", "</think>"),
+    // `<thinking>` is a DISTINCT literal, not a prefix match for `<think>` --
+    // the closing `>` makes them disjoint, so order here does not matter.
+    // `pond-core`'s twin filter has carried this pair for a while; this one did
+    // not, so a model using the longer spelling had its entire reasoning block
+    // rendered to the user as the answer.
+    ("<thinking>", "</thinking>"),
     ("<thought>", "</thought>"),
 ];
 
@@ -36,13 +51,9 @@ const STANDALONE_SENTINELS: &[&str] = &[
     "<end_of_turn>",
     // Orphaned close tags (model emitted close without a matching open):
     "</think>",
+    "</thinking>",
     "</thought>",
 ];
-
-/// Maximum tag length across PAIRED_TAGS (open + close) and STANDALONE_SENTINELS.
-/// Used to decide how many trailing bytes to hold back as lookahead. Computed
-/// at runtime in `safe_emit_len_max` — this constant is just a fast upper bound.
-const _MAX_TAG_LEN: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum State {
@@ -124,10 +135,9 @@ impl ThoughtFilter {
                         self.block_body.clear();
                         self.state = State::InsideBlock(close);
                     } else {
-                        // No paired tag visible. Hold back a lookahead tail
-                        // long enough to detect any partial tag (open + sentinel).
-                        let look = max_normal_lookahead();
-                        let safe = safe_emit_len(&self.buf, look);
+                        // No paired tag visible. Hold back only a tail that
+                        // could still become one -- normally nothing at all.
+                        let safe = safe_emit_len(&self.buf, &NORMAL_MARKERS);
                         out.push_str(&strip_standalones(&self.buf[..safe]));
                         self.buf.drain(..safe);
                         break;
@@ -165,7 +175,7 @@ impl ThoughtFilter {
                         self.state = State::Normal;
                     } else {
                         // Discard everything but a tail that may start close.
-                        let safe = safe_emit_len(&self.buf, close_tag.len());
+                        let safe = safe_emit_len(&self.buf, &[close_tag]);
                         // Accumulate the safely-discarded portion for tool_call
                         // envelopes so we can surface it once close arrives.
                         self.block_body.push_str(&self.buf[..safe]);
@@ -185,7 +195,19 @@ impl ThoughtFilter {
         let pending = std::mem::take(&mut self.buf);
         match self.state {
             State::Normal => strip_standalones(&pending),
-            State::InsideBlock(_) => String::new(),
+            State::InsideBlock(close) => {
+                // Dropping model output, so say so. The stream ended with a
+                // reasoning or tool-call envelope still open, which means either
+                // the model was cut off or it emitted an open marker it never
+                // closed. Either way bytes are being discarded, and discarding
+                // them silently is what made this class of bug invisible.
+                tracing::warn!(
+                    close_marker = close,
+                    dropped_bytes = pending.len() + self.block_body.len(),
+                    "stream ended inside an unclosed block; its body is discarded",
+                );
+                String::new()
+            }
         }
     }
 
@@ -251,17 +273,20 @@ pub fn parse_tool_envelope(body: &str) -> Option<(String, String)> {
     None
 }
 
-/// Worst-case lookahead in Normal state: must be ≥ longest open tag and
-/// ≥ longest standalone sentinel so neither can be missed when split.
-fn max_normal_lookahead() -> usize {
-    let opens = PAIRED_TAGS.iter().map(|(o, _)| o.len()).max().unwrap_or(0);
-    let stand = STANDALONE_SENTINELS
+/// Every marker that can begin in `State::Normal`: the paired-tag OPEN markers
+/// plus the standalone sentinels. Close markers are absent on purpose -- inside
+/// a block only one close marker matters and it is already known.
+///
+/// Derived from the two tables rather than written out again, so adding a tag
+/// cannot leave a stale copy behind. Built once: `push` runs per token, so a
+/// per-call `Vec` here would be a per-token allocation.
+static NORMAL_MARKERS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+    PAIRED_TAGS
         .iter()
-        .map(|s| s.len())
-        .max()
-        .unwrap_or(0);
-    opens.max(stand)
-}
+        .map(|&(open, _)| open)
+        .chain(STANDALONE_SENTINELS.iter().copied())
+        .collect()
+});
 
 /// Remove every occurrence of every standalone sentinel from the input.
 /// Cheap because the sentinel set is tiny.
@@ -275,16 +300,46 @@ fn strip_standalones(s: &str) -> String {
     out
 }
 
-/// Return the byte index up to which `s` can be safely emitted given that the
-/// next tag we're scanning for is `tag_len` bytes long. We hold back the last
-/// `tag_len - 1` bytes so a tag straddling the buffer boundary is still
-/// detectable on the next push. Snaps down to the nearest UTF-8 char boundary.
-fn safe_emit_len(s: &str, tag_len: usize) -> usize {
-    let mut cut = s.len().saturating_sub(tag_len.saturating_sub(1));
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
+/// Byte index up to which `s` can be emitted right now.
+///
+/// Withholds only the longest suffix of `s` that is a *proper* prefix of some
+/// marker in `markers`. That suffix is the only thing which could still turn
+/// into a marker once more tokens arrive, so holding it back is sufficient to
+/// catch a marker split across chunk boundaries -- and holding back anything
+/// more is what stalls the stream. Returns `s.len()` when no suffix could begin
+/// a marker, which is the common case for ordinary prose.
+///
+/// A complete marker is deliberately *not* a match: proper prefixes only. In
+/// `State::Normal` a complete open tag has already been found by `buf.find`,
+/// and a complete sentinel is removed by [`strip_standalones`], so treating a
+/// whole marker as a partial would withhold it forever.
+///
+/// The returned index is always a UTF-8 char boundary, so callers can slice at
+/// it. Cost is bounded by the longest marker (17 bytes) times the marker count,
+/// per push -- this runs per token, including on a Jetson Orin Nano.
+fn safe_emit_len(s: &str, markers: &[&str]) -> usize {
+    let longest = markers.iter().map(|m| m.len()).max().unwrap_or(0);
+    // A proper prefix is at most `longest - 1` bytes, so nothing before this
+    // point can be part of a partial marker.
+    let earliest = s.len().saturating_sub(longest.saturating_sub(1));
+
+    // Walk forwards from the earliest possible start and take the FIRST hit,
+    // which is the longest withheld tail. `i < s.len()` keeps the empty suffix
+    // out of the running -- every marker "starts with" it, and matching it
+    // would withhold the whole buffer.
+    for i in earliest..s.len() {
+        if !s.is_char_boundary(i) {
+            continue;
+        }
+        let tail = &s[i..];
+        if markers
+            .iter()
+            .any(|m| m.len() > tail.len() && m.starts_with(tail))
+        {
+            return i;
+        }
     }
-    cut
+    s.len()
 }
 
 #[cfg(test)]
@@ -496,16 +551,166 @@ mod tests {
 
     #[test]
     fn idempotent_on_empty_chunks() {
-        // Short pushes get held back as lookahead in case they're the start of
-        // a partial tag — the buffered tail is released by flush() at stream end.
+        // An empty push emits nothing and changes nothing. Note that `push("hi")`
+        // now emits "hi" immediately -- it cannot begin a marker, so there is
+        // nothing to hold back. The buffer is only non-empty between a partial
+        // marker and its resolution.
         let mut f = ThoughtFilter::new();
         assert_eq!(f.push(""), "");
-        let _ = f.push("hi");
+        assert_eq!(f.push("hi"), "hi");
         assert_eq!(f.push(""), "");
         // Combined emitted + flush == original input.
         let mut g = ThoughtFilter::new();
         let mut total = g.push("hi");
         total.push_str(&g.flush());
         assert_eq!(total, "hi");
+    }
+    // ── Holdback behaviour ─────────────────────────────────────────────────
+    //
+    // The bug these pin: `safe_emit_len` used to withhold a fixed 16 bytes on
+    // every push regardless of content, so the visible answer trailed
+    // generation by that much and froze the chat mid-word.
+
+    #[test]
+    fn ordinary_text_is_emitted_with_no_holdback_on_the_very_first_push() {
+        // The two strings the bug report caught frozen on screen. Both are
+        // returned whole, before any flush().
+        let mut f = ThoughtFilter::new();
+        assert_eq!(f.push("Just let me kno"), "Just let me kno");
+
+        let mut g = ThoughtFilter::new();
+        assert_eq!(
+            g.push("The current president of the United States"),
+            "The current president of the United States",
+        );
+
+        // Down to a single character, which is what a real token stream looks
+        // like at the start of a turn.
+        let mut h = ThoughtFilter::new();
+        assert_eq!(h.push("T"), "T");
+    }
+
+    #[test]
+    fn every_prefix_of_tag_free_text_is_emitted_as_it_arrives() {
+        // Kills the class rather than the instance: after feeding k characters,
+        // the filter must have emitted exactly those k characters -- never
+        // lagging behind by a lookahead window.
+        let raw = "Hello! I can help with reminders, sensors and the news.";
+        let mut f = ThoughtFilter::new();
+        let mut emitted = String::new();
+        for (k, c) in raw.chars().enumerate() {
+            emitted.push_str(&f.push(&c.to_string()));
+            let expected: String = raw.chars().take(k + 1).collect();
+            assert_eq!(emitted, expected, "lagged after {} chars", k + 1);
+        }
+        assert_eq!(f.flush(), "", "nothing should be left to flush");
+    }
+
+    #[test]
+    fn holds_back_only_a_suffix_that_could_begin_a_marker() {
+        // A bare angle bracket followed by text that no marker starts with is
+        // fully resolved, so none of it is withheld.
+        let mut f = ThoughtFilter::new();
+        assert_eq!(f.push("a < b"), "a < b");
+
+        // A genuine partial marker is withheld in full, then resolved.
+        let mut g = ThoughtFilter::new();
+        assert_eq!(g.push("text <thi"), "text ");
+        assert_eq!(g.push("nk>hidden</think>shown"), "shown");
+    }
+
+    #[test]
+    fn holds_the_longest_matching_suffix_not_a_shorter_one() {
+        // "<think" is six bytes of a live partial; withholding only the final
+        // "<" would emit "think" as text and then fail to match the tag.
+        let mut f = ThoughtFilter::new();
+        assert_eq!(f.push("ok <think"), "ok ");
+        assert_eq!(f.push(">reasoning</think>done"), "done");
+    }
+
+    #[test]
+    fn a_complete_sentinel_is_not_withheld_as_a_partial() {
+        // `<eos>` is a whole sentinel and no marker extends it, so it is
+        // stripped immediately rather than held back forever.
+        let mut f = ThoughtFilter::new();
+        assert_eq!(f.push("bye<eos>"), "bye");
+    }
+
+    #[test]
+    fn a_complete_close_tag_that_extends_into_a_longer_one_resolves_next_push() {
+        // "</think>" is complete, but it is also a proper prefix of
+        // "</thinking>", so it must be held for exactly one push and then
+        // resolved once the next byte proves which one it was.
+        let mut f = ThoughtFilter::new();
+        assert_eq!(f.push("done</think>"), "done");
+        assert_eq!(f.push(" more"), " more");
+    }
+
+    #[test]
+    fn multibyte_text_is_never_split_mid_character() {
+        // A non-ASCII tail cannot begin a marker (every marker is ASCII), so it
+        // must pass straight through rather than being snapped to a boundary.
+        let mut f = ThoughtFilter::new();
+        assert_eq!(f.push("Grüße, 世界"), "Grüße, 世界");
+
+        // Fed one char at a time, the multibyte chars must survive intact.
+        let raw = "héllo 世界 — ok";
+        let mut g = ThoughtFilter::new();
+        let mut out = String::new();
+        for c in raw.chars() {
+            out.push_str(&g.push(&c.to_string()));
+        }
+        out.push_str(&g.flush());
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn every_marker_is_ascii_so_a_partial_never_starts_mid_character() {
+        // `safe_emit_len` relies on this: because every marker is pure ASCII,
+        // a suffix matching a marker prefix can never begin inside a multi-byte
+        // character. Adding a non-ASCII marker would invalidate that reasoning,
+        // and this test is what would catch it.
+        for (open, close) in PAIRED_TAGS {
+            assert!(open.is_ascii(), "non-ASCII open marker: {open}");
+            assert!(close.is_ascii(), "non-ASCII close marker: {close}");
+        }
+        for sentinel in STANDALONE_SENTINELS {
+            assert!(sentinel.is_ascii(), "non-ASCII sentinel: {sentinel}");
+        }
+    }
+
+    #[test]
+    fn holdback_never_exceeds_the_longest_marker() {
+        // Whatever the input, the withheld tail is bounded by the longest
+        // marker, so the filter cannot accumulate unbounded state in Normal.
+        let longest = NORMAL_MARKERS.iter().map(|m| m.len()).max().unwrap();
+        for probe in ["plain text", "a < b", "x <thi", "<|channel", "<end_of_tur"] {
+            let held = probe.len() - safe_emit_len(probe, &NORMAL_MARKERS);
+            assert!(held < longest, "{probe:?} held {held} bytes");
+        }
+    }
+
+    // ── The `<thinking>` spelling, previously missing from this filter ─────
+
+    #[test]
+    fn strips_the_long_thinking_spelling() {
+        assert_eq!(run(&["<thinking>reasoning</thinking>Answer."]), "Answer.");
+    }
+
+    #[test]
+    fn strips_the_long_thinking_spelling_split_across_chunks() {
+        assert_eq!(run(&["<thin", "king>hmm</think", "ing>ok"]), "ok");
+    }
+
+    #[test]
+    fn strips_orphaned_long_close_thinking_tag() {
+        assert_eq!(run(&["result</thinking> done"]), "result done");
+    }
+
+    #[test]
+    fn the_two_thinking_spellings_stay_disjoint() {
+        // `<think>` requires `>` at index 6, so it can never match the head of
+        // `<thinking>`. Each spelling must close with its own tag.
+        assert_eq!(run(&["<think>a</think>X<thinking>b</thinking>Y"]), "XY");
     }
 }
