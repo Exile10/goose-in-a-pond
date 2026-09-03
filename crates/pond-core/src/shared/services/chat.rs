@@ -3708,6 +3708,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_tail_is_withheld_when_the_reply_ends_on_ordinary_text() {
+        // The sibling #153 never got. That fix guaranteed the withheld tail is
+        // released at stream END; it left the filter withholding a fixed 16
+        // bytes on every push regardless of content, so the caption trailed
+        // generation for the whole reply and froze mid-word whenever generation
+        // slowed. A reply that ends on ordinary text must now leave the filter
+        // with nothing to flush at all.
+        //
+        // Deliberately the mirror of the test above: same harness, same
+        // assertion on reconstruction, but an utterance whose tail CANNOT begin
+        // a marker. Together they pin both halves -- an ambiguous tail is still
+        // held, an unambiguous one never is.
+        let agent = Arc::new(MockAgent::new());
+        let storage = Arc::new(InMemorySessionStorage::new());
+        let session_id = "no-tail-session".to_string();
+        storage.create_session(session_id.clone()).await.unwrap();
+
+        let collector = EventCollector::default();
+        let utterance = "the kettle is on";
+        let input = Arc::new(ScriptedListenInput::new([utterance]));
+        let svc = ChatService::new(agent, session_id.clone(), storage.clone())
+            .with_voice_input(input)
+            .with_voice_output(Arc::new(CapturingSpeak::default()))
+            .with_event_sink(collector.sink());
+
+        svc.run_loop().await.unwrap();
+
+        let events = collector.events.lock().unwrap().clone();
+        let tokens: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::Token { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        let msgs = storage.get_messages(&session_id).await.unwrap();
+        let assistant = msgs
+            .iter()
+            .find(|m| m.message.role == crate::models::domain::message::Role::Assistant)
+            .expect("assistant turn must persist");
+
+        let streamed: String = tokens.concat();
+        assert_eq!(
+            streamed, assistant.message.content,
+            "the streamed Token events must reconstruct the full persisted reply"
+        );
+        // The load-bearing half: the first Token already carries the reply's
+        // opening bytes. Under the old fixed lookahead the first 16 bytes were
+        // withheld, so a reply this short emitted NOTHING until flush.
+        assert!(
+            !tokens.is_empty(),
+            "an ordinary reply must produce at least one Token before flush"
+        );
+        // The load-bearing assertion. MockAgent delivers this reply as a single
+        // chunk, so with no holdback the FIRST Token is the whole reply and
+        // flush contributes nothing. Under the old fixed 16-byte lookahead the
+        // first Token would have been the reply minus its last 16 bytes, with
+        // the remainder arriving only at flush -- i.e. two Tokens, the first
+        // one truncated mid-word.
+        assert_eq!(
+            tokens[0], assistant.message.content,
+            "the first Token must carry the whole single-chunk reply, not a \
+             lookahead-truncated prefix"
+        );
+        assert_eq!(
+            tokens.len(),
+            1,
+            "flush must contribute no Token when the reply ends on ordinary \
+             text; got {tokens:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn finalize_persist_failure_keeps_loop_alive_and_skips_turn_complete() {
         // REGRESSION: a transient persist failure (SQLITE_BUSY from serve + child
         // WAL contention) used to hard-fail the turn — resetting to wake-word mode
