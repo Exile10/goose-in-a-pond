@@ -2709,16 +2709,15 @@ async fn run_server(
                     return; // still disabled, or a problem build_mesh_transport already logged
                 };
                 let new_transport = Some(new_transport);
-                let (new_provider, new_capability_query, _invoice_requester) =
-                    build_mesh_provider(
-                        &new_transport,
-                        peer_directory,
-                        credit_ledger,
-                        usage_tally,
-                        settings_repo.clone(),
-                        llm_provider,
-                        payment_rail,
-                    );
+                let (new_provider, new_capability_query, _invoice_requester) = build_mesh_provider(
+                    &new_transport,
+                    peer_directory,
+                    credit_ledger,
+                    usage_tally,
+                    settings_repo.clone(),
+                    llm_provider,
+                    payment_rail,
+                );
                 *mesh_transport.write().await = new_transport;
                 *mesh_provider.write().await = new_provider;
                 *peer_capability_query.write().await = new_capability_query;
@@ -4054,6 +4053,7 @@ async fn run_server(
         event_log: Some(event_log.clone()),
         push_token_repo: Some(push_token_repo.clone()),
         face_recognition,
+        runs: Arc::new(pond_api::runs::RunSupervisor::default()),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         // Long-lived per-device notification streams get their own, larger pool
         // so connected phones never starve interactive chat SSE (#99 audit).
@@ -4826,7 +4826,7 @@ async fn run_chat(
             Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
             Some(trim_storage), // powers the trimmer's summary splice
             Some(chat_model_repo.clone()),
-            input == "whisper", // voice_mode
+            input == "whisper",                       // voice_mode
             Arc::new(tokio::sync::RwLock::new(None)), // mesh_provider — CLI chat doesn't build the mesh stack (server-only for now)
         )
         .await;

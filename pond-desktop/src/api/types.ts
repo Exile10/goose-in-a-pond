@@ -789,9 +789,24 @@ export interface ChatStreamRequest {
   canvas_mode?: boolean;
   voice_mode?: boolean;
   images?: ImageAttachment[];
+  /** Ask the server to keep this turn running if the connection drops. */
+  resumable?: boolean;
 }
 
-export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision" | "turn_stats" | "turn_limit_reached" | "context_warning" | "subagent_progress";
+/** What the server is still driving for a session, from `GET .../active-run`. */
+export interface ActiveRun {
+  run_id: string;
+  session_id: string;
+  state: "running" | "finished" | "failed" | "cancelled";
+  started_at: string;
+  /** Oldest frame still replayable. Anything before it is genuinely lost. */
+  first_seq: number;
+  last_seq: number;
+  /** Identifies the server process. A different one means the run is gone. */
+  epoch: string;
+}
+
+export type ChatEventType = "text" | "thinking" | "tool_call" | "tool_result" | "done" | "error" | "status" | "review_status" | "review_revision" | "tool_revision" | "turn_stats" | "turn_limit_reached" | "context_warning" | "subagent_progress" | "run_started" | "reattached" | "replay_gap" | "run_evicted" | "cancelled";
 
 /**
  * PAI-6 P6. Where one delegation has got to.
@@ -916,6 +931,24 @@ export interface ChatEvent {
     prompt_tokens: number;
     completion_tokens: number;
   };
+  /** The run's frame sequence, read from the SSE `id:` field rather than the
+   *  JSON body. What a reattach resumes from. */
+  seq?: number;
+  /** Present on "run_started", "reattached", "run_evicted", "cancelled" and on
+   *  every done frame — the turn this belongs to. */
+  run_id?: string;
+  /** Present on "run_started" and "reattached". A different epoch means the run
+   *  this client remembers died with a previous server process. */
+  epoch?: string;
+  /** Present on "done": the turn was cancelled or timed out rather than
+   *  finishing on its own. */
+  interrupted?: boolean;
+  /** Present on "replay_gap": the oldest frame the server can still replay.
+   *  Everything the client missed before it is unrecoverable. */
+  first_available_seq?: number;
+  /** Present on "replay_gap" and "run_evicted": what the client should do,
+   *  which is always to reload the session rather than pretend it caught up. */
+  advice?: string;
 }
 
 // ── Transcription ─────────────────────────────────────────────

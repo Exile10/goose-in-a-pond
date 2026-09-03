@@ -40,6 +40,7 @@ pub mod cleanup;
 pub mod middleware;
 pub mod oauth_callback;
 pub mod routes;
+pub mod runs;
 pub mod thought_filter;
 pub mod tool_context;
 
@@ -300,6 +301,10 @@ pub struct AppState {
     /// stalled or abandoned clients. Acquired at the start of `chat_stream`
     /// and `agent_chat_stream`; dropped when the stream ends or disconnects.
     pub sse_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Detached agent runs: the registry, the cap that bounds them, and this
+    /// process's epoch. A turn that outlives its connection is owned here rather
+    /// than by the response body — see `crate::runs`.
+    pub runs: Arc<crate::runs::RunSupervisor>,
     /// Bounds concurrent `/notifications/stream` connections (#99). Kept
     /// SEPARATE from `sse_semaphore`: a phone holds its notification stream
     /// open indefinitely, so sharing the small interactive-chat pool would let
@@ -393,8 +398,9 @@ pub struct AppState {
     /// `Option`) so `PUT /api/v1/settings` can hot-enable mesh via
     /// `mesh_rebuild` below, without a restart — mirrors `llm_provider`'s
     /// hot-swap discipline above.
-    pub mesh_transport:
-        Arc<tokio::sync::RwLock<Option<Arc<dyn pond_core::mesh::ports::mesh_transport::MeshTransport>>>>,
+    pub mesh_transport: Arc<
+        tokio::sync::RwLock<Option<Arc<dyn pond_core::mesh::ports::mesh_transport::MeshTransport>>>,
+    >,
     /// Private mesh (#132 Milestone 3.5): an `LlmProvider` that routes
     /// completions to a trusted peer instead of a local model. `None` inside
     /// the lock unless `mesh_transport` is also populated — same
@@ -428,7 +434,8 @@ pub struct AppState {
     /// still disabled. Does not tear anything down on disable: mesh_enabled
     /// has only ever gated construction here, never the behaviour of an
     /// already-built stack, and this keeps that contract.
-    pub mesh_rebuild: Option<Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>>,
+    pub mesh_rebuild:
+        Option<Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>>,
 }
 
 impl AppState {

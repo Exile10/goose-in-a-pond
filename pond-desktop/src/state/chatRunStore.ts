@@ -195,6 +195,12 @@ interface InternalState {
   inThinkBlock: boolean;
   /** Object URLs this store created and is therefore allowed to revoke. */
   ownedPreviews: Set<string>;
+  /** The server-side run driving the current turn, once it has named itself. */
+  runId: string | null;
+  /** The server process that run belongs to. A different one means it is gone. */
+  epoch: string | null;
+  /** How far this client has read. What a reattach resumes from. */
+  lastSeq: number;
   bridge: ChatRunBridge | null;
   snapshot: ChatRunSnapshot;
   subs: Set<Subscriber>;
@@ -212,6 +218,9 @@ const state: InternalState = {
   runSeq: 0,
   inThinkBlock: false,
   ownedPreviews: new Set(),
+  runId: null,
+  epoch: null,
+  lastSeq: 0,
   bridge: null,
   snapshot: {
     messages: [],
@@ -299,7 +308,15 @@ export function getChatRun(): ChatRunSnapshot {
  */
 export function hasLiveThread(): boolean {
   if (state.busy) return true;
-  return state.completedTurns > state.acknowledgedTurns;
+  if (state.completedTurns > state.acknowledgedTurns) return true;
+  // A pointer left behind by the last window, read synchronously.
+  //
+  // The timing is load-bearing: a surface decides which screen to open on while
+  // it is mounting, and `resumeActiveRun` cannot answer by then — it has a
+  // round trip to make. Without this the app lands on the wall and the turn it
+  // is about to resume into appears a second later behind it, which is the
+  // exact failure this whole change exists to remove.
+  return readRunPointer() !== null;
 }
 
 /** A surface has shown the finished turn; stop resuming into it. */
@@ -389,6 +406,212 @@ function drainQueue(): void {
   void runTurn({ text: next });
 }
 
+/**
+ * One turn's frames, whichever stream they arrive on.
+ *
+ * Extracted so that a turn STARTED here and a turn REATTACHED to after a reload
+ * fold identically. Two copies of this would be two chances to disagree about
+ * what a frame means, which is the same reason the Hub renders a projection of
+ * one message model rather than keeping its own.
+ */
+interface TurnCtx {
+  /** True once the conversation has moved on and this run must stop writing. */
+  stale: () => boolean;
+  userMsgId: number;
+  agentMsgId: number;
+}
+
+async function consume(stream: AsyncGenerator<unknown>, ctx: TurnCtx): Promise<void> {
+  for await (const event of stream) {
+    if (ctx.stale()) return;
+    const ev = event as ChatEvent;
+
+    // Where this client has got to, so a reattach can ask for the rest and
+    // nothing arrives twice.
+    if (typeof ev.seq === "number") {
+      state.lastSeq = ev.seq;
+      rememberRun();
+    }
+
+    if (ev.type === "run_started") {
+      // The turn now has a name, and so does its conversation: the server mints
+      // the session id up front rather than at the end, so this is the first
+      // moment the client can know it. Adopting it here is what makes the
+      // pointer below writable at all -- waiting for `done` would mean a reload
+      // one second into a turn had nothing to come back to.
+      state.runId = ev.run_id ?? null;
+      state.epoch = ev.epoch ?? null;
+      if (ev.session_id && !state.sessionId) {
+        state.sessionId = ev.session_id;
+        state.bridge?.onSessionId(ev.session_id);
+        commit();
+      }
+      rememberRun();
+      continue;
+    }
+    if (ev.type === "reattached" || ev.type === "cancelled") {
+      // Bookkeeping frames, not content. `cancelled` is followed by a `done`
+      // that carries `interrupted`, which is what the bubble reads.
+      continue;
+    }
+    if (ev.type === "replay_gap" || ev.type === "run_evicted") {
+      // The server cannot hand back what this client missed. Say so on the
+      // bubble rather than stitching a partial answer together and presenting
+      // it as whole -- and reload the session, which is authoritative for
+      // everything that actually committed.
+      console.warn("Chat run lost frames; reloading the conversation:", ev.type);
+      const sessionId = state.sessionId;
+      if (sessionId) void openSession(sessionId);
+      return;
+    }
+
+    if (ev.type === "text" && (ev.content ?? ev.token)) {
+      const raw = ev.content ?? ev.token ?? "";
+      const [visible, newInBlock] = filterThinking(raw, state.inThinkBlock);
+      state.inThinkBlock = newInBlock;
+      if (visible) {
+        mutate((prev) => {
+          const last = prev[prev.length - 1];
+          if (!last || last.role !== "agent") return prev;
+          // A bubble already showing an error is finished. The error arm
+          // OVERWRITES `text` while this one APPENDS to it, so text arriving
+          // after an error ran straight onto the end of the error sentence --
+          // "…missing providerI could not produce a response". The server sends
+          // these as two separate frames and deliberately keeps streaming past an
+          // error, so the honest rendering is two messages, not one string.
+          if (last.error) {
+            return [...prev, { id: ++_msgId, role: "agent", text: visible, streaming: true }];
+          }
+          return [...prev.slice(0, -1), { ...last, text: last.text + visible, status: undefined }];
+        });
+      }
+    } else if (ev.type === "thinking" && ev.content) {
+      const now = Date.now();
+      patchLastAgent((last) => ({
+        ...last,
+        thinkingBlocks: [...(last.thinkingBlocks ?? []), ev.content as string],
+        // First chunk opens the span; every chunk moves the close, so the
+        // duration is how long reasoning actually streamed rather than
+        // how long the whole turn took.
+        thinkingStartedAt: last.thinkingStartedAt ?? now,
+        thinkingEndedAt: now,
+      }));
+    } else if (ev.type === "status" && ev.content) {
+      patchLastAgent((last) => ({ ...last, status: ev.content }));
+    } else if (ev.type === "tool_call" && ev.tool) {
+      const card: ContextCardType = {
+        id: nextCardId(),
+        tool: ev.tool,
+        callId: ev.id as string | undefined,
+        data: (ev.result as Record<string, unknown>) ?? {},
+        timestamp_ms: Date.now(),
+      };
+      state.bridge?.onContextCard(card);
+      patchLastAgent((last) => ({
+        ...last,
+        cards: [...(last.cards ?? []), card],
+        status: friendlyToolStatus(ev.tool ?? ""),
+      }));
+    } else if (ev.type === "tool_result" && ev.id) {
+      mutate((prev) => {
+        const last = prev[prev.length - 1];
+        if (!last || last.role !== "agent" || !last.cards) return prev;
+        const cardData   = ev.ui?.data ?? { result: ev.content };
+        const renderHint = ev.ui?.card_type;
+        const evId   = ev.id as string;
+        const evTool = ev.tool as string | undefined;
+        const newCards = last.cards.map((c) =>
+          (c.callId && c.callId === evId) || (evTool && c.tool === evTool)
+            ? { ...c, data: cardData, ...(renderHint ? { renderHint } : {}) }
+            : c,
+        );
+        return [...prev.slice(0, -1), { ...last, cards: newCards, status: undefined }];
+      });
+    } else if (ev.type === "review_status" && ev.content) {
+      patchLastAgent((last) => ({ ...last, status: ev.content }));
+    } else if ((ev.type === "review_revision" || ev.type === "tool_revision") && ev.content) {
+      state.inThinkBlock = false;
+      patchLastAgent((last) => ({ ...last, text: ev.content!, status: undefined }));
+    } else if (ev.type === "error" || ev.error) {
+      const errMsg = ev.error ?? "Unknown error from agent";
+      patchLastAgent((last) => ({
+        ...last,
+        text: `Error: ${errMsg}`,
+        streaming: false,
+        error: true,
+      }));
+    } else if (ev.done && ev.session_id) {
+      state.sessionId = ev.session_id;
+      state.bridge?.onSessionId(ev.session_id);
+      patchLastAgent((last) => ({
+        ...last,
+        ...(ev.model_role ? { modelRole: ev.model_role } : {}),
+        ...(ev.usage && ev.usage.completion_tokens > 0 ? { tokenUsage: ev.usage } : {}),
+      }));
+      if (ev.model_name && ev.model_role) {
+        state.bridge?.onResponseMeta({
+          modelName: ev.model_name,
+          modelRole: ev.model_role,
+          completionTokens: ev.usage?.completion_tokens ?? 0,
+        });
+      }
+      // The stream never carries the persisted message ids, so copy/edit/
+      // refresh/like/dislike (which all act on a real backend id) have
+      // nothing to target yet. Fetch the small tail of the session and
+      // match by id, not array position — same reasoning as turn_stats
+      // below, a session switch mid-fetch must not misattribute this.
+      const doneSessionId = ev.session_id;
+      const forUser = ctx.userMsgId;
+      const forAgent = ctx.agentMsgId;
+      void (async () => {
+        try {
+          const recent = await api.getSessionMessages(doneSessionId, 10);
+          if (ctx.stale()) return;
+          const nonTool = recent.filter((m) => m.role !== "tool");
+          const lastUser  = [...nonTool].reverse().find((m) => m.role === "user");
+          const lastAgent = [...nonTool].reverse().find((m) => m.role === "assistant");
+          mutate((prev) => prev.map((m) => {
+            if (m.id === forAgent && lastAgent) return { ...m, backendId: lastAgent.id, liked: lastAgent.liked ?? null };
+            if (m.id === forUser && lastUser) return { ...m, backendId: lastUser.id };
+            return m;
+          }));
+        } catch {
+          // Non-fatal: the turn already rendered; only the action icons
+          // stay disabled until the next successful history load.
+        }
+      })();
+    } else if (ev.type === "turn_stats") {
+      // Attach by id, not array position — a mid-stream session switch
+      // replaces `messages` with another conversation's history, and the
+      // stats must never land on one of those messages.
+      const stats = ev as unknown as TurnStats;
+      mutate((prev) => prev.map((m) => (m.id === ctx.agentMsgId ? { ...m, turnStats: stats } : m)));
+    } else if (ev.type === "turn_limit_reached") {
+      // The agent ran out of turns rather than finishing. Mark the message
+      // (by id, same reasoning as turn_stats) so it offers a Continue action
+      // instead of leaving the backend's "would you like me to continue?"
+      // as a question nothing can answer.
+      const limit = ev.max_turns ?? 0;
+      mutate((prev) => prev.map((m) => (m.id === ctx.agentMsgId ? { ...m, turnLimit: limit } : m)));
+    } else if (ev.type === "subagent_progress") {
+      // PAI-6 P6. Attach by id — same reasoning as turn_stats — and fold
+      // through the one shared reducer, so this surface and the hub cannot
+      // disagree about what a frame means.
+      mutate((prev) => prev.map((m) =>
+        m.id === ctx.agentMsgId
+          ? { ...m, delegations: applySubagentProgress(m.delegations ?? [], ev) }
+          : m,
+      ));
+    } else if (ev.type === "context_warning") {
+      // PAI-4 P7b. The window is filling. Attach by id — same reasoning as
+      // turn_stats and turn_limit_reached — so the note lands on this turn
+      // and not on whatever message a mid-stream session switch left last.
+      const cw = ev as unknown as ContextWarning;
+      mutate((prev) => prev.map((m) => (m.id === ctx.agentMsgId ? { ...m, contextWarning: cw } : m)));
+    }
+  }
+}
+
 async function runTurn(turn: SendTurn): Promise<void> {
   const text = turn.text.trim();
   const images = turn.images ?? [];
@@ -402,6 +625,10 @@ async function runTurn(turn: SendTurn): Promise<void> {
   const runId = ++state.runSeq;
   /** A run the conversation has moved on from must not write anything. */
   const stale = () => runId !== state.runSeq;
+  // A fresh turn: forget whatever run the last one left behind.
+  state.runId = null;
+  state.epoch = null;
+  state.lastSeq = 0;
 
   for (const url of turn.previewUrls ?? []) state.ownedPreviews.add(url);
 
@@ -415,164 +642,25 @@ async function runTurn(turn: SendTurn): Promise<void> {
   state.messages = [...state.messages, userMsg, agentMsg];
   commit();
 
+  const ctx: TurnCtx = { stale, userMsgId: userMsg.id, agentMsgId: agentMsg.id };
+
   try {
     const token = state.bridge?.sessionToken ?? null;
     api.setToken(token);
-    for await (const event of api.chatStream(
-      text,
-      state.sessionId,
-      token ?? undefined,
-      undefined,
-      images,
-    )) {
-      if (stale()) return;
-      const ev = event as ChatEvent;
-
-      if (ev.type === "text" && (ev.content ?? ev.token)) {
-        const raw = ev.content ?? ev.token ?? "";
-        const [visible, newInBlock] = filterThinking(raw, state.inThinkBlock);
-        state.inThinkBlock = newInBlock;
-        if (visible) {
-          mutate((prev) => {
-            const last = prev[prev.length - 1];
-            if (!last || last.role !== "agent") return prev;
-            // A bubble already showing an error is finished. The error arm
-            // OVERWRITES `text` while this one APPENDS to it, so text arriving
-            // after an error ran straight onto the end of the error sentence --
-            // "…missing providerI could not produce a response". The server sends
-            // these as two separate frames and deliberately keeps streaming past an
-            // error, so the honest rendering is two messages, not one string.
-            if (last.error) {
-              return [...prev, { id: ++_msgId, role: "agent", text: visible, streaming: true }];
-            }
-            return [...prev.slice(0, -1), { ...last, text: last.text + visible, status: undefined }];
-          });
-        }
-      } else if (ev.type === "thinking" && ev.content) {
-        const now = Date.now();
-        patchLastAgent((last) => ({
-          ...last,
-          thinkingBlocks: [...(last.thinkingBlocks ?? []), ev.content as string],
-          // First chunk opens the span; every chunk moves the close, so the
-          // duration is how long reasoning actually streamed rather than
-          // how long the whole turn took.
-          thinkingStartedAt: last.thinkingStartedAt ?? now,
-          thinkingEndedAt: now,
-        }));
-      } else if (ev.type === "status" && ev.content) {
-        patchLastAgent((last) => ({ ...last, status: ev.content }));
-      } else if (ev.type === "tool_call" && ev.tool) {
-        const card: ContextCardType = {
-          id: nextCardId(),
-          tool: ev.tool,
-          callId: ev.id as string | undefined,
-          data: (ev.result as Record<string, unknown>) ?? {},
-          timestamp_ms: Date.now(),
-        };
-        state.bridge?.onContextCard(card);
-        patchLastAgent((last) => ({
-          ...last,
-          cards: [...(last.cards ?? []), card],
-          status: friendlyToolStatus(ev.tool ?? ""),
-        }));
-      } else if (ev.type === "tool_result" && ev.id) {
-        mutate((prev) => {
-          const last = prev[prev.length - 1];
-          if (!last || last.role !== "agent" || !last.cards) return prev;
-          const cardData   = ev.ui?.data ?? { result: ev.content };
-          const renderHint = ev.ui?.card_type;
-          const evId   = ev.id as string;
-          const evTool = ev.tool as string | undefined;
-          const newCards = last.cards.map((c) =>
-            (c.callId && c.callId === evId) || (evTool && c.tool === evTool)
-              ? { ...c, data: cardData, ...(renderHint ? { renderHint } : {}) }
-              : c,
-          );
-          return [...prev.slice(0, -1), { ...last, cards: newCards, status: undefined }];
-        });
-      } else if (ev.type === "review_status" && ev.content) {
-        patchLastAgent((last) => ({ ...last, status: ev.content }));
-      } else if ((ev.type === "review_revision" || ev.type === "tool_revision") && ev.content) {
-        state.inThinkBlock = false;
-        patchLastAgent((last) => ({ ...last, text: ev.content!, status: undefined }));
-      } else if (ev.type === "error" || ev.error) {
-        const errMsg = ev.error ?? "Unknown error from agent";
-        patchLastAgent((last) => ({
-          ...last,
-          text: `Error: ${errMsg}`,
-          streaming: false,
-          error: true,
-        }));
-      } else if (ev.done && ev.session_id) {
-        state.sessionId = ev.session_id;
-        state.bridge?.onSessionId(ev.session_id);
-        patchLastAgent((last) => ({
-          ...last,
-          ...(ev.model_role ? { modelRole: ev.model_role } : {}),
-          ...(ev.usage && ev.usage.completion_tokens > 0 ? { tokenUsage: ev.usage } : {}),
-        }));
-        if (ev.model_name && ev.model_role) {
-          state.bridge?.onResponseMeta({
-            modelName: ev.model_name,
-            modelRole: ev.model_role,
-            completionTokens: ev.usage?.completion_tokens ?? 0,
-          });
-        }
-        // The stream never carries the persisted message ids, so copy/edit/
-        // refresh/like/dislike (which all act on a real backend id) have
-        // nothing to target yet. Fetch the small tail of the session and
-        // match by id, not array position — same reasoning as turn_stats
-        // below, a session switch mid-fetch must not misattribute this.
-        const doneSessionId = ev.session_id;
-        const forUser = userMsg.id;
-        const forAgent = agentMsg.id;
-        void (async () => {
-          try {
-            const recent = await api.getSessionMessages(doneSessionId, 10);
-            if (stale()) return;
-            const nonTool = recent.filter((m) => m.role !== "tool");
-            const lastUser  = [...nonTool].reverse().find((m) => m.role === "user");
-            const lastAgent = [...nonTool].reverse().find((m) => m.role === "assistant");
-            mutate((prev) => prev.map((m) => {
-              if (m.id === forAgent && lastAgent) return { ...m, backendId: lastAgent.id, liked: lastAgent.liked ?? null };
-              if (m.id === forUser && lastUser) return { ...m, backendId: lastUser.id };
-              return m;
-            }));
-          } catch {
-            // Non-fatal: the turn already rendered; only the action icons
-            // stay disabled until the next successful history load.
-          }
-        })();
-      } else if (ev.type === "turn_stats") {
-        // Attach by id, not array position — a mid-stream session switch
-        // replaces `messages` with another conversation's history, and the
-        // stats must never land on one of those messages.
-        const stats = ev as unknown as TurnStats;
-        mutate((prev) => prev.map((m) => (m.id === agentMsg.id ? { ...m, turnStats: stats } : m)));
-      } else if (ev.type === "turn_limit_reached") {
-        // The agent ran out of turns rather than finishing. Mark the message
-        // (by id, same reasoning as turn_stats) so it offers a Continue action
-        // instead of leaving the backend's "would you like me to continue?"
-        // as a question nothing can answer.
-        const limit = ev.max_turns ?? 0;
-        mutate((prev) => prev.map((m) => (m.id === agentMsg.id ? { ...m, turnLimit: limit } : m)));
-      } else if (ev.type === "subagent_progress") {
-        // PAI-6 P6. Attach by id — same reasoning as turn_stats — and fold
-        // through the one shared reducer, so this surface and the hub cannot
-        // disagree about what a frame means.
-        mutate((prev) => prev.map((m) =>
-          m.id === agentMsg.id
-            ? { ...m, delegations: applySubagentProgress(m.delegations ?? [], ev) }
-            : m,
-        ));
-      } else if (ev.type === "context_warning") {
-        // PAI-4 P7b. The window is filling. Attach by id — same reasoning as
-        // turn_stats and turn_limit_reached — so the note lands on this turn
-        // and not on whatever message a mid-stream session switch left last.
-        const cw = ev as unknown as ContextWarning;
-        mutate((prev) => prev.map((m) => (m.id === agentMsg.id ? { ...m, contextWarning: cw } : m)));
-      }
-    }
+    await consume(
+      api.chatStream(
+        text,
+        state.sessionId,
+        token ?? undefined,
+        undefined,
+        images,
+        // Ask the server to keep going if this window goes away. Everything
+        // below -- remembering the run, reattaching on the way back -- is only
+        // reachable because of this flag.
+        true,
+      ),
+      ctx,
+    );
   } catch (e) {
     if (stale()) return;
     // Loud on the console as well as in the bubble: with no surface mounted the
@@ -598,6 +686,193 @@ async function runTurn(turn: SendTurn): Promise<void> {
       // recurse straight back into itself on this stack.
       queueMicrotask(drainQueue);
     }
+  }
+}
+
+// ── Surviving a reload ────────────────────────────────────────────────────────
+
+/**
+ * Where the run pointer is kept between page loads.
+ *
+ * `localStorage` and not the store, obviously — the store dies with the window,
+ * which is the case this exists for. It holds no conversation content, only
+ * enough to ask the server what it is still doing: the session, the run, the
+ * server process that run belongs to, and how far this client had read.
+ */
+const RUN_POINTER_KEY = "giap-chat-run";
+
+interface RunPointer {
+  sessionId: string;
+  runId: string;
+  epoch: string;
+  lastSeq: number;
+}
+
+function rememberRun(): void {
+  if (!state.sessionId || !state.runId || !state.epoch) return;
+  const pointer: RunPointer = {
+    sessionId: state.sessionId,
+    runId: state.runId,
+    epoch: state.epoch,
+    lastSeq: state.lastSeq,
+  };
+  try {
+    localStorage.setItem(RUN_POINTER_KEY, JSON.stringify(pointer));
+  } catch {
+    // Private browsing, or storage disabled. Losing the pointer costs a resume,
+    // not a turn — the answer is still persisted server-side either way.
+  }
+}
+
+function forgetRun(): void {
+  try {
+    localStorage.removeItem(RUN_POINTER_KEY);
+  } catch {
+    // Same as above: nothing here is load-bearing enough to fail over.
+  }
+}
+
+function readRunPointer(): RunPointer | null {
+  try {
+    const raw = localStorage.getItem(RUN_POINTER_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as RunPointer;
+    if (!parsed.sessionId || !parsed.runId) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pick up a turn this window was never around for.
+ *
+ * The reload story, end to end. The store died with the last window, so the
+ * transcript comes from the session's persisted messages and the turn in flight
+ * comes from the run's own replay — the one part the database cannot answer,
+ * because an assistant turn is only written once it finishes.
+ *
+ * Returns whether anything was resumed. Every failure is quiet and ends in the
+ * same place: no run, and a conversation the user can still read.
+ */
+export async function resumeActiveRun(): Promise<boolean> {
+  const pointer = readRunPointer();
+  if (!pointer) return false;
+  if (state.busy) return false;
+
+  let active;
+  try {
+    active = await api.getActiveRun(pointer.sessionId);
+  } catch (e) {
+    console.warn("Could not ask about the active run (non-fatal):", e);
+    return false;
+  }
+
+  // Gone, or gone with the process that owned it. Either way the pointer is
+  // stale and the persisted messages are the whole truth — but the conversation
+  // still opens, because the person was just in it and `hasLiveThread` has
+  // already sent the surface to the thread on the strength of that pointer.
+  // Landing them in an empty one would be worse than the wall they were spared.
+  if (!active || active.run_id !== pointer.runId || active.epoch !== pointer.epoch) {
+    forgetRun();
+    await openSession(pointer.sessionId);
+    state.completedTurns += 1;
+    commit();
+    return false;
+  }
+  if (active.state !== "running") {
+    // It finished while nothing was here to see it. The answer is in the
+    // database by now, so there is nothing to tail — but the thread should
+    // still open on it rather than on the wall.
+    forgetRun();
+    await openSession(pointer.sessionId);
+    state.completedTurns += 1;
+    commit();
+    return true;
+  }
+
+  // Everything committed so far, which is the user's question and every turn
+  // before this one. The answer being written right now is not in here yet.
+  await openSession(pointer.sessionId);
+
+  const runId = ++state.runSeq;
+  const stale = () => runId !== state.runSeq;
+  state.busy = true;
+  state.turnSeed = Date.now();
+  state.inThinkBlock = false;
+  state.runId = pointer.runId;
+  state.epoch = pointer.epoch;
+  state.lastSeq = pointer.lastSeq;
+
+  // A bubble for the answer in progress. The user's half is already on screen
+  // from the history load above, so only the agent's is added here.
+  const agentMsg: Message = { id: ++_msgId, role: "agent", text: "", streaming: true };
+  const lastUser = [...state.messages].reverse().find((m) => m.role === "user");
+  state.messages = [...state.messages, agentMsg];
+  commit();
+
+  const ctx: TurnCtx = {
+    stale,
+    userMsgId: lastUser?.id ?? agentMsg.id,
+    agentMsgId: agentMsg.id,
+  };
+
+  try {
+    const token = state.bridge?.sessionToken ?? null;
+    api.setToken(token);
+    // From where this client had actually read, not from the beginning: the
+    // frames before that are already on screen from a previous window, and
+    // replaying them would write the answer out twice.
+    await consume(
+      api.reattachRun(pointer.runId, pointer.lastSeq, pointer.epoch, token ?? undefined),
+      ctx,
+    );
+  } catch (e) {
+    if (!stale()) {
+      console.warn("Could not follow the run that was already in flight:", e);
+      patchLastAgent((last) => ({
+        ...last,
+        text: `Error: ${String(e)}`,
+        streaming: false,
+        error: true,
+      }));
+    }
+  } finally {
+    if (!stale()) {
+      mutate((prev) => {
+        const last = prev[prev.length - 1];
+        if (!last || last.role !== "agent" || !last.streaming) return prev;
+        return [...prev.slice(0, -1), { ...last, streaming: false }];
+      });
+      state.busy = false;
+      state.completedTurns += 1;
+      forgetRun();
+      commit();
+    }
+  }
+  return true;
+}
+
+/**
+ * Stop the turn on purpose.
+ *
+ * The only way now: a detached run does not end because its reader left, so
+ * closing the window or navigating away is no longer a cancel. Local state is
+ * cleared regardless of what the server says, because a stop the user asked for
+ * should not appear to have failed on a network error.
+ */
+export async function abortRun(): Promise<void> {
+  const runId = state.runId;
+  state.runSeq += 1;
+  state.busy = false;
+  state.queued = [];
+  forgetRun();
+  commit();
+  if (!runId) return;
+  try {
+    await api.cancelRun(runId);
+  } catch (e) {
+    console.warn("Could not stop the run server-side (non-fatal):", e);
   }
 }
 
@@ -697,6 +972,10 @@ export function __resetChatRunForTests(): void {
   state.runSeq = 0;
   state.inThinkBlock = false;
   state.ownedPreviews.clear();
+  state.runId = null;
+  state.epoch = null;
+  state.lastSeq = 0;
+  forgetRun();
   state.bridge = null;
   state.subs.clear();
   commit();
