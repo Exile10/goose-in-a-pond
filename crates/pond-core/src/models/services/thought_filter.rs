@@ -11,6 +11,13 @@
 //! and orphaned close tags (`</think>`, `</thought>`).
 //!
 //! Reuse a single instance across all chunks of one response.
+//!
+//! The holdback is *conditional*: only the longest suffix of the buffer that is
+//! a proper prefix of some marker is withheld, so ordinary prose is forwarded
+//! the instant it arrives. An earlier version withheld a fixed 16 bytes on
+//! every push regardless of content, which made spoken and displayed text
+//! trail generation by that much. `ordinary_text_is_emitted_with_no_holdback`
+//! is the guard.
 
 /// Paired tags whose entire contents (and the tags themselves) are dropped.
 const PAIRED_TAGS: &[(&str, &str)] = &[
@@ -79,8 +86,7 @@ impl ThoughtFilter {
                         self.buf.drain(..i + open.len());
                         self.state = State::InsideBlock(close);
                     } else {
-                        let look = max_normal_lookahead();
-                        let safe = safe_emit_len(&self.buf, look);
+                        let safe = safe_emit_len(&self.buf, &NORMAL_MARKERS);
                         out.push_str(&strip_standalones(&self.buf[..safe]));
                         self.buf.drain(..safe);
                         break;
@@ -92,7 +98,7 @@ impl ThoughtFilter {
                         self.buf.drain(..i + close_tag.len());
                         self.state = State::Normal;
                     } else {
-                        let safe = safe_emit_len(&self.buf, close_tag.len());
+                        let safe = safe_emit_len(&self.buf, &[close_tag]);
                         self.buf.drain(..safe);
                         break;
                     }
@@ -108,20 +114,31 @@ impl ThoughtFilter {
         let pending = std::mem::take(&mut self.buf);
         match self.state {
             State::Normal => strip_standalones(&pending),
-            State::InsideBlock(_) => String::new(),
+            State::InsideBlock(close) => {
+                // Dropping model output, so say so. On the voice path this is
+                // text that was never spoken; discarding it silently is what
+                // made this class of bug invisible.
+                tracing::warn!(
+                    close_marker = close,
+                    dropped_bytes = pending.len(),
+                    "stream ended inside an unclosed block; its body is discarded",
+                );
+                String::new()
+            }
         }
     }
 }
 
-fn max_normal_lookahead() -> usize {
-    let opens = PAIRED_TAGS.iter().map(|(o, _)| o.len()).max().unwrap_or(0);
-    let stand = STANDALONE_SENTINELS
+/// Every marker that can begin in `State::Normal`: the paired-tag OPEN markers
+/// plus the standalone sentinels. Derived from the tables so adding a tag cannot
+/// leave a stale copy behind, and built once because `push` runs per token.
+static NORMAL_MARKERS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+    PAIRED_TAGS
         .iter()
-        .map(|s| s.len())
-        .max()
-        .unwrap_or(0);
-    opens.max(stand)
-}
+        .map(|&(open, _)| open)
+        .chain(STANDALONE_SENTINELS.iter().copied())
+        .collect()
+});
 
 fn strip_standalones(s: &str) -> String {
     let mut out = s.to_string();
@@ -133,12 +150,42 @@ fn strip_standalones(s: &str) -> String {
     out
 }
 
-fn safe_emit_len(s: &str, tag_len: usize) -> usize {
-    let mut cut = s.len().saturating_sub(tag_len.saturating_sub(1));
-    while cut > 0 && !s.is_char_boundary(cut) {
-        cut -= 1;
+/// Byte index up to which `s` can be emitted right now.
+///
+/// Withholds only the longest suffix of `s` that is a *proper* prefix of some
+/// marker in `markers` -- the only bytes that could still turn into a marker
+/// once more tokens arrive. Returns `s.len()` when no suffix could begin a
+/// marker, which is the common case for ordinary prose.
+///
+/// A complete marker is deliberately not a match. In `State::Normal` a complete
+/// open tag has already been found by `buf.find` and a complete sentinel is
+/// removed by [`strip_standalones`], so treating a whole marker as a partial
+/// would withhold it forever.
+///
+/// Every marker is ASCII, so a matching suffix can never begin inside a
+/// multi-byte character; the returned index is always a char boundary. Cost is
+/// bounded by the longest marker times the marker count, independent of buffer
+/// length -- this runs per token.
+fn safe_emit_len(s: &str, markers: &[&str]) -> usize {
+    let longest = markers.iter().map(|m| m.len()).max().unwrap_or(0);
+    let earliest = s.len().saturating_sub(longest.saturating_sub(1));
+
+    // First hit walking forwards is the longest withheld tail. `i < s.len()`
+    // keeps the empty suffix out -- every marker "starts with" it, and matching
+    // it would withhold the whole buffer.
+    for i in earliest..s.len() {
+        if !s.is_char_boundary(i) {
+            continue;
+        }
+        let tail = &s[i..];
+        if markers
+            .iter()
+            .any(|m| m.len() > tail.len() && m.starts_with(tail))
+        {
+            return i;
+        }
     }
-    cut
+    s.len()
 }
 
 #[cfg(test)]
@@ -263,5 +310,79 @@ mod tests {
     #[test]
     fn the_longer_spelling_survives_chunk_boundaries() {
         assert_eq!(run(&["<think", "ing>hmm</think", "ing>Done."]), "Done.");
+    }
+    // ── Holdback behaviour ─────────────────────────────────────────────────
+    //
+    // The bug these pin: the lookahead used to withhold a fixed 16 bytes on
+    // every push regardless of content, so displayed and spoken text trailed
+    // generation by that much and froze mid-word when generation slowed.
+
+    #[test]
+    fn ordinary_text_is_emitted_with_no_holdback() {
+        let mut f = ThoughtFilter::new();
+        assert_eq!(f.push("Just let me kno"), "Just let me kno");
+        assert_eq!(ThoughtFilter::new().push("T"), "T");
+    }
+
+    #[test]
+    fn every_prefix_of_tag_free_text_is_emitted_as_it_arrives() {
+        // After feeding k characters the filter must have emitted exactly those
+        // k characters -- never lagging behind by a lookahead window.
+        let raw = "The kettle is on and the door is locked.";
+        let mut f = ThoughtFilter::new();
+        let mut emitted = String::new();
+        for (k, c) in raw.chars().enumerate() {
+            emitted.push_str(&f.push(&c.to_string()));
+            let expected: String = raw.chars().take(k + 1).collect();
+            assert_eq!(emitted, expected, "lagged after {} chars", k + 1);
+        }
+        assert_eq!(f.flush(), "", "nothing should be left to flush");
+    }
+
+    #[test]
+    fn holds_back_only_a_suffix_that_could_begin_a_marker() {
+        assert_eq!(ThoughtFilter::new().push("a < b"), "a < b");
+
+        let mut g = ThoughtFilter::new();
+        assert_eq!(g.push("text <thi"), "text ");
+        assert_eq!(g.push("nk>hidden</think>shown"), "shown");
+    }
+
+    #[test]
+    fn a_partial_sentinel_is_still_withheld_until_it_resolves() {
+        // The shape issue #153 was about: a reply ending mid-sentinel. It is a
+        // proper prefix of `<end_of_turn>`, so it is withheld at push time and
+        // released by flush -- which is what the regression test in
+        // `shared::services::chat` asserts.
+        let mut f = ThoughtFilter::new();
+        assert_eq!(f.push("the code is 42<end_of_tu"), "the code is 42");
+        assert_eq!(f.flush(), "<end_of_tu");
+    }
+
+    #[test]
+    fn multibyte_text_is_never_split_mid_character() {
+        assert_eq!(ThoughtFilter::new().push("Grüße, 世界"), "Grüße, 世界");
+
+        let raw = "héllo 世界 — ok";
+        let mut g = ThoughtFilter::new();
+        let mut out = String::new();
+        for c in raw.chars() {
+            out.push_str(&g.push(&c.to_string()));
+        }
+        out.push_str(&g.flush());
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn every_marker_is_ascii_so_a_partial_never_starts_mid_character() {
+        // `safe_emit_len` relies on this. A non-ASCII marker would invalidate
+        // its char-boundary reasoning, and this test is what would catch it.
+        for (open, close) in PAIRED_TAGS {
+            assert!(open.is_ascii(), "non-ASCII open marker: {open}");
+            assert!(close.is_ascii(), "non-ASCII close marker: {close}");
+        }
+        for sentinel in STANDALONE_SENTINELS {
+            assert!(sentinel.is_ascii(), "non-ASCII sentinel: {sentinel}");
+        }
     }
 }
