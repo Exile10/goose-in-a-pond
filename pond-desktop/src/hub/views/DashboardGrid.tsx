@@ -39,6 +39,7 @@ import { WeatherWidget } from "../primitives/WeatherWidget";
 import { NowPlaying } from "../primitives/NowPlaying";
 import { Suggestion } from "../primitives/Suggestion";
 import { useHomeData, useRoutines } from "../state/hubDataStore";
+import { homeLine } from "../state/homeLine";
 import { formatHubDate, greetingForHour, useNow } from "../state/useNow";
 import {
   CARDS,
@@ -55,6 +56,12 @@ import "./dashboard-grid.css";
 
 /** Devices shown before the household has narrowed anything. More than this is a list, not a glance. */
 const GLANCE_LIMIT = 8;
+
+/**
+ * At or below this many devices, the report cards spread out instead of leaving
+ * empty columns. Four is one row of tiles at every size this screen supports.
+ */
+const SPARSE_LIMIT = 4;
 
 /** The room filter's "everything" option. Not a room id, so it cannot collide with one. */
 const ALL_ROOMS = "__all__";
@@ -99,6 +106,18 @@ export function DashboardGrid({ onNavigate, onTalk, sessionId }: DashboardGridPr
 
   const greeting = greetingForHour(now.getHours());
 
+  // "Few" rather than "none": a house with two lamps has the same problem as a
+  // house with none — a devices card that occupies two columns to show one row
+  // of tiles, and three empty ones beside it.
+  const sparse = home.devices.length <= SPARSE_LIMIT;
+  const playing = home.nowPlaying.connected && home.nowPlaying.playing;
+  const line = homeLine({
+    user: home.user,
+    devices: home.devices,
+    weather: home.weather,
+    now,
+  });
+
   return (
     // Two raised surfaces is the budget (DESIGN.md §3, "spend the offset about
     // twice per screen"). Held here rather than remembered: InkBudget warns in
@@ -115,11 +134,12 @@ export function DashboardGrid({ onNavigate, onTalk, sessionId }: DashboardGridPr
             </p>
           </div>
 
-          <InkButton
-            variant="quiet"
-            onPress={() => setEditing(true)}
-            aria-label="Arrange Home"
-          >
+          {/*
+            No `aria-label` here: InkButton does not forward it. The button's
+            accessible name is the text below, which is why the small-panel rule
+            clips that text rather than removing it.
+          */}
+          <InkButton variant="quiet" onPress={() => setEditing(true)}>
             <Pencil size={18} strokeWidth={2.2} aria-hidden="true" />
             <span className="dash__btn-label">Arrange</span>
           </InkButton>
@@ -179,6 +199,9 @@ export function DashboardGrid({ onNavigate, onTalk, sessionId }: DashboardGridPr
               key={id}
               id={id}
               devices={devices}
+              playing={playing}
+              sparse={sparse}
+              line={line}
               searching={searching}
               query={query}
               sessionId={sessionId}
@@ -224,6 +247,12 @@ function filterDevices(devices: DeviceData[], query: string, room: string): Devi
 interface DashCardProps {
   id: CardId;
   devices: DeviceData[];
+  /** Something is actually playing, so the music card earns its width. */
+  playing: boolean;
+  /** Few or no devices — the report cards spread into the space instead. */
+  sparse: boolean;
+  /** The one sentence about this house, computed where the data lives. */
+  line: string;
   searching: boolean;
   query: string;
   sessionId: string | null;
@@ -234,14 +263,17 @@ interface DashCardProps {
  * One card. Every branch is backed by a slice of `HomeData` that the pond
  * actually populates — there is no placeholder card for data we do not have.
  */
-function DashCard({ id, devices, searching, query, sessionId, onNavigate }: DashCardProps) {
+function DashCard({ id, devices, playing, sparse, line, searching, query, sessionId, onNavigate }: DashCardProps) {
   switch (id) {
     case "suggestion":
       // The only element on the screen that asks for anything, and one of the
       // two that may spend the offset.
       return searching ? null : (
         <section className="dash__cell dash__cell--wide">
-          <Suggestion sessionId={sessionId} />
+          <Suggestion
+            sessionId={sessionId}
+            quiet={<p className="dash__line">{line}</p>}
+          />
         </section>
       );
 
@@ -272,15 +304,26 @@ function DashCard({ id, devices, searching, query, sessionId, onNavigate }: Dash
       );
 
     case "weather":
+      // A house with nothing paired still has a sky. Rather than leaving three
+      // empty columns beside a single "add a device" prompt, the weather takes
+      // the room — it is the one card that is always true, and a new household
+      // should meet a screen that looks finished rather than unfurnished.
       return searching ? null : (
-        <section className="dash__cell">
+        <section className={`dash__cell${sparse ? " dash__cell--wide" : ""}`}>
           <WeatherWidget />
         </section>
       );
 
     case "nowPlaying":
+      // Form carries data (DESIGN.md §3): the card is wide while something is
+      // actually playing and ordinary when it is not. A music card that is
+      // always large is decoration; one that grows when there is a track to
+      // show is reporting.
       return searching ? null : (
-        <section className="dash__cell">
+        <section
+          className={`dash__cell${playing ? " dash__cell--wide" : ""}`}
+          data-playing={playing || undefined}
+        >
           <NowPlaying variant="tile" />
         </section>
       );
