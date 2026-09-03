@@ -56,10 +56,25 @@
 }
 
 /* The label collapses before the icon does — on the small panel the pencil
-   alone is unambiguous next to a screen you are already looking at. */
+   alone is unambiguous next to a screen you are already looking at.
+
+   CLIPPED, not `display: none`. `InkButton` does not forward `aria-label` (it
+   renders `<button class="ink-btn"><span>Arrange</span></button>` and drops the
+   attribute), so the visible text IS the button's accessible name. Hiding it
+   the usual way left an unlabelled icon button on every panel under 900px —
+   the exact failure DESIGN.md §6 rules out. Clipping keeps the name in the
+   accessibility tree and takes the pixels back. */
 @media (max-width: 900px) {
   .dash__btn-label {
-    display: none;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
   }
 }
 
@@ -422,4 +437,90 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* ── The sky ──────────────────────────────────────────────────
+   Two axes. The HOUR sets the light (`wx--dawn|day|dusk|night`, derived from
+   real sunrise and sunset in `WeatherWidget`), and the CONDITION sets the
+   weather over it (`wx--sky-*`, read from the forecast icon). A clear night
+   and an overcast night are the same hour and very different things to look
+   at, which one axis cannot say.
+
+   CONTRAST IS THE CONSTRAINT, not the palette. The card carries white text and
+   DESIGN.md §6 makes 4.5:1 a floor, so every gradient below is dark enough to
+   hold it at its LIGHTEST stop — that is what caps how bright a clear noon can
+   get. The overlay is what keeps that true without flattening the colour: a
+   dark scrim under the text, not a lighter sky.
+
+   These are the one place in the interface where colour carries meaning rather
+   than marking state. That is allowed here because the subject is the sky
+   itself — the card reports the world, and the world is not a control. Nothing
+   else on this screen may take colour as a signal (§3).
+   ──────────────────────────────────────────────────────────── */
+
+.wx {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+}
+
+/* The scrim, and its alpha is DERIVED rather than chosen.
+   
+   The first version faded from 0.34 at the top to 0.10 lower down, on the
+   assumption that every sky was dark enough to carry white text. Measured, it
+   was not: dawn's lightest stop came out at 2.05:1 in the lower half, less than
+   half the 4.5:1 DESIGN.md §6 requires — and dawn is the sky a household sees
+   on a kitchen panel every morning.
+   
+   0.45 is the smallest FLAT alpha at which every stop of all four skies clears
+   4.5:1 against white, including the 1.04 brightening `wx--sky-snow` applies.
+   Worst case at that value is 4.56:1 on brightened dawn, rgb(255,193,121).
+   Flat, not a gradient: a fade means the guarantee holds at the top of the card
+   and quietly stops holding further down, which is the shape the first version
+   had.
+   
+   Same method Ink uses for its glass — compute the minimum alpha that holds
+   over anything, rather than pick one that looks about right. More opaque than
+   a marketing shot; that is what "legible over any sky" costs. */
+.wx::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: rgba(9, 12, 24, 0.45);
+  pointer-events: none;
+}
+
+/* Cloud thickens the sky and drains it. Measured as a filter rather than a
+   second gradient so it composes with all four hours instead of needing four
+   more rules. */
+.wx--sky-cloud { filter: saturate(0.72) brightness(0.92); }
+.wx--sky-rain  { filter: saturate(0.55) brightness(0.78); }
+.wx--sky-storm { filter: saturate(0.4) brightness(0.62) contrast(1.08); }
+
+/* Snow lightens rather than darkens. Its 1.04 brightening is included in the
+   0.45 derivation above, so it needs no scrim of its own. */
+.wx--sky-snow { filter: saturate(0.35) brightness(1.04); }
+
+/* Clear leaves the hour's own sky alone. Nothing to add: a clear day IS the
+   dawn/day/dusk/night gradient, which is why there is no `wx--sky-clear` rule
+   and its absence is deliberate rather than missing. */
+
+@media (prefers-reduced-motion: reduce) {
+  .wx { transition: none; }
+}
+
+/* ── The line ─────────────────────────────────────────────────
+   One sentence about this house, where a suggestion would sit. It reports and
+   never asks, so it takes no edge, no fill and no icon — the weight it carries
+   is that it is true, not that it is decorated.
+   ──────────────────────────────────────────────────────────── */
+
+.dash__line {
+  margin: 0;
+  padding: 2px 0;
+  color: var(--color-text-secondary);
+  font-size: 0.95rem;
+  line-height: 1.4;
+  text-wrap: pretty;
 }
