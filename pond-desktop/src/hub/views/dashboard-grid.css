@@ -1,0 +1,526 @@
+/* ────────────────────────────────────────────────────────────
+   Home's layout, for two touchscreens and a desktop.
+
+   Sizes this has to hold, from DESIGN.md §4:
+     800×480   the small panel — two columns, and the toolbar wraps
+     1024×600  the shelf panel — three columns
+     desktop   the classic surface — four or more, denser controls
+
+   Written as one auto-fitting grid rather than a breakpoint per device,
+   because the panel sizes are the ones we know about and not the ones we are
+   limited to. A wall display at 1920 gets more columns without a new rule.
+
+   Colour discipline (§2, §3): purple is an edge, a ring and an accent, never a
+   sentence — it measures 4.42:1 on Jarida White, which clears the 3:1 a UI
+   boundary needs and misses the 4.5:1 body copy needs. Nothing here paints
+   text with it.
+   ──────────────────────────────────────────────────────────── */
+
+.dash {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4, 16px);
+  padding: var(--space-4, 16px);
+  min-height: 0;
+}
+
+/* ── Head ─────────────────────────────────────────────────── */
+
+.dash__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3, 12px);
+  flex-wrap: wrap;
+}
+
+.dash__greet {
+  margin: 0;
+  font-family: var(--font-display, inherit);
+  font-weight: 700;
+  font-style: italic;
+  letter-spacing: -0.02em;
+  font-size: clamp(1.35rem, 3.2vw, 1.9rem);
+  line-height: 1.15;
+  color: var(--color-text);
+}
+
+.dash__greet span {
+  color: var(--color-text);
+}
+
+.dash__sub {
+  margin: 2px 0 0;
+  color: var(--color-text-secondary);
+  font-size: 0.9rem;
+}
+
+/* The label collapses before the icon does — on the small panel the pencil
+   alone is unambiguous next to a screen you are already looking at.
+
+   CLIPPED, not `display: none`. `InkButton` does not forward `aria-label` (it
+   renders `<button class="ink-btn"><span>Arrange</span></button>` and drops the
+   attribute), so the visible text IS the button's accessible name. Hiding it
+   the usual way left an unlabelled icon button on every panel under 900px —
+   the exact failure DESIGN.md §6 rules out. Clipping keeps the name in the
+   accessibility tree and takes the pixels back. */
+@media (max-width: 900px) {
+  .dash__btn-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+}
+
+/* ── Toolbar: chrome, so it stays on a hairline ───────────── */
+
+.dash__toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3, 12px);
+  flex-wrap: wrap;
+  padding-bottom: var(--space-2, 8px);
+  border-bottom: 1px solid var(--color-hairline, rgba(0, 0, 0, 0.12));
+}
+
+.dash__search {
+  flex: 1 1 16rem;
+  min-width: 12rem;
+}
+
+/*
+  `type="search"` gets a clear button from the browser, and this file supplies
+  its own. Two of them appeared side by side, which is one more than anyone
+  needs and the wrong one is the easier target.
+
+  Ours is kept and the native one hidden: it carries a real `aria-label`, takes
+  the 44px reach below, and looks the same in every browser — the webkit button
+  is unstyleable and absent elsewhere, so relying on it would mean a control
+  that exists on some panels and not others.
+*/
+.dash__search input[type="search"]::-webkit-search-cancel-button,
+.dash__search input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+/* Dense control: 36px of look, 44px of reach, extended VERTICALLY only.
+   Growing sideways makes neighbouring controls steal each other's taps
+   (DESIGN.md §3, "touch the chrome, not the data"). */
+.dash__clear {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+
+.dash__clear::after {
+  content: "";
+  position: absolute;
+  inset: -8px 0;
+}
+
+.dash__clear:hover {
+  color: var(--color-text);
+}
+
+.dash__clear:focus-visible {
+  outline: 2px solid var(--color-focus, var(--color-accent));
+  outline-offset: 2px;
+}
+
+/* ── Grid ─────────────────────────────────────────────────── */
+
+/*
+  Explicit column counts, not `auto-fit`.
+
+  auto-fit was the obvious choice and the wrong one. The wide cards — devices
+  and the suggestion — have to span "everything except the aside", and with a
+  column count nobody knows at author time that cannot be written: `span 2` is
+  two thirds of a 1024px panel and half of a desktop, so the same rule that
+  packed correctly on the shelf left a column-shaped hole beside the suggestion
+  on a wide screen.
+
+  Three counts, one per surface, each leaving exactly one column for the cards
+  that report — weather, music, and anything the household adds. The wide span
+  is always `columns - 1`.
+*/
+.dash__grid {
+  display: grid;
+  gap: var(--space-4, 16px);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: start;
+}
+
+.dash__cell {
+  min-width: 0;
+}
+
+.dash__cell--wide {
+  grid-column: span 2;
+}
+
+/* Desktop and wall panels: a fourth column, and the aside keeps exactly one. */
+@media (min-width: 75rem) {
+  .dash__grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .dash__cell--wide {
+    grid-column: span 3;
+  }
+}
+
+.dash__label {
+  margin: 0 0 var(--space-2, 8px);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+}
+
+.dash__tiles {
+  display: grid;
+  gap: var(--space-3, 12px);
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+}
+
+/* An empty screen is an invitation to act, not a mood (DESIGN.md §7). */
+.dash__empty {
+  width: 100%;
+  min-height: 44px;
+  padding: var(--space-4, 16px);
+  border: 2px dashed var(--border-ink, var(--color-accent));
+  border-radius: var(--radius-lg, 14px);
+  background: transparent;
+  color: var(--color-text);
+  font: inherit;
+  cursor: pointer;
+}
+
+.dash__empty:focus-visible {
+  outline: 2px solid var(--color-focus, var(--color-accent));
+  outline-offset: 2px;
+}
+
+/* ── Scene chips ──────────────────────────────────────────── */
+
+.dash__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/*
+  A scene that is running is RAISED, not coloured (DESIGN.md §3, "state is
+  elevation, not hue"). Colour never means selected here — spending the page's
+  one real colour on a status leaves nothing for the control that is actually
+  asking a question.
+*/
+.dash__chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--color-hairline, rgba(0, 0, 0, 0.12));
+  border-radius: 999px;
+  background: var(--color-surface, #fff);
+  color: var(--color-text);
+  font-size: 0.85rem;
+}
+
+.dash__chip[data-on] {
+  border: 2px solid var(--border-ink, var(--color-accent));
+  box-shadow: 2px 2px 0 var(--border-ink, var(--color-accent));
+}
+
+/* ── Talk ─────────────────────────────────────────────────── */
+
+.dash__talk {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 var(--space-4, 16px);
+  border: 2px solid var(--border-ink, var(--color-accent));
+  border-radius: 999px;
+  background: var(--color-surface, #fff);
+  color: var(--color-text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.dash__talk:focus-visible {
+  outline: 2px solid var(--color-focus, var(--color-accent));
+  outline-offset: 2px;
+}
+
+/* ── Arrange sheet ────────────────────────────────────────── */
+
+.dash__sheet-label {
+  margin: 0 0 var(--space-2, 8px);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-secondary);
+}
+
+.dash__arrange {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2, 8px);
+}
+
+.dash__arrange-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3, 12px);
+  padding: var(--space-2, 8px) 0;
+  border-bottom: 1px solid var(--color-hairline, rgba(0, 0, 0, 0.12));
+}
+
+.dash__arrange-row:last-child {
+  border-bottom: 0;
+}
+
+.dash__arrange-text {
+  min-width: 0;
+}
+
+.dash__arrange-acts {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+/* Full 44px here, not the dense 36: this sheet is reached by a finger on the
+   panel and the buttons sit side by side, which is exactly where an
+   under-sized target costs a mis-tap. */
+.dash__icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  border: 1px solid var(--color-hairline, rgba(0, 0, 0, 0.12));
+  border-radius: var(--radius-md, 10px);
+  background: var(--color-surface, #fff);
+  color: var(--color-text);
+  font: inherit;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+.dash__icon-btn:hover:not(:disabled) {
+  border-color: var(--border-ink, var(--color-accent));
+}
+
+.dash__icon-btn:focus-visible {
+  outline: 2px solid var(--color-focus, var(--color-accent));
+  outline-offset: 2px;
+}
+
+.dash__icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ── Small panel: 800×480 ─────────────────────────────────── */
+
+@media (max-width: 52rem) {
+  .dash {
+    gap: var(--space-3, 12px);
+    padding: var(--space-3, 12px);
+  }
+
+  /*
+    Search and rooms share one row here.
+
+    Stacked, they cost 97px of a 480px panel and pushed the first device row to
+    185px — 39% of the screen spent before anything the household came to look
+    at. Side by side it is 52px, which buys most of a second row of tiles.
+
+    The pills scroll rather than wrap. Hiding an option behind a scroll is a
+    real cost, so it is taken only on the panel where the alternative is worse:
+    a wrapped second row costs every household 45px on every visit to save the
+    few with more rooms than fit a swipe.
+  */
+  .dash__toolbar {
+    flex-wrap: nowrap;
+  }
+
+  .dash__search {
+    flex: 0 1 15rem;
+    min-width: 9rem;
+  }
+
+  .dash__toolbar > :not(.dash__search) {
+    min-width: 0;
+    overflow-x: auto;
+    /* The segmented control wraps its own pills by default, which is what put
+       six rooms on two rows and cost 40px. It scrolls on one row here instead. */
+    flex-wrap: nowrap;
+    /* Momentum on the panel, and no scrollbar eating a touch target. */
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+
+  /* A pill that shrinks to fit is a pill nobody can read across a room. */
+  .dash__toolbar .ink-choice {
+    flex: 0 0 auto;
+  }
+
+  .dash__toolbar > :not(.dash__search)::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Two columns, and no narrower — one column on an 800px panel wastes the
+     half of the screen that makes it a panel rather than a phone. */
+  /* Two columns, and no narrower — one column on an 800px panel wastes the
+     half of the screen that makes it a panel rather than a phone. There is no
+     room for an aside here, so the wide cards take the whole row. */
+  .dash__grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .dash__cell--wide {
+    grid-column: 1 / -1;
+  }
+
+  .dash__tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* ── Short panel: 480px tall ──────────────────────────────── */
+
+@media (max-height: 34rem) {
+  /* The greeting is the first thing to give up its height: it is the one
+     element on the screen that reports nothing. */
+  .dash__greet {
+    font-size: 1.2rem;
+  }
+
+  .dash__sub {
+    font-size: 0.82rem;
+  }
+}
+
+/* The ink lift is the one motion this interface relies on, and DESIGN.md §6
+   requires it be disable-able. */
+@media (prefers-reduced-motion: reduce) {
+  .dash *,
+  .dash *::before,
+  .dash *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ── The sky ──────────────────────────────────────────────────
+   Two axes. The HOUR sets the light (`wx--dawn|day|dusk|night`, derived from
+   real sunrise and sunset in `WeatherWidget`), and the CONDITION sets the
+   weather over it (`wx--sky-*`, read from the forecast icon). A clear night
+   and an overcast night are the same hour and very different things to look
+   at, which one axis cannot say.
+
+   CONTRAST IS THE CONSTRAINT, not the palette. The card carries white text and
+   DESIGN.md §6 makes 4.5:1 a floor, so every gradient below is dark enough to
+   hold it at its LIGHTEST stop — that is what caps how bright a clear noon can
+   get. The overlay is what keeps that true without flattening the colour: a
+   dark scrim under the text, not a lighter sky.
+
+   These are the one place in the interface where colour carries meaning rather
+   than marking state. That is allowed here because the subject is the sky
+   itself — the card reports the world, and the world is not a control. Nothing
+   else on this screen may take colour as a signal (§3).
+   ──────────────────────────────────────────────────────────── */
+
+.wx {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+}
+
+/* The scrim, and its alpha is DERIVED rather than chosen.
+   
+   The first version faded from 0.34 at the top to 0.10 lower down, on the
+   assumption that every sky was dark enough to carry white text. Measured, it
+   was not: dawn's lightest stop came out at 2.05:1 in the lower half, less than
+   half the 4.5:1 DESIGN.md §6 requires — and dawn is the sky a household sees
+   on a kitchen panel every morning.
+   
+   0.45 is the smallest FLAT alpha at which every stop of all four skies clears
+   4.5:1 against white, including the 1.04 brightening `wx--sky-snow` applies.
+   Worst case at that value is 4.56:1 on brightened dawn, rgb(255,193,121).
+   Flat, not a gradient: a fade means the guarantee holds at the top of the card
+   and quietly stops holding further down, which is the shape the first version
+   had.
+   
+   Same method Ink uses for its glass — compute the minimum alpha that holds
+   over anything, rather than pick one that looks about right. More opaque than
+   a marketing shot; that is what "legible over any sky" costs. */
+.wx::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: rgba(9, 12, 24, 0.45);
+  pointer-events: none;
+}
+
+/* Cloud thickens the sky and drains it. Measured as a filter rather than a
+   second gradient so it composes with all four hours instead of needing four
+   more rules. */
+.wx--sky-cloud { filter: saturate(0.72) brightness(0.92); }
+.wx--sky-rain  { filter: saturate(0.55) brightness(0.78); }
+.wx--sky-storm { filter: saturate(0.4) brightness(0.62) contrast(1.08); }
+
+/* Snow lightens rather than darkens. Its 1.04 brightening is included in the
+   0.45 derivation above, so it needs no scrim of its own. */
+.wx--sky-snow { filter: saturate(0.35) brightness(1.04); }
+
+/* Clear leaves the hour's own sky alone. Nothing to add: a clear day IS the
+   dawn/day/dusk/night gradient, which is why there is no `wx--sky-clear` rule
+   and its absence is deliberate rather than missing. */
+
+@media (prefers-reduced-motion: reduce) {
+  .wx { transition: none; }
+}
+
+/* ── The line ─────────────────────────────────────────────────
+   One sentence about this house, where a suggestion would sit. It reports and
+   never asks, so it takes no edge, no fill and no icon — the weight it carries
+   is that it is true, not that it is decorated.
+   ──────────────────────────────────────────────────────────── */
+
+.dash__line {
+  margin: 0;
+  padding: 2px 0;
+  color: var(--color-text-secondary);
+  font-size: 0.95rem;
+  line-height: 1.4;
+  text-wrap: pretty;
+}

@@ -18,9 +18,14 @@ interface Props {
   /** Who is asking. Without one the server cannot tell who a suggestion is
       addressed to, so there is nothing safe to show. */
   sessionId: string | null;
+  /**
+   * What to show when there is nothing to suggest. Falls back to a plain
+   * reassurance when a caller has nothing more specific to say.
+   */
+  quiet?: React.ReactNode;
 }
 
-export function Suggestion({ sessionId }: Props) {
+export function Suggestion({ sessionId, quiet }: Props) {
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [expanded, setExpanded] = useState(false);
   const [deciding, setDeciding] = useState(false);
@@ -77,8 +82,14 @@ export function Suggestion({ sessionId }: Props) {
     return (
       <section className="sugg sugg--quiet" aria-live="polite">
         {/* Not an invitation to act: nothing needing you is the good outcome
-            here, so it reads as reassurance rather than an empty inbox. */}
-        <p className="sugg__quiet-text">Nothing needs you right now.</p>
+            here, so it reads as reassurance rather than an empty inbox.
+
+            A caller can supply something better. "Nothing needs you right now"
+            is true, and true of any house on any day, which makes it wallpaper
+            on a screen that is glanced at. Home passes a line about THIS house
+            — which lights are on, whether the doors are locked — and the
+            default stays for callers with no such context to offer. */}
+        {quiet ?? <p className="sugg__quiet-text">Nothing needs you right now.</p>}
       </section>
     );
   }
