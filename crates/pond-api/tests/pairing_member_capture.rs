@@ -125,6 +125,7 @@ async fn make_app() -> Harness {
         notification_tx: tokio::sync::broadcast::channel::<Notification>(16).0,
         notification_queue: None,
         notification_sender: None,
+        runs: Arc::new(pond_api::runs::RunSupervisor::default()),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,

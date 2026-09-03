@@ -10,7 +10,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { api } from "../api/PondApiClient";
 import { refreshHomeData } from "../hub/state/hubDataStore";
-import { setChatRunBridge } from "./chatRunStore";
+import { setChatRunBridge, resumeActiveRun } from "./chatRunStore";
 import {
   reducer,
   buildInitialState,
@@ -145,6 +145,23 @@ export function AppContextProvider({ children }: { children: ReactNode }) {
     onResponseMeta: (meta) => dispatch({ type: "SET_LAST_RESPONSE_META", payload: meta }),
     onContextCard:  (card) => dispatch({ type: "PUSH_CONTEXT_CARD", payload: card }),
   }), [state.sessionToken, state.serverOnline]);
+
+  // A turn started before this window existed.
+  //
+  // Asked once, as soon as the server is reachable and the bridge below is
+  // installed above, because the answer needs a token. Nothing happens unless the
+  // last window left a run pointer behind AND the server is still driving that
+  // run, so the ordinary cold start pays one 404 and stops.
+  const resumeAskedRef = useRef(false);
+  useEffect(() => {
+    if (!state.serverOnline || resumeAskedRef.current) return;
+    resumeAskedRef.current = true;
+    void resumeActiveRun().catch(() => {
+      // Non-fatal by construction: the conversation is readable from its
+      // persisted messages either way, and `resumeActiveRun` already warns.
+    });
+  }, [state.serverOnline]);
+
 
   useEffect(() => {
     const unlisten: Array<() => void> = [];

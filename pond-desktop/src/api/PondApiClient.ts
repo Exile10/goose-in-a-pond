@@ -21,6 +21,7 @@ import {
   type HfModel,
   type HfModelFile,
   type ImageAttachment,
+  type ActiveRun,
   type LlamafileRelease,
   type LogEntry,
   type MarketplaceExtension,
@@ -1186,6 +1187,7 @@ export class PondApiClient {
     token?: string,
     canvasMode?: boolean,
     images?: ImageAttachment[],
+    resumable?: boolean,
   ): AsyncGenerator<ChatEvent> {
     const reqBody: ChatStreamRequest = {
       message,
@@ -1193,8 +1195,67 @@ export class PondApiClient {
       canvas_mode: canvasMode ?? false,
       // Only set when non-empty so text-only turns keep today's exact body.
       ...(images && images.length > 0 ? { images } : {}),
+      // Only set when asked, so a turn that does not want to outlive its
+      // connection sends exactly the body it always did.
+      ...(resumable ? { resumable: true } : {}),
     };
     yield* this.streamSse("/api/v1/chat/stream", reqBody, token);
+  }
+
+  /**
+   * The run driving this session, if the server is still driving one.
+   *
+   * The way back in after a reload: the app knows its session id and nothing
+   * else, so this is what turns that into a run to reattach to. `null` when
+   * there is none — which is also the honest answer after a server restart,
+   * since the run died with the process.
+   */
+  async getActiveRun(sessionId: string): Promise<ActiveRun | null> {
+    try {
+      return await this.request<ActiveRun>(
+        "GET",
+        `/api/v1/sessions/${encodeURIComponent(sessionId)}/active-run`,
+      );
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
+  /**
+   * Follow a run already in flight, replaying from `afterSeq` first.
+   *
+   * `epoch` is what the run reported when it started. Sending it back is what
+   * earns a 410 with a reason instead of a bare 404 when the server has
+   * restarted underneath the client.
+   */
+  async *reattachRun(
+    runId: string,
+    afterSeq: number,
+    epoch?: string,
+    token?: string,
+  ): AsyncGenerator<ChatEvent> {
+    const q = new URLSearchParams({ after_seq: String(afterSeq) });
+    if (epoch) q.set("epoch", epoch);
+    yield* this.streamSse(
+      `/api/v1/chat/runs/${encodeURIComponent(runId)}/events?${q}`,
+      undefined,
+      token,
+      { method: "GET" },
+    );
+  }
+
+  /** Stop a run on purpose — the only way, now that hanging up is not one. */
+  async cancelRun(runId: string): Promise<void> {
+    await this.request("POST", `/api/v1/chat/runs/${encodeURIComponent(runId)}/cancel`);
+  }
+
+  /** Stop whatever run this session is driving, without knowing its id. */
+  async cancelSessionRun(sessionId: string): Promise<void> {
+    await this.request(
+      "DELETE",
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/active-run`,
+    );
   }
 
   /** Absolute URL for a persisted chat-image attachment (see SessionMessageImage.url). */
@@ -1237,7 +1298,9 @@ export class PondApiClient {
     path: string,
     body: unknown,
     token?: string,
+    opts?: { method?: "GET" | "POST" },
   ): AsyncGenerator<ChatEvent> {
+    const method = opts?.method ?? "POST";
     await this.ensureTokenFresh();
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     const tok = token ?? this.token;
@@ -1250,9 +1313,9 @@ export class PondApiClient {
     for (let attempt = 0; attempt <= 2; attempt++) {
       try {
         res = await fetch(`${this.base}${path}`, {
-          method: "POST",
+          method,
           headers,
-          body: JSON.stringify(body),
+          ...(method === "POST" ? { body: JSON.stringify(body) } : {}),
           signal: controller.signal,
         });
         clearTimeout(timeoutId);
@@ -1281,9 +1344,9 @@ export class PondApiClient {
         const retryTimeout = setTimeout(() => retryController.abort(), 120_000);
         try {
           res = await fetch(`${this.base}${path}`, {
-            method: "POST",
+            method,
             headers,
-            body: JSON.stringify(body),
+            ...(method === "POST" ? { body: JSON.stringify(body) } : {}),
             signal: retryController.signal,
           });
         } finally {
@@ -1301,6 +1364,11 @@ export class PondApiClient {
     const reader = res.body!.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    // The server puts a run's frame sequence in the SSE `id:` field rather than
+    // inside the JSON, so no frame shape changed and no per-token parse was
+    // added on a Jetson's hot path. It is what a reattach resumes from, so it
+    // has to be read here rather than thrown away with the rest of the envelope.
+    let lastSeq: number | undefined;
 
     try {
       while (true) {
@@ -1313,6 +1381,11 @@ export class PondApiClient {
 
         for (const line of lines) {
           const trimmed = line.trim();
+          if (trimmed.startsWith("id: ")) {
+            const parsed = Number(trimmed.slice(4));
+            if (Number.isFinite(parsed)) lastSeq = parsed;
+            continue;
+          }
           if (!trimmed || trimmed === "data: [DONE]") {
             if (trimmed === "data: [DONE]") yield { type: "done", done: true };
             continue;
@@ -1320,7 +1393,7 @@ export class PondApiClient {
           const data = trimmed.startsWith("data: ") ? trimmed.slice(6) : trimmed;
           try {
             const event = JSON.parse(data) as ChatEvent;
-            yield event;
+            yield lastSeq === undefined ? event : { ...event, seq: lastSeq };
           } catch {
             // Malformed SSE line — skip
           }

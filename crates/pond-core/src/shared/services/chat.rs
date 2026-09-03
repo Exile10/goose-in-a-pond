@@ -983,6 +983,7 @@ impl ChatService {
     pub async fn persist_user_message(&self, message: &str) -> Result<()> {
         self.persist_user_message_with_images(message, Vec::new())
             .await
+            .map(|_| ())
     }
 
     /// Persist the user side of a turn along with its image attachments
@@ -990,20 +991,27 @@ impl ChatService {
     ///
     /// The storage adapter decides where the bytes land; this service only has
     /// to stop dropping them. Attachment order is the order given.
+    /// Returns the id of the row written.
+    ///
+    /// The caller needs it because this row is committed BEFORE inference
+    /// starts, so a turn that is cancelled or dies before it says anything
+    /// leaves a question with no answer behind it. Only whoever holds the id
+    /// can take it back.
     pub async fn persist_user_message_with_images(
         &self,
         message: &str,
         images: Vec<crate::models::domain::message::ImageAttachment>,
-    ) -> Result<()> {
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
         let sm = SessionMessage::new(
-            Uuid::new_v4().to_string(),
+            id.clone(),
             self.session_id.clone(),
             ChatMessage::user_with_images(message, images),
         );
         self.session_storage
             .add_message(self.session_id.clone(), sm)
             .await?;
-        Ok(())
+        Ok(id)
     }
 
     /// Persist the assistant side of a turn. Call after the agent stream drains.

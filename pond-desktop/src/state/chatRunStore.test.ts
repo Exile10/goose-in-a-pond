@@ -20,6 +20,8 @@ import { api } from "../api/PondApiClient";
 import {
   __resetChatRunForTests,
   setChatRunBridge,
+  resumeActiveRun,
+  abortRun,
   useChatRun,
   getChatRun,
   sendTurn,
@@ -37,6 +39,9 @@ vi.mock("../api/PondApiClient", () => ({
     chatStream: vi.fn(),
     setToken: vi.fn(),
     getSessionMessages: vi.fn(),
+    getActiveRun: vi.fn(),
+    reattachRun: vi.fn(),
+    cancelRun: vi.fn(),
     sessionAttachmentUrl: vi.fn(
       (sessionId: string, id: string) => `/api/v1/sessions/${sessionId}/attachments/${id}`,
     ),
@@ -108,6 +113,8 @@ beforeEach(() => {
   __resetChatRunForTests();
   setChatRunBridge(bridge());
   vi.mocked(api.getSessionMessages).mockResolvedValue([]);
+  vi.mocked(api.getActiveRun).mockResolvedValue(null);
+  localStorage.clear();
 });
 
 // ── Starting a turn ───────────────────────────────────────────────────────────
@@ -368,5 +375,237 @@ describe("truncateFrom", () => {
     const userId = getChatRun().messages[0].id;
     truncateFrom(userId);
     expect(getChatRun().messages).toEqual([]);
+  });
+});
+
+// ── Surviving a reload ────────────────────────────────────────────────────────
+
+/**
+ * The window died and came back.
+ *
+ * There is no way to really reload inside a test, so these drive the seam the
+ * reload goes through: a run pointer left in `localStorage` by the last window,
+ * and a store that starts empty. What is under test is whether the app can pick
+ * up a turn it was never around for.
+ */
+describe("resuming a run this window never started", () => {
+  const POINTER = {
+    sessionId: "sess-live",
+    runId: "run-7",
+    epoch: "epoch-a",
+    lastSeq: 4,
+  };
+
+  function leaveAPointer(over: Partial<typeof POINTER> = {}) {
+    localStorage.setItem("giap-chat-run", JSON.stringify({ ...POINTER, ...over }));
+  }
+
+  it("does nothing at all on an ordinary cold start", async () => {
+    expect(await resumeActiveRun()).toBe(false);
+    expect(api.getActiveRun).not.toHaveBeenCalled();
+    expect(hasLiveThread()).toBe(false);
+  });
+
+  it("sends the surface to the thread before the server has even answered", async () => {
+    // A surface decides which screen to open while it mounts, and the round
+    // trip below has not happened yet. Landing on the wall and having the turn
+    // appear behind it a second later is the failure this change exists to
+    // remove, so the pointer alone has to be enough.
+    leaveAPointer();
+    expect(hasLiveThread()).toBe(true);
+  });
+
+  it("still opens the conversation when the run turns out to be gone", async () => {
+    leaveAPointer();
+    vi.mocked(api.getActiveRun).mockResolvedValue(null);
+    vi.mocked(api.getSessionMessages).mockResolvedValue([
+      { id: "m1", session_id: "sess-live", role: "user", content: "still here", created_at: "" },
+    ] as never);
+
+    await resumeActiveRun();
+
+    // `hasLiveThread` already sent the surface to the thread on the strength of
+    // the pointer, so leaving it empty would be worse than the wall it skipped.
+    expect(getChatRun().messages[0].text).toBe("still here");
+  });
+
+  it("picks up a turn that is still being written", async () => {
+    leaveAPointer();
+    vi.mocked(api.getSessionMessages).mockResolvedValue([
+      { id: "m1", session_id: "sess-live", role: "user", content: "why a V", created_at: "" },
+    ] as never);
+    vi.mocked(api.getActiveRun).mockResolvedValue({
+      run_id: "run-7",
+      session_id: "sess-live",
+      state: "running",
+      started_at: "",
+      first_seq: 1,
+      last_seq: 6,
+      epoch: "epoch-a",
+    } as never);
+    const held = deferredStream();
+    vi.mocked(api.reattachRun).mockReturnValue(held.gen as never);
+
+    const resumed = resumeActiveRun();
+    await flush();
+
+    // Resumed from where the LAST window had read, not from the beginning:
+    // replaying what is already on screen would write the answer out twice.
+    expect(vi.mocked(api.reattachRun).mock.calls[0].slice(0, 3)).toEqual([
+      "run-7",
+      4,
+      "epoch-a",
+    ]);
+    expect(getChatRun().busy).toBe(true);
+    expect(getChatRun().messages[0].text).toBe("why a V");
+
+    await held.push({ type: "text", content: "it saves energy." } as ChatEvent);
+    await held.push({ done: true, session_id: "sess-live" } as ChatEvent);
+    await held.end();
+    await resumed;
+
+    const run = getChatRun();
+    expect(run.messages[1].text).toBe("it saves energy.");
+    expect(run.busy).toBe(false);
+    expect(localStorage.getItem("giap-chat-run")).toBeNull();
+  });
+
+  it("opens the finished thread rather than tailing a turn that is already over", async () => {
+    leaveAPointer();
+    vi.mocked(api.getActiveRun).mockResolvedValue({
+      run_id: "run-7",
+      session_id: "sess-live",
+      state: "finished",
+      started_at: "",
+      first_seq: 1,
+      last_seq: 9,
+      epoch: "epoch-a",
+    } as never);
+
+    expect(await resumeActiveRun()).toBe(true);
+    expect(api.reattachRun).not.toHaveBeenCalled();
+    expect(hasLiveThread()).toBe(true);
+    expect(localStorage.getItem("giap-chat-run")).toBeNull();
+  });
+
+  it("gives up quietly when the server has restarted underneath it", async () => {
+    leaveAPointer();
+    vi.mocked(api.getActiveRun).mockResolvedValue({
+      run_id: "run-7",
+      session_id: "sess-live",
+      state: "running",
+      started_at: "",
+      first_seq: 1,
+      last_seq: 6,
+      // A different process. The run this pointer names died with the last one.
+      epoch: "epoch-b",
+    } as never);
+
+    expect(await resumeActiveRun()).toBe(false);
+    expect(api.reattachRun).not.toHaveBeenCalled();
+    expect(
+      localStorage.getItem("giap-chat-run"),
+      "a pointer to a run that cannot exist must not be tried again",
+    ).toBeNull();
+  });
+
+  it("gives up quietly when the run is simply gone", async () => {
+    leaveAPointer();
+    vi.mocked(api.getActiveRun).mockResolvedValue(null);
+    expect(await resumeActiveRun()).toBe(false);
+    expect(localStorage.getItem("giap-chat-run")).toBeNull();
+  });
+});
+
+describe("remembering the run", () => {
+  it("writes the pointer down as soon as the turn names itself", async () => {
+    const held = deferredStream();
+    vi.mocked(api.chatStream).mockReturnValue(held.gen as never);
+
+    sendTurn({ text: "hi" });
+    await held.push({
+      type: "run_started",
+      run_id: "run-9",
+      session_id: "sess-x",
+      epoch: "epoch-a",
+      seq: 1,
+    } as ChatEvent);
+
+    // Deliberately not deferred to the end of the turn: the whole point is to
+    // survive a reload that could happen in the next moment.
+    const pointer = JSON.parse(localStorage.getItem("giap-chat-run") ?? "{}");
+    expect(pointer.runId).toBe("run-9");
+    expect(pointer.epoch).toBe("epoch-a");
+  });
+
+  it("asks for the turn to be resumable in the first place", () => {
+    vi.mocked(api.chatStream).mockReturnValue(stream([]) as never);
+    sendTurn({ text: "hi" });
+    expect(vi.mocked(api.chatStream).mock.calls[0][5]).toBe(true);
+  });
+
+  it("reloads the conversation rather than showing half an answer as whole", async () => {
+    const held = deferredStream();
+    vi.mocked(api.chatStream).mockReturnValue(held.gen as never);
+    sendTurn({ text: "hi" });
+    await held.push({ done: true, session_id: "sess-gap" } as ChatEvent);
+    await held.end();
+
+    vi.mocked(api.getSessionMessages).mockResolvedValue([
+      { id: "m1", session_id: "sess-gap", role: "user", content: "hi", created_at: "" },
+    ] as never);
+    const gapped = deferredStream();
+    vi.mocked(api.chatStream).mockReturnValue(gapped.gen as never);
+    sendTurn({ text: "again" });
+    await gapped.push({ type: "text", content: "partial" } as ChatEvent);
+    await gapped.push({
+      type: "replay_gap",
+      requested_after_seq: 2,
+      first_available_seq: 40,
+      advice: "reload_session_messages",
+    } as ChatEvent);
+    await gapped.end();
+
+    expect(api.getSessionMessages).toHaveBeenCalledWith("sess-gap");
+  });
+});
+
+describe("stopping on purpose", () => {
+  it("tells the server, because hanging up no longer does", async () => {
+    const held = deferredStream();
+    vi.mocked(api.chatStream).mockReturnValue(held.gen as never);
+    sendTurn({ text: "hi" });
+    await held.push({
+      type: "run_started",
+      run_id: "run-11",
+      session_id: "s",
+      epoch: "e",
+      seq: 1,
+    } as ChatEvent);
+
+    await abortRun();
+
+    expect(api.cancelRun).toHaveBeenCalledWith("run-11");
+    expect(getChatRun().busy).toBe(false);
+    expect(localStorage.getItem("giap-chat-run")).toBeNull();
+  });
+
+  it("still clears locally when the server cannot be told", async () => {
+    const held = deferredStream();
+    vi.mocked(api.chatStream).mockReturnValue(held.gen as never);
+    sendTurn({ text: "hi" });
+    await held.push({
+      type: "run_started",
+      run_id: "run-12",
+      session_id: "s",
+      epoch: "e",
+      seq: 1,
+    } as ChatEvent);
+    vi.mocked(api.cancelRun).mockRejectedValue(new Error("offline"));
+
+    // A stop the user asked for must not look like it failed because the
+    // network did.
+    await expect(abortRun()).resolves.toBeUndefined();
+    expect(getChatRun().busy).toBe(false);
   });
 });

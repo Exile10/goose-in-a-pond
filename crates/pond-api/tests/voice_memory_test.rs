@@ -157,6 +157,7 @@ async fn make_memory_app() -> (axum::Router, Arc<MockMemoryRepository>, tempfile
         notification_sender: None,
         notification_sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         face_recognition: None,
+        runs: Arc::new(pond_api::runs::RunSupervisor::default()),
         sse_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         answer_reviewer: None,
         memory_extractor: None,
