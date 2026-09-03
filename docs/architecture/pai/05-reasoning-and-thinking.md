@@ -54,9 +54,15 @@ which returns `None` for `Thinking`.
 
 Before P1, thinking reached the UI **only** through `ThoughtFilter`, a streaming state machine
 (`pond-api/src/thought_filter.rs`) that scrapes tag-delimited blocks out of the text stream:
-`<|channel>thought…<channel|>`, `<think>…</think>`, `<thought>…</thought>`, plus standalone
-sentinels. It is constructed with capture only when `show_thinking && !voice_mode` (grep
-`with_thinking_capture` in `routes.rs`).
+`<|channel>thought…<channel|>`, `<|tool_call>…<tool_call|>`, `<think>…</think>`,
+`<thinking>…</thinking>`, `<thought>…</thought>`, plus standalone sentinels. It is constructed with
+capture only when `show_thinking && !voice_mode` (grep `with_thinking_capture` in `routes.rs`).
+
+There is a second copy at `pond-core/src/models/services/thought_filter.rs` serving the voice/TTS
+and workflow-event path. The two are deliberately separate today but MUST keep the same tag table:
+until 2026-09-03 the `pond-api` copy was missing the `<thinking>`/`</thinking>` pair the `pond-core`
+one had, so a model using the longer spelling had its whole reasoning block rendered to the user as
+the answer. See [The holdback contract](#the-holdback-contract) for the other half of that story.
 
 The claim that "the entire feature rests on regex-matching whatever envelope the model happens to
 emit" was true in general and **false for the local/gguf path with thinking ON**, which is the
@@ -126,6 +132,56 @@ is deliberate and documented, and is a different thing from the roadmap's compla
 
 ---
 
+### 1.8 The holdback contract
+
+<a id="the-holdback-contract"></a>
+
+`ThoughtFilter` cannot decide whether `<thi` is the start of `<think>` or just prose until more
+tokens arrive, so it buffers. What it buffers is the contract, and getting it wrong is a visible
+product defect rather than an internal detail.
+
+**The contract.** After `push` returns, the filter's buffer holds *exactly* the longest suffix of
+what it has seen that is a **proper prefix of some marker** — an open tag or a standalone sentinel.
+Everything else has been emitted. For ordinary prose no suffix matches, so the holdback is **zero
+bytes and text flows with no delay at all**. `safe_emit_len` is the implementation; both filters
+carry the same one.
+
+Three properties follow, and each has a test:
+
+- **Ordinary text is never delayed.** `ordinary_text_is_emitted_with_no_holdback_on_the_very_first_push`
+  and `every_prefix_of_tag_free_text_is_emitted_as_it_arrives`.
+- **A marker split across chunks is still caught**, because the bytes that could still become one
+  are the bytes retained. The per-token streaming tests are the proof.
+- **A complete marker is not treated as a partial**, or it would be withheld forever. A complete
+  open tag has already been found by `find`, and a complete sentinel is removed by
+  `strip_standalones`. The one real exception is `</think>`, which is also a proper prefix of
+  `</thinking>`: it is held for exactly one push and then resolved.
+
+The holdback must stay bounded by the longest marker, which is why every marker is ASCII —
+`every_marker_is_ascii_so_a_partial_never_starts_mid_character` pins that, because a non-ASCII
+marker would break the char-boundary reasoning that lets the cut index be sliced directly.
+
+**Why this is written down.** Until 2026-09-03 the holdback was *unconditional*: `safe_emit_len`
+withheld the trailing 16 bytes (`"<|channel>thought".len() - 1`) on every push regardless of
+content. The lookahead was sized correctly and applied blind. Consequences:
+
+- The visible answer permanently trailed generation by 16 bytes, released only by `flush()` at
+  stream end, so the chat froze **mid-word** whenever generation slowed.
+- The first tokens of a turn emitted no SSE frame at all, so `TurnAccumulator`'s `ttft` was recorded
+  late — the metric understated the very delay it exists to measure.
+- Issue #153 was the same defect seen from the other end: the withheld tail never reached the
+  desktop caption. That fix guaranteed the tail is released at stream *end* and left the mid-stream
+  holdback in place, which is why the regression test
+  (`thought_filter_tail_is_emitted_as_token_and_matches_persisted_text`) passed while the bug
+  survived. Its mid-stream sibling is
+  `no_tail_is_withheld_when_the_reply_ends_on_ordinary_text`.
+
+**What the holdback is not.** It is not the cause of every mid-answer pause. A reasoning block
+legitimately produces no answer text for its whole duration, and the completeness check
+(`Settings::goal_check_enabled`, default ON) spends a whole extra inference whose reply is then
+suppressed. Both are real multi-second gaps with nothing to do with buffering. Do not reach for the
+filter when the symptom is a pause the filter cannot explain — measure which one you have first.
+
 ## 2. The gap
 
 GIAP has a thinking *display* feature built on string matching, and no thinking *capability*
@@ -165,8 +221,10 @@ as tags in the content stream, which is most of them today. The order becomes: s
 the provider offers one, tag scraping otherwise.
 
 This matters beyond tidiness. A structured channel cannot be confused with prose, cannot be truncated
-mid-tag by a chunk boundary, and does not need the lookahead buffering `ThoughtFilter` performs on
-every token.
+mid-tag by a chunk boundary, and does not need the partial-tag holdback `ThoughtFilter` performs.
+That holdback is now conditional and usually zero — see
+[The holdback contract](#the-holdback-contract) — but "usually zero" is still a thing that can go
+wrong, and a structured channel is a thing that cannot.
 
 ### 3.2 Count reasoning tokens
 
@@ -890,6 +948,11 @@ is — its rationale at `goose_agent.rs:1000-1011` is a measured result, not a p
 4. `output_reserve_tokens` is never zero, whatever the measurement says.
 5. `ThoughtFilter` stays. Structured channels are an optimisation, not a replacement — most local
    models still inline their tags.
+6. **The holdback is conditional.** `ThoughtFilter` withholds only bytes that are a proper prefix of
+   a marker, so ordinary text is never delayed by a single token. A fixed-size holdback is a
+   user-visible defect, not a safe simplification — see [1.8](#the-holdback-contract).
+7. **Both filters carry the same tag table.** `pond-api` and `pond-core` hold separate copies; a tag
+   added to one and not the other leaks reasoning to whichever surface was missed.
 
 ---
 
