@@ -91,6 +91,10 @@ pub struct SetDeviceStateParams {
     /// blind can be fully down with its slats open. Only blinds with slats.
     #[serde(default)]
     pub tilt: Option<u8>,
+    /// Open (true) or shut (false) a valve. Not `power`: a valve has no on/off
+    /// switch. Use `position` for how far open, where the valve has a level.
+    #[serde(default)]
+    pub valve: Option<bool>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -441,7 +445,7 @@ impl DeviceControlMcpServer {
     }
 
     #[tool(
-        description = "Set smart-device state: power, brightness, target_temp, lock, colour, fan, position, tilt. device_id: id, name, or natural ref like \"the light\"."
+        description = "Set smart-device state: power, brightness, target_temp, lock, colour, fan, position, tilt, valve. device_id: id, name, or natural ref like \"the light\"."
     )]
     async fn set_device_state(
         &self,
@@ -471,6 +475,7 @@ impl DeviceControlMcpServer {
             && p.operation.is_none()
             && p.position.is_none()
             && p.tilt.is_none()
+            && p.valve.is_none()
         {
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "No change requested for '{device_id}'. Specify one of: power (on/off), \
@@ -480,8 +485,8 @@ impl DeviceControlMcpServer {
                  fan_speed (0-100), fan_mode (off/low/medium/high/on/auto/\
                  smart), setting + setting_value (appliance settings such as a wash \
                  cycle or spin speed — see describe_device), operation (start/stop/\
-                 pause/resume), position (0-100 percent open), or tilt (0-100 percent \
-                 open, for slats)."
+                 pause/resume), position (0-100 percent open), tilt (0-100 percent \
+                 open, for slats), or valve (true/false, to open or shut one)."
             ))]));
         }
 
@@ -556,6 +561,15 @@ impl DeviceControlMcpServer {
             match self.control.set_locked(device_id, locked).await {
                 Ok(_) => applied.push(format!("locked={locked}")),
                 Err(e) => return Ok(guidance(format!("Couldn't (un)lock '{device_id}': {e}"))),
+            }
+        }
+        if let Some(open) = p.valve {
+            match self.control.set_valve(device_id, open).await {
+                Ok(_) => applied.push(format!("valve={}", if open { "open" } else { "closed" })),
+                Err(e) => {
+                    let asked = if open { "open" } else { "close" };
+                    return Ok(guidance(format!("Couldn't {asked} '{device_id}': {e}")));
+                }
             }
         }
         // Colour: hue and saturation are one action. If only one is given, keep

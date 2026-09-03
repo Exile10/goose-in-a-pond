@@ -5,6 +5,7 @@ import {
   Lightbulb, Lock, Thermometer, Fan, Blinds, RefreshCw,
   PlugZap, WashingMachine, Waves, Wind, MonitorPlay, Bot, BellRing, ToggleLeft,
   Router,
+  Droplet,
 } from "lucide-react";
 import { api } from "../api/PondApiClient";
 import { ApiError, type Device, type MatterStatus } from "../api/types";
@@ -57,6 +58,9 @@ function DeviceIcon({ kind }: { kind: string | undefined }) {
   // A hub that speaks for other devices — a Hue, Aqara or Tuya bridge. It appears
   // beside the devices behind it and drives nothing itself.
   if (kind === "bridge")     return <Router size={22} />;
+  // A valve is opened and shut, not switched on: it has no On/Off cluster at all,
+  // and before it had a type it arrived as an unknown device that could do nothing.
+  if (kind === "valve")      return <Droplet size={22} />;
   return <Monitor size={22} />;
 }
 

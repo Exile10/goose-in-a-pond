@@ -16,6 +16,7 @@ import {
   type EndpointSnapshot,
   type NodeSnapshot,
 } from "./snapshot.js";
+import { clusterHasFeature } from "./sensors.js";
 import { operationsOf, settingsOf } from "./settings.js";
 import { applianceSetpoint } from "./thermostat.js";
 
@@ -40,6 +41,8 @@ export const CLUSTER_SWITCH = "switch";
  * nameless and the hub's own liveness the only liveness there was.
  */
 export const CLUSTER_BRIDGED_DEVICE_INFO = "bridgedDeviceBasicInformation";
+/** A valve: open, shut, and -- where it says so -- how far. */
+export const CLUSTER_VALVE = "valveConfigurationAndControl";
 
 /**
  * Every cluster this module names, for the snapshot allowlist.
@@ -64,6 +67,7 @@ export function deviceClusters(): ReadonlySet<string> {
     CLUSTER_SMOKE_CO_ALARM,
     CLUSTER_SWITCH,
     CLUSTER_BRIDGED_DEVICE_INFO,
+    CLUSTER_VALVE,
   ]);
 }
 
@@ -101,6 +105,11 @@ const DEVICE_TYPES: ReadonlyMap<number, string> = new Map([
   // plug used to arrive wearing a lightbulb.
   [0x010a, "plug"], // On/Off Plug-in Unit
   [0x010b, "plug"], // Dimmable Plug-in Unit
+  // The in-wall equivalents of the two above: a module behind a faceplate switching
+  // or dimming whatever is wired to it. A plug rather than a light, because what it
+  // drives is the installer's business and not something Matter states.
+  [0x010f, "plug"], // Mounted On/Off Control
+  [0x0110, "plug"], // Mounted Dimmable Load Control
   // Closures
   [0x000a, "lock"], // Door Lock
   [0x0202, "covering"], // Window Covering
@@ -109,6 +118,11 @@ const DEVICE_TYPES: ReadonlyMap<number, string> = new Map([
   [0x0072, "thermostat"], // Room Air Conditioner
   [0x002b, "fan"], // Fan
   [0x002c, "air"], // Air Purifier
+  // Both carry a Thermostat and are driven by asking for a temperature, which is what
+  // the word has to convey — a water heater's own mode cluster is read by the ModeBase
+  // rule and needs no entry of its own.
+  [0x0309, "thermostat"], // Heat Pump
+  [0x050f, "thermostat"], // Water Heater
   // Sensors
   [0x0015, "sensor"], // Contact Sensor
   [0x002d, "sensor"], // Air Quality Sensor
@@ -118,13 +132,26 @@ const DEVICE_TYPES: ReadonlyMap<number, string> = new Map([
   [0x0305, "sensor"], // Pressure Sensor
   [0x0306, "sensor"], // Flow Sensor
   [0x0307, "sensor"], // Humidity Sensor
+  // Boolean-state detectors. They report one bit and take no orders, so they read as
+  // sensors rather than as alarms: nothing on them sounds.
+  [0x0041, "sensor"], // Water Freeze Detector
+  [0x0043, "sensor"], // Water Leak Detector
+  [0x0044, "sensor"], // Rain Sensor
   // An alarm is not a sensor to a user: it is the thing that wakes them.
   [0x0076, "alarm"], // Smoke/CO Alarm
   // A switch reports which way it is thrown and takes no orders, so it is its own
-  // type rather than a light with the controls missing. Deliberately NOT the switch
-  // CLIENT types (0x0103 On/Off Light Switch, 0x0104 Dimmer Switch, 0x0105 Colour
-  // Dimmer Switch): those drive other devices, and claiming a mapping nobody has
-  // held a device against is how a plug arrived wearing a lightbulb.
+  // type rather than a light with the controls missing.
+  //
+  // Deliberately NOT the CLIENT device types, and the omission is the whole family
+  // rather than an oversight in it: 0x0103 On/Off Light Switch, 0x0104 Dimmer Switch,
+  // 0x0105 Colour Dimmer Switch, 0x000b Door Lock Controller, 0x0203 Window Covering
+  // Controller, 0x0304 Pump Controller, 0x030a Thermostat Controller, 0x0840 Control
+  // Bridge, 0x0850 On/Off Sensor, 0x0029 Casting Video Client, 0x002a Video Remote
+  // Control. Every one of those is a remote: it binds to another device and issues
+  // commands, and holds no server cluster GIAP could read or drive. Typing them would
+  // put a row on the wall that answers "cannot be controlled" for every verb -- and
+  // claiming a mapping nobody has held a device against is how a plug arrived wearing
+  // a lightbulb.
   [0x000f, "switch"], // Generic Switch
   // A hub that speaks for other devices. Not drivable itself, and deliberately a
   // device anyway: it is the physical thing on the shelf, it owns the fabric
@@ -133,11 +160,34 @@ const DEVICE_TYPES: ReadonlyMap<number, string> = new Map([
   // Appliances
   [0x0073, "appliance"], // Laundry Washer
   [0x0075, "appliance"], // Dishwasher
+  [0x007c, "appliance"], // Laundry Dryer
+  [0x0079, "appliance"], // Microwave Oven
+  [0x0078, "appliance"], // Cooktop
+  // Composed appliances, whose own endpoint carries little or nothing: an oven's
+  // function lives in its cabinets, a refrigerator's in its compartments. The type is
+  // still worth stating, because the alternative is the node arriving as whatever its
+  // first cabinet claims -- or, with nothing to claim, as the monitor fallback.
+  [0x007b, "appliance"], // Oven
+  [0x0070, "appliance"], // Refrigerator
+  // And the parts themselves, for the same reason in reverse: a cabinet or a hob ring
+  // commissioned on its own is still an appliance, not an unknown.
+  [0x0071, "appliance"], // Temperature Controlled Cabinet
+  [0x0077, "appliance"], // Cook Surface
+  // A cooker hood is a fan with a filter, and Fan Control is what it publishes.
+  [0x007a, "fan"], // Extractor Hood
   [0x0074, "vacuum"], // Robotic Vacuum Cleaner
   [0x0303, "pump"], // Pump
+  // A valve is not a plug with water in it: it takes `open` and `close` rather than
+  // On/Off, and an irrigation system is one or several of them.
+  [0x0042, "valve"], // Water Valve
+  [0x0040, "valve"], // Irrigation System
   // Media
   [0x0023, "media"], // Casting Video Player
   [0x0028, "media"], // Basic Video Player
+  // A speaker on its own, rather than as a video player's part. Its Level Control is
+  // a volume either way -- `volumeEndpoint` already tells the two apart by this very
+  // device type -- so the only thing missing was the word for it.
+  [0x0022, "media"], // Speaker
 ]);
 
 /**
@@ -231,6 +281,20 @@ export function levelIsBrightness(node: NodeSnapshot): boolean {
   );
 }
 
+/**
+ * Does this valve say it has a level, rather than only open and shut?
+ *
+ * Valve Configuration and Control's LVL feature is optional. Claims first, evidence
+ * second -- the same order `colorSupport` uses: the feature map is believed where it
+ * speaks, and a device that publishes a `currentLevel` has one whatever it claims.
+ */
+export function valveHasLevel(node: NodeSnapshot): boolean {
+  const state = endpointWith(node, CLUSTER_VALVE)?.clusters[CLUSTER_VALVE];
+  if (state === undefined) return false;
+  if (clusterHasFeature(state, "level")) return true;
+  return state["currentLevel"] !== undefined || state["targetLevel"] !== undefined;
+}
+
 function capabilitiesOf(node: NodeSnapshot): string[] {
   const capabilities: string[] = [];
   const hasOnOff = hasCluster(node, CLUSTER_ON_OFF);
@@ -255,6 +319,13 @@ function capabilitiesOf(node: NodeSnapshot): string[] {
     capabilities.push("temperature");
   }
   if (hasCluster(node, CLUSTER_DOOR_LOCK)) capabilities.push("lock");
+  if (hasCluster(node, CLUSTER_VALVE)) {
+    capabilities.push("valve");
+    // Only a valve that says it has a level. The LVL feature is optional and a plain
+    // solenoid has none, so offering one is a control the device would reject -- the
+    // same rule `tilt` follows for a roller blind with no slats.
+    if (valveHasLevel(node)) capabilities.push("position");
+  }
   // A covering was listed with no capabilities at all while `describe` offered it a
   // position, so the short answer said a controllable device could not be driven.
   if (hasCluster(node, CLUSTER_WINDOW_COVERING)) {
