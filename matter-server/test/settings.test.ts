@@ -354,6 +354,33 @@ describe("appliance settings", () => {
     expect(fault.message).toBe("socket hang up");
   });
 
+  it("calls a device that answered with a status answered, not unreachable", () => {
+    // Measured against a valve whose firmware declares `open` and has no handler for
+    // it: the command was delivered, the device answered Matter's generic Failure,
+    // and GIAP reported the valve as UNREACHABLE -- while it sat there responding in
+    // milliseconds. Any status response proves the session was up.
+    const answered = refusalOrFault(
+      "matter-17",
+      new Error("Received error status: Failure(1) (InvokeResponse)"),
+    );
+    expect(answered.code).toBe("device_refused");
+    expect(answered.message).toMatch(/answered with an error of its own/);
+    // Still carrying what the device actually said, so the generic status is not
+    // hidden behind the explanation of it.
+    expect(answered.message).toMatch(/Failure\(1\)/);
+  });
+
+  it("keeps a specific status more specific than the generic one", () => {
+    // A device answering "Constraint error" arrives wrapped in the same "Received
+    // error status" phrasing, and must still get the meaning of the constraint
+    // rather than the catch-all.
+    const constrained = refusalOrFault(
+      "matter-1",
+      new Error("Received error status: Constraint error (WriteResponse)"),
+    );
+    expect(constrained.message).toMatch(/outside what it will accept/);
+  });
+
   it("tells a refusal everything the description already knew", () => {
     // The gap: describe said "49 to 82 C in steps of 1" while the refusal said
     // "49 to 82 C" -- true of a request for 50.5, and no use, because it does not

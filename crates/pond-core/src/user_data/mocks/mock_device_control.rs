@@ -72,4 +72,15 @@ impl DeviceControlPort for RecordingDeviceControl {
             },
         ))
     }
+
+    async fn set_valve(&self, device_id: &str, open: bool) -> Result<DeviceControlOutcome> {
+        self.record(format!("set_valve({device_id}, open={open})"));
+        Ok(DeviceControlOutcome::new(
+            device_id,
+            DeviceStatePatch {
+                valve: Some(open),
+                ..Default::default()
+            },
+        ))
+    }
 }
