@@ -7,12 +7,9 @@ use pond_core::models::domain::message::{ChatMessage, Role};
 use pond_core::models::ports::provider::LlmProvider;
 use std::sync::Arc;
 
-/// Adapter: GooseProviderAdapter
-///
-/// Bridges pond's `LlmProvider` port to Goose's `Provider` trait.
-/// Converts between pond `ChatMessage` and Goose `Message` types.
-/// Goose providers are model-agnostic; the `ModelConfig` selects the model
-/// per call, so this adapter carries it alongside the provider.
+/// Bridges pond's `LlmProvider` port to Goose's `Provider` trait, converting between pond
+/// `ChatMessage` and Goose `Message`. Goose providers are model-agnostic; the `ModelConfig`
+/// selects the model per call, so this adapter carries it alongside the provider.
 pub struct GooseProviderAdapter {
     provider: Arc<dyn GooseProvider>,
     model_config: ModelConfig,

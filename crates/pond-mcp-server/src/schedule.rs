@@ -3,8 +3,12 @@
 //!
 //! Provides 12 tools: `list_schedules`, `create_schedule`, `update_schedule`,
 //! `delete_schedule`, `pause_schedule`, `resume_schedule`, `run_schedule_now`,
-//! `get_schedule_runs`, `world_clock`, `create_sensor_rule`,
-//! `list_sensor_rules`, `delete_sensor_rule`.
+//! `get_schedule_runs`, `world_clock`.
+//!
+//! Sensor RULES moved to `giap-sensors` (they are about sensors, and a
+//! household reaching for a timer should not pay ~437 tokens of schema for
+//! them). `sensor_rule_summary` stays here because `list_schedules` renders
+//! them too — a rule is still a scheduled task underneath.
 //! Depends on [`SchedulerPort`] and [`SettingsRepository`].
 
 use pond_core::user_data::domain::schedule::{
@@ -131,43 +135,13 @@ pub struct ScheduleIdParam {
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
-pub struct CreateSensorRuleParams {
-    pub name: Option<String>,
-    /// "sensor" (default) | "camera" | "device".
-    pub source: Option<String>,
-    /// Match this device/camera ID only; omit for any.
-    pub device_id: Option<String>,
-    /// Event type, e.g. "motion", "person", "temperature"; omit for any.
-    pub signal: Option<String>,
-    /// Compare event value: gt | gte | lt | lte | eq.
-    pub op: Option<String>,
-    /// Threshold for `op`.
-    pub value: Option<f64>,
-    /// Fire only after this local time, 24h "HH:MM".
-    pub after: Option<String>,
-    /// Fire only before this local time, 24h "HH:MM".
-    pub before: Option<String>,
-    /// Action: send this prompt to the agent.
-    pub prompt: Option<String>,
-    /// Action: switch this device (with power_on).
-    pub power_device_id: Option<String>,
-    /// true = on (default), false = off.
-    pub power_on: Option<bool>,
-    /// Action: notification title (requires notify_body).
-    pub notify_title: Option<String>,
-    pub notify_body: Option<String>,
-    /// Debounce seconds between fires. Default 60.
-    pub cooldown_secs: Option<u64>,
-    /// Catch-all for unexpected fields the model sends.
-    #[serde(flatten)]
-    #[schemars(skip)]
-    pub extra: std::collections::HashMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-pub struct DeleteSensorRuleParams {
-    /// Rule ID (see list_sensor_rules).
-    pub rule_id: Option<String>,
+pub struct ScheduleActionParams {
+    /// Schedule ID, from list_schedules.
+    #[serde(default)]
+    pub id: String,
+    /// delete | pause | resume | run_now.
+    #[serde(default)]
+    pub action: String,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
     #[schemars(skip)]
@@ -192,6 +166,25 @@ pub struct UpdateScheduleParams {
     pub cron: Option<String>,
     pub prompt: Option<String>,
     /// IANA timezone.
+    pub timezone: Option<String>,
+    /// Catch-all for unexpected fields the model sends.
+    #[serde(flatten)]
+    #[schemars(skip)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// The merged surface for create-or-update. `id` decides which.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ScheduleUpsertParams {
+    /// Existing schedule ID to change. Omit to create a new one.
+    #[serde(default)]
+    pub id: String,
+    pub name: Option<String>,
+    /// 6-field cron: sec min hr dom mon dow. Also accepts natural language.
+    pub cron: Option<String>,
+    /// Prompt sent to the agent on each fire.
+    pub prompt: Option<String>,
+    /// IANA timezone; default: user's setting.
     pub timezone: Option<String>,
     /// Catch-all for unexpected fields the model sends.
     #[serde(flatten)]
@@ -311,9 +304,8 @@ impl ScheduleMcpServer {
     }
 
     #[tool(description = "\
-Set a one-shot timer or reminder that fires ONCE after a delay, then deletes \
-itself. Use for \"in 10 minutes\", \"remind me in an hour\". For anything \
-repeating use create_schedule instead.")]
+One-shot timer or reminder: fires ONCE after a delay, then deletes itself \
+(\"in 10 minutes\"). Anything repeating: create_schedule.")]
     async fn set_timer(
         &self,
         _ctx: RequestContext<RoleServer>,
@@ -384,28 +376,43 @@ repeating use create_schedule instead.")]
         }
     }
 
+    // create and update were two tools over near-identical schemas -- name,
+    // cron, prompt, timezone, differing only in whether `id` was present and
+    // whether the fields were optional. `id` is the whole distinction, so it
+    // is now the parameter that carries it.
     #[tool(
-        description = "Create a scheduled task. Accepts natural language ('every morning at 8am') or 6-field cron: sec min hr dom mon dow."
+        description = "Create a scheduled task that sends a prompt to the agent on a cron. Pass an existing id to change one instead; omitted fields keep their current value."
     )]
     async fn create_schedule(
         &self,
         _ctx: RequestContext<RoleServer>,
-        params: Parameters<CreateScheduleParams>,
+        params: Parameters<ScheduleUpsertParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        eprintln!("[schedule] ╔═══ MCP SERVER RECEIVED ═══");
-        eprintln!("[schedule] ║ params.name:  {:?}", params.0.name);
-        eprintln!("[schedule] ║ params.cron:  {:?}", params.0.cron);
-        eprintln!("[schedule] ║ params.prompt: {:?}", params.0.prompt);
-        eprintln!("[schedule] ║ params.extra: {:?}", params.0.extra);
-        eprintln!("[schedule] ╚═══════════════════════════");
+        let p = params.0;
+        if p.id.trim().is_empty() {
+            let c = CreateScheduleParams {
+                name: p.name.unwrap_or_default(),
+                cron: p.cron.unwrap_or_default(),
+                prompt: p.prompt.unwrap_or_default(),
+                timezone: p.timezone,
+                extra: p.extra,
+            };
 
-        let user_msg = crate::last_user_message();
+            eprintln!("[schedule] ╔═══ MCP SERVER RECEIVED ═══");
+            eprintln!("[schedule] ║ params.name:  {:?}", c.name);
+            eprintln!("[schedule] ║ params.cron:  {:?}", c.cron);
+            eprintln!("[schedule] ║ params.prompt: {:?}", c.prompt);
+            eprintln!("[schedule] ║ params.extra: {:?}", c.extra);
+            eprintln!("[schedule] ╚═══════════════════════════");
 
-        // ── ToolCaller PRIMARY: generate all params from user message ──
-        const SCHEDULE_SCHEMA: &str = r#"{"type":"object","properties":{"cron":{"type":"string","description":"6-field cron: sec min hr dom mon dow. Example: 0 0 8 * * * for daily 8 AM"},"prompt":{"type":"string","description":"The action to perform on each fire"},"name":{"type":"string","description":"Short human-readable name"}},"required":["cron","prompt"]}"#;
+            let user_msg = crate::last_user_message();
 
-        let (tc_cron, tc_prompt, tc_name) =
-            if let Some(args) = crate::generate_params("create_schedule", SCHEDULE_SCHEMA).await {
+            // ── ToolCaller PRIMARY: generate all params from user message ──
+            const SCHEDULE_SCHEMA: &str = r#"{"type":"object","properties":{"cron":{"type":"string","description":"6-field cron: sec min hr dom mon dow. Example: 0 0 8 * * * for daily 8 AM"},"prompt":{"type":"string","description":"The action to perform on each fire"},"name":{"type":"string","description":"Short human-readable name"}},"required":["cron","prompt"]}"#;
+
+            let (tc_cron, tc_prompt, tc_name) = if let Some(args) =
+                crate::generate_params("create_schedule", SCHEDULE_SCHEMA).await
+            {
                 eprintln!("[schedule] ToolCaller generated: {:?}", args);
                 (
                     args.get("cron")
@@ -422,368 +429,272 @@ repeating use create_schedule instead.")]
                 (None, None, None)
             };
 
-        // ── Resolve cron: ToolCaller > model param > user message parse > nudge ──
-        // Validate cron looks like a real 6-field expression (not garbage from small models)
-        let looks_like_cron = |s: &str| {
-            let parts: Vec<&str> = s.split_whitespace().collect();
-            parts.len() == 6
-                && parts.iter().all(|p| {
-                    p.chars()
-                        .all(|c| c.is_ascii_digit() || c == '*' || c == '/' || c == '-' || c == ',')
-                })
-        };
-        let cron = tc_cron
-            .filter(|s| !s.is_empty() && looks_like_cron(s))
-            .or_else(|| {
-                let c = &params.0.cron;
-                if c.is_empty() || !looks_like_cron(c) {
-                    None
-                } else {
-                    Some(c.clone())
-                }
-            })
-            .or_else(|| parse_cron_from_message(&user_msg.to_lowercase()));
-
-        let cron = match cron {
-            Some(c) => c,
-            None => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Could not parse a schedule from: \"{}\". \
-                     Retry with cron (sec min hr dom mon dow). \
-                     Examples: '0 0 8 * * *' = daily 8 AM, '0 30 9 * * 1' = Monday 9:30 AM.",
-                    user_msg
-                ))]));
-            }
-        };
-
-        // ── Resolve prompt: ToolCaller > model param > user message extract ──
-        let prompt = tc_prompt
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                let p = &params.0.prompt;
-                if p.is_empty() {
-                    None
-                } else {
-                    Some(p.clone())
-                }
-            })
-            .unwrap_or_else(|| extract_prompt_from_message(&user_msg.to_lowercase(), &user_msg));
-
-        // ── Resolve name: ToolCaller > model param > derive from prompt ──
-        let name = tc_name
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                let n = &params.0.name;
-                if n.is_empty() {
-                    None
-                } else {
-                    Some(n.clone())
-                }
-            })
-            .unwrap_or_else(|| {
-                if prompt.len() > 40 {
-                    format!("{}...", &prompt[..37])
-                } else {
-                    prompt.clone()
-                }
-            });
-
-        // Default timezone to user's setting if not provided.
-        let timezone = match &params.0.timezone {
-            Some(tz) if !tz.is_empty() => tz.clone(),
-            _ => self
-                .settings_repo
-                .get()
-                .await
-                .map(|s| s.timezone.clone())
-                .unwrap_or_else(|_| "UTC".to_string()),
-        };
-
-        let id = uuid::Uuid::new_v4().to_string();
-        let req = CreateScheduleRequest {
-            fire_at: None,
-            once: false,
-            id: id.clone(),
-            label: name,
-            cron: cron.clone(),
-            timezone: timezone.clone(),
-            kind: TaskKind::AgentPrompt {
-                prompt: prompt.clone(),
-            },
-        };
-
-        match self.scheduler.create_task(req).await {
-            Ok(schedule) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Schedule created: \"{}\" [{}] — {} {} (agent prompt: \"{}\")",
-                schedule.label, schedule.id, schedule.cron, schedule.timezone, prompt,
-            ))])),
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Failed to create schedule: {e}. Check the cron expression '{}' is valid 6-field format.",
-                cron
-            ))])),
-        }
-    }
-
-    #[tool(description = "Delete a scheduled task by ID.")]
-    async fn delete_schedule(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<ScheduleIdParam>,
-    ) -> Result<CallToolResult, ErrorData> {
-        match self.scheduler.delete_task(&params.0.id).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Schedule '{}' deleted.",
-                params.0.id
-            ))])),
-            Err(e) => Err(ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Failed to delete schedule: {}", e),
-                None,
-            )),
-        }
-    }
-
-    #[tool(
-        description = "Create a rule fired by sensor/camera/device events, not a timer. Needs at least one action: prompt, device power, or notify."
-    )]
-    async fn create_sensor_rule(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<CreateSensorRuleParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let p = params.0;
-
-        // ── Source ──
-        let source_kind = match p.source.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
-            Some(s) if s == "sensor" => TriggerSourceKind::Sensor,
-            Some(s) if s == "camera" => TriggerSourceKind::Camera,
-            Some(s) if s == "device" => TriggerSourceKind::Device,
-            None => TriggerSourceKind::Sensor,
-            Some(other) => {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Invalid source '{other}'. Use sensor, camera, or device."
-                ))]));
-            }
-        };
-
-        // ── Condition ──
-        let op = match p.op.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
-            None => None,
-            Some(s) => match s.as_str() {
-                "gt" | ">" => Some(CompareOp::Gt),
-                "gte" | ">=" => Some(CompareOp::Gte),
-                "lt" | "<" => Some(CompareOp::Lt),
-                "lte" | "<=" => Some(CompareOp::Lte),
-                "eq" | "==" | "=" => Some(CompareOp::Eq),
-                other => {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Invalid op '{other}'. Use gt, gte, lt, lte, or eq."
-                    ))]));
-                }
-            },
-        };
-        for (field, v) in [("after", &p.after), ("before", &p.before)] {
-            if let Some(v) = v {
-                if chrono::NaiveTime::parse_from_str(v, "%H:%M").is_err() {
-                    return Ok(CallToolResult::success(vec![Content::text(format!(
-                        "Invalid `{field}` '{v}' — use 24h HH:MM (e.g. \"18:30\")."
-                    ))]));
-                }
-            }
-        }
-
-        // ── Actions (at least one) ──
-        let mut actions = Vec::new();
-        if let Some(prompt) = p.prompt.as_deref().filter(|s| !s.trim().is_empty()) {
-            actions.push(TriggerAction::AgentPrompt {
-                prompt: prompt.trim().to_string(),
-            });
-        }
-        if let Some(device_id) = p
-            .power_device_id
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-        {
-            actions.push(TriggerAction::DevicePower {
-                device_id: device_id.trim().to_string(),
-                on: p.power_on.unwrap_or(true),
-            });
-        }
-        if let (Some(title), Some(body)) = (&p.notify_title, &p.notify_body) {
-            actions.push(TriggerAction::Notify {
-                title: title.clone(),
-                body: body.clone(),
-            });
-        }
-        if actions.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "A rule needs at least one action: `prompt`, `power_device_id` (+ `power_on`), \
-                 or `notify_title` + `notify_body`.",
-            )]));
-        }
-
-        let spec = SensorTriggerSpec {
-            source: TriggerSource {
-                kind: source_kind,
-                device_id: p.device_id.filter(|s| !s.trim().is_empty()),
-                signal: p.signal.filter(|s| !s.trim().is_empty()),
-            },
-            condition: TriggerCondition {
-                op,
-                value: p.value,
-                after: p.after,
-                before: p.before,
-            },
-            actions,
-            cooldown_secs: p
-                .cooldown_secs
-                .unwrap_or_else(SensorTriggerSpec::default_cooldown_secs),
-        };
-
-        let label = p
-            .name
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| format!("Rule: {}", sensor_rule_summary(&spec)));
-        let timezone = self
-            .settings_repo
-            .get()
-            .await
-            .map(|s| s.timezone)
-            .unwrap_or_else(|_| "UTC".to_string());
-        let id = format!("rule-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-
-        let req = pond_core::user_data::ports::scheduler::CreateScheduleRequest {
-            fire_at: None,
-            once: false,
-            id: id.clone(),
-            label: label.clone(),
-            // Sentinel for display — event rules are never cron-registered.
-            cron: "@event".to_string(),
-            timezone,
-            kind: TaskKind::SensorTrigger(spec.clone()),
-        };
-        match self.scheduler.create_task(req).await {
-            Ok(_) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Sensor rule created: \"{label}\" [{id}] — {} (cooldown {}s). \
-                 It fires when a matching event arrives.",
-                sensor_rule_summary(&spec),
-                spec.cooldown_secs,
-            ))])),
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Failed to create sensor rule: {e}"
-            ))])),
-        }
-    }
-
-    #[tool(
-        description = "List sensor/event-triggered rules. Time-based schedules: use list_schedules."
-    )]
-    async fn list_sensor_rules(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        match self.scheduler.list_tasks().await {
-            Ok(tasks) => {
-                let rules: Vec<String> = tasks
-                    .iter()
-                    .filter_map(|t| match &t.kind {
-                        TaskKind::SensorTrigger(spec) => Some(format!(
-                            "- \"{}\" [{}]: {} (cooldown {}s{})",
-                            t.label,
-                            t.id,
-                            sensor_rule_summary(spec),
-                            spec.cooldown_secs,
-                            if t.paused { ", paused" } else { "" },
-                        )),
-                        _ => None,
+            // ── Resolve cron: ToolCaller > model param > user message parse > nudge ──
+            // Validate cron looks like a real 6-field expression (not garbage from small models)
+            let looks_like_cron = |s: &str| {
+                let parts: Vec<&str> = s.split_whitespace().collect();
+                parts.len() == 6
+                    && parts.iter().all(|p| {
+                        p.chars().all(|c| {
+                            c.is_ascii_digit() || c == '*' || c == '/' || c == '-' || c == ','
+                        })
                     })
-                    .collect();
-                let text = if rules.is_empty() {
-                    "No sensor rules defined. Create one with create_sensor_rule.".to_string()
-                } else {
-                    rules.join("\n")
-                };
-                Ok(CallToolResult::success(vec![Content::text(text)]))
+            };
+            let cron = tc_cron
+                .filter(|s| !s.is_empty() && looks_like_cron(s))
+                .or_else(|| {
+                    let c = &c.cron;
+                    if c.is_empty() || !looks_like_cron(c) {
+                        None
+                    } else {
+                        Some(c.clone())
+                    }
+                })
+                .or_else(|| parse_cron_from_message(&user_msg.to_lowercase()));
+
+            let cron = match cron {
+                Some(c) => c,
+                None => {
+                    return Ok(CallToolResult::success(vec![Content::text(format!(
+                        // The field ORDER is what the model gets wrong, so that is
+                        // what this teaches. It used to give two ready-made cron
+                        // strings, and a copied one creates a real recurring
+                        // schedule at a time nobody asked for — persistent state
+                        // the user has to discover and delete, unlike a wrong
+                        // sentence they can simply ignore.
+                        "Could not parse a schedule from: \"{}\". \
+                         Retry with cron in the order: sec min hr dom mon dow. \
+                         Build it from the time the user actually said.",
+                        user_msg
+                    ))]));
+                }
+            };
+
+            // ── Resolve prompt: ToolCaller > model param > user message extract ──
+            let prompt = tc_prompt
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    let p = &c.prompt;
+                    if p.is_empty() {
+                        None
+                    } else {
+                        Some(p.clone())
+                    }
+                })
+                .unwrap_or_else(|| {
+                    extract_prompt_from_message(&user_msg.to_lowercase(), &user_msg)
+                });
+
+            // ── Resolve name: ToolCaller > model param > derive from prompt ──
+            let name = tc_name
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    let n = &c.name;
+                    if n.is_empty() {
+                        None
+                    } else {
+                        Some(n.clone())
+                    }
+                })
+                .unwrap_or_else(|| {
+                    if prompt.len() > 40 {
+                        format!("{}...", &prompt[..37])
+                    } else {
+                        prompt.clone()
+                    }
+                });
+
+            // Default timezone to user's setting if not provided.
+            let timezone = match &c.timezone {
+                Some(tz) if !tz.is_empty() => tz.clone(),
+                _ => self
+                    .settings_repo
+                    .get()
+                    .await
+                    .map(|s| s.timezone.clone())
+                    .unwrap_or_else(|_| "UTC".to_string()),
+            };
+
+            let id = uuid::Uuid::new_v4().to_string();
+            let req = CreateScheduleRequest {
+                fire_at: None,
+                once: false,
+                id: id.clone(),
+                label: name,
+                cron: cron.clone(),
+                timezone: timezone.clone(),
+                kind: TaskKind::AgentPrompt {
+                    prompt: prompt.clone(),
+                },
+            };
+
+            match self.scheduler.create_task(req).await {
+                Ok(schedule) => Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Schedule created: \"{}\" [{}] — {} {} (agent prompt: \"{}\")",
+                    schedule.label, schedule.id, schedule.cron, schedule.timezone, prompt,
+                ))])),
+                Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Failed to create schedule: {e}. Check the cron expression '{}' is valid 6-field format.",
+                    cron
+                ))])),
             }
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Failed to list sensor rules: {e}"
-            ))])),
+        } else {
+            let u = UpdateScheduleParams {
+                id: p.id,
+                name: p.name,
+                cron: p.cron,
+                prompt: p.prompt,
+                timezone: p.timezone,
+                extra: p.extra,
+            };
+
+            let user_msg = crate::last_user_message();
+
+            // ── Resolve ID: model param > extract from user message ──
+            let id = if u.id.is_empty() {
+                // Try to find a UUID-shaped string in the user message
+                user_msg
+                    .split_whitespace()
+                    .find(|w| uuid::Uuid::parse_str(w).is_ok())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+            } else {
+                u.id.clone()
+            };
+
+            if id.is_empty() {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "Missing schedule ID. Please provide the ID of the schedule to update. \
+                     Use list_schedules to see all schedules and their IDs.",
+                )]));
+            }
+
+            // ── Resolve cron: natural language parse > validated literal ──
+            // Same validation as create_schedule — reject strings that aren't valid 6-field cron.
+            let looks_like_cron = |s: &str| {
+                let parts: Vec<&str> = s.split_whitespace().collect();
+                parts.len() == 6
+                    && parts.iter().all(|p| {
+                        p.chars().all(|c| {
+                            c.is_ascii_digit() || c == '*' || c == '/' || c == '-' || c == ','
+                        })
+                    })
+            };
+            let cron = u.cron.as_ref().and_then(|c| {
+                if c.is_empty() {
+                    return None;
+                }
+                // Try natural language first, then validated literal
+                parse_cron_from_message(&c.to_lowercase()).or_else(|| {
+                    if looks_like_cron(c) {
+                        Some(c.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
+
+            // ── Resolve prompt: pass through if provided ──
+            let prompt =
+                u.prompt
+                    .as_ref()
+                    .and_then(|p| if p.is_empty() { None } else { Some(p.clone()) });
+
+            // ── Build TaskKind only if prompt changed ──
+            let kind = prompt.map(|p| TaskKind::AgentPrompt { prompt: p });
+
+            let req =
+                UpdateScheduleRequest {
+                    fire_at: None,
+                    once: false,
+                    label: u.name.as_ref().and_then(|n| {
+                        if n.is_empty() {
+                            None
+                        } else {
+                            Some(n.clone())
+                        }
+                    }),
+                    cron,
+                    timezone: u.timezone.as_ref().and_then(|tz| {
+                        if tz.is_empty() {
+                            None
+                        } else {
+                            Some(tz.clone())
+                        }
+                    }),
+                    kind,
+                };
+
+            match self.scheduler.update_task(&id, req).await {
+                Ok(schedule) => {
+                    let prompt_preview = match &schedule.kind {
+                        TaskKind::AgentPrompt { prompt } => {
+                            if prompt.len() > 60 {
+                                format!("{}...", &prompt[..57])
+                            } else {
+                                prompt.clone()
+                            }
+                        }
+                        TaskKind::Webhook { webhook_url } => format!("webhook: {webhook_url}"),
+                        TaskKind::SensorTrigger(spec) => sensor_rule_summary(spec),
+                    };
+                    Ok(CallToolResult::success(vec![Content::text(format!(
+                        "Schedule updated: \"{}\" [{}] — {} {} ({})",
+                        schedule.label,
+                        schedule.id,
+                        schedule.cron,
+                        schedule.timezone,
+                        prompt_preview,
+                    ))]))
+                }
+                Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Failed to update schedule '{}': {e}. Check the ID is correct \
+                     (use list_schedules to see all schedules).",
+                    id
+                ))])),
+            }
         }
     }
 
-    #[tool(description = "Delete a sensor rule by ID (see list_sensor_rules).")]
-    async fn delete_sensor_rule(
+    // One tool with an action enum, replacing delete/pause/resume/run_now.
+    //
+    // Those four were 78 tokens between them, so this is not really a token
+    // change -- it is a COUNT change. Four tools that differ only in a verb
+    // are four things the model has to tell apart, and the same reasoning that
+    // gave `control` thirteen playback actions applies here.
+    #[tool(
+        description = "Act on an existing schedule by ID: delete it, pause it, resume a paused one, or run it now regardless of its cron."
+    )]
+    async fn schedule_action(
         &self,
         _ctx: RequestContext<RoleServer>,
-        params: Parameters<DeleteSensorRuleParams>,
+        params: Parameters<ScheduleActionParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let Some(id) = params.0.rule_id.filter(|s| !s.trim().is_empty()) else {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "I need a `rule_id`. Use list_sensor_rules to find it.",
-            )]));
+        let id = params.0.id;
+        let action = params.0.action.trim().to_ascii_lowercase();
+        let (result, past) = match action.as_str() {
+            "delete" => (self.scheduler.delete_task(&id).await, "deleted"),
+            "pause" => (self.scheduler.pause_task(&id).await, "paused"),
+            "resume" => (self.scheduler.resume_task(&id).await, "resumed"),
+            "run_now" => (
+                self.scheduler.run_now(&id).await,
+                "triggered for immediate execution",
+            ),
+            other => {
+                return Err(ErrorData::new(
+                    ErrorCode::INVALID_PARAMS,
+                    format!("unknown action '{other}' -- use delete, pause, resume or run_now"),
+                    None,
+                ))
+            }
         };
-        match self.scheduler.delete_task(id.trim()).await {
+        match result {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Sensor rule {id} deleted."
-            ))])),
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Failed to delete sensor rule '{id}': {e}"
-            ))])),
-        }
-    }
-
-    #[tool(description = "Pause a scheduled task until resumed.")]
-    async fn pause_schedule(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<ScheduleIdParam>,
-    ) -> Result<CallToolResult, ErrorData> {
-        match self.scheduler.pause_task(&params.0.id).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Schedule '{}' paused.",
-                params.0.id
+                "Schedule '{id}' {past}."
             ))])),
             Err(e) => Err(ErrorData::new(
                 ErrorCode::INTERNAL_ERROR,
-                format!("Failed to pause schedule: {}", e),
-                None,
-            )),
-        }
-    }
-
-    #[tool(description = "Resume a paused scheduled task.")]
-    async fn resume_schedule(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<ScheduleIdParam>,
-    ) -> Result<CallToolResult, ErrorData> {
-        match self.scheduler.resume_task(&params.0.id).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Schedule '{}' resumed.",
-                params.0.id
-            ))])),
-            Err(e) => Err(ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Failed to resume schedule: {}", e),
-                None,
-            )),
-        }
-    }
-
-    #[tool(description = "Run a scheduled task immediately, ignoring its cron.")]
-    async fn run_schedule_now(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<ScheduleIdParam>,
-    ) -> Result<CallToolResult, ErrorData> {
-        match self.scheduler.run_now(&params.0.id).await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Schedule '{}' triggered for immediate execution.",
-                params.0.id
-            ))])),
-            Err(e) => Err(ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                format!("Failed to run schedule: {}", e),
+                format!("Failed to {action} schedule: {e}"),
                 None,
             )),
         }
@@ -862,121 +773,6 @@ repeating use create_schedule instead.")]
                 format!("Failed to get runs: {}", e),
                 None,
             )),
-        }
-    }
-
-    #[tool(
-        description = "Update a schedule's name, cron, prompt, or timezone. Only provided fields change."
-    )]
-    async fn update_schedule(
-        &self,
-        _ctx: RequestContext<RoleServer>,
-        params: Parameters<UpdateScheduleParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let user_msg = crate::last_user_message();
-
-        // ── Resolve ID: model param > extract from user message ──
-        let id = if params.0.id.is_empty() {
-            // Try to find a UUID-shaped string in the user message
-            user_msg
-                .split_whitespace()
-                .find(|w| uuid::Uuid::parse_str(w).is_ok())
-                .map(|s| s.to_string())
-                .unwrap_or_default()
-        } else {
-            params.0.id.clone()
-        };
-
-        if id.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "Missing schedule ID. Please provide the ID of the schedule to update. \
-                 Use list_schedules to see all schedules and their IDs.",
-            )]));
-        }
-
-        // ── Resolve cron: natural language parse > validated literal ──
-        // Same validation as create_schedule — reject strings that aren't valid 6-field cron.
-        let looks_like_cron = |s: &str| {
-            let parts: Vec<&str> = s.split_whitespace().collect();
-            parts.len() == 6
-                && parts.iter().all(|p| {
-                    p.chars()
-                        .all(|c| c.is_ascii_digit() || c == '*' || c == '/' || c == '-' || c == ',')
-                })
-        };
-        let cron = params.0.cron.as_ref().and_then(|c| {
-            if c.is_empty() {
-                return None;
-            }
-            // Try natural language first, then validated literal
-            parse_cron_from_message(&c.to_lowercase()).or_else(|| {
-                if looks_like_cron(c) {
-                    Some(c.clone())
-                } else {
-                    None
-                }
-            })
-        });
-
-        // ── Resolve prompt: pass through if provided ──
-        let prompt =
-            params.0.prompt.as_ref().and_then(
-                |p| {
-                    if p.is_empty() {
-                        None
-                    } else {
-                        Some(p.clone())
-                    }
-                },
-            );
-
-        // ── Build TaskKind only if prompt changed ──
-        let kind = prompt.map(|p| TaskKind::AgentPrompt { prompt: p });
-
-        let req = UpdateScheduleRequest {
-            label: params.0.name.as_ref().and_then(|n| {
-                if n.is_empty() {
-                    None
-                } else {
-                    Some(n.clone())
-                }
-            }),
-            cron,
-            timezone: params.0.timezone.as_ref().and_then(|tz| {
-                if tz.is_empty() {
-                    None
-                } else {
-                    Some(tz.clone())
-                }
-            }),
-            kind,
-            fire_at: None,
-            once: false,
-        };
-
-        match self.scheduler.update_task(&id, req).await {
-            Ok(schedule) => {
-                let prompt_preview = match &schedule.kind {
-                    TaskKind::AgentPrompt { prompt } => {
-                        if prompt.len() > 60 {
-                            format!("{}...", &prompt[..57])
-                        } else {
-                            prompt.clone()
-                        }
-                    }
-                    TaskKind::Webhook { webhook_url } => format!("webhook: {webhook_url}"),
-                    TaskKind::SensorTrigger(spec) => sensor_rule_summary(spec),
-                };
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Schedule updated: \"{}\" [{}] — {} {} ({})",
-                    schedule.label, schedule.id, schedule.cron, schedule.timezone, prompt_preview,
-                ))]))
-            }
-            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
-                "Failed to update schedule '{}': {e}. Check the ID is correct \
-                 (use list_schedules to see all schedules).",
-                id
-            ))])),
         }
     }
 
@@ -1336,7 +1132,7 @@ pub async fn try_upcoming_schedules_context(scheduler: &dyn SchedulerPort) -> Op
 }
 
 /// One-line human summary of a sensor rule, shared by every display site.
-fn sensor_rule_summary(spec: &SensorTriggerSpec) -> String {
+pub(crate) fn sensor_rule_summary(spec: &SensorTriggerSpec) -> String {
     let src = match spec.source.kind {
         TriggerSourceKind::Sensor => "sensor",
         TriggerSourceKind::Camera => "camera",
@@ -1375,9 +1171,16 @@ pub fn init_schedule_deps(
 
 /// Spawn function compatible with Goose's `SpawnServerFn` type.
 pub fn spawn_schedule_server(reader: DuplexStream, writer: DuplexStream) {
-    let deps = SCHEDULE_DEPS
-        .get()
-        .expect("init_schedule_deps() not called");
+    // Missing deps = this path never initialised this extension (the voice/CLI
+    // binary vs `serve` install different families). A skipped extension is a
+    // logged, contained failure; a panic here took down every builtin server's
+    // startup at once (2026-08-27, giap-context in the voice child).
+    let Some(deps) = SCHEDULE_DEPS.get() else {
+        tracing::error!(
+            "spawn_schedule_server called before init_schedule_deps — extension will not start"
+        );
+        return;
+    };
     let server = ScheduleMcpServer::new(deps.scheduler.clone(), deps.settings_repo.clone());
     crate::serve_builtin("giap-schedule", server, reader, writer);
 }

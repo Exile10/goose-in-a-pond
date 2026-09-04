@@ -3,14 +3,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-/// Driven Port: tool-call argument generation.
-///
-/// When the main LLM decides to call an MCP tool but fails to produce valid
-/// arguments (common with small local GGUF models), this specialist model
-/// generates the structured arguments from the tool schema + user query.
-///
-/// The specialist sees NO conversation history — only the tool schema and the
-/// user's original request. This keeps inference fast and context-free.
+/// Driven port: tool-call argument generation. When the main LLM calls an MCP tool but produces
+/// invalid arguments (common with small local GGUF models), this specialist regenerates them from
+/// the tool schema and the user's request. It sees no conversation history, which keeps it fast.
 #[async_trait]
 pub trait ToolCaller: Send + Sync {
     /// Generate tool-call arguments for the given tool and user query.

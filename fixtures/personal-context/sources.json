@@ -1,0 +1,114 @@
+[
+  {
+    "id": "mac-eventkit-wanjiku",
+    "kind": "calendar",
+    "profile_id": "profile_wanjiku",
+    "provider": "eventkit-macos",
+    "scopes": [
+      "calendars.read"
+    ]
+  },
+  {
+    "id": "mac-spotlight-wanjiku",
+    "kind": "files",
+    "profile_id": "profile_wanjiku",
+    "provider": "spotlight-macos",
+    "scopes": [
+      "files.metadata.read"
+    ]
+  },
+  {
+    "id": "eds-cal-otieno",
+    "kind": "calendar",
+    "profile_id": "profile_otieno",
+    "provider": "eds-gnome",
+    "scopes": [
+      "calendars.read"
+    ]
+  },
+  {
+    "id": "tracker3-files-otieno",
+    "kind": "files",
+    "profile_id": "profile_otieno",
+    "provider": "tracker3-gnome",
+    "scopes": [
+      "files.metadata.read"
+    ]
+  },
+  {
+    "id": "winrt-cal-amara",
+    "kind": "calendar",
+    "profile_id": "profile_amara",
+    "provider": "winrt-appointments",
+    "scopes": [
+      "appointments.read"
+    ]
+  },
+  {
+    "id": "imap-wanjiku",
+    "kind": "mail",
+    "profile_id": "profile_wanjiku",
+    "provider": "imap-gmail",
+    "scopes": [
+      "mail.read"
+    ]
+  },
+  {
+    "id": "imap-otieno",
+    "kind": "mail",
+    "profile_id": "profile_otieno",
+    "provider": "imap-fastmail",
+    "scopes": [
+      "mail.read"
+    ]
+  },
+  {
+    "id": "caldav-shared",
+    "kind": "calendar",
+    "profile_id": "profile_wanjiku",
+    "provider": "caldav-google",
+    "scopes": [
+      "calendars.read"
+    ]
+  },
+  {
+    "id": "gotg-otieno",
+    "kind": "mobile",
+    "profile_id": "profile_otieno",
+    "provider": "gotg",
+    "scopes": [
+      "location",
+      "contacts"
+    ]
+  },
+  {
+    "id": "slack-wanjiku",
+    "kind": "chat",
+    "profile_id": "profile_wanjiku",
+    "provider": "slack",
+    "scopes": [
+      "channels.history"
+    ]
+  },
+  {
+    "id": "hall-pir",
+    "kind": "sensor",
+    "profile_id": "profile_wanjiku",
+    "provider": "pond-sensor",
+    "scopes": []
+  },
+  {
+    "id": "door-cam",
+    "kind": "camera",
+    "profile_id": "profile_wanjiku",
+    "provider": "pond-camera",
+    "scopes": []
+  },
+  {
+    "id": "voice-pond",
+    "kind": "voice",
+    "profile_id": "profile_wanjiku",
+    "provider": "pond-voice",
+    "scopes": []
+  }
+]

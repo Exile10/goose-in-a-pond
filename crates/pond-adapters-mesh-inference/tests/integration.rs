@@ -1,9 +1,7 @@
 //! In-process, loopback-only integration tests for mesh inference (#132
-//! Milestone 3). Two real `Libp2pMeshTransport` nodes on `127.0.0.1`, mocked
-//! `PeerDirectory`/`CreditLedger`/`UsageTally` (trust-pin persistence and
-//! settlement are separate milestones — not what this crate is proving).
-//! Nothing here touches real hardware or the public network, so no test is
-//! `#[ignore]`d.
+//! Milestone 3): two real `Libp2pMeshTransport` nodes on `127.0.0.1` with mocked
+//! `PeerDirectory`/`CreditLedger`/`UsageTally`. No real hardware or public
+//! network is touched, so no test is `#[ignore]`d.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,12 +73,10 @@ async fn wait_for_listen_address(node: &Libp2pMeshTransport) -> String {
     panic!("node never reported a listen address");
 }
 
-/// Grants `a` and `b` mutual trust in each other's *transport-level*
-/// directory, then connects `a` to `b` and waits until both sides'
-/// `connected_peers()` agrees — `b` (the listener) only learns about `a`
-/// once the handshake request arrives, asynchronously. Trust is not
-/// symmetric in the domain, so both directions are stated rather than
-/// assumed (mirrors `pond-adapters-mesh-libp2p`'s own test helper).
+/// Grants `a` and `b` mutual transport-level trust, connects `a` to `b`, and
+/// waits until both `connected_peers()` agree — the listener only learns about
+/// `a` once the handshake arrives. Trust is not symmetric, so both directions
+/// are stated (mirrors `pond-adapters-mesh-libp2p`'s own test helper).
 async fn connect(
     a: &Libp2pMeshTransport,
     a_dir: &MockPeerDirectory,
@@ -831,12 +827,9 @@ async fn querying_capabilities_reflects_the_peers_real_payment_rail_state() {
     assert!(capabilities.lightning_available);
 }
 
-/// Yields pure `<think>...</think>` (no visible text at all) on its first
-/// `fail_first_n` calls, then a real answer — standing in for a bare local
-/// model that sometimes produces only reasoning with nothing after it.
-/// `calls` counts every `stream_complete` invocation, so a test can assert
-/// the lender actually retried locally rather than shipping the empty
-/// attempt to the wire.
+/// Yields pure `<think>...</think>` on its first `fail_first_n` calls, then a
+/// real answer. `calls` counts every `stream_complete` invocation, so a test can
+/// assert the lender retried locally rather than shipping the empty attempt.
 struct EmptyThenRealProvider {
     fail_first_n: usize,
     calls: std::sync::atomic::AtomicUsize,
@@ -972,11 +965,9 @@ async fn a_lend_side_empty_completion_is_retried_and_the_real_answer_reaches_the
     );
 }
 
-/// A lender that never produces visible text — not even on the last
-/// attempt — must still terminate with a usage chunk rather than hang or
-/// error, bounded at `MAX_EMPTY_COMPLETION_ATTEMPTS` calls, so a permanently
-/// unproductive backing provider can't turn into runaway local compute
-/// spend or a stuck borrower.
+/// A lender that never produces visible text must still terminate with a usage
+/// chunk, bounded at `MAX_EMPTY_COMPLETION_ATTEMPTS` calls, so an unproductive
+/// backing provider cannot become runaway local spend or a stuck borrower.
 #[tokio::test]
 async fn a_lend_side_completion_that_never_produces_visible_text_still_terminates() {
     let (a_transport, a_dir) = spawn_transport().await; // the lender

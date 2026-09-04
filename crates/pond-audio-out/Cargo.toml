@@ -5,18 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
-# ── Why this crate exists ─────────────────────────────────────────────────────
-# The speaker-side counterpart to `pond-audio` (which owns the microphone).
-#
-# These helpers lived inside `pond-adapters-piper` and were `pub(crate)`, so a
-# second TTS engine could only have them by copy-paste. They are entirely
-# backend-agnostic — WAV in, speaker out, with barge-in and turn-generation
-# semantics that took several bugs to get right (see `play_wav`'s comments).
-# Exactly one implementation of that logic should exist.
-#
-# `pond-voice` is NOT the home: it is a deliberate leaf (std only, no rodio, no
-# anyhow) because `pond-desktop/src-tauri` declares its own workspace and can
-# only depend on a leaf.
+# The speaker-side counterpart to `pond-audio`: backend-agnostic WAV in, speaker
+# out, with the barge-in and turn-generation semantics documented on `play_wav`,
+# so a second TTS engine need not copy them. `pond-voice` cannot host it: it is a
+# std-only leaf because `pond-desktop/src-tauri` is a workspace of its own.
 
 [dependencies]
 pond-core = { workspace = true }

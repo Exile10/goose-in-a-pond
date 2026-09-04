@@ -1,32 +1,7 @@
-//! PAI-7 P3b: a person can see and dispose of a proposal over HTTP.
-//!
-//! P3a landed the `Proposal` domain, the port, `SqliteProposalRepository` and
-//! migrations 0041/0042, and stamped itself "NOTHING CONSTRUCTS IT YET" — no
-//! `AppState` field, no `main.rs` line, no route. This file drives the two
-//! routes that changed that, against a real database with real rows.
-//!
-//! The four claims that matter, all of them refusals:
-//!
-//! * **Invariant 4 — addressed to a profile, never broadcast.** A member sees
-//!   only their own proposals, and a caller who is not one member sees none.
-//!   `Household` is refused here as well as `Guest`, because `Household` is not
-//!   a weaker address than `Owner` — it *is* the broadcast.
-//! * **Invariant 5 — a `Guest` receives nothing.**
-//! * **Invariant 7 — a proposal expires**, on the read path, with no sweeper
-//!   involved.
-//! * **The decide route is not a second way to decide a user-staged draft.** It
-//!   would be if it read `DraftRepository::get`, and it would then skip the
-//!   policy tally and audit entry that `DraftMcpServer::decide` records — the
-//!   telemetry PAI-2 P8b's enforce flip is waiting on. A plain draft's id is a
-//!   404 here, and the draft is still pending afterwards.
-//!
-//! # Reaching each scope
-//!
-//! `identity_resolution::resolve` is what these routes call, so the fixtures
-//! produce the scopes the way production does rather than by asserting one:
-//! two members plus an unidentified session is `Guest`, one member plus an
-//! unidentified session is `Household`, and a session with a stored identity is
-//! `Owner`. No test here constructs a `ProfileScope`.
+//! PAI-7 P3b: a person can see and dispose of a proposal over HTTP, against a
+//! real database. All four claims are refusals: addressed to one profile, so
+//! `Household` and `Guest` see none; it expires on the read path; and a draft id
+//! 404s, since deciding one here would skip the policy tally and audit entry.
 
 use std::sync::Arc;
 
@@ -120,6 +95,7 @@ async fn make_app() -> Harness {
     hs.add_valid_token("test-token".to_string()).await;
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(hs),
@@ -140,6 +116,7 @@ async fn make_app() -> Harness {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         face_recognition: None,
@@ -439,13 +416,10 @@ async fn a_guest_receives_nothing_and_is_told_why() {
     );
 }
 
-/// Invariant 4's other half, and the deliberate cliff.
-///
-/// `Household` is the broadcast, so it cannot hold a proposal — even on a
-/// one-member pond, where it is the scope an unidentified session resolves to.
-/// This test exists to make that cost visible rather than discovered: on a
-/// default install nothing binds a session to a member yet, so this surface
-/// answers 403 until something does.
+/// Invariant 4's other half, and the deliberate cliff. `Household` is the
+/// broadcast, so it cannot hold a proposal, even on a one-member pond where an
+/// unidentified session resolves to it. On a default install nothing binds a
+/// session to a member yet, so this surface answers 403 until something does.
 #[tokio::test]
 async fn an_unidentified_session_on_a_one_member_pond_is_still_refused() {
     let h = make_app().await;

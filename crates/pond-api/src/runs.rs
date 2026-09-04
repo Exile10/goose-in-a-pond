@@ -1,38 +1,7 @@
-//! Agent turns that outlive the connection that asked for them.
-//!
-//! A turn used to *be* the SSE response body: `chat_stream_inner` opened the
-//! agent stream inside `async_stream!` and yielded frames straight out of it.
-//! That made the connection the turn's owner, and dropping the connection its
-//! cancellation — deliberately so, and documented as such in
-//! `pond-adapters-goose`'s `chat_stream`, where a `DropGuard` cancels the token
-//! handed to the agent loop.
-//!
-//! It also meant a reload killed the answer mid-sentence. The user's message is
-//! persisted before inference starts and the assistant's only after the token
-//! loop drains, so a client that went away between the two left the question
-//! stored and the answer nowhere.
-//!
-//! Here the turn is a task instead, driving a [`RunHandle`]. The handle keeps a
-//! sequenced ring of frames it has already produced plus a broadcast channel for
-//! the live tail, so every SSE body — the original POST and every reattach — is
-//! a *subscriber*: replay what you missed, then follow along. This is the shape
-//! `notifications_stream` already uses (replay the undelivered queue, then tail
-//! the broadcast), for the same reason.
-//!
-//! # Two policies, because "nobody is listening" does not always mean "stop"
-//!
-//! [`RunPolicy::Ephemeral`] reproduces the old contract exactly: when the last
-//! subscriber leaves, cancel. [`RunPolicy::Detached`] ignores the subscriber
-//! count. The default is `Ephemeral` and that default is load-bearing — see
-//! `RunPolicy`'s own documentation for the voice path that depends on it.
-//!
-//! # What this does NOT survive
-//!
-//! A restart of *this process*. The registry is in memory, and so is everything
-//! a run needs: the agent's state, its cancellation token, its authority lease,
-//! its device claim. [`RunSupervisor::epoch`] exists so a client is told that
-//! plainly instead of being handed an indistinguishable 404 — see
-//! `epoch`'s documentation.
+//! Agent turns that outlive the connection that asked for them: a turn is a task driving a
+//! [`RunHandle`], and every SSE body — the original POST and each reattach — is a subscriber that
+//! replays the sequenced frame ring then tails the broadcast. The default [`RunPolicy::Ephemeral`]
+//! is load-bearing. Nothing survives a process restart; [`RunSupervisor::epoch`] says so honestly.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -46,24 +15,18 @@ use tokio_util::sync::CancellationToken;
 /// compared, logged, and put in a URL.
 pub type RunId = String;
 
-/// How many frames a run keeps for replay.
-///
-/// Sized against the failure this exists for: a desktop reload is seconds, not
-/// minutes. Two thousand frames is a long answer's worth of tokens plus every
-/// tool and thinking frame around it, and it bounds what one abandoned run can
-/// hold when nobody ever comes back for it.
+/// How many frames a run keeps for replay. Sized for the failure it exists for, a desktop reload of
+/// seconds: 2048 frames is a long answer's worth of tokens plus its tool and thinking frames, and
+/// it bounds what one abandoned run can hold.
 const MAX_FRAMES: usize = 2048;
 
 /// Byte ceiling for the same ring, because frame COUNT is a poor proxy for
 /// memory once a tool result arrives carrying a base64 image.
 const MAX_BYTES: usize = 1024 * 1024;
 
-/// Live fan-out depth.
-///
-/// Deliberately smaller than [`MAX_FRAMES`], and that relationship is the whole
-/// reason a lagging subscriber is recoverable: anything the broadcast queue
-/// drops is still in the ring, so `RecvError::Lagged` becomes "re-read from
-/// where you actually are" rather than a hole in the transcript.
+/// Live fan-out depth. Must stay smaller than [`MAX_FRAMES`]: that is what makes a lagging
+/// subscriber recoverable, since anything the broadcast queue drops is still in the replay ring,
+/// so `RecvError::Lagged` means "re-read from where you are" rather than a hole in the transcript.
 const BROADCAST_CAP: usize = 256;
 
 const _: () = assert!(
@@ -72,12 +35,9 @@ const _: () = assert!(
      or a lagging subscriber has no way back"
 );
 
-/// Where a finished run stops being reattachable.
-///
-/// Long enough to cover what it is for — a reload is one to three seconds, a
-/// full restart with re-authentication perhaps twenty — with an order of
-/// magnitude spare, and short enough that a pond does not accumulate finished
-/// turns nobody asked for.
+/// Where a finished run stops being reattachable. A reload takes one to three seconds and a full
+/// restart with re-authentication perhaps twenty, so 120s leaves an order of magnitude spare while
+/// still keeping finished turns from accumulating.
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(120);
 
 /// How many detached runs may be in flight at once.
@@ -112,24 +72,19 @@ impl RunState {
 pub enum RunOwner {
     /// The bearer token named a paired device.
     Device(String),
-    /// The pond could not name a device — the loopback development bypass, or a
-    /// token the handshake could not attribute. Reattach then needs only a valid
-    /// token, which is the same rung the original request was granted. This
-    /// neither widens nor narrows anything; there is simply no finer rule
-    /// available for a caller that was never named.
+    /// The pond could not name a device: the loopback development bypass, or a token the handshake
+    /// could not attribute. Reattach then needs only a valid token, the same rung the original
+    /// request was granted, since no finer rule exists for a caller that was never named.
     Unattributed,
 }
 
 /// Whether being abandoned ends a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunPolicy {
-    /// The historical contract: last subscriber out cancels the turn.
-    ///
-    /// The voice path depends on this and must keep it. `WebVoiceBackend` fires
-    /// a *speculative* `/chat/stream` the moment trailing silence begins —
-    /// before the pause is confirmed — and aborts it when speech resumes. Under
-    /// `Detached` that speculative turn would run to completion and persist a
-    /// question-and-answer pair for a half-sentence nobody finished saying.
+    /// Last subscriber out cancels the turn. The voice path depends on it: `WebVoiceBackend` fires
+    /// a speculative `/chat/stream` at the first trailing silence and aborts it when speech
+    /// resumes, and under `Detached` that turn would finish and persist a question and answer for
+    /// a half-sentence nobody said.
     Ephemeral,
     /// Nobody listening is not a reason to stop.
     Detached,
@@ -139,11 +94,8 @@ pub enum RunPolicy {
 
 /// One SSE frame, exactly as a client receives it.
 ///
-/// `payload` is the `data:` line the existing frame builders already produce and
-/// is never re-parsed. The sequence number rides in the SSE `id:` field instead,
-/// which every SSE parser already surfaces — so no existing frame shape changes,
-/// and a per-token JSON round-trip is not added to the hot path of a device that
-/// may be a Jetson.
+/// `payload` is the `data:` line the frame builders produce and is never re-parsed; the sequence
+/// number rides in the SSE `id:` field, so no frame shape changes and the hot path stays JSON-free.
 #[derive(Clone, Debug)]
 pub struct RunFrame {
     pub seq: u64,
@@ -375,11 +327,8 @@ struct RegistryInner {
 
 /// Every run this process is driving, plus the ones it has recently finished.
 ///
-/// `std::sync::Mutex<HashMap>` rather than a concurrent map: this is touched
-/// once per run start, per reattach and per sweep — never per token — so
-/// contention is not a consideration, and `std`'s mutex is the one that makes
-/// holding a lock across an `.await` a compile error rather than a silent stall.
-/// Nothing here awaits inside the lock.
+/// `std::sync::Mutex` rather than a concurrent map: it is touched per run start, reattach and
+/// sweep, never per token, and it makes holding the lock across an `.await` a compile error.
 pub struct RunRegistry {
     inner: Mutex<RegistryInner>,
     max_runs: usize,
@@ -498,27 +447,18 @@ impl RunRegistry {
     }
 }
 
-/// Everything the API layer needs to own detached runs.
-///
-/// One field on `AppState` rather than three, because roughly thirty
-/// integration-test fixtures spell `AppState` out as a struct literal and each
-/// extra field is thirty more mechanical edits.
+/// Everything the API layer needs to own detached runs, as ONE `AppState` field rather than three:
+/// roughly thirty integration-test fixtures spell `AppState` out as a struct literal, so every
+/// extra field costs thirty mechanical edits.
 pub struct RunSupervisor {
     pub registry: RunRegistry,
-    /// Bounds concurrent DETACHED runs.
-    ///
-    /// Deliberately not `sse_semaphore`, for the reason already written on
-    /// `notification_sse_semaphore`: one counter cannot mean both "clients
-    /// reading" and "runs in flight". A detached run outlives its connection, so
-    /// sharing the small interactive pool would let a handful of abandoned runs
-    /// starve chat entirely.
+    /// Bounds concurrent DETACHED runs. Deliberately not `sse_semaphore`: one counter cannot mean
+    /// both "clients reading" and "runs in flight", and since a detached run outlives its
+    /// connection, sharing the small interactive pool would let a few abandoned runs starve chat.
     pub permits: Arc<tokio::sync::Semaphore>,
-    /// Identifies THIS process.
-    ///
-    /// A run id minted under a different epoch names a run that died with the
-    /// last process. Saying so is the difference between an honest "the server
-    /// restarted, reload the session" and a bare 404 the client cannot tell
-    /// apart from "your run finished and aged out".
+    /// Identifies THIS process. A run id minted under a different epoch names a run that died with
+    /// the last process; saying so lets the client distinguish a restart from "your run finished
+    /// and aged out", which a bare 404 cannot.
     pub epoch: String,
 }
 

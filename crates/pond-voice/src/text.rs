@@ -945,6 +945,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn punctuation_survives_the_whole_speech_pass() {
+        // The marks are prosody once they reach Kokoro — a comma is a pause, a
+        // question mark bends the pitch up — so this pass must not treat them
+        // as formatting. It never did; the loss was downstream, in espeak. This
+        // is here so that stays true.
+        assert_eq!(
+            strip_markdown_for_speech("**Hello**, world! Are you _sure_? Yes; really."),
+            "Hello, world! Are you sure? Yes; really.",
+        );
+    }
+
+    #[test]
     fn markdown_bold_stripped() {
         assert_eq!(
             strip_markdown_for_speech("The **quick** fox"),

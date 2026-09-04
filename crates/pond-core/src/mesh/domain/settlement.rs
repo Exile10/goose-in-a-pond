@@ -6,19 +6,10 @@ use serde::{Deserialize, Serialize};
 use super::millisats::Millisats;
 use super::peer_id::PeerId;
 
-/// The exchange rate every Pond settles at: millisats owed per borrowed
-/// token.
+/// Millisats owed per borrowed token: the rate every Pond settles at.
 ///
-/// A dev-decided constant, not a per-Pond setting and not something the two
-/// sides of a borrow negotiate — a borrower that could set its own rate
-/// could simply decide to pay less (or nothing) regardless of what the
-/// lender expects. One number, baked into the software the same way on
-/// every install, is what makes "circle" trust meaningful for payment: your
-/// peer already trusts you enough to run their model; they don't also have
-/// to trust that your local settings weren't tampered with.
-///
-/// Not yet a final number — flagged internally as directional, not
-/// business-signed-off.
+/// Baked in, not negotiated and not per-Pond configurable — a borrower that could set
+/// its own rate could decide to pay less. Directional, not business-signed-off yet.
 pub const MESH_SETTLEMENT_MILLISATS_PER_TOKEN: u64 = 30;
 
 /// A completed off-hot-path Lightning settlement with a trusted peer.

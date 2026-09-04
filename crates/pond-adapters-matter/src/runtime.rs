@@ -1,29 +1,7 @@
-//! [`MatterRuntime`] — the reconciling owner of everything Matter.
-//!
-//! Wiring Matter used to be a one-shot decision in `serve()`: read
-//! `matter_enabled`, connect or fall back to the logging stub, done until the
-//! process restarted. That made the setting unusable from the UI — flipping it
-//! changed nothing anyone could see, so the "turn it on in Settings" error was
-//! advice the user could not act on.
-//!
-//! Here the decision becomes a loop. A single reconciler task owns the mutable
-//! state (controller child process, WebSocket, commissioner, bridge supervisor)
-//! and converges it toward whatever was last requested through
-//! [`MatterRuntimePort::apply`]. Desired state arrives over a `watch` channel,
-//! so rapid toggles coalesce to the final value and two reconciles can never
-//! interleave. Everything else in the process holds cells that stay valid
-//! across enable and disable:
-//!
-//! ```text
-//!   PUT /settings ─► apply(enabled, url) ─► watch ─► reconciler
-//!                                                       │
-//!               status cell ◄── Connecting/Connected/Unreachable
-//!          commissioner cell ◄── MatterCommissioner      (read by the API)
-//!              control cell  ◄── MatterDeviceControl     (read by the facade)
-//! ```
-//!
-//! Setup runs inside a `select!` against the next desired state, so a disable
-//! cancels an in-flight controller install instead of waiting minutes for it.
+//! [`MatterRuntime`] — the reconciling owner of everything Matter. One reconciler task owns
+//! the mutable state and converges it toward the last value sent through
+//! [`MatterRuntimePort::apply`] over a `watch` channel, so rapid toggles coalesce and two
+//! reconciles never interleave; setup runs in a `select!` so a disable cancels an install.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,11 +41,8 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long to wait for a killed controller to actually exit.
 ///
-/// Deliberately shorter than [`SHUTDOWN_TIMEOUT`], which this runs inside: a
-/// teardown that spent the whole shutdown budget waiting on one child would
-/// leave nothing for the rest of it. Generous even so — the signal is SIGKILL,
-/// so a process that has not gone in three seconds is wedged in the kernel and
-/// waiting longer will not help.
+/// Shorter than [`SHUTDOWN_TIMEOUT`], which this runs inside, so one child cannot spend the
+/// whole budget. The signal is SIGKILL: a process still alive after this is wedged.
 const KILL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The live [`MatterDeviceControl`], or `None` while Matter is off or
@@ -76,11 +51,8 @@ type ControlCell = Arc<RwLock<Option<Arc<MatterDeviceControl>>>>;
 
 /// What the runtime has been asked to converge to.
 ///
-/// `nonce` makes every [`MatterRuntimePort::apply`] a distinct value so the
-/// watch channel always wakes the reconciler. Whether that wake-up causes any
-/// work is decided by comparing against what is actually running — so a
-/// repeated save while connected is a no-op, while a repeated save while
-/// unreachable retries the connection.
+/// `nonce` makes every [`MatterRuntimePort::apply`] a distinct value so the watch channel
+/// always wakes the reconciler; whether that causes work is decided against what is running.
 #[derive(Clone, PartialEq, Eq)]
 struct Desired {
     url: String,
@@ -147,28 +119,18 @@ impl MatterRuntime {
         runtime
     }
 
-    /// Wait for the reconciler to reach a settled state, or for `timeout`.
-    ///
-    /// Startup calls this so the Matter lines land with the rest of the startup
-    /// log rather than arriving after the "listening" banner, which reads as if
-    /// something restarted. `apply` is deliberately non-blocking — a first-run
-    /// install takes minutes and serving must not wait on it — so this is the
-    /// bounded compromise: settle quickly in the ordinary case, give up and let
-    /// the install continue in the background in the slow one.
-    ///
-    /// Costs nothing when Matter is off: `apply` reaches `Disabled` without
-    /// touching the network, so this returns on the first poll.
+    /// Wait for the reconciler to reach a settled state, or for `timeout`, so the Matter
+    /// startup lines land before the "listening" banner. `apply` is deliberately
+    /// non-blocking because a first-run install takes minutes, so this is the bounded
+    /// compromise: settle quickly, or give up and let the install continue in background.
     pub async fn settle(&self, timeout: Duration) -> MatterStatus {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let status = self.status().await;
-            // `enabled` first, and this is the whole subtlety: `apply` only
-            // SENDS to the watch channel, so for a moment after it returns the
-            // reconciler has not woken and the status is still the initial
-            // `Disabled`. Polling only for "not Connecting" saw that and
-            // returned instantly — which is why the Matter lines still landed
-            // after the banner. Waiting for the reconciler to acknowledge the
-            // request is what makes this a wait rather than a race.
+            // `enabled` first: `apply` only SENDS to the watch channel, so for a
+            // moment after it returns the reconciler has not woken and the status
+            // is still the initial `Disabled`. Waiting for that acknowledgement is
+            // what makes this a wait rather than a race.
             if status.enabled && !matches!(status.state, MatterState::Connecting) {
                 return status;
             }
@@ -179,12 +141,10 @@ impl MatterRuntime {
         }
     }
 
-    /// Route the runtime's user-facing notifications through `sender`.
-    ///
-    /// Separate from construction because the notification stack is built after
-    /// the runtime is — see [`MatterNotifier`]. Call it before the first
-    /// [`apply`](MatterRuntimePort::apply), or a first-run install finishes
-    /// without the user ever being told it started.
+    /// Route the runtime's user-facing notifications through `sender`. Separate from
+    /// construction because the notification stack is built after the runtime; see
+    /// [`MatterNotifier`]. Call it before the first [`apply`](MatterRuntimePort::apply), or
+    /// a first-run install finishes without the user ever being told it started.
     pub async fn attach_notifications(&self, sender: Arc<dyn NotificationSender>) {
         self.notifier.attach(sender).await;
     }
@@ -274,14 +234,10 @@ struct Reconciler {
 /// What is currently running, owned by the reconciler task.
 #[derive(Default)]
 struct Running {
-    /// The controller GIAP started, if any. Killed explicitly on teardown:
-    /// `kill_on_drop` does not fire on the signal path, where the process exits
-    /// without unwinding, and the controller would outlive the Pond.
-    ///
-    /// Shared with the supervisor rather than held outright: when the
-    /// supervisor finds the process dead it starts a replacement and parks the
-    /// new handle here, so teardown kills the controller that is actually
-    /// running instead of a handle to something that exited long ago.
+    /// The controller GIAP started, if any. Killed explicitly on teardown: `kill_on_drop`
+    /// does not fire on the signal path, where the process exits without unwinding, so the
+    /// controller would outlive the Pond. Shared with the supervisor, which parks a
+    /// respawned handle here, so teardown kills the controller actually running.
     child: SharedServerChild,
     supervisor: Option<JoinHandle<()>>,
 }
@@ -307,18 +263,10 @@ async fn reconcile_loop(mut rx: watch::Receiver<Desired>, r: Reconciler) {
             return;
         }
 
-        // Nothing has been asked for yet.
-        //
-        // `nonce` is zero only in the channel's initial value, and every `apply`
-        // increments it — so this is the one reliable way to tell "no request"
-        // from "a request that happens to look like the default". Without it the
-        // first pass ran with an EMPTY url: `changed` is false (""=="") and
-        // `healthy` is false, so the guard below fired, `connect` bailed with
-        // "no Matter controller address is set", and the runtime sat in
-        // `Unreachable` before anyone had asked it for anything. Startup's wait
-        // then saw that as a settled state and returned instantly, which is why
-        // the Matter lines landed after the banner on some runs and before it on
-        // others — a race against a cycle that should never have happened.
+        // Nothing has been asked for yet. `nonce` is zero only in the channel's initial
+        // value and every `apply` increments it, so this is the one reliable way to tell
+        // "no request" from "a request that looks like the default". Without it the first
+        // pass ran with an empty url and settled in `Unreachable` before anyone asked.
         if want.nonce == 0 {
             if rx.changed().await.is_err() {
                 teardown(&mut running, &r).await;
@@ -374,12 +322,10 @@ async fn reconcile_loop(mut rx: watch::Receiver<Desired>, r: Reconciler) {
                             );
                         }
                         Err(e) => {
-                            // `describe` and not `to_string`: this string is
-                            // the ONLY account of the failure the user gets, and
-                            // plain Display shows just the outermost context —
-                            // "connecting to the controller at ws://…" with the
-                            // reason thrown away. It is also served by
-                            // `GET /api/v1/matter/status`, hence the redaction.
+                            // `describe` and not `to_string`: this is the only
+                            // account of the failure the user gets, and Display
+                            // shows the outermost context with the reason thrown
+                            // away. Served by `GET /api/v1/matter/status`, so redacted.
                             let error = describe(&e);
                             tracing::warn!(
                                 target: "giap::trace",
@@ -508,36 +454,17 @@ async fn teardown(running: &mut Running, r: &Reconciler) {
 
 /// Kill the controller GIAP started, whichever process that currently is.
 ///
-/// Reads the handle out of the shared cell rather than taking a `Child` by
-/// value: after a respawn the handle from `connect` refers to a process that
-/// exited long ago, and killing that one would leave the live controller
-/// running past the Pond. Empty cell means GIAP started nothing — the user's
-/// own controller is theirs to stop.
+/// Reads the handle out of the shared cell rather than taking a `Child` by value: after a
+/// respawn the `connect` handle names a dead process. Empty cell means GIAP started none.
 pub(crate) async fn stop_controller(child: &SharedServerChild, data_dir: &std::path::Path) {
     if let Some(mut running) = child.lock().await.take() {
         tracing::info!("matter: stopping the controller GIAP started");
         let _ = running.start_kill();
 
-        // AWAITED, not merely signalled. `start_kill` sends the signal and
-        // returns, so this function used to report a stopped controller while
-        // the process was still bound to the port -- and the very next thing a
-        // restart does is probe that port. It found the dying controller,
-        // which resets the connection on its way out, classified that as
-        // `Occupant::Foreign`, and refused to start:
-        //
-        //     matter: the controller port belongs to something else
-        //     port 5580 is already in use by something that is not a
-        //     giap-matter controller ... Connection reset by peer
-        //
-        // Matter then sat `unreachable` with a message blaming a process that
-        // did not exist. Latent until now, because the only thing that
-        // restarted a controller was a URL change -- which usually means a
-        // different port, so nothing raced. Toggling BLE restarts on the SAME
-        // port, which made it routine.
-        //
-        // Bounded because shutdown must not hang, though SIGKILL cannot be
-        // refused: the timeout is for a process wedged in the kernel, not for
-        // one that might ignore us.
+        // AWAITED, not merely signalled: `start_kill` returns before the process
+        // releases the port, and a restart probing that port finds the dying
+        // controller, classifies it `Occupant::Foreign` and refuses to start.
+        // Bounded because shutdown must not hang; SIGKILL itself cannot be refused.
         if tokio::time::timeout(KILL_TIMEOUT, running.wait())
             .await
             .is_err()
@@ -557,13 +484,10 @@ pub(crate) async fn stop_controller(child: &SharedServerChild, data_dir: &std::p
     }
 }
 
-/// A [`DeviceControlPort`] that follows the runtime: Matter while connected,
-/// a fallback (the logging stub) otherwise.
-///
-/// The port is cloned into the agent, the MCP server, and the tool wiring at
-/// startup, so it has to be one `Arc` that lives for the whole process. This
-/// facade is that `Arc`; the decision moves behind it, into a cell the
-/// reconciler writes.
+/// A [`DeviceControlPort`] that follows the runtime: Matter while connected, a fallback
+/// (the logging stub) otherwise. Cloned into the agent, the MCP server and the tool wiring
+/// at startup, so it must be one `Arc` for the whole process; the decision moves behind it,
+/// into a cell the reconciler writes.
 pub struct SwitchableDeviceControl {
     matter: ControlCell,
     status: Arc<RwLock<MatterStatus>>,
@@ -571,24 +495,10 @@ pub struct SwitchableDeviceControl {
 }
 
 impl SwitchableDeviceControl {
-    /// The backend for `device_id`, or the reason there is none.
-    ///
-    /// A Matter device never falls back. The stub answers every verb with
-    /// success, so routing `matter-18` to it while Matter was off reported the
-    /// fan as switched on when nothing had been sent anywhere — the agent then
-    /// told the user so, truthfully relaying a lie it had been handed. A device
-    /// on some other transport still falls back, which is what the stub is for.
-    ///
-    /// The test is `is_matter_device_id` — a PREFIX check — and not "does this id
-    /// parse as a node id". The two differ for any Matter id this grammar cannot
-    /// read, and the difference is which way the mistake falls: a parse test sends
-    /// such an id to the stub, which is the exact lie above. A prefix test sends it
-    /// to the error below, which names a real state the user can act on. It also
-    /// keeps working when the id grammar grows, as it is about to for bridged
-    /// devices.
-    ///
-    /// The backend is cloned so the lock is released before any await on the
-    /// network.
+    /// The backend for `device_id`, or the reason there is none. A Matter device never
+    /// falls back: the stub answers every verb with success and would report the device
+    /// switched on when nothing was sent. The test is the PREFIX check
+    /// `is_matter_device_id`, so an unreadable Matter id reaches the error, not the stub.
     async fn backend_for(&self, device_id: &str) -> Result<Arc<dyn DeviceControlPort>> {
         if let Some(matter) = self.matter.read().await.clone() {
             return Ok(matter);
@@ -757,17 +667,10 @@ mod controller_lifetime_tests {
             .unwrap_or(false)
     }
 
-    /// The controller is GONE when `stop_controller` returns, not merely
-    /// signalled.
+    /// The controller is GONE when `stop_controller` returns, not merely signalled.
     ///
-    /// `start_kill` sends the signal and returns, so this reported a stopped
-    /// controller while the process still held the Matter port. A restart
-    /// probes that port immediately, found the dying controller resetting
-    /// connections on its way out, classified it `Occupant::Foreign` and
-    /// refused to start — leaving Matter `unreachable` with a message blaming a
-    /// process that no longer existed. Found by toggling BLE, which restarts on
-    /// the same port; a URL change usually moves the port, which is why this
-    /// stayed hidden.
+    /// `start_kill` only sends the signal, so a restart probing the Matter port finds the
+    /// dying controller, classifies it `Occupant::Foreign` and refuses to start.
     #[tokio::test]
     async fn stopping_the_controller_waits_for_it_to_actually_exit() {
         let spawned = tokio::process::Command::new("sleep")

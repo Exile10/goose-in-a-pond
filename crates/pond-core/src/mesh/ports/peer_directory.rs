@@ -15,9 +15,8 @@ pub enum PeerDirectoryError {
 
 /// Driven Port: PeerDirectory
 ///
-/// Owns which peers this Pond trusts and at what scope. `MeshTransport`
-/// consults this before connecting; a peer absent from the directory is not
-/// trusted at all.
+/// Owns which peers this Pond trusts and at what scope. `MeshTransport` consults this
+/// before connecting; a peer absent from the directory is not trusted at all.
 #[async_trait]
 pub trait PeerDirectory: Send + Sync {
     async fn add_trusted_peer(

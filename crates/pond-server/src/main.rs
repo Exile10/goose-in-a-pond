@@ -3,7 +3,7 @@
 //! Usage:
 //!   pond-server setup [--model tiny|base|small]
 //!   pond-server serve [--port PORT] [--open]
-//!   pond-server chat  [--provider mock|llamafile|ollama] [--model MODEL] [--input stdin|whisper] [--whisper-url URL]
+//!   pond-server chat  [--voice] [--provider mock|llamafile|ollama] [--model MODEL]
 //!   pond-server status
 //!
 //! # TODO — Setup Script
@@ -152,11 +152,16 @@ enum Commands {
         #[arg(short = 'M', long)]
         model: Option<String>,
 
-        /// Input source: stdin (text) or whisper (microphone → ASR)
-        #[arg(short = 'I', long, default_value = "stdin")]
-        input: String,
+        /// Listen on the microphone instead of the keyboard.
+        ///
+        /// One flag turns on the whole stack — wake word, speech detection,
+        /// recognition, spoken reply — and fetches whatever part of it is not
+        /// on disk yet. It replaces `--input stdin|whisper`, which asked the
+        /// operator to name a component in order to choose a mode.
+        #[arg(long)]
+        voice: bool,
 
-        /// Enable voice-based wake word detection (requires --input whisper).
+        /// Enable voice-based wake word detection (requires --voice).
         /// Say the trigger phrase to activate the assistant before each turn.
         /// Defaults to the wake word stored in Settings.
         #[arg(long)]
@@ -166,8 +171,9 @@ enum Commands {
         #[arg(long)]
         no_wake_word: bool,
 
-        /// Text-to-speech engine: piper, or none (print only).
-        /// Defaults to the active TTS model stored in Settings.
+        /// Text-to-speech engine: kokoro, or none (print only).
+        /// Defaults to kokoro, which is the only engine there is — the help
+        /// said `piper` for two releases after Piper stopped being wired.
         #[arg(long)]
         tts: Option<String>,
 
@@ -426,6 +432,20 @@ fn main() -> Result<()> {
     // wrong yet, and the subsystems that need Node say so themselves if it
     // turns out not to be there at all.
     node_path::ensure_node_on_path();
+    // Name the TLS provider before anything can ask rustls to guess.
+    //
+    // This workspace enables BOTH of rustls' crypto backends without meaning
+    // to: `aws_lc_rs` from the root Cargo.toml and `ring` from hyper-rustls via
+    // reqwest. rustls refuses to pick between them, and every entry point that
+    // infers a provider panics rather than returning an error — on whatever
+    // background worker happened to touch TLS first, which is a crash with no
+    // relationship to the code that caused it.
+    //
+    // Installing one here makes the answer deterministic for the whole process,
+    // including dependencies that will hit the inferring path later. `Err` means
+    // somebody already installed one, which is equally fine and not worth
+    // failing a boot over.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -525,7 +545,7 @@ async fn async_main() -> Result<()> {
         Some(Commands::Chat {
             provider,
             model,
-            input,
+            voice,
             wake_word,
             no_wake_word,
             tts,
@@ -546,7 +566,7 @@ async fn async_main() -> Result<()> {
             run_chat(
                 provider.as_deref(),
                 model.as_deref(),
-                &input,
+                voice,
                 wake_word.as_deref(),
                 no_wake_word,
                 tts.as_deref(),
@@ -581,7 +601,7 @@ async fn async_main() -> Result<()> {
         None => {
             // Default: run interactive chat (backward compat) — provider comes from Settings
             let _log = tracing_setup::init_tracing(false, &data_dir);
-            run_chat(None, None, "stdin", None, true, Some("none"), None, false).await
+            run_chat(None, None, false, None, true, Some("none"), None, false).await
         }
     }
 }
@@ -887,7 +907,7 @@ async fn run_setup(model: &str) -> Result<()> {
     println!("     and assign model roles (chat / think / task).");
     println!();
     println!("  Or run interactive CLI chat (configure voice + TTS via Settings first):");
-    println!("       pond-server chat --input whisper");
+    println!("       pond-server chat --voice");
     println!("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     Ok(())
@@ -1051,14 +1071,28 @@ fn report_acceleration() {
     #[cfg(not(feature = "local-inference"))]
     let cuda_build = false;
 
-    let model = std::fs::read_to_string("/proc/device-tree/model").ok();
+    // A device profile answers for the host when one is active, so a Mac can
+    // reach this table's other cells. Inert unless POND_DEVICE_PROFILE is set,
+    // which nothing in production or in deploy.sh sets.
+    let profile = pond_core::models::domain::device_profile::active();
+
+    let probed = std::fs::read_to_string("/proc/device-tree/model").ok();
     // The device tree pads with NULs; a trailing NUL would defeat a `contains`
     // on some readers and costs nothing to strip.
-    let model = model.as_deref().map(|m| m.trim_end_matches('\0').trim());
-    let accelerated = host_is_accelerated(
-        model,
-        std::path::Path::new("/etc/nv_tegra_release").exists(),
-    );
+    let probed = probed.as_deref().map(|m| m.trim_end_matches('\0').trim());
+
+    let (model, tegra_release) = match profile {
+        Some(p) => (p.device_tree_model.as_deref(), p.has_tegra_release),
+        None => (
+            probed,
+            std::path::Path::new("/etc/nv_tegra_release").exists(),
+        ),
+    };
+    let accelerated = host_is_accelerated(model, tegra_release);
+    // An emulated CUDA build is a claim about the binary, not the host, so it is
+    // OR-ed rather than substituted: a real CUDA build must never be talked out
+    // of reporting itself by a profile.
+    let cuda_build = cuda_build || profile.is_some_and(|p| p.pretend_cuda);
 
     match warning(classify(accelerated, cuda_build)) {
         Some(w) => tracing::error!("{w}"),
@@ -2157,6 +2191,8 @@ async fn run_server(
                         saw_activity_since_start,
                         idle_for,
                         idle_threshold,
+                        // Never exempt: a pond nobody has talked to has nothing to consolidate.
+                        false,
                     )
                     .await
                 else {
@@ -2438,6 +2474,8 @@ async fn run_server(
                         saw_activity_since_start,
                         idle_for,
                         idle_threshold,
+                        // Never exempt: no turn since boot means no conversation to name.
+                        false,
                     )
                     .await
                 else {
@@ -2577,30 +2615,15 @@ async fn run_server(
         // coordinates default to 0), so requiring coordinates here left every
         // onboarded install with weather permanently "not configured"; the
         // adapter geocodes the name on demand.
-        if settings.weather_enabled
-            && (settings.weather_latitude != 0.0
-                || settings.weather_longitude != 0.0
-                || !settings.weather_location_name.trim().is_empty())
-        {
-            let loc = if settings.weather_location_name.is_empty() {
-                format!(
-                    "{:.3}, {:.3}",
-                    settings.weather_latitude, settings.weather_longitude
-                )
-            } else {
-                settings.weather_location_name.clone()
-            };
-            tracing::info!(
-                "weather enabled: {} ({}, {})",
-                loc,
-                settings.weather_latitude,
-                settings.weather_longitude
-            );
-            Some(Arc::new(OpenMeteoWeatherAdapter::new(
-                settings.weather_latitude,
-                settings.weather_longitude,
-                loc,
-            )))
+        // Asked, not read. `Location::weather_target` is the one place that
+        // decides whether this pond knows enough to ask about the weather, and
+        // it is the same answer voice mode gets below — these were two copies
+        // of the same six lines, and both of them missed the time-zone
+        // fallback that `location::resolve` has always applied.
+        let place = pond_core::user_data::services::location::resolve(&settings);
+        if let (true, Some((lat, lon, loc))) = (settings.weather_enabled, place.weather_target()) {
+            tracing::info!("weather enabled: {} ({}, {})", loc, lat, lon);
+            Some(Arc::new(OpenMeteoWeatherAdapter::new(lat, lon, loc)))
         } else {
             tracing::info!(
                 "weather disabled — enable via PUT /api/v1/settings (weather_enabled + lat/lon or location_name)"
@@ -2762,6 +2785,13 @@ async fn run_server(
         }
     };
 
+    // The sensor-RULE tools live in `giap-sensors` but need the scheduler, and
+    // the scheduler is built here rather than beside the other sensor deps —
+    // hence a second install rather than reordering startup around it.
+    if let Some(sched) = scheduler.clone() {
+        pond_mcp_server::init_sensor_rule_deps(sched, settings_repo.clone());
+    }
+
     // MCP Memory — enabled when --features mcp-memory is passed at build time.
     #[cfg(feature = "mcp-memory")]
     let mcp_memory: Option<
@@ -2853,7 +2883,7 @@ async fn run_server(
         let started_at_utc = chrono::Utc::now();
 
         tokio::spawn(async move {
-            use pond_core::context::index_maintenance::run_index_maintenance;
+            use pond_core::context::index_maintenance::{plan_sweep, run_index_maintenance};
             // Same alias the other three schedule blocks in this file use. The
             // sweep reads the shared inactivity threshold so it waits on the
             // same definition of "idle" as consolidation, rather than a second
@@ -2862,6 +2892,8 @@ async fn run_server(
 
             let poll = std::time::Duration::from_secs(INDEX_MAINTENANCE_POLL_SECS);
             let chore_idle = std::time::Duration::from_secs(sched::INACTIVITY_THRESHOLD_SECS);
+            // Whether a pass has COMPLETED since this process started.
+            let mut indexed_since_boot = false;
 
             tokio::select! {
                 _ = cancel.cancelled() => return,
@@ -2906,6 +2938,9 @@ async fn run_server(
                     (poll, chore_idle)
                 };
 
+                let first_post_boot = !indexed_since_boot;
+                let tick = plan_sweep(asked, indexed_since_boot);
+
                 let Some(_slot) = sweep_lane
                     .acquire(
                         LaneJob::IndexMaintenance,
@@ -2917,27 +2952,90 @@ async fn run_server(
                         true,
                         floor,
                         // A person asking is itself the activity this guard
-                        // wants to have seen, and on a pond that has served no
-                        // turn since boot it would otherwise refuse forever.
-                        saw_activity_since_start || asked,
+                        // wants to have seen; so is the first pass after boot,
+                        // on a pond that would otherwise refuse forever. See
+                        // `plan_sweep` for why the index needs that exemption
+                        // when the other chores do not.
+                        saw_activity_since_start,
                         idle_for,
                         idle_threshold,
+                        // Per-job, so relaxing the gate for the index does not
+                        // hand the tick to a chore that is still gated.
+                        tick.exempt_from_activity_gate,
                     )
                     .await
                 else {
                     continue;
                 };
 
-                let report =
-                    run_index_maintenance(&index, storage.as_ref(), provider.as_ref(), &cancel)
-                        .await;
-                if asked {
+                // An exempt pass is exhaustive, so it must be interruptible --
+                // the alternative is a pond that boots, finds a mailbox to
+                // embed, and cannot be told to stop. A CHILD token so that
+                // giving the machine back does not also cancel the sweep task
+                // for the life of the process.
+                let pass = cancel.child_token();
+                // The baseline is the moment this pass was admitted. The
+                // watcher cancels only on activity NEWER than it — somebody
+                // actually came back — never on activity that merely happened
+                // recently. The previous predicate (`elapsed() < chore_idle`)
+                // judged recency, and for a requested pass that inverted the
+                // gate's own decision: the gate waives idleness because the
+                // person pressing Reindex IS the reason to run, and then the
+                // watcher saw that same person's turn, still under fifteen
+                // minutes old, and killed the pass at its first tick — after
+                // the route had already CLEARED the index. Measured: press
+                // Reindex within 15 minutes of any turn and the pass died at
+                // ~15s with requested=true interrupted=true still_missing=1073.
+                // The same predicate also made the first-post-boot pass a
+                // near-miss: boot initialises the activity clock, and the pass
+                // fires at 16 minutes against a 15-minute threshold — one
+                // slow poll from cancelling itself forever.
+                let baseline = *sweep_activity.read().await;
+                let watcher = tokio::spawn({
+                    let pass = pass.clone();
+                    let activity = sweep_activity.clone();
+                    async move {
+                        // Only the in-process timestamp: it is written the
+                        // moment a turn starts, whereas the database one lags
+                        // by however long that turn takes to persist. This is
+                        // the signal that says "somebody is here NOW".
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            if *activity.read().await > baseline {
+                                pass.cancel();
+                                return;
+                            }
+                        }
+                    }
+                });
+
+                let report = run_index_maintenance(
+                    &index,
+                    storage.as_ref(),
+                    provider.as_ref(),
+                    &pass,
+                    tick.budget,
+                )
+                .await;
+                watcher.abort();
+
+                // The exemption is spent only by a pass that finished. One cut
+                // short by a member coming back has not indexed the backlog,
+                // and treating it as done would leave the pond in exactly the
+                // state the exemption exists to prevent.
+                if !pass.is_cancelled() {
+                    indexed_since_boot = true;
+                }
+
+                if asked || first_post_boot {
                     tracing::info!(
+                        requested = asked,
+                        interrupted = pass.is_cancelled(),
                         adopted = report.adopted,
                         summaries = report.summaries_indexed,
                         context = report.context_indexed,
                         still_missing = report.still_missing,
-                        "requested personal-context reindex finished"
+                        "personal-context index pass finished"
                     );
                 }
             }
@@ -3756,6 +3854,10 @@ async fn run_server(
     //    window of recent household facts to reason over, this wants every
     //    event exactly once so nothing is silently dropped by a ring that
     //    wrapped.
+    // Hoisted out of the block below so the router can reach it: the sweep and
+    // the "check now" route must be the SAME syncer, or the button and the
+    // timer become two implementations of one word.
+    let mut account_syncer: Option<Arc<dyn pond_core::context::ports::AccountSync>> = None;
     {
         let context_repo: Arc<dyn pond_core::context::ports::ContextRepository> = Arc::new(
             pond_infra::sqlite_context::SqliteContextRepository::new(
@@ -3791,6 +3893,47 @@ async fn run_server(
             embedding_provider.clone(),
             unified_retrieval,
         );
+
+        // PAI-8's first connector, on a timer.
+        //
+        // Deferred like the index sweep and for the same reason: a household's
+        // first turn after a restart must not wait while the pond talks to a
+        // calendar server. The interval is deliberately unhurried -- a calendar
+        // changes a few times a week, the ctag check makes an unchanged sync
+        // nearly free, and anything faster is load on somebody else's server
+        // for no new information.
+        if let Some(secrets) = secret_repo.clone() {
+            let syncer = Arc::new(pond_server::account_sync::AccountSyncer::new(
+                context_repo.clone(),
+                pipeline.clone(),
+                secrets.clone(),
+            ));
+            account_syncer = Some(syncer.clone());
+            tokio::spawn(async move {
+                const FIRST_RUN_DELAY: std::time::Duration = std::time::Duration::from_secs(90);
+                const INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+                tokio::time::sleep(FIRST_RUN_DELAY).await;
+                loop {
+                    match syncer.run(chrono::Utc::now()).await {
+                        Ok(report) if report.sources > 0 => tracing::info!(
+                            sources = report.sources,
+                            unchanged = report.unchanged,
+                            ingested = report.ingested,
+                            needs_reauth = report.needs_reauth,
+                            failed = report.failed,
+                            paused = report.paused,
+                            "account sync"
+                        ),
+                        // Silent when nothing is connected, which is every pond
+                        // until somebody connects something. A half-hourly line
+                        // saying "nothing" is how a log stops being read.
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "account sync could not run"),
+                    }
+                    tokio::time::sleep(INTERVAL).await;
+                }
+            });
+        }
 
         let ingest = Arc::new(pond_core::context::bus_ingest::BusIngest::new(
             context_repo,
@@ -3995,6 +4138,7 @@ async fn run_server(
         session_storage,
         http_client: reqwest::Client::new(),
         agent,
+        warmup: Default::default(),
         llm_provider,
         llamafile_url: llamafile_url.clone(),
         tts,
@@ -4017,6 +4161,7 @@ async fn run_server(
         // on a pond where nothing is going to refill, which is a lie that reads
         // as success -- the caller waits for a rebuild that never happens.
         index_reindex: index_sweep_running.then(|| index_reindex_requested.clone()),
+        account_sync: account_syncer.clone(),
         sensor_storage,
         camera_storage,
         prompt_template_dir: Some(data_dir.join("prompts")),
@@ -4224,6 +4369,13 @@ async fn run_server(
     }
 
     // Build router
+    // Precompile the static prompt prefix before the first message arrives:
+    // the model load and the multi-thousand-token preamble prefill move to
+    // boot, and turn 1 hits the engine's ReusePrefix path. Progress is
+    // mirrored into `state.warmup` for GET /api/v1/warmup (the UI's boot
+    // banner); the settings handler re-runs this on a provider/model change.
+    pond_api::spawn_prefix_prewarm(state.clone(), false);
+
     let app = pond_api::build_router(state, static_dir);
 
     // Resolve hostname — strip trailing ".local" if the OS already appended it
@@ -4398,11 +4550,91 @@ fn write_ndjson_line(ev: &pond_core::shared::domain::agent::WorkflowEvent) {
     }
 }
 
+/// Build the speech detector the capture loops should use, or `None` to keep
+/// the energy gate.
+///
+/// Diagnostics go to stderr rather than through `out!`: that macro is a no-op
+/// under `--json-events`, which is the only mode the desktop shell uses, so a
+/// warning printed with it would reach nobody in the case that matters most.
+///
+/// The composition root owns this choice because `pond-adapters-whisper` is in
+/// CI's fast-crate set and must stay buildable without an ONNX Runtime; it
+/// knows the trait and nothing else.
+///
+/// Every failure degrades to `None` rather than propagating — a missing model,
+/// a dead download, an ONNX Runtime that will not load. A pond that cannot load
+/// its VAD should be a pond with a worse VAD, not a deaf one, and the energy
+/// gate it falls back to is the one that shipped for a year.
+async fn build_speech_detector(
+    vad_backend: &str,
+    data_dir: &std::path::Path,
+) -> Option<Box<dyn pond_voice::dsp::SpeechDetector + Send>> {
+    if vad_backend.eq_ignore_ascii_case("rms") {
+        // The escape hatch, for a board whose ONNX Runtime is broken.
+        return None;
+    }
+    if !vad_backend.eq_ignore_ascii_case("silero") {
+        // Validation rejects anything outside `VAD_BACKENDS` at the API, but
+        // `apply_key` stores whatever is in the row verbatim, so a hand-edited
+        // database can still land here. Say so rather than silently choosing.
+        eprintln!("  Listen   unknown vad_backend \"{vad_backend}\" — using the energy gate.");
+        return None;
+    }
+
+    // This DOES download, in front of `ready`, which is the opposite of what
+    // the Kokoro engine does a few hundred lines below — and deliberately.
+    // Kokoro's weights are 92 MB and `serve` has already fetched them, so the
+    // voice child can refuse and report a diagnostic. These are 2 MB, and
+    // `chat --voice` has to work as a standalone command with no server ever
+    // having run: refusing here would mean the detector is only ever on for
+    // people who happened to start the desktop first. The whisper model on the
+    // same path is 142 MB and fetches here too, so on the run where this is
+    // slow it is not what is making it slow.
+    let path = model_download::ensure_silero_model(data_dir).await?;
+
+    // Bounded, because a broken ONNX Runtime does not fail — it HANGS.
+    // `load-dynamic` with no dylib to open blocks forever inside ort's init,
+    // and an unbounded wait here is a permanently silent startup with nothing
+    // in the log. Kokoro's engine load is guarded the same way, for the same
+    // reason.
+    const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+    let loading = tokio::time::timeout(
+        LOAD_TIMEOUT,
+        tokio::task::spawn_blocking(move || pond_adapters_silero::SileroDetector::new(&path)),
+    )
+    .await;
+
+    match loading {
+        Ok(Ok(Ok(detector))) => {
+            tracing::info!("silero VAD active");
+            Some(Box::new(detector) as Box<dyn pond_voice::dsp::SpeechDetector + Send>)
+        }
+        Ok(Ok(Err(e))) => {
+            eprintln!("  Listen   silero VAD failed to load: {e}");
+            eprintln!("           Using the energy gate.");
+            None
+        }
+        Ok(Err(e)) => {
+            eprintln!("  Listen   silero VAD load panicked: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "  Listen   silero VAD load timed out after {}s — the ONNX Runtime is \
+                 probably missing or version-incompatible.",
+                LOAD_TIMEOUT.as_secs()
+            );
+            eprintln!("           Using the energy gate.");
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_chat(
     provider: Option<&str>,
     model: Option<&str>,
-    input: &str,
+    voice_mode: bool,
     wake_word: Option<&str>,
     no_wake_word: bool,
     tts: Option<&str>,
@@ -4492,6 +4724,23 @@ async fn run_chat(
         Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
     );
 
+    // And the personal-context read handles — the fourth verse of the same
+    // song (audit #115/#157, vision #130, sensors above): `serve` installed
+    // them and this path did not, so the first voice session that loaded
+    // giap-context panicked with "init_context_deps() not called"
+    // (2026-08-27) — and, before the spawn fns learned to degrade, took every
+    // other builtin server down with it. No vector index or embedder here:
+    // like the serve path without an embedding provider, `recall` answers
+    // nothing rather than quietly degrading to context-only results.
+    pond_mcp_server::context::init_context_deps(
+        Arc::new(pond_infra::sqlite_context::SqliteContextRepository::new(
+            db.system.clone(),
+            Arc::new(pond_infra::rule_redactor::RuleRedactor::new()),
+        )),
+        None,
+        None,
+    );
+
     // Load settings and model registry early — drives provider, model, TTS, and wake word.
     // Falls back to Settings::default() when the DB has no rows yet (first run).
     let settings_repo_chat = SqliteSettingsRepository::new(db.system.clone());
@@ -4578,10 +4827,10 @@ async fn run_chat(
         }
     };
 
-    // Resolve the whisper ggml model path (used by both the in-process backend
-    // and the legacy HTTP subprocess). When voice input is not requested we
-    // still resolve the path to surface a clear download-needed message.
-    let whisper_model_path: Option<std::path::PathBuf> = if input == "whisper" {
+    // Resolve the whisper ggml model path for the in-process backend. Only
+    // under --voice: outside it there is no microphone and no reason to make a
+    // text session wait on a 142 MB download.
+    let whisper_model_path: Option<std::path::PathBuf> = if voice_mode {
         match voice_models.whisper.as_ref() {
             None => {
                 let name = settings.active_whisper_model.as_str();
@@ -4756,26 +5005,15 @@ async fn run_chat(
     // Wire weather so giap__get_current_weather MCP tool is available in voice mode.
     // Same gate as the primary wiring above: coordinates OR a location name (the
     // adapter geocodes the name), so an onboarded name-only config still works.
-    let weather: Option<Arc<dyn WeatherProvider>> = if settings.weather_enabled
-        && (settings.weather_latitude != 0.0
-            || settings.weather_longitude != 0.0
-            || !settings.weather_location_name.trim().is_empty())
-    {
-        let loc = if settings.weather_location_name.is_empty() {
-            format!(
-                "{:.3}, {:.3}",
-                settings.weather_latitude, settings.weather_longitude
-            )
-        } else {
-            settings.weather_location_name.clone()
-        };
-        Some(Arc::new(OpenMeteoWeatherAdapter::new(
-            settings.weather_latitude,
-            settings.weather_longitude,
-            loc,
-        )))
-    } else {
-        None
+    // The same question the HTTP wiring asks above, through the same function.
+    let weather: Option<Arc<dyn WeatherProvider>> = match (
+        settings.weather_enabled,
+        pond_core::user_data::services::location::resolve(&settings).weather_target(),
+    ) {
+        (true, Some((lat, lon, loc))) => {
+            Some(Arc::new(OpenMeteoWeatherAdapter::new(lat, lon, loc)))
+        }
+        _ => None,
     };
 
     // ── Build the GooseAdapter (MCP tools + model routing) ───────────────────────
@@ -4826,7 +5064,7 @@ async fn run_chat(
             Arc::new(pond_infra::logging_device_control::LoggingDeviceControl::new()),
             Some(trim_storage), // powers the trimmer's summary splice
             Some(chat_model_repo.clone()),
-            input == "whisper",                       // voice_mode
+            voice_mode,
             Arc::new(tokio::sync::RwLock::new(None)), // mesh_provider — CLI chat doesn't build the mesh stack (server-only for now)
         )
         .await;
@@ -4853,14 +5091,18 @@ async fn run_chat(
                 let persona =
                     pond_core::prompts::sanitize_field(&settings.assistant_personality, 200);
                 let tz = pond_core::prompts::sanitize_field(&settings.timezone, 50);
-                let location = if settings.weather_location_name.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        "\nLocation: {}.",
-                        pond_core::prompts::sanitize_field(&settings.weather_location_name, 100)
-                    )
-                };
+                // Through the resolver, like `prompts.rs` already does. This
+                // copy read the raw field, so the two prompt paths described
+                // the same pond differently: one knew the time zone implied a
+                // city and the other said nothing at all.
+                let location =
+                    match pond_core::user_data::services::location::resolve(&settings).describe() {
+                        Some(place) => format!(
+                            "\nLocation: {}.",
+                            pond_core::prompts::sanitize_field(place, 100)
+                        ),
+                        None => String::new(),
+                    };
                 let addendum = pond_core::prompts::sanitize_field(&settings.prompt_addendum, 500);
                 pond_core::prompts::render_template(
                     &tmpl,
@@ -4890,6 +5132,7 @@ async fn run_chat(
         }
     }
 
+    let warm_agent = agent.clone();
     let mut chat_service = ChatService::new(agent, session_id.clone(), storage)
         .with_system_prompt(system_prompt)
         .with_thinking_tone(settings.voice_thinking_tone_enabled);
@@ -5015,7 +5258,7 @@ async fn run_chat(
     // Build a shared in-process Whisper backend once per session. It powers
     // both the `VoiceInput` adapter and the wake-word detector — no separate
     // KWS subprocess needed any more.
-    let whisper_backend: Option<Arc<WhisperRsInput>> = if input == "whisper" {
+    let whisper_backend: Option<Arc<WhisperRsInput>> = if voice_mode {
         match &whisper_model_path {
             Some(p) => match WhisperRsInput::new(p.clone(), mic_handle.clone()) {
                 Ok(w) => {
@@ -5067,8 +5310,18 @@ async fn run_chat(
         None
     };
 
-    let voice: Arc<dyn VoiceInput> = match (input, &whisper_backend) {
-        ("whisper", Some(backend)) => {
+    // Swap in the configured detector, if there is one and it loads. Done after
+    // construction rather than passed to `new` because both the VoiceInput
+    // adapter and the wake-word detector share this one instance, and the
+    // choice is a setting rather than a property of the model file.
+    if let Some(backend) = &whisper_backend {
+        if let Some(detector) = build_speech_detector(&settings.vad_backend, &data_dir).await {
+            backend.set_speech_detector(detector);
+        }
+    }
+
+    let voice: Arc<dyn VoiceInput> = match &whisper_backend {
+        Some(backend) => {
             out!(
                 "  Listen   {}",
                 voice_models
@@ -5080,7 +5333,7 @@ async fn run_chat(
             );
             backend.clone() as Arc<dyn VoiceInput>
         }
-        _ => {
+        None => {
             out!("  Listen   typed input (no speech model)");
             Arc::new(StdinInput::new())
         }
@@ -5088,7 +5341,7 @@ async fn run_chat(
     chat_service = chat_service.with_voice_input(voice);
 
     // ── Wire wake word detector ──
-    if no_wake_word || input != "whisper" || whisper_backend.is_none() {
+    if no_wake_word || whisper_backend.is_none() {
         chat_service = chat_service.with_wake_word_detector(Arc::new(InstantActivation));
     } else {
         let backend = whisper_backend.clone().expect("checked above");
@@ -5252,7 +5505,7 @@ async fn run_chat(
             tts_unavailable(&reason)
         }
     };
-    chat_service = chat_service.with_voice_output(voice_out);
+    chat_service = chat_service.with_voice_output(voice_out.clone());
 
     // The console is deliberately near-silent from here on (tracing is pinned
     // to WARN for it), so point at the file that is not — every detail of the
@@ -5262,6 +5515,56 @@ async fn run_chat(
         "  Log      {}",
         data_dir.join("logs").join("pond.log").display()
     );
+
+    // ── Prefix warm-up + spoken readiness ─────────────────────────────────────
+    // The voice child used to pay model load + preamble prefill on the FIRST
+    // utterance, with the user already mid-sentence. Move that cost to session
+    // start, say so aloud while it runs, and greet by name when the pond is
+    // ready — the greeting doubles as the audible "you can speak now" signal.
+    // Under --json-events every spoken line goes through `voice_out`, which is
+    // SilentOutput when no TTS engine is up, so stdout stays pure NDJSON.
+    {
+        use pond_core::models::ports::agent::WarmupPhase;
+        use pond_core::shared::domain::agent::WorkflowEvent;
+        let will_warm = effective_provider != "mock"
+            && matches!(settings.chat_provider.as_str(), "local" | "gguf")
+            && std::env::var("POND_DISABLE_PREWARM").as_deref() != Ok("1");
+        if will_warm {
+            if json_events {
+                write_ndjson_line(&WorkflowEvent::Warmup {
+                    state: "warming".to_string(),
+                });
+            }
+            let _ = voice_out.speak("Warming up.").await;
+            let last = Arc::new(std::sync::Mutex::new(None::<WarmupPhase>));
+            let sink = last.clone();
+            warm_agent
+                .prewarm(
+                    true, // voice prompt: the warmed prefix must match voice turns
+                    Arc::new(move |phase| {
+                        *sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(phase);
+                    }),
+                )
+                .await;
+            let state = match last.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                Some(WarmupPhase::Ready) => "ready",
+                Some(WarmupPhase::Skipped { .. }) => "skipped",
+                _ => "failed",
+            };
+            if json_events {
+                write_ndjson_line(&WorkflowEvent::Warmup {
+                    state: state.to_string(),
+                });
+            }
+        }
+        let name = settings.user_name.trim();
+        let greeting = if name.is_empty() {
+            "Hi, ready to take your first request.".to_string()
+        } else {
+            format!("Hi {name}, ready to take your first request.")
+        };
+        let _ = voice_out.speak(&greeting).await;
+    }
 
     // ── Emit `ready` (contract) ────────────────────────────────────────────────
     // All models are loaded and every adapter is wired; announce readiness
@@ -6860,7 +7163,7 @@ async fn run_calibrate(
     }
     println!();
     println!("  The wake-word detector will now match any of these variants.");
-    println!("  Run `pond-server chat --input whisper` to test it.");
+    println!("  Run `pond-server chat --voice` to test it.");
     println!();
 
     mic_handle.shutdown();
@@ -7174,7 +7477,7 @@ async fn run_main_menu() -> Result<()> {
 
         match choice.trim() {
             "1" => {
-                run_chat(None, None, "stdin", None, true, Some("none"), None, false).await?;
+                run_chat(None, None, false, None, true, Some("none"), None, false).await?;
             }
             "2" => {
                 let data_dir = default_data_dir();
@@ -8738,24 +9041,17 @@ async fn run_agent_cmd(action: AgentAction) -> Result<()> {
     let llamafile_url = format!("http://127.0.0.1:{}", ports::llamafile_port());
 
     // Wire weather from settings so giap__get_current_weather MCP tool is available.
-    let weather: Option<Arc<dyn WeatherProvider>> = if settings.weather_enabled
-        && (settings.weather_latitude != 0.0 || settings.weather_longitude != 0.0)
-    {
-        let loc = if settings.weather_location_name.is_empty() {
-            format!(
-                "{:.3}, {:.3}",
-                settings.weather_latitude, settings.weather_longitude
-            )
-        } else {
-            settings.weather_location_name.clone()
-        };
-        Some(Arc::new(OpenMeteoWeatherAdapter::new(
-            settings.weather_latitude,
-            settings.weather_longitude,
-            loc,
-        )))
-    } else {
-        None
+    // The third copy of this decision, and it was the strictest of the three:
+    // it required COORDINATES, so a pond that had only ever been given a place
+    // name got weather over HTTP and in voice mode, and was refused it here.
+    let weather: Option<Arc<dyn WeatherProvider>> = match (
+        settings.weather_enabled,
+        pond_core::user_data::services::location::resolve(&settings).weather_target(),
+    ) {
+        (true, Some((lat, lon, loc))) => {
+            Some(Arc::new(OpenMeteoWeatherAdapter::new(lat, lon, loc)))
+        }
+        _ => None,
     };
 
     match action {

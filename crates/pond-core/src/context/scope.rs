@@ -1,20 +1,7 @@
-//! Which context rows a [`ProfileScope`] may see (PAI-8 invariants 1 and 2).
-//!
-//! One predicate, in the domain, because there are two implementations of the
-//! same rule — an in-memory filter and a SQL `WHERE` — and two implementations
-//! of a boundary rule is how a boundary rule drifts. `sqlite_context.rs` mirrors
-//! this in SQL and cross-checks itself against this function over a fixture, so
-//! a divergence fails a test rather than leaking a row.
-//!
-//! # Where this differs from the memory rule, deliberately
-//!
-//! `sqlite_memory::scope_sql` reads `Owner(id)` as "this person's rows **plus
-//! unattributed ones**", because a memory with `profile_id IS NULL` predates
-//! per-profile attribution and is shared household context. Context items have
-//! no such rows: `profile_id` is `NOT NULL` in the schema and non-optional in
-//! the type, so there is nothing for the `OR profile_id IS NULL` limb to match.
-//! Leaving it out is not a behaviour change; adding it would create a hiding
-//! place for a row that belongs to nobody.
+//! Which context rows a [`ProfileScope`] may see (PAI-8 invariants 1 and 2). One predicate in the
+//! domain, mirrored in SQL by `sqlite_context.rs`, which cross-checks itself against this function
+//! over a fixture so a divergence fails a test rather than leaking a row. Unlike
+//! `sqlite_memory::scope_sql` there is no `OR profile_id IS NULL` limb: `profile_id` is `NOT NULL`.
 
 use crate::context::domain::{ContextItem, ContextSource};
 use crate::user_data::domain::profile::ProfileScope;

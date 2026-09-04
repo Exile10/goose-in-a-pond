@@ -15,13 +15,10 @@ tracing     = { workspace = true }
 image       = { workspace = true }
 ndarray     = "0.17"
 
-# ort v2 — load-dynamic links to the system ONNX Runtime at runtime rather
-# than statically. This keeps GIAP's build lightweight and lets operators
-# swap in a CUDA/TensorRT-enabled ORT on Jetson without recompiling.
-#
-# Expects `ORT_DYLIB_PATH` to point at `libonnxruntime.so` (Linux/Jetson) or
-# `libonnxruntime.dylib` (macOS). Falls back to the default library search
-# path if unset.
+# load-dynamic links the system ONNX Runtime at run time, so operators can swap in a
+# CUDA/TensorRT-enabled ORT on Jetson without recompiling. `ORT_DYLIB_PATH` must point at
+# libonnxruntime.so (Linux/Jetson) or libonnxruntime.dylib (macOS); unset falls back to the
+# default library search path.
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "api-18"] }
 
 [dev-dependencies]

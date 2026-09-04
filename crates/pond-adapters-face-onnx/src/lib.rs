@@ -1,31 +1,7 @@
-//! ONNX-based face embedding adapter.
-//!
-//! Implements [`FaceEmbeddingExtractor`] by running an ONNX embedding model
-//! (ArcFace-512 by default, MobileFaceNet-128 supported) via the `ort` crate.
-//!
-//! # Pipeline
-//!
-//! 1. Decode image bytes (any format supported by the `image` crate).
-//! 2. **Alignment** — when five facial landmarks are supplied, fit a 2-D
-//!    similarity transform (Umeyama) that maps the subject's landmarks onto
-//!    the canonical 112×112 template ArcFace was trained on, then warp the
-//!    image through that transform.  When only a bbox is supplied, crop and
-//!    resize.  When neither, take the center square.
-//! 3. Normalise per-channel: `(pixel/255 - 0.5) / 0.5`.
-//! 4. **Quality gate** — reject crops with near-zero pixel variance (blank
-//!    frames, lens caps) or extreme brightness (black / white frames).  The
-//!    gate intentionally runs *after* normalisation so its threshold is
-//!    expressed in the same units the network sees.
-//! 5. Feed through the ONNX model (NCHW layout).
-//! 6. L2-normalise the resulting embedding so cosine similarity reduces to a
-//!    plain dot product at match time.
-//!
-//! # Runtime linkage
-//!
-//! The `ort` crate is built with `load-dynamic`.  The ONNX Runtime shared
-//! library is resolved at startup via `dlopen`/`LoadLibrary` and can be
-//! overridden with `ORT_DYLIB_PATH`.  On Jetson, point this at a TensorRT-
-//! enabled ORT build to get CUDA acceleration for free.
+//! ONNX face embedding adapter implementing [`FaceEmbeddingExtractor`] (ArcFace-512 default,
+//! MobileFaceNet-128). Pipeline: decode, align via Umeyama to the 112×112 template (or crop),
+//! normalise `(pixel/255 - 0.5) / 0.5`, quality gates, NCHW inference, then L2-normalise so
+//! cosine similarity reduces to a dot product. `ORT_DYLIB_PATH` overrides the ORT shared library.
 
 pub mod alignment;
 pub mod antispoof;
@@ -38,18 +14,12 @@ pub use scrfd::ScrfdDetector;
 
 use std::sync::OnceLock;
 
-/// Process-wide ONNX anti-spoof handle, lazy-loaded on first use.  Kept
-/// in a `OnceLock` so we read `POND_FACE_ANTISPOOF_PATH` exactly once and
-/// don't re-attempt the load on every frame.  When the env var is unset
-/// or the file is missing the handle stays `None` and the heuristic gate
-/// is used instead.
+/// Process-wide ONNX anti-spoof handle, lazy-loaded once so `POND_FACE_ANTISPOOF_PATH` is
+/// read once and a failed load is not retried per frame. `None` means the heuristic gate runs.
 static ONNX_ANTISPOOF: OnceLock<Option<OnnxAntispoof>> = OnceLock::new();
-/// Optional secondary Silent-Face model for ensemble PAD.  Silent-Face ships
-/// two models (MiniFASNetV2 @ 2.7× crop + MiniFASNetV1SE @ 4.0× crop) and
-/// *ensembles* them — the wider crop lets V1SE see phone bezels / paper
-/// edges that V2 alone misses.  When `$POND_FACE_ANTISPOOF_PATH_2` is set,
-/// we run both and take `max(spoof_score)` so either model firing rejects
-/// the frame.
+/// Optional secondary model for ensemble PAD (`$POND_FACE_ANTISPOOF_PATH_2`). Silent-Face
+/// pairs MiniFASNetV2 at a 2.7× crop with V1SE at 4.0×, whose wider view sees phone bezels
+/// and paper edges; both run and `max(spoof_score)` wins, so either model firing rejects.
 static ONNX_ANTISPOOF_2: OnceLock<Option<OnnxAntispoof>> = OnceLock::new();
 
 fn antispoof_onnx() -> Option<&'static OnnxAntispoof> {
@@ -131,14 +101,10 @@ impl EmbeddingModel {
 const MEAN: f32 = 0.5;
 const SCALE: f32 = 1.0 / 0.5;
 
-/// Channel order for the embedder input.  InsightFace's `buffalo_l` uses
-/// `swapRB=True` in `cv2.dnn.blobFromImages`, which converts the
-/// natively-BGR OpenCV image to RGB before feeding the model — so the
-/// stock buffalo_l ONNX files expect **RGB**.  But there are many
-/// community re-exports of ArcFace R100 out there where the exporter
-/// assumed raw BGR input; feeding RGB to one of those produces the
-/// classic "every face scores 0.98+" collapsed-embedding symptom.
-/// Override via `POND_FACE_EMBED_CHANNEL_ORDER=bgr|rgb` (default: rgb).
+/// Channel order for the embedder input, `POND_FACE_EMBED_CHANNEL_ORDER=bgr|rgb` (default
+/// rgb). Stock InsightFace `buffalo_l` exports expect RGB (`swapRB=True`); community ArcFace
+/// R100 re-exports often assume BGR, and feeding them RGB gives the "every face scores 0.98+"
+/// collapsed-embedding symptom.
 fn use_bgr_input() -> bool {
     std::env::var("POND_FACE_EMBED_CHANNEL_ORDER")
         .map(|v| v.to_ascii_lowercase() == "bgr")
@@ -151,28 +117,15 @@ fn use_bgr_input() -> bool {
 /// the very source of the "everyone matches" failure mode.
 const MIN_CONTENT_VARIANCE: f32 = 0.006;
 
-/// Mean-brightness gate (0.0 → fully black, 1.0 → fully white, pre-norm
-/// scale).  Rejects images where the exposure is so off that the face has no
-/// detail to embed.
-///
-/// Floor lowered from 0.05 → 0.025: with the pre-detection auto-exposure +
-/// CLAHE pipeline now running on the full frame BEFORE the embedder ever
-/// sees the aligned crop, real-user inputs that make it this far are
-/// already brightened. The 0.05 floor was rejecting genuine low-light
-/// frames where the user's face was correctly detected but the embedder's
-/// pre-norm mean still measured ~0.04. 0.025 catches lens-cap / total-dark
-/// inputs while admitting the dimmest realistic indoor user frames.
+/// Mean-brightness gate in pre-normalisation units (0.0 black, 1.0 white): exposure so far
+/// off that the face has no detail to embed. The floor must stay below the ~0.04 that genuine
+/// low-light frames still measure after auto-exposure; 0.025 still catches a lens cap.
 const MIN_MEAN_BRIGHTNESS: f32 = 0.025;
 const MAX_MEAN_BRIGHTNESS: f32 = 0.95;
 
-/// Minimum Laplacian variance (in normalised [0,1] pixel units, scaled ×1000
-/// for readability) required to pass the blur gate.  Laplacian variance is
-/// the standard "is this image blurry?" heuristic — blurry crops yield a
-/// very flat Laplacian response because there are no sharp edges.  The
-/// threshold was tuned by measuring real webcam captures: a focused indoor
-/// headshot sits at ~30-200, a motion-blurred frame at ~3-10, a completely
-/// out-of-focus frame < 1.  We set the floor at 4 — high enough to reject
-/// obvious blur, low enough to admit imperfect focus from cheap webcams.
+/// Blur-gate floor: Laplacian variance in normalised [0,1] pixel units, times 1000. Measured
+/// on real webcam captures: a focused indoor headshot sits at ~30-200, motion blur at ~3-10,
+/// fully out of focus below 1. Four rejects obvious blur yet admits cheap-webcam focus.
 const MIN_LAPLACIAN_VAR_X1000: f32 = 4.0;
 
 /// Mean-luminance threshold below which the low-light auto-exposure pass
@@ -201,23 +154,13 @@ pub(crate) fn mean_luminance(img: &RgbImage) -> f32 {
     ((acc / n as f64) / 255.0) as f32
 }
 
-/// Per-channel 2-98 percentile histogram stretch.  Cheap (~0.2 ms on
-/// 112×112) and dependency-free.  Mutates the image in place: each pixel
-/// channel is linearly mapped from `[p2, p98]` → `[0, 255]`, with values
-/// outside the range clamped.  Channels are processed independently so a
-/// global colour cast doesn't survive — which is what we want for face
-/// recognition where chroma carries no useful identity signal.
+/// Low-light auto-exposure, in place. Each channel is mapped from `[p2, p98]` to `[0, 255]`
+/// (or CLAHE, see the mode switch below). Channels are independent, so a global colour cast
+/// does not survive; chroma carries no identity signal, so that is wanted.
 pub(crate) fn stretch_histogram_2_98(img: &mut RgbImage) {
-    // Dispatcher: caller picks the algorithm via POND_FACE_AUTO_EXPOSURE_MODE.
-    //
-    //   * `stretch` (default) — per-channel 2-98 percentile linear stretch.
-    //     Cheap (~0.2 ms on 112x112), preserves global tonality, may leave
-    //     mixed-lighting scenes with shadowed faces.
-    //   * `clahe`              — per-channel Contrast Limited Adaptive
-    //     Histogram Equalization (8x8 tiles, clip 4x mean). Recovers face
-    //     detail in scenes with both bright windows and dim corners much
-    //     better than `stretch` does, at the cost of ~3 ms compute and
-    //     slightly more visible noise on uniformly-dim frames.
+    // POND_FACE_AUTO_EXPOSURE_MODE picks the algorithm: `stretch` (default, ~0.2 ms on 112x112,
+    // keeps global tonality but can leave shadowed faces in mixed light) or `clahe` (8x8 tiles,
+    // clip 4x mean, ~3 ms; recovers detail next to bright windows, noisier when uniformly dim).
     match auto_exposure_mode().as_str() {
         "clahe" => clahe_per_channel(img, 8, 4.0),
         _ => stretch_histogram_2_98_linear(img),
@@ -281,18 +224,10 @@ fn stretch_histogram_2_98_linear(img: &mut RgbImage) {
     }
 }
 
-/// Per-channel Contrast Limited Adaptive Histogram Equalisation.
-///
-/// Splits the image into `tiles_per_axis × tiles_per_axis` blocks; for each
-/// block + each colour channel, builds a 256-bin histogram, clips bins that
-/// exceed `clip_limit × mean_bin_count` and redistributes the excess
-/// uniformly, then derives a CDF and applies bilinear interpolation between
-/// the four nearest tile-centre CDFs to smoothly equalise each pixel.
-///
-/// Pure CPU, single-pass, ~3 ms on a 640×640 frame.  Per-channel rather than
-/// per-luminance keeps the implementation small and matches the contract of
-/// the existing percentile stretch (chroma is not preserved either way; for
-/// face recognition that's fine — the embedder is colour-agnostic).
+/// Per-channel Contrast Limited Adaptive Histogram Equalisation: `tiles_per_axis` squared
+/// tiles, bins above `clip_limit × mean_bin_count` redistributed, bilinear blend of the four
+/// nearest tile CDFs. About 3 ms on 640×640. Per-channel, like the percentile stretch, drops
+/// chroma, which the embedder ignores anyway.
 fn clahe_per_channel(img: &mut RgbImage, tiles_per_axis: u32, clip_limit: f32) {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
@@ -492,16 +427,9 @@ fn preprocess(
             .to_rgb8()
     };
 
-    // Low-light auto-correct.  Cheap per-channel histogram stretch (map the
-    // 2nd-98th percentile range to [0,255]) applied only when the mean
-    // luminance of the aligned crop falls below `LOW_LIGHT_TRIGGER`.  This
-    // recovers a usable dynamic range from underexposed webcam frames so:
-    //   * the brightness gate further down does not false-reject the user;
-    //   * the Laplacian-variance blur gate sees real edges instead of
-    //     uniform noise floor;
-    //   * the embedder receives an input distribution closer to its
-    //     training data, which improves match confidence under poor light.
-    // Disable with `POND_FACE_AUTO_EXPOSURE=off` if it ever harms a setup.
+    // Low-light auto-correct on crops below `LOW_LIGHT_TRIGGER`: recovers dynamic range so the
+    // brightness gate does not false-reject, the blur gate sees real edges, and the embedder
+    // gets an input closer to its training data. Disable with POND_FACE_AUTO_EXPOSURE=off.
     if auto_exposure_enabled() {
         let mean_pre = mean_luminance(&resized);
         if mean_pre < LOW_LIGHT_TRIGGER {
@@ -580,29 +508,15 @@ fn preprocess(
         return Ok(None);
     }
 
-    // Anti-spoof gate — passive presentation-attack detection.  Disabled
-    // when POND_FACE_ANTISPOOF=off; threshold overridable via
-    // POND_FACE_ANTISPOOF_THRESHOLD (default 0.50 when Silent-Face ONNX is
-    // loaded — a calibrated probability — and 0.65 when we're falling back
-    // to the heuristic gate, which needs a looser cutoff to avoid
-    // false-rejecting real users in poor lighting).
-    //
-    // Path selection:
-    //   * When `$POND_FACE_ANTISPOOF_PATH` resolves to a Silent-Face ONNX
-    //     model, use it (better accuracy, calibrated probability).
-    //   * Otherwise fall back to the heuristic gate (saturation /
-    //     highlight / gradient-skew) which is fast and dependency-free.
+    // Anti-spoof gate. Disabled by POND_FACE_ANTISPOOF=off; the threshold comes from
+    // `antispoof_threshold` (POND_FACE_ANTISPOOF_THRESHOLD or a per-path default). The ONNX
+    // model at $POND_FACE_ANTISPOOF_PATH is preferred, the heuristic gate is the fallback.
     if antispoof_enabled() {
         let (report, is_onnx) = match antispoof_onnx() {
             Some(model) => {
-                // Silent-Face MiniFASNetV2 was trained on *loose* crops
-                // (scale ≈ 2.7 around the face bbox) so it can see head +
-                // shoulders + a strip of background — that's how it learns
-                // the phone-bezel / paper-edge / moiré cues.  Feeding the
-                // tight 112×112 aligned template instead pushes the model
-                // into an out-of-distribution regime and it happily
-                // predicts `live ≈ 0` for every frame.  Compute the loose
-                // crop from the original `img` here.
+                // Silent-Face was trained on loose crops (about 2.7x the face bbox) where bezel
+                // and paper-edge cues are visible; the tight aligned 112×112 template is out of
+                // distribution and scores every frame `live ≈ 0`, so crop the original `img`.
                 let loose = loose_antispoof_crop(&img, bbox, landmarks, 2.7);
                 let primary = match model.analyse(&loose) {
                     Ok(r) => r,
@@ -663,14 +577,9 @@ fn preprocess(
     Ok(Some(tensor))
 }
 
-/// Compute the loose bbox that Silent-Face MiniFASNetV2 expects
-/// (scale ≈ 2.7 around the detected face bbox, clamped to the image)
-/// and return it as an RGB crop of the *original* frame.
-///
-/// We derive a bbox from landmarks when a bbox wasn't supplied by the
-/// caller (landmarks enclose the face tightly enough — the ×2.7 expansion
-/// below adds the context).  Falls back to a centre square if neither is
-/// present.
+/// The loose crop Silent-Face expects: the face bbox expanded `scale` times about its centre,
+/// clamped to the image, cut from the ORIGINAL frame as RGB. Without a bbox one is derived
+/// from the landmarks; without either, the centre square.
 fn loose_antispoof_crop(
     img: &DynamicImage,
     bbox: Option<BoundingBox>,
@@ -742,17 +651,9 @@ fn antispoof_threshold(is_onnx: bool) -> f32 {
     {
         return v;
     }
-    // Defaults differ by path:
-    //   * Silent-Face ONNX returns a calibrated [0, 1] probability.  We
-    //     pulled the ONNX threshold down from 0.50 → 0.40: phone-screen
-    //     replays of the user's own photo were producing spoof scores in
-    //     the 0.42–0.48 range and slipping past the 0.50 floor.  0.40 is
-    //     still well above the live regime (0.05–0.20) so false-reject
-    //     rate stays acceptable, while catching the screen-photo attack
-    //     the user reported.
-    //   * The heuristic score uses ad-hoc saturation / highlight / skew
-    //     features, and the empirical split to avoid false-rejecting real
-    //     users under LED ring lights sits closer to 0.65.
+    // Defaults differ by path. ONNX gives a calibrated probability: 0.40 catches phone-screen
+    // replays (measured 0.42-0.48) while staying above the live regime (0.05-0.20). The
+    // heuristic score needs 0.65 to avoid false-rejecting real users under LED ring lights.
     if is_onnx {
         0.40
     } else {

@@ -1,13 +1,6 @@
-//! Integration tests for the scheduler REST routes:
-//!   GET    /api/v1/schedules
-//!   POST   /api/v1/schedules
-//!   GET    /api/v1/schedules/upcoming
-//!   DELETE /api/v1/schedules/:id
-//!   POST   /api/v1/schedules/:id/pause
-//!   POST   /api/v1/schedules/:id/resume
-//!   POST   /api/v1/schedules/:id/run-now
-//!   GET    /api/v1/schedules/:id/runs
-//!
+//! Integration tests for the scheduler REST routes under /api/v1/schedules: list,
+//! create, upcoming, delete, and the per-id actions pause, resume, run-now and
+//! runs.
 //! Run: cargo test -p pond-api --test schedule_integration_test
 
 use axum::body::Body;
@@ -213,6 +206,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
     let scheduler: Option<Arc<dyn SchedulerPort>> = Some(Arc::new(InMemoryScheduler::new()));
 
     let state = Arc::new(AppState {
+        warmup: Default::default(),
         db: Arc::new(db),
         onboarding_repo: Arc::new(CompletedOnboarding),
         handshake: Arc::new(mock_hs),
@@ -233,6 +227,7 @@ async fn make_app() -> (axum::Router, tempfile::TempDir) {
         embedding_provider: None,
         vector_index: None,
         index_reindex: None,
+        account_sync: None,
         sensor_storage: Arc::new(MockSensorStorage::new()),
         camera_storage: Arc::new(MockCameraStorage::new()),
         prompt_template_dir: None,

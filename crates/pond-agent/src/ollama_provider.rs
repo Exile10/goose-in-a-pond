@@ -1,11 +1,7 @@
 //! OllamaInferenceProvider — implements `InferenceProvider` for Ollama HTTP.
-//!
-//! Uses true NDJSON streaming via `reqwest::Response::chunk()` for
-//! token-by-token delivery. Supports native tool calling when the model
-//! declares tool_calls in its response.
-//!
-//! Auto-pull: if the model is not found (404), automatically pulls it
-//! via `/api/pull` and retries.
+//! Streams NDJSON via `reqwest::Response::chunk()` for token-by-token delivery,
+//! and supports native tool calling when the model returns tool_calls. A 404 for
+//! the model triggers an automatic `/api/pull` and one retry.
 
 use crate::ollama_wire::{
     OllamaChatRequest, OllamaFunctionDef, OllamaMessage, OllamaOptions, OllamaPullRequest,
@@ -28,11 +24,8 @@ pub struct OllamaInferenceProvider {
 }
 
 impl OllamaInferenceProvider {
-    /// Create a new provider targeting the given Ollama base URL.
-    ///
-    /// # Arguments
-    /// * `base_url` - e.g. `"http://localhost:11434"`
-    /// * `model` - e.g. `"gemma4:latest"`, `"qwen3:8b"`
+    /// Create a new provider targeting `base_url`, e.g.
+    /// `"http://localhost:11434"`, with `model` such as `"gemma4:latest"`.
     pub fn new(base_url: &str, model: &str) -> Self {
         Self {
             client: reqwest::Client::new(),

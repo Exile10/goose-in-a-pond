@@ -1,38 +1,7 @@
-//! The on-pond producer's one moving part (PAI-8 P3s).
-//!
-//! [`producer`](crate::context::producer) is a pure function and
-//! [`IngestPipeline`] is a pure-ish sink; this joins them, and it exists so that
-//! the wiring in `pond-server` is one call rather than four decisions.
-//!
-//! # Why this is in `pond-core` and not in `main.rs`
-//!
-//! Invariant 5: policy in `pond-core`, mechanism in adapters. Four things have
-//! to be decided to turn a bus event into a stored row, and every one of them is
-//! policy:
-//!
-//! 1. **Which scope enumerates the sources.** [`INGEST_SCOPE`] — and getting it
-//!    wrong is not a compile error, it is a silently empty corpus
-//!    ([`ProfileScope::Guest`]) or one member's device feeding another member's
-//!    row (an `Owner` picked from the wrong place).
-//! 2. **When to read the store at all.** A disabled producer must not cost a
-//!    query per bus event on a Jetson, so the toggle is answered before the
-//!    read, not after it.
-//! 3. **What an unreadable store means.** It means refuse: see [`AbsorbError`].
-//! 4. **What a refusal is worth saying.** A feature that is switched on and says
-//!    nothing is indistinguishable from one that is broken — the lesson PAI-7 P4
-//!    paid for when its reviewer ran silently on every pond — so the refusals
-//!    are traced with their own sentences rather than dropped.
-//!
-//! A binary that had to make those four choices would be making them in the
-//! crate this workstream's invariants cannot see.
-//!
-//! # What this is not
-//!
-//! It is not a subscriber. It holds no task, no channel and no clock: the caller
-//! owns the bus subscription and passes each event in with the settings it read
-//! for that tick. That is deliberate — a service that cached `Settings` at
-//! construction would make `PUT /api/v1/settings` a no-op until restart, which
-//! is exactly the shape of the `set_network_mode` defect PAI-2 P6a recorded.
+//! Joins [`producer`](crate::context::producer) to [`IngestPipeline`] (PAI-8 P3s); the policy
+//! lives here. [`INGEST_SCOPE`] picks the sources, the toggle is answered before the store read,
+//! and an unreadable store refuses ([`AbsorbError`]) with a traced reason. Not a subscriber: the
+//! caller owns the bus and passes fresh `Settings` per event; a cached copy would ignore new PUTs.
 
 use std::sync::Arc;
 
@@ -46,20 +15,10 @@ use crate::shared::ports::event_bus::BusEvent;
 use crate::user_data::domain::profile::ProfileScope;
 use crate::user_data::domain::settings::Settings;
 
-/// The scope the pond enumerates context sources under when it is deciding
-/// which of them an event belongs to.
-///
-/// [`ProfileScope::Household`] because this read has no asker. It is the pond
-/// itself walking every source a member created, and each source then supplies
-/// its OWN `profile_id` to the item written under it — so the breadth here never
-/// becomes breadth in a stored row.
-///
-/// It is a constant rather than an argument on purpose. A caller that could pass
-/// a scope would eventually pass a session's scope, and a session's scope is the
-/// answer to "what may this speaker read", which is a different question with a
-/// worse failure mode: a `Guest` turn arriving while a sensor fires would make
-/// the pond stop recording, and an `Owner` turn would make one member's presence
-/// at the keyboard decide whose devices get recorded.
+/// The household scope the pond enumerates context sources under when deciding which an event
+/// belongs to. The read has no asker, and each source supplies its own `profile_id` to its item.
+/// A constant, not an argument: a caller would eventually pass a session's scope, and a `Guest`
+/// turn arriving while a sensor fired would then stop the pond recording.
 pub const INGEST_SCOPE: ProfileScope = ProfileScope::Household;
 
 /// What one bus event did.
@@ -84,14 +43,9 @@ impl AbsorbReport {
 
 #[derive(Debug, Error)]
 pub enum AbsorbError {
-    /// The source list could not be read.
-    ///
-    /// This is an error and not an empty report, and the difference is the
-    /// failure-direction rule. "No sources" and "I cannot tell you what the
-    /// sources are" are different answers, and answering the second with the
-    /// first would mean an unreadable store looks exactly like a household that
-    /// has not configured anything — so a broken store would be reported by this
-    /// feature as working correctly and doing nothing, forever.
+    /// The source list could not be read. An error rather than an empty report: "no sources" and
+    /// "I cannot tell you what the sources are" are different answers, and conflating them makes a
+    /// broken store look like a household that has configured nothing.
     #[error(
         "could not read this household's context sources, so the event was offered to none of \
          them: {0}"
@@ -112,11 +66,8 @@ impl BusIngest {
 
     /// Offer one bus event to every source that might follow it.
     ///
-    /// `settings` is a parameter rather than a field so the toggle is answered
-    /// from whatever the caller last read, and `now` is a parameter for the same
-    /// reason [`IngestPipeline::ingest`] takes one: the ingest timestamp is the
-    /// caller's clock, and a service that read its own could not be tested for
-    /// the stability the idempotency claim rests on.
+    /// `settings` and `now` are parameters, not fields: the toggle is answered from whatever the
+    /// caller last read, and the ingest timestamp is the caller's clock so idempotency is testable.
     pub async fn absorb(
         &self,
         settings: &Settings,
@@ -296,12 +247,10 @@ mod tests {
         );
     }
 
-    /// One event, three sources: two follow the device and each gets its own
-    /// row under its own owner, and the third is refused. Both halves matter —
-    /// a service that offered the event to only the first matching source would
-    /// pass a one-follower test, and one that offered it to every source would
-    /// pass a count-only test while filing the porch sensor's motion under the
-    /// hall sensor's followers.
+    /// One event, three sources: the two that follow the device each get a row under their own
+    /// owner, and the third is refused. Both halves matter: stopping at the first match passes a
+    /// one-follower test, and offering the event to every source passes a count-only test while
+    /// filing the porch sensor's motion under the hall sensor's followers.
     #[tokio::test]
     async fn one_event_reaches_every_source_that_follows_it_and_no_others() {
         let repo = Arc::new(MockContextRepository::new());

@@ -1,29 +1,7 @@
-//! The single microphone owner.
-//!
-//! Before this, three subsystems each called `default_input_device()`
-//! independently — the wake-word detector, the capture path, and piper's
-//! barge-in listener — and `run_loop` could have all three live at once, since
-//! it starts the detector *while* TTS and the barge-in listener are running.
-//! Three concurrent streams on one device is undefined at best; under ALSA
-//! without dmix the second `build_input_stream` simply fails, which is the
-//! "wake word works once, then stops" shape.
-//!
-//! There is now exactly one owner. Everything else subscribes.
-//!
-//! ## Why a thread and not a tokio task
-//!
-//! `cpal::Stream` is `!Send` on CoreAudio — the crate says so itself, and
-//! `pond-adapters-piper` already carries the workaround (`AudioKeeper`, a
-//! named thread that owns a `rodio::OutputStream` and hands out only the
-//! `Send` handle). The same constraint applies to input, so the owner is an OS
-//! thread with an mpsc command channel. An async actor would not compile
-//! without the same `unsafe impl Send` dance, and would buy nothing.
-//!
-//! ## Privacy
-//!
-//! `mic_enabled = false` **closes the device**. It does not capture and
-//! discard: that would leave the OS microphone indicator lit, and a user who
-//! sees that indicator is right not to believe the setting.
+//! The single microphone owner: one component opens the device, everything else subscribes,
+//! because a second concurrent `build_input_stream` fails (ALSA without dmix). `cpal::Stream`
+//! is `!Send` on CoreAudio, so the owner is an OS thread with an mpsc channel, not a task.
+//! `mic_enabled = false` closes the device, so the OS microphone indicator goes out.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -59,16 +37,10 @@ pub enum MicCommand {
     Open,
     /// Stop capturing and release the device, unconditionally.
     Close,
-    /// Stop capturing, but only if `generation` is still the current one.
-    ///
-    /// The mic has one device and many users, several of which run on detached
-    /// threads: a cancelled wake-word detector, for instance, releases the mic
-    /// from a blocking thread that the orchestrator has already stopped waiting
-    /// on, and by then the follow-up capture has usually opened the same
-    /// handle. An unconditional `Close` from that thread closes the device out
-    /// from under the capture, which presents as a conversation that hears
-    /// nothing after the wake word — the failure that is hardest to attribute,
-    /// because the component that caused it is already gone.
+    /// Stop capturing, but only if `generation` is still the current one. Users run on detached
+    /// threads that outlive their cancellation, so an unconditional `Close` from one closes the
+    /// device under whoever opened next: the conversation hears nothing after the wake word,
+    /// and the component responsible is already gone.
     CloseIfGeneration(u64),
     /// Apply the privacy setting. `false` closes an open device immediately.
     SetEnabled(bool),
@@ -89,12 +61,9 @@ pub struct MicShared {
     /// cheaply tell whether anything happened since it last looked.
     tick: Mutex<u64>,
     enabled: AtomicBool,
-    /// Which capture "owns" the device right now.
-    ///
-    /// The mic is single-owner but the handle is shared, and its users run on
-    /// detached threads that can outlive their own cancellation. Without a
-    /// generation, a `Close` sent by a component that has already given up
-    /// lands on whoever opened next — see `close_session`.
+    /// Which capture "owns" the device right now. Users run on detached threads that outlive
+    /// their cancellation; without a generation, a `Close` from a component that already gave
+    /// up lands on whoever opened next. See `close_session`.
     generation: AtomicU64,
 }
 
@@ -168,16 +137,10 @@ impl MicShared {
     }
 }
 
-/// A cursor into the shared ring.
-///
-/// `recent(n)` answers "the last n samples", which suits an energy gate. It
-/// cannot answer "everything said since I started listening" — the question
-/// both capture paths actually ask, for an utterance that may run to 30 s
-/// against a ring sized for a fraction of that. `n` is not knowable up front,
-/// and guessing high silently returns audio from before the turn began.
-///
-/// A reader tracks its own position instead, and counts what it lost rather
-/// than quietly returning a shorter clip that still sounds plausible.
+/// A cursor into the shared ring. `recent(n)` suits an energy gate but cannot answer
+/// "everything since I started listening", which is what both capture paths ask for utterances
+/// up to 30 s against a much smaller ring. A reader tracks its own position and counts what it
+/// lost, rather than silently returning a short clip that still sounds plausible.
 pub struct MicReader {
     shared: Arc<MicShared>,
     cursor: u64,
@@ -272,9 +235,8 @@ impl MicHandle {
 
     /// Block until the state satisfies `pred`, or the timeout elapses.
     ///
-    /// Exists for the device handoff: `voice_cmd.rs` already had to bolt a
-    /// 1-second `wait_for_wake_thread_exit` onto the old design because
-    /// "asked it to stop" is not "the device is free".
+    /// Exists for the device handoff, where "asked it to stop" is not "the device is free"
+    /// (see `wait_for_wake_thread_exit` in `voice_cmd.rs`).
     pub fn wait_for(&self, pred: impl Fn(&MicState) -> bool, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -328,11 +290,9 @@ pub fn run(mut device: Box<dyn CaptureDevice>, shared: Arc<MicShared>, rx: Recei
     while let Ok(cmd) = rx.recv() {
         match cmd {
             MicCommand::Open => {
-                // Idempotent. The owner is shared, so a second subscriber
-                // asking for a device that is already streaming must not
-                // punch a hole in the audio the first one is mid-read of —
-                // `CpalCapture::start` opens with a `self.stop()`, so a
-                // re-apply would drop and rebuild the stream.
+                // Idempotent: `CpalCapture::start` opens with a `self.stop()`, so re-applying
+                // for a second subscriber would drop and rebuild a stream the first is
+                // mid-read of.
                 if want_open && shared.state().is_open() {
                     continue;
                 }
@@ -663,16 +623,9 @@ mod tests {
         assert!(t0.elapsed() < std::time::Duration::from_secs(1));
     }
 
-    /// A capture that has lost the device cannot release it.
-    ///
-    /// The mic has one device and several users, and some of them run on
-    /// detached threads that outlive their own cancellation: the wake-word
-    /// detector releases the mic from a blocking thread the orchestrator has
-    /// already stopped waiting on, by which time the follow-up conversational
-    /// capture has usually opened the same handle. An unconditional `close()`
-    /// there shuts the device under the capture, and the symptom -- a
-    /// conversation that hears nothing after the wake word -- points at a
-    /// component that has already exited.
+    /// A capture that has lost the device cannot release it. Detached users outlive their own
+    /// cancellation, so an unconditional `close()` from one shuts the device under whoever
+    /// opened next: a conversation that hears nothing after the wake word.
     #[test]
     fn a_stale_owner_cannot_close_a_device_somebody_else_claimed() {
         let h = Harness::new(true, None);

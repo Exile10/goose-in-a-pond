@@ -1,21 +1,7 @@
-//! UltraFace ONNX face detector.
-//!
-//! Implements [`FaceDetector`] by running the
-//! [Ultra-Light-Fast-Generic-Face-Detector-1MB][ultraface] (RFB-320 variant)
-//! ONNX model.  The model outputs *decoded* `[x1,y1,x2,y2]` boxes in
-//! normalised `[0,1]` coordinates and per-anchor scores, so post-processing
-//! is just confidence filtering + NMS — no priorbox math required.
-//!
-//! [ultraface]: https://github.com/onnx/models/tree/main/validated/vision/body_analysis/ultraface
-//!
-//! # Why UltraFace over mtCNN?
-//!
-//! mtCNN is a three-model cascade (PNet → RNet → ONet) which means three
-//! ONNX sessions, three forward passes, and priorbox-style decoding.
-//! UltraFace is a single 1.5 MB model that produces decoded boxes directly
-//! and runs at ~30 FPS on a Jetson Nano — a better fit for GIAP's
-//! edge-deployment story.  Either model plugs into the [`FaceDetector`]
-//! port, so swapping is contained.
+//! UltraFace (RFB-320) ONNX face detector implementing [`FaceDetector`]: bbox only, no
+//! landmarks. Outputs are decoded `[x1,y1,x2,y2]` in normalised `[0,1]`, so post-processing
+//! is confidence filtering plus NMS. Model:
+//! <https://github.com/onnx/models/tree/main/validated/vision/body_analysis/ultraface>
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -50,10 +36,8 @@ pub struct UltraFaceDetector {
 impl UltraFaceDetector {
     /// Load an UltraFace ONNX model from `model_path`.
     ///
-    /// `score_thresh` — minimum confidence for an anchor to survive the
-    /// first pass (default 0.7 is a good balance for indoor cameras).
-    /// `iou_thresh` — IoU above which overlapping boxes are collapsed in
-    /// NMS (default 0.3).
+    /// `score_thresh` is the minimum anchor confidence (default 0.7 suits indoor cameras);
+    /// `iou_thresh` is the IoU above which NMS collapses overlapping boxes (default 0.3).
     pub fn new(model_path: impl Into<PathBuf>, score_thresh: f32, iou_thresh: f32) -> Result<Self> {
         let path = model_path.into();
         if !path.exists() {
